@@ -54,6 +54,7 @@
         userIcon,
         userIconPortrait,
         viewportSource = null,
+        viewportNavigationGeneration = 0,
         parserProjectionResolver,
         selectedConversationOperations,
         hasNewUnreadMessage = $bindable(false),
@@ -70,6 +71,7 @@
         userIcon: string
         userIconPortrait?: boolean
         viewportSource?: ConversationViewportSource | null
+        viewportNavigationGeneration?: number
         parserProjectionResolver?: LiveChatParserProjectionResolver
         selectedConversationOperations?: SelectedConversationOperations
         hasNewUnreadMessage?: boolean
@@ -85,6 +87,13 @@
             isOptimizedStreamingMessage: boolean
             streamingOptimizationMode: StreamingDisplayOptimizationMode
             rawStreamingText: string
+        }) => void
+        updateViewportBinding?: (state: {
+            viewportRow: ConversationViewportRow
+            viewportSourceToken: string
+            captureViewportTarget: () => ReturnType<ConversationViewportSource['captureMessageTarget']>
+            parserProjection?: BoundedLiveChatParserProjection
+            totalMessages: number
         }) => void
     }
 
@@ -119,8 +128,10 @@
         retryTimer: ReturnType<typeof setTimeout> | null
     }
     let rowParserProjections = new Map<string, RowParserProjectionState>()
+    let sourceHandoffRuntimeKeys = new Set<string>()
     let sourceUnsubscribe: (() => void) | null = null
     let activeViewportSource: ConversationViewportSource | null = null
+    let activeViewportNavigationGeneration = 0
     let sourceUpdateRevision = $state(0)
     let lastMountedSourceTailKey: string | null = null
     let pendingSourceWasAtBottom: boolean | null = null
@@ -217,10 +228,10 @@
     }
 
     function currentChatScope(): string {
-        const conversationIdentity = currentConversationIdentity()
-        const sourceIdentity = activeViewportSource?.snapshot().sourceToken
-            ?? 'compatibility-array'
-        return `${conversationIdentity}|${sourceIdentity.length}:${sourceIdentity}`
+        if (activeViewportSource) {
+            return `viewport:${currentConversationHandoffIdentity()}`
+        }
+        return `${currentConversationIdentity()}|19:compatibility-array`
     }
 
     function objectScopeIdentity(identities: WeakMap<object, number>, value: object): number {
@@ -304,6 +315,7 @@
         keyLookupScans = 0
         pinReasons = new Map()
         playingMedia = new Map()
+        sourceHandoffRuntimeKeys = new Set()
         viewportAnchor = null
         viewportResult = null
         identitySequence = null
@@ -505,10 +517,12 @@
         if (source === activeViewportSource) return
         const nextConversationIdentity = currentConversationHandoffIdentity()
         const previousSnapshot = currentSourceSnapshot()
+        const nextSnapshot = source?.snapshot() ?? null
         const previousAnchor = captureDomAnchor()
         const preserveHandoff = (
             source !== null &&
             activeViewportSource !== null &&
+            activeViewportNavigationGeneration === viewportNavigationGeneration &&
             renderedConversationIdentity === nextConversationIdentity &&
             previousSnapshot !== null &&
             previousAnchor !== null
@@ -544,12 +558,16 @@
         releaseSourcePins()
         sourceUnsubscribe?.()
         sourceUnsubscribe = null
+        if (preserveHandoff && previousSnapshot && nextSnapshot) {
+            remapMountedSourceRows(nextSnapshot)
+        }
         activeViewportSource = source
+        activeViewportNavigationGeneration = viewportNavigationGeneration
         sourceUpdateRevision += 1
         lastMountedSourceTailKey = null
         pendingSourceWasAtBottom = handoffWasAtBottom
         pendingSourceHandoffAnchor = handoffAnchor
-        activeScope = null
+        if (!preserveHandoff) activeScope = null
         if (source) {
             sourceUnsubscribe = source.subscribe(() => {
                 queueMicrotask(() => {
@@ -765,9 +783,14 @@
                     parserProjection = parserProjectionState.projection
                 }
             }
-            const requiresRemount = parserProjectionState?.needsRemount === true
+            const sourceHandoff = sourceHandoffRuntimeKeys.has(key)
+            const requiresRemount = sourceHandoff
+                || parserProjectionState?.needsRemount === true
                 || !areChatRenderSignaturesEqual(previousSignature, renderSignature)
-            const preserveMountedRuntime = parserProjectionState?.preserveMountedRuntime === true
+            const preserveMountedRuntime = (
+                sourceHandoff
+                || parserProjectionState?.preserveMountedRuntime === true
+            )
                 && mountInstances.has(key) && (
                 activeStreamingMessage
                 || pinReasons.get(key)?.has('editor') === true
@@ -812,8 +835,20 @@
                 mountInstances.set(key, instance)
                 renderSignatures.set(key, renderSignature)
                 if (parserProjectionState) parserProjectionState.needsRemount = false
+                sourceHandoffRuntimeKeys.delete(key)
             } else {
-                mountInstances.get(key)?.updateStreamingDisplay?.({
+                const instance = mountInstances.get(key)
+                if (sourceHandoff && viewportRow && activeViewportSource && sourceSnapshot) {
+                    const source = activeViewportSource
+                    instance?.updateViewportBinding?.({
+                        viewportRow,
+                        viewportSourceToken: sourceSnapshot.sourceToken,
+                        captureViewportTarget: () => source.captureMessageTarget(viewportRow.key),
+                        parserProjection,
+                        totalMessages,
+                    })
+                }
+                instance?.updateStreamingDisplay?.({
                     isOptimizedStreamingMessage: activeStreamingMessage,
                     streamingOptimizationMode: performanceMode,
                     rawStreamingText: message.data,
@@ -860,6 +895,47 @@
             }
             chatBody.insertBefore(element, cursor)
         }
+    }
+
+    function remapMountedSourceRows(nextSnapshot: ConversationViewportSnapshot): void {
+        const remapped: Array<{ previousKey: string; nextKey: string }> = []
+        for (const [previousKey, element] of mountedElements) {
+            const absoluteIndex = Number(element.dataset.chatIndex)
+            if (!Number.isSafeInteger(absoluteIndex) || absoluteIndex < 0) continue
+            const nextKey = nextSnapshot.keyAt(absoluteIndex)
+            if (nextKey === undefined) continue
+            remapped.push({ previousKey, nextKey })
+        }
+        for (const key of [...rowParserProjections.keys()]) {
+            releaseRowParserProjection(key)
+        }
+        for (const { previousKey, nextKey } of remapped) {
+            if (previousKey === nextKey) continue
+            moveKeyedEntry(mountedElements, previousKey, nextKey)
+            moveKeyedEntry(mountInstances, previousKey, nextKey)
+            moveKeyedEntry(renderSignatures, previousKey, nextKey)
+            moveKeyedEntry(pinReasons, previousKey, nextKey)
+            moveKeyedEntry(playingMedia, previousKey, nextKey)
+            moveKeyedEntry(measuredHeights, previousKey, nextKey)
+            moveKeyedEntry(measuredHeightRecency, previousKey, nextKey)
+            moveKeyedEntry(measuredHeightIndexByKey, previousKey, nextKey)
+            if (renderKeys.delete(previousKey)) renderKeys.add(nextKey)
+            sourceHandoffRuntimeKeys.delete(previousKey)
+            sourceHandoffRuntimeKeys.add(nextKey)
+            const element = mountedElements.get(nextKey)
+            if (element) element.dataset.chatRenderKey = nextKey
+        }
+    }
+
+    function moveKeyedEntry<T>(
+        values: Map<string, T>,
+        previousKey: string,
+        nextKey: string,
+    ): void {
+        const value = values.get(previousKey)
+        if (value === undefined) return
+        values.delete(previousKey)
+        values.set(nextKey, value)
     }
 
     function ensureElement(key: string, viewportIndex: number): HTMLElement {
@@ -931,6 +1007,7 @@
             mountedElements.delete(key)
         }
         renderSignatures.delete(key)
+        sourceHandoffRuntimeKeys.delete(key)
     }
 
     function releaseRowRuntimeState(key: string, preserveParserProjection = false): void {
@@ -969,13 +1046,15 @@
             && areChatRenderSignaturesEqual(existing.renderSignature, renderSignature)
         ) return existing
 
-        const preserveMountedRuntime = existing?.source === source && (
-            existing.sourceToken !== sourceSnapshot.sourceToken
-            || existing.sourceVersion !== sourceSnapshot.version
-            || existing.row.key !== row.key
-            || existing.row.absoluteIndex !== row.absoluteIndex
-            || existing.row.sourceVersion !== row.sourceVersion
-            || existing.totalMessages !== totalMessages
+        const preserveMountedRuntime = sourceHandoffRuntimeKeys.has(key) || (
+            existing?.source === source && (
+                existing.sourceToken !== sourceSnapshot.sourceToken
+                || existing.sourceVersion !== sourceSnapshot.version
+                || existing.row.key !== row.key
+                || existing.row.absoluteIndex !== row.absoluteIndex
+                || existing.row.sourceVersion !== row.sourceVersion
+                || existing.totalMessages !== totalMessages
+            )
         )
         releaseRowParserProjection(key)
         const controller = new AbortController()
@@ -995,10 +1074,18 @@
             retryTimer: null,
         }
         rowParserProjections.set(key, state)
+        resolveRowParserProjection(key, state)
+        return state
+    }
+
+    function resolveRowParserProjection(
+        key: string,
+        state: RowParserProjectionState,
+    ): void {
         void parserProjectionResolver!.resolve({
-            row,
-            totalMessages,
-            signal: controller.signal,
+            row: state.row,
+            totalMessages: state.totalMessages,
+            signal: state.controller.signal,
             isCurrent: () => isRowParserProjectionCurrent(key, state),
         }).then((projection) => {
             if (!isRowParserProjectionCurrent(key, state)) {
@@ -1008,16 +1095,20 @@
             state.projection = projection
             reconcileViewport()
         }).catch(() => {
-            if (!isRowParserProjectionCurrent(key, state)) return
+            releaseResolvedRowParserProjection(state)
+            if (
+                !isRowParserProjectionCurrent(key, state)
+                || state.retryTimer !== null
+            ) return
             state.failed = true
             state.retryTimer = setTimeout(() => {
                 if (!isRowParserProjectionCurrent(key, state)) return
-                rowParserProjections.delete(key)
-                state.controller.abort()
-                reconcileViewport()
+                state.retryTimer = null
+                state.failed = false
+                state.needsRemount = mountInstances.has(key)
+                resolveRowParserProjection(key, state)
             }, PARSER_PROJECTION_RETRY_DELAY_MS)
         })
-        return state
     }
 
     function isRowParserProjectionCurrent(
@@ -1048,6 +1139,10 @@
         rowParserProjections.delete(key)
         state.controller.abort()
         if (state.retryTimer !== null) clearTimeout(state.retryTimer)
+        releaseResolvedRowParserProjection(state)
+    }
+
+    function releaseResolvedRowParserProjection(state: RowParserProjectionState): void {
         if (state.projection?.kind === 'complete') state.projection.release()
         state.projection = null
     }
@@ -1445,6 +1540,7 @@
         measuredHeightRecency.clear()
         pinReasons.clear()
         playingMedia.clear()
+        sourceHandoffRuntimeKeys.clear()
         imageResolutionGeneration += 1
     })
 

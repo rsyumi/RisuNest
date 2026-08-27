@@ -221,6 +221,30 @@
         rawStreamingText = state.rawStreamingText
     }
 
+    export function updateViewportBinding(state: {
+        viewportRow: ConversationViewportRow
+        viewportSourceToken: string
+        captureViewportTarget: () => CapturedChatMessageTarget | null
+        parserProjection?: BoundedLiveChatParserProjection
+        totalMessages: number
+    }) {
+        viewportRow = state.viewportRow
+        viewportSourceToken = state.viewportSourceToken
+        captureViewportTarget = state.captureViewportTarget
+        parserProjection = state.parserProjection
+        idx = state.viewportRow.absoluteIndex
+        totalLength = state.totalMessages
+        if (editMode) {
+            editIntent = captureViewportEditIntent()
+            editTarget = editIntent ? null : captureCurrentMessage()
+        }
+        if (partialEditIntent || partialEditTarget) {
+            partialEditIntent = captureViewportEditIntent()
+            partialEditTarget = partialEditIntent ? null : captureCurrentMessage()
+        }
+        updateDisplayedMessage()
+    }
+
     function currentConversationSession() {
         const currentCharacter = DBState.db.characters[selIdState.selId]
         const currentChat = currentCharacter?.chats[currentCharacter.chatPage]

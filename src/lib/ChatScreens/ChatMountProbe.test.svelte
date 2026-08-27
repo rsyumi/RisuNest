@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte'
+    import { onDestroy, onMount, untrack } from 'svelte'
     import type { StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
     import { chatMountProbe } from './chatMountProbe'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
@@ -23,6 +23,10 @@
     } = $props()
 
     const instanceId = chatMountProbe.nextInstanceId++
+    if (untrack(() => idx) >= 0 && chatMountProbe.throwNextMount) {
+        chatMountProbe.throwNextMount = false
+        throw new Error('chat mount probe failure')
+    }
     let displayedStreamingText = $state('')
 
     export function updateStreamingDisplay(state: {
@@ -37,6 +41,8 @@
             isOptimizedStreamingMessage: state.isOptimizedStreamingMessage,
         })
     }
+
+    export function updateViewportBinding() {}
 
     onMount(() => {
         displayedStreamingText = rawStreamingText

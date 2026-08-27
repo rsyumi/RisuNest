@@ -112,6 +112,7 @@ interface HarnessInstance {
     jumpTo(index: number, options?: { align?: 'start' | 'center'; highlight?: boolean }): Promise<boolean>
     jumpToLatestMessage(): Promise<void>
     setViewportSource(source: ConversationViewportSource | null): void
+    setViewportNavigationGeneration(generation: number): void
     hasUnreadMessage(): boolean
     getCurrentCharacter(): character
 }
@@ -650,6 +651,189 @@ describe('Chats imperative mount lifecycle', () => {
         })
     })
 
+    test('preserves pinned row runtime across a transient parser projection retry', async () => {
+        const messages = [makeMessage(0)]
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        let rejectedRefresh = false
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) => {
+                if (row.absoluteIndex === 0 && row.sourceVersion > 0 && !rejectedRefresh) {
+                    rejectedRefresh = true
+                    throw new Error('transient projection failure')
+                }
+                return boundedProjection(currentCharacter, row.absoluteIndex)
+            }),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        const row = probeElements(target)[0]
+        const instance = Number(row.dataset.chatProbe)
+        const editor = document.createElement('textarea')
+        editor.value = 'retry-safe draft'
+        row.append(editor)
+        editor.focus()
+        const media = document.createElement('audio')
+        row.append(media)
+        media.dispatchEvent(new Event('play'))
+
+        session.append(makeMessage(1))
+
+        await vi.waitFor(() => expect(rejectedRefresh).toBe(true))
+        await vi.waitFor(() => expect(
+            (resolver.resolve as ReturnType<typeof vi.fn>).mock.calls.filter(
+                ([input]) => input.row.absoluteIndex === 0 && input.row.sourceVersion > 0,
+            ),
+        ).toHaveLength(2))
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        expect(probeIdForMessage(target, 'message-0')).toBe(instance)
+        expect(editor.isConnected).toBe(true)
+        expect(editor.value).toBe('retry-safe draft')
+        expect(media.isConnected).toBe(true)
+        expect(session.pinCount('editor')).toBe(1)
+        expect(session.pinCount('playing-media')).toBe(1)
+    })
+
+    test('releases a complete projection when reconciliation throws and retries', async () => {
+        const messages = [makeMessage(0)]
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        const release = vi.fn()
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn()
+                .mockResolvedValueOnce({
+                    kind: 'complete',
+                    characterId: 'character-id',
+                    conversationId: 'chat-room-id',
+                    revision: 1,
+                    totalMessages: 1,
+                    chatID: 0,
+                    projectedChatID: 0,
+                    historyOffset: 0,
+                    reasons: ['projection-budget'],
+                    release,
+                })
+                .mockResolvedValueOnce(boundedProjection(currentCharacter, 0)),
+        }
+        chatMountProbe.throwNextMount = true
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+
+        await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+        await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+    })
+
+    test('preserves pinned row runtime across a same-conversation source replacement', async () => {
+        const messages = [makeMessage(0), makeMessage(1)]
+        messages[1].role = 'char'
+        const firstCharacter = makeMetadataOnlyCharacter()
+        firstCharacter.chats[0].isStreaming = true
+        firstCharacter.chats[0].activeStreamingDisplayOptimizationMode = 'balanced'
+        const firstSource = makePersistentViewportSource(messages)
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) => boundedProjection(
+                firstCharacter,
+                row.absoluteIndex,
+            )),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: firstCharacter,
+                initialViewportSource: firstSource,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        const editorRow = probeElements(target).find(
+            (element) => element.dataset.message === 'message-0',
+        )!
+        const mediaRow = probeElements(target).find(
+            (element) => element.dataset.message === 'message-1',
+        )!
+        const editorInstance = Number(editorRow.dataset.chatProbe)
+        const mediaInstance = Number(mediaRow.dataset.chatProbe)
+        const editor = document.createElement('textarea')
+        editor.value = 'handoff draft'
+        editorRow.append(editor)
+        editor.focus()
+        const media = document.createElement('audio')
+        mediaRow.append(media)
+        media.dispatchEvent(new Event('play'))
+
+        const replacementCharacter = makeCharacter(structuredClone(messages), true)
+        const { session, source: replacementSource } = makeViewportSource(replacementCharacter)
+        firstSource.dispose()
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        expect(probeIdForMessage(target, 'message-0')).toBe(editorInstance)
+        expect(probeIdForMessage(target, 'message-1')).toBe(mediaInstance)
+        expect(editor.isConnected).toBe(true)
+        expect(editor.value).toBe('handoff draft')
+        expect(media.isConnected).toBe(true)
+        expect(session.pinCount('editor')).toBe(1)
+        expect(session.pinCount('playing-media')).toBe(1)
+        expect(session.pinCount('streaming')).toBe(1)
+    })
+
+    test('does not preserve pinned runtime across a new navigation generation', async () => {
+        const messages = [makeMessage(0), makeMessage(1)]
+        const firstCharacter = makeCharacter(messages)
+        const { source: firstSource } = makeViewportSource(firstCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: firstCharacter,
+                initialViewportSource: firstSource,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        const row = probeElements(target).find(
+            (element) => element.dataset.message === 'message-0',
+        )!
+        const instance = Number(row.dataset.chatProbe)
+        const editor = document.createElement('textarea')
+        row.append(editor)
+        editor.focus()
+        const media = document.createElement('audio')
+        row.append(media)
+        media.dispatchEvent(new Event('play'))
+
+        const replacementCharacter = makeCharacter(structuredClone(messages))
+        const { source: replacementSource } = makeViewportSource(replacementCharacter)
+        ;(mounted as HarnessInstance).setViewportNavigationGeneration(1)
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+
+        await vi.waitFor(() => expect(
+            probeIdForMessage(target, 'message-0'),
+        ).not.toBe(instance))
+        expect(editor.isConnected).toBe(false)
+        expect(media.isConnected).toBe(false)
+    })
+
     test('renders source rows and conversation count without reading a metadata-only shell body', async () => {
         const messages = [makeMessage(0), makeMessage(1), makeMessage(2)]
         const source = makePersistentViewportSource(messages)
@@ -988,6 +1172,9 @@ describe('Chats imperative mount lifecycle', () => {
                 height: 100,
             } as DOMRect)
         }
+        const anchorWrapper = target.querySelector<HTMLElement>(
+            '[data-chat-viewport-index="101"]',
+        )
 
         const replacementMessages = messages.map((entry, index) => ({
             ...entry,
@@ -1006,10 +1193,8 @@ describe('Chats imperative mount lifecycle', () => {
                 element.dataset.message === 'replacement-100' && element.dataset.index === '100'
             )),
         ).toBe(true))
-        expect(scrollParent.scrollBy).toHaveBeenCalledWith({
-            top: -120,
-            behavior: 'instant',
-        })
+        expect(target.querySelector('[data-chat-viewport-index="101"]')).toBe(anchorWrapper)
+        expect(scrollParent.scrollBy).not.toHaveBeenCalled()
     })
 
     test('does not remap a source anchor across different conversation owners', async () => {

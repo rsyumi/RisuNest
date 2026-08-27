@@ -146,6 +146,10 @@
         void viewportBindingRevision
         return selectedConversationViewport.source
     })
+    let conversationViewportNavigationGeneration = $derived.by(() => {
+        void viewportBindingRevision
+        return persistentRuntime.getNavigationGeneration()
+    })
     let currentChat = $derived.by(() => {
         void viewportBindingRevision
         if (conversationViewportSource) return undefined
@@ -1409,7 +1413,8 @@
                     : msg
                 )} {send} readLatestMessages={(signal) =>
                     readSelectedConversationLatestTail(persistentRuntime, 10, signal)
-                } writeSuggestions={writeSelectedConversationSuggestions}/>
+                } writeSuggestions={writeSelectedConversationSuggestions}
+                getNavigationGeneration={() => persistentRuntime.getNavigationGeneration()}/>
             {/if}
 
             {#if chatPanelStore.length > 0}
@@ -1447,6 +1452,7 @@
                 bind:this={chatsInstance}
                 messages={conversationViewportSource ? undefined : currentChat}
                 viewportSource={conversationViewportSource}
+                viewportNavigationGeneration={conversationViewportNavigationGeneration}
                 parserProjectionResolver={liveParserProjectionResolver}
                 selectedConversationOperations={conversationViewportSource
                     ? selectedConversationOperations

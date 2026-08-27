@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+    isAutoSuggestionRequestIdentityCurrent,
     readConversationSuggestions,
     writeConversationSuggestions,
 } from './autoSuggestionMetadata'
@@ -10,6 +11,21 @@ import { createMetadataOnlySelectedConversation } from './storage/selectedConver
 import type { character } from './storage/database.svelte'
 
 describe('auto suggestion metadata', () => {
+    it('rejects a same-conversation response after navigation leaves and returns', () => {
+        const request = {
+            characterIndex: 0,
+            chatPage: 0,
+            navigationGeneration: 4,
+        }
+
+        expect(isAutoSuggestionRequestIdentityCurrent(request, {
+            characterIndex: 0,
+            chatPage: 0,
+            navigationGeneration: 6,
+        })).toBe(false)
+        expect(isAutoSuggestionRequestIdentityCurrent(request, { ...request })).toBe(true)
+    })
+
     it('reads and updates suggestions on a metadata-only selected conversation', () => {
         const conversation = createMetadataOnlySelectedConversation({
             id: 'conversation-a',

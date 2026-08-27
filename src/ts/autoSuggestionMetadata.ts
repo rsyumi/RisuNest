@@ -6,6 +6,21 @@ import type { Chat, Database } from './storage/database.svelte'
 
 type ConversationOwner = Database['characters'][number]
 
+export interface AutoSuggestionRequestIdentity {
+    readonly characterIndex: number
+    readonly chatPage: number
+    readonly navigationGeneration: number
+}
+
+export function isAutoSuggestionRequestIdentityCurrent(
+    request: AutoSuggestionRequestIdentity,
+    current: AutoSuggestionRequestIdentity,
+): boolean {
+    return request.characterIndex === current.characterIndex
+        && request.chatPage === current.chatPage
+        && request.navigationGeneration === current.navigationGeneration
+}
+
 export function readConversationSuggestions(
     owner: ConversationOwner | undefined,
 ): string[] | undefined {

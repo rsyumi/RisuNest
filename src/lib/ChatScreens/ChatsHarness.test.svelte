@@ -9,11 +9,13 @@
         initialMessages,
         initialCharacter,
         initialViewportSource = null,
+        initialViewportNavigationGeneration = 0,
         parserProjectionResolver,
     }: {
         initialMessages?: Message[]
         initialCharacter: character
         initialViewportSource?: ConversationViewportSource | null
+        initialViewportNavigationGeneration?: number
         parserProjectionResolver?: LiveChatParserProjectionResolver
     } = $props()
 
@@ -21,11 +23,13 @@
     let currentCharacter = $state<character>(null as unknown as character)
     let chats = $state<ChatViewportHandle>()
     let viewportSource = $state<ConversationViewportSource | null>(null)
+    let viewportNavigationGeneration = $state(0)
     let hasNewUnreadMessage = $state(false)
     const initialize = () => {
         messages = initialMessages
         currentCharacter = initialCharacter
         viewportSource = initialViewportSource
+        viewportNavigationGeneration = initialViewportNavigationGeneration
     }
     initialize()
 
@@ -60,6 +64,10 @@
 
     export function setViewportSource(nextSource: ConversationViewportSource | null) {
         viewportSource = nextSource
+    }
+
+    export function setViewportNavigationGeneration(generation: number) {
+        viewportNavigationGeneration = generation
     }
 
     export function switchCharacter(character: character, nextMessages: Message[]) {
@@ -98,6 +106,7 @@
         bind:this={chats}
         {messages}
         {viewportSource}
+        {viewportNavigationGeneration}
         {parserProjectionResolver}
         {currentCharacter}
         onReroll={() => {}}

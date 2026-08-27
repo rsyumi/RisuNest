@@ -20,6 +20,7 @@ export const chatMountProbe = {
     mounts: [] as ChatProbeMount[],
     unmounts: [] as number[],
     streamingUpdates: [] as ChatProbeStreamingUpdate[],
+    throwNextMount: false,
 }
 
 export function resetChatMountProbe() {
@@ -27,4 +28,5 @@ export function resetChatMountProbe() {
     chatMountProbe.mounts = []
     chatMountProbe.unmounts = []
     chatMountProbe.streamingUpdates = []
+    chatMountProbe.throwNextMount = false
 }

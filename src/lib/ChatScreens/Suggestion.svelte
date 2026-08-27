@@ -14,6 +14,7 @@
     import DeferredMarkdown from "src/lib/UI/DeferredMarkdown.svelte";
     import {defaultAutoSuggestPrompt} from "../../ts/storage/defaultPrompts.js";
     import {
+        isAutoSuggestionRequestIdentityCurrent,
         readConversationSuggestions,
     } from "../../ts/autoSuggestionMetadata";
 
@@ -22,9 +23,16 @@
         messageInput: (string:string) => any;
         readLatestMessages: (signal?: AbortSignal) => Promise<Message[]>;
         writeSuggestions: (suggestions: readonly string[]) => Promise<boolean>;
+        getNavigationGeneration: () => number;
     }
 
-    let { send, messageInput, readLatestMessages, writeSuggestions }: Props = $props();
+    let {
+        send,
+        messageInput,
+        readLatestMessages,
+        writeSuggestions,
+        getNavigationGeneration,
+    }: Props = $props();
     let suggestMessages:string[] = $state(
         readConversationSuggestions(DBState.db.characters[$selectedCharID]),
     )
@@ -69,6 +77,11 @@
         }
 
         const requestId = suggestionRequestId + 1
+        const requestIdentity = {
+            characterIndex: requestCharId,
+            chatPage: requestChatPage,
+            navigationGeneration: getNavigationGeneration(),
+        }
         const requestController = isTauri ? undefined : new AbortController()
         suggestionRequestId = requestId
         abortController = requestController
@@ -77,8 +90,11 @@
         try {
             const lastMessages = await readLatestMessages(requestController?.signal)
             const stillCurrentTail = suggestionRequestId === requestId &&
-                $selectedCharID === requestCharId &&
-                DBState.db.characters[requestCharId]?.chatPage === requestChatPage
+                isAutoSuggestionRequestIdentityCurrent(requestIdentity, {
+                    characterIndex: $selectedCharID,
+                    chatPage: DBState.db.characters[$selectedCharID]?.chatPage ?? -1,
+                    navigationGeneration: getNavigationGeneration(),
+                })
             if (!stillCurrentTail || lastMessages.length === 0) return
             const prompt = DBState.db.autoSuggestPrompt && DBState.db.autoSuggestPrompt.length > 0 ? DBState.db.autoSuggestPrompt : defaultAutoSuggestPrompt
             let promptbody:OpenAIChat[] = [
@@ -110,7 +126,12 @@
                 bias: {},
                 currentChar : currentChar as character
             }, 'submodel', requestController?.signal ?? null)
-            const stillCurrentRequest = suggestionRequestId === requestId && $selectedCharID === requestCharId && DBState.db.characters[requestCharId]?.chatPage === requestChatPage
+            const stillCurrentRequest = suggestionRequestId === requestId &&
+                isAutoSuggestionRequestIdentityCurrent(requestIdentity, {
+                    characterIndex: $selectedCharID,
+                    chatPage: DBState.db.characters[$selectedCharID]?.chatPage ?? -1,
+                    navigationGeneration: getNavigationGeneration(),
+                })
             if(rq2.type !== 'fail' && rq2.type !== 'streaming' && rq2.type !== 'multiline' && progress && stillCurrentRequest){
                 var suggestMessagesNew = rq2.result.split('\n').filter(msg => msg.startsWith('-')).map(msg => msg.replace('-','').trim())
                 if (await writeSuggestions(suggestMessagesNew)) {
