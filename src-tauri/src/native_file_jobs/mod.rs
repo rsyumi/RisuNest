@@ -145,6 +145,7 @@ pub(crate) struct NativeFileJobStarted {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PreparedContentFormat {
     JsonCard,
+    PngCard,
     CharxCard,
     AppendedCharxJpeg,
 }
@@ -2487,6 +2488,7 @@ pub(crate) mod restore;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use std::fs;
     use std::io::{Cursor, Write};
@@ -2648,6 +2650,57 @@ mod tests {
         let mut output = appended_jpeg_prefix.unwrap_or(&[]).to_vec();
         output.extend_from_slice(&archive.finish().unwrap().into_inner());
         output
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(data.len() + 12);
+        chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(data);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(data);
+        chunk.extend_from_slice(&crc.finalize().to_be_bytes());
+        chunk
+    }
+
+    fn png_text_chunk(keyword: &str, value: &str) -> Vec<u8> {
+        let mut data = keyword.as_bytes().to_vec();
+        data.push(0);
+        data.extend_from_slice(value.as_bytes());
+        png_chunk(b"tEXt", &data)
+    }
+
+    fn png_card_fixture(
+        chara_json: &str,
+        ccv3_json: &str,
+        embedded_assets: &[(&str, &[u8])],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let signature = b"\x89PNG\r\n\x1a\n";
+        let ihdr = png_chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        let preserved_text = png_text_chunk("comment", "preserved");
+        let idat = png_chunk(b"IDAT", &[]);
+        let iend = png_chunk(b"IEND", &[]);
+        let mut source = signature.to_vec();
+        source.extend_from_slice(&ihdr);
+        source.extend_from_slice(&png_text_chunk("chara", &STANDARD.encode(chara_json)));
+        source.extend_from_slice(&png_text_chunk("ccv3", &STANDARD.encode(ccv3_json)));
+        source.extend_from_slice(&preserved_text);
+        for (reference, bytes) in embedded_assets {
+            source.extend_from_slice(&png_text_chunk(
+                &format!("chara-ext-asset_:{reference}"),
+                &STANDARD.encode(bytes),
+            ));
+        }
+        source.extend_from_slice(&idat);
+        source.extend_from_slice(&iend);
+
+        let mut base = signature.to_vec();
+        base.extend_from_slice(&ihdr);
+        base.extend_from_slice(&preserved_text);
+        base.extend_from_slice(&idat);
+        base.extend_from_slice(&iend);
+        (source, base)
     }
 
     fn wait_for_content_job(state: &NativeFileJobState, job_id: &str) -> JobStatus {
@@ -3350,6 +3403,154 @@ mod tests {
             .join("native-file-jobs/jobs")
             .join(&started.job_id)
             .exists());
+    }
+
+    #[test]
+    fn content_prepare_png_preserves_encoded_metadata_and_promotes_exact_assets() {
+        let directory = TempDir::new().unwrap();
+        let chara = r#"{"spec":"chara_card_v2","data":{"name":"stale"}}"#;
+        let ccv3 = r#"{"spec":"chara_card_v3","data":{"name":"PNG fixture"}}"#;
+        let portrait_collision: &[u8] = b"embedded portrait token";
+        let second: &[u8] = b"opaque ordinary asset";
+        let (source_bytes, expected_base) = png_card_fixture(
+            chara,
+            ccv3,
+            &[
+                ("native-png-portrait", portrait_collision),
+                ("007", second),
+                ("007", second),
+            ],
+        );
+        let source = directory.path().join("prepared.PNG");
+        fs::write(&source, source_bytes).unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "prepared.PNG");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Succeeded);
+        let content = prepared
+            .prepared_content
+            .as_ref()
+            .expect("prepared PNG content");
+        assert_eq!(content.format, PreparedContentFormat::PngCard);
+        assert_eq!(content.cas_session_id, started.job_id);
+        assert_eq!(
+            content.metadata,
+            json!({ "chara": STANDARD.encode(chara), "ccv3": STANDARD.encode(ccv3) })
+        );
+        assert_eq!(content.assets.len(), 3);
+
+        let portrait = &content.assets[0];
+        assert_eq!(portrait.token, "native-png-portrait-1");
+        assert_eq!(portrait.reference_key, portrait.token);
+        assert_eq!(portrait.mime, "image/png");
+        assert_eq!(portrait.ext, "png");
+        assert_eq!(portrait.name, format!("{}.png", portrait.object_hash));
+        assert_eq!(
+            content.portrait_logical_id.as_deref(),
+            Some(portrait.logical_id.as_str())
+        );
+
+        let collision = &content.assets[1];
+        assert_eq!(collision.token, "native-png-portrait");
+        assert_eq!(collision.reference_key, collision.token);
+        assert_eq!(collision.mime, "");
+        assert_eq!(collision.ext, "png");
+        assert_eq!(collision.name, format!("{}.png", collision.object_hash));
+
+        let numbered = &content.assets[2];
+        assert_eq!(numbered.token, "007");
+        assert_eq!(numbered.reference_key, numbered.token);
+        assert_eq!(numbered.mime, "");
+        assert_eq!(numbered.ext, "png");
+        assert_eq!(numbered.name, format!("{}.png", numbered.object_hash));
+
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert_eq!(
+            cas.read_object(&portrait.object_hash).unwrap(),
+            Some(expected_base)
+        );
+        assert_eq!(
+            cas.read_object(&collision.object_hash).unwrap(),
+            Some(portrait_collision.to_vec())
+        );
+        assert_eq!(
+            cas.read_object(&numbered.object_hash).unwrap(),
+            Some(second.to_vec())
+        );
+        let session = crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .expect("prepared PNG keeps its durable CAS session");
+        assert_eq!(session.pin_count(), 0);
+        assert!(!session.is_sealed());
+        assert!(!session.is_released());
+    }
+
+    #[test]
+    fn content_prepare_png_conflicting_duplicate_aborts_its_durable_cas_session() {
+        let directory = TempDir::new().unwrap();
+        let card = r#"{"spec":"chara_card_v3","data":{"name":"PNG fixture"}}"#;
+        let (source_bytes, _) = png_card_fixture(
+            card,
+            card,
+            &[("duplicate", b"first"), ("duplicate", b"second")],
+        );
+        let source = directory.path().join("conflicting.png");
+        fs::write(&source, source_bytes).unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "conflicting.png");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Failed);
+        assert_eq!(
+            prepared.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid-input")
+        );
+        assert!(prepared.prepared_content.is_none());
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn content_prepare_png_empty_asset_reference_aborts_before_publication() {
+        let directory = TempDir::new().unwrap();
+        let card = r#"{"spec":"chara_card_v3","data":{"name":"PNG fixture"}}"#;
+        let (source_bytes, expected_base) = png_card_fixture(card, card, &[("", b"payload")]);
+        let source = directory.path().join("empty-reference.png");
+        fs::write(&source, source_bytes).unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "empty-reference.png");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Failed);
+        assert_eq!(
+            prepared.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid-input")
+        );
+        assert!(prepared.prepared_content.is_none());
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .is_err());
+        use sha2::{Digest as _, Sha256};
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert!(cas
+            .stat_object(&hex::encode(Sha256::digest(expected_base)))
+            .unwrap()
+            .is_none());
+        assert!(cas
+            .stat_object(&hex::encode(Sha256::digest(b"payload")))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

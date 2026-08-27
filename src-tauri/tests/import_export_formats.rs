@@ -718,6 +718,33 @@ fn extension_routing_is_case_insensitive_but_content_sniffing_is_authoritative()
 }
 
 #[test]
+fn png_signature_classification_is_content_authoritative() {
+    let png = b"\x89PNG\r\n\x1a\n";
+
+    assert_eq!(
+        classify_content("CARD.PnG", &mut Cursor::new(png), &limits(), &|| false).unwrap(),
+        ContentKind::PngCard
+    );
+    assert_eq!(
+        classify_content("misleading.JSON", &mut Cursor::new(png), &limits(), &|| {
+            false
+        })
+        .unwrap(),
+        ContentKind::PngCard
+    );
+    assert_eq!(
+        classify_content(
+            "not-a-png.png",
+            &mut Cursor::new(b"unknown"),
+            &limits(),
+            &|| false
+        )
+        .unwrap(),
+        ContentKind::Unknown
+    );
+}
+
+#[test]
 fn content_sniffing_fills_its_prefix_across_short_reads() {
     let module = risum(
         &json!({"type":"risuModule","module":{"assets":[]}}),

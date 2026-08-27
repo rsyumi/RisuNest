@@ -9,6 +9,9 @@ use super::{
 };
 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
 use crate::asset_repository::{PayloadCas, PreparedPayload};
+use crate::import_export_jobs::png_card::{
+    parse_png_card, PngCardError, PngCardLimits, PngCardParseResult, StagedPngPayload,
+};
 use crate::import_export_jobs::{
     classify_content, parse_json_card, parse_risum, ContentKind, FormatError, FormatErrorKind,
     ImportLimits, JobStaging, JsonCardPayload, ParsedJsonCard,
@@ -185,7 +188,10 @@ pub(super) fn prepare_content(
     .map_err(native_format_error)?;
     let supported = matches!(
         kind,
-        ContentKind::JsonCard | ContentKind::CharxCard | ContentKind::AppendedCharxJpeg
+        ContentKind::JsonCard
+            | ContentKind::PngCard
+            | ContentKind::CharxCard
+            | ContentKind::AppendedCharxJpeg
     );
     if !supported {
         return match kind {
@@ -195,7 +201,7 @@ pub(super) fn prepare_content(
             )),
             ContentKind::RisuModule | ContentKind::Unknown => Err(NativeJobError::new(
                 "invalid-input",
-                "content preparation accepts Character Card v3 JSON and CharX cards only",
+                "content preparation accepts JSON, PNG, and CharX character cards only",
             )),
             _ => unreachable!("supported content kinds were handled above"),
         };
@@ -213,6 +219,7 @@ pub(super) fn prepare_content(
             &cas,
             job,
         ),
+        ContentKind::PngCard => prepare_png_content(&mut source, owned_directory, &cas, job),
         ContentKind::CharxCard | ContentKind::AppendedCharxJpeg => {
             let spool_path = owned_directory.join("source.charx");
             spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested()).and_then(
@@ -241,6 +248,143 @@ pub(super) fn prepare_content(
     }
     prepared.cas_session_id = job.id();
     Ok(prepared)
+}
+
+fn prepare_png_content(
+    source: &mut OpenedJobSource,
+    owned_directory: &Path,
+    cas: &PayloadCas,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    source
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    let parsed = parse_png_card(
+        &mut source.file,
+        owned_directory,
+        PngCardLimits::default(),
+        || job.is_cancel_requested(),
+    )
+    .map_err(native_png_error)?;
+    let PngCardParseResult {
+        chara,
+        ccv3,
+        base_image,
+        embedded_assets,
+    } = parsed;
+    validate_png_asset_references(&embedded_assets)?;
+
+    let embedded_tokens = embedded_assets
+        .iter()
+        .filter_map(|payload| payload.asset_reference.as_deref())
+        .collect::<HashSet<_>>();
+    let portrait_token = collision_safe_png_portrait_token(&embedded_tokens);
+    let portrait = promote_png_payload(
+        &base_image,
+        owned_directory,
+        &portrait_token,
+        "image/png",
+        cas,
+        job,
+    )?;
+    let portrait_logical_id = portrait.logical_id.clone();
+    let mut assets = Vec::with_capacity(embedded_assets.len() + 1);
+    assets.push(portrait);
+    for payload in embedded_assets {
+        let reference = payload
+            .asset_reference
+            .as_deref()
+            .expect("PNG asset references were validated before promotion");
+        assets.push(promote_png_payload(
+            &payload,
+            owned_directory,
+            reference,
+            "",
+            cas,
+            job,
+        )?);
+    }
+
+    let mut metadata = serde_json::Map::new();
+    if let Some(chara) = chara {
+        metadata.insert("chara".to_owned(), Value::String(chara));
+    }
+    if let Some(ccv3) = ccv3 {
+        metadata.insert("ccv3".to_owned(), Value::String(ccv3));
+    }
+    Ok(PreparedContent {
+        format: PreparedContentFormat::PngCard,
+        metadata: Value::Object(metadata),
+        assets,
+        cas_session_id: String::new(),
+        portrait_logical_id: Some(portrait_logical_id),
+        module: None,
+    })
+}
+
+fn validate_png_asset_references(
+    embedded_assets: &[StagedPngPayload],
+) -> Result<(), NativeJobError> {
+    if embedded_assets
+        .iter()
+        .any(|payload| payload.asset_reference.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "PNG embedded asset reference must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn collision_safe_png_portrait_token(embedded_tokens: &HashSet<&str>) -> String {
+    const BASE: &str = "native-png-portrait";
+    if !embedded_tokens.contains(BASE) {
+        return BASE.to_owned();
+    }
+    for suffix in 1_u64.. {
+        let candidate = format!("{BASE}-{suffix}");
+        if !embedded_tokens.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("the finite PNG asset set cannot exhaust portrait tokens")
+}
+
+fn promote_png_payload(
+    payload: &StagedPngPayload,
+    owned_directory: &Path,
+    token: &str,
+    mime: &str,
+    cas: &PayloadCas,
+    job: &JobControl,
+) -> Result<PreparedContentAsset, NativeJobError> {
+    let staged = StagedPayloadDescriptor {
+        original_name: payload.staged_id.clone(),
+        normalized_name: payload.staged_id.clone(),
+        extension: Some("png".to_owned()),
+        normalized_extension: Some("png".to_owned()),
+        mime_type: mime.to_owned(),
+        decoded_size: payload.byte_size,
+        compressed_size: payload.byte_size,
+        crc32: 0,
+        sha256: payload.sha256.clone(),
+        staged_path: owned_directory.join(&payload.staged_id),
+        card_asset_types: Vec::new(),
+    };
+    let promoted = promote_staged_payload(cas, &staged, job)?;
+    let object_hash = promoted.content_hash;
+    Ok(PreparedContentAsset {
+        reference_key: token.to_owned(),
+        token: token.to_owned(),
+        logical_id: format!("assets/{object_hash}.png"),
+        name: format!("{object_hash}.png"),
+        object_hash,
+        byte_size: promoted.byte_size,
+        mime: mime.to_owned(),
+        ext: "png".to_owned(),
+    })
 }
 
 fn prepare_json_content(
@@ -707,6 +851,16 @@ fn native_charx_error(error: CharXParseError) -> NativeJobError {
         CharXParseErrorCode::Cancelled => "cancelled",
         CharXParseErrorCode::Io => "invalid-source",
         _ => "invalid-input",
+    };
+    NativeJobError::new(code, error.to_string())
+}
+
+fn native_png_error(error: PngCardError) -> NativeJobError {
+    let code = match error {
+        PngCardError::Cancelled => "cancelled",
+        PngCardError::Io(_) => "invalid-source",
+        PngCardError::Invalid(_) => "invalid-input",
+        PngCardError::LimitExceeded(_) => "native-limit",
     };
     NativeJobError::new(code, error.to_string())
 }

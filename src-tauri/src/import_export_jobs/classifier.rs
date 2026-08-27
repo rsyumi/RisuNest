@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::io::{self, Read, Seek, SeekFrom};
 
 const SNIFF_PREFIX_BYTES: usize = 16;
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const ZIP_PREFLIGHT_READ_BYTES: usize = 64 * 1024;
 const ZIP_COMMENT_MAX_BYTES: usize = u16::MAX as usize;
 const ZIP_EOCD_BYTES: usize = 22;
@@ -19,6 +20,7 @@ const ZIP_CENTRAL_ENTRY_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
 pub enum ContentKind {
     RisuModule,
     JsonCard,
+    PngCard,
     CharxCard,
     AppendedCharxJpeg,
     JpegAsset,
@@ -57,6 +59,9 @@ pub fn classify_content(
     }
     if prefix.starts_with(&[111, 0]) {
         return Ok(ContentKind::RisuModule);
+    }
+    if prefix.starts_with(PNG_SIGNATURE) {
+        return Ok(ContentKind::PngCard);
     }
     if looks_like_json(prefix) {
         return Ok(ContentKind::JsonCard);
