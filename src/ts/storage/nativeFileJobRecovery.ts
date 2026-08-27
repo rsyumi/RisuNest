@@ -73,6 +73,7 @@ async function reconcileExportInBackground(
     dependencies: NativeFileJobRecoveryDependencies,
 ): Promise<void> {
     let status = initial
+    let retainNativeJob = false
     while (!isTerminal(status)) {
         await dependencies.wait(100)
         status = await dependencies.invoke('native_file_job_status', {
@@ -92,15 +93,19 @@ async function reconcileExportInBackground(
         }
         else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
             const handoffId = characterCharxHandoffId(status.result.handoffPath)
-            if (!handoffId || dependencies.androidSafExportId?.() !== handoffId) {
-                await dependencies.invoke('native_character_charx_handoff_cleanup', {
-                    path: status.result.handoffPath,
-                })
+            if (handoffId && dependencies.androidSafExportId?.() === handoffId) {
+                retainNativeJob = true
+                return
             }
+            await dependencies.invoke('native_character_charx_handoff_cleanup', {
+                path: status.result.handoffPath,
+            })
         }
     }
     finally {
-        await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
+        if (!retainNativeJob) {
+            await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
+        }
     }
 }
 

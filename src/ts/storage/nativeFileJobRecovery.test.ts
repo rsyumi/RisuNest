@@ -336,6 +336,7 @@ describe('native file job bootstrap reconciliation', () => {
         const calls: string[] = []
         const exportId = '123e4567-e89b-42d3-a456-426614174004'
         const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\risu-charx-${exportId}.charx`
+        const androidSafExportId = vi.fn(() => exportId)
         const dependencies = {
             invoke: vi.fn(async (command: string) => {
                 calls.push(command)
@@ -351,12 +352,50 @@ describe('native file job bootstrap reconciliation', () => {
                 throw new Error(`Unexpected command: ${command}`)
             }),
             wait: vi.fn(async () => undefined),
-            androidSafExportId: () => exportId,
+            androidSafExportId,
         }
 
         await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
         await vi.waitFor(() => {
-            expect(calls).toEqual(['native_file_job_list', 'native_file_job_forget'])
+            expect(androidSafExportId).toHaveBeenCalledOnce()
+        })
+        expect(calls).toEqual(['native_file_job_list'])
+    })
+
+    it('cleans and forgets a character CharX handoff after Android SAF becomes terminal', async () => {
+        const calls: string[] = []
+        const exportId = '123e4567-e89b-42d3-a456-426614174004'
+        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\risu-charx-${exportId}.charx`
+        const dependencies = {
+            invoke: vi.fn(async (command: string) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('charx-export', 'succeeded', 'complete'),
+                    kind: 'export-character-charx' as const,
+                    result: {
+                        ...restoreStatus('charx-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }]
+                if (command === 'native_character_charx_handoff_cleanup') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+            androidSafExportId: () => getAndroidSafExportSourceId({
+                copyExport: vi.fn(),
+                getExportSourceId: () => exportId,
+                getExportStatus: () => JSON.stringify({ state: 'succeeded' }),
+            }),
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        await vi.waitFor(() => {
+            expect(calls).toEqual([
+                'native_file_job_list',
+                'native_character_charx_handoff_cleanup',
+                'native_file_job_forget',
+            ])
         })
     })
 
