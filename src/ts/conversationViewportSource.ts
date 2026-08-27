@@ -9,6 +9,13 @@ import {
     type ActiveConversationSession,
 } from './storage/activeConversationSession'
 import type { Message } from './storage/database.svelte'
+import type {
+    ConversationWindow,
+    ConversationWindowQuery,
+    DataRevision,
+    Versioned,
+} from './storage/persistentDataStore'
+import { validateConversationWindowQuery } from './storage/persistentDataStore'
 
 declare const conversationViewportKeyBrand: unique symbol
 
@@ -66,6 +73,21 @@ export interface ConversationViewportSource {
 export interface SynchronousSessionConversationViewportSourceOptions {
     session: ActiveConversationSession
     captureCurrent(): CurrentChatMessageTarget | null
+}
+
+export interface PersistentConversationWindowReader {
+    readConversationWindow(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationWindow> | null>
+}
+
+export interface PersistentConversationViewportSourceOptions {
+    reader: PersistentConversationWindowReader
+    characterId: string
+    conversationId: string
+    revision: DataRevision
+    totalMessages: number
+    rowBudget: number
 }
 
 let nextSourceToken = 0
@@ -293,5 +315,287 @@ implements ConversationViewportSource {
         if (this.disposed || !this.session.isActive) {
             throw new Error('Conversation viewport source is disposed')
         }
+    }
+}
+
+interface PersistentCachedRow {
+    row: ConversationViewportRow
+    lastUsed: number
+}
+
+interface PersistentRangePinState {
+    startIndex: number
+    endIndex: number
+    reason: ConversationViewportPinReason
+}
+
+export class PersistentConversationViewportSource
+implements ConversationViewportSource {
+    readonly sourceToken = createSourceToken()
+
+    private readonly reader: PersistentConversationWindowReader
+    private readonly characterId: string
+    private readonly conversationId: string
+    private readonly rowBudget: number
+    private readonly listeners = new Set<() => void>()
+    private readonly pins = new Map<number, PersistentRangePinState>()
+    private rows = new Map<number, PersistentCachedRow>()
+    private currentRevision: DataRevision
+    private totalMessages: number
+    private epoch = 0
+    private accessClock = 0
+    private nextPinId = 0
+    private disposed = false
+
+    constructor(options: PersistentConversationViewportSourceOptions) {
+        if (typeof options.characterId !== 'string' || options.characterId.length === 0) {
+            throw new RangeError('Character ID must be a nonempty string')
+        }
+        if (typeof options.conversationId !== 'string' || options.conversationId.length === 0) {
+            throw new RangeError('Conversation ID must be a nonempty string')
+        }
+        this.validateRevision(options.revision)
+        this.validateMessageCount(options.totalMessages)
+        if (!Number.isSafeInteger(options.rowBudget) || options.rowBudget <= 0) {
+            throw new RangeError('Conversation viewport row budget must be a positive safe integer')
+        }
+        this.reader = options.reader
+        this.characterId = options.characterId
+        this.conversationId = options.conversationId
+        this.currentRevision = options.revision
+        this.totalMessages = options.totalMessages
+        this.rowBudget = options.rowBudget
+    }
+
+    snapshot(): ConversationViewportSnapshot {
+        const epoch = this.epoch
+        const totalMessages = this.disposed ? 0 : this.totalMessages
+        return {
+            sourceToken: this.sourceToken,
+            version: epoch,
+            totalMessages,
+            keyAt: (absoluteIndex) => this.keyAt(epoch, totalMessages, absoluteIndex),
+            indexOfKey: (key) => this.indexOfKey(epoch, totalMessages, key),
+            rowAt: (absoluteIndex) => this.rowAt(epoch, absoluteIndex),
+        }
+    }
+
+    async ensureRange(input: ConversationViewportRangeRequest): Promise<void> {
+        this.assertUsable()
+        if (input.signal?.aborted) return
+        const query = {
+            characterId: this.characterId,
+            conversationId: this.conversationId,
+            startIndex: input.startIndex,
+            limit: input.limit,
+        }
+        validateConversationWindowQuery(query)
+        const epoch = this.epoch
+        const revision = this.currentRevision
+        const result = await this.reader.readConversationWindow(query)
+        if (
+            input.signal?.aborted ||
+            this.disposed ||
+            epoch !== this.epoch ||
+            revision !== this.currentRevision
+        ) return
+        if (!result) throw new Error(`Conversation ${this.conversationId} was not found`)
+        if (result.revision !== revision) return
+        const window = result.value
+        const expectedStartIndex = Math.min(this.totalMessages, input.startIndex)
+        const expectedEndIndex = Math.min(
+            this.totalMessages,
+            expectedStartIndex + input.limit,
+        )
+        if (
+            window.characterId !== this.characterId ||
+            window.conversationId !== this.conversationId ||
+            window.startIndex !== expectedStartIndex ||
+            window.endIndex !== expectedEndIndex ||
+            window.totalMessages !== this.totalMessages ||
+            window.messages.length !== expectedEndIndex - expectedStartIndex
+        ) {
+            throw new Error(`Conversation ${this.conversationId} returned a mismatched window`)
+        }
+        for (let offset = 0; offset < window.messages.length; offset++) {
+            const absoluteIndex = window.startIndex + offset
+            const key = this.keyAt(epoch, this.totalMessages, absoluteIndex)
+            if (key === undefined) continue
+            this.rows.set(absoluteIndex, {
+                row: {
+                    key,
+                    absoluteIndex,
+                    message: window.messages[offset],
+                    sourceVersion: epoch,
+                },
+                lastUsed: ++this.accessClock,
+            })
+        }
+        this.evictUnpinnedRows()
+        this.notifyListeners()
+    }
+
+    advanceRevision(revision: DataRevision, totalMessages: number): void {
+        this.assertUsable()
+        this.validateRevision(revision)
+        this.validateMessageCount(totalMessages)
+        if (revision <= this.currentRevision) {
+            throw new RangeError('Persistent conversation revision must advance')
+        }
+        this.currentRevision = revision
+        this.totalMessages = totalMessages
+        this.epoch += 1
+        this.pins.clear()
+        this.rows = new Map()
+        this.notifyListeners()
+    }
+
+    acquireRangePin(
+        startIndex: number,
+        endIndex: number,
+        reason: ConversationViewportPinReason,
+    ): ConversationViewportPin {
+        this.assertUsable()
+        this.validatePinRange(startIndex, endIndex)
+        const pinId = ++this.nextPinId
+        this.pins.set(pinId, { startIndex, endIndex, reason })
+        let released = false
+        return {
+            release: () => {
+                if (released) return
+                released = true
+                this.pins.delete(pinId)
+                if (!this.disposed && this.evictUnpinnedRows()) {
+                    this.notifyListeners()
+                }
+            },
+        }
+    }
+
+    subscribe(listener: () => void): () => void {
+        this.assertUsable()
+        this.listeners.add(listener)
+        let subscribed = true
+        return () => {
+            if (!subscribed) return
+            subscribed = false
+            this.listeners.delete(listener)
+        }
+    }
+
+    captureMessageTarget(_key: ConversationViewportKey): CapturedChatMessageTarget | null {
+        return null
+    }
+
+    dispose(): void {
+        if (this.disposed) return
+        this.disposed = true
+        this.pins.clear()
+        this.rows.clear()
+        this.notifyListeners()
+        this.listeners.clear()
+    }
+
+    private keyAt(
+        epoch: number,
+        totalMessages: number,
+        absoluteIndex: number,
+    ): ConversationViewportKey | undefined {
+        if (
+            this.disposed ||
+            epoch !== this.epoch ||
+            !Number.isSafeInteger(absoluteIndex) ||
+            absoluteIndex < 0 ||
+            absoluteIndex >= totalMessages
+        ) return undefined
+        return `${this.sourceToken}|${epoch}|${absoluteIndex}` as ConversationViewportKey
+    }
+
+    private indexOfKey(
+        epoch: number,
+        totalMessages: number,
+        key: ConversationViewportKey,
+    ): number {
+        if (this.disposed || epoch !== this.epoch || typeof key !== 'string') return -1
+        const prefix = `${this.sourceToken}|${epoch}|`
+        if (!key.startsWith(prefix)) return -1
+        const encodedIndex = key.slice(prefix.length)
+        if (!/^(?:0|[1-9]\d*)$/.test(encodedIndex)) return -1
+        const absoluteIndex = Number(encodedIndex)
+        if (!Number.isSafeInteger(absoluteIndex) || absoluteIndex >= totalMessages) return -1
+        return absoluteIndex
+    }
+
+    private rowAt(epoch: number, absoluteIndex: number): ConversationViewportRow | undefined {
+        if (this.disposed || epoch !== this.epoch) return undefined
+        const cached = this.rows.get(absoluteIndex)
+        if (!cached) return undefined
+        cached.lastUsed = ++this.accessClock
+        return cached.row
+    }
+
+    private notifyListeners(): void {
+        for (const listener of [...this.listeners]) {
+            try {
+                listener()
+            } catch (error) {
+                console.error('Conversation viewport subscriber failed', error)
+            }
+        }
+    }
+
+    private evictUnpinnedRows(): boolean {
+        let evicted = false
+        while (this.rows.size > this.rowBudget) {
+            let oldestIndex: number | undefined
+            let oldestAccess = Number.POSITIVE_INFINITY
+            for (const [absoluteIndex, cached] of this.rows) {
+                if (this.isPinned(absoluteIndex) || cached.lastUsed >= oldestAccess) continue
+                oldestIndex = absoluteIndex
+                oldestAccess = cached.lastUsed
+            }
+            if (oldestIndex === undefined) return evicted
+            this.rows.delete(oldestIndex)
+            evicted = true
+        }
+        return evicted
+    }
+
+    private isPinned(absoluteIndex: number): boolean {
+        for (const pin of this.pins.values()) {
+            if (absoluteIndex >= pin.startIndex && absoluteIndex < pin.endIndex) return true
+        }
+        return false
+    }
+
+    private validatePinRange(startIndex: number, endIndex: number): void {
+        if (!Number.isSafeInteger(startIndex) || startIndex < 0) {
+            throw new RangeError('Conversation pin startIndex must be a nonnegative safe integer')
+        }
+        if (!Number.isSafeInteger(endIndex) || endIndex < 0) {
+            throw new RangeError('Conversation pin endIndex must be a nonnegative safe integer')
+        }
+        if (endIndex <= startIndex) {
+            throw new RangeError('Conversation pin range must not be empty')
+        }
+        if (endIndex > this.totalMessages) {
+            throw new RangeError('Conversation pin range exceeds the current message count')
+        }
+    }
+
+    private validateRevision(revision: DataRevision): void {
+        if (!Number.isSafeInteger(revision) || revision < 0) {
+            throw new RangeError('Persistent conversation revision must be a nonnegative safe integer')
+        }
+    }
+
+    private validateMessageCount(totalMessages: number): void {
+        if (!Number.isSafeInteger(totalMessages) || totalMessages < 0) {
+            throw new RangeError('Persistent conversation message count must be a nonnegative safe integer')
+        }
+    }
+
+    private assertUsable(): void {
+        if (this.disposed) throw new Error('Conversation viewport source is disposed')
     }
 }

@@ -1,14 +1,48 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+    PersistentConversationViewportSource,
     SynchronousSessionConversationViewportSource,
     type ConversationViewportKey,
     type ConversationViewportSource,
 } from './conversationViewportSource'
 import { ActiveConversationSession } from './storage/activeConversationSession'
 import type { Chat, Message, character } from './storage/database.svelte'
+import type {
+    ConversationWindowQuery,
+    Versioned,
+    ConversationWindow,
+} from './storage/persistentDataStore'
 
 function message(chatId: string | undefined, data: string): Message {
     return { role: 'char', data, ...(chatId === undefined ? {} : { chatId }) }
+}
+
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((resolvePromise) => {
+        resolve = resolvePromise
+    })
+    return { promise, resolve }
+}
+
+function persistentWindow(
+    startIndex: number,
+    messages: Message[],
+    totalMessages: number,
+    overrides: Partial<ConversationWindow> = {},
+): ConversationWindow {
+    const endIndex = startIndex + messages.length
+    return {
+        characterId: 'character-a',
+        conversationId: 'conversation-a',
+        messages,
+        startIndex,
+        endIndex,
+        totalMessages,
+        hasMoreBefore: startIndex > 0,
+        hasMoreAfter: endIndex < totalMessages,
+        ...overrides,
+    }
 }
 
 function harness(messages: Message[]) {
@@ -272,5 +306,339 @@ describe('SynchronousSessionConversationViewportSource', () => {
 
         session.delete(session.locate(1))
         expect(source.captureMessageTarget(key)).toBeNull()
+    })
+})
+
+describe('PersistentConversationViewportSource', () => {
+    it('derives owned keys in constant space and loads an exact persistent window', async () => {
+        const readConversationWindow = vi.fn(
+            async (input: ConversationWindowQuery): Promise<Versioned<ConversationWindow>> => ({
+                revision: 7,
+                value: {
+                    characterId: input.characterId,
+                    conversationId: input.conversationId,
+                    messages: [message('message-999999998', 'loaded')],
+                    startIndex: 999_999_998,
+                    endIndex: 999_999_999,
+                    totalMessages: 1_000_000_000,
+                    hasMoreBefore: true,
+                    hasMoreAfter: true,
+                },
+            }),
+        )
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow },
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 1_000_000_000,
+            rowBudget: 8,
+        })
+        const before = source.snapshot()
+        const key = before.keyAt(999_999_998)!
+
+        expect(before.indexOfKey(key)).toBe(999_999_998)
+        expect(before.indexOfKey(`${key}x` as ConversationViewportKey)).toBe(-1)
+        expect(before.keyAt(1_000_000_000)).toBeUndefined()
+
+        await source.ensureRange({
+            startIndex: 999_999_998,
+            limit: 1,
+            reason: 'viewport',
+        })
+
+        expect(readConversationWindow).toHaveBeenCalledWith({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            startIndex: 999_999_998,
+            limit: 1,
+        })
+        expect(source.snapshot().rowAt(999_999_998)).toMatchObject({
+            key,
+            absoluteIndex: 999_999_998,
+            message: { data: 'loaded' },
+            sourceVersion: 0,
+        })
+        expect(source.captureMessageTarget(key)).toBeNull()
+    })
+
+    it('rejects structurally mismatched windows and discards another revision', async () => {
+        const mismatches: Array<[string, Partial<ConversationWindow>]> = [
+            ['character', { characterId: 'character-b' }],
+            ['conversation', { conversationId: 'conversation-b' }],
+            ['start', { startIndex: 1 }],
+            ['end', { endIndex: 2 }],
+            ['total', { totalMessages: 4 }],
+            ['message count', { messages: [] }],
+        ]
+
+        for (const [label, overrides] of mismatches) {
+            const source = new PersistentConversationViewportSource({
+                reader: {
+                    readConversationWindow: async () => ({
+                        revision: 7,
+                        value: persistentWindow(0, [message('zero', 'zero')], 3, overrides),
+                    }),
+                },
+                characterId: 'character-a',
+                conversationId: 'conversation-a',
+                revision: 7,
+                totalMessages: 3,
+                rowBudget: 2,
+            })
+
+            await expect(source.ensureRange({
+                startIndex: 0,
+                limit: 1,
+                reason: 'viewport',
+            }), label).rejects.toThrow(/mismatched window/)
+            expect(source.snapshot().rowAt(0)).toBeUndefined()
+        }
+
+        const listener = vi.fn()
+        const staleRevisionSource = new PersistentConversationViewportSource({
+            reader: {
+                readConversationWindow: async () => ({
+                    revision: 8,
+                    value: persistentWindow(0, [message('zero', 'zero')], 3),
+                }),
+            },
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 3,
+            rowBudget: 2,
+        })
+        staleRevisionSource.subscribe(listener)
+
+        await staleRevisionSource.ensureRange({
+            startIndex: 0,
+            limit: 1,
+            reason: 'viewport',
+        })
+
+        expect(staleRevisionSource.snapshot().rowAt(0)).toBeUndefined()
+        expect(listener).not.toHaveBeenCalled()
+
+        const missingSource = new PersistentConversationViewportSource({
+            reader: { readConversationWindow: async () => null },
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 3,
+            rowBudget: 2,
+        })
+        await expect(missingSource.ensureRange({
+            startIndex: 0,
+            limit: 1,
+            reason: 'viewport',
+        })).rejects.toThrow(/was not found/)
+    })
+
+    it('advances its epoch and discards pending old-epoch, aborted, and disposed reads', async () => {
+        const pending = deferred<Versioned<ConversationWindow> | null>()
+        const readConversationWindow = vi.fn(() => pending.promise)
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow },
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 3,
+            rowBudget: 2,
+        })
+        const listener = vi.fn()
+        source.subscribe(listener)
+        const oldKey = source.snapshot().keyAt(0)!
+        const stale = source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+
+        source.advanceRevision(8, 4)
+        pending.resolve({
+            revision: 7,
+            value: persistentWindow(0, [message('zero', 'stale')], 3),
+        })
+        await stale
+
+        const advanced = source.snapshot()
+        expect(advanced).toMatchObject({ version: 1, totalMessages: 4 })
+        expect(advanced.keyAt(0)).not.toBe(oldKey)
+        expect(advanced.indexOfKey(oldKey)).toBe(-1)
+        expect(advanced.rowAt(0)).toBeUndefined()
+        expect(listener).toHaveBeenCalledTimes(1)
+
+        const abortedPending = deferred<Versioned<ConversationWindow> | null>()
+        readConversationWindow.mockImplementationOnce(() => abortedPending.promise)
+        const controller = new AbortController()
+        const aborted = source.ensureRange({
+            startIndex: 0,
+            limit: 1,
+            reason: 'jump',
+            signal: controller.signal,
+        })
+        controller.abort()
+        abortedPending.resolve({
+            revision: 8,
+            value: persistentWindow(0, [message('zero', 'aborted')], 4),
+        })
+        await aborted
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+        expect(listener).toHaveBeenCalledTimes(1)
+
+        const disposedPending = deferred<Versioned<ConversationWindow> | null>()
+        readConversationWindow.mockImplementationOnce(() => disposedPending.promise)
+        const disposed = source.ensureRange({ startIndex: 0, limit: 1, reason: 'streaming' })
+        source.dispose()
+        disposedPending.resolve({
+            revision: 8,
+            value: persistentWindow(0, [message('zero', 'disposed')], 4),
+        })
+        await disposed
+        expect(source.snapshot().totalMessages).toBe(0)
+        expect(listener).toHaveBeenCalledTimes(2)
+    })
+
+    it('retains pinned rows beyond the budget and evicts least-recent unpinned rows', async () => {
+        const readConversationWindow = vi.fn(async (input: ConversationWindowQuery) => {
+            const endIndex = Math.min(6, input.startIndex! + input.limit!)
+            const messages = Array.from(
+                { length: endIndex - input.startIndex! },
+                (_, offset) => message(
+                    `message-${input.startIndex! + offset}`,
+                    `data-${input.startIndex! + offset}`,
+                ),
+            )
+            return {
+                revision: 7,
+                value: persistentWindow(input.startIndex!, messages, 6),
+            }
+        })
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow },
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 6,
+            rowBudget: 2,
+        })
+        const listener = vi.fn()
+        source.subscribe(listener)
+        const oldViewport = source.acquireRangePin(0, 2, 'viewport')
+        await source.ensureRange({ startIndex: 0, limit: 2, reason: 'viewport' })
+
+        const nextViewport = source.acquireRangePin(2, 4, 'viewport')
+        await source.ensureRange({ startIndex: 2, limit: 2, reason: 'viewport' })
+        for (let index = 0; index < 4; index++) {
+            expect(source.snapshot().rowAt(index)?.absoluteIndex).toBe(index)
+        }
+
+        oldViewport.release()
+        oldViewport.release()
+        expect(listener).toHaveBeenCalledTimes(3)
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+        expect(source.snapshot().rowAt(1)).toBeUndefined()
+        expect(source.snapshot().rowAt(2)).toBeDefined()
+        expect(source.snapshot().rowAt(3)).toBeDefined()
+
+        nextViewport.release()
+        expect(listener).toHaveBeenCalledTimes(3)
+        source.snapshot().rowAt(2)
+        await source.ensureRange({ startIndex: 4, limit: 1, reason: 'jump' })
+        expect(listener).toHaveBeenCalledTimes(4)
+        expect(source.snapshot().rowAt(2)).toBeDefined()
+        expect(source.snapshot().rowAt(3)).toBeUndefined()
+        expect(source.snapshot().rowAt(4)).toBeDefined()
+    })
+
+    it('rejects malformed or foreign keys and invalidates old-epoch pins', async () => {
+        const reader = {
+            readConversationWindow: vi.fn(async () => ({
+                revision: 8,
+                value: persistentWindow(0, [
+                    message('zero', 'zero'),
+                    message('one', 'one'),
+                ], 2),
+            })),
+        }
+        const source = new PersistentConversationViewportSource({
+            reader,
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 2,
+            rowBudget: 1,
+        })
+        const original = source.snapshot()
+        const originalKey = original.keyAt(0)!
+        const separator = originalKey.lastIndexOf('|')
+        const prefix = originalKey.slice(0, separator + 1)
+        const foreign = new PersistentConversationViewportSource({
+            reader,
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 2,
+            rowBudget: 1,
+        })
+        const malformed = [
+            `${prefix}`,
+            `${prefix}-1`,
+            `${prefix}01`,
+            `${prefix}1.0`,
+            `${prefix}9007199254740992`,
+            foreign.snapshot().keyAt(0)!,
+        ] as ConversationViewportKey[]
+        for (const key of malformed) expect(original.indexOfKey(key)).toBe(-1)
+
+        const oldPin = source.acquireRangePin(0, 1, 'playing-media')
+        source.advanceRevision(8, 2)
+        await source.ensureRange({ startIndex: 0, limit: 2, reason: 'viewport' })
+
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+        expect(source.snapshot().rowAt(1)).toBeDefined()
+        expect(() => oldPin.release()).not.toThrow()
+    })
+
+    it('validates authority, range, pin, and monotonic revision inputs', async () => {
+        const reader = {
+            readConversationWindow: vi.fn(async () => null),
+        }
+        expect(() => new PersistentConversationViewportSource({
+            reader,
+            characterId: '',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 3,
+            rowBudget: 2,
+        })).toThrow(/Character ID/)
+        expect(() => new PersistentConversationViewportSource({
+            reader,
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 3,
+            rowBudget: 0,
+        })).toThrow(/row budget/)
+
+        const source = new PersistentConversationViewportSource({
+            reader,
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 3,
+            rowBudget: 2,
+        })
+        await expect(source.ensureRange({
+            startIndex: -1,
+            limit: 1,
+            reason: 'viewport',
+        })).rejects.toThrow(/startIndex/)
+        expect(reader.readConversationWindow).not.toHaveBeenCalled()
+        expect(() => source.acquireRangePin(0, 0, 'editor')).toThrow(/must not be empty/)
+        expect(() => source.acquireRangePin(0, 4, 'playing-media')).toThrow(/message count/)
+        expect(() => source.advanceRevision(7, 4)).toThrow(/must advance/)
+        expect(() => source.advanceRevision(8, -1)).toThrow(/message count/)
+
+        const streaming = source.acquireRangePin(2, 3, 'streaming')
+        expect(() => streaming.release()).not.toThrow()
+        expect(() => streaming.release()).not.toThrow()
     })
 })
