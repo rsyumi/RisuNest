@@ -13,7 +13,9 @@ use crate::{
         PayloadCas,
     },
     local_backup::NeverCancelled,
-    lossless_backup::create_and_verify_lossless_backup_v1_report,
+    lossless_backup::{
+        create_and_verify_lossless_backup_v1_report, verify_lossless_package_v1_for_production,
+    },
     persistent_store::{
         LogicalDeltaConflictKind, LogicalDeltaConflictPolicy, LogicalDeltaPlanResolution,
         PersistentLogicalDeltaTarget, PersistentStore, StoreError, SyncGenerationIdentity,
@@ -246,6 +248,85 @@ fn valid_backups(backups: &[PeerBidirectionalBackupReceipt]) -> bool {
     backups
         .iter()
         .all(|backup| !backup.package_id.is_empty() && !backup.path.is_empty())
+}
+
+fn verify_bidirectional_backup_receipt(
+    path: &Path,
+    expected_revision: i64,
+    side: PeerBidirectionalBackupSide,
+) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(PeerSyncError::Storage(
+            "bidirectional backup path is not a regular file".to_owned(),
+        ));
+    }
+    let verified =
+        verify_lossless_package_v1_for_production(&mut File::open(path)?, &NeverCancelled)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    if verified
+        .manifest
+        .extensions
+        .get("sourceRevision")
+        .and_then(serde_json::Value::as_i64)
+        != Some(expected_revision)
+    {
+        return Err(PeerSyncError::Storage(
+            "bidirectional backup belongs to another source revision".to_owned(),
+        ));
+    }
+    Ok(PeerBidirectionalBackupReceipt {
+        package_id: verified.archive_sha256,
+        side,
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
+fn ensure_bidirectional_backup_receipt(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    operation_id: &str,
+    expected_revision: i64,
+    side: PeerBidirectionalBackupSide,
+) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
+    let side_name = match side {
+        PeerBidirectionalBackupSide::Local => "local",
+        PeerBidirectionalBackupSide::Remote => "remote",
+    };
+    let backup_root = app_root.join("peer-bidirectional").join("backups");
+    fs::create_dir_all(&backup_root)?;
+    let backup_path = backup_root.join(format!("{operation_id}-{side_name}.risulossless"));
+    match fs::symlink_metadata(&backup_path) {
+        Ok(_) => {
+            return verify_bidirectional_backup_receipt(&backup_path, expected_revision, side);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let backup_staging = app_root
+        .join("peer-bidirectional")
+        .join("backup-staging")
+        .join(format!("{operation_id}-{side_name}"));
+    fs::create_dir_all(&backup_staging)?;
+    match create_and_verify_lossless_backup_v1_report(
+        &backup_path,
+        &backup_staging,
+        cas,
+        store,
+        expected_revision,
+        &NeverCancelled,
+    ) {
+        Ok(report) => Ok(PeerBidirectionalBackupReceipt {
+            package_id: report.archive_sha256,
+            side,
+            path: backup_path.to_string_lossy().into_owned(),
+        }),
+        Err(_) if fs::symlink_metadata(&backup_path).is_ok() => {
+            verify_bidirectional_backup_receipt(&backup_path, expected_revision, side)
+        }
+        Err(error) => Err(PeerSyncError::Storage(error.to_string())),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -655,28 +736,14 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
             .iter()
             .any(|backup| backup.side == PeerBidirectionalBackupSide::Local)
     {
-        let backup_root = app_root.join("peer-bidirectional").join("backups");
-        fs::create_dir_all(&backup_root)?;
-        let backup_path = backup_root.join(format!("{operation_id}-local.risulossless"));
-        let backup_staging = app_root
-            .join("peer-bidirectional")
-            .join("backup-staging")
-            .join(operation_id);
-        fs::create_dir_all(&backup_staging)?;
-        let report = create_and_verify_lossless_backup_v1_report(
-            &backup_path,
-            &backup_staging,
-            cas,
+        backups.push(ensure_bidirectional_backup_receipt(
             store,
+            cas,
+            app_root,
+            operation_id,
             context.expected_local_revision,
-            &NeverCancelled,
-        )
-        .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
-        backups.push(PeerBidirectionalBackupReceipt {
-            package_id: report.archive_sha256,
-            side: PeerBidirectionalBackupSide::Local,
-            path: backup_path.to_string_lossy().into_owned(),
-        });
+            PeerBidirectionalBackupSide::Local,
+        )?);
         journal.store(&PeerBidirectionalDurableOperation::AwaitingConflict {
             schema: OPERATION_SCHEMA.to_owned(),
             context: context.clone(),
@@ -2385,6 +2452,105 @@ mod tests {
         assert!(!job.is_released());
         drop(job);
 
+        let backup_path = directory
+            .path()
+            .join("peer-bidirectional")
+            .join("backups")
+            .join(format!("{}-local.risulossless", conflict.operation_id));
+        fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+        let wrong_source_directory = tempfile::tempdir().unwrap();
+        let wrong_source_cas = PayloadCas::new(wrong_source_directory.path()).unwrap();
+        let mut wrong_source_store = PersistentStore::open(wrong_source_directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut wrong_source_store, &wrong_source_cas);
+        let wrong_source_staging = wrong_source_directory.path().join("backup-staging");
+        fs::create_dir_all(&wrong_source_staging).unwrap();
+        create_and_verify_lossless_backup_v1_report(
+            &backup_path,
+            &wrong_source_staging,
+            &wrong_source_cas,
+            &mut wrong_source_store,
+            1,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let wrong_source_bytes = fs::read(&backup_path).unwrap();
+        let mut wrong_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &remote.manifest.generation,
+        )
+        .unwrap();
+        assert!(resolve_bidirectional_conflict(
+            &mut store,
+            &cas,
+            directory.path(),
+            &conflict.operation_id,
+            PeerBidirectionalConflictWinner::Remote,
+            2,
+            &remote.manifest_bytes,
+            &mut wrong_source,
+        )
+        .is_err());
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(store.read_root(None).unwrap().value, lossless_root("Local"));
+        assert_eq!(fs::read(&backup_path).unwrap(), wrong_source_bytes);
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap()
+                .unwrap(),
+            PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. }
+                if backups.is_empty()
+        ));
+
+        fs::remove_file(&backup_path).unwrap();
+        fs::write(&backup_path, b"corrupt backup").unwrap();
+        let mut corrupt_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &remote.manifest.generation,
+        )
+        .unwrap();
+        assert!(resolve_bidirectional_conflict(
+            &mut store,
+            &cas,
+            directory.path(),
+            &conflict.operation_id,
+            PeerBidirectionalConflictWinner::Remote,
+            2,
+            &remote.manifest_bytes,
+            &mut corrupt_source,
+        )
+        .is_err());
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(store.read_root(None).unwrap().value, lossless_root("Local"));
+        assert_eq!(fs::read(&backup_path).unwrap(), b"corrupt backup");
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap()
+                .unwrap(),
+            PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. }
+                if backups.is_empty()
+        ));
+
+        fs::remove_file(&backup_path).unwrap();
+        let complete_staging = directory.path().join("complete-backup-staging");
+        fs::create_dir_all(&complete_staging).unwrap();
+        let completed_backup = create_and_verify_lossless_backup_v1_report(
+            &backup_path,
+            &complete_staging,
+            &cas,
+            &mut store,
+            2,
+            &NeverCancelled,
+        )
+        .unwrap();
+        drop(store);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
         let mut resolution_source = LogicalDeltaSourceSession::open(
             remote_directory.path(),
             remote_directory.path(),
@@ -2420,7 +2586,7 @@ mod tests {
             PeerBidirectionalDurableOperation::LocalCommitted { backups, .. } => {
                 assert_eq!(backups.len(), 1);
                 assert_eq!(backups[0].side, PeerBidirectionalBackupSide::Local);
-                assert_eq!(backups[0].package_id.len(), 64);
+                assert_eq!(backups[0].package_id, completed_backup.archive_sha256);
                 assert!(Path::new(&backups[0].path).is_file());
             }
             other => panic!("unexpected retained operation: {other:?}"),
