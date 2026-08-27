@@ -21,6 +21,21 @@ pub(crate) struct PeerBidirectionalConflict {
     pub(crate) conflict_type: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PeerBidirectionalBackupSide {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PeerBidirectionalBackupReceipt {
+    pub(crate) package_id: String,
+    pub(crate) side: PeerBidirectionalBackupSide,
+    pub(crate) path: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerBidirectionalCompletedResult {
@@ -30,6 +45,7 @@ pub(crate) struct PeerBidirectionalCompletedResult {
     pub(crate) remote_revision: i64,
     pub(crate) transferred_objects: u64,
     pub(crate) transferred_bytes: u64,
+    pub(crate) backups: Vec<PeerBidirectionalBackupReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,9 +78,47 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         shared_generation: SyncGenerationIdentity,
         transferred_objects: u64,
         transferred_bytes: u64,
+        backups: Vec<PeerBidirectionalBackupReceipt>,
     },
     Completed {
         schema: String,
+        result: PeerBidirectionalCompletedResult,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PeerBidirectionalConflictStatus {
+    key: String,
+    #[serde(rename = "type")]
+    conflict_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PeerBidirectionalConflictResult {
+    kind: &'static str,
+    operation_id: String,
+    conflicts: Vec<PeerBidirectionalConflictStatus>,
+    local_manifest_hash: String,
+    remote_manifest_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "phase",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum PeerBidirectionalStatusOperation {
+    AwaitingConflict {
+        result: PeerBidirectionalConflictResult,
+    },
+    LocalCommitted {
+        operation_id: String,
+        committed_revision: i64,
+    },
+    Completed {
         result: PeerBidirectionalCompletedResult,
     },
 }
@@ -103,14 +157,65 @@ impl PeerBidirectionalDurableOperation {
             } if *committed_revision < 0 => Err(PeerSyncError::Storage(
                 "local-committed operation has an invalid revision".to_owned(),
             )),
+            Self::LocalCommitted { backups, .. } if !valid_backups(backups) => {
+                Err(PeerSyncError::Storage(
+                    "local-committed operation has an invalid backup".to_owned(),
+                ))
+            }
             Self::Completed { result, .. } if result.revision < 0 || result.remote_revision < 0 => {
                 Err(PeerSyncError::Storage(
                     "completed operation has an invalid revision".to_owned(),
                 ))
             }
+            Self::Completed { result, .. } if !valid_backups(&result.backups) => Err(
+                PeerSyncError::Storage("completed operation has an invalid backup".to_owned()),
+            ),
             _ => Ok(()),
         }
     }
+
+    pub(crate) fn status_projection(&self) -> PeerBidirectionalStatusOperation {
+        match self {
+            Self::AwaitingConflict {
+                context,
+                conflicts,
+                local_manifest_hash,
+                remote_manifest_hash,
+                ..
+            } => PeerBidirectionalStatusOperation::AwaitingConflict {
+                result: PeerBidirectionalConflictResult {
+                    kind: "conflict",
+                    operation_id: context.operation_id.clone(),
+                    conflicts: conflicts
+                        .iter()
+                        .map(|conflict| PeerBidirectionalConflictStatus {
+                            key: conflict.key.clone(),
+                            conflict_type: conflict.conflict_type.clone(),
+                        })
+                        .collect(),
+                    local_manifest_hash: local_manifest_hash.clone(),
+                    remote_manifest_hash: remote_manifest_hash.clone(),
+                },
+            },
+            Self::LocalCommitted {
+                context,
+                committed_revision,
+                ..
+            } => PeerBidirectionalStatusOperation::LocalCommitted {
+                operation_id: context.operation_id.clone(),
+                committed_revision: *committed_revision,
+            },
+            Self::Completed { result, .. } => PeerBidirectionalStatusOperation::Completed {
+                result: result.clone(),
+            },
+        }
+    }
+}
+
+fn valid_backups(backups: &[PeerBidirectionalBackupReceipt]) -> bool {
+    backups
+        .iter()
+        .all(|backup| !backup.package_id.is_empty() && !backup.path.is_empty())
 }
 
 pub(crate) struct PeerBidirectionalOperationJournal {
@@ -286,6 +391,14 @@ mod tests {
         }
     }
 
+    fn backup(side: PeerBidirectionalBackupSide) -> PeerBidirectionalBackupReceipt {
+        PeerBidirectionalBackupReceipt {
+            package_id: "f".repeat(64),
+            side,
+            path: "peer-bidirectional/backups/conflict.risulossless".to_owned(),
+        }
+    }
+
     #[test]
     fn local_committed_operation_survives_reopen_and_atomic_completion() {
         let directory = tempfile::tempdir().unwrap();
@@ -298,6 +411,7 @@ mod tests {
             shared_generation: generation("local-a", "3", 'e'),
             transferred_objects: 2,
             transferred_bytes: 19,
+            backups: vec![backup(PeerBidirectionalBackupSide::Local)],
         };
         journal.store(&local_committed).unwrap();
         assert_eq!(journal.load().unwrap(), Some(local_committed));
@@ -311,6 +425,7 @@ mod tests {
                 remote_revision: 4,
                 transferred_objects: 3,
                 transferred_bytes: 27,
+                backups: vec![backup(PeerBidirectionalBackupSide::Local)],
             },
         };
         journal.store(&completed).unwrap();
@@ -332,6 +447,7 @@ mod tests {
                     remote_revision: 4,
                     transferred_objects: 0,
                     transferred_bytes: 0,
+                    backups: vec![],
                 },
             })
             .unwrap();
@@ -342,5 +458,83 @@ mod tests {
         assert!(journal.load().unwrap().is_some());
         journal.acknowledge_completed(operation_id).unwrap();
         assert_eq!(journal.load().unwrap(), None);
+    }
+
+    #[test]
+    fn durable_operations_project_the_exact_frontend_contract() {
+        let operation_id = "123e4567-e89b-42d3-a456-426614174004";
+        let conflict = PeerBidirectionalDurableOperation::AwaitingConflict {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            conflicts: vec![PeerBidirectionalConflict {
+                key: "r1:root".to_owned(),
+                conflict_type: "sameRecord".to_owned(),
+            }],
+            local_manifest_hash: "a".repeat(64),
+            remote_manifest_hash: "b".repeat(64),
+        };
+        assert_eq!(
+            serde_json::to_value(conflict.status_projection()).unwrap(),
+            serde_json::json!({
+                "phase": "awaitingConflict",
+                "result": {
+                    "kind": "conflict",
+                    "operationId": operation_id,
+                    "conflicts": [{"key": "r1:root", "type": "sameRecord"}],
+                    "localManifestHash": "a".repeat(64),
+                    "remoteManifestHash": "b".repeat(64),
+                }
+            })
+        );
+
+        let local_committed = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            committed_revision: 8,
+            shared_generation: generation("local-a", "3", 'e'),
+            transferred_objects: 2,
+            transferred_bytes: 19,
+            backups: vec![backup(PeerBidirectionalBackupSide::Local)],
+        };
+        assert_eq!(
+            serde_json::to_value(local_committed.status_projection()).unwrap(),
+            serde_json::json!({
+                "phase": "localCommitted",
+                "operationId": operation_id,
+                "committedRevision": 8,
+            })
+        );
+
+        let completed = PeerBidirectionalDurableOperation::Completed {
+            schema: OPERATION_SCHEMA.to_owned(),
+            result: PeerBidirectionalCompletedResult {
+                kind: "updated".to_owned(),
+                operation_id: operation_id.to_owned(),
+                revision: 8,
+                remote_revision: 9,
+                transferred_objects: 3,
+                transferred_bytes: 27,
+                backups: vec![backup(PeerBidirectionalBackupSide::Remote)],
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(completed.status_projection()).unwrap(),
+            serde_json::json!({
+                "phase": "completed",
+                "result": {
+                    "kind": "updated",
+                    "operationId": operation_id,
+                    "revision": 8,
+                    "remoteRevision": 9,
+                    "transferredObjects": 3,
+                    "transferredBytes": 27,
+                    "backups": [{
+                        "packageId": "f".repeat(64),
+                        "side": "remote",
+                        "path": "peer-bidirectional/backups/conflict.risulossless",
+                    }],
+                }
+            })
+        );
     }
 }
