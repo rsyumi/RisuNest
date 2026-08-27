@@ -4514,8 +4514,7 @@ mod tests {
     #[test]
     fn production_target_activates_the_verified_lossless_package_once() {
         let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("repository");
-        fs::create_dir(&repository).unwrap();
+        let repository = directory.path();
         let incoming = production_package(directory.path(), "New", b"new");
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
@@ -4561,8 +4560,7 @@ mod tests {
     #[test]
     fn production_target_retries_same_manifest_with_a_new_pre_replacement_backup() {
         let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("repository");
-        fs::create_dir(&repository).unwrap();
+        let repository = directory.path();
         let incoming = production_package(directory.path(), "New", b"new");
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
@@ -4642,8 +4640,7 @@ mod tests {
     #[test]
     fn production_target_adopts_same_manifest_that_wins_the_commit_race() {
         let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("repository");
-        fs::create_dir(&repository).unwrap();
+        let repository = directory.path();
         let incoming = production_package(directory.path(), "New", b"new");
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
@@ -4680,6 +4677,129 @@ mod tests {
 
         assert_eq!(store.revision().unwrap(), 2);
         assert_eq!(store.materialize(None).unwrap()["username"], "New");
+    }
+
+    #[test]
+    fn production_target_recovers_a_sealed_precommit_peer_clone_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let target_root = directory.path().join("peer-target");
+        let manifest_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let mut target =
+            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
+                .unwrap();
+        let mut stage = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut stage,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming.clone()),
+            )
+            .unwrap();
+        target.leave_durable_job_after_precommit_failure_once_for_test();
+
+        assert!(target
+            .activate_if_current(&mut stage, None, manifest_id)
+            .is_err());
+        let retained = collect_durable_cas_job_roots(directory.path());
+        assert!(retained.blockers.is_empty());
+        assert!(!retained.object_hashes.is_empty() || !retained.manifest_hashes.is_empty());
+        drop(stage);
+        drop(target);
+        assert_eq!(store.revision().unwrap(), 1);
+
+        let mut target =
+            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
+                .unwrap();
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+        let mut retry = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut retry,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming),
+            )
+            .unwrap();
+        assert_eq!(
+            target
+                .activate_if_current(&mut retry, None, manifest_id)
+                .unwrap(),
+            CloneActivation::Activated
+        );
+        drop(target);
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn production_target_recovers_a_committed_peer_clone_job_before_idempotent_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let target_root = directory.path().join("peer-target");
+        let manifest_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let mut target =
+            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
+                .unwrap();
+        let mut stage = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut stage,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming),
+            )
+            .unwrap();
+        target.leave_durable_job_after_commit_once_for_test();
+
+        assert!(target
+            .activate_if_current(&mut stage, None, manifest_id)
+            .is_err());
+        assert_eq!(
+            target.active_manifest_id().unwrap().as_deref(),
+            Some(manifest_id)
+        );
+        let retained = collect_durable_cas_job_roots(directory.path());
+        assert!(retained.blockers.is_empty());
+        assert!(!retained.object_hashes.is_empty() || !retained.manifest_hashes.is_empty());
+        drop(target);
+        assert_eq!(store.revision().unwrap(), 2);
+
+        let mut target =
+            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 2, &NeverCancelled)
+                .unwrap();
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+        assert_eq!(
+            target
+                .activate_if_current(&mut stage, None, manifest_id)
+                .unwrap(),
+            CloneActivation::AlreadyActive
+        );
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
     }
 
     #[test]
