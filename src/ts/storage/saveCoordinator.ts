@@ -53,6 +53,7 @@ export interface SaveCoordinatorDependencies {
     publishPluginStorageWorkingSet?(storage: Database['pluginCustomStorage']): void
     capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
+    captureSelectedConversationAuthority?(): WindowedConversationPersistenceAuthority | null
     captureCharacter(id: string): CompleteCharacter | null
     /** Installs the working copy synchronously and must not throw. */
     replaceDatabase(database: Database): void
@@ -85,6 +86,34 @@ export interface PersistedConversationMutationEvent {
     revision: DataRevision
 }
 
+export interface WindowedConversationPersistenceAuthority {
+    kind: 'windowed'
+    characterId: string
+    conversationId: string
+    sessionToken: ConversationSessionToken
+    storeRevision: DataRevision
+    persistedSessionVersion: number
+    sessionVersion: number
+    totalMessages: number
+}
+
+export class WindowedConversationRequiresCompatibilityError extends Error {
+    constructor(reason: string) {
+        super(`Windowed conversation requires complete compatibility: ${reason}`)
+        this.name = 'WindowedConversationRequiresCompatibilityError'
+    }
+}
+
+type WindowedCharacterShell = Omit<CompleteCharacter, 'chats'> & {
+    chats: Array<Omit<Chat, 'message'>>
+}
+
+interface WindowedSelectedCharacterCapture {
+    shell: WindowedCharacterShell
+    shellCanonical: string
+    authority: WindowedConversationPersistenceAuthority
+}
+
 interface CapturedState {
     root: RootDatabase
     rootCanonical: string
@@ -95,6 +124,7 @@ interface CapturedState {
     character: CompleteCharacter | null
     characterCanonical: string | null
     conversationStubIds: ReadonlySet<string>
+    windowedCharacter: WindowedSelectedCharacterCapture | null
 }
 
 export interface CharacterAdditionRequest {
@@ -149,6 +179,65 @@ function canonicalize(value: unknown): unknown {
 
 export function canonicalJson(value: unknown): string {
     return JSON.stringify(canonicalize(value))
+}
+
+function cloneOwnPropertiesExcept(
+    value: Record<string, unknown>,
+    excludedKey: string,
+): Record<string, unknown> {
+    const result: Record<string, unknown> = {}
+    for (const key of Object.keys(value)) {
+        if (key === excludedKey) continue
+        defineOwnEnumerableProperty(result, key, safeStructuredClone(value[key]))
+    }
+    return result
+}
+
+function captureWindowedCharacterShell(character: CompleteCharacter): WindowedCharacterShell {
+    const detail = cloneOwnPropertiesExcept(
+        character as unknown as Record<string, unknown>,
+        'chats',
+    )
+    const chats = character.chats.map((conversation) =>
+        cloneOwnPropertiesExcept(
+            conversation as unknown as Record<string, unknown>,
+            'message',
+        ) as Omit<Chat, 'message'>
+    )
+    return { ...detail, chats } as WindowedCharacterShell
+}
+
+function validWindowedAuthority(
+    authority: WindowedConversationPersistenceAuthority,
+): boolean {
+    return authority.kind === 'windowed'
+        && typeof authority.characterId === 'string'
+        && authority.characterId.length > 0
+        && typeof authority.conversationId === 'string'
+        && authority.conversationId.length > 0
+        && typeof authority.sessionToken === 'string'
+        && authority.sessionToken.length > 0
+        && Number.isSafeInteger(authority.storeRevision)
+        && authority.storeRevision >= 0
+        && Number.isSafeInteger(authority.persistedSessionVersion)
+        && authority.persistedSessionVersion >= 0
+        && Number.isSafeInteger(authority.sessionVersion)
+        && authority.sessionVersion >= authority.persistedSessionVersion
+        && Number.isSafeInteger(authority.totalMessages)
+        && authority.totalMessages >= 0
+}
+
+function sameWindowedAuthority(
+    left: WindowedConversationPersistenceAuthority,
+    right: WindowedConversationPersistenceAuthority,
+): boolean {
+    return left.characterId === right.characterId
+        && left.conversationId === right.conversationId
+        && left.sessionToken === right.sessionToken
+        && left.storeRevision === right.storeRevision
+        && left.persistedSessionVersion === right.persistedSessionVersion
+        && left.sessionVersion === right.sessionVersion
+        && left.totalMessages === right.totalMessages
 }
 
 function messageMatchesAfterIdNormalization(
@@ -735,6 +824,7 @@ export class SaveCoordinator {
     private presetsBaseline: string | null = null
     private characterBaseline: string | null = null
     private characterBaselineId: string | null = null
+    private windowedCharacterBaseline: WindowedSelectedCharacterCapture | null = null
     private dirtyGeneration = 0
     private pendingByteCount = 0
     private debounceHandle: unknown
@@ -844,10 +934,59 @@ export class SaveCoordinator {
         if (
             this.destructiveReplacementFence !== null ||
             this.currentRevision !== revision ||
-            this.dirtyGeneration !== mutationGeneration
+            this.dirtyGeneration !== mutationGeneration ||
+            (this.dependencies.captureSelectedConversationAuthority?.() ?? null) !== null
         ) return false
         this.characterBaseline = canonicalJson(character)
         this.characterBaselineId = character.chaId
+        this.windowedCharacterBaseline = null
+        return true
+    }
+
+    adoptWindowedSelectedConversation(
+        revision: DataRevision,
+        mutationGeneration: number,
+        character: CompleteCharacter,
+        authority: WindowedConversationPersistenceAuthority,
+    ): boolean {
+        if (
+            this.destructiveReplacementFence !== null ||
+            this.currentRevision !== revision ||
+            this.dirtyGeneration !== mutationGeneration ||
+            !validWindowedAuthority(authority) ||
+            authority.storeRevision !== revision ||
+            authority.sessionVersion !== authority.persistedSessionVersion ||
+            character.chaId !== authority.characterId ||
+            this.pendingByteCount > 0 ||
+            this.pendingConversationMutations.length > 0 ||
+            this.pendingResidentCompensations.length > 0 ||
+            this.pendingCharacterAddition !== null
+        ) return false
+        const currentAuthority =
+            this.dependencies.captureSelectedConversationAuthority?.() ?? null
+        const currentCharacter = this.dependencies.captureSelectedCharacter()
+        if (
+            !currentAuthority ||
+            !validWindowedAuthority(currentAuthority) ||
+            !sameWindowedAuthority(currentAuthority, authority) ||
+            currentCharacter?.chaId !== authority.characterId
+        ) return false
+        const shell = captureWindowedCharacterShell(character)
+        const currentShell = captureWindowedCharacterShell(currentCharacter)
+        const matchingConversations = shell.chats.filter(
+            (conversation) => conversation.id === authority.conversationId,
+        )
+        if (
+            matchingConversations.length !== 1 ||
+            canonicalJson(shell) !== canonicalJson(currentShell)
+        ) return false
+        this.windowedCharacterBaseline = {
+            shell,
+            shellCanonical: canonicalJson(shell),
+            authority: safeStructuredClone(authority),
+        }
+        this.characterBaseline = null
+        this.characterBaselineId = null
         return true
     }
 
@@ -2112,23 +2251,45 @@ export class SaveCoordinator {
             await this.retryPublicationCleanup()
         }
         if (this.pendingResidentCompensations.length > 0) {
+            if (
+                this.windowedCharacterBaseline ||
+                (this.dependencies.captureSelectedConversationAuthority?.() ?? null) !== null
+            ) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'resident compensation requires a complete selected character',
+                )
+            }
             await this.retryPendingResidentCompensations(publishOfficial)
         }
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
             const pendingConversationMutations = [...this.pendingConversationMutations]
+            const windowedCapture = this.requireMatchingWindowedCapture(captured)
             const selectionSwitched =
+                windowedCapture === null &&
                 captured.character !== null &&
                 this.characterBaselineId !== null &&
                 captured.character.chaId !== this.characterBaselineId
             const detached =
-                !captured.character || selectionSwitched ? this.captureDetachedCharacter() : null
+                windowedCapture === null && (!captured.character || selectionSwitched)
+                    ? this.captureDetachedCharacter()
+                    : null
             const addition = this.capturePendingAddition()
-            const conversationProjection = this.projectConversationMutations(
-                captured,
-                pendingConversationMutations,
-            )
+            if (windowedCapture && addition) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'character addition requires a complete selected character',
+                )
+            }
+            const conversationProjection = windowedCapture
+                ? await this.projectWindowedConversationMutations(
+                    captured,
+                    pendingConversationMutations,
+                )
+                : this.projectConversationMutations(
+                    captured,
+                    pendingConversationMutations,
+                )
             const recordedConversations = conversationProjection?.exactMutations ?? null
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
@@ -2147,7 +2308,9 @@ export class SaveCoordinator {
             ) {
                 commit.replacePresets = captured.presets
             }
-            if (detached) {
+            if (windowedCapture) {
+                if (recordedConversations) commit.conversations = recordedConversations
+            } else if (detached) {
                 commit.replaceCharacter = detached.character
             } else if (
                 captured.character &&
@@ -2244,6 +2407,16 @@ export class SaveCoordinator {
                             committed.revision,
                         )
                     }
+                    if (windowedCapture) {
+                        const persistedSessionVersion = persistedConversationMutations.at(-1)
+                            ?.event.sessionVersion
+                            ?? windowedCapture.authority.persistedSessionVersion
+                        this.setWindowedCharacterBaseline(
+                            windowedCapture,
+                            committed.revision,
+                            persistedSessionVersion,
+                        )
+                    }
                     if (replacementIsAddition && addition) {
                         addition.pending.baseline = addition.canonical
                     }
@@ -2267,7 +2440,11 @@ export class SaveCoordinator {
                 }
             }
 
-            if (!captured.character && !commit.replaceCharacter) this.setCharacterBaseline(captured)
+            if (
+                windowedCapture === null &&
+                !captured.character &&
+                !commit.replaceCharacter
+            ) this.setCharacterBaseline(captured)
 
             const current = this.capture()
             const currentAddition = this.capturePendingAddition()
@@ -2278,7 +2455,7 @@ export class SaveCoordinator {
                     current.pluginStorageCanonical === this.pluginStorageBaseline) &&
                 (current.presetsCanonical === null ||
                     current.presetsCanonical === this.presetsBaseline) &&
-                current.characterCanonical === this.characterBaseline &&
+                this.selectedCaptureMatchesBaseline(current) &&
                 (!currentAddition ||
                     (currentAddition.pending.locallyAdded &&
                         currentAddition.canonical === currentAddition.pending.baseline))
@@ -2498,6 +2675,14 @@ export class SaveCoordinator {
         canonical: string
         conversationStubIds: ReadonlySet<string>
     } | null {
+        if (
+            this.windowedCharacterBaseline ||
+            (this.dependencies.captureSelectedConversationAuthority?.() ?? null) !== null
+        ) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'resident character capture requires complete ownership',
+            )
+        }
         const character = this.dependencies.captureCharacter(characterId)
         if (!character) return null
         const conversationStubIds = new Set(
@@ -2624,6 +2809,14 @@ export class SaveCoordinator {
     }
 
     private async retryPendingResidentCompensations(publishOfficial: boolean): Promise<void> {
+        if (
+            this.windowedCharacterBaseline ||
+            (this.dependencies.captureSelectedConversationAuthority?.() ?? null) !== null
+        ) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'resident compensation requires complete ownership',
+            )
+        }
         while (this.pendingResidentCompensations.length > 0) {
             const pending = this.pendingResidentCompensations[0]
             const resident = this.captureResidentCharacter(pending.characterId)
@@ -2731,6 +2924,206 @@ export class SaveCoordinator {
     private setCharacterBaseline(captured: CapturedState): void {
         this.characterBaseline = captured.characterCanonical
         this.characterBaselineId = captured.character?.chaId ?? null
+        this.windowedCharacterBaseline = null
+    }
+
+    private setWindowedCharacterBaseline(
+        captured: WindowedSelectedCharacterCapture,
+        revision: DataRevision,
+        persistedSessionVersion: number,
+    ): void {
+        this.windowedCharacterBaseline = {
+            shell: safeStructuredClone(captured.shell),
+            shellCanonical: captured.shellCanonical,
+            authority: {
+                ...safeStructuredClone(captured.authority),
+                storeRevision: revision,
+                persistedSessionVersion,
+            },
+        }
+        this.characterBaseline = null
+        this.characterBaselineId = null
+    }
+
+    private requireMatchingWindowedCapture(
+        captured: CapturedState,
+    ): WindowedSelectedCharacterCapture | null {
+        const baseline = this.windowedCharacterBaseline
+        const current = captured.windowedCharacter
+        if (!baseline && !current) return null
+        if (!baseline || !current) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'authority mode changed without explicit adoption',
+            )
+        }
+        if (
+            baseline.authority.characterId !== current.authority.characterId ||
+            baseline.authority.conversationId !== current.authority.conversationId ||
+            baseline.authority.sessionToken !== current.authority.sessionToken ||
+            baseline.authority.storeRevision !== this.revision ||
+            current.authority.storeRevision !== this.revision ||
+            baseline.authority.persistedSessionVersion !==
+                current.authority.persistedSessionVersion ||
+            baseline.authority.sessionVersion !==
+                baseline.authority.persistedSessionVersion
+        ) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'session authority no longer matches the adopted baseline',
+            )
+        }
+        return current
+    }
+
+    private async projectWindowedConversationMutations(
+        captured: CapturedState,
+        pending: readonly PendingConversationMutation[],
+    ): Promise<ConversationMutationProjection> {
+        const current = captured.windowedCharacter
+        const baseline = this.windowedCharacterBaseline
+        if (!current || !baseline) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'windowed projection has no adopted baseline',
+            )
+        }
+        const authority = current.authority
+        const relevantPending = pending.filter(({ event }) =>
+            event.characterId === authority.characterId &&
+            event.conversationId === authority.conversationId &&
+            event.sessionToken === authority.sessionToken
+        )
+        if (relevantPending.length !== pending.length) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'pending evidence belongs to another conversation or session',
+            )
+        }
+        if (relevantPending.length === 0) {
+            if (
+                authority.sessionVersion !== authority.persistedSessionVersion ||
+                authority.totalMessages !== baseline.authority.totalMessages ||
+                current.shellCanonical !== baseline.shellCanonical
+            ) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'selected changes have no exact mutation evidence',
+                )
+            }
+            return { exactMutations: null, coveredPending: [] }
+        }
+
+        const persisted = await this.dependencies.store.readConversationWindow({
+            characterId: authority.characterId,
+            conversationId: authority.conversationId,
+            startIndex: 0,
+            limit: 1,
+        })
+        if (
+            !persisted ||
+            persisted.revision !== this.revision ||
+            persisted.value.characterId !== authority.characterId ||
+            persisted.value.conversationId !== authority.conversationId ||
+            persisted.value.startIndex !== 0 ||
+            !Number.isSafeInteger(persisted.value.totalMessages) ||
+            persisted.value.totalMessages < 0 ||
+            persisted.value.totalMessages !== baseline.authority.totalMessages
+        ) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'persistent conversation count or revision changed',
+            )
+        }
+
+        const projectedShell = safeStructuredClone(baseline.shell)
+        const projectedMatches = projectedShell.chats.filter(
+            (conversation) => conversation.id === authority.conversationId,
+        )
+        const currentMatches = current.shell.chats.filter(
+            (conversation) => conversation.id === authority.conversationId,
+        )
+        if (projectedMatches.length !== 1 || currentMatches.length !== 1) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'selected conversation identity is ambiguous',
+            )
+        }
+
+        let expectedVersion = baseline.authority.persistedSessionVersion
+        let messageCount = persisted.value.totalMessages
+        const mutations: ConversationMutation[] = []
+        for (const pendingMutation of relevantPending) {
+            const { event } = pendingMutation
+            if (
+                event.previousVersion !== expectedVersion ||
+                event.sessionVersion <= expectedVersion
+            ) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'mutation versions are not a contiguous prefix',
+                )
+            }
+            const conversationMetadata = cloneOwnPropertiesExcept(
+                event.conversation as Record<string, unknown>,
+                'message',
+            ) as Omit<Chat, 'message'>
+            for (const range of event.mutations) {
+                if (range.completeOwner) {
+                    throw new WindowedConversationRequiresCompatibilityError(
+                        'complete-owner evidence requires complete ownership',
+                    )
+                }
+                const deleteCount = range.deleteCount
+                if (
+                    range.start > messageCount ||
+                    deleteCount > messageCount - range.start
+                ) {
+                    throw new WindowedConversationRequiresCompatibilityError(
+                        'absolute mutation range exceeds the persistent conversation',
+                    )
+                }
+                const messages = safeStructuredClone(range.messages)
+                messageCount = messageCount - deleteCount + messages.length
+                mutations.push({
+                    type: 'replace-range',
+                    characterId: event.characterId,
+                    conversationId: event.conversationId,
+                    start: range.start,
+                    deleteCount,
+                    messages,
+                    conversation: safeStructuredClone(conversationMetadata),
+                })
+            }
+            const target = projectedMatches[0] as Record<string, unknown>
+            const metadata = event.conversation as Record<string, unknown>
+            for (const key of Object.keys(target)) {
+                if (!Object.hasOwn(metadata, key)) delete target[key]
+            }
+            for (const key of Object.keys(metadata)) {
+                if (key !== 'message') target[key] = safeStructuredClone(metadata[key])
+            }
+            expectedVersion = event.sessionVersion
+        }
+        if (
+            expectedVersion !== authority.sessionVersion ||
+            messageCount !== authority.totalMessages ||
+            canonicalJson(projectedShell) !== current.shellCanonical
+        ) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'mutation evidence does not explain the selected projection',
+            )
+        }
+        return {
+            exactMutations: mutations,
+            coveredPending: [...relevantPending],
+        }
+    }
+
+    private selectedCaptureMatchesBaseline(captured: CapturedState): boolean {
+        if (this.windowedCharacterBaseline) {
+            return captured.windowedCharacter !== null
+                && captured.windowedCharacter.shellCanonical ===
+                    this.windowedCharacterBaseline.shellCanonical
+                && sameWindowedAuthority(
+                    captured.windowedCharacter.authority,
+                    this.windowedCharacterBaseline.authority,
+                )
+        }
+        return captured.windowedCharacter === null
+            && captured.characterCanonical === this.characterBaseline
     }
 
     private projectConversationMutations(
@@ -2933,6 +3326,11 @@ export class SaveCoordinator {
 
     /** Returns the last tracked character when the selection moved away before its edits were committed. */
     private captureDetachedCharacter(): { character: CompleteCharacter; canonical: string } | null {
+        if (this.windowedCharacterBaseline) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'detached character capture requires complete ownership',
+            )
+        }
         if (this.characterBaseline === null || this.characterBaselineId === null) return null
         const retained = this.dependencies.captureCharacter(this.characterBaselineId)
         if (!retained) return null
@@ -2965,6 +3363,40 @@ export class SaveCoordinator {
             : legacyPresets ?? []
         const presetsCanonical = presetsValue === null ? null : canonicalJson(presetsValue)
         const characterValue = this.dependencies.captureSelectedCharacter()
+        const windowedAuthority =
+            this.dependencies.captureSelectedConversationAuthority?.() ?? null
+        if (windowedAuthority !== null) {
+            if (
+                !characterValue ||
+                !validWindowedAuthority(windowedAuthority) ||
+                characterValue.chaId !== windowedAuthority.characterId
+            ) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'selected authority does not match the selected character',
+                )
+            }
+            const shell = captureWindowedCharacterShell(characterValue)
+            return {
+                root: JSON.parse(rootCanonical) as RootDatabase,
+                rootCanonical,
+                pluginStorage: pluginStorageCanonical === null
+                    ? null
+                    : JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage'],
+                pluginStorageCanonical,
+                presets: presetsCanonical === null
+                    ? null
+                    : JSON.parse(presetsCanonical) as botPreset[],
+                presetsCanonical,
+                character: null,
+                characterCanonical: null,
+                conversationStubIds: new Set(),
+                windowedCharacter: {
+                    shell,
+                    shellCanonical: canonicalJson(shell),
+                    authority: safeStructuredClone(windowedAuthority),
+                },
+            }
+        }
         const conversationStubIds = new Set(
             characterValue?.chats
                 .filter(isConversationSummaryStub)
@@ -2988,6 +3420,7 @@ export class SaveCoordinator {
                 : null,
             characterCanonical,
             conversationStubIds,
+            windowedCharacter: null,
         }
     }
 
@@ -3023,10 +3456,16 @@ export class SaveCoordinator {
                 : null,
             characterCanonical,
             conversationStubIds: new Set(),
+            windowedCharacter: null,
         }
     }
 
     private async reconstructCapturedCharacter(captured: CapturedState): Promise<CompleteCharacter> {
+        if (captured.windowedCharacter) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'character reconstruction requires complete ownership',
+            )
+        }
         return this.reconstructCharacterWithStubBodies(
             captured.character!,
             captured.conversationStubIds,
@@ -3270,6 +3709,11 @@ export class SaveCoordinator {
         live: CapturedState,
         preserveConflicts: boolean,
     ): ReplacementRebaseResult {
+        if (before.windowedCharacter || live.windowedCharacter || this.windowedCharacterBaseline) {
+            throw new WindowedConversationRequiresCompatibilityError(
+                'database replacement requires complete ownership',
+            )
+        }
         const publishedParts = splitDatabase(canonicalDatabaseClone(candidate))
         const compensation: Omit<WorkingSetCommit, 'expectedRevision'> = {}
         let publishedRoot: RootDatabase
@@ -3412,6 +3856,6 @@ export class SaveCoordinator {
                 captured.presetsCanonical === null
                 || captured.presetsCanonical === this.presetsBaseline
             )
-            && captured.characterCanonical === this.characterBaseline
+            && this.selectedCaptureMatchesBaseline(captured)
     }
 }
