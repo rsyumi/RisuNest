@@ -1428,7 +1428,14 @@ fn validate_staged_owner_manifests(
             .ok_or_else(|| {
                 invalid_manifest("present lossless owner head requires a staged parent property")
             })?;
-        if decoded.len() != head.entry_count as usize || !owner_tuples_match(parent, &decoded) {
+        let allow_trailing_fields = matches!(
+            &head.owner,
+            AssetOwnerLocator::RootModuleAssets { .. }
+                | AssetOwnerLocator::PersonaEmbeddedModuleAssets { .. }
+        );
+        if decoded.len() != head.entry_count as usize
+            || !owner_tuples_match(parent, &decoded, allow_trailing_fields)
+        {
             return Err(invalid_manifest(
                 "lossless owner manifest tuples differ from the staged parent",
             ));
@@ -1499,15 +1506,23 @@ fn read_bounded_owner_manifest(
         .map_err(|error| LosslessError::new(code, format!("invalid {context}: {error}")))
 }
 
-fn owner_tuples_match(parent: &[Value], decoded: &[OwnerManifestEntry]) -> bool {
+fn owner_tuples_match(
+    parent: &[Value],
+    decoded: &[OwnerManifestEntry],
+    allow_trailing_fields: bool,
+) -> bool {
     parent.len() == decoded.len()
         && parent.iter().zip(decoded).all(|(value, entry)| {
             value.as_array().is_some_and(|tuple| {
-                tuple.len() == 3
-                    && tuple
-                        .iter()
-                        .zip(&entry.tuple)
-                        .all(|(value, expected)| value.as_str() == Some(expected))
+                (if allow_trailing_fields {
+                    tuple.len() >= 3
+                } else {
+                    tuple.len() == 3
+                }) && tuple
+                    .iter()
+                    .take(3)
+                    .zip(&entry.tuple)
+                    .all(|(value, expected)| value.as_str() == Some(expected))
             })
         })
 }
@@ -3723,6 +3738,33 @@ mod tests {
                 .unwrap(),
             owner_manifest
         );
+    }
+
+    #[test]
+    fn owner_manifest_prefix_matching_retains_module_tails_but_not_character_tails() {
+        let manifest = vec![OwnerManifestEntry {
+            tuple: [
+                "label".to_owned(),
+                "assets/owner.bin".to_owned(),
+                "bin".to_owned(),
+            ],
+            payload_hash: None,
+        }];
+        let retained = vec![json!([
+            "label",
+            "assets/owner.bin",
+            "bin",
+            "tail",
+            {"rank":1}
+        ])];
+
+        assert!(owner_tuples_match(&retained, &manifest, true));
+        assert!(!owner_tuples_match(&retained, &manifest, false));
+        assert!(!owner_tuples_match(
+            &[json!(["different", "assets/owner.bin", "bin", "tail"])],
+            &manifest,
+            true,
+        ));
     }
 
     #[test]

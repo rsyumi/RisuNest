@@ -199,18 +199,34 @@ impl OwnerManifestProjector {
                 "owner manifest {manifest_hash} entry count mismatch"
             )));
         }
-        let tuples = Value::Array(
-            entries
-                .iter()
-                .map(|entry| Value::Array(entry.tuple.iter().cloned().map(Value::String).collect()))
-                .collect(),
+        let allow_trailing_fields = matches!(
+            &head.owner,
+            AssetOwnerLocator::RootModuleAssets { .. }
+                | AssetOwnerLocator::PersonaEmbeddedModuleAssets { .. }
         );
-        if parent.get(property) != Some(&tuples) {
+        let matches = parent
+            .get(property)
+            .and_then(Value::as_array)
+            .is_some_and(|tuples| {
+                tuples.len() == entries.len()
+                    && tuples.iter().zip(&entries).all(|(tuple, entry)| {
+                        tuple.as_array().is_some_and(|tuple| {
+                            (if allow_trailing_fields {
+                                tuple.len() >= 3
+                            } else {
+                                tuple.len() == 3
+                            }) && tuple[..3]
+                                .iter()
+                                .zip(&entry.tuple)
+                                .all(|(actual, expected)| actual.as_str() == Some(expected))
+                        })
+                    })
+            });
+        if !matches {
             return Err(validation(
                 "owner manifest does not match pinned legacy tuples",
             ));
         }
-        parent.insert(property.to_owned(), tuples);
         Ok(entries)
     }
 }

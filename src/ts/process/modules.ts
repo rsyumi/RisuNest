@@ -109,7 +109,9 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
     module = safeStructuredClone(module)
     module.assets ??= []
     module.assets = module.assets.map((asset) => {
-        return [asset[0], '', asset[2]] as [string,string,string]
+        const retained = safeStructuredClone(asset)
+        retained[1] = ''
+        return retained
     })
 
     const mainbuf = await encodeRPack(Buffer.from(JSON.stringify({

@@ -48,11 +48,16 @@ describe('pinned asset-owner compatibility projector', () => {
             'Assets\\Mixed/Path.BIN',
             'OddExt',
         ]
-        const moduleTuples: [string, string, string][] = [
+        const moduleManifestTuples: [string, string, string][] = [
             duplicate,
             ['second', 'https://example.invalid/remote', 'REMOTE'],
             duplicate,
         ]
+        const moduleTuples = [
+            [...moduleManifestTuples[0], 'first-tail', { rank: 1 }],
+            [...moduleManifestTuples[1], 'second-tail', { rank: 2 }],
+            [...moduleManifestTuples[2], 'third-tail', { rank: 3 }],
+        ] as unknown as [string, string, string][]
         const personaTuples: [string, string, string][] = [
             ['persona', 'assets/persona.bin', ''],
             ['persona', 'assets/persona.bin', ''],
@@ -121,7 +126,7 @@ describe('pinned asset-owner compatibility projector', () => {
         )
         await addPresentHead(
             { kind: 'root-module-assets', index: 2 },
-            moduleTuples,
+            moduleManifestTuples,
             [new Uint8Array(32).fill(1), null, new Uint8Array(32).fill(1)],
         )
         heads.push({
@@ -206,6 +211,47 @@ describe('pinned asset-owner compatibility projector', () => {
 
         await expect(projectPinnedCompatibilityDatabase(lease, {
             readOwnerManifest: async () => mismatched.bytes,
+        })).rejects.toThrow('does not match pinned legacy tuples')
+        await lease.release()
+    })
+
+    it('rejects trailing fields for character additional assets', async () => {
+        const database = structuredClone(fixtureDatabase)
+        database.modules = []
+        database.personas = []
+        database.characters[0].additionalAssets = [[
+            'character',
+            'assets/character.bin',
+            'bin',
+            'unsupported-tail',
+        ]] as unknown as [string, string, string][]
+        const manifest = await encodedManifest(
+            [['character', 'assets/character.bin', 'bin']],
+            [null],
+        )
+        const store = new IndexedDbPersistentDataStore(
+            'asset-owner-projector-character-tail',
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(database)
+        const character = (await store.readCharacter(database.characters[0].chaId))!.value
+        const committed = await store.commit({
+            expectedRevision: imported.revision,
+            character,
+            assetOwnerHeads: [{
+                owner: {
+                    kind: 'character-additional-assets',
+                    characterId: database.characters[0].chaId,
+                },
+                ...manifest.head,
+            } as AssetOwnerHead],
+        })
+        const lease = await store.acquireRevision(committed.revision)
+
+        await expect(projectPinnedCompatibilityDatabase(lease, {
+            readOwnerManifest: async () => manifest.bytes,
         })).rejects.toThrow('does not match pinned legacy tuples')
         await lease.release()
     })

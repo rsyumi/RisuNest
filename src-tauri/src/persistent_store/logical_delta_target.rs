@@ -1922,10 +1922,8 @@ fn rehydrate_owner_property(
     parent: &mut Map<String, Value>,
     property: &str,
     head: &ResolvedOwnerHead,
+    allow_retained_property: bool,
 ) -> Result<(), PeerSyncError> {
-    if parent.contains_key(property) {
-        return validation("logical owner property was not stripped from its parent envelope");
-    }
     if head.head.present {
         let tuples = head.tuples.clone().ok_or_else(|| {
             PeerSyncError::Validation(
@@ -1943,9 +1941,49 @@ fn rehydrate_owner_property(
                 "logical owner property index exceeds the platform range".to_owned(),
             )
         })?;
+        if let Some(retained) = parent.get(property) {
+            if !allow_retained_property {
+                return validation(
+                    "logical owner property was not stripped from its parent envelope",
+                );
+            }
+            if parent.keys().position(|key| key == property) != Some(property_index) {
+                return validation("retained logical owner property index differs from its head");
+            }
+            let retained = retained.as_array().ok_or_else(|| {
+                PeerSyncError::Validation(
+                    "retained logical owner property must be a tuple array".to_owned(),
+                )
+            })?;
+            if retained.len() != tuples.len() {
+                return validation("retained logical owner tuple count differs from its manifest");
+            }
+            let mut has_trailing_fields = false;
+            for (retained, expected) in retained.iter().zip(&tuples) {
+                let (Some(retained), Some(expected)) = (retained.as_array(), expected.as_array())
+                else {
+                    return validation("retained logical owner tuple differs from its manifest");
+                };
+                if retained.len() < 3 || expected.len() != 3 || retained[..3] != expected[..] {
+                    return validation("retained logical owner tuple differs from its manifest");
+                }
+                has_trailing_fields |= retained.len() > 3;
+            }
+            if !has_trailing_fields {
+                return validation(
+                    "exact-three logical owner property must use canonical stripping",
+                );
+            }
+            return Ok(());
+        }
         parent.shift_insert(property_index, property.to_owned(), Value::Array(tuples));
-    } else if head.tuples.is_some() || head.head.property_index.is_some() {
-        return validation("absent logical owner head contains manifest reconstruction data");
+    } else {
+        if parent.contains_key(property) {
+            return validation("absent logical owner property was retained in its parent envelope");
+        }
+        if head.tuples.is_some() || head.head.property_index.is_some() {
+            return validation("absent logical owner head contains manifest reconstruction data");
+        }
     }
     Ok(())
 }
@@ -1980,7 +2018,7 @@ fn rehydrate_root_owners(
                     "logical root module owner head coverage is incomplete".to_owned(),
                 )
             })?;
-            rehydrate_owner_property(module, "assets", head)?;
+            rehydrate_owner_property(module, "assets", head, true)?;
             expected += 1;
         }
     }
@@ -2001,7 +2039,7 @@ fn rehydrate_root_owners(
                         "logical persona owner head coverage is incomplete".to_owned(),
                     )
                 })?;
-            rehydrate_owner_property(embedded, "assets", head)?;
+            rehydrate_owner_property(embedded, "assets", head, true)?;
             expected += 1;
         }
     }
@@ -2027,7 +2065,7 @@ fn rehydrate_character_owner(
         return validation("logical character owner head differs from its encoded key");
     }
     let detail = json_object_mut(detail, "logical character detail")?;
-    rehydrate_owner_property(detail, "additionalAssets", head)
+    rehydrate_owner_property(detail, "additionalAssets", head, false)
 }
 
 fn clone_generation(
@@ -4971,12 +5009,14 @@ mod tests {
                     value: json!({
                         "theme":"remote",
                         "modules":[{
+                            "assets":[["label","assets/owner.bin","bin","module-tail",{"rank":1}]],
                             "before":"module-before",
                             "name":"Module",
                             "after":"module-after"
                         }],
                         "personas":[{"embeddedModule":{
                             "before":"persona-before",
+                            "assets":[["label","assets/owner.bin","bin","persona-tail",{"rank":2}]],
                             "name":"Embedded",
                             "after":"persona-after"
                         }}]
@@ -5282,7 +5322,7 @@ mod tests {
         assert_eq!(root["theme"], "remote");
         assert_eq!(
             root["modules"][0]["assets"],
-            json!([["label", "assets/owner.bin", "bin"]])
+            json!([["label", "assets/owner.bin", "bin", "module-tail", {"rank":1}]])
         );
         assert_eq!(
             root["modules"][0]
@@ -5295,7 +5335,7 @@ mod tests {
         );
         assert_eq!(
             root["personas"][0]["embeddedModule"]["assets"],
-            json!([["label", "assets/owner.bin", "bin"]])
+            json!([["label", "assets/owner.bin", "bin", "persona-tail", {"rank":2}]])
         );
         assert_eq!(
             root["personas"][0]["embeddedModule"]
@@ -5730,5 +5770,39 @@ mod tests {
         );
         assert!(!staging_root.exists());
         assert_eq!(cas.stat_object(&record.object.hash).unwrap(), None);
+    }
+
+    #[test]
+    fn retained_module_owner_property_rejects_noncanonical_or_mismatched_forms() {
+        let head = ResolvedOwnerHead {
+            head: LogicalOwnerHead::present(
+                LogicalOwnerLocator::RootModule { index: 0 },
+                "11".repeat(32),
+                1,
+                0,
+            )
+            .unwrap(),
+            tuples: Some(vec![json!(["label", "assets/owner.bin", "bin"])]),
+        };
+        let cases = [
+            (
+                json!({"assets":[["label","assets/owner.bin","bin"]],"name":"Module"}),
+                "exact-three logical owner property must use canonical stripping",
+            ),
+            (
+                json!({"assets":[["different","assets/owner.bin","bin","tail"]],"name":"Module"}),
+                "retained logical owner tuple differs from its manifest",
+            ),
+            (
+                json!({"before":true,"assets":[["label","assets/owner.bin","bin","tail"]]}),
+                "retained logical owner property index differs from its head",
+            ),
+        ];
+
+        for (module, expected) in cases {
+            let mut root = json!({"modules":[module]});
+            let error = rehydrate_root_owners(&mut root, std::slice::from_ref(&head)).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 }

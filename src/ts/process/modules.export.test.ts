@@ -94,9 +94,9 @@ describe('legacy module export', () => {
             name: 'Byte exact module',
             description: 'Legacy asset roundtrip',
             assets: [
-                ['ordinary-asset-a', 'asset://source-a', 'bin'],
-                ['ordinary-asset-b', 'asset://source-b', 'dat'],
-            ],
+                ['ordinary-asset-a', 'asset://source-a', 'bin', 'first-tail', { rank: 1 }],
+                ['ordinary-asset-b', 'asset://source-b', 'dat', 'second-tail', { rank: 2 }],
+            ] as unknown as [string, string, string][],
         }
 
         const exported = await exportModuleLegacy(module, { alertEnd: false, saveData: false })
@@ -113,8 +113,8 @@ describe('legacy module export', () => {
             Array.from(secondBytes),
         ])
         expect(imported.assets).toEqual([
-            ['ordinary-asset-a', 'asset://roundtrip-a', 'bin'],
-            ['ordinary-asset-b', 'asset://roundtrip-b', 'dat'],
+            ['ordinary-asset-a', 'asset://roundtrip-a', 'bin', 'first-tail', { rank: 1 }],
+            ['ordinary-asset-b', 'asset://roundtrip-b', 'dat', 'second-tail', { rank: 2 }],
         ])
     })
 })

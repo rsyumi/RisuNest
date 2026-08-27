@@ -20,11 +20,15 @@ export interface AssetRepositoryOwnerManifestView {
     readOwnerManifest(manifestHash: string): Promise<Uint8Array | null>
 }
 
-function exactTupleArray(value: unknown, expected: readonly AssetTuple[]): boolean {
+function matchesTupleArray(
+    value: unknown,
+    expected: readonly AssetTuple[],
+    allowTrailingFields: boolean,
+): boolean {
     if (!Array.isArray(value) || value.length !== expected.length) return false
     return value.every((tuple, index) => (
         Array.isArray(tuple)
-        && tuple.length === 3
+        && (allowTrailingFields ? tuple.length >= 3 : tuple.length === 3)
         && tuple[0] === expected[index][0]
         && tuple[1] === expected[index][1]
         && tuple[2] === expected[index][2]
@@ -65,10 +69,13 @@ async function applyOwnerHead(
         tuple[1],
         tuple[2],
     ] as [string, string, string])
-    if (!exactTupleArray(target[property], tuples)) {
+    if (!matchesTupleArray(
+        target[property],
+        tuples,
+        owner.kind !== 'character-additional-assets',
+    )) {
         throw new Error('Owner manifest does not match pinned legacy tuples')
     }
-    target[property] = tuples
 }
 
 async function pinnedPresets(

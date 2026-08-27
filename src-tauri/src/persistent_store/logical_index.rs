@@ -2617,14 +2617,32 @@ fn strip_owner_property(
     parent: &mut serde_json::Map<String, Value>,
     property: &str,
     head: &mut ValidatedOwnerHead,
+    allow_trailing_fields: bool,
 ) -> StoreResult<()> {
     let property_index = parent.keys().position(|key| key == property);
     if property_index.is_some() != head.head.present {
         return validation("owner head property presence does not match its parent record");
     }
     if let Some(expected) = &head.tuples {
-        if parent.get(property) != Some(&Value::Array(expected.clone())) {
+        let Some(actual) = parent.get(property).and_then(Value::as_array) else {
             return validation("owner manifest tuples do not match their parent record");
+        };
+        if actual.len() != expected.len() {
+            return validation("owner manifest tuples do not match their parent record");
+        }
+        let mut has_trailing_fields = false;
+        for (actual, expected) in actual.iter().zip(expected) {
+            let (Some(actual), Some(expected)) = (actual.as_array(), expected.as_array()) else {
+                return validation("owner manifest tuples do not match their parent record");
+            };
+            if actual.len() < 3
+                || expected.len() != 3
+                || actual[..3] != expected[..]
+                || (!allow_trailing_fields && actual.len() != 3)
+            {
+                return validation("owner manifest tuples do not match their parent record");
+            }
+            has_trailing_fields |= actual.len() > 3;
         }
         head.head.property_index = Some(
             u64::try_from(property_index.expect("present owner property has an index")).map_err(
@@ -2633,7 +2651,9 @@ fn strip_owner_property(
                 },
             )?,
         );
-        parent.shift_remove(property);
+        if !has_trailing_fields {
+            parent.shift_remove(property);
+        }
     } else {
         head.head.property_index = None;
     }
@@ -2680,7 +2700,7 @@ fn strip_root_owner_properties(
                     message: "root module owner head coverage is incomplete".to_owned(),
                 }
             })?;
-            strip_owner_property(module, "assets", &mut heads[head_index])?;
+            strip_owner_property(module, "assets", &mut heads[head_index], true)?;
             expected += 1;
         }
     }
@@ -2709,7 +2729,7 @@ fn strip_root_owner_properties(
                 .ok_or_else(|| StoreError::Validation {
                     message: "persona embedded module owner head coverage is incomplete".to_owned(),
                 })?;
-            strip_owner_property(embedded, "assets", &mut heads[head_index])?;
+            strip_owner_property(embedded, "assets", &mut heads[head_index], true)?;
             expected += 1;
         }
     }
@@ -2739,7 +2759,7 @@ fn strip_character_owner_property(
         .ok_or_else(|| StoreError::Validation {
             message: "character logical projection requires an object".to_owned(),
         })?;
-    strip_owner_property(detail, "additionalAssets", head)
+    strip_owner_property(detail, "additionalAssets", head, false)
 }
 
 fn payload_dependency(
@@ -3365,6 +3385,9 @@ mod tests {
     use crate::asset_repository::owner_manifest_codec::{
         encode_owner_manifest, OwnerManifestEntry,
     };
+    use crate::native_file_jobs::{
+        JobSource, JobState, NativeFileJobStartRequest, NativeFileJobState,
+    };
     use crate::peer_sync::logical_delta::{
         decode_asset_alias_metadata, decode_logical_record, decode_message_page,
         LogicalManifestRecord,
@@ -3372,12 +3395,76 @@ mod tests {
     use crate::persistent_store::{snapshot, ConversationMutation};
     use rusqlite::params;
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn open_j2_fixture() -> (tempfile::TempDir, PersistentStore, PayloadCas) {
         let directory = tempfile::tempdir().expect("create fixture directory");
         let store = PersistentStore::open(directory.path()).expect("open store");
         let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
         (directory, store, cas)
+    }
+
+    fn risum_fixture(module: Value, assets: &[&[u8]]) -> Vec<u8> {
+        let map = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
+        let encode = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| map[*byte as usize])
+                .collect::<Vec<_>>()
+        };
+        let metadata = encode(
+            serde_json::to_string(&json!({ "type": "risuModule", "module": module }))
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut bytes = vec![111, 0];
+        bytes.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&metadata);
+        for asset in assets {
+            let encoded = encode(asset);
+            bytes.push(1);
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes.push(0);
+        bytes
+    }
+
+    fn prepare_risum_content(
+        repository_root: &Path,
+        native_jobs: &NativeFileJobState,
+        module: Value,
+        assets: &[&[u8]],
+    ) -> crate::native_file_jobs::PreparedContent {
+        let source = repository_root.join("trailing-tuples.risum");
+        std::fs::write(&source, risum_fixture(module, assets)).unwrap();
+        let started = native_jobs
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::DesktopPath {
+                    path: source.to_string_lossy().into_owned(),
+                },
+                display_name: "trailing-tuples.risum".to_owned(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = native_jobs.status(&started.job_id).unwrap();
+            if status.state == JobState::Succeeded {
+                return native_jobs
+                    .prepared_content_receipt(&started.job_id)
+                    .unwrap();
+            }
+            assert!(
+                !matches!(status.state, JobState::Failed | JobState::Cancelled),
+                "RISUM preparation failed: {:?}",
+                status.error,
+            );
+            assert!(Instant::now() < deadline, "RISUM preparation timed out");
+            thread::yield_now();
+        }
     }
 
     fn seed_all_record_families(store: &PersistentStore, cas: &PayloadCas) -> (String, String) {
@@ -4099,6 +4186,146 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn native_risum_append_preserves_trailing_tuples_with_an_active_logical_index() {
+        let (directory, mut store, cas) = open_j2_fixture();
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let native_jobs = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let trailing_tuples = json!([
+            ["duplicate", "", "OddExt", "first-trailing", {"rank": 1}],
+            ["duplicate", "", "OddExt", "second-trailing", {"rank": 2}]
+        ]);
+        let content = prepare_risum_content(
+            directory.path(),
+            &native_jobs,
+            json!({
+                "id": "source-id",
+                "name": "Trailing tuple module",
+                "assets": trailing_tuples
+            }),
+            &[b"same exact bytes", b"same exact bytes"],
+        );
+        let mut module = content.metadata.clone();
+        module["id"] = json!("new-module-id");
+        for asset in &content.assets {
+            let position = asset.position.unwrap();
+            module["assets"][position][1] = json!(asset.logical_id);
+        }
+        let expected_tuples = module["assets"].clone();
+        let owner_head = content.owner_head.unwrap();
+        let manifest_hash = owner_head.manifest_hash.clone().unwrap();
+        let payload_hash = content.assets[0].object_hash.clone();
+        let aliases = content
+            .assets
+            .iter()
+            .map(|asset| AssetAlias {
+                key: asset.logical_id.clone(),
+                object_hash: Some(asset.object_hash.clone()),
+                kind: "asset".to_owned(),
+                size: i64::try_from(asset.byte_size).unwrap(),
+                mime: asset.mime.clone(),
+                name: asset.name.clone(),
+                ext: asset.ext.clone(),
+                inlay_type: None,
+                width: None,
+                height: None,
+                metadata: json!({}),
+            })
+            .map(|alias| (alias.key.clone(), alias))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        let committed = store
+            .commit_with_asset_aliases(
+                &WorkingSetCommit {
+                    expected_revision: 0,
+                    root: Some(json!({ "modules": [module] })),
+                    replace_presets: None,
+                    character: None,
+                    character_details: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: None,
+                    delete_character_id: None,
+                    plugin_storage: None,
+                    asset_owner_heads: Some(vec![super::super::AssetOwnerHead::present(
+                        super::super::AssetOwnerLocator::RootModuleAssets { index: 0 },
+                        manifest_hash.clone(),
+                        i64::try_from(owner_head.entry_count).unwrap(),
+                    )]),
+                },
+                &aliases,
+            )
+            .expect("append trailing-tuple RISUM with active logical index");
+
+        assert_eq!(committed.revision, 1);
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(
+            store
+                .build_indexed_logical_manifest("library", &sealed.manifest.generation)
+                .unwrap()
+                .manifest_hash,
+            sealed.manifest_hash,
+        );
+        let root_key = encode_logical_record_key(&LogicalRecordLocator::Root).unwrap();
+        let (root_object_hash, root_dependencies): (String, Vec<String>) = {
+            let object_hash = store
+                .connection
+                .query_row(
+                    "SELECT object_hash FROM logical_record_heads
+                     WHERE library_id = 'library' AND generation_id = ?1 AND record_key = ?2",
+                    params![sealed.manifest.generation, root_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT object_hash FROM logical_record_dependencies
+                     WHERE library_id = 'library' AND generation_id = ?1 AND record_key = ?2
+                     ORDER BY object_hash ASC",
+                )
+                .unwrap();
+            let dependencies = statement
+                .query_map(params![sealed.manifest.generation, root_key], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap();
+            (object_hash, dependencies)
+        };
+        let root_envelope = store
+            .reconstruct_logical_object(
+                &cas,
+                "library",
+                &sealed.manifest.generation,
+                &root_object_hash,
+            )
+            .unwrap();
+        let LogicalRecordEnvelope::Root { value, .. } =
+            decode_logical_record(&root_envelope).unwrap()
+        else {
+            panic!("expected logical root envelope");
+        };
+        assert_eq!(value["modules"][0]["assets"], expected_tuples);
+        assert_eq!(
+            root_dependencies.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([manifest_hash, payload_hash]),
+        );
+        assert_eq!(
+            store.materialize(None).unwrap()["modules"][0]["assets"],
+            expected_tuples,
+        );
+        let lease = store.acquire_revision(committed.revision).unwrap();
+        let exported = store.export_risu_save(&lease.lease, false).unwrap();
+        store
+            .cleanup_risu_save_export(Path::new(&exported.path))
+            .unwrap();
     }
 
     #[test]
