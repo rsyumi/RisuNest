@@ -373,7 +373,7 @@ async function deriveParserHistoryBoundsFromReader(
     let end = selectionEndExclusive
     const captureText = collectCaptureText([selectedMessages, renderContext]).join('\n')
 
-    if (requiresFullParserHistory(captureText)) {
+    if (requiresFullConversationProjection(captureText)) {
         return { start: 0, end: reader.totalTurns }
     }
 
@@ -411,8 +411,8 @@ async function deriveParserHistoryBoundsFromReader(
     return { start, end }
 }
 
-function requiresFullParserHistory(captureText: string): boolean {
-    return /{{\s*(?:userhistory|usermessages|user_history|charhistory|charmessages|char_history|history|messages|messageunixtimearray|idleduration|idle_duration|lastmessage|lastmessageid|lastmessageindex)(?=\s*(?:::|}}))/i.test(captureText)
+function requiresFullConversationProjection(captureText: string): boolean {
+    return /{{\s*(?:userhistory|usermessages|user_history|charhistory|charmessages|char_history|history|messages|messageunixtimearray|message_unixtime_array|idleduration|idle_duration|lastmessage|lastmessageid|lastmessageindex|pick|rollp|rollpick)(?=\s*(?:::|}}))/i.test(captureText)
 }
 
 function previousChatLogPattern(): RegExp {
@@ -496,7 +496,7 @@ function deriveParserHistoryBounds(
         messages.slice(selectionStartIndex, selectionEndExclusive),
         renderContext,
     ]).join('\n')
-    if (requiresFullParserHistory(captureText)) {
+    if (requiresFullConversationProjection(captureText)) {
         start = 0
         end = messages.length
     }

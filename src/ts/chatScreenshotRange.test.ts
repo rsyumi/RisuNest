@@ -352,6 +352,37 @@ describe('chat screenshot ranges', () => {
         ])
     })
 
+    it.each([
+        '{{message_unixtime_array}}',
+        '{{pick::one::two}}',
+        '{{rollp::1d6}}',
+        '{{rollpick::1d6}}',
+    ])('keeps the full pinned message-count semantics for %s', async (macro) => {
+        const messages = Array.from({ length: 100 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' as const : 'user' as const,
+            data: index === 99 ? macro : `turn ${index + 1}`,
+        }))
+        const { reader } = rangeReader(messages)
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: reader.characterId,
+            chatId: reader.chatId,
+            revision: reader.revision,
+            sessionVersion: 1,
+            totalTurns: reader.totalTurns,
+            renderContext: renderContext(),
+        })
+
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            100,
+            100,
+        )
+
+        expect(job.renderContext.historyStartIndex).toBe(0)
+        expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(100)
+    })
+
     it('extends the pinned projection for previouschatlog without rereading the selection', async () => {
         const messages = Array.from({ length: 100 }, (_, index) => ({
             role: index % 2 === 0 ? 'char' as const : 'user' as const,

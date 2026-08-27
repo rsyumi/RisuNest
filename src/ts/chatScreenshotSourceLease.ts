@@ -15,6 +15,7 @@ import {
     type PersistentConversationReadDependencies,
 } from './storage/persistentConversationRead'
 import type { PersistentRevisionLease } from './storage/persistentDataStore'
+import { releasePersistentRevisionLease } from './storage/persistentRecordIterator'
 
 export interface ChatScreenshotSourceDependencies extends PersistentConversationReadDependencies {
     getActiveConversationSession(): ActiveConversationSession | null
@@ -214,7 +215,7 @@ export async function openChatScreenshotSourceLease(
         let activeJob: Promise<ChatScreenshotJob> | null = null
         const release = () => {
             if (releasePromise) return releasePromise
-            releasePromise = lease.release().then(() => {
+            releasePromise = releasePersistentRevisionLease(lease).then(() => {
                 released = true
             })
             return releasePromise
@@ -253,6 +254,6 @@ export async function openChatScreenshotSourceLease(
         keepLease = true
         return source
     } finally {
-        if (!keepLease) await lease.release()
+        if (!keepLease) await releasePersistentRevisionLease(lease)
     }
 }

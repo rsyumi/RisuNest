@@ -215,6 +215,22 @@ describe('chat screenshot source lease', () => {
         )
     })
 
+    it('retries a transient pinned revision release failure', async () => {
+        const source = harness([{ role: 'user', data: 'open' }])
+        source.release
+            .mockRejectedValueOnce(new Error('transient release failure'))
+            .mockResolvedValueOnce(undefined)
+        const lease = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+
+        await lease.close()
+
+        expect(source.release).toHaveBeenCalledTimes(2)
+    })
+
     it('releases the pinned revision when materialization is cancelled', async () => {
         const source = harness([{ role: 'user', data: 'open' }])
         const lease = await openChatScreenshotSourceLease({
