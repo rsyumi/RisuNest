@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
@@ -116,7 +116,12 @@ pub(super) fn run_job(
     job.start(JobPhase::WritingExport)
         .map_err(|error| job_control_error(&job, error))?;
     let prepared = crate::persistent_store::commands::with_store_mut(app.state(), |store| {
-        store.prepare_official_publication(&request.lease, request.expected_revision)
+        store.prepare_official_publication_for_job(
+            &request.lease,
+            request.expected_revision,
+            &job.id(),
+            now_millis(),
+        )
     })
     .map_err(store_error)?;
     let revision = prepared.revision;
@@ -764,6 +769,14 @@ fn invalid_input(message: impl AsRef<str>) -> NativeJobError {
 
 fn cancelled(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("cancelled", message)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]

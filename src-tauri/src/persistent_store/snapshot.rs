@@ -107,6 +107,12 @@ impl RevisionReadLease {
         self.active_readers
             .publish_detached_asset_roots(&self.lease, roots)
     }
+
+    #[cfg(feature = "native-official-publication")]
+    pub(crate) fn asset_roots(&self) -> StoreResult<AssetRootSet> {
+        let cas = PayloadCas::new(&self.repository_root)?;
+        collect_asset_roots_for_generation(&self.connection, &cas, &self.target.generation)
+    }
 }
 
 impl Drop for RevisionReadLease {
@@ -520,10 +526,22 @@ pub(super) fn collect_asset_roots(
     scan_optional_hash_column(
         connection,
         "SELECT manifest_hash FROM asset_owner_heads WHERE present = 1",
+        [],
         &mut roots.manifest_hashes,
     )?;
-    scan_asset_alias_roots(connection, &mut roots)?;
-    let cold_aliases = scan_cold_alias_roots(connection, &mut roots)?;
+    scan_asset_alias_roots(
+        connection,
+        "SELECT logical_key, object_hash FROM asset_aliases",
+        [],
+        &mut roots,
+    )?;
+    let cold_aliases = scan_cold_alias_roots(
+        connection,
+        "SELECT key, object_hash, size FROM cold_aliases
+         ORDER BY generation ASC, key ASC",
+        [],
+        &mut roots,
+    )?;
     let retained_generations: i64 =
         connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
     let has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();
@@ -531,6 +549,7 @@ pub(super) fn collect_asset_roots(
         scan_optional_hash_column(
             connection,
             "SELECT manifest_hash FROM logical_sync_generations WHERE state = 'complete'",
+            [],
             &mut roots.object_hashes,
         )?;
     }
@@ -538,6 +557,7 @@ pub(super) fn collect_asset_roots(
         scan_optional_hash_column(
             connection,
             "SELECT manifest_hash FROM logical_peer_common_bases",
+            [],
             &mut roots.object_hashes,
         )?;
     }
@@ -550,13 +570,13 @@ pub(super) fn collect_asset_roots(
         "SELECT value FROM messages",
         "SELECT value FROM plugin_storage",
     ] {
-        scan_json_column(connection, query, &mut roots)?;
+        scan_json_column(connection, query, [], &mut roots)?;
     }
     for query in [
         "SELECT image FROM bot_presets WHERE image IS NOT NULL",
         "SELECT image FROM characters WHERE image IS NOT NULL",
     ] {
-        scan_text_column(connection, query, &mut roots)?;
+        scan_text_column(connection, query, [], &mut roots)?;
     }
     let plugin_rows: i64 =
         connection.query_row("SELECT COUNT(*) FROM plugin_storage", [], |row| row.get(0))?;
@@ -570,6 +590,66 @@ pub(super) fn collect_asset_roots(
         roots.blockers.insert("cold-payload-unscanned".to_owned());
         roots.retain_all_objects = true;
     }
+    if !roots.cold_keys.is_empty() {
+        roots.blockers.insert("cold-payload-unscanned".to_owned());
+        roots.retain_all_objects = true;
+    }
+    Ok(roots)
+}
+
+#[cfg(feature = "native-official-publication")]
+fn collect_asset_roots_for_generation(
+    connection: &Connection,
+    cas: &PayloadCas,
+    generation: &str,
+) -> StoreResult<AssetRootSet> {
+    let mut roots = AssetRootSet::default();
+
+    scan_optional_hash_column(
+        connection,
+        "SELECT manifest_hash FROM asset_owner_heads
+         WHERE generation = ?1 AND present = 1",
+        [generation],
+        &mut roots.manifest_hashes,
+    )?;
+    scan_asset_alias_roots(
+        connection,
+        "SELECT logical_key, object_hash FROM asset_aliases WHERE generation = ?1",
+        [generation],
+        &mut roots,
+    )?;
+    let cold_aliases = scan_cold_alias_roots(
+        connection,
+        "SELECT key, object_hash, size FROM cold_aliases
+         WHERE generation = ?1 ORDER BY key ASC",
+        [generation],
+        &mut roots,
+    )?;
+    for query in [
+        "SELECT value FROM root WHERE generation = ?1",
+        "SELECT value FROM bot_presets WHERE generation = ?1",
+        "SELECT detail FROM characters WHERE generation = ?1",
+        "SELECT detail FROM conversations WHERE generation = ?1",
+        "SELECT value FROM messages WHERE generation = ?1",
+        "SELECT value FROM plugin_storage WHERE generation = ?1",
+    ] {
+        scan_json_column(connection, query, [generation], &mut roots)?;
+    }
+    for query in [
+        "SELECT image FROM bot_presets WHERE generation = ?1 AND image IS NOT NULL",
+        "SELECT image FROM characters WHERE generation = ?1 AND image IS NOT NULL",
+    ] {
+        scan_text_column(connection, query, [generation], &mut roots)?;
+    }
+    let plugin_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM plugin_storage WHERE generation = ?1",
+        [generation],
+        |row| row.get(0),
+    )?;
+    if plugin_rows > 0 {
+        roots.retain_all_objects = true;
+    }
+    resolve_nested_cold_roots(cas, cold_aliases, &mut roots)?;
     if !roots.cold_keys.is_empty() {
         roots.blockers.insert("cold-payload-unscanned".to_owned());
         roots.retain_all_objects = true;
@@ -592,15 +672,14 @@ fn repository_root_from_database_path(database_path: &Path) -> StoreResult<PathB
         .ok_or_else(|| validation("persistent database has no repository root"))
 }
 
-fn scan_cold_alias_roots(
+fn scan_cold_alias_roots<P: rusqlite::Params>(
     connection: &Connection,
+    query: &str,
+    params: P,
     roots: &mut AssetRootSet,
 ) -> StoreResult<Vec<(String, String, u64)>> {
-    let mut statement = connection.prepare(
-        "SELECT key, object_hash, size FROM cold_aliases
-         ORDER BY generation ASC, key ASC",
-    )?;
-    let mut rows = statement.query([])?;
+    let mut statement = connection.prepare(query)?;
+    let mut rows = statement.query(params)?;
     let mut aliases = Vec::new();
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
@@ -701,13 +780,14 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
         .map_err(StoreError::from)
 }
 
-fn scan_optional_hash_column(
+fn scan_optional_hash_column<P: rusqlite::Params>(
     connection: &Connection,
     query: &str,
+    params: P,
     target: &mut std::collections::BTreeSet<String>,
 ) -> StoreResult<()> {
     let mut statement = connection.prepare(query)?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
         let value: Option<String> = row.get(0)?;
         if let Some(value) = value {
@@ -717,9 +797,14 @@ fn scan_optional_hash_column(
     Ok(())
 }
 
-fn scan_asset_alias_roots(connection: &Connection, roots: &mut AssetRootSet) -> StoreResult<()> {
-    let mut statement = connection.prepare("SELECT logical_key, object_hash FROM asset_aliases")?;
-    let mut rows = statement.query([])?;
+fn scan_asset_alias_roots<P: rusqlite::Params>(
+    connection: &Connection,
+    query: &str,
+    params: P,
+    roots: &mut AssetRootSet,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(query)?;
+    let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
         let logical_key: String = row.get(0)?;
         let object_hash: Option<String> = row.get(1)?;
@@ -732,13 +817,14 @@ fn scan_asset_alias_roots(connection: &Connection, roots: &mut AssetRootSet) -> 
     Ok(())
 }
 
-fn scan_json_column(
+fn scan_json_column<P: rusqlite::Params>(
     connection: &Connection,
     query: &str,
+    params: P,
     roots: &mut AssetRootSet,
 ) -> StoreResult<()> {
     let mut statement = connection.prepare(query)?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
         let encoded: String = row.get(0)?;
         let value: serde_json::Value = serde_json::from_str(&encoded)?;
@@ -747,13 +833,14 @@ fn scan_json_column(
     Ok(())
 }
 
-fn scan_text_column(
+fn scan_text_column<P: rusqlite::Params>(
     connection: &Connection,
     query: &str,
+    params: P,
     roots: &mut AssetRootSet,
 ) -> StoreResult<()> {
     let mut statement = connection.prepare(query)?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
         let value: String = row.get(0)?;
         observe_text(&value, roots);

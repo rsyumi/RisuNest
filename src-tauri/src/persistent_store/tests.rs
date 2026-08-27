@@ -2102,6 +2102,117 @@ fn official_publication_transfers_only_the_exact_expected_revision_lease() {
 
 #[cfg(feature = "native-official-publication")]
 #[test]
+fn official_publication_seals_exact_owner_and_direct_roots_before_reader_transfer() {
+    use crate::asset_repository::job_pins::{CasReleaseOutcome, DurableCasJob};
+
+    let directory = tempfile::tempdir().expect("create publication store");
+    let mut store = PersistentStore::open(directory.path()).expect("open publication store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let owner = cas
+        .prepare_bytes(b"owner-manifest")
+        .expect("prepare owner manifest");
+    let direct = cas
+        .prepare_bytes(b"direct-object")
+        .expect("prepare direct object");
+    let historical_owner = cas
+        .prepare_bytes(b"historical-owner-manifest")
+        .expect("prepare historical owner manifest");
+    let historical_direct = cas
+        .prepare_bytes(b"historical-direct-object")
+        .expect("prepare historical direct object");
+    let generation = super::active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES (?1, 'root-module-assets', '0', 1, ?2, 1)",
+            rusqlite::params![&generation, &owner.content_hash],
+        )
+        .expect("insert owner root");
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES ('historical-generation', 'root-module-assets', '0', 1, ?1, 1)",
+            [&historical_owner.content_hash],
+        )
+        .expect("insert historical owner root");
+    for (key, hash, size) in [
+        (
+            "assets/owner-overlap.bin",
+            &owner.content_hash,
+            owner.byte_size,
+        ),
+        ("assets/direct.bin", &direct.content_hash, direct.byte_size),
+    ] {
+        store
+            .connection
+            .execute(
+                "INSERT INTO asset_aliases (
+                    generation, logical_key, object_hash, kind, size, mime, name, ext,
+                    inlay_type, width, height, metadata
+                 ) VALUES (?1, ?2, ?3, 'asset', ?4,
+                    'application/octet-stream', ?2, 'bin', NULL, NULL, NULL, '{}')",
+                rusqlite::params![&generation, key, hash, size as i64],
+            )
+            .expect("insert direct root");
+    }
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height, metadata
+             ) VALUES ('historical-generation', 'assets/historical.bin', ?1, 'asset', ?2,
+                'application/octet-stream', 'historical.bin', 'bin', NULL, NULL, NULL, '{}')",
+            rusqlite::params![
+                &historical_direct.content_hash,
+                historical_direct.byte_size as i64
+            ],
+        )
+        .expect("insert historical direct root");
+    let lease = store
+        .acquire_revision(0)
+        .expect("acquire exact revision")
+        .lease;
+    let exports = directory.path().join("persistent").join("exports");
+
+    let prepared = store
+        .prepare_official_publication_for_job(&lease, 0, "publication-root-job", 1)
+        .expect("prepare durable publication");
+
+    let durable = DurableCasJob::open(directory.path(), "publication-root-job")
+        .expect("open sealed publication journal");
+    assert!(durable.is_sealed());
+    assert_eq!(
+        durable.root_set().expect("read durable roots"),
+        crate::asset_repository::migration_gc::AssetRootSet {
+            manifest_hashes: [owner.content_hash.clone()].into(),
+            object_hashes: [direct.content_hash.clone()].into(),
+            ..Default::default()
+        }
+    );
+    assert_eq!(store.active_readers.active_count(), 1);
+    assert!(matches!(
+        store.read_root(Some(&lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert!(!exports.exists());
+
+    drop(prepared);
+    assert_eq!(store.active_readers.active_count(), 0);
+    assert!(DurableCasJob::open(directory.path(), "publication-root-job").is_ok());
+    let mut durable = DurableCasJob::open(directory.path(), "publication-root-job")
+        .expect("reopen publication journal");
+    durable
+        .release(CasReleaseOutcome::Aborted)
+        .expect("release publication fixture");
+}
+
+#[cfg(feature = "native-official-publication")]
+#[test]
 fn official_publication_payload_closes_its_reader_and_reopens_exact_managed_bytes() {
     let directory = tempfile::tempdir().expect("create publication store");
     let mut store = PersistentStore::open(directory.path()).expect("open publication store");

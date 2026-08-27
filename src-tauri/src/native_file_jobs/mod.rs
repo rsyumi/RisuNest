@@ -1620,6 +1620,55 @@ impl NativeFileJobState {
     }
 
     pub(crate) fn forget(&self, job_id: &str) -> Result<bool, NativeJobError> {
+        #[cfg(feature = "native-official-publication")]
+        {
+            let job = self
+                .registry
+                .lookup(job_id)
+                .map_err(|error| NativeJobError::new("store-error", error))?;
+            let Some(job) = job else {
+                return Ok(false);
+            };
+            let status = job.status();
+            if status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal() {
+                use crate::asset_repository::job_pins::{CasReleaseOutcome, DurableCasJob};
+
+                let outcome = match status
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.publication.as_ref())
+                {
+                    Some(
+                        OfficialPublicationAttemptResult::Written { .. }
+                        | OfficialPublicationAttemptResult::NotModified { .. },
+                    ) if status.state == JobState::Succeeded => CasReleaseOutcome::Committed,
+                    _ => CasReleaseOutcome::Aborted,
+                };
+                let repository_root = self.root.parent().ok_or_else(|| {
+                    NativeJobError::new(
+                        "cleanup-failed",
+                        "native job root has no repository parent",
+                    )
+                })?;
+                match DurableCasJob::open(repository_root, job_id) {
+                    Ok(mut durable) => durable.release(outcome).map_err(|error| {
+                        NativeJobError::new(
+                            "cleanup-failed",
+                            format!("official publication CAS release failed: {error}"),
+                        )
+                    })?,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && status.state != JobState::Succeeded => {}
+                    Err(error) => {
+                        return Err(NativeJobError::new(
+                            "cleanup-failed",
+                            format!("official publication CAS release failed: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
         self.registry
             .forget(job_id)
             .map_err(|error| NativeJobError::new("store-error", error))
@@ -2281,7 +2330,7 @@ impl JobRegistry {
             .map_err(|error| format!("native job registry mutex poisoned: {error}"))?;
         let mut terminal = Vec::new();
         for (id, job) in jobs.iter() {
-            if job.retains_prepared_content_until_forget()? {
+            if job.retains_terminal_receipt_until_forget()? {
                 continue;
             }
             if let Some(time) = job.terminal_time() {
@@ -2328,14 +2377,15 @@ impl JobControl {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
-    fn retains_prepared_content_until_forget(&self) -> Result<bool, String> {
+    fn retains_terminal_receipt_until_forget(&self) -> Result<bool, String> {
         let status = self
             .status
             .lock()
             .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
-        Ok(status.kind == JobKind::PrepareContentImport
+        Ok((status.kind == JobKind::PrepareContentImport
             && status.state == JobState::Succeeded
             && status.prepared_content.is_some())
+            || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal()))
     }
 
     fn request_cancel(&self) -> Result<CancelOutcome, String> {
@@ -3236,6 +3286,163 @@ mod tests {
         job.finish_official_publication_success(summary).unwrap();
         assert_eq!(job.status().state, JobState::Succeeded);
         assert!(job.status().result.unwrap().publication.is_some());
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    fn sealed_publication_job(repository_root: &Path, job_id: &str) -> (String, PathBuf) {
+        use crate::asset_repository::job_pins::{CasJobKind, CasObjectRole, DurableCasJob};
+
+        let mut store = crate::persistent_store::PersistentStore::open(repository_root).unwrap();
+        let cas = crate::asset_repository::PayloadCas::new(repository_root).unwrap();
+        let payload = cas.prepare_bytes(b"publication-root").unwrap();
+        let mut durable = DurableCasJob::begin(
+            repository_root,
+            job_id,
+            CasJobKind::OfficialPublicationOrExportPreparation,
+            1,
+        )
+        .unwrap();
+        durable
+            .pin_existing(
+                &cas,
+                &payload.content_hash,
+                payload.byte_size,
+                CasObjectRole::DirectObject,
+            )
+            .unwrap();
+        durable.seal(&mut store, 2).unwrap();
+        (payload.content_hash, durable.journal_path().to_owned())
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    fn finish_written_publication(job: &JobControl) {
+        job.start(JobPhase::WritingExport).unwrap();
+        job.set_phase(JobPhase::UploadingDatabase).unwrap();
+        job.begin_official_publication_finalization().unwrap();
+        let mut summary = result(1);
+        summary.publication = Some(OfficialPublicationAttemptResult::Written {
+            account_id: "account-1".to_owned(),
+            session: Some("session".to_owned()),
+            save_date: "date".to_owned(),
+            status: 200,
+            replacement_key: "database/database.bin".to_owned(),
+            warning: None,
+            reload_session: false,
+        });
+        job.finish_official_publication_success(summary).unwrap();
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    #[test]
+    fn publication_receipt_ack_releases_committed_roots_only_when_forgotten() {
+        use crate::asset_repository::job_pins::collect_durable_cas_job_roots;
+
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let job = state
+            .registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        let (hash, _) = sealed_publication_job(directory.path(), &job.id());
+        finish_written_publication(&job);
+
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .contains(&hash));
+        assert_eq!(job.status().state, JobState::Succeeded);
+
+        assert!(state.forget(&job.id()).unwrap());
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .is_empty());
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    #[test]
+    fn terminal_publication_receipt_is_not_pruned_before_acknowledgement() {
+        let registry = JobRegistry::with_retention(0, Duration::ZERO);
+        let publication = registry.create(JobKind::OfficialPublicationUpload).unwrap();
+        let publication_id = publication.id();
+        finish_written_publication(&publication);
+
+        let ordinary = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+        ordinary.start(JobPhase::ReadingSource).unwrap();
+        ordinary.finish_success(result(1)).unwrap();
+
+        assert_eq!(
+            registry.status(&publication_id).unwrap().state,
+            JobState::Succeeded
+        );
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    #[test]
+    fn terminal_publication_failure_forget_releases_aborted_roots() {
+        use crate::asset_repository::job_pins::collect_durable_cas_job_roots;
+
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let job = state
+            .registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        let (hash, _) = sealed_publication_job(directory.path(), &job.id());
+        job.start(JobPhase::WritingExport).unwrap();
+        job.finish_failure("transport-failed", "offline").unwrap();
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .contains(&hash));
+
+        assert!(state.forget(&job.id()).unwrap());
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .is_empty());
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    #[test]
+    fn publication_release_error_retains_terminal_receipt_and_journal() {
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let job = state
+            .registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        let (_, journal) = sealed_publication_job(directory.path(), &job.id());
+        finish_written_publication(&job);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(b"not-json\n")
+            .unwrap();
+
+        assert!(state.forget(&job.id()).is_err());
+        assert_eq!(state.status(&job.id()).unwrap().state, JobState::Succeeded);
+        assert!(journal.is_file());
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    #[test]
+    fn process_loss_keeps_unacknowledged_publication_roots_as_startup_blockers() {
+        use crate::asset_repository::job_pins::collect_durable_cas_job_roots;
+
+        let directory = TempDir::new().unwrap();
+        let native_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(native_root.clone());
+        let job = state
+            .registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        let (hash, _) = sealed_publication_job(directory.path(), &job.id());
+        finish_written_publication(&job);
+        drop(job);
+        drop(state);
+
+        let _restarted = NativeFileJobState::initialize(native_root);
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .contains(&hash));
     }
 
     fn write_literal_spool(root: &Path, token: &str, manifest: &str, created_at_millis: u64) {

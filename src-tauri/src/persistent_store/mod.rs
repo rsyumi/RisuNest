@@ -1692,6 +1692,95 @@ impl PersistentStore {
         })
     }
 
+    #[cfg(feature = "native-official-publication")]
+    pub(crate) fn prepare_official_publication_for_job(
+        &mut self,
+        lease: &str,
+        expected_revision: i64,
+        job_id: &str,
+        created_at_ms: i64,
+    ) -> StoreResult<PreparedOfficialPublication> {
+        use crate::asset_repository::job_pins::{
+            CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
+        };
+
+        if !lease.starts_with("snapshot-") {
+            return Err(StoreError::Validation {
+                message: "revision lease must be a snapshot lease".to_owned(),
+            });
+        }
+        let roots = {
+            let reader = self
+                .revision_leases
+                .get(lease)
+                .ok_or(StoreError::SnapshotReleased)?;
+            if reader.target.revision != expected_revision {
+                return Err(StoreError::RevisionConflict {
+                    expected: expected_revision,
+                    actual: reader.target.revision,
+                });
+            }
+            reader.asset_roots()?
+        };
+        let mut durable = DurableCasJob::begin(
+            &self.repository_root,
+            job_id,
+            CasJobKind::OfficialPublicationOrExportPreparation,
+            created_at_ms,
+        )?;
+        let pin_result = (|| -> StoreResult<()> {
+            let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+            let mut pins = Vec::with_capacity(
+                roots
+                    .manifest_hashes
+                    .len()
+                    .saturating_add(roots.object_hashes.len()),
+            );
+            for hash in &roots.manifest_hashes {
+                let byte_size = cas
+                    .stat_object(hash)?
+                    .ok_or_else(|| StoreError::Validation {
+                        message: "Pinned publication owner manifest is missing from CAS".to_owned(),
+                    })?;
+                pins.push((hash.clone(), byte_size, CasObjectRole::OwnerManifest));
+            }
+            for hash in roots
+                .object_hashes
+                .iter()
+                .filter(|hash| !roots.manifest_hashes.contains(*hash))
+            {
+                let byte_size = cas
+                    .stat_object(hash)?
+                    .ok_or_else(|| StoreError::Validation {
+                        message: "Pinned publication object is missing from CAS".to_owned(),
+                    })?;
+                pins.push((hash.clone(), byte_size, CasObjectRole::DirectObject));
+            }
+            durable.pin_existing_batch(&cas, &pins)?;
+            durable.seal(self, created_at_ms)?;
+            Ok(())
+        })();
+        if let Err(error) = pin_result {
+            return Err(combine_publication_cleanup_error(
+                error,
+                durable
+                    .release(CasReleaseOutcome::Aborted)
+                    .map_err(StoreError::from),
+                "CAS job abort",
+            ));
+        }
+        match self.prepare_official_publication(lease, expected_revision) {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => Err(combine_publication_cleanup_error(
+                error,
+                durable
+                    .release(CasReleaseOutcome::Aborted)
+                    .map_err(StoreError::from),
+                "CAS job abort",
+            )),
+        }
+    }
+
     pub(crate) fn cleanup_risu_save_export(&self, path: &Path) -> StoreResult<()> {
         export::cleanup(&self.snapshots_dir, path)
     }
