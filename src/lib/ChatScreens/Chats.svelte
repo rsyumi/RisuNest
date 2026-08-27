@@ -49,7 +49,7 @@
         viewportSource = null,
         hasNewUnreadMessage = $bindable(false),
     }: {
-        messages: Message[]
+        messages?: Message[]
         currentCharacter: character | groupChat
         onReroll: () => void
         unReroll: () => void
@@ -96,12 +96,14 @@
     let sourceUpdateRevision = $state(0)
     let lastMountedSourceTailKey: string | null = null
     let pendingSourceWasAtBottom: boolean | null = null
+    let pendingSourceHandoffAnchor: ChatViewportAnchor | null = null
+    let renderedConversationIdentity: string | null = null
     let viewportAnchor: ChatViewportAnchor | null = null
     let viewportResult: ChatViewportResult | null = null
     let identitySequence: ChatRenderIdentitySequence | null = null
     let messageRenderKeys: string[] = []
     let registeredScope: string | null = null
-    let registeredMessages: Message[] | null = null
+    let registeredMessages: Message[] | undefined
     let registeredLength = 0
     let previousReloadPointer: unknown = null
     let activeScope: string | null = null
@@ -155,7 +157,7 @@
         })
     })
 
-    function currentChatScope(): string {
+    function currentConversationIdentity(): string {
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const selectedCharacterIndex = get(selectedCharID)
         const ownerId = currentCharacter.type === 'group'
@@ -171,8 +173,26 @@
             String(ownerSessionId),
             conversationId,
             String(conversationSessionId),
-            activeViewportSource?.snapshot().sourceToken ?? 'compatibility-array',
         ].map((part) => `${part.length}:${part}`).join('|')
+    }
+
+    function currentConversationHandoffIdentity(): string {
+        const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
+        const selectedCharacterIndex = get(selectedCharID)
+        const ownerId = currentCharacter.type === 'group'
+            ? `group:${selectedCharacterIndex}:${currentCharacter.chaId}`
+            : `character:${currentCharacter.chaId}`
+        const conversationId = currentChat?.id ?? `page:${currentCharacter.chatPage}`
+        return [ownerId, conversationId]
+            .map((part) => `${part.length}:${part}`)
+            .join('|')
+    }
+
+    function currentChatScope(): string {
+        const conversationIdentity = currentConversationIdentity()
+        const sourceIdentity = activeViewportSource?.snapshot().sourceToken
+            ?? 'compatibility-array'
+        return `${conversationIdentity}|${sourceIdentity.length}:${sourceIdentity}`
     }
 
     function objectScopeIdentity(identities: WeakMap<object, number>, value: object): number {
@@ -232,14 +252,16 @@
     }
 
     function currentMessageCount(snapshot = currentSourceSnapshot()): number {
-        return snapshot?.totalMessages ?? messages.length
+        return snapshot ? snapshot.totalMessages : messages?.length ?? 0
     }
 
     function currentMessageKey(
         absoluteIndex: number,
         snapshot = currentSourceSnapshot(),
     ): string | undefined {
-        return snapshot?.keyAt(absoluteIndex) ?? messageRenderKeys[absoluteIndex]
+        return snapshot
+            ? snapshot.keyAt(absoluteIndex)
+            : messageRenderKeys[absoluteIndex]
     }
 
     function resetViewport(scope: string): void {
@@ -259,7 +281,7 @@
         identitySequence = null
         messageRenderKeys = []
         registeredScope = null
-        registeredMessages = null
+        registeredMessages = undefined
         registeredLength = 0
         previousReloadPointer = null
         activeScope = scope
@@ -268,20 +290,29 @@
 
     function syncIdentityRegistration(scope: string, reloadPointer: unknown): void {
         if (activeViewportSource) return
+        const compatibilityMessages = messages ?? []
         const needsStructuralRegistration = (
             registeredScope !== scope
             || registeredMessages !== messages
-            || messages.length < registeredLength
+            || compatibilityMessages.length < registeredLength
             || reloadPointer !== previousReloadPointer
         )
         if (needsStructuralRegistration) {
-            identitySequence = identityRegistry.register(scope, messages)
-        } else if (messages.length > registeredLength) {
-            identitySequence = identityRegistry.registerAppend(scope, messages, registeredLength)
+            identitySequence = identityRegistry.register(scope, compatibilityMessages)
+        } else if (compatibilityMessages.length > registeredLength) {
+            identitySequence = identityRegistry.registerAppend(
+                scope,
+                compatibilityMessages,
+                registeredLength,
+            )
         } else if (!identitySequence) {
-            identitySequence = identityRegistry.register(scope, messages)
+            identitySequence = identityRegistry.register(scope, compatibilityMessages)
         }
-        if (needsStructuralRegistration || messages.length !== registeredLength || messageRenderKeys.length === 0) {
+        if (
+            needsStructuralRegistration ||
+            compatibilityMessages.length !== registeredLength ||
+            messageRenderKeys.length === 0
+        ) {
             messageRenderKeys = identitySequence.toArray()
         }
         if (needsStructuralRegistration) {
@@ -290,7 +321,7 @@
         }
         registeredScope = scope
         registeredMessages = messages
-        registeredLength = messages.length
+        registeredLength = compatibilityMessages.length
         previousReloadPointer = reloadPointer
     }
 
@@ -444,6 +475,42 @@
 
     function activateViewportSource(source: ConversationViewportSource | null): void {
         if (source === activeViewportSource) return
+        const nextConversationIdentity = currentConversationHandoffIdentity()
+        const previousSnapshot = currentSourceSnapshot()
+        const previousAnchor = captureDomAnchor()
+        const preserveHandoff = (
+            source !== null &&
+            activeViewportSource !== null &&
+            renderedConversationIdentity === nextConversationIdentity &&
+            previousSnapshot !== null &&
+            previousAnchor !== null
+        )
+        const handoffWasAtBottom = preserveHandoff
+            ? pendingSourceWasAtBottom ?? checkIfAtBottom()
+            : null
+        let handoffAnchor: ChatViewportAnchor | null = null
+        if (preserveHandoff) {
+            const startOffset = hasConversationStart() ? 1 : 0
+            const sourceIndex = previousSnapshot.indexOfKey(
+                previousAnchor.key as ConversationViewportKey,
+            )
+            const absoluteIndex = sourceIndex >= 0
+                ? sourceIndex
+                : previousAnchor.indexHint - startOffset
+            const nextSnapshot = source.snapshot()
+            const remappedIndex = Math.min(
+                Math.max(absoluteIndex, 0),
+                nextSnapshot.totalMessages - 1,
+            )
+            const remappedKey = nextSnapshot.keyAt(remappedIndex)
+            if (remappedKey !== undefined) {
+                handoffAnchor = {
+                    key: remappedKey,
+                    indexHint: remappedIndex + startOffset,
+                    relativeOffset: previousAnchor.relativeOffset,
+                }
+            }
+        }
         navigationGeneration += 1
         abortSourceLoads()
         releaseSourcePins()
@@ -452,22 +519,40 @@
         activeViewportSource = source
         sourceUpdateRevision += 1
         lastMountedSourceTailKey = null
-        pendingSourceWasAtBottom = null
+        pendingSourceWasAtBottom = handoffWasAtBottom
+        pendingSourceHandoffAnchor = handoffAnchor
         activeScope = null
         if (source) {
             sourceUnsubscribe = source.subscribe(() => {
-                if (source !== activeViewportSource || !chatBody) return
-                if (lastMountedSourceTailKey !== null) {
-                    pendingSourceWasAtBottom = (
-                        pendingSourceWasAtBottom === true ||
-                        isMountedKeyAtBottom(lastMountedSourceTailKey)
-                    )
-                }
-                sourceUpdateRevision += 1
-                reconcileViewport()
+                queueMicrotask(() => {
+                    queueMicrotask(() => {
+                        if (source !== activeViewportSource || !chatBody) return
+                        if (lastMountedSourceTailKey !== null) {
+                            pendingSourceWasAtBottom = (
+                                pendingSourceWasAtBottom === true ||
+                                isMountedKeyAtBottom(lastMountedSourceTailKey)
+                            )
+                        }
+                        sourceUpdateRevision += 1
+                        reconcileViewport({
+                            anchor: pendingSourceHandoffAnchor ?? undefined,
+                        })
+                        if (
+                            pendingSourceHandoffAnchor &&
+                            mountedElements.has(pendingSourceHandoffAnchor.key)
+                        ) {
+                            const completedAnchor = pendingSourceHandoffAnchor
+                            scheduleFrame(() => {
+                                if (pendingSourceHandoffAnchor === completedAnchor) {
+                                    pendingSourceHandoffAnchor = null
+                                }
+                            })
+                        }
+                    })
+                })
             })
         }
-        if (chatBody) reconcileViewport()
+        if (chatBody) reconcileViewport({ anchor: handoffAnchor ?? undefined })
     }
 
     $effect.pre(() => {
@@ -517,6 +602,7 @@
     } = {}): ChatViewportResult | null {
         if (!chatBody) return null
         const scope = currentChatScope()
+        renderedConversationIdentity = currentConversationHandoffIdentity()
         if (activeScope !== scope) resetViewport(scope)
         const reloadPointerMap = get(ReloadChatPointer)
         const sourceSnapshot = currentSourceSnapshot()
@@ -524,7 +610,9 @@
         const keySource = viewportKeySource(scope, sourceSnapshot)
         const preservedAnchor = options.anchor !== undefined
             ? options.anchor
-            : options.preserveAnchor === false ? viewportAnchor : captureDomAnchor()
+            : options.preserveAnchor === false
+                ? viewportAnchor
+                : pendingSourceHandoffAnchor ?? captureDomAnchor()
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
         const result = buildChatViewport({
@@ -588,7 +676,7 @@
                 const key = conversationStartKey(scope)
                 const element = ensureElement(key, row.index)
                 currentRenderKeys.add(key)
-                renderConversationStart(key, element)
+                renderConversationStart(key, element, totalMessages)
                 element.classList.remove('is-latest-chat-row', 'is-settled-history')
                 orderedElements.push(element)
                 continue
@@ -596,9 +684,9 @@
 
             const index = row.index - startOffset
             const viewportRow = sourceSnapshot?.rowAt(index)
-            const message = (viewportRow?.message ?? (
-                sourceSnapshot ? undefined : messages[index]
-            )) as Message | undefined
+            const message = (
+                sourceSnapshot ? viewportRow?.message : messages?.[index]
+            ) as Message | undefined
             const key = row.key
             if (!message) {
                 const retainedElement = mountedElements.get(key)
@@ -729,7 +817,11 @@
         return element
     }
 
-    function renderConversationStart(key: string, element: HTMLElement): void {
+    function renderConversationStart(
+        key: string,
+        element: HTMLElement,
+        totalMessages: number,
+    ): void {
         const character = currentCharacter as character
         const currentChat = character.chats[character.chatPage]
         const signature = JSON.stringify([
@@ -743,6 +835,7 @@
             character.largePortrait,
             resolvedCharacterImage,
             showAiWarning,
+            totalMessages,
         ])
         if (element.dataset.chatConversationStartSignature === signature && mountInstances.has(key)) return
         unmountInstance(key)
@@ -753,6 +846,7 @@
                 currentCharacter: character,
                 resolvedImage: resolvedCharacterImage ?? '',
                 showAiWarning,
+                totalMessages,
                 onReroll: onFirstMessageReroll,
                 unReroll: unFirstMessageReroll,
                 onRemoveCreatorQuote,
@@ -1107,7 +1201,7 @@
     }
 
     let previousLength = 0
-    let previousConversationScope: string | null = null
+    let previousConversationIdentity: string | null = null
 
     $effect(() => {
         void $ReloadChatPointer
@@ -1115,12 +1209,19 @@
         const wasAtBottom = pendingSourceWasAtBottom ?? checkIfAtBottom()
         pendingSourceWasAtBottom = null
         reconcileViewport()
-        const conversationScope = currentChatScope()
-        const isSameChat = conversationScope === previousConversationScope
+        const conversationIdentity = currentConversationHandoffIdentity()
+        const isSameChat = conversationIdentity === previousConversationIdentity
         const totalMessages = currentMessageCount()
         if (isSameChat && totalMessages > previousLength) {
-            const lastMessage = currentSourceSnapshot()?.rowAt(totalMessages - 1)?.message
-                ?? messages.at(-1)
+            const snapshot = currentSourceSnapshot()
+            const lastMessage = snapshot
+                ? snapshot.rowAt(totalMessages - 1)?.message
+                : messages?.at(-1)
+            if (snapshot && !lastMessage) {
+                pendingSourceWasAtBottom = wasAtBottom
+                previousConversationIdentity = conversationIdentity
+                return
+            }
             if (lastMessage?.role === 'char' && DBState.db.autoScrollToNewMessage) {
                 if (wasAtBottom || DBState.db.alwaysScrollToNewMessage) {
                     if (autoScrollTimer) clearTimeout(autoScrollTimer)
@@ -1134,7 +1235,7 @@
             }
         }
         previousLength = totalMessages
-        previousConversationScope = conversationScope
+        previousConversationIdentity = conversationIdentity
     })
 
     onMount(() => {

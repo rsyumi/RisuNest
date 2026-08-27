@@ -4,7 +4,10 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import type { character, Message } from 'src/ts/storage/database.svelte'
 import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
-import { SynchronousSessionConversationViewportSource } from 'src/ts/conversationViewportSource'
+import {
+    PersistentConversationViewportSource,
+    SynchronousSessionConversationViewportSource,
+} from 'src/ts/conversationViewportSource'
 import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
 
 const imageMocks = vi.hoisted(() => ({
@@ -100,6 +103,7 @@ interface HarnessInstance {
     mutateScriptOutput(output: string): void
     setImage(image: string): void
     switchCharacter(character: character, messages: Message[]): void
+    switchCharacterAndSource(character: character, source: ConversationViewportSource): void
     jumpTo(index: number, options?: { align?: 'start' | 'center'; highlight?: boolean }): Promise<boolean>
     jumpToLatestMessage(): Promise<void>
     setViewportSource(source: ConversationViewportSource | null): void
@@ -155,6 +159,48 @@ function makeViewportSource(currentCharacter: character) {
         captureCurrent: () => ({ character: currentCharacter, conversation }),
     })
     return { session, source }
+}
+
+function makeMetadataOnlyCharacter(): character {
+    const conversation = {
+        id: 'chat-room-id',
+        isStreaming: false,
+        activeStreamingDisplayOptimizationMode: 'balanced',
+    } as character['chats'][number]
+    Object.defineProperty(conversation, 'message', {
+        get() {
+            throw new Error('metadata-only conversation body was accessed')
+        },
+    })
+    return { ...makeCharacter([]), chats: [conversation] } as character
+}
+
+function makePersistentViewportSource(messages: readonly Message[]) {
+    return new PersistentConversationViewportSource({
+        reader: {
+            async readConversationWindow({ characterId, conversationId, startIndex, limit }) {
+                const endIndex = Math.min(messages.length, startIndex + limit)
+                return {
+                    revision: 1,
+                    value: {
+                        characterId,
+                        conversationId,
+                        startIndex: Math.min(startIndex, messages.length),
+                        endIndex,
+                        totalMessages: messages.length,
+                        messages: messages.slice(startIndex, endIndex),
+                        hasMoreBefore: startIndex > 0,
+                        hasMoreAfter: endIndex < messages.length,
+                    },
+                }
+            },
+        },
+        characterId: 'character-id',
+        conversationId: 'chat-room-id',
+        revision: 1,
+        totalMessages: messages.length,
+        rowBudget: 64,
+    })
 }
 
 function probeElements(target: HTMLElement): HTMLElement[] {
@@ -487,6 +533,24 @@ describe('Chats imperative mount lifecycle', () => {
         expect(session.pinCount('streaming')).toBe(0)
     })
 
+    test('renders source rows and conversation count without reading a metadata-only shell body', async () => {
+        const messages = [makeMessage(0), makeMessage(1), makeMessage(2)]
+        const source = makePersistentViewportSource(messages)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: makeMetadataOnlyCharacter(),
+                initialViewportSource: source,
+            },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(3))
+        expect(probeElements(target).map((element) => element.dataset.message)).toEqual(
+            [...messages].reverse().map((entry) => entry.data),
+        )
+        expect(probeElements(target).every((element) => element.dataset.index !== undefined)).toBe(true)
+    })
+
     test('refreshes mounted bookmark presentation after a source metadata mutation', async () => {
         const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
         mounted = mount(ChatsHarness, {
@@ -656,6 +720,157 @@ describe('Chats imperative mount lifecycle', () => {
             probeElements(target).map((element) => element.dataset.message),
         ).toContain('replacement-7'))
         expect(target.textContent).not.toContain('message-99')
+    })
+
+    test('remaps an absolute DOM anchor across a source replacement for the same conversation', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        const currentCharacter = makeCharacter(messages)
+        const { source } = makeViewportSource(currentCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await expect((mounted as HarnessInstance).jumpTo(100)).resolves.toBe(true)
+
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () => ({
+            top: 0,
+            bottom: 500,
+            height: 500,
+        } as DOMRect)
+        scrollParent.scrollBy = vi.fn()
+        for (const wrapper of target.querySelectorAll<HTMLElement>('[data-chat-render-key]')) {
+            const index = Number(wrapper.dataset.chatViewportIndex)
+            wrapper.getBoundingClientRect = () => ({
+                top: index === 101 ? 120 : 1_000,
+                bottom: index === 101 ? 220 : 1_100,
+                height: 100,
+            } as DOMRect)
+        }
+
+        const replacementMessages = messages.map((entry, index) => ({
+            ...entry,
+            data: `replacement-${index}`,
+        }))
+        const replacementCharacter = makeCharacter(replacementMessages)
+        const { source: replacementSource } = makeViewportSource(replacementCharacter)
+        source.dispose()
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => (
+                element.dataset.message === 'replacement-100' && element.dataset.index === '100'
+            )),
+        ).toBe(true))
+        expect(scrollParent.scrollBy).toHaveBeenCalledWith({
+            top: -120,
+            behavior: 'instant',
+        })
+    })
+
+    test('does not remap a source anchor across different conversation owners', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        const currentCharacter = makeCharacter(messages)
+        const { source } = makeViewportSource(currentCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await expect((mounted as HarnessInstance).jumpTo(100)).resolves.toBe(true)
+
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () => ({
+            top: 0,
+            bottom: 500,
+            height: 500,
+        } as DOMRect)
+        scrollParent.scrollBy = vi.fn()
+        const anchor = probeElements(target)
+            .find((element) => element.dataset.message === 'message-100')!
+            .closest<HTMLElement>('[data-chat-render-key]')!
+        anchor.getBoundingClientRect = () => ({
+            top: 120,
+            bottom: 220,
+            height: 100,
+        } as DOMRect)
+
+        const replacementMessages = messages.map((entry, index) => ({
+            ...entry,
+            data: `other-${index}`,
+        }))
+        const replacementCharacter = makeCharacter(replacementMessages)
+        replacementCharacter.chaId = 'other-character'
+        replacementCharacter.chats[0].id = 'other-conversation'
+        const { source: replacementSource } = makeViewportSource(replacementCharacter)
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'other-199'),
+        ).toBe(true))
+        expect(scrollParent.scrollBy).not.toHaveBeenCalled()
+    })
+
+    test('preserves bottom auto-scroll when a replacement source appends a delayed tail row', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
+        messages.at(-1)!.role = 'char'
+        const currentCharacter = makeCharacter(messages)
+        const { source } = makeViewportSource(currentCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () => ({
+            top: 0,
+            bottom: 500,
+            height: 500,
+        } as DOMRect)
+        const oldTail = probeElements(target)
+            .find((element) => element.dataset.message === 'message-7')!
+            .closest<HTMLElement>('[data-chat-render-key]')!
+        oldTail.getBoundingClientRect = () => ({
+            top: 450,
+            bottom: 500,
+            height: 50,
+        } as DOMRect)
+        const scrollIntoView = vi.spyOn(HTMLElement.prototype, 'scrollIntoView')
+        DBState.db.autoScrollToNewMessage = true
+
+        const replacementMessages = [...messages, makeMessage(8, { role: 'char' })]
+        const replacementCharacter = makeCharacter(replacementMessages)
+        const { source: replacementSource } = makeViewportSource(replacementCharacter)
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-8'),
+        ).toBe(true))
+        await vi.waitFor(() => expect(scrollIntoView).toHaveBeenCalled(), { timeout: 1_500 })
+        expect((mounted as HarnessInstance).hasUnreadMessage()).toBe(false)
     })
 
     test('bounds retained height corrections while visiting a long conversation', async () => {

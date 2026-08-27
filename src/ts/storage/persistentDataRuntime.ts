@@ -2,6 +2,7 @@ import type { Chat, Database, botPreset, character, groupChat } from './database
 import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
 import {
     ActiveWorkingSet,
+    type ActiveConversationViewportSourceListener,
     type CharacterActivationOptions,
     type CompleteConversationLease,
     type SelectedConversationTarget,
@@ -279,6 +280,9 @@ export interface PersistentDataRuntime {
     getActiveConversationSession(): ActiveConversationSession | null
     getSelectedConversationMode(): 'complete' | 'windowed' | null
     getActiveConversationViewportSource(): ConversationViewportSource | null
+    subscribeActiveConversationViewportSource(
+        listener: ActiveConversationViewportSourceListener,
+    ): () => void
     captureSelectedConversationTarget(): SelectedConversationTarget | null
     captureSelectedConversationAuthority(): WindowedConversationPersistenceAuthority | null
     acquireCompleteConversation(
@@ -623,6 +627,8 @@ export function createPersistentDataRuntime(
         getSelectedConversationMode: () => workingSet.selectedConversationMode,
         getActiveConversationViewportSource: () =>
             workingSet.activeConversationViewportSource,
+        subscribeActiveConversationViewportSource: (listener) =>
+            workingSet.subscribeActiveConversationViewportSource(listener),
         captureSelectedConversationTarget: () =>
             workingSet.captureSelectedConversationTarget(),
         captureSelectedConversationAuthority: () =>

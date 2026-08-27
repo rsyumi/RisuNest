@@ -549,6 +549,48 @@ describe('selected conversation lifecycle', () => {
         ).toHaveBeenCalledWith(8, expect.objectContaining({ storeRevision: 8 }))
     })
 
+    it('notifies active source subscribers once per state or revision transition', () => {
+        const harness = makeHarness(10_000)
+        const sources: Array<unknown> = []
+        const listener = vi.fn((source) => sources.push(source))
+        const unsubscribe = harness.workingSet.subscribeActiveConversationViewportSource(listener)
+
+        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
+        expect(listener).toHaveBeenCalledTimes(1)
+        expect(sources[0]).toBe(harness.workingSet.activeConversationViewportSource)
+
+        harness.setCoordinatorRevision(8)
+        harness.workingSet.advanceStoreRevision(8)
+        expect(listener).toHaveBeenCalledTimes(2)
+        expect(sources[1]).toBe(harness.workingSet.activeConversationViewportSource)
+
+        unsubscribe()
+        unsubscribe()
+        harness.workingSet.invalidateActiveConversationSession()
+        expect(listener).toHaveBeenCalledTimes(2)
+    })
+
+    it('isolates active source subscriber failures and safely unsubscribes', () => {
+        const harness = makeHarness(3)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const retained = vi.fn()
+        const unsubscribeThrowing = harness.workingSet.subscribeActiveConversationViewportSource(
+            () => { throw new Error('subscriber failed') },
+        )
+        const unsubscribeRetained = harness.workingSet.subscribeActiveConversationViewportSource(
+            retained,
+        )
+
+        harness.workingSet.invalidateActiveConversationSession()
+
+        expect(retained).toHaveBeenCalledOnce()
+        expect(consoleError).toHaveBeenCalledOnce()
+        expect(() => unsubscribeThrowing()).not.toThrow()
+        expect(() => unsubscribeThrowing()).not.toThrow()
+        expect(() => unsubscribeRetained()).not.toThrow()
+        consoleError.mockRestore()
+    })
+
     it('wires lifecycle authority, source, storage revision and promotion through the runtime', async () => {
         const database = {
             username: 'Runtime fixture',
@@ -591,7 +633,12 @@ describe('selected conversation lifecycle', () => {
         await runtime.initializeActiveWorkingSet(workingCopy)
 
         expect(runtime.getSelectedConversationMode()).toBe('complete')
+        const runtimeSourceChanges = vi.fn()
+        const unsubscribeSource = runtime.subscribeActiveConversationViewportSource(
+            runtimeSourceChanges,
+        )
         expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+        expect(runtimeSourceChanges).toHaveBeenCalledOnce()
         expect(runtime.getSelectedConversationMode()).toBe('windowed')
         expect(runtime.getActiveConversationViewportSource()).toBeInstanceOf(
             PersistentConversationViewportSource,
@@ -619,12 +666,15 @@ describe('selected conversation lifecycle', () => {
             storeRevision: revision.revision + 2,
             totalMessages: 10_000,
         })
+        expect(runtimeSourceChanges).toHaveBeenCalledTimes(3)
 
         const target = runtime.captureSelectedConversationTarget()!
         const lease = await runtime.acquireCompleteConversation('runtime-test', target)
         expect(lease.target).toEqual(runtime.captureSelectedConversationTarget())
         expect(runtime.getSelectedConversationMode()).toBe('complete')
         expect(workingCopy.characters[0].chats[0].message).toHaveLength(10_000)
+        expect(runtimeSourceChanges).toHaveBeenCalledTimes(4)
+        unsubscribeSource()
         lease.release()
     })
 

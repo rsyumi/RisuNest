@@ -353,6 +353,59 @@ describe('Chat frozen capture presentation', () => {
         expect(indexReads).not.toHaveBeenCalled()
     })
 
+    test('does not recapture optional presentation fields missing from a viewport row', async () => {
+        const message = {
+            role: 'char' as const,
+            data: 'Viewport body without optional fields',
+        }
+        const indexReads = vi.fn(() => {
+            throw new Error('live message index was recaptured')
+        })
+        const messages = new Proxy([] as typeof message[], {
+            get(target, property, receiver) {
+                if (property === '3') return indexReads()
+                return Reflect.get(target, property, receiver)
+            },
+        })
+        live.db = {
+            ...live.db,
+            theme: 'mobilechat',
+            characters: [{
+                type: 'character',
+                name: 'Live Character',
+                chaId: 'live-character',
+                chatPage: 0,
+                chats: [{ id: 'live-chat', message: messages, bookmarks: [] }],
+                ttsMode: 'none',
+            }],
+        }
+
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: message.data,
+                name: 'Live Character',
+                role: 'char',
+                idx: 3,
+                totalLength: 10,
+                isLastMemory: false,
+                viewportRow: {
+                    key: 'viewport-key' as any,
+                    absoluteIndex: 3,
+                    message,
+                    sourceVersion: 1,
+                },
+                captureViewportTarget: () => null,
+            },
+        })
+
+        await vi.waitFor(() => expect(
+            target.querySelector('[data-chat-body-probe]')?.textContent,
+        ).toBe(message.data))
+        expect(target.querySelector('[data-chat-id=""]')).not.toBeNull()
+        expect(indexReads).not.toHaveBeenCalled()
+    })
+
     test('renders each frozen group turn with the same names as the normal Chat presentation', async () => {
         const memberA = { ...context().parserContext.character, name: 'Member A', chaId: 'member-a' }
         const memberB = { ...context().parserContext.character, name: 'Member B', chaId: 'member-b' }

@@ -138,6 +138,10 @@ type SelectedConversationState =
     | CompleteSelectedConversationState
     | WindowedSelectedConversationState
 
+export type ActiveConversationViewportSourceListener = (
+    source: ConversationViewportSource | null,
+) => void
+
 export class ActiveWorkingSet {
     private navigationGeneration = 0
     private activeIds = new Set<string>()
@@ -148,6 +152,9 @@ export class ActiveWorkingSet {
     private activeSession: ActiveConversationSession | null = null
     private selectedConversationState: SelectedConversationState | null = null
     private promotionFlight: Promise<CompleteSelectedConversationState> | null = null
+    private readonly viewportSourceListeners = new Set<
+        ActiveConversationViewportSourceListener
+    >()
 
     constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
 
@@ -169,6 +176,18 @@ export class ActiveWorkingSet {
 
     get activeConversationViewportSource(): ConversationViewportSource | null {
         return this.selectedConversationState?.viewportSource ?? null
+    }
+
+    subscribeActiveConversationViewportSource(
+        listener: ActiveConversationViewportSourceListener,
+    ): () => void {
+        this.viewportSourceListeners.add(listener)
+        let subscribed = true
+        return () => {
+            if (!subscribed) return
+            subscribed = false
+            this.viewportSourceListeners.delete(listener)
+        }
     }
 
     captureSelectedConversationTarget(): SelectedConversationTarget | null {
@@ -345,6 +364,7 @@ export class ActiveWorkingSet {
                 this.activeSession = null
                 state.viewportSource.dispose()
                 state.session.invalidate()
+                this.notifyActiveConversationViewportSource()
                 return false
             }
             viewportSource.dispose()
@@ -352,13 +372,19 @@ export class ActiveWorkingSet {
         }
         state.viewportSource.dispose()
         state.session.invalidate()
+        this.notifyActiveConversationViewportSource()
         return true
     }
 
     advanceStoreRevision(revision: DataRevision): void {
         const state = this.selectedConversationState
         if (state?.kind !== 'windowed') {
+            const previousRevision = this.activeSession?.storeRevision
             this.activeSession?.advanceStoreRevision(revision)
+            if (
+                previousRevision !== undefined &&
+                this.activeSession?.storeRevision !== previousRevision
+            ) this.notifyActiveConversationViewportSource()
             return
         }
         if (revision < state.authority.storeRevision) {
@@ -392,6 +418,7 @@ export class ActiveWorkingSet {
             throw new Error('Windowed selected conversation revision was not adopted')
         }
         state.viewportSource.dispose()
+        this.notifyActiveConversationViewportSource()
     }
 
     beginConversationMutationPersistence(event: ActiveConversationMutationEvent) {
@@ -490,10 +517,9 @@ export class ActiveWorkingSet {
             ? database.characters.find((character) => character.chaId === selectedId)
             : undefined
         const conversation = selected?.chats[selected.chatPage ?? 0]
-        this.clearActiveConversationSession()
         if (selected && conversation) {
             this.publishActiveConversationSession(selected.chaId, conversation, revision)
-        }
+        } else this.clearActiveConversationSession()
     }
 
     async activateCharacter(
@@ -759,8 +785,11 @@ export class ActiveWorkingSet {
             (candidate) => candidate.id === fallbackConversation.id,
         ) ?? fallbackConversation
         const conversationId = conversation.id ?? fallbackConversation.id
-        this.clearActiveConversationSession()
-        if (!conversationId) return
+        const cleared = this.clearActiveConversationSession(false)
+        if (!conversationId) {
+            if (cleared) this.notifyActiveConversationViewportSource()
+            return
+        }
         const complete = this.createCompleteSelectedConversationState(
             characterId,
             conversation,
@@ -768,14 +797,18 @@ export class ActiveWorkingSet {
         )
         this.activeSession = complete.session
         this.selectedConversationState = complete
+        this.notifyActiveConversationViewportSource()
     }
 
-    private clearActiveConversationSession(): void {
+    private clearActiveConversationSession(notify = true): boolean {
+        const changed = this.selectedConversationState !== null || this.activeSession !== null
         this.selectedConversationState?.viewportSource.dispose()
         this.activeSession?.invalidate()
         this.activeSession = null
         this.selectedConversationState = null
         this.promotionFlight = null
+        if (changed && notify) this.notifyActiveConversationViewportSource()
+        return changed
     }
 
     private async promoteWindowedConversation(
@@ -861,6 +894,7 @@ export class ActiveWorkingSet {
             throw error
         }
         state.viewportSource.dispose()
+        this.notifyActiveConversationViewportSource()
         return complete
     }
 
@@ -906,6 +940,17 @@ export class ActiveWorkingSet {
             viewportSource,
         }
         return complete
+    }
+
+    private notifyActiveConversationViewportSource(): void {
+        const source = this.activeConversationViewportSource
+        for (const listener of [...this.viewportSourceListeners]) {
+            try {
+                listener(source)
+            } catch (error) {
+                console.error('Active conversation viewport source subscriber failed', error)
+            }
+        }
     }
 
     private requireCurrentWindowedState(

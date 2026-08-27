@@ -9,12 +9,12 @@
         initialCharacter,
         initialViewportSource = null,
     }: {
-        initialMessages: Message[]
+        initialMessages?: Message[]
         initialCharacter: character
         initialViewportSource?: ConversationViewportSource | null
     } = $props()
 
-    let messages = $state<Message[]>([])
+    let messages = $state<Message[] | undefined>()
     let currentCharacter = $state<character>(null as unknown as character)
     let chats = $state<ChatViewportHandle>()
     let viewportSource = $state<ConversationViewportSource | null>(null)
@@ -32,7 +32,7 @@
     }
 
     export function updateMessage(index: number, data: string) {
-        messages[index].data = data
+        if (messages) messages[index].data = data
     }
 
     export function setStreaming(isStreaming: boolean) {
@@ -62,6 +62,15 @@
     export function switchCharacter(character: character, nextMessages: Message[]) {
         currentCharacter = character
         messages = nextMessages
+    }
+
+    export function switchCharacterAndSource(
+        character: character,
+        nextSource: ConversationViewportSource,
+    ) {
+        currentCharacter = character
+        messages = undefined
+        viewportSource = nextSource
     }
 
     export function jumpTo(index: number, options?: ChatViewportJumpOptions) {

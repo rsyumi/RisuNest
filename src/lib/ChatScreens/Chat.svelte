@@ -127,6 +127,33 @@
     let captureLineHeight = $derived(captureSettings?.lineHeight ?? DBState.db.lineHeight ?? 1.25)
     let hideCaptureIcon = $derived(captureSettings?.hideIcons ?? $HideIconStore)
     let presentedMessage = $derived(captureMessage ?? viewportRow?.message)
+    let presentedChatId = $derived(
+        captureContext
+            ? captureMessage?.chatId ?? ''
+            : viewportRow
+                ? viewportRow.message.chatId ?? ''
+                : DBState.db.characters?.[selIdState.selId]
+                    ?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]
+                    ?.message?.[idx]?.chatId ?? '',
+    )
+    let presentedTime = $derived(
+        captureContext
+            ? captureMessage?.time
+            : viewportRow
+                ? viewportRow.message.time
+                : DBState.db.characters?.[selIdState.selId]
+                    ?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]
+                    ?.message?.[idx]?.time,
+    )
+    let presentedRole = $derived(
+        captureContext
+            ? captureMessage?.role ?? role
+            : viewportRow
+                ? viewportRow.message.role
+                : DBState.db.characters?.[selIdState.selId]
+                    ?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]
+                    ?.message?.[idx]?.role ?? role,
+    )
 
     function captureParserChara() {
         const character = captureContext?.parserContext.character
@@ -252,11 +279,7 @@
         try{
             const cbsConditions:CbsConditions = {
                 firstmsg: firstMessage ?? false,
-                chatRole: presentedMessage?.role ?? (
-                    captureContext
-                        ? role
-                        : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]?.message?.[idx]?.role ?? null
-                ),
+                chatRole: presentedRole,
             }
             return cbsConditions
         }
@@ -396,13 +419,20 @@
         }
     }
 
-    let isBookmarked = $derived(captureContext
-        ? captureChat?.bookmarks?.includes(captureMessage?.chatId ?? '') ?? false
-        : bookmarked ?? (
-            DBState.db.characters[selIdState.selId]
-                ?.chats[DBState.db.characters[selIdState.selId].chatPage]
-                ?.bookmarks?.includes(DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]?.chatId) ?? false
-        )
+    let isBookmarked = $derived(
+        captureContext
+            ? captureChat?.bookmarks?.includes(captureMessage?.chatId ?? '') ?? false
+            : viewportRow
+                ? bookmarked ?? false
+                : bookmarked ?? (
+                    DBState.db.characters[selIdState.selId]
+                        ?.chats[DBState.db.characters[selIdState.selId].chatPage]
+                        ?.bookmarks?.includes(
+                            DBState.db.characters[selIdState.selId]
+                                .chats[DBState.db.characters[selIdState.selId].chatPage]
+                                .message[idx]?.chatId,
+                        ) ?? false
+                ),
     );
 
     let staticCaptureSettled = false
@@ -450,13 +480,15 @@
             <button class="text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1
                     hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center" 
                     onclick={() => {
-                        const currentMessage = presentedMessage ?? (
-                            idx >= 0
-                                ? DBState.db.characters[$selectedCharID]
-                                    ?.chats[DBState.db.characters[$selectedCharID].chatPage]
-                                    ?.message[idx]
-                                : undefined
-                        )
+                        const currentMessage = captureContext
+                            ? captureMessage
+                            : viewportRow
+                                ? viewportRow.message
+                                : idx >= 0
+                                    ? DBState.db.characters[$selectedCharID]
+                                        ?.chats[DBState.db.characters[$selectedCharID].chatPage]
+                                        ?.message[idx]
+                                    : undefined
                         const currentGenerationInfo = currentMessage?.generationInfo
                             ?? messageGenerationInfo
                         if (!currentMessage || !currentGenerationInfo) return
@@ -1188,11 +1220,7 @@
 {/if}
 <div class="flex max-w-full justify-center risu-chat"
      data-chat-index={idx}
-     data-chat-id={captureContext
-        ? captureMessage?.chatId ?? ''
-        : presentedMessage?.chatId
-            ?? DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.chatId
-            ?? ''}
+     data-chat-id={presentedChatId}
      style={isLastMemory ? `border-top:${captureSettings?.memoryLimitThickness ?? DBState.db.memoryLimitThickness}px solid rgba(98, 114, 164, 0.7);` : ''}
      onclickcapture={handleButtonTriggerWithin}>
     <div class="text-textcolor mt-1 ml-4 mr-4 mb-1 p-2 bg-transparent grow border-t-gray-900 border-opacity/30 border-transparent flexium items-start max-w-full" >
@@ -1207,11 +1235,7 @@
                     class:rounded-tr-none={role === 'user'}
                 >
                     <p class="text-gray-800">{@render textBox()}</p>
-                    {#if presentedMessage?.time ?? (
-                        captureContext
-                            ? captureMessage?.time
-                            : DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.time
-                    )}
+                    {#if presentedTime}
                         <span class="text-xs text-textcolor2 mt-1 block">
                             {new Intl.DateTimeFormat(undefined, {
                                 hour: '2-digit',
@@ -1220,11 +1244,7 @@
                                 month: '2-digit',
                                 day: '2-digit',
                                 hour12: false
-                            }).format(presentedMessage?.time ?? (
-                                captureContext
-                                    ? captureMessage?.time
-                                    : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].time
-                            ))}
+                            }).format(presentedTime)}
                         </span>
                     {/if}
                 </div>
@@ -1262,9 +1282,17 @@
             {@render senderIcon({rounded: captureSettings?.roundIcons ?? DBState.db.roundIcons})}
             <span class="flex flex-col ml-4 w-full max-w-full min-w-0 text-black">
                 <div class="flexium items-center chat-width">
-                    {#if (captureCharacter?.chaId ?? DBState.db.characters[selIdState.selId]?.chaId) === "§playground" && !blankMessage && (presentedMessage ?? DBState.db.characters[selIdState.selId]?.chats?.[DBState.db.characters[selIdState.selId]?.chatPage]?.message?.[idx])}
+                    {#if (captureCharacter?.chaId ?? DBState.db.characters[selIdState.selId]?.chaId) === "§playground" && !blankMessage && (
+                        captureContext
+                            ? captureMessage
+                            : viewportRow
+                                ? viewportRow.message
+                                : DBState.db.characters[selIdState.selId]
+                                    ?.chats?.[DBState.db.characters[selIdState.selId]?.chatPage]
+                                    ?.message?.[idx]
+                    )}
                         <span class="chat-width text-xl border-darkborderc flex items-center text-textcolor">
-                            <span>{(presentedMessage?.role ?? DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role) === 'char' ? 'Assistant' : 'User'}</span>
+                            <span>{presentedRole === 'char' ? 'Assistant' : 'User'}</span>
                             <button class="ml-2 text-textcolor2 hover:text-textcolor" onclick={() => {
                                 const target = captureCurrentMessage()
                                 if (!target || !toggleCapturedMessageRole(target, chatMessageContext)) return

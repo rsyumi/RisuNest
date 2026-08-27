@@ -3,6 +3,7 @@ import { doingChat } from '../process/generationState'
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
 import type {
+    ActiveConversationViewportSourceListener,
     CompleteConversationLease,
     SelectedConversationTarget,
 } from './activeWorkingSet.svelte'
@@ -345,6 +346,9 @@ export const getSelectedConversationMode = (): 'complete' | 'windowed' | null =>
     getPersistentDataRuntime().getSelectedConversationMode()
 export const getActiveConversationViewportSource = (): ConversationViewportSource | null =>
     getPersistentDataRuntime().getActiveConversationViewportSource()
+export const subscribeActiveConversationViewportSource = (
+    listener: ActiveConversationViewportSourceListener,
+): (() => void) => getPersistentDataRuntime().subscribeActiveConversationViewportSource(listener)
 export const captureSelectedConversationTarget = (): SelectedConversationTarget | null =>
     getPersistentDataRuntime().captureSelectedConversationTarget()
 export const captureSelectedConversationAuthority = ():

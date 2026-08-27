@@ -8,6 +8,7 @@
         currentCharacter,
         resolvedImage,
         showAiWarning,
+        totalMessages,
         onReroll,
         unReroll,
         onRemoveCreatorQuote,
@@ -15,6 +16,7 @@
         currentCharacter: character
         resolvedImage: string
         showAiWarning: boolean
+        totalMessages: number
         onReroll: () => void
         unReroll: () => void
         onRemoveCreatorQuote: () => void
@@ -54,7 +56,7 @@
         currentPage={(currentChat.fmIndex ?? -1) + 2}
         totalPages={alternateGreetings.length + 1}
     />
-    {#if showAiWarning && currentChat.message.length === 0}
+    {#if showAiWarning && totalMessages === 0}
         <div class="ml-auto mr-auto mt-4 text-textcolor2 italic max-w-2/3 wrap-break-word text-center">
             {language.aiGenerationWarning}
         </div>
