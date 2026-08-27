@@ -1575,11 +1575,11 @@ mod tests {
     #[test]
     fn canonical_database_hash_sorts_object_keys_recursively() {
         let original_value: Value = serde_json::from_str(
-            r#"{"characters":[],"botPresets":[],"modules":[{"zeta":0,"alpha":1}],"tail":{"zeta":false,"alpha":true},"sequence":[0,1]}"#,
+            r#"{"characters":[],"botPresets":[{"name":"preset"}],"botPresetsId":0,"personas":[{"id":"persona"}],"selectedPersona":0,"tail":{"zeta":false,"alpha":true},"sequence":[0,1]}"#,
         )
         .unwrap();
         let reordered_value: Value = serde_json::from_str(
-            r#"{"sequence":[0,1],"tail":{"alpha":true,"zeta":false},"modules":[{"alpha":1,"zeta":0}],"botPresets":[],"characters":[]}"#,
+            r#"{"sequence":[0,1],"tail":{"alpha":true,"zeta":false},"selectedPersona":0,"personas":[{"id":"persona"}],"botPresetsId":0,"botPresets":[{"name":"preset"}],"characters":[]}"#,
         )
         .unwrap();
 
