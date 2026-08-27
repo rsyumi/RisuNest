@@ -328,13 +328,31 @@ fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJ
             "Android spool owned directory escapes its canonical source root",
         ));
     }
-    validate_spool_source(&canonical_spool, token)
+    validate_spool_source(&canonical_spool, token, None)
 }
 
 fn claim_spool_source(
     job_root: &Path,
     token: &str,
     owned_directory: &Path,
+) -> Result<PathBuf, NativeJobError> {
+    claim_spool_source_with_display_name(job_root, token, owned_directory, None)
+}
+
+fn claim_spool_content_source(
+    job_root: &Path,
+    token: &str,
+    owned_directory: &Path,
+    display_name: &str,
+) -> Result<PathBuf, NativeJobError> {
+    claim_spool_source_with_display_name(job_root, token, owned_directory, Some(display_name))
+}
+
+fn claim_spool_source_with_display_name(
+    job_root: &Path,
+    token: &str,
+    owned_directory: &Path,
+    expected_display_name: Option<&str>,
 ) -> Result<PathBuf, NativeJobError> {
     parse_android_spool_token(token)?;
     let sources_root = job_root.join("sources").canonicalize().map_err(|error| {
@@ -366,10 +384,14 @@ fn claim_spool_source(
             "claimed Android spool escapes its native job directory",
         ));
     }
-    validate_spool_source(&canonical_claimed, token)
+    validate_spool_source(&canonical_claimed, token, expected_display_name)
 }
 
-fn validate_spool_source(canonical_spool: &Path, token: &str) -> Result<PathBuf, NativeJobError> {
+fn validate_spool_source(
+    canonical_spool: &Path,
+    token: &str,
+    expected_display_name: Option<&str>,
+) -> Result<PathBuf, NativeJobError> {
     let ownership_path = canonical_spool.join("ownership.json");
     let ownership_metadata = ownership_path.metadata().map_err(|error| {
         invalid_source_error(format!("Android spool ownership is unavailable: {error}"))
@@ -409,26 +431,20 @@ fn validate_spool_source(canonical_spool: &Path, token: &str) -> Result<PathBuf,
     if manifest.token != token
         || manifest.state != SpoolState::Ready
         || !is_safe_spool_display_name(&manifest.display_name)
+        || expected_display_name.is_some_and(|name| name != manifest.display_name)
     {
         return Err(invalid_source_error("Android spool source is not ready"));
     }
-    let source = canonical_spool
-        .join("source.risudat")
-        .canonicalize()
-        .map_err(|error| {
-            invalid_source_error(format!("Android spool source is unavailable: {error}"))
-        })?;
-    if source.parent() != Some(canonical_spool) {
-        return Err(invalid_source_error(
-            "Android spool source escapes its owned directory",
-        ));
-    }
-    let metadata = source.metadata().map_err(|error| {
+    let source = canonical_spool.join("source.risudat");
+    let metadata = fs::symlink_metadata(&source).map_err(|error| {
         invalid_source_error(format!(
             "Android spool source metadata is unavailable: {error}"
         ))
     })?;
-    if !metadata.is_file() || manifest.bytes != Some(metadata.len()) {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || manifest.bytes != Some(metadata.len())
+    {
         return Err(invalid_source_error(
             "Android spool source does not match its ready manifest",
         ));
@@ -1031,15 +1047,6 @@ impl NativeFileJobState {
                 )
             })?
             .to_path_buf();
-        let opened_source = match &source {
-            JobSource::DesktopPath { .. } => open_job_source(&self.root, &source)?,
-            JobSource::AndroidSpool { .. } => {
-                return Err(NativeJobError::new(
-                    "invalid-input",
-                    "content preparation currently supports desktop sources only",
-                ));
-            }
-        };
         let worker_permit =
             WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
         let warning_codes = self
@@ -1063,6 +1070,29 @@ impl NativeFileJobState {
                 let _ = job.finish_failure("capability-unavailable", &error);
                 let _ = self.registry.forget(&job_id);
                 return Err(NativeJobError::new("capability-unavailable", error));
+            }
+        };
+        let opened_source = match &source {
+            JobSource::DesktopPath { .. } => open_job_source(&self.root, &source),
+            JobSource::AndroidSpool { token } => {
+                claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
+                    .and_then(|path| open_regular_file_no_follow(&path))
+            }
+        };
+        let opened_source = match opened_source {
+            Ok(source) => source,
+            Err(error) => {
+                let cleanup =
+                    cleanup_one_owned_directory(&self.root.join("jobs"), &owned_directory, &job_id);
+                let _ = job.finish_failure(&error.code, &error.message);
+                let _ = self.registry.forget(&job_id);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(NativeJobError::new(
+                        "cleanup-failed",
+                        format!("{}; cleanup failed: {cleanup}", error.message),
+                    )),
+                };
             }
         };
         let root = self.root.clone();
@@ -3322,6 +3352,168 @@ mod tests {
             .path()
             .join("native-file-jobs/jobs")
             .join(&started.job_id)
+            .exists());
+    }
+
+    #[test]
+    fn content_job_claims_one_ready_android_spool_into_its_owned_directory() {
+        let directory = TempDir::new().unwrap();
+        let job_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(job_root.clone());
+        let token = Uuid::new_v4().to_string();
+        let source_bytes = br#"{"spec":"chara_card_v3","data":{"name":"Android","assets":[]}}"#;
+        write_literal_spool(
+            &job_root,
+            &token,
+            &format!(
+                "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"android-card.json\",\"bytes\":{},\"totalBytes\":null}}",
+                source_bytes.len(),
+            ),
+            1,
+        );
+        fs::write(
+            directory
+                .path()
+                .join("native-file-jobs/sources")
+                .join(&token)
+                .join("source.risudat"),
+            source_bytes,
+        )
+        .unwrap();
+        let jobs_root = job_root.join("jobs");
+        let unrelated = jobs_root.join("preserve-me");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("sentinel"), b"preserve").unwrap();
+        let started = state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::AndroidSpool {
+                    token: token.clone(),
+                },
+                display_name: "android-card.json".to_owned(),
+            })
+            .expect("content job should claim the ready Android spool");
+        assert!(state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::AndroidSpool {
+                    token: token.clone(),
+                },
+                display_name: "android-card.json".to_owned(),
+            })
+            .is_err());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state.is_terminal() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "content preparation timed out");
+            thread::yield_now();
+        };
+        assert_eq!(status.state, JobState::Succeeded);
+        let content = status
+            .prepared_content
+            .as_ref()
+            .expect("prepared Android content");
+        assert_eq!(content.cas_session_id, started.job_id);
+        assert_eq!(
+            content
+                .metadata
+                .pointer("/data/name")
+                .and_then(Value::as_str),
+            Some("Android"),
+        );
+        let session = crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .expect("prepared Android content keeps its durable CAS session");
+        assert_eq!(session.pin_count(), 0);
+        assert!(!session.is_sealed());
+        assert!(!session.is_released());
+        assert!(!directory
+            .path()
+            .join("native-file-jobs/sources")
+            .join(token)
+            .exists());
+        assert!(!jobs_root.join(started.job_id).exists());
+        assert_eq!(fs::read(unrelated.join("sentinel")).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn content_job_rejects_a_claimed_spool_source_link_without_following_it() {
+        let directory = TempDir::new().unwrap();
+        let job_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(job_root.clone());
+        let token = Uuid::new_v4().to_string();
+        let source_bytes = br#"{"spec":"chara_card_v3","data":{"name":"Linked","assets":[]}}"#;
+        write_literal_spool(
+            &job_root,
+            &token,
+            &format!(
+                "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"linked-card.json\",\"bytes\":{},\"totalBytes\":null}}",
+                source_bytes.len(),
+            ),
+            1,
+        );
+        let spool = job_root.join("sources").join(&token);
+        let source = spool.join("source.risudat");
+        let linked_payload = spool.join("linked-payload");
+        fs::write(&linked_payload, source_bytes).unwrap();
+        fs::remove_file(&source).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&linked_payload, &source).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&linked_payload, &source).unwrap();
+        let error = state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::AndroidSpool { token },
+                display_name: "linked-card.json".to_owned(),
+            })
+            .expect_err("content preparation must not follow a claimed spool source link");
+
+        assert_eq!(error.code, "invalid-source");
+    }
+
+    #[test]
+    fn content_job_uses_the_claimed_spool_display_name_for_classification() {
+        let directory = TempDir::new().unwrap();
+        let job_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(job_root.clone());
+        let token = Uuid::new_v4().to_string();
+        let source_bytes = br#"{"spec":"chara_card_v3","data":{"name":"Mismatched","assets":[]}}"#;
+        write_literal_spool(
+            &job_root,
+            &token,
+            &format!(
+                "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"database.risudat\",\"bytes\":{},\"totalBytes\":null}}",
+                source_bytes.len(),
+            ),
+            1,
+        );
+        fs::write(
+            directory
+                .path()
+                .join("native-file-jobs/sources")
+                .join(&token)
+                .join("source.risudat"),
+            source_bytes,
+        )
+        .unwrap();
+        let error = state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::AndroidSpool {
+                    token: token.clone(),
+                },
+                display_name: "card.json".to_owned(),
+            })
+            .expect_err("content preparation must use the claimed spool display name");
+
+        assert_eq!(error.code, "invalid-source");
+        assert!(!directory
+            .path()
+            .join("native-file-jobs/sources")
+            .join(token)
             .exists());
     }
 

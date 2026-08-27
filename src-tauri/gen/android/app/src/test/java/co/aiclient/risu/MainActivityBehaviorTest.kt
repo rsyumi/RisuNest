@@ -12,13 +12,17 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `native SAF routing preserves legacy imports for other associated formats`() {
-    assertEquals(true, shouldUseNativeRisuSaveSpool("backup.risudat"))
-    assertEquals(true, shouldUseNativeRisuSaveSpool("BACKUP.RISUDAT"))
-    assertEquals(false, shouldUseNativeRisuSaveSpool("module.risum"))
-    assertEquals(false, shouldUseNativeRisuSaveSpool("preset.risup"))
-    assertEquals(false, shouldUseNativeRisuSaveSpool("character.charx"))
-    assertEquals(false, shouldUseNativeRisuSaveSpool("unknown"))
+  fun `native SAF routing spools only restore and recognized character candidates`() {
+    assertEquals(true, shouldUseNativeFileJobSpool("backup.risudat"))
+    assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISUDAT"))
+    assertEquals(true, shouldUseNativeFileJobSpool("character.charx"))
+    assertEquals(true, shouldUseNativeFileJobSpool("character.json"))
+    assertEquals(true, shouldUseNativeFileJobSpool("character.jpg"))
+    assertEquals(true, shouldUseNativeFileJobSpool("character.JPEG"))
+    assertEquals(false, shouldUseNativeFileJobSpool("module.risum"))
+    assertEquals(false, shouldUseNativeFileJobSpool("preset.risup"))
+    assertEquals(false, shouldUseNativeFileJobSpool("character.png"))
+    assertEquals(false, shouldUseNativeFileJobSpool("unknown"))
   }
 
   @Test

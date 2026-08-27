@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     cancelActiveNativeFileOperation,
     nativeFileOperation,
+    runExternalAndroidNativeFileOperation,
     runSharedNativeFileOperation,
 } from './nativeFileJobManager'
 
@@ -50,5 +51,39 @@ describe('renderer-lifetime native file job manager', () => {
         cancelActiveNativeFileOperation()
         await expect(promise).rejects.toBeDefined()
         expect(observedSignal.aborted).toBe(true)
+    })
+
+    it('runs external Android open events FIFO instead of joining an unrelated active operation', async () => {
+        let releaseActive!: () => void
+        let releaseFirstEvent!: () => void
+        const calls: string[] = []
+        const active = runSharedNativeFileOperation('import', async () => {
+            calls.push('active')
+            await new Promise<void>((resolve) => releaseActive = resolve)
+            return 'active'
+        })
+        const firstEvent = runExternalAndroidNativeFileOperation('import', async () => {
+            calls.push('first-event')
+            await new Promise<void>((resolve) => releaseFirstEvent = resolve)
+            return 'first-event'
+        })
+        const secondEvent = runExternalAndroidNativeFileOperation('import', async () => {
+            calls.push('second-event')
+            return 'second-event'
+        })
+
+        expect(firstEvent).not.toBe(active)
+        expect(secondEvent).not.toBe(active)
+        expect(calls).toEqual(['active'])
+
+        releaseActive()
+        await expect(active).resolves.toBe('active')
+        await Promise.resolve()
+        expect(calls).toEqual(['active', 'first-event'])
+
+        releaseFirstEvent()
+        await expect(firstEvent).resolves.toBe('first-event')
+        await expect(secondEvent).resolves.toBe('second-event')
+        expect(calls).toEqual(['active', 'first-event', 'second-event'])
     })
 })

@@ -11,7 +11,7 @@ import {
     type AndroidSpoolReady,
 } from './androidSafBridge'
 import { createAndroidRisuSaveSpoolRoute } from './androidRisuSaveRoute'
-import { runSharedNativeFileOperation } from './nativeFileJobManager'
+import { runExternalAndroidNativeFileOperation } from './nativeFileJobManager'
 import {
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
@@ -55,7 +55,7 @@ export function registerAndroidRisuSaveRoute(): void {
             }
         },
         restore: async ({ source }) => {
-            const result = await runSharedNativeFileOperation(
+            const result = await runExternalAndroidNativeFileOperation(
                 'import',
                 ({ signal, onStatus, setBlocking }) => runNativeBlockRisuSaveRestore(
                     getPersistentDataRuntime(),

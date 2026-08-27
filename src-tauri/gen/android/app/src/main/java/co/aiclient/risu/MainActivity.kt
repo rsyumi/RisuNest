@@ -223,8 +223,12 @@ internal fun openedFilesScript(paths: List<String>): String {
   return "window.tauriOpenedFiles=[$values];"
 }
 
-internal fun shouldUseNativeRisuSaveSpool(displayName: String): Boolean =
-  displayName.endsWith(".risudat", ignoreCase = true)
+internal fun shouldUseNativeFileJobSpool(displayName: String): Boolean =
+  displayName.endsWith(".risudat", ignoreCase = true) ||
+    displayName.endsWith(".json", ignoreCase = true) ||
+    displayName.endsWith(".charx", ignoreCase = true) ||
+    displayName.endsWith(".jpg", ignoreCase = true) ||
+    displayName.endsWith(".jpeg", ignoreCase = true)
 
 internal class RestoredIntentConsumptionMarker(
   private val isConsumed: () -> Boolean,
@@ -1187,13 +1191,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   ) {
     val uris = claimOpenedFileUris(openedIntent)
     if (uris.isEmpty()) return
-    val (risuSaveUris, legacyUris) = uris.partition { uri ->
+    val (nativeJobUris, legacyUris) = uris.partition { uri ->
       val displayName = runCatching { resolveLegacyDisplayName(uri) }
         .getOrElse { sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") }
-      shouldUseNativeRisuSaveSpool(displayName)
+      shouldUseNativeFileJobSpool(displayName)
     }
     if (includeLegacyFiles) injectLegacyOpenedFiles(webView, legacyUris)
-    if (risuSaveUris.isEmpty()) return
+    if (nativeJobUris.isEmpty()) return
     val requestId = UUID.randomUUID().toString()
     val cancellation = AtomicBoolean(false)
     safSourceCancellations[requestId] = cancellation
@@ -1202,7 +1206,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val store = safSpoolStore()
         val sources = withContext(Dispatchers.IO) {
           store.cleanupStale()
-          risuSaveUris.map(::contentResolverSource)
+          nativeJobUris.map(::contentResolverSource)
         }
         val copyContext = currentCoroutineContext()
         val batch = spoolOpenedFilesOnIo(
@@ -1243,7 +1247,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val store = safSpoolStore()
         store.cleanupStale()
         store.listReady().filter {
-          shouldUseNativeRisuSaveSpool(it.displayName) && deliveredSpoolTokens.add(it.token)
+          shouldUseNativeFileJobSpool(it.displayName) && deliveredSpoolTokens.add(it.token)
         }
       }
       if (ready.isEmpty() || lifecycleWebView !== webView) return@launch

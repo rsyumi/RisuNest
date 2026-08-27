@@ -18,6 +18,7 @@ export const nativeFileOperation = writable<NativeFileOperationState | null>(nul
 
 let activeOperation: Promise<unknown> | null = null
 let activeController: AbortController | null = null
+let externalAndroidOperationTail: Promise<void> = Promise.resolve()
 
 export function runSharedNativeFileOperation<T>(
     kind: NativeFileOperationState['kind'],
@@ -44,6 +45,26 @@ export function runSharedNativeFileOperation<T>(
     })
     activeOperation = promise
     return promise
+}
+
+export function runExternalAndroidNativeFileOperation<T>(
+    kind: NativeFileOperationState['kind'],
+    operation: (context: SharedNativeFileOperationContext) => Promise<T>,
+): Promise<T> {
+    const queued = externalAndroidOperationTail.then(async () => {
+        while (activeOperation) {
+            try {
+                await activeOperation
+            }
+            catch {}
+        }
+        return await runSharedNativeFileOperation(kind, operation)
+    })
+    externalAndroidOperationTail = queued.then(
+        () => undefined,
+        () => undefined,
+    )
+    return queued
 }
 
 export function cancelActiveNativeFileOperation(): void {
