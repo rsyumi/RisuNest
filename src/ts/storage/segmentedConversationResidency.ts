@@ -265,6 +265,16 @@ export class SegmentedConversationResidency {
         return this.acknowledgedVersion
     }
 
+    advanceStoreRevision(revision: DataRevision): boolean {
+        validateIndex(revision, 'Conversation storage-only data revision')
+        if (revision < this.baseRevision) {
+            throw new RangeError('Conversation storage-only data revision moved backwards')
+        }
+        if (revision === this.baseRevision) return false
+        this.baseRevision = revision
+        return true
+    }
+
     get residentBytes(): number {
         let bytes = 0
         const counted = new Set<Message>()

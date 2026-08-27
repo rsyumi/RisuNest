@@ -63,6 +63,8 @@ export interface SaveCoordinatorDependencies {
     clock?: SaveCoordinatorClock
     now?(): number
     onLocalRevision?(revision: DataRevision): void
+    /** Advances revision-only working-set state synchronously and must not throw. */
+    onStorageOnlyRevision?(revision: DataRevision): void
     onConversationMutationPersistenceStarted?(
         event: ActiveConversationMutationEvent,
     ): ConversationMutationPersistenceHandle | null | undefined
@@ -777,6 +779,27 @@ export class SaveCoordinator {
             this.destructiveReplacementFence.blockedPrePublicationDirty = false
         }
         this.armPublicationCleanupRetryIfNeeded()
+    }
+
+    runStorageOnlyMutation(
+        operation: (expectedRevision: DataRevision) => Promise<DataRevision>,
+    ): Promise<void> {
+        this.assertInitialized()
+        this.assertPersistentMutationAllowed()
+        return this.enqueue(async () => {
+            const expectedRevision = this.revision
+            const revision = await operation(expectedRevision)
+            if (!Number.isSafeInteger(revision) || revision < 0) {
+                throw new RangeError('Storage-only mutation returned an invalid revision')
+            }
+            if (revision < expectedRevision) {
+                throw new RevisionConflictError(expectedRevision, revision)
+            }
+            if (revision === expectedRevision) return
+            this.currentRevision = revision
+            this.dependencies.onStorageOnlyRevision?.(revision)
+            this.dependencies.onLocalRevision?.(revision)
+        })
     }
 
     adoptHydratedCharacter(

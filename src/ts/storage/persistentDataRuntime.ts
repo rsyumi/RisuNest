@@ -255,6 +255,9 @@ export interface PersistentDataRuntime {
     readonly revision: DataRevision
     initializeActiveWorkingSet(database: Database): Promise<void>
     refreshActiveWorkingSetFromStore(revision: DataRevision): Promise<void>
+    runStorageOnlyMutation(
+        operation: (expectedRevision: DataRevision) => Promise<DataRevision>,
+    ): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
     acknowledgeGenerationCompletion(): Promise<void>
@@ -469,6 +472,7 @@ export function createPersistentDataRuntime(
         clock: dependencies.clock,
         now: dependencies.now,
         onLocalRevision: dependencies.onLocalRevision,
+        onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
         onConversationMutationPersistenceStarted: (event) =>
             workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {
@@ -566,6 +570,7 @@ export function createPersistentDataRuntime(
         initializeActiveWorkingSet: (database) => workingSet.initializeActiveWorkingSet(database),
         refreshActiveWorkingSetFromStore: (revision) =>
             refreshCommittedWorkingSet(revision),
+        runStorageOnlyMutation: (operation) => coordinator.runStorageOnlyMutation(operation),
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),

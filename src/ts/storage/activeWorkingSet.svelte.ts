@@ -88,6 +88,10 @@ export class ActiveWorkingSet {
         return this.activeSession
     }
 
+    advanceStoreRevision(revision: DataRevision): void {
+        this.activeSession?.advanceStoreRevision(revision)
+    }
+
     beginConversationMutationPersistence(event: ActiveConversationMutationEvent) {
         const session = this.activeSession
         if (

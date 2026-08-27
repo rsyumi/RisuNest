@@ -1,5 +1,6 @@
 import { isNodeServer, isTauri } from '../platform'
 import { configureLocalColdStorageRuntime } from '../process/coldstorage.svelte'
+import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { createLocalColdStorageRuntime } from './localColdStorageRuntime'
 import { getPersistentStorageAuthority } from './persistentDataStoreFactory'
 import {
@@ -30,12 +31,49 @@ import {
     createLegacyNodeColdPayloadStore,
     createLegacyTauriColdPayloadStore,
 } from './platformColdPayloadStore'
+import { RevisionConflictError } from './persistentDataStore'
+import type { ColdPayloadStore } from './coldPayloadStore'
+import type { PersistentStorageAuthority } from './persistentStorageAuthority'
 
 async function createLocalColdPayloadStore() {
     const backend = await getPlatformBlobKeyValueBackend()
     if (isTauri) return createLegacyTauriColdPayloadStore(backend)
     if (isNodeServer) return createLegacyNodeColdPayloadStore(backend)
     return createLegacyBrowserOpfsColdPayloadStore(() => navigator.storage.getDirectory())
+}
+
+function createCoordinatorOwnedColdPayloadStore(
+    store: ColdPayloadStore,
+    authority: PersistentStorageAuthority,
+): ColdPayloadStore {
+    const mutate = (operation: () => Promise<void>) =>
+        getPersistentDataRuntime().runStorageOnlyMutation((expectedRevision) =>
+            authority.gate.runTransition(async () => {
+                const before = await authority.rawStore.readRoot()
+                if (before.revision !== expectedRevision) {
+                    throw new RevisionConflictError(expectedRevision, before.revision)
+                }
+                await operation()
+                return (await authority.rawStore.readRoot()).revision
+            }))
+    return {
+        read: (key) => store.read(key),
+        async write(key, data) {
+            const ownedData = data.slice()
+            await mutate(() => store.write(key, ownedData))
+        },
+        list: () => store.list(),
+        remove: (key) => mutate(() => store.remove(key)),
+    }
+}
+
+function createConfiguredColdPayloadStore(
+    store: ColdPayloadStore,
+    authority: PersistentStorageAuthority,
+): ColdPayloadStore {
+    return isTauri
+        ? createCoordinatorOwnedColdPayloadStore(store, authority)
+        : createGatedColdPayloadStore(store, authority.gate)
 }
 
 async function installPersistentStorage(): Promise<void> {
@@ -78,9 +116,9 @@ async function installPersistentStorage(): Promise<void> {
         createRuntimeAssetRepositoryDispatcher(selection),
     )
     configureLocalColdStorageRuntime(
-        createLocalColdStorageRuntime(createGatedColdPayloadStore(
+        createLocalColdStorageRuntime(createConfiguredColdPayloadStore(
             createRuntimeColdPayloadDispatcher(coldSelection),
-            authority.gate,
+            authority,
         )),
     )
 }
@@ -149,9 +187,9 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
             createRuntimeAssetRepositoryDispatcher(selection),
         )
         configureLocalColdStorageRuntime(
-            createLocalColdStorageRuntime(createGatedColdPayloadStore(
+            createLocalColdStorageRuntime(createConfiguredColdPayloadStore(
                 createRuntimeColdPayloadDispatcher(coldSelection),
-                authority.gate,
+                authority,
             )),
         )
         return (await authority.rawStore.readColdPayloadAuthority()).revision

@@ -1091,6 +1091,18 @@ export class ActiveConversationSession {
         return this.currentStoreRevision
     }
 
+    advanceStoreRevision(revision: DataRevision): boolean {
+        this.assertActive()
+        validateIndex(revision, 'Conversation storage-only data revision')
+        if (revision < this.currentStoreRevision) {
+            throw new RangeError('Conversation storage-only data revision moved backwards')
+        }
+        if (revision === this.currentStoreRevision) return false
+        if (!this.compatibilityFallback) this.residency.advanceStoreRevision(revision)
+        this.currentStoreRevision = revision
+        return true
+    }
+
     get version(): number {
         return this.sessionVersion
     }

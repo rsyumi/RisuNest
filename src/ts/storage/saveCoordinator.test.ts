@@ -140,6 +140,92 @@ describe('SaveCoordinator', () => {
         return { database, added }
     }
 
+    it('adopts a successful storage-only revision without changing dirty state or baselines', async () => {
+        const database = makeDatabase()
+        const commit = vi.fn()
+        const onStorageOnlyRevision = vi.fn()
+        const onLocalRevision = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onStorageOnlyRevision,
+            onLocalRevision,
+        })
+        coordinator.initialize(4, database)
+        const generation = coordinator.mutationGeneration
+
+        await coordinator.runStorageOnlyMutation(async (expectedRevision) => {
+            expect(expectedRevision).toBe(4)
+            return 5
+        })
+
+        expect(coordinator.revision).toBe(5)
+        expect(coordinator.mutationGeneration).toBe(generation)
+        expect(coordinator.pendingBytes).toBe(0)
+        expect(onStorageOnlyRevision).toHaveBeenCalledWith(5)
+        expect(onLocalRevision).toHaveBeenCalledWith(5)
+        await coordinator.flushPendingData('storage-only-baseline')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('does not advance storage-only state when the mutation fails', async () => {
+        const database = makeDatabase()
+        const error = new Error('cold mutation failed')
+        const onStorageOnlyRevision = vi.fn()
+        const onLocalRevision = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onStorageOnlyRevision,
+            onLocalRevision,
+        })
+        coordinator.initialize(4, database)
+        const generation = coordinator.mutationGeneration
+
+        await expect(coordinator.runStorageOnlyMutation(async () => {
+            throw error
+        })).rejects.toBe(error)
+
+        expect(coordinator.revision).toBe(4)
+        expect(coordinator.mutationGeneration).toBe(generation)
+        expect(coordinator.pendingBytes).toBe(0)
+        expect(onStorageOnlyRevision).not.toHaveBeenCalled()
+        expect(onLocalRevision).not.toHaveBeenCalled()
+    })
+
+    it('serializes storage-only mutation after an ordinary save without losing either revision', async () => {
+        const database = makeDatabase()
+        const committed = deferred<{ revision: number }>()
+        const commit = vi.fn(() => committed.promise)
+        const storageMutation = vi.fn(async (expectedRevision: number) => expectedRevision + 1)
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(4, database)
+        database.username = 'Ordinary save'
+        coordinator.markPersistentDataDirty(1)
+
+        const flushing = coordinator.flushPendingData('ordinary-before-cold')
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+        const storing = coordinator.runStorageOnlyMutation(storageMutation)
+        expect(storageMutation).not.toHaveBeenCalled()
+
+        committed.resolve({ revision: 5 })
+        await flushing
+        await storing
+
+        expect(commit).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: 4 }))
+        expect(storageMutation).toHaveBeenCalledWith(5)
+        expect(coordinator.revision).toBe(6)
+    })
+
     it('commits captured plugin storage mutations atomically without putting values in root', async () => {
         const database = makeDatabase()
         database.pluginCustomStorage = { alpha: 'old', removed: true }
