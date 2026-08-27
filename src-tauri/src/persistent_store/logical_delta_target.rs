@@ -1800,7 +1800,9 @@ fn derive_exact_three_way_plan(
             if local_record == remote_record {
                 continue;
             }
-            return validation(format!("logical delta merge conflicts at record {key}"));
+            return Err(PeerSyncError::LogicalMergeConflict {
+                record: key.to_owned(),
+            });
         }
         if local_changed {
             preserve.push(key.to_owned());
@@ -3341,6 +3343,22 @@ mod tests {
         }
     }
 
+    fn expect_begin_merge_conflict(
+        target: &mut PersistentLogicalDeltaTarget<'_>,
+        plan: &ReadyLogicalDeltaPlan,
+    ) {
+        match target.begin(plan) {
+            Err(PeerSyncError::LogicalMergeConflict { .. }) => {}
+            Err(error) => panic!("expected logical merge conflict, got {error}"),
+            Ok(stage) => {
+                target
+                    .abort(stage)
+                    .expect("abort unexpectedly accepted conflict stage");
+                panic!("conflicting logical delta plan reached staging");
+            }
+        }
+    }
+
     #[test]
     fn stage_payload_rejects_trailing_bytes_without_reading_past_the_first_extra_byte() {
         let (directory, mut store, cas) = open_fixture();
@@ -3577,6 +3595,69 @@ mod tests {
         );
         assert!(preserve.is_empty());
         assert_eq!(candidates, vec![empty_hash]);
+    }
+
+    #[test]
+    fn exact_plan_reports_delete_vs_edit_as_a_typed_merge_conflict() {
+        let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "shared-plugin".to_owned(),
+        })
+        .unwrap();
+        let manifest =
+            |generation: &str,
+             sequence: &str,
+             record: LogicalManifestRecord,
+             objects: Vec<LogicalManifestObject>| LogicalManifest {
+                schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+                library_id: "library".to_owned(),
+                generation: generation.to_owned(),
+                generation_sequence: sequence.to_owned(),
+                parent_generation: None,
+                source_revision: 1,
+                records: vec![record],
+                objects,
+            };
+        let live = |hash: &str| {
+            LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: key.clone(),
+                state: "live".to_owned(),
+                object_hash: hash.repeat(64),
+                dependencies: vec![],
+            })
+        };
+        let base = manifest(
+            "base",
+            "0",
+            live("a"),
+            vec![LogicalManifestObject {
+                hash: "a".repeat(64),
+                size: 1,
+            }],
+        );
+        let local = manifest(
+            "local",
+            "1",
+            LogicalManifestRecord::Tombstone(LogicalManifestTombstoneRecord {
+                key: key.clone(),
+                state: "tombstone".to_owned(),
+                deleted_generation_sequence: "1".to_owned(),
+            }),
+            vec![],
+        );
+        let remote = manifest(
+            "remote",
+            "1",
+            live("b"),
+            vec![LogicalManifestObject {
+                hash: "b".repeat(64),
+                size: 1,
+            }],
+        );
+
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &local, &remote),
+            Err(PeerSyncError::LogicalMergeConflict { record }) if record == key
+        ));
     }
 
     #[test]
@@ -4680,7 +4761,7 @@ mod tests {
         )
         .unwrap();
 
-        expect_begin_validation(&mut target, &plan);
+        expect_begin_merge_conflict(&mut target, &plan);
         assert!(!staging_root.exists());
     }
 

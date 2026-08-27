@@ -73,6 +73,9 @@ pub enum PeerSyncError {
         expected: Option<String>,
         actual: Option<String>,
     },
+    LogicalMergeConflict {
+        record: String,
+    },
     AlreadyActivated,
     Protocol(String),
     Storage(String),

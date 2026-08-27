@@ -1912,6 +1912,8 @@ mod timeout_tests {
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
+    static LOGICAL_LAN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     const TEST_SESSION_ID: &str = "00000000-0000-4000-8000-000000000000";
     const TEST_BEARER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -2122,6 +2124,7 @@ mod timeout_tests {
 
     #[test]
     fn logical_session_reuses_claim_bearer_revoke_and_bounded_object_routes() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
             generation: "generation-1".to_owned(),
@@ -2179,10 +2182,17 @@ mod timeout_tests {
         assert_eq!(client.fetch_manifest().unwrap(), built.manifest_bytes);
         let mut reader = client
             .open_object(&LogicalDeltaObject {
-                hash: record_hash,
+                hash: record_hash.clone(),
                 size: record_bytes.len() as u64,
             })
             .unwrap();
+        let devices = host.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].verified_bytes, 0);
+        assert_eq!(
+            devices[0].current_object.as_deref(),
+            Some(record_hash.as_str())
+        );
         let mut received = Vec::new();
         reader.read_to_end(&mut received).unwrap();
         assert_eq!(received, record_bytes);
@@ -2196,6 +2206,77 @@ mod timeout_tests {
             client.fetch_manifest(),
             Err(PeerSyncError::Transport(_))
         ));
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn logical_progress_never_marks_a_corrupt_object_as_verified() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "plugin-key".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let record_hash = built.record_objects[0].object.hash.clone();
+        let record_size = built.record_objects[0].object.size;
+        let mut corrupt = built.record_objects[0].object.bytes.clone();
+        corrupt[0] ^= 0xff;
+        let logical = PreparedLogicalLanSession::new(
+            "00000000-0000-4000-8000-000000000052",
+            "00000000-0000-4000-8000-000000000053",
+            built.manifest_hash.clone(),
+            built.manifest_bytes,
+            built
+                .manifest
+                .objects
+                .iter()
+                .map(|object| LogicalDeltaObject {
+                    hash: object.hash.clone(),
+                    size: object.size,
+                })
+                .collect(),
+            Box::new(LogicalFixtureSource(BTreeMap::from([(
+                record_hash.clone(),
+                corrupt,
+            )]))),
+        )
+        .unwrap();
+        let mut host = LanCloneHost::prepare_logical(logical);
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let mut client = LanLogicalDeltaClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: record_hash,
+                size: record_size,
+            })
+            .unwrap();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+
+        let devices = host.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].verified_bytes, 0);
+        assert_eq!(devices[0].current_object, None);
         host.stop().unwrap();
     }
 
@@ -2214,13 +2295,49 @@ mod timeout_tests {
 
 #[cfg(desktop)]
 pub struct LanLogicalDeltaClient {
-    client: reqwest::blocking::Client,
+    control_client: reqwest::blocking::Client,
+    object_client: reqwest::blocking::Client,
     control_timeout: Duration,
     session_url: String,
     pub device_id: String,
     bearer: String,
     source_device_id: String,
     manifest_id: String,
+    verified_bytes: Arc<Mutex<u64>>,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicalRequestKind {
+    Control,
+    Object,
+}
+
+#[cfg(desktop)]
+fn logical_request_timeout(
+    kind: LogicalRequestKind,
+    control_timeout: Duration,
+) -> Option<Duration> {
+    match kind {
+        LogicalRequestKind::Control => Some(control_timeout),
+        LogicalRequestKind::Object => None,
+    }
+}
+
+#[cfg(desktop)]
+fn build_logical_http_client(
+    kind: LogicalRequestKind,
+    control_timeout: Duration,
+) -> Result<reqwest::blocking::Client, PeerSyncError> {
+    let builder = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    let builder = match logical_request_timeout(kind, control_timeout) {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    };
+    builder.build().map_err(transport)
 }
 
 #[cfg(desktop)]
@@ -2248,14 +2365,10 @@ impl LanLogicalDeltaClient {
             ));
         }
         let control_timeout = CONTROL_REQUEST_TIMEOUT;
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(control_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(transport)?;
-        let response = client
+        let control_client =
+            build_logical_http_client(LogicalRequestKind::Control, control_timeout)?;
+        let object_client = build_logical_http_client(LogicalRequestKind::Object, control_timeout)?;
+        let response = control_client
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
@@ -2294,13 +2407,15 @@ impl LanLogicalDeltaClient {
             ));
         }
         Ok(Self {
-            client,
+            control_client,
+            object_client,
             control_timeout,
             session_url,
             device_id: response.device_id,
             bearer: response.bearer,
             source_device_id,
             manifest_id: manifest_id.to_owned(),
+            verified_bytes: Arc::new(Mutex::new(0)),
         })
     }
 
@@ -2310,7 +2425,10 @@ impl LanLogicalDeltaClient {
 
     pub fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
         let response = self
-            .authorized(self.client.get(format!("{}/manifest", self.session_url)))
+            .authorized_control(
+                self.control_client
+                    .get(format!("{}/manifest", self.session_url)),
+            )
             .send()
             .map_err(transport)?;
         if response.status() != reqwest::StatusCode::OK {
@@ -2352,13 +2470,23 @@ impl LanLogicalDeltaClient {
         Ok(bytes)
     }
 
-    fn authorized(
+    fn authorized_control(
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
         request
             .bearer_auth(&self.bearer)
             .timeout(self.control_timeout)
+    }
+
+    fn progress_reporter(&self) -> LogicalProgressReporter {
+        LogicalProgressReporter {
+            client: self.control_client.clone(),
+            control_timeout: self.control_timeout,
+            session_url: self.session_url.clone(),
+            bearer: self.bearer.clone(),
+            verified_bytes: Arc::clone(&self.verified_bytes),
+        }
     }
 }
 
@@ -2367,10 +2495,9 @@ impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
     fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
         validate_object_hash(&object.hash)?;
         let response = self
-            .authorized(
-                self.client
-                    .get(format!("{}/objects/{}", self.session_url, object.hash)),
-            )
+            .object_client
+            .get(format!("{}/objects/{}", self.session_url, object.hash))
+            .bearer_auth(&self.bearer)
             .send()
             .map_err(transport)?;
         if response.status() != reqwest::StatusCode::OK {
@@ -2393,6 +2520,142 @@ impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
                 "logical delta object response identity is invalid".to_owned(),
             ));
         }
-        Ok(Box::new(response))
+        let reporter = self.progress_reporter();
+        let _ = reporter.report_current(Some(&object.hash));
+        Ok(Box::new(LogicalProgressReader {
+            inner: response,
+            reporter,
+            expected_hash: object.hash.clone(),
+            expected_size: object.size,
+            received_size: 0,
+            hasher: Sha256::new(),
+            cleared: false,
+            completed: false,
+        }))
+    }
+}
+
+#[cfg(desktop)]
+struct LogicalProgressReporter {
+    client: reqwest::blocking::Client,
+    control_timeout: Duration,
+    session_url: String,
+    bearer: String,
+    verified_bytes: Arc<Mutex<u64>>,
+}
+
+#[cfg(desktop)]
+impl LogicalProgressReporter {
+    fn verified_bytes(&self) -> Result<u64, PeerSyncError> {
+        self.verified_bytes
+            .lock()
+            .map(|value| *value)
+            .map_err(|error| {
+                PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
+            })
+    }
+
+    fn report_current(&self, current_object: Option<&str>) -> Result<(), PeerSyncError> {
+        let response = self
+            .client
+            .post(format!("{}/progress", self.session_url))
+            .bearer_auth(&self.bearer)
+            .json(&ProgressRequest {
+                verified_bytes: self.verified_bytes()?,
+                current_object: current_object.map(str::to_owned),
+            })
+            .timeout(self.control_timeout)
+            .send()
+            .map_err(transport)?;
+        if response.status().as_u16() != 204 {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
+    fn complete_object(&self, size: u64) -> Result<(), PeerSyncError> {
+        {
+            let mut verified = self.verified_bytes.lock().map_err(|error| {
+                PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
+            })?;
+            *verified = verified.checked_add(size).ok_or_else(|| {
+                PeerSyncError::Validation("logical progress byte count overflow".to_owned())
+            })?;
+        }
+        self.report_current(None)
+    }
+}
+
+#[cfg(desktop)]
+struct LogicalProgressReader {
+    inner: reqwest::blocking::Response,
+    reporter: LogicalProgressReporter,
+    expected_hash: String,
+    expected_size: u64,
+    received_size: u64,
+    hasher: Sha256,
+    cleared: bool,
+    completed: bool,
+}
+
+#[cfg(desktop)]
+impl LogicalProgressReader {
+    fn clear_current(&mut self) {
+        if !self.cleared {
+            self.cleared = self.reporter.report_current(None).is_ok();
+        }
+    }
+
+    fn finish_if_verified(&mut self) {
+        if self.completed {
+            return;
+        }
+        let hash = hex::encode(self.hasher.clone().finalize());
+        if self.received_size == self.expected_size && hash == self.expected_hash {
+            self.completed = true;
+            self.cleared = self.reporter.complete_object(self.expected_size).is_ok();
+        } else {
+            self.clear_current();
+        }
+    }
+}
+
+#[cfg(desktop)]
+impl Read for LogicalProgressReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return self.inner.read(output);
+        }
+        match self.inner.read(output) {
+            Ok(0) => {
+                self.finish_if_verified();
+                Ok(0)
+            }
+            Ok(read) => {
+                self.received_size =
+                    self.received_size.checked_add(read as u64).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "logical object stream byte count overflow",
+                        )
+                    })?;
+                self.hasher.update(&output[..read]);
+                Ok(read)
+            }
+            Err(error) => {
+                self.clear_current();
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(desktop)]
+impl Drop for LogicalProgressReader {
+    fn drop(&mut self) {
+        self.clear_current();
     }
 }

@@ -2,7 +2,7 @@ use super::{
     execute_logical_delta_pull,
     lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
-    select_missing_logical_delta_objects, LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject,
+    LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     PeerSyncError,
 };
 use crate::{
@@ -17,12 +17,13 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -301,15 +302,79 @@ pub enum PeerDeltaPullResult {
     },
 }
 
+#[derive(Default)]
+struct MeasuredTransferTotals {
+    objects: Cell<u64>,
+    bytes: Cell<u64>,
+}
+
+struct MeasuredLogicalDeltaSource<'a, S: LogicalDeltaObjectSource + ?Sized> {
+    inner: &'a mut S,
+    totals: Rc<MeasuredTransferTotals>,
+}
+
+impl<'a, S: LogicalDeltaObjectSource + ?Sized> MeasuredLogicalDeltaSource<'a, S> {
+    fn new(inner: &'a mut S) -> Self {
+        Self {
+            inner,
+            totals: Rc::new(MeasuredTransferTotals::default()),
+        }
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (self.totals.objects.get(), self.totals.bytes.get())
+    }
+}
+
+impl<S: LogicalDeltaObjectSource + ?Sized> LogicalDeltaObjectSource
+    for MeasuredLogicalDeltaSource<'_, S>
+{
+    fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
+        let reader = self.inner.open_object(object)?;
+        let objects = self.totals.objects.get().checked_add(1).ok_or_else(|| {
+            PeerSyncError::Validation("logical transfer object count overflow".to_owned())
+        })?;
+        self.totals.objects.set(objects);
+        Ok(Box::new(MeasuredLogicalDeltaReader {
+            inner: reader,
+            totals: Rc::clone(&self.totals),
+        }))
+    }
+}
+
+struct MeasuredLogicalDeltaReader {
+    inner: Box<dyn Read>,
+    totals: Rc<MeasuredTransferTotals>,
+}
+
+impl Read for MeasuredLogicalDeltaReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(output)?;
+        let bytes = self
+            .totals
+            .bytes
+            .get()
+            .checked_add(read as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "logical transfer byte count overflow",
+                )
+            })?;
+        self.totals.bytes.set(bytes);
+        Ok(read)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn pull_logical_delta(
+fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
     app_root: &Path,
     source_device_id: &str,
     expected_revision: i64,
     remote_manifest_bytes: &[u8],
-    remote_source: &mut LanLogicalDeltaClient,
+    remote_source: &mut S,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
     let actual_revision = store.revision().map_err(store_error)?;
     if actual_revision != expected_revision {
@@ -402,7 +467,13 @@ fn pull_logical_delta(
         }
     }
 
-    let plan = target.build_ready_plan(expected_revision)?;
+    let plan = match target.build_ready_plan(expected_revision) {
+        Ok(plan) => plan,
+        Err(error) => {
+            drop(target);
+            return classify_plan_error(error);
+        }
+    };
     let local_hashes = local
         .manifest
         .objects
@@ -414,21 +485,16 @@ fn pull_logical_delta(
         .iter()
         .map(|object| (object.hash.clone(), object.size))
         .collect::<BTreeMap<_, _>>();
-    let selection = select_missing_logical_delta_objects(&plan, &local_hashes, cas, &remote_sizes)?;
-    let transferred_objects = selection.missing_objects().len() as u64;
-    let transferred_bytes = selection
-        .missing_objects()
-        .iter()
-        .try_fold(0_u64, |total, object| total.checked_add(object.size))
-        .ok_or_else(|| PeerSyncError::Validation("logical transfer size overflow".to_owned()))?;
+    let mut measured_source = MeasuredLogicalDeltaSource::new(remote_source);
     let activation = execute_logical_delta_pull(
         &plan,
         &local_hashes,
         cas,
         &remote_sizes,
-        remote_source,
+        &mut measured_source,
         &mut target,
     );
+    let (transferred_objects, transferred_bytes) = measured_source.totals();
     drop(target);
     match activation {
         Ok(LogicalDeltaActivation::Activated { revision }) => {
@@ -467,6 +533,15 @@ fn pull_logical_delta(
             }
             Err(error)
         }
+    }
+}
+
+fn classify_plan_error(error: PeerSyncError) -> Result<PeerDeltaPullResult, PeerSyncError> {
+    match error {
+        PeerSyncError::LogicalMergeConflict { .. } => Ok(PeerDeltaPullResult::Conflict {
+            reason: "localAndRemoteChanged",
+        }),
+        error => Err(error),
     }
 }
 
@@ -898,6 +973,24 @@ mod tests {
         );
         assert_eq!(store.revision().unwrap(), 0);
         assert_eq!(source.reads, 0);
+
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                "00000000-0000-4000-8000-000000000002",
+                0,
+                &other.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::FullCloneRequired {
+                reason: "noExactCommonBase",
+            }
+        );
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(source.reads, 0);
     }
 
     #[test]
@@ -1012,5 +1105,22 @@ mod tests {
             store.read_root(None).unwrap().value,
             json!({"side":"local"})
         );
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                peer,
+                1,
+                &remote.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "localAndRemoteChanged",
+            }
+        );
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(source.reads, 0);
     }
 }
