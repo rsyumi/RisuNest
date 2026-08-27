@@ -19,6 +19,13 @@
     } from 'src/ts/storage/sync/peerDelta'
     import { getDesktopPeerDeltaController } from 'src/ts/storage/sync/peerDeltaController'
     import {
+        parsePeerBidirectionalUri,
+        type PeerBidirectionalCapabilities,
+        type PeerBidirectionalSourceStatus,
+        type PeerBidirectionalSyncResult,
+    } from 'src/ts/storage/sync/peerBidirectional'
+    import { getDesktopPeerBidirectionalController } from 'src/ts/storage/sync/peerBidirectionalController'
+    import {
         consumePendingPeerCloneUri,
         subscribePeerCloneUri,
     } from 'src/ts/storage/sync/peerCloneDeepLink'
@@ -35,6 +42,11 @@
         acquireDestructiveReplacementFence,
     })
     const deltaController = getDesktopPeerDeltaController({
+        flushPendingData,
+        capturePersistentMutationToken,
+        acquirePersistentMutationFence: acquireDestructiveReplacementFence,
+    })
+    const bidirectionalController = getDesktopPeerBidirectionalController({
         flushPendingData,
         capturePersistentMutationToken,
         acquirePersistentMutationFence: acquireDestructiveReplacementFence,
@@ -58,6 +70,14 @@
     let deltaPullResult = $state<PeerDeltaPullResult>()
     let deltaBusy = $state(false)
     let deltaError = $state('')
+    let bidirectionalCapabilities = $state<PeerBidirectionalCapabilities>()
+    let bidirectionalSourceStatus = $state<PeerBidirectionalSourceStatus>({ phase: 'idle', devices: [] })
+    let bidirectionalSourcePairingUri = $state('')
+    let bidirectionalPairingInput = $state('')
+    let bidirectionalOperationPhase = $state('idle')
+    let bidirectionalResult = $state<PeerBidirectionalSyncResult>()
+    let bidirectionalBusy = $state(false)
+    let bidirectionalError = $state('')
 
     $effect(() => {
         if (sourceMode !== 'named' || sourceStatus.phase !== 'prepared') {
@@ -89,6 +109,17 @@
         && deltaCapabilities.authenticatedTransportReady
     ))
     const deltaOperationRunning = $derived(deltaBusy || deltaPullPhase === 'running')
+    const bidirectionalEnabled = $derived(!!(
+        bidirectionalCapabilities?.productionEnabled
+        && bidirectionalCapabilities.sourceReady
+        && bidirectionalCapabilities.atomicActivationReady
+        && bidirectionalCapabilities.authenticatedTransportReady
+        && bidirectionalCapabilities.losslessBackupReady
+        && bidirectionalCapabilities.durableStateReady
+    ))
+    const bidirectionalBackups = $derived(
+        bidirectionalResult && 'backups' in bidirectionalResult ? bidirectionalResult.backups : [],
+    )
 
     function reportError(cause: unknown): void {
         error = cause instanceof Error ? cause.message : String(cause)
@@ -280,11 +311,89 @@
         }
     }
 
+    function refreshBidirectionalState(): void {
+        const snapshot = bidirectionalController.snapshot()
+        bidirectionalCapabilities = snapshot.capabilities
+        bidirectionalSourceStatus = snapshot.sourceStatus
+        bidirectionalSourcePairingUri = snapshot.sourcePairingUri
+        bidirectionalOperationPhase = snapshot.operationPhase
+        bidirectionalResult = snapshot.operationResult
+        bidirectionalError = snapshot.error
+    }
+
+    async function withBidirectionalBusy(operation: () => Promise<void>): Promise<void> {
+        if (bidirectionalBusy) return
+        bidirectionalBusy = true
+        bidirectionalError = ''
+        try {
+            await operation()
+        } catch (cause) {
+            bidirectionalError = cause instanceof Error ? cause.message : String(cause)
+        } finally {
+            bidirectionalBusy = false
+            refreshBidirectionalState()
+        }
+    }
+
+    async function prepareBidirectionalSource(): Promise<void> {
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.prepare()
+        })
+    }
+
+    async function startBidirectionalSource(): Promise<void> {
+        if (!bidirectionalSourceStatus.sessionId) return
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.start(bidirectionalSourceStatus.sessionId!)
+        })
+    }
+
+    async function stopBidirectionalSource(): Promise<void> {
+        if (!bidirectionalSourceStatus.sessionId) return
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.stop(bidirectionalSourceStatus.sessionId!)
+        })
+    }
+
+    async function revokeBidirectionalDevice(deviceId: string): Promise<void> {
+        if (!bidirectionalSourceStatus.sessionId) return
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.revoke(bidirectionalSourceStatus.sessionId!, deviceId)
+        })
+    }
+
+    async function syncBidirectional(): Promise<void> {
+        if (!bidirectionalPairingInput) return
+        try {
+            parsePeerBidirectionalUri(bidirectionalPairingInput)
+        } catch {
+            bidirectionalError = language.peerBidirectional.invalidLink
+            return
+        }
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.sync(bidirectionalPairingInput)
+        })
+    }
+
+    async function resolveBidirectional(winner: 'local' | 'remote'): Promise<void> {
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.resolve(winner)
+        })
+    }
+
+    async function resumeBidirectional(): Promise<void> {
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.resume()
+        })
+    }
+
     onMount(() => {
         const unsubscribeController = controller.subscribe(() => refreshState())
         const unsubscribeDeltaController = deltaController.subscribe(() => refreshDeltaState())
+        const unsubscribeBidirectionalController = bidirectionalController.subscribe(() => refreshBidirectionalState())
         void controller.initialize()
         void deltaController.initialize()
+        void bidirectionalController.initialize()
         void restoreSourceQr().catch(reportError)
         const pendingUri = consumePendingPeerCloneUri()
         if (pendingUri) acceptPairingUri(pendingUri)
@@ -293,6 +402,7 @@
             unsubscribe()
             unsubscribeController()
             unsubscribeDeltaController()
+            unsubscribeBidirectionalController()
         }
     })
 </script>
@@ -548,5 +658,139 @@
 
     {#if deltaError}
         <p class="mt-3 text-sm text-draculared">{deltaError}</p>
+    {/if}
+</section>
+
+<section class="mt-4 rounded-md border border-darkborderc bg-darkbg p-3">
+    <h3 class="text-xl font-bold">{language.peerBidirectional.title}</h3>
+    <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.description}</p>
+
+    {#if bidirectionalCapabilities && !bidirectionalEnabled}
+        <p class="mt-3 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">
+            {language.peerBidirectional.unavailable}
+        </p>
+    {/if}
+
+    <div class="mt-4 rounded-md border border-darkborderc p-3">
+        <h4 class="font-bold">{language.peerBidirectional.source}</h4>
+        <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.sourceHelp}</p>
+        <div class="mt-2 flex flex-wrap gap-2">
+            <Button disabled={!bidirectionalEnabled || bidirectionalBusy} onclick={prepareBidirectionalSource}>
+                {language.peerBidirectional.prepare}
+            </Button>
+            <Button
+                disabled={!bidirectionalEnabled || bidirectionalBusy || bidirectionalSourceStatus.phase !== 'prepared'}
+                onclick={startBidirectionalSource}
+            >{language.peerBidirectional.start}</Button>
+            <Button
+                styled="danger"
+                disabled={bidirectionalBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
+                onclick={stopBidirectionalSource}
+            >{language.peerBidirectional.stop}</Button>
+        </div>
+
+        {#if bidirectionalSourcePairingUri}
+            <label class="mt-3 block text-sm font-bold" for="peer-bidirectional-source-uri">
+                {language.peerBidirectional.pairingLink}
+            </label>
+            <textarea
+                id="peer-bidirectional-source-uri"
+                readonly
+                rows="3"
+                class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"
+                value={bidirectionalSourcePairingUri}
+            ></textarea>
+            <Button
+                className="mt-2"
+                disabled={bidirectionalBusy}
+                onclick={() => navigator.clipboard.writeText(bidirectionalSourcePairingUri)}
+            >{language.peerBidirectional.copyLink}</Button>
+        {/if}
+
+        {#if bidirectionalSourceStatus.devices.length > 0}
+            <h5 class="mt-3 font-bold">{language.peerBidirectional.devices}</h5>
+            <ul class="mt-1 flex flex-col gap-2">
+                {#each bidirectionalSourceStatus.devices as device (device.deviceId)}
+                    <li class="flex items-center justify-between gap-2 rounded-md bg-bgcolor p-2 text-sm">
+                        <span>{device.deviceId}</span>
+                        <Button
+                            size="sm"
+                            styled="danger"
+                            disabled={bidirectionalBusy || device.revoked}
+                            onclick={() => revokeBidirectionalDevice(device.deviceId)}
+                        >{language.peerBidirectional.revoke}</Button>
+                    </li>
+                {/each}
+            </ul>
+        {/if}
+    </div>
+
+    <div class="mt-3 rounded-md border border-darkborderc p-3">
+        <h4 class="font-bold">{language.peerBidirectional.target}</h4>
+        <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.targetHelp}</p>
+        <label class="mt-3 block text-sm font-bold" for="peer-bidirectional-target-uri">
+            {language.peerBidirectional.pairingLink}
+        </label>
+        <textarea
+            id="peer-bidirectional-target-uri"
+            bind:value={bidirectionalPairingInput}
+            rows="3"
+            class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"
+        ></textarea>
+        <Button
+            className="mt-2"
+            disabled={!bidirectionalEnabled || bidirectionalBusy || !bidirectionalPairingInput}
+            onclick={syncBidirectional}
+        >{language.peerBidirectional.sync}</Button>
+
+        {#if bidirectionalOperationPhase === 'running'}
+            <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.syncing}</p>
+        {:else if bidirectionalOperationPhase === 'awaitingConflict' && bidirectionalResult?.kind === 'conflict'}
+            <div class="mt-3 rounded-md border border-draculared p-3">
+                <p class="font-bold text-draculared">{language.peerBidirectional.conflictTitle}</p>
+                <ul class="mt-2 list-disc pl-5 text-sm">
+                    {#each bidirectionalResult.conflicts as conflict (conflict.key)}
+                        <li>{conflict.key}: {language.peerBidirectional[conflict.type]}</li>
+                    {/each}
+                </ul>
+                <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.backupWarning}</p>
+                <div class="mt-2 flex flex-wrap gap-2">
+                    <Button disabled={bidirectionalBusy} onclick={() => resolveBidirectional('local')}>
+                        {language.peerBidirectional.keepLocal}
+                    </Button>
+                    <Button disabled={bidirectionalBusy} onclick={() => resolveBidirectional('remote')}>
+                        {language.peerBidirectional.keepRemote}</Button>
+                </div>
+            </div>
+        {:else if bidirectionalOperationPhase === 'localCommitted' || bidirectionalOperationPhase === 'failed'}
+            <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.resumeRequired}</p>
+            <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
+                {language.peerBidirectional.resume}
+            </Button>
+        {:else if bidirectionalResult?.kind === 'noChanges'}
+            <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.noChanges}</p>
+        {:else if bidirectionalResult?.kind === 'updated'}
+            <p class="mt-2 text-sm text-textcolor2">
+                {language.peerBidirectional.updated(
+                    bidirectionalResult.transferredObjects,
+                    bidirectionalResult.transferredBytes.toLocaleString(),
+                )}
+            </p>
+        {:else if bidirectionalResult?.kind === 'stale'}
+            <p class="mt-2 text-sm text-draculared">{language.peerBidirectional.stale}</p>
+        {/if}
+
+        {#if bidirectionalBackups.length > 0}
+            <h5 class="mt-3 font-bold">{language.peerBidirectional.backupCreated}</h5>
+            <ul class="mt-1 list-disc pl-5 text-sm text-textcolor2">
+                {#each bidirectionalBackups as backup (backup.packageId)}
+                    <li>{backup.side}: {backup.path}</li>
+                {/each}
+            </ul>
+        {/if}
+    </div>
+
+    {#if bidirectionalError}
+        <p class="mt-3 text-sm text-draculared">{bidirectionalError}</p>
     {/if}
 </section>
