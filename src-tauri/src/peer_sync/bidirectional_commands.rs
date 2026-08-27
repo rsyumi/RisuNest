@@ -2186,11 +2186,43 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
-        store
+        let base = store
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174002";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    shared.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
         let operation_id = "123e4567-e89b-42d3-a456-426614174015";
-        let retained_context = context(operation_id);
+        let mut retained_context = context(operation_id);
+        retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        retained_context.expected_remote_revision = 4;
+        retained_context.previous_shared = shared.clone();
+        retained_context.previous_local = shared.clone();
         let job = RefCell::new(
             DurableCasJob::begin(
                 directory.path(),
@@ -2243,34 +2275,106 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
+
+        let result = complete_bidirectional_local_after_remote_apply(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            LanBidirectionalRemoteApplyReceipt {
+                committed_revision: 4,
+                committed_generation: LanBidirectionalGeneration {
+                    generation_id: shared.generation_id,
+                    manifest_hash: shared.manifest_hash,
+                    generation_sequence: shared.generation_sequence,
+                },
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backup: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.kind, "updated");
+        assert_eq!(result.transferred_objects, 0);
+        assert_eq!(result.transferred_bytes, 0);
+        assert_eq!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::Completed {
+                schema: OPERATION_SCHEMA.to_owned(),
+                result,
+            })
+        );
     }
 
     #[test]
-    fn only_the_matching_completed_operation_can_be_acknowledged() {
+    fn completed_acknowledgement_preserves_lossless_backups() {
         let directory = tempfile::tempdir().unwrap();
         let journal = PeerBidirectionalOperationJournal::new(directory.path());
         let operation_id = "123e4567-e89b-42d3-a456-426614174004";
-        journal
-            .store(&PeerBidirectionalDurableOperation::Completed {
-                schema: OPERATION_SCHEMA.to_owned(),
-                result: PeerBidirectionalCompletedResult {
-                    kind: "noChanges".to_owned(),
-                    operation_id: operation_id.to_owned(),
-                    revision: 7,
-                    remote_revision: 4,
-                    transferred_objects: 0,
-                    transferred_bytes: 0,
-                    backups: vec![],
-                },
-            })
-            .unwrap();
+        let backup_root = directory.path().join("peer-bidirectional/backups");
+        fs::create_dir_all(&backup_root).unwrap();
+        let local_path = backup_root.join(format!("{operation_id}-local.risulossless"));
+        let remote_path = backup_root.join(format!("{operation_id}-remote.risulossless"));
+        fs::write(&local_path, b"retained local backup").unwrap();
+        fs::write(&remote_path, b"retained remote backup").unwrap();
+        let backups = vec![
+            PeerBidirectionalBackupReceipt {
+                package_id: "a".repeat(64),
+                side: PeerBidirectionalBackupSide::Local,
+                path: local_path.to_string_lossy().into_owned(),
+            },
+            PeerBidirectionalBackupReceipt {
+                package_id: "b".repeat(64),
+                side: PeerBidirectionalBackupSide::Remote,
+                path: remote_path.to_string_lossy().into_owned(),
+            },
+        ];
+        let local_committed = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            committed_revision: 7,
+            shared_generation: generation("shared-a", "2", 'e'),
+            changed: true,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: backups.clone(),
+        };
+        journal.store(&local_committed).unwrap();
 
         assert!(journal
             .acknowledge_completed("123e4567-e89b-42d3-a456-426614174099")
             .is_err());
-        assert!(journal.load().unwrap().is_some());
-        journal.acknowledge_completed(operation_id).unwrap();
-        assert_eq!(journal.load().unwrap(), None);
+        assert!(journal.acknowledge_completed(operation_id).is_err());
+        assert_eq!(journal.load().unwrap(), Some(local_committed));
+
+        let completed = PeerBidirectionalDurableOperation::Completed {
+            schema: OPERATION_SCHEMA.to_owned(),
+            result: PeerBidirectionalCompletedResult {
+                kind: "updated".to_owned(),
+                operation_id: operation_id.to_owned(),
+                revision: 7,
+                remote_revision: 4,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups,
+            },
+        };
+        journal.store(&completed).unwrap();
+        let reopened = PeerBidirectionalOperationJournal::new(directory.path());
+        assert_eq!(reopened.load().unwrap(), Some(completed.clone()));
+        assert!(reopened
+            .acknowledge_completed("123e4567-e89b-42d3-a456-426614174099")
+            .is_err());
+        assert_eq!(reopened.load().unwrap(), Some(completed));
+        assert!(local_path.is_file());
+        assert!(remote_path.is_file());
+
+        reopened.acknowledge_completed(operation_id).unwrap();
+        assert_eq!(reopened.load().unwrap(), None);
+        assert_eq!(fs::read(local_path).unwrap(), b"retained local backup");
+        assert_eq!(fs::read(remote_path).unwrap(), b"retained remote backup");
     }
 
     #[test]
