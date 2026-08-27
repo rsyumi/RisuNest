@@ -1,6 +1,6 @@
 use super::{
-    current_revision, logical_index::scan_compact_manifest, PersistentStore, StoreError,
-    StoreResult,
+    active_generation, current_revision, logical_index::scan_compact_manifest, PersistentStore,
+    StoreError, StoreResult,
 };
 use crate::peer_sync::logical_delta::{
     hash_logical_manifest, validate_logical_manifest, LogicalManifest,
@@ -52,6 +52,12 @@ pub(crate) struct RegisteredSyncDevice {
     pub(crate) acknowledged_at: i64,
     pub(crate) revoked_at: Option<i64>,
     pub(crate) forgotten_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncDeviceAckState {
+    pub(crate) shared_identity: SyncGenerationIdentity,
+    pub(crate) local_identity: SyncGenerationIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +130,45 @@ struct TombstoneCursor {
 }
 
 impl PersistentStore {
+    pub(crate) fn sync_device_ack_state(
+        &self,
+        library_id: &str,
+        device_id: &str,
+    ) -> StoreResult<SyncDeviceAckState> {
+        validate_library_id(library_id)?;
+        validate_device_id(device_id)?;
+        let device = load_device(&self.connection, library_id, device_id)?.ok_or_else(|| {
+            StoreError::Validation {
+                message: "sync device is not registered".to_owned(),
+            }
+        })?;
+        if device.status != RegisteredSyncDeviceStatus::Active {
+            return sync_conflict("only an active sync device has a usable acknowledgement");
+        }
+        let shared_identity = device.acknowledged_generation;
+        if load_common_base(&self.connection, library_id, device_id)?.as_ref()
+            != Some(&shared_identity)
+        {
+            return validation("sync device acknowledgement differs from its common base");
+        }
+        let proof = load_ack_proof(&self.connection, library_id, device_id)?.ok_or_else(|| {
+            StoreError::Validation {
+                message: "sync device acknowledgement proof is missing".to_owned(),
+            }
+        })?;
+        require_ack_proof(
+            &self.connection,
+            library_id,
+            device_id,
+            &shared_identity,
+            &proof.local_identity,
+        )?;
+        Ok(SyncDeviceAckState {
+            shared_identity,
+            local_identity: proof.local_identity,
+        })
+    }
+
     pub(crate) fn verify_shared_ack_local_proof(
         &self,
         shared_identity: &SyncGenerationIdentity,
@@ -396,6 +441,70 @@ impl PersistentStore {
             expected_previous_local,
             next_shared,
             next_proof,
+        )?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn advance_active_sync_device_shared_ack(
+        &mut self,
+        library_id: &str,
+        device_id: &str,
+        expected_local_revision: i64,
+        expected_previous_shared: &SyncGenerationIdentity,
+        expected_previous_local: &SyncGenerationIdentity,
+        next_shared: &SyncGenerationIdentity,
+        shared_manifest: &LogicalManifest,
+        local_identity: &SyncGenerationIdentity,
+    ) -> StoreResult<RegisteredSyncDevice> {
+        if expected_local_revision < 0 {
+            return validation("expected local revision must be nonnegative");
+        }
+        let proof =
+            self.verify_shared_ack_local_proof(next_shared, shared_manifest, local_identity)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision = current_revision(&transaction)?;
+        if actual_revision != expected_local_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_local_revision,
+                actual: actual_revision,
+            });
+        }
+        let active = active_generation(&transaction)?;
+        let local_is_active: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_sync_generations
+                WHERE library_id = ?1 AND generation_id = ?2
+                  AND manifest_hash = ?3 AND generation_sequence = ?4
+                  AND pds_generation = ?5 AND source_revision = ?6
+                  AND state = 'complete' AND completed_at IS NOT NULL
+             )",
+            params![
+                library_id,
+                local_identity.generation_id,
+                local_identity.manifest_hash,
+                local_identity.generation_sequence,
+                active,
+                expected_local_revision,
+            ],
+            |row| row.get(0),
+        )?;
+        if !local_is_active {
+            return validation(
+                "local acknowledgement witness is not the exact active logical generation",
+            );
+        }
+        let updated = advance_sync_device_shared_ack_in_transaction(
+            &transaction,
+            library_id,
+            device_id,
+            expected_previous_shared,
+            expected_previous_local,
+            next_shared,
+            proof,
         )?;
         transaction.commit()?;
         Ok(updated)

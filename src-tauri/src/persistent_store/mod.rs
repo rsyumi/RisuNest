@@ -30,7 +30,7 @@ pub(crate) use commands::PersistentStoreState;
 pub(crate) use snapshot::RevisionReadLease;
 #[allow(unused_imports)]
 pub(crate) use sync_device_registry::{
-    RegisteredSyncDevice, RegisteredSyncDeviceStatus, SyncGenerationIdentity,
+    RegisteredSyncDevice, RegisteredSyncDeviceStatus, SyncDeviceAckState, SyncGenerationIdentity,
     TombstoneCollectionItem, TombstoneCollectionPage, VerifiedSharedAckLocalProof,
     VerifiedSyncDeviceRegistration,
 };

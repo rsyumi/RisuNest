@@ -1,6 +1,7 @@
 use super::{
-    active_generation, current_revision, logical_index::scan_compact_manifest, PersistentStore,
-    StoreError,
+    active_generation, current_revision, logical_index::scan_compact_manifest,
+    sync_device_registry::advance_sync_device_shared_ack_in_transaction, PersistentStore,
+    StoreError, SyncDeviceAckState, SyncGenerationIdentity, VerifiedSharedAckLocalProof,
 };
 use crate::{
     asset_repository::{
@@ -77,6 +78,21 @@ pub(crate) struct PersistentLogicalDeltaTarget<'a> {
     staging_root: PathBuf,
     durable_job: Option<&'a RefCell<DurableCasJob>>,
     conflict_policy: LogicalDeltaConflictPolicy,
+    activation_mode: LogicalDeltaActivationMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicalDeltaActivationMode {
+    AdvanceRemoteBase,
+    DeferPeerState,
+    AdvanceSharedAck,
+}
+
+struct PreparedSharedAckTransition {
+    previous: SyncDeviceAckState,
+    next_shared: SyncGenerationIdentity,
+    local_identity: SyncGenerationIdentity,
+    proof: VerifiedSharedAckLocalProof,
 }
 
 pub(crate) enum PersistentLogicalDeltaStage {
@@ -105,6 +121,16 @@ pub(crate) struct PeerBase {
     generation_id: String,
     manifest_hash: String,
     generation_sequence: String,
+}
+
+impl From<PeerBase> for SyncGenerationIdentity {
+    fn from(base: PeerBase) -> Self {
+        Self {
+            generation_id: base.generation_id,
+            manifest_hash: base.manifest_hash,
+            generation_sequence: base.generation_sequence,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +348,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             staging_root,
             None,
             LogicalDeltaConflictPolicy::Reject,
+            LogicalDeltaActivationMode::AdvanceRemoteBase,
         )
     }
 
@@ -346,6 +373,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             staging_root,
             None,
             conflict_policy,
+            LogicalDeltaActivationMode::AdvanceRemoteBase,
         )
     }
 
@@ -370,6 +398,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             staging_root,
             Some(durable_job),
             LogicalDeltaConflictPolicy::Reject,
+            LogicalDeltaActivationMode::AdvanceRemoteBase,
         )
     }
 
@@ -395,6 +424,109 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             staging_root,
             Some(durable_job),
             conflict_policy,
+            LogicalDeltaActivationMode::AdvanceRemoteBase,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_p5_deferred(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        conflict_policy: LogicalDeltaConflictPolicy,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            None,
+            conflict_policy,
+            LogicalDeltaActivationMode::DeferPeerState,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_p5_deferred_with_durable_job(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        durable_job: &'a RefCell<DurableCasJob>,
+        conflict_policy: LogicalDeltaConflictPolicy,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            Some(durable_job),
+            conflict_policy,
+            LogicalDeltaActivationMode::DeferPeerState,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_p5_remote_shared_ack(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        conflict_policy: LogicalDeltaConflictPolicy,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            None,
+            conflict_policy,
+            LogicalDeltaActivationMode::AdvanceSharedAck,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_p5_remote_shared_ack_with_durable_job(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        durable_job: &'a RefCell<DurableCasJob>,
+        conflict_policy: LogicalDeltaConflictPolicy,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            Some(durable_job),
+            conflict_policy,
+            LogicalDeltaActivationMode::AdvanceSharedAck,
         )
     }
 
@@ -409,9 +541,15 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         staging_root: &Path,
         durable_job: Option<&'a RefCell<DurableCasJob>>,
         conflict_policy: LogicalDeltaConflictPolicy,
+        activation_mode: LogicalDeltaActivationMode,
     ) -> Result<Self, PeerSyncError> {
         if peer_id.is_empty() || library_id.is_empty() || local_generation_id.is_empty() {
             return validation("logical delta target identities must be nonempty");
+        }
+        if activation_mode != LogicalDeltaActivationMode::AdvanceRemoteBase {
+            store
+                .sync_device_ack_state(library_id, peer_id)
+                .map_err(storage_error)?;
         }
         let remote_manifest = decode_logical_manifest(remote_manifest_bytes)
             .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
@@ -444,6 +582,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             staging_root: staging_root.to_path_buf(),
             durable_job,
             conflict_policy,
+            activation_mode,
         })
     }
 
@@ -637,6 +776,58 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             manifest_hash: self.remote_manifest_hash.clone(),
             generation_sequence: self.remote_manifest.generation_sequence.clone(),
         }
+    }
+
+    fn sync_identity_for_local_generation(
+        &self,
+        generation_id: &str,
+    ) -> Result<SyncGenerationIdentity, PeerSyncError> {
+        let built = scan_compact_manifest(
+            &self.store.connection,
+            &self.library_id,
+            generation_id,
+            true,
+        )
+        .map_err(storage_error)?;
+        Ok(SyncGenerationIdentity {
+            generation_id: built.manifest.generation,
+            manifest_hash: built.manifest_hash,
+            generation_sequence: built.manifest.generation_sequence,
+        })
+    }
+
+    fn current_logical_head_generation(&self) -> Result<String, PeerSyncError> {
+        self.store
+            .connection
+            .query_row(
+                "SELECT generation_id FROM logical_library_head
+                 WHERE singleton = 1 AND library_id = ?1",
+                [&self.library_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    fn verified_shared_ack_transition(
+        &self,
+        local_generation_id: &str,
+    ) -> Result<PreparedSharedAckTransition, PeerSyncError> {
+        let previous = self
+            .store
+            .sync_device_ack_state(&self.library_id, &self.peer_id)
+            .map_err(storage_error)?;
+        let next_shared = SyncGenerationIdentity::from(self.remote_base());
+        let local_identity = self.sync_identity_for_local_generation(local_generation_id)?;
+        let proof = self
+            .store
+            .verify_shared_ack_local_proof(&next_shared, &self.remote_manifest, &local_identity)
+            .map_err(storage_error)?;
+        Ok(PreparedSharedAckTransition {
+            previous,
+            next_shared,
+            local_identity,
+            proof,
+        })
     }
 
     fn load_common_base_manifest(&self, base: &PeerBase) -> Result<LogicalManifest, PeerSyncError> {
@@ -1647,6 +1838,18 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                     return validation("logical delta retry revision differs from its stage");
                 }
                 let remote_base = self.remote_base();
+                if self.activation_mode == LogicalDeltaActivationMode::AdvanceSharedAck {
+                    let local_head = self.current_logical_head_generation()?;
+                    let shared_ack = self.verified_shared_ack_transition(&local_head)?;
+                    if shared_ack.previous.shared_identity
+                        != SyncGenerationIdentity::from(remote_base.clone())
+                        || shared_ack.previous.local_identity != shared_ack.local_identity
+                    {
+                        return validation(
+                            "P5 completed acknowledgement differs from its local witness",
+                        );
+                    }
+                }
                 let transaction = self
                     .store
                     .connection
@@ -1688,6 +1891,12 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                 if expected_base.manifest_hash != expected_base_manifest_hash {
                     return validation("logical delta activation base differs from its stage");
                 }
+                let shared_ack =
+                    if self.activation_mode == LogicalDeltaActivationMode::AdvanceSharedAck {
+                        Some(self.verified_shared_ack_transition(&self.local_generation_id)?)
+                    } else {
+                        None
+                    };
                 let transaction = self
                     .store
                     .connection
@@ -1705,14 +1914,16 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                             .unwrap_or_default(),
                     });
                 }
-                update_common_base(
+                advance_peer_state_in_transaction(
                     &transaction,
+                    self.activation_mode,
                     &self.peer_id,
                     &self.library_id,
                     &self.remote_manifest.generation,
                     next_base_manifest_hash,
                     next_base_generation_sequence,
                     expected_base,
+                    shared_ack,
                 )?;
                 transaction.commit().map_err(sql_error)?;
                 Ok(LogicalDeltaActivation::Activated {
@@ -1732,6 +1943,12 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                 if expected_base.manifest_hash != expected_base_manifest_hash {
                     return validation("logical delta activation base differs from its stage");
                 }
+                let shared_ack =
+                    if self.activation_mode == LogicalDeltaActivationMode::AdvanceSharedAck {
+                        Some(self.verified_shared_ack_transition(logical_generation_id)?)
+                    } else {
+                        None
+                    };
                 let transaction = self
                     .store
                     .connection
@@ -1815,14 +2032,16 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                     return validation("logical delta library head changed before PDS activation");
                 }
                 set_active(&transaction, next_revision, &active_generation)?;
-                update_common_base(
+                advance_peer_state_in_transaction(
                     &transaction,
+                    self.activation_mode,
                     &self.peer_id,
                     &self.library_id,
                     &self.remote_manifest.generation,
                     next_base_manifest_hash,
                     next_base_generation_sequence,
                     expected_base,
+                    shared_ack,
                 )?;
                 transaction.commit().map_err(sql_error)?;
                 Ok(LogicalDeltaActivation::Activated {
@@ -3193,6 +3412,57 @@ fn update_common_base(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn advance_peer_state_in_transaction(
+    transaction: &Transaction<'_>,
+    activation_mode: LogicalDeltaActivationMode,
+    peer_id: &str,
+    library_id: &str,
+    remote_generation_id: &str,
+    remote_manifest_hash: &str,
+    remote_generation_sequence: &str,
+    expected_base: &PeerBase,
+    shared_ack: Option<PreparedSharedAckTransition>,
+) -> Result<(), PeerSyncError> {
+    match activation_mode {
+        LogicalDeltaActivationMode::AdvanceRemoteBase => update_common_base(
+            transaction,
+            peer_id,
+            library_id,
+            remote_generation_id,
+            remote_manifest_hash,
+            remote_generation_sequence,
+            expected_base,
+        ),
+        LogicalDeltaActivationMode::DeferPeerState => Ok(()),
+        LogicalDeltaActivationMode::AdvanceSharedAck => {
+            let shared_ack = shared_ack.ok_or_else(|| {
+                PeerSyncError::Validation(
+                    "P5 shared acknowledgement proof was not prepared".to_owned(),
+                )
+            })?;
+            if shared_ack.previous.shared_identity
+                != SyncGenerationIdentity::from(expected_base.clone())
+            {
+                return validation(
+                    "P5 shared acknowledgement differs from the expected common base",
+                );
+            }
+            advance_sync_device_shared_ack_in_transaction(
+                transaction,
+                library_id,
+                peer_id,
+                &shared_ack.previous.shared_identity,
+                &shared_ack.previous.local_identity,
+                &shared_ack.next_shared,
+                shared_ack.proof,
+            )
+            .map(|_| ())
+            .map_err(storage_error)
+        }
+    }
+}
+
 fn set_active(
     transaction: &Transaction<'_>,
     revision: i64,
@@ -3586,7 +3856,8 @@ mod tests {
         },
         persistent_store::{
             logical_index::LogicalIndexBuildRequest, snapshot, AssetOwnerHead, AssetOwnerLocator,
-            PersistentStore, WorkingSetCommit,
+            PersistentStore, SyncGenerationIdentity, VerifiedSyncDeviceRegistration,
+            WorkingSetCommit,
         },
     };
     use serde_json::json;
@@ -5085,6 +5356,489 @@ mod tests {
             0
         );
         assert!(!staging_root.exists() || staging_root.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn p5_deferred_local_commit_leaves_shared_base_ack_and_proof_unchanged() {
+        let (directory, mut store, cas) = open_fixture();
+        store
+            .connection
+            .execute(
+                "UPDATE root SET value = ?1 WHERE generation = 'revision-0'",
+                [json!({"theme":"base"}).to_string()],
+            )
+            .unwrap();
+        let base = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "shared-c".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_peer_common_bases (
+                    peer_id, library_id, generation_id, manifest_hash,
+                    generation_sequence, updated_at
+                 ) VALUES ('peer', 'library', 'shared-c', ?1, '0', 0)",
+                [&base.manifest_hash],
+            )
+            .unwrap();
+        let common = SyncGenerationIdentity {
+            generation_id: "shared-c".to_owned(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: "0".to_owned(),
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::for_test("library", "peer", common.clone(), 1),
+                0,
+            )
+            .unwrap();
+        let remote = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "remote-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("shared-c".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Root,
+                LogicalRecordEnvelope::Root {
+                    value: json!({"theme":"remote"}),
+                    owner_heads: vec![],
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let record = remote.record_objects.first().unwrap();
+        let staging_root = directory.path().join("p5-deferred-staging");
+        let mut target = PersistentLogicalDeltaTarget::new_p5_deferred(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "shared-c",
+            &remote.manifest_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .unwrap();
+        let plan = target.build_ready_plan(0).unwrap();
+        let mut source = MapSource {
+            objects: [(record.object.hash.clone(), record.object.bytes.clone())]
+                .into_iter()
+                .collect(),
+            content_gets: 0,
+        };
+        let remote_sizes = [(record.object.hash.clone(), record.object.size)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &remote_sizes,
+                &mut source,
+                &mut target,
+            )
+            .unwrap(),
+            LogicalDeltaActivation::Activated { revision: 1 }
+        );
+        drop(target);
+
+        assert_eq!(store.read_root(None).unwrap().value["theme"], "remote");
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<(String, String, String), _, _>(
+                    "SELECT common_base.generation_id,
+                            device.acknowledged_generation_id,
+                            proof.local_generation_id
+                     FROM logical_peer_common_bases AS common_base
+                     JOIN logical_sync_devices AS device
+                       ON device.library_id = common_base.library_id
+                      AND device.device_id = common_base.peer_id
+                     JOIN logical_sync_device_ack_proofs AS proof
+                       ON proof.library_id = device.library_id
+                      AND proof.device_id = device.device_id
+                     WHERE common_base.peer_id = 'peer' AND common_base.library_id = 'library'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+            (
+                common.generation_id.clone(),
+                common.generation_id.clone(),
+                common.generation_id.clone(),
+            )
+        );
+        let local = store
+            .connection
+            .query_row::<SyncGenerationIdentity, _, _>(
+                "SELECT generation.generation_id, generation.manifest_hash,
+                        generation.generation_sequence
+                 FROM logical_library_head AS head
+                 JOIN logical_sync_generations AS generation
+                   ON generation.library_id = head.library_id
+                  AND generation.generation_id = head.generation_id
+                 WHERE head.singleton = 1",
+                [],
+                |row| {
+                    Ok(SyncGenerationIdentity {
+                        generation_id: row.get(0)?,
+                        manifest_hash: row.get(1)?,
+                        generation_sequence: row.get(2)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_ne!(local.generation_id, "shared-c");
+        let shared = SyncGenerationIdentity {
+            generation_id: remote.manifest.generation.clone(),
+            manifest_hash: remote.manifest_hash,
+            generation_sequence: remote.manifest.generation_sequence.clone(),
+        };
+        assert!(store
+            .advance_active_sync_device_shared_ack(
+                "library",
+                "peer",
+                0,
+                &common,
+                &common,
+                &shared,
+                &remote.manifest,
+                &local,
+            )
+            .is_err());
+        assert_eq!(
+            store.sync_device_ack_state("library", "peer").unwrap(),
+            SyncDeviceAckState {
+                shared_identity: common.clone(),
+                local_identity: common.clone(),
+            }
+        );
+        store
+            .advance_active_sync_device_shared_ack(
+                "library",
+                "peer",
+                1,
+                &common,
+                &common,
+                &shared,
+                &remote.manifest,
+                &local,
+            )
+            .unwrap();
+        store
+            .advance_active_sync_device_shared_ack(
+                "library",
+                "peer",
+                1,
+                &common,
+                &common,
+                &shared,
+                &remote.manifest,
+                &local,
+            )
+            .unwrap();
+        assert_eq!(
+            store.sync_device_ack_state("library", "peer").unwrap(),
+            SyncDeviceAckState {
+                shared_identity: shared,
+                local_identity: local,
+            }
+        );
+    }
+
+    #[test]
+    fn p5_target_requires_an_active_registered_device_before_staging() {
+        let (directory, mut store, cas) = open_fixture();
+        let remote = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "shared-a".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("shared-c".to_owned()),
+            source_revision: 1,
+            records: vec![],
+        })
+        .unwrap();
+
+        assert!(PersistentLogicalDeltaTarget::new_p5_deferred(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "shared-c",
+            &remote.manifest_bytes,
+            &directory.path().join("p5-unregistered-staging"),
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn p5_remote_activation_atomically_records_shared_ack_and_local_witness() {
+        let (directory, mut store, cas) = open_fixture();
+        store
+            .connection
+            .execute(
+                "UPDATE root SET value = ?1 WHERE generation = 'revision-0'",
+                [json!({"theme":"base"}).to_string()],
+            )
+            .unwrap();
+        let base = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "shared-c".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_peer_common_bases (
+                    peer_id, library_id, generation_id, manifest_hash,
+                    generation_sequence, updated_at
+                 ) VALUES ('peer', 'library', 'shared-c', ?1, '0', 0)",
+                [&base.manifest_hash],
+            )
+            .unwrap();
+        let common = SyncGenerationIdentity {
+            generation_id: "shared-c".to_owned(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: "0".to_owned(),
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::for_test("library", "peer", common, 1),
+                0,
+            )
+            .unwrap();
+        let shared = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "shared-a".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("shared-c".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Root,
+                LogicalRecordEnvelope::Root {
+                    value: json!({"theme":"merged"}),
+                    owner_heads: vec![],
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let record = shared.record_objects.first().unwrap();
+        let shared_bytes = shared.manifest_bytes.clone();
+        let staging_root = directory.path().join("p5-remote-staging");
+        let mut target = PersistentLogicalDeltaTarget::new_p5_remote_shared_ack(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "shared-c",
+            &shared_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .unwrap();
+        let plan = target.build_ready_plan(0).unwrap();
+        let mut source = MapSource {
+            objects: [(record.object.hash.clone(), record.object.bytes.clone())]
+                .into_iter()
+                .collect(),
+            content_gets: 0,
+        };
+        let remote_sizes = [(record.object.hash.clone(), record.object.size)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &remote_sizes,
+                &mut source,
+                &mut target,
+            )
+            .unwrap(),
+            LogicalDeltaActivation::Activated { revision: 1 }
+        );
+        drop(target);
+
+        let committed: (String, String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT head.generation_id, common_base.generation_id,
+                        device.acknowledged_generation_id, proof.local_generation_id
+                 FROM logical_library_head AS head
+                 JOIN logical_peer_common_bases AS common_base
+                   ON common_base.library_id = head.library_id
+                 JOIN logical_sync_devices AS device
+                   ON device.library_id = common_base.library_id
+                  AND device.device_id = common_base.peer_id
+                 JOIN logical_sync_device_ack_proofs AS proof
+                   ON proof.library_id = device.library_id
+                  AND proof.device_id = device.device_id
+                 WHERE head.singleton = 1 AND common_base.peer_id = 'peer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_ne!(committed.0, "shared-a");
+        assert_eq!(committed.1, "shared-a");
+        assert_eq!(committed.2, "shared-a");
+        assert_eq!(committed.3, committed.0);
+        assert_eq!(store.read_root(None).unwrap().value["theme"], "merged");
+
+        let mut retry_source = EmptySource { content_gets: 0 };
+        let mut retry_target = PersistentLogicalDeltaTarget::new_p5_remote_shared_ack(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "shared-c",
+            &shared_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .unwrap();
+        assert_eq!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &remote_sizes,
+                &mut retry_source,
+                &mut retry_target,
+            )
+            .unwrap(),
+            LogicalDeltaActivation::AlreadyActive { revision: 1 }
+        );
+        assert_eq!(retry_source.content_gets, 0);
+    }
+
+    #[test]
+    fn p5_remote_no_op_advances_shared_ack_with_current_local_witness() {
+        let (directory, mut store, cas) = open_fixture();
+        let base = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "shared-c".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap();
+        let mut shared = base.manifest.clone();
+        shared.generation = "shared-a".to_owned();
+        shared.generation_sequence = "1".to_owned();
+        shared.parent_generation = Some("shared-c".to_owned());
+        let shared_bytes = encode_logical_manifest(&shared).unwrap();
+        let shared_hash = hash(&shared_bytes);
+        assert_eq!(
+            cas.prepare_bytes(&shared_bytes).unwrap().content_hash,
+            shared_hash
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_peer_common_bases (
+                    peer_id, library_id, generation_id, manifest_hash,
+                    generation_sequence, updated_at
+                 ) VALUES ('peer', 'library', 'shared-c', ?1, '0', 0)",
+                [&base.manifest_hash],
+            )
+            .unwrap();
+        let common = SyncGenerationIdentity {
+            generation_id: "shared-c".to_owned(),
+            manifest_hash: base.manifest_hash,
+            generation_sequence: "0".to_owned(),
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::for_test("library", "peer", common, 1),
+                0,
+            )
+            .unwrap();
+        let staging_root = directory.path().join("p5-remote-no-op-staging");
+        let mut target = PersistentLogicalDeltaTarget::new_p5_remote_shared_ack(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "shared-c",
+            &shared_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .unwrap();
+        let plan = target.build_ready_plan(0).unwrap();
+        assert!(plan.apply.is_empty());
+        let mut source = EmptySource { content_gets: 0 };
+
+        assert_eq!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &BTreeMap::new(),
+                &mut source,
+                &mut target,
+            )
+            .unwrap(),
+            LogicalDeltaActivation::Activated { revision: 0 }
+        );
+        drop(target);
+
+        assert_eq!(source.content_gets, 0);
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(shared.generation_sequence, "1");
+        assert_eq!(
+            store
+                .connection
+                .query_row::<(String, String, String), _, _>(
+                    "SELECT common_base.generation_id, device.acknowledged_generation_id,
+                            proof.local_generation_id
+                     FROM logical_peer_common_bases AS common_base
+                     JOIN logical_sync_devices AS device
+                       ON device.library_id = common_base.library_id
+                      AND device.device_id = common_base.peer_id
+                     JOIN logical_sync_device_ack_proofs AS proof
+                       ON proof.library_id = device.library_id
+                      AND proof.device_id = device.device_id
+                     WHERE common_base.peer_id = 'peer' AND common_base.library_id = 'library'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+            (
+                "shared-a".to_owned(),
+                "shared-a".to_owned(),
+                "shared-c".to_owned(),
+            )
+        );
+        assert_eq!(shared_hash, hash(&shared_bytes));
     }
 
     #[test]
