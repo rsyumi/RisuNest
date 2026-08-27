@@ -3,6 +3,7 @@ import {
     createCompleteAssetRepositoryBlobStore,
     type AssetAliasLegacyReader,
     type AssetObjectUrlResolver,
+    type DurableAssetWriteSessionFactory,
     type NewInlayImageEncoder,
 } from './assetRepository'
 import { selectAssetRepositoryAuthority } from './assetRepositoryAuthority'
@@ -23,6 +24,7 @@ export function createNativeV2BlobStore(input: {
     cas: ImmutablePayloadCas
     objectUrls: AssetObjectUrlResolver
     newInlayImages: NewInlayImageEncoder
+    writeSessions: DurableAssetWriteSessionFactory
 }): BlobStore {
     return createCompleteAssetRepositoryBlobStore({
         store: input.store,
@@ -31,6 +33,7 @@ export function createNativeV2BlobStore(input: {
         legacyFallback: true,
         objectUrls: input.objectUrls,
         newInlayImages: input.newInlayImages,
+        writeSessions: input.writeSessions,
     })
 }
 

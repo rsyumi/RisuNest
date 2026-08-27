@@ -5,7 +5,11 @@ import {
     type BlobStore,
     type InlayBlobMetadata,
 } from './blobStore'
-import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
+import {
+    hashPayloadBytes,
+    type ImmutablePayloadCas,
+    type PreparedImmutablePayload,
+} from './payloadCas'
 import {
     RevisionConflictError,
     validateAssetAlias,
@@ -331,6 +335,18 @@ export interface NewInlayImageEncoder {
     ): Promise<NewInlayImageEncoding>
 }
 
+export type DurableAssetWriteReleaseOutcome = 'committed' | 'aborted'
+
+export interface DurableAssetWriteSession {
+    prepare(data: Uint8Array): Promise<PreparedImmutablePayload>
+    seal(): Promise<void>
+    release(outcome: DurableAssetWriteReleaseOutcome): Promise<void>
+}
+
+export interface DurableAssetWriteSessionFactory {
+    begin(): Promise<DurableAssetWriteSession>
+}
+
 export interface CompleteAssetRepositoryBlobStoreOptions {
     store: CompleteAssetAliasStore
     cas: ImmutablePayloadCas
@@ -338,6 +354,7 @@ export interface CompleteAssetRepositoryBlobStoreOptions {
     legacyFallback: boolean
     objectUrls: AssetObjectUrlResolver
     newInlayImages: NewInlayImageEncoder
+    writeSessions?: DurableAssetWriteSessionFactory
     listPageSize?: number
 }
 
@@ -416,22 +433,44 @@ export function createCompleteTypedAssetRepository(
             size: ownedData.byteLength,
         } as AssetAlias
         validateAssetAlias(pendingAlias)
-        const prepared = await options.cas.prepare(ownedData)
-        if (prepared.byteSize !== ownedData.byteLength) {
-            throw new Error(`Prepared payload size mismatch for ${identity.key}`)
-        }
-        const alias = { ...pendingAlias, objectHash: prepared.contentHash } as AssetAlias
-        validateAssetAlias(alias)
-        for (;;) {
-            const { revision } = await options.store.readRoot()
-            try {
-                await options.store.commitAssetAlias(alias, revision)
-                break
-            } catch (error) {
-                if (!(error instanceof RevisionConflictError)) throw error
+        const session = await options.writeSessions?.begin()
+        let releaseAsAbortedOnFailure = session !== undefined
+        try {
+            const prepared = session
+                ? await session.prepare(ownedData)
+                : await options.cas.prepare(ownedData)
+            if (prepared.byteSize !== ownedData.byteLength) {
+                throw new Error(`Prepared payload size mismatch for ${identity.key}`)
             }
+            const alias = { ...pendingAlias, objectHash: prepared.contentHash } as AssetAlias
+            validateAssetAlias(alias)
+            await session?.seal()
+            for (;;) {
+                const { revision } = await options.store.readRoot()
+                try {
+                    releaseAsAbortedOnFailure = false
+                    await options.store.commitAssetAlias(alias, revision)
+                    break
+                } catch (error) {
+                    if (!(error instanceof RevisionConflictError)) throw error
+                    releaseAsAbortedOnFailure = session !== undefined
+                }
+            }
+            await session?.release('committed')
+            return aliasBlobMetadata(alias)
+        } catch (error) {
+            if (session && releaseAsAbortedOnFailure) {
+                try {
+                    await session.release('aborted')
+                } catch (releaseError) {
+                    throw new AggregateError(
+                        [error, releaseError],
+                        `Asset write and durable CAS session cleanup failed for ${identity.key}`,
+                    )
+                }
+            }
+            throw error
         }
-        return aliasBlobMetadata(alias)
     }
 
     return {

@@ -2,7 +2,11 @@ import { invoke } from '@tauri-apps/api/core'
 
 import type { InlayBlobMetadata } from './blobStore'
 import { validateBlobReadRange } from './blobStore'
-import type { AssetObjectUrlResolver, NewInlayImageEncoder } from './assetRepository'
+import type {
+    AssetObjectUrlResolver,
+    DurableAssetWriteSessionFactory,
+    NewInlayImageEncoder,
+} from './assetRepository'
 import {
     objectPhysicalKey,
     type ImmutablePayloadCas,
@@ -117,6 +121,29 @@ export async function releaseCasJob(
 ): Promise<void> {
     pinSessionId(sessionId, 'Native CAS job release')
     await invokeCommand('asset_cas_job_release', { sessionId, outcome })
+}
+
+export function createNativeDurableAssetWriteSessionFactory(
+    invokeCommand: InvokeCommand = invoke,
+): DurableAssetWriteSessionFactory {
+    return {
+        async begin() {
+            const sessionId = await beginCasJob(
+                'direct-asset-or-inlay-write',
+                invokeCommand,
+            )
+            return {
+                prepare: (data) => prepareCasObject(
+                    sessionId,
+                    data,
+                    'direct-object',
+                    invokeCommand,
+                ),
+                seal: () => sealCasJob(sessionId, invokeCommand),
+                release: (outcome) => releaseCasJob(sessionId, outcome, invokeCommand),
+            }
+        },
+    }
 }
 
 export function createNativeImmutablePayloadCas(

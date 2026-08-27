@@ -4,6 +4,7 @@ import {
     createCompleteAssetRepositoryBlobStore,
     createCompleteTypedAssetRepository,
     type CompleteAssetAliasStore,
+    type DurableAssetWriteSessionFactory,
 } from './assetRepository'
 import type { ImmutablePayloadCas } from './payloadCas'
 import type { AssetAlias, AssetAliasIdentity } from './persistentDataStore'
@@ -63,6 +64,7 @@ function createFacade(input: {
     cas?: ImmutablePayloadCas
     legacyFallback?: boolean
     legacy?: ReturnType<typeof createLegacy>
+    writeSessions?: DurableAssetWriteSessionFactory
 } = {}) {
     const store = input.store ?? createStore()
     const cas = input.cas ?? createCas()
@@ -87,6 +89,7 @@ function createFacade(input: {
         legacyFallback: input.legacyFallback ?? true,
         objectUrls: { resolveObjectUrl },
         newInlayImages: { encodeNewInlayImage },
+        ...(input.writeSessions === undefined ? {} : { writeSessions: input.writeSessions }),
         listPageSize: 2,
     }
     return {
@@ -184,6 +187,97 @@ describe('complete AssetRepository BlobStore facade', () => {
             name: 'photo.bin',
             ext: 'bin',
         })
+    })
+
+    it('keeps a native direct-object pin sealed until the exact alias is durable', async () => {
+        const events: string[] = []
+        const writeSessions: DurableAssetWriteSessionFactory = {
+            begin: vi.fn(async () => ({
+                prepare: vi.fn(async (data) => {
+                    events.push(`prepare:${[...data].join(',')}:direct-object`)
+                    return {
+                        contentHash: assetHash,
+                        byteSize: data.byteLength,
+                        physicalKey: `assets-v2/objects/aa/${'a'.repeat(62)}`,
+                        deduplicated: false,
+                    }
+                }),
+                seal: vi.fn(async () => { events.push('seal') }),
+                release: vi.fn(async (outcome) => { events.push(`release:${outcome}`) }),
+            })),
+        }
+        const store = createStore({
+            commitAssetAlias: vi.fn(async () => {
+                events.push('commit-alias')
+                return { revision: 11 }
+            }),
+        })
+        const { facade, cas } = createFacade({ store, writeSessions })
+
+        await facade.put('assets/photo.bin', Uint8Array.of(0, 255, 7, 42), {
+            kind: 'asset',
+            mime: 'application/x-exact',
+            name: 'photo.bin',
+            ext: 'bin',
+        })
+
+        expect(events).toEqual([
+            'prepare:0,255,7,42:direct-object',
+            'seal',
+            'commit-alias',
+            'release:committed',
+        ])
+        expect(cas.prepare).not.toHaveBeenCalled()
+    })
+
+    it('aborts an unsealed direct write but retains a sealed session on ambiguous activation failure', async () => {
+        const preSealRelease = vi.fn(async () => undefined)
+        const preSealFailure = new Error('prepare failed')
+        const preSealSessions: DurableAssetWriteSessionFactory = {
+            begin: vi.fn(async () => ({
+                prepare: vi.fn(async () => { throw preSealFailure }),
+                seal: vi.fn(async () => undefined),
+                release: preSealRelease,
+            })),
+        }
+        const preSeal = createFacade({ writeSessions: preSealSessions })
+
+        await expect(preSeal.facade.put('assets/pre-seal.bin', Uint8Array.of(1), {
+            kind: 'asset',
+            mime: 'application/octet-stream',
+            name: 'pre-seal.bin',
+            ext: 'bin',
+        })).rejects.toBe(preSealFailure)
+        expect(preSealRelease).toHaveBeenCalledWith('aborted')
+
+        const sealedRelease = vi.fn(async () => undefined)
+        const activationFailure = new Error('activation outcome unknown')
+        const sealedSessions: DurableAssetWriteSessionFactory = {
+            begin: vi.fn(async () => ({
+                prepare: vi.fn(async (data) => ({
+                    contentHash: assetHash,
+                    byteSize: data.byteLength,
+                    physicalKey: `assets-v2/objects/aa/${'a'.repeat(62)}`,
+                    deduplicated: false,
+                })),
+                seal: vi.fn(async () => undefined),
+                release: sealedRelease,
+            })),
+        }
+        const sealed = createFacade({
+            writeSessions: sealedSessions,
+            store: createStore({
+                commitAssetAlias: vi.fn(async () => { throw activationFailure }),
+            }),
+        })
+
+        await expect(sealed.facade.put('assets/sealed.bin', Uint8Array.of(2), {
+            kind: 'asset',
+            mime: 'application/octet-stream',
+            name: 'sealed.bin',
+            ext: 'bin',
+        })).rejects.toBe(activationFailure)
+        expect(sealedRelease).not.toHaveBeenCalled()
     })
 
     it('uses bounded CAS reads and never falls back for a non-null object hash', async () => {

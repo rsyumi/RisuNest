@@ -22,6 +22,7 @@ import {
 } from './assetRepositoryRuntime'
 import {
     createNativeAssetObjectUrlResolver,
+    createNativeDurableAssetWriteSessionFactory,
     createNativeImmutablePayloadCas,
     createNativeNewInlayImageEncoder,
 } from './nativeAssetRepository'
@@ -88,6 +89,7 @@ async function installPersistentStorage(): Promise<void> {
             cas: createNativeImmutablePayloadCas(),
             objectUrls: createNativeAssetObjectUrlResolver(),
             newInlayImages: createNativeNewInlayImageEncoder(),
+            writeSessions: createNativeDurableAssetWriteSessionFactory(),
         })
         : undefined
     const selection = {
@@ -162,6 +164,7 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
             cas,
             objectUrls: createNativeAssetObjectUrlResolver(),
             newInlayImages: createNativeNewInlayImageEncoder(),
+            writeSessions: createNativeDurableAssetWriteSessionFactory(),
         })
         const selection = {
             store: authority.rawStore,

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
     beginCasJob,
+    createNativeDurableAssetWriteSessionFactory,
     createNativeImmutablePayloadCas,
     createNativeNewInlayImageEncoder,
     pinExistingCasObject,
@@ -109,5 +110,38 @@ describe('native asset repository adapters', () => {
             'asset_cas_job_release',
         ])
         expect(invoke).not.toHaveBeenCalledWith(expect.stringContaining('catalog'), expect.anything())
+    })
+
+    it('binds normal asset publication to one direct-write native session', async () => {
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'asset_cas_job_begin') return 'asset-write-1'
+            if (command === 'asset_cas_job_prepare') return {
+                contentHash: '66'.repeat(32),
+                byteSize: 2,
+                physicalKey: `assets-v2/objects/66/${'66'.repeat(32).slice(2)}`,
+                deduplicated: true,
+            }
+            return null
+        })
+        const factory = createNativeDurableAssetWriteSessionFactory(invoke)
+
+        const session = await factory.begin()
+        await session.prepare(Uint8Array.of(9, 8))
+        await session.seal()
+        await session.release('committed')
+
+        expect(invoke.mock.calls).toEqual([
+            ['asset_cas_job_begin', { kind: 'direct-asset-or-inlay-write' }],
+            ['asset_cas_job_prepare', {
+                sessionId: 'asset-write-1',
+                data: [9, 8],
+                role: 'direct-object',
+            }],
+            ['asset_cas_job_seal', { sessionId: 'asset-write-1' }],
+            ['asset_cas_job_release', {
+                sessionId: 'asset-write-1',
+                outcome: 'committed',
+            }],
+        ])
     })
 })
