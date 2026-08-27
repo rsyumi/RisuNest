@@ -123,6 +123,7 @@ describe('live chat parser history projection', () => {
     it('builds a bounded common-row projection with absolute and projected offsets', async () => {
         const messages = makeMessages(100)
         const { input, reads } = makeInput(messages, 99, { maxProjectionMessages: 32 })
+        const originalSeed = structuredClone(input.contextSeed)
 
         const result = await createChatParserHistoryProjection(input)
 
@@ -148,6 +149,7 @@ describe('live chat parser history projection', () => {
             result.context.parserContext.character.chats[0].message,
         ).toEqual(result.messages)
         expect(result.context.parserContext.historyOffset).toBe(95)
+        expect(input.contextSeed).toEqual(originalSeed)
         expect(reads[0]).toEqual({ startIndex: 99, limit: 1 })
         expect(Math.max(...reads.map(({ limit }) => limit))).toBeLessThanOrEqual(32)
     })
@@ -172,6 +174,43 @@ describe('live chat parser history projection', () => {
             { startIndex: 89, limit: 1 },
             { startIndex: 10, limit: 79 },
         ])
+    })
+
+    it('falls back without spreading an imported message with many literal indices', async () => {
+        const literalCount = 200_000
+        const currentAbsoluteIndex = literalCount + 1
+        const currentMessage: Message = { role: 'char', data: 'current' }
+        const { input, reader } = makeInput([currentMessage], 0, {
+            totalMessages: currentAbsoluteIndex + 1,
+            currentAbsoluteIndex,
+            maxProjectionMessages: 16,
+            parserSource: Array.from(
+                { length: literalCount },
+                (_, index) => `{{previouschatlog::${index}}}`,
+            ).join(''),
+        })
+        reader.readConversationWindow = async (query) => ({
+            revision: REVISION,
+            value: {
+                characterId: CHARACTER_ID,
+                conversationId: CONVERSATION_ID,
+                messages: [currentMessage],
+                startIndex: query.startIndex ?? 0,
+                endIndex: (query.startIndex ?? 0) + 1,
+                totalMessages: currentAbsoluteIndex + 1,
+                hasMoreBefore: true,
+                hasMoreAfter: false,
+            },
+        })
+        const lease = makeCompleteLease(
+            Array.from({ length: currentAbsoluteIndex + 1 }, () => currentMessage),
+        )
+        input.acquireCompleteProjection = vi.fn(async () => lease)
+
+        const result = await createChatParserHistoryProjection(input)
+
+        expect(result.kind).toBe('complete')
+        expect(input.acquireCompleteProjection).toHaveBeenCalledOnce()
     })
 
     it('includes the prior character row and two prior user rows needed by parser semantics', async () => {
@@ -202,6 +241,45 @@ describe('live chat parser history projection', () => {
             'near user',
             'current',
         ])
+    })
+
+    it('scans large same-role history in linear work', async () => {
+        const messageCount = 2_048
+        let roleReads = 0
+        const messages = Array.from({ length: messageCount }, (_, index) => ({
+            get role() {
+                roleReads += 1
+                return 'char' as const
+            },
+            data: `turn ${index}`,
+        }))
+        const { input, reader } = makeInput(messages, messageCount - 1, {
+            maxProjectionMessages: messageCount,
+        })
+        reader.readConversationWindow = async (query) => {
+            const startIndex = query.startIndex ?? 0
+            const limit = query.limit ?? messageCount
+            const endIndex = startIndex + limit
+            return {
+                revision: REVISION,
+                value: {
+                    characterId: CHARACTER_ID,
+                    conversationId: CONVERSATION_ID,
+                    messages: messages.slice(startIndex, endIndex),
+                    startIndex,
+                    endIndex,
+                    totalMessages: messageCount,
+                    hasMoreBefore: startIndex > 0,
+                    hasMoreAfter: endIndex < messageCount,
+                },
+            }
+        }
+        roleReads = 0
+
+        const result = await createChatParserHistoryProjection(input)
+
+        expect(result.kind).toBe('bounded')
+        expect(roleReads).toBeLessThanOrEqual(messageCount * 3 + 2)
     })
 
     it('falls back before exceeding the bounded budget for a distant literal dependency', async () => {
@@ -417,6 +495,35 @@ describe('live chat parser history projection', () => {
         }
     })
 
+    it.each(['sparse', 'undefined'] as const)(
+        'rejects a %s PDS message window before parser projection',
+        async (mode) => {
+            const messages = makeMessages(10)
+            const { input, reader } = makeInput(messages, 9)
+            reader.readConversationWindow = async () => {
+                const rows = new Array<Message>(1)
+                if (mode === 'undefined') rows[0] = undefined as never
+                return {
+                    revision: REVISION,
+                    value: {
+                        characterId: CHARACTER_ID,
+                        conversationId: CONVERSATION_ID,
+                        messages: rows,
+                        startIndex: 9,
+                        endIndex: 10,
+                        totalMessages: 10,
+                        hasMoreBefore: true,
+                        hasMoreAfter: false,
+                    },
+                }
+            }
+
+            await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+                /conversation window.*message row/i,
+            )
+        },
+    )
+
     it('rejects a complete callback that returns a partial context as complete', async () => {
         const messages = makeMessages(20)
         const partial = {
@@ -433,4 +540,125 @@ describe('live chat parser history projection', () => {
         )
         expect(partial.release).toHaveBeenCalledOnce()
     })
+
+    it('rejects a complete callback result without a callable release', async () => {
+        const messages = makeMessages(20)
+        const malformed = {
+            ...makeCompleteLease(messages),
+            release: undefined,
+        }
+        const { input } = makeInput(messages, 19, {
+            parserSource: '{{history}}',
+            acquireCompleteProjection: async () => malformed as never,
+        })
+
+        await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+            /complete projection lease.*release/i,
+        )
+    })
+
+    it('rejects divergent parser and database character authorities', async () => {
+        const messages = makeMessages(20)
+        const lease = makeCompleteLease(messages)
+        lease.context.parserContext.database.characters[0] = structuredClone(
+            lease.context.parserContext.character,
+        )
+        const { input } = makeInput(messages, 19, {
+            parserSource: '{{history}}',
+            acquireCompleteProjection: async () => lease,
+        })
+
+        await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+            /complete projection.*authority/i,
+        )
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+
+    it('rejects sparse complete message arrays with the expected length', async () => {
+        const messages = makeMessages(20)
+        const lease = makeCompleteLease(messages)
+        const sparse = new Array<Message>(messages.length)
+        sparse[messages.length - 1] = messages[messages.length - 1]
+        lease.context.parserContext.character.chats[0].message = sparse
+        const { input } = makeInput(messages, 19, {
+            parserSource: '{{history}}',
+            acquireCompleteProjection: async () => lease,
+        })
+
+        await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+            /complete projection.*dense/i,
+        )
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+
+    it('rejects an explicit undefined complete message row', async () => {
+        const messages = makeMessages(20)
+        const lease = makeCompleteLease(messages)
+        lease.context.parserContext.character.chats[0].message[2] = undefined as never
+        const { input } = makeInput(messages, 19, {
+            parserSource: '{{history}}',
+            acquireCompleteProjection: async () => lease,
+        })
+
+        await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+            /complete projection.*message row/i,
+        )
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+
+    it('rejects complete history whose current row differs from the pinned PDS row', async () => {
+        const messages = makeMessages(20)
+        const completeMessages = structuredClone(messages)
+        completeMessages[19].data = 'stale current row'
+        const lease = makeCompleteLease(completeMessages)
+        const { input } = makeInput(messages, 19, {
+            parserSource: '{{history}}',
+            acquireCompleteProjection: async () => lease,
+        })
+
+        await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+            /complete projection.*current row/i,
+        )
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+
+    it.each(['stale', 'abort'] as const)(
+        'releases a complete lease when acquisition resolves after %s',
+        async (mode) => {
+            const messages = makeMessages(20)
+            const lease = makeCompleteLease(messages)
+            let current = true
+            let resolveComplete!: (lease: ChatParserCompleteProjectionLease) => void
+            let markAcquisitionStarted!: () => void
+            const acquisitionStarted = new Promise<void>((resolve) => {
+                markAcquisitionStarted = resolve
+            })
+            const complete = new Promise<ChatParserCompleteProjectionLease>((resolve) => {
+                resolveComplete = resolve
+            })
+            const abortController = new AbortController()
+            const { input } = makeInput(messages, 19, {
+                parserSource: '{{history}}',
+                signal: abortController.signal,
+                isCurrent: () => current,
+                acquireCompleteProjection: () => {
+                    markAcquisitionStarted()
+                    return complete
+                },
+            })
+
+            const pending = createChatParserHistoryProjection(input)
+            await acquisitionStarted
+            if (mode === 'stale') current = false
+            else abortController.abort()
+            resolveComplete(lease)
+
+            await expect(pending).rejects.toMatchObject(
+                mode === 'stale'
+                    ? { name: 'ChatParserHistoryProjectionStaleError' }
+                    : { name: 'AbortError' },
+            )
+            expect(lease.release).toHaveBeenCalledOnce()
+        },
+    )
 })

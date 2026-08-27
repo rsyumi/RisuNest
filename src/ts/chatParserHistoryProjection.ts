@@ -123,14 +123,13 @@ export async function createChatParserHistoryProjection(
         source: [input.parserSource, currentMessage],
         unsafeDependencies: input.unsafeDependencies,
     })
-    const requestedIndices = classification.absoluteMessageIndices.filter(
-        (index) => index >= 0 && index < input.totalMessages,
-    )
-    const initialStart = Math.min(input.currentAbsoluteIndex, ...requestedIndices)
-    const initialEnd = Math.max(
-        input.currentAbsoluteIndex + 1,
-        ...requestedIndices.map((index) => index + 1),
-    )
+    let initialStart = input.currentAbsoluteIndex
+    let initialEnd = input.currentAbsoluteIndex + 1
+    for (const index of classification.absoluteMessageIndices) {
+        if (index < 0 || index >= input.totalMessages) continue
+        initialStart = Math.min(initialStart, index)
+        initialEnd = Math.max(initialEnd, index + 1)
+    }
     const reasons: ChatParserCompleteProjectionReason[] = [...classification.reasons]
     if (initialEnd - initialStart > input.maxProjectionMessages) {
         reasons.push('projection-budget')
@@ -140,15 +139,17 @@ export async function createChatParserHistoryProjection(
     }
 
     let prefixStart = initialStart
-    let prefix = prefixStart === input.currentAbsoluteIndex
+    const initialPrefix = prefixStart === input.currentAbsoluteIndex
         ? []
         : await readExactRange(input, prefixStart, input.currentAbsoluteIndex)
+    const prefixSegmentsNewestFirst = initialPrefix.length > 0 ? [initialPrefix] : []
     const suffix = initialEnd === input.currentAbsoluteIndex + 1
         ? []
         : await readExactRange(input, input.currentAbsoluteIndex + 1, initialEnd)
 
-    let backward = inspectBackwardRows(prefix, prefixStart, currentMessage)
-    while (!backward.satisfied && prefixStart > 0) {
+    const backward = createBackwardRowScan(currentMessage, input.currentAbsoluteIndex)
+    inspectBackwardRows(initialPrefix, prefixStart, backward)
+    while (!backwardRowsSatisfied(backward) && prefixStart > 0) {
         const minimumAllowedStart = initialEnd - input.maxProjectionMessages
         const nextStart = Math.max(
             0,
@@ -159,12 +160,13 @@ export async function createChatParserHistoryProjection(
             return acquireCompleteProjection(input, currentMessage, ['projection-budget'])
         }
         const extension = await readExactRange(input, nextStart, prefixStart)
-        prefix = [...extension, ...prefix]
+        prefixSegmentsNewestFirst.push(extension)
         prefixStart = nextStart
-        backward = inspectBackwardRows(prefix, prefixStart, currentMessage)
+        inspectBackwardRows(extension, prefixStart, backward)
     }
 
     const historyOffset = Math.min(initialStart, backward.requiredStart)
+    const prefix = [...prefixSegmentsNewestFirst].reverse().flat()
     const retainedPrefix = prefix.slice(historyOffset - prefixStart)
     const messages = [...retainedPrefix, currentMessage, ...suffix]
     if (messages.length > input.maxProjectionMessages) {
@@ -271,29 +273,51 @@ function validateWindow(
     ) {
         throw new Error('Chat parser history conversation window is not the exact requested range')
     }
+    assertValidMessageRows(
+        window.messages,
+        'Chat parser history conversation window contains an invalid message row',
+        'Chat parser history conversation window message rows must be dense',
+    )
+}
+
+interface BackwardRowScan {
+    readonly pendingRoles: Set<Message['role']>
+    remainingUsers: number
+    requiredStart: number
+}
+
+function createBackwardRowScan(
+    currentMessage: Message,
+    currentAbsoluteIndex: number,
+): BackwardRowScan {
+    return {
+        pendingRoles: new Set<Message['role']>([currentMessage.role, 'char']),
+        remainingUsers: 2,
+        requiredStart: currentAbsoluteIndex,
+    }
 }
 
 function inspectBackwardRows(
     prefix: readonly Message[],
     prefixStart: number,
-    currentMessage: Message,
-): Readonly<{ satisfied: boolean; requiredStart: number }> {
-    const pendingRoles = new Set<Message['role']>([currentMessage.role, 'char'])
-    let remainingUsers = 2
-    let requiredStart = prefixStart + prefix.length
+    scan: BackwardRowScan,
+): void {
     for (let offset = prefix.length - 1; offset >= 0; offset -= 1) {
         const message = prefix[offset]
         const absoluteIndex = prefixStart + offset
-        if (pendingRoles.delete(message.role)) requiredStart = Math.min(requiredStart, absoluteIndex)
-        if (message.role === 'user' && remainingUsers > 0) {
-            remainingUsers -= 1
-            requiredStart = Math.min(requiredStart, absoluteIndex)
+        const role = message.role
+        if (scan.pendingRoles.delete(role)) {
+            scan.requiredStart = Math.min(scan.requiredStart, absoluteIndex)
+        }
+        if (role === 'user' && scan.remainingUsers > 0) {
+            scan.remainingUsers -= 1
+            scan.requiredStart = Math.min(scan.requiredStart, absoluteIndex)
         }
     }
-    return {
-        satisfied: pendingRoles.size === 0 && remainingUsers === 0,
-        requiredStart,
-    }
+}
+
+function backwardRowsSatisfied(scan: BackwardRowScan): boolean {
+    return scan.pendingRoles.size === 0 && scan.remainingUsers === 0
 }
 
 async function acquireCompleteProjection(
@@ -305,7 +329,7 @@ async function acquireCompleteProjection(
         throw new ChatParserCompleteProjectionRequiredError(reasons)
     }
     assertProjectionCurrent(input)
-    const lease = await input.acquireCompleteProjection({
+    const candidate: unknown = await input.acquireCompleteProjection({
         characterId: input.characterId,
         conversationId: input.conversationId,
         revision: input.revision,
@@ -315,11 +339,13 @@ async function acquireCompleteProjection(
         reasons,
         signal: input.signal,
     })
+    let lease: ChatParserCompleteProjectionLease
     try {
         assertProjectionCurrent(input)
-        validateCompleteLease(lease, input)
+        validateCompleteLease(candidate, input, currentMessage)
+        lease = candidate
     } catch (error) {
-        await lease.release()
+        await releaseRejectedCompleteLease(candidate)
         throw error
     }
     return {
@@ -337,24 +363,45 @@ async function acquireCompleteProjection(
 }
 
 function validateCompleteLease(
-    lease: ChatParserCompleteProjectionLease,
+    lease: unknown,
     input: ChatParserHistoryProjectionInput,
-): void {
+    currentMessage: Message,
+): asserts lease is ChatParserCompleteProjectionLease {
     if (
-        lease.characterId !== input.characterId
-        || lease.conversationId !== input.conversationId
-        || lease.revision !== input.revision
-        || lease.totalMessages !== input.totalMessages
+        typeof lease !== 'object'
+        || lease === null
+        || typeof (lease as { release?: unknown }).release !== 'function'
+    ) {
+        throw new Error('Complete projection lease must provide a callable release')
+    }
+    const completeLease = lease as ChatParserCompleteProjectionLease
+    if (
+        completeLease.characterId !== input.characterId
+        || completeLease.conversationId !== input.conversationId
+        || completeLease.revision !== input.revision
+        || completeLease.totalMessages !== input.totalMessages
     ) {
         throw new Error('Complete projection evidence does not match the requested conversation')
     }
-    validateContextIdentity(lease.context, input, true)
+    validateContextIdentity(completeLease.context, input, true, currentMessage)
+}
+
+async function releaseRejectedCompleteLease(lease: unknown): Promise<void> {
+    if (typeof lease !== 'object' || lease === null) return
+    const release = (lease as { release?: unknown }).release
+    if (typeof release !== 'function') return
+    try {
+        await release.call(lease)
+    } catch {
+        // Preserve the validation, cancellation, or staleness error that rejected the lease.
+    }
 }
 
 function validateContextIdentity(
     context: ProcessScriptCaptureContext,
     input: ChatParserHistoryProjectionInput,
     complete: boolean,
+    currentMessage?: Message,
 ): void {
     const parser = context.parserContext
     const character = parser.character
@@ -369,6 +416,9 @@ function validateContextIdentity(
     ) {
         throw new Error('Chat parser projection context does not match the requested conversation')
     }
+    if (complete && (databaseCharacter !== character || databaseChat !== chat)) {
+        throw new Error('Complete projection context must use one shared conversation authority')
+    }
     const expectedCount = complete ? input.totalMessages : 0
     if (chat.message.length !== expectedCount || databaseChat.message.length !== expectedCount) {
         throw new Error(
@@ -377,9 +427,72 @@ function validateContextIdentity(
                 : 'Bounded projection context seed must not contain conversation messages',
         )
     }
+    if (complete) {
+        assertDenseCompleteMessages(chat.message)
+        if (!isSameProjectionValue(chat.message[input.currentAbsoluteIndex], currentMessage)) {
+            throw new Error('Complete projection current row does not match the pinned PDS row')
+        }
+    }
     if (complete && (parser.historyOffset ?? 0) !== 0) {
         throw new Error('Complete projection context cannot have a history offset')
     }
+}
+
+function assertDenseCompleteMessages(messages: readonly Message[]): void {
+    assertValidMessageRows(
+        messages,
+        'Complete projection contains an invalid message row',
+        'Complete projection message history must be dense',
+    )
+}
+
+function assertValidMessageRows(
+    messages: readonly Message[],
+    invalidMessage: string,
+    sparseMessage: string,
+): void {
+    for (let index = 0; index < messages.length; index += 1) {
+        if (!(index in messages)) throw new Error(`${sparseMessage} at index ${index}`)
+        const message = messages[index]
+        const role = message?.role
+        if (
+            typeof message !== 'object'
+            || message === null
+            || (role !== 'user' && role !== 'char')
+            || typeof message.data !== 'string'
+        ) {
+            throw new Error(`${invalidMessage} at index ${index}`)
+        }
+    }
+}
+
+function isSameProjectionValue(left: unknown, right: unknown): boolean {
+    if (Object.is(left, right)) return true
+    if (typeof left !== 'object' || left === null || typeof right !== 'object' || right === null) {
+        return false
+    }
+    if (Array.isArray(left) || Array.isArray(right)) {
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+            return false
+        }
+        for (let index = 0; index < left.length; index += 1) {
+            if ((index in left) !== (index in right)) return false
+            if (index in left && !isSameProjectionValue(left[index], right[index])) return false
+        }
+        return true
+    }
+    const leftRecord = left as Record<string, unknown>
+    const rightRecord = right as Record<string, unknown>
+    const leftKeys = Object.keys(leftRecord).sort()
+    const rightKeys = Object.keys(rightRecord).sort()
+    if (leftKeys.length !== rightKeys.length) return false
+    for (let index = 0; index < leftKeys.length; index += 1) {
+        const key = leftKeys[index]
+        if (key !== rightKeys[index] || !isSameProjectionValue(leftRecord[key], rightRecord[key])) {
+            return false
+        }
+    }
+    return true
 }
 
 function buildBoundedContext(
