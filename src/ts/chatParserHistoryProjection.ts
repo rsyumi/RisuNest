@@ -114,11 +114,12 @@ export async function createChatParserHistoryProjection(
     assertProjectionCurrent(input)
     validateContextIdentity(input.contextSeed, input, false)
 
-    const [currentMessage] = await readExactRange(
+    const [readCurrentMessage] = await readExactRange(
         input,
         input.currentAbsoluteIndex,
         input.currentAbsoluteIndex + 1,
     )
+    const currentMessage = cloneProjectionData(readCurrentMessage)
     const classification = classifyChatParserHistory({
         source: [input.parserSource, currentMessage],
         unsafeDependencies: input.unsafeDependencies,
@@ -335,7 +336,7 @@ async function acquireCompleteProjection(
         revision: input.revision,
         totalMessages: input.totalMessages,
         currentAbsoluteIndex: input.currentAbsoluteIndex,
-        currentMessage,
+        currentMessage: cloneProjectionData(currentMessage),
         reasons,
         signal: input.signal,
     })

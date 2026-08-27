@@ -622,6 +622,29 @@ describe('live chat parser history projection', () => {
         expect(lease.release).toHaveBeenCalledOnce()
     })
 
+    it('does not let complete acquisition mutate the pinned current-row evidence', async () => {
+        const messages = makeMessages(20)
+        messages[19].generationInfo = { model: 'pinned model' }
+        const lease = makeCompleteLease(messages)
+        const { input } = makeInput(messages, 19, {
+            parserSource: '{{history}}',
+            acquireCompleteProjection: async (request) => {
+                request.currentMessage.data = 'callback mutation'
+                if (!request.currentMessage.generationInfo) {
+                    throw new Error('Expected nested generation evidence')
+                }
+                request.currentMessage.generationInfo.model = 'callback model'
+                lease.context.parserContext.character.chats[0].message[19] = request.currentMessage
+                return lease
+            },
+        })
+
+        await expect(createChatParserHistoryProjection(input)).rejects.toThrow(
+            /complete projection.*current row/i,
+        )
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+
     it.each(['stale', 'abort'] as const)(
         'releases a complete lease when acquisition resolves after %s',
         async (mode) => {
