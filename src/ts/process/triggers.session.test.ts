@@ -233,6 +233,58 @@ test('does not publish Trigger metadata to either conversation after navigation'
     }
 })
 
+test('keeps eager character metadata on its original owner after navigation', async () => {
+    const original = fixture()
+    original.char.desc = 'original description'
+    original.char.triggerscript[0].effect = [
+        { type: 'v2Wait', value: '0.001', valueType: 'value' },
+        { type: 'v2SetCharacterDesc', value: 'updated original', valueType: 'value' },
+    ] as never
+    const replacement = fixture()
+    replacement.char.chaId = 'character-2'
+    replacement.char.desc = 'replacement description'
+    replacement.chat.id = 'conversation-2'
+    const replacementSession = new ActiveConversationSession({
+        characterId: replacement.char.chaId,
+        conversationId: replacement.chat.id!,
+        conversation: replacement.chat,
+        storeRevision: 20,
+    })
+    runtime.session = original.session
+    DBState.db = {
+        characters: [original.char, replacement.char],
+        templateDefaultVariables: '',
+    } as never
+    vi.useFakeTimers()
+
+    try {
+        const pending = runTrigger(original.char, 'manual', {
+            chat: original.chat,
+            manualName: 'ordered',
+        })
+        const settled = pending.then(
+            () => null,
+            (error: unknown) => error,
+        )
+        await vi.advanceTimersByTimeAsync(0)
+        selectedCharID.set(1)
+        runtime.session = replacementSession
+        await vi.advanceTimersByTimeAsync(1)
+
+        expect(await settled).toEqual(expect.objectContaining({
+            message: expect.stringMatching(/inactive/i),
+        }))
+        expect((DBState.db.characters.find(
+            (candidate) => candidate.chaId === original.char.chaId,
+        ) as character | undefined)?.desc).toBe('updated original')
+        expect((DBState.db.characters.find(
+            (candidate) => candidate.chaId === replacement.char.chaId,
+        ) as character | undefined)?.desc).toBe('replacement description')
+    } finally {
+        vi.useRealTimers()
+    }
+})
+
 test('does not clone conversation history when no trigger exists', async () => {
     const { chat, char } = fixture()
     char.triggerscript = []
@@ -302,6 +354,72 @@ test('reuses a supplied operation chat across recursive triggers without cloning
     } finally {
         operation.release()
     }
+})
+
+test('does not clone inactive conversation bodies for a current-chat trigger', async () => {
+    const { chat, char, session } = fixture()
+    const archived = {
+        id: 'conversation-archived',
+        name: 'Archived',
+        message: [{ role: 'user', data: 'archived', chatId: 'archived-0' }],
+    } as Chat
+    let archivedBodyReads = 0
+    Object.defineProperty(archived.message[0], 'data', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+            archivedBodyReads += 1
+            return 'archived'
+        },
+    })
+    char.chats.push(archived)
+    char.triggerscript[0].effect = [{
+        type: 'v2SetCharacterDesc',
+        value: 'updated description',
+        valueType: 'value',
+    }] as never
+    runtime.session = session
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+
+    await runTrigger(char, 'manual', {
+        chat,
+        manualName: 'ordered',
+    })
+
+    expect(archivedBodyReads).toBe(0)
+    expect((DBState.db.characters[0] as character).chats[1].message[0].data).toBe('archived')
+})
+
+test('releases the owned operation pin when trigger character setup fails', async () => {
+    const { chat, char, session } = fixture()
+    const archived = {
+        id: 'conversation-archived',
+        name: 'Archived',
+        message: [],
+    } as Chat
+    Object.defineProperty(archived, 'note', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+            throw new Error('metadata failed')
+        },
+    })
+    char.chats.push(archived)
+    runtime.session = session
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+
+    await expect(runTrigger(char, 'manual', {
+        chat,
+        manualName: 'ordered',
+    })).rejects.toThrow('metadata failed')
+
+    expect(session.activePinReasons).toEqual([])
 })
 
 test('pins display history for the full awaited trigger lifetime', async () => {

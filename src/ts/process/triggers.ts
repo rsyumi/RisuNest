@@ -1,11 +1,11 @@
 import { parseChatML } from "../parser/chatML";
 import { risuChatParser as risuChatParserGlobal } from "../parser/parser.svelte";
 import type { ActiveConversationPin } from "../storage/activeConversationSession";
-import { getCurrentCharacter, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
+import { getCurrentCharacter, getDatabase, setCharacterByIndex, setDatabase, type Chat, type character } from "../storage/database.svelte";
 import { tokenize } from "../tokenizer";
 import { getModuleTriggers } from "./modules";
 import { get } from "svelte/store";
-import { ReloadChatPointer, ReloadGUIPointer, selectedCharID, CurrentTriggerIdStore, DBState } from "../stores.svelte";
+import { ReloadChatPointer, ReloadGUIPointer, CurrentTriggerIdStore, DBState } from "../stores.svelte";
 import { processMultiCommand } from "./command";
 import { parseKeyValue, sleep } from "../util";
 import { alertError, alertInput, alertNormal, alertSelect } from "../alert";
@@ -1061,6 +1061,41 @@ async function collectStreamingText(stream: ReadableStream<{ [key: string]: stri
     return lastChunk
 }
 
+function cloneChatMetadata(chat: Chat): Chat {
+    const metadata: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(chat)) {
+        if (key !== 'message') metadata[key] = value
+    }
+    return {
+        ...safeStructuredClone(metadata),
+        message: [],
+    } as Chat
+}
+
+function cloneTriggerCharacter(source: character, currentChat: Chat): character {
+    const cloned = safeStructuredClone({
+        ...source,
+        chats: [],
+    }) as character
+    cloned.chats = source.chats.map((chat, index) =>
+        index === source.chatPage ? currentChat : cloneChatMetadata(chat),
+    )
+    return cloned
+}
+
+function resolveTriggerCharacterOwner(source: character): {
+    character: character
+    index: number
+} {
+    const database = getDatabase()
+    const index = database.characters.findIndex((candidate) => candidate.chaId === source.chaId)
+    const owner = database.characters[index]
+    if (!owner || owner.type === 'group') {
+        throw new Error(`Trigger character ${source.chaId} is no longer available`)
+    }
+    return { character: owner as character, index }
+}
+
 export async function runTrigger(char:character,mode:triggerMode, arg:{
     chat: Chat,
     recursiveCount?: number
@@ -1078,7 +1113,29 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     if (char.triggerscript.length === 0 && moduleTriggers.length === 0) {
         return null
     }
-    char = arg.displayMode ? char : safeStructuredClone(char)
+    let ownedConversationOperation: ConversationOperationContext | null = null
+    if (!arg.displayMode && !arg.conversationOperation) {
+        const activeSession = peekActiveConversationSession()
+        if (
+            activeSession?.isActive &&
+            activeSession.materializeCompatibilityArray() === arg.chat.message
+        ) {
+            ownedConversationOperation = createConversationOperationContext(
+                activeSession,
+                arg.chat,
+            )
+        }
+    }
+    const conversationOperation = arg.conversationOperation ?? ownedConversationOperation
+    let displayHistoryPin: ActiveConversationPin | null = null
+    let conversationOperationClosed = false
+    try {
+    let chat = conversationOperation?.chat ?? (
+        arg.displayMode
+            ? arg.chat
+            : safeStructuredClone(arg.chat ?? char.chats[char.chatPage])
+    )
+    char = arg.displayMode ? char : cloneTriggerCharacter(char, chat)
     let varChanged = false
     let stopSending = arg.stopSending ?? false
     const CharacterlowLevelAccess = char.lowLevelAccess ?? false
@@ -1101,26 +1158,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         CurrentTriggerIdStore.set(arg.triggerId || null)
     }
     
-    let ownedConversationOperation: ConversationOperationContext | null = null
-    if (!arg.displayMode && !arg.conversationOperation) {
-        const activeSession = peekActiveConversationSession()
-        if (
-            activeSession?.isActive &&
-            activeSession.materializeCompatibilityArray() === arg.chat.message
-        ) {
-            ownedConversationOperation = createConversationOperationContext(
-                activeSession,
-                arg.chat,
-            )
-        }
-    }
-    const conversationOperation = arg.conversationOperation ?? ownedConversationOperation
-    let chat = conversationOperation?.chat ?? (
-        arg.displayMode
-            ? arg.chat
-            : safeStructuredClone(arg.chat ?? char.chats[char.chatPage])
-    )
-    let displayHistoryPin: ActiveConversationPin | null = null
     if (arg.displayMode) {
         const activeSession = peekActiveConversationSession()
         if (
@@ -1146,10 +1183,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         setChatVar: parserArgument.setChatVar ??
             operationSetChatVar,
     })
-    let conversationOperationClosed = false
-
-    try {
-
     let tempVars:Record<string, string> = arg.tempVars ?? {}
     
     let localVarScopes: Record<number, Record<string, string>>[] = [{}]
@@ -2039,10 +2072,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         char.globalLore[index][1] = value
                     }
 
-                    const db = getDatabase()
-                    const selectedCharId = get(selectedCharID)
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(db.characters[selectedCharId])
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.globalLore = char.globalLore
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2GetLorebook':{
@@ -2072,10 +2104,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     let value = effect.value
                     char.globalLore[index][2] = value
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.globalLore = char.globalLore
+                    setCharacterByIndex(owner.index, owner.character)
 
                     break
                 }
@@ -2176,10 +2207,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2SetCharacterDesc':{
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     char.desc = value
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase();
-                    (db.characters[selectedCharId] as character).desc = value
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.desc = value
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2GetPersonaDesc':{
@@ -2204,10 +2234,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2SetReplaceGlobalNote':{
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     char.replaceGlobalNote = value
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase();
-                    (db.characters[selectedCharId] as character).replaceGlobalNote = value
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.replaceGlobalNote = value
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2MakeArrayVar':{
@@ -2581,10 +2610,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         selective: false
                     })
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.globalLore = char.globalLore
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2ModifyLorebookByIndex':{
@@ -2616,10 +2644,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         char.globalLore[index].insertorder = insertOrderNum
                     }
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.globalLore = char.globalLore
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2DeleteLorebookByIndex':{
@@ -2632,10 +2659,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
 
                     char.globalLore.splice(index, 1)
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.globalLore = char.globalLore
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2GetLorebookCountNew':{
@@ -2653,10 +2679,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
 
                     char.globalLore[index].alwaysActive = effect.value
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    const owner = resolveTriggerCharacterOwner(char)
+                    owner.character.globalLore = char.globalLore
+                    setCharacterByIndex(owner.index, owner.character)
                     break
                 }
                 case 'v2RegexTest':{
