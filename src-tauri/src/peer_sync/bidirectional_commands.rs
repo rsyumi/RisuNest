@@ -383,16 +383,6 @@ fn ensure_bidirectional_backup_receipt(
             side,
             path: backup_path.to_string_lossy().into_owned(),
         }),
-        Err(_) if fs::symlink_metadata(&backup_path).is_ok() => {
-            verify_bidirectional_backup_receipt(
-                &backup_path,
-                operation_id,
-                expected_revision,
-                side,
-                expected_source,
-                None,
-            )
-        }
         Err(error) => Err(PeerSyncError::Storage(error.to_string())),
     }
 }
@@ -799,29 +789,49 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
             received: received_remote_hash,
         });
     }
-    if winner == PeerBidirectionalConflictWinner::Remote
-        && !backups
+    if winner == PeerBidirectionalConflictWinner::Remote {
+        if let Some(receipt) = backups
             .iter()
-            .any(|backup| backup.side == PeerBidirectionalBackupSide::Local)
-    {
-        backups.push(ensure_bidirectional_backup_receipt(
-            store,
-            cas,
-            app_root,
-            operation_id,
-            context.expected_local_revision,
-            PeerBidirectionalBackupSide::Local,
-            &local_generation,
-        )?);
-        journal.store(&PeerBidirectionalDurableOperation::AwaitingConflict {
-            schema: OPERATION_SCHEMA.to_owned(),
-            context: context.clone(),
-            conflicts: conflicts.clone(),
-            local_generation: local_generation.clone(),
-            local_manifest_hash: local_manifest_hash.clone(),
-            remote_manifest_hash: remote_manifest_hash.clone(),
-            backups: backups.clone(),
-        })?;
+            .find(|backup| backup.side == PeerBidirectionalBackupSide::Local)
+        {
+            let expected_path = bidirectional_backup_path(
+                app_root,
+                operation_id,
+                PeerBidirectionalBackupSide::Local,
+            );
+            if Path::new(&receipt.path) != expected_path {
+                return Err(PeerSyncError::Storage(
+                    "bidirectional backup receipt has an unexpected path".to_owned(),
+                ));
+            }
+            verify_bidirectional_backup_receipt(
+                &expected_path,
+                operation_id,
+                context.expected_local_revision,
+                PeerBidirectionalBackupSide::Local,
+                &local_generation,
+                Some(&receipt.package_id),
+            )?;
+        } else {
+            backups.push(ensure_bidirectional_backup_receipt(
+                store,
+                cas,
+                app_root,
+                operation_id,
+                context.expected_local_revision,
+                PeerBidirectionalBackupSide::Local,
+                &local_generation,
+            )?);
+            journal.store(&PeerBidirectionalDurableOperation::AwaitingConflict {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: context.clone(),
+                conflicts: conflicts.clone(),
+                local_generation: local_generation.clone(),
+                local_manifest_hash: local_manifest_hash.clone(),
+                remote_manifest_hash: remote_manifest_hash.clone(),
+                backups: backups.clone(),
+            })?;
+        }
     }
     let job = RefCell::new(DurableCasJob::open(app_root, &context.durable_job_id)?);
     let recovered_after_activation = job.borrow().is_sealed();
@@ -2801,8 +2811,127 @@ mod tests {
             &NeverCancelled,
         )
         .unwrap();
+        let completed_receipt = PeerBidirectionalBackupReceipt {
+            package_id: completed_backup.archive_sha256.clone(),
+            side: PeerBidirectionalBackupSide::Local,
+            path: backup_path.to_string_lossy().into_owned(),
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        let mut retained_with_receipt = journal.load().unwrap().unwrap();
+        match &mut retained_with_receipt {
+            PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. } => {
+                backups.push(completed_receipt.clone());
+            }
+            other => panic!("unexpected retained operation: {other:?}"),
+        }
+        journal.store(&retained_with_receipt).unwrap();
         drop(store);
         let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        fs::remove_file(&backup_path).unwrap();
+        let mut missing_backup_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &remote.manifest.generation,
+        )
+        .unwrap();
+        assert!(resolve_bidirectional_conflict(
+            &mut store,
+            &cas,
+            directory.path(),
+            &conflict.operation_id,
+            PeerBidirectionalConflictWinner::Remote,
+            2,
+            &remote.manifest_bytes,
+            &mut missing_backup_source,
+        )
+        .is_err());
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(store.read_root(None).unwrap().value, lossless_root("Local"));
+        assert_eq!(journal.load().unwrap(), Some(retained_with_receipt.clone()));
+
+        create_and_verify_peer_bidirectional_backup_v1_report(
+            &backup_path,
+            &complete_staging,
+            &cas,
+            &mut store,
+            2,
+            &lossless_source_binding(
+                &conflict.operation_id,
+                PeerBidirectionalBackupSide::Local,
+                &local_generation,
+            ),
+            &NeverCancelled,
+        )
+        .unwrap();
+        fs::write(&backup_path, b"corrupt persisted backup").unwrap();
+        let mut corrupt_persisted_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &remote.manifest.generation,
+        )
+        .unwrap();
+        assert!(resolve_bidirectional_conflict(
+            &mut store,
+            &cas,
+            directory.path(),
+            &conflict.operation_id,
+            PeerBidirectionalConflictWinner::Remote,
+            2,
+            &remote.manifest_bytes,
+            &mut corrupt_persisted_source,
+        )
+        .is_err());
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(fs::read(&backup_path).unwrap(), b"corrupt persisted backup");
+        assert_eq!(journal.load().unwrap(), Some(retained_with_receipt.clone()));
+
+        fs::remove_file(&backup_path).unwrap();
+        create_and_verify_peer_bidirectional_backup_v1_report(
+            &backup_path,
+            &complete_staging,
+            &cas,
+            &mut store,
+            2,
+            &lossless_source_binding(
+                &conflict.operation_id,
+                PeerBidirectionalBackupSide::Local,
+                &local_generation,
+            ),
+            &NeverCancelled,
+        )
+        .unwrap();
+        let mut wrong_hash_receipt = retained_with_receipt.clone();
+        match &mut wrong_hash_receipt {
+            PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. } => {
+                backups[0].package_id = "0".repeat(64);
+            }
+            other => panic!("unexpected retained operation: {other:?}"),
+        }
+        journal.store(&wrong_hash_receipt).unwrap();
+        let mut wrong_hash_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &remote.manifest.generation,
+        )
+        .unwrap();
+        assert!(resolve_bidirectional_conflict(
+            &mut store,
+            &cas,
+            directory.path(),
+            &conflict.operation_id,
+            PeerBidirectionalConflictWinner::Remote,
+            2,
+            &remote.manifest_bytes,
+            &mut wrong_hash_source,
+        )
+        .is_err());
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(journal.load().unwrap(), Some(wrong_hash_receipt));
+        journal.store(&retained_with_receipt).unwrap();
 
         let mut resolution_source = LogicalDeltaSourceSession::open(
             remote_directory.path(),
