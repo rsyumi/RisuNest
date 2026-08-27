@@ -781,6 +781,11 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
             "bidirectional remote operation ID is invalid".to_owned(),
         ));
     }
+    if expected_revision < 0 {
+        return Err(PeerSyncError::Validation(
+            "bidirectional remote revision must be nonnegative".to_owned(),
+        ));
+    }
     if backup_losing_side {
         return Err(PeerSyncError::Protocol(
             "bidirectional remote conflict backup is not implemented".to_owned(),
@@ -798,6 +803,52 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
         return Err(PeerSyncError::Validation(
             "bidirectional shared generation differs from its verified manifest".to_owned(),
         ));
+    }
+    let expected_shared = SyncGenerationIdentity {
+        generation_id: expected_shared_generation.generation_id.clone(),
+        manifest_hash: expected_shared_generation.manifest_hash.clone(),
+        generation_sequence: expected_shared_generation.generation_sequence.clone(),
+    };
+    let actual_revision = store.revision().map_err(store_error)?;
+    if actual_revision != expected_revision {
+        let recovered_revision = expected_revision.checked_add(1);
+        if recovered_revision == Some(actual_revision) {
+            let active = store
+                .seal_or_initialize_active_logical_generation(cas)
+                .map_err(store_error)?;
+            let active_identity = SyncGenerationIdentity {
+                generation_id: active.manifest.generation,
+                manifest_hash: active.manifest_hash,
+                generation_sequence: active.manifest.generation_sequence,
+            };
+            let common_base = store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .map_err(store_error)?;
+            let acknowledgement =
+                match store.sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id) {
+                    Ok(acknowledgement) => Some(acknowledgement),
+                    Err(StoreError::Validation { .. }) => None,
+                    Err(error) => return Err(store_error(error)),
+                };
+            if common_base.as_ref() == Some(&expected_shared)
+                && acknowledgement.as_ref().is_some_and(|state| {
+                    state.shared_identity == expected_shared
+                        && state.local_identity == active_identity
+                })
+            {
+                return Ok(LanBidirectionalRemoteApplyReceipt {
+                    committed_revision: actual_revision,
+                    committed_generation: expected_shared_generation,
+                    transferred_objects: 0,
+                    transferred_bytes: 0,
+                    backup: None,
+                });
+            }
+        }
+        return Err(PeerSyncError::ActivationConflict {
+            expected: Some(expected_revision.to_string()),
+            actual: Some(actual_revision.to_string()),
+        });
     }
     let previous = store
         .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
@@ -892,11 +943,6 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
     let acknowledged = store
         .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
         .map_err(store_error)?;
-    let expected_shared = SyncGenerationIdentity {
-        generation_id: expected_shared_generation.generation_id.clone(),
-        manifest_hash: expected_shared_generation.manifest_hash.clone(),
-        generation_sequence: expected_shared_generation.generation_sequence.clone(),
-    };
     if acknowledged.shared_identity != expected_shared {
         return Err(PeerSyncError::Storage(
             "bidirectional remote acknowledgement differs from shared generation".to_owned(),
@@ -2509,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_apply_reports_shared_a_and_advances_only_after_activation() {
+    fn remote_apply_response_loss_reissues_shared_a_without_redownload() {
         let directory = tempfile::tempdir().unwrap();
         let bootstrap_root = directory.path().join("bootstrap");
         fs::create_dir(&bootstrap_root).unwrap();
@@ -2701,12 +2747,55 @@ mod tests {
         assert_eq!(remote_ack.shared_identity, shared_identity);
         assert_ne!(remote_ack.local_identity, remote_ack.shared_identity);
 
+        drop(shared_source);
+        drop(remote_source);
+        drop(remote_store);
+        drop(local_store);
+        let mut remote_store = PersistentStore::open(&remote_root).unwrap();
+        let mut local_store = PersistentStore::open(&local_root).unwrap();
+        let mut retry_source = FixtureSource {
+            objects: BTreeMap::new(),
+            reads: 0,
+        };
+        let recovered_receipt = apply_bidirectional_remote_shared(
+            &mut remote_store,
+            &remote_cas,
+            &remote_root,
+            &operation_id,
+            local_device,
+            1,
+            &common.manifest_hash,
+            LanBidirectionalGeneration {
+                generation_id: shared_identity.generation_id.clone(),
+                manifest_hash: shared_identity.manifest_hash.clone(),
+                generation_sequence: shared_identity.generation_sequence.clone(),
+            },
+            &shared.manifest_bytes,
+            &mut retry_source,
+            false,
+        )
+        .unwrap();
+        assert_eq!(remote_store.revision().unwrap(), 2);
+        assert_eq!(recovered_receipt.committed_revision, 2);
+        assert_eq!(
+            recovered_receipt.committed_generation,
+            LanBidirectionalGeneration {
+                generation_id: shared_identity.generation_id.clone(),
+                manifest_hash: shared_identity.manifest_hash.clone(),
+                generation_sequence: shared_identity.generation_sequence.clone(),
+            }
+        );
+        assert_eq!(recovered_receipt.transferred_objects, 0);
+        assert_eq!(recovered_receipt.transferred_bytes, 0);
+        assert!(recovered_receipt.backup.is_none());
+        assert_eq!(retry_source.reads, 0);
+
         let result = complete_bidirectional_local_after_remote_apply(
             &mut local_store,
             &local_cas,
             &local_root,
             &operation_id,
-            receipt,
+            recovered_receipt,
         )
         .unwrap();
 
@@ -2714,7 +2803,7 @@ mod tests {
         assert_eq!(result.operation_id, operation_id);
         assert_eq!(result.revision, 2);
         assert_eq!(result.remote_revision, 2);
-        assert_eq!(result.transferred_objects, 2);
+        assert_eq!(result.transferred_objects, 1);
         assert!(result.transferred_bytes > 0);
         assert!(result.backups.is_empty());
         let local_ack = local_store
@@ -2732,5 +2821,34 @@ mod tests {
                 result: result.clone(),
             }
         );
+
+        remote_store
+            .revoke_sync_device(PRODUCT_LOGICAL_LIBRARY_ID, local_device, &shared_identity)
+            .unwrap();
+        let mut invalid_retry_source = FixtureSource {
+            objects: BTreeMap::new(),
+            reads: 0,
+        };
+        assert!(matches!(
+            apply_bidirectional_remote_shared(
+                &mut remote_store,
+                &remote_cas,
+                &remote_root,
+                &operation_id,
+                local_device,
+                1,
+                &common.manifest_hash,
+                LanBidirectionalGeneration {
+                    generation_id: shared_identity.generation_id.clone(),
+                    manifest_hash: shared_identity.manifest_hash.clone(),
+                    generation_sequence: shared_identity.generation_sequence.clone(),
+                },
+                &shared.manifest_bytes,
+                &mut invalid_retry_source,
+                false,
+            ),
+            Err(PeerSyncError::ActivationConflict { .. })
+        ));
+        assert_eq!(invalid_retry_source.reads, 0);
     }
 }
