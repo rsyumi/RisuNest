@@ -1,3 +1,4 @@
+mod character_charx_export;
 pub mod charx;
 mod content;
 mod jpeg_asset;
@@ -209,6 +210,13 @@ pub(crate) enum NativeFileJobStartRequest {
     ExportLegacyLocalBackup {
         destination: Option<String>,
         expected_revision: i64,
+    },
+    ExportCharacterCharx {
+        destination: String,
+        expected_revision: i64,
+        character_id: String,
+        card: Value,
+        module: Value,
     },
     PrepareContentImport {
         source: JobSource,
@@ -1155,6 +1163,42 @@ impl NativeFileJobState {
                     store,
                 }
             }
+            NativeFileJobStartRequest::ExportCharacterCharx {
+                destination,
+                expected_revision,
+                character_id,
+                card,
+                module,
+            } => {
+                let destination = PathBuf::from(destination);
+                validate_desktop_destination(&destination)?;
+                if character_id.is_empty() || character_id.len() > 512 {
+                    return Err(NativeJobError::new(
+                        "invalid-input",
+                        "character export requires a bounded character ID",
+                    ));
+                }
+                let metadata_bytes = serde_json::to_vec(&(&card, &module))
+                    .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
+                if metadata_bytes.len() > 8 * 1024 * 1024 {
+                    return Err(NativeJobError::new(
+                        "invalid-input",
+                        "character export metadata exceeds the 8 MiB limit",
+                    ));
+                }
+                let prepared =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.prepare_risu_save_export(expected_revision)
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ExportCharacterCharx {
+                    destination,
+                    character_id,
+                    card,
+                    module,
+                    prepared,
+                }
+            }
             request @ NativeFileJobStartRequest::PrepareContentImport { .. } => {
                 return self.start_content(request);
             }
@@ -1627,6 +1671,21 @@ impl NativeFileJobState {
                     store,
                     &job,
                 ),
+                NativeFileJobTask::ExportCharacterCharx {
+                    destination,
+                    character_id,
+                    card,
+                    module,
+                    prepared,
+                } => character_charx_export::export_character_charx(
+                    prepared,
+                    &character_id,
+                    card,
+                    module,
+                    &owned_directory,
+                    &destination,
+                    &job,
+                ),
                 NativeFileJobTask::ImportJpegAsset {
                     opened_source,
                     display_name,
@@ -1953,6 +2012,13 @@ enum NativeFileJobTask {
         expected_revision: i64,
         store: crate::persistent_store::PersistentStore,
     },
+    ExportCharacterCharx {
+        destination: PathBuf,
+        character_id: String,
+        card: Value,
+        module: Value,
+        prepared: crate::persistent_store::PreparedRisuSaveExport,
+    },
     ImportJpegAsset {
         opened_source: Option<OpenedJobSource>,
         source: JobSource,
@@ -1982,6 +2048,7 @@ impl NativeFileJobTask {
             Self::ExportLossless { .. } => JobKind::ExportLosslessBackup,
             Self::RestoreLegacyLocalBackup { .. } => JobKind::RestoreLegacyLocalBackup,
             Self::ExportLegacyLocalBackup { .. } => JobKind::ExportLegacyLocalBackup,
+            Self::ExportCharacterCharx { .. } => JobKind::ExportCharacterCharx,
             Self::ImportJpegAsset { .. } => JobKind::ImportJpegAsset,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
@@ -2016,6 +2083,7 @@ impl NativeFileJobTask {
             | Self::ImportJpegAsset {
                 expected_revision, ..
             } => *expected_revision,
+            Self::ExportCharacterCharx { prepared, .. } => prepared.revision,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { prepared } => prepared.revision(),
             #[cfg(feature = "native-official-publication")]
@@ -2271,6 +2339,7 @@ pub(crate) enum JobKind {
     ExportBlockRisuSave,
     ExportLosslessBackup,
     ExportLegacyLocalBackup,
+    ExportCharacterCharx,
     PrepareContentImport,
     ImportJpegAsset,
     KeiBackupUpload,
@@ -2874,6 +2943,7 @@ impl JobControl {
             JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
             JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::ExportLegacyLocalBackup => JobPhase::WritingExport,
+            JobKind::ExportCharacterCharx => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
             JobKind::ImportJpegAsset => JobPhase::ReadingSource,
             JobKind::KeiBackupUpload => JobPhase::WritingExport,

@@ -17,6 +17,39 @@ pub(crate) mod destination;
 
 pub(crate) const EXPORT_CANCELLED_MESSAGE: &str = "native RisuSave export cancelled";
 
+pub(crate) fn projected_character(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    target: &ReadTarget,
+    character_id: &str,
+) -> StoreResult<Value> {
+    let mut character = super::query::read_character(connection, character_id, target)?
+        .ok_or_else(|| StoreError::Validation {
+            message: "pinned character does not exist".to_owned(),
+        })?
+        .value;
+    let object = character
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Validation {
+            message: "pinned character must be an object".to_owned(),
+        })?;
+    OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?
+        .project_character(character_id, object)?;
+    Ok(character)
+}
+
+pub(crate) fn pinned_asset_alias(
+    connection: &Connection,
+    target: &ReadTarget,
+    key: &str,
+) -> StoreResult<super::AssetAlias> {
+    super::query::read_asset_alias(connection, "asset", key, target)?
+        .ok_or_else(|| StoreError::Validation {
+            message: format!("pinned character asset alias is missing: {key}"),
+        })
+        .map(|versioned| versioned.value)
+}
+
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 
 const CONFIG: u8 = 0;

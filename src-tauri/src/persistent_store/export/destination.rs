@@ -136,6 +136,28 @@ pub(crate) fn write_legacy_backup_destination_controlled(
     )
 }
 
+pub(crate) fn write_charx_destination_controlled(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(DestinationProgress),
+    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
+) -> Result<DestinationWriteResult, DestinationWriteError> {
+    write_desktop_destination_with_commit_kind(
+        &RealFileSystem,
+        SourceKind::CharacterCharX,
+        source_root,
+        source,
+        destination_root,
+        destination,
+        is_cancelled,
+        on_progress,
+        before_replace,
+    )
+}
+
 trait DestinationFileSystem {
     type Source: Read;
     type Destination: Write;
@@ -243,6 +265,7 @@ enum SourceKind {
     ScreenshotOutput,
     LosslessBackup,
     LegacyBackup,
+    CharacterCharX,
 }
 
 fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
@@ -261,6 +284,7 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
         SourceKind::ScreenshotOutput => validated_screenshot_source(source_root, source)?,
         SourceKind::LosslessBackup => validated_lossless_source(source_root, source)?,
         SourceKind::LegacyBackup => validated_legacy_backup_source(source_root, source)?,
+        SourceKind::CharacterCharX => validated_charx_source(source_root, source)?,
     };
     let destination = validated_destination(destination_root, destination)?;
     if source.parent() == destination.parent() {
@@ -395,6 +419,21 @@ fn validated_legacy_backup_source(
     let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
     if source.parent() != Some(root.as_path())
         || source.file_name().and_then(|name| name.to_str()) != Some("archive.bin.part")
+        || !source.is_file()
+    {
+        return Err(DestinationWriteError::InvalidSource);
+    }
+    Ok(source)
+}
+
+fn validated_charx_source(
+    source_root: &Path,
+    source: &Path,
+) -> Result<PathBuf, DestinationWriteError> {
+    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
+    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
+    if source.parent() != Some(root.as_path())
+        || source.file_name().and_then(|name| name.to_str()) != Some("character.charx")
         || !source.is_file()
     {
         return Err(DestinationWriteError::InvalidSource);

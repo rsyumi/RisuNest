@@ -923,6 +923,15 @@ pub(crate) struct OfficialPublicationPayload {
 }
 
 impl PreparedRisuSaveExport {
+    pub(crate) fn repository_root(&self) -> StoreResult<&Path> {
+        self.snapshots_dir
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| StoreError::Validation {
+                message: "native export repository root is unavailable".to_owned(),
+            })
+    }
+
     pub(crate) fn take_reader(&mut self) -> StoreResult<RevisionReadLease> {
         self.reader.take().ok_or_else(|| StoreError::Validation {
             message: "native export reader has already been taken".to_owned(),

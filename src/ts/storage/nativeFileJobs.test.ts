@@ -106,7 +106,9 @@ describe('native file jobs', () => {
         const result = await runNativeCharacterCharxExport(
             {
                 revision: 31,
-                flushPendingData: async (reason) => calls.push([`flush:${reason}`, undefined]),
+                flushPendingData: async (reason) => {
+                    calls.push([`flush:${reason}`, undefined])
+                },
             },
             {
                 characterId: 'character-id',
