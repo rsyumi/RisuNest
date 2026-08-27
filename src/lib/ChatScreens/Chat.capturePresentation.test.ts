@@ -3,9 +3,21 @@
 import { writable } from 'svelte/store'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, unmount } from 'svelte'
+import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
+import type { character, Chat as ChatRecord, Message } from 'src/ts/storage/database.svelte'
+import type { ConversationViewportKey } from 'src/ts/conversationViewportSource'
+import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
 
 const live = vi.hoisted(() => ({
     db: {} as Record<string, any>,
+}))
+const runtime = vi.hoisted(() => ({
+    activeSession: null as unknown,
+    persistent: {} as Record<string, unknown>,
+}))
+const actionMocks = vi.hoisted(() => ({
+    runTrigger: vi.fn(),
+    runLuaButtonTrigger: vi.fn(),
 }))
 const parserCalls = vi.hoisted(() => [] as Array<{
     chara?: unknown
@@ -65,8 +77,10 @@ vi.mock('src/ts/process/scripts', () => ({
 vi.mock('src/ts/model/modellist', () => ({
     getModelInfo: (model: string) => ({ shortName: model || 'model' }),
 }))
-vi.mock('src/ts/process/scriptings', () => ({ runLuaButtonTrigger: vi.fn() }))
-vi.mock('src/ts/process/triggers', () => ({ runTrigger: vi.fn() }))
+vi.mock('src/ts/process/scriptings', () => ({
+    runLuaButtonTrigger: actionMocks.runLuaButtonTrigger,
+}))
+vi.mock('src/ts/process/triggers', () => ({ runTrigger: actionMocks.runTrigger }))
 vi.mock('src/ts/process/tts', () => ({ sayTTS: vi.fn() }))
 vi.mock('src/ts/sync/multiuser', () => ({ ConnectionOpenStore: writable(false) }))
 vi.mock('src/ts/util', () => ({
@@ -90,6 +104,10 @@ vi.mock('src/ts/process/files/inlayRenderSource', () => ({
     DeferredInlayMarkerRegistry: class {}, withResolvedDeferredInlaySources: vi.fn(),
 }))
 vi.mock('src/ts/process/files/chatCopyInlays', () => ({ copyImageSourceToDataUrl: vi.fn() }))
+vi.mock('../../ts/storage/persistentDataRuntime.svelte', () => ({
+    getActiveConversationSession: () => runtime.activeSession,
+    getPersistentDataRuntime: () => runtime.persistent,
+}))
 
 import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
 import Chat from './Chat.svelte'
@@ -168,12 +186,111 @@ function context(overrides: Record<string, unknown> = {}) {
     }
 }
 
+function makeWindowedEditHarness() {
+    const message: Message = {
+        role: 'char',
+        data: 'Original viewport message',
+        chatId: 'message-1',
+    }
+    const completeConversation = {
+        id: 'conversation-a',
+        name: 'Conversation',
+        note: '',
+        localLore: [],
+        message: [{ role: 'user' as const, data: 'zero' }, message],
+        bookmarks: [],
+    } as ChatRecord
+    const completeCharacter = {
+        type: 'character',
+        name: 'Live Character',
+        chaId: 'character-a',
+        chatPage: 0,
+        chats: [completeConversation],
+        ttsMode: 'none',
+    } as unknown as character
+    const metadataConversation = {
+        id: completeConversation.id,
+        bookmarks: [],
+    } as unknown as character['chats'][number]
+    Object.defineProperty(metadataConversation, 'message', {
+        get() {
+            throw new Error('metadata-only conversation body was accessed')
+        },
+    })
+    const metadataCharacter = {
+        ...completeCharacter,
+        chats: [metadataConversation],
+    }
+    const session = new ActiveConversationSession({
+        characterId: completeCharacter.chaId,
+        conversationId: completeConversation.id,
+        conversation: completeConversation,
+        storeRevision: 7,
+    })
+    const release = vi.fn()
+    const intent = {
+        selection: {
+            characterId: completeCharacter.chaId,
+            conversationId: completeConversation.id,
+            navigationGeneration: 1,
+            storeRevision: 7,
+        },
+        absoluteIndex: 1,
+        sourceToken: 'source-a',
+        sourceVersion: 3,
+        rowKey: 'row-1' as ConversationViewportKey,
+        messageEvidence: message,
+    }
+    const captureMessageEditIntent = vi.fn(() => intent)
+    const acquireTarget = vi.fn(async () => {
+        live.db.characters = [completeCharacter]
+        runtime.activeSession = session
+        const locator = session.locate(1)
+        return {
+            target: {
+                kind: 'session' as const,
+                absoluteIndex: 1,
+                character: completeCharacter,
+                conversation: completeConversation,
+                message: session.readMessage(locator),
+                session,
+                locator,
+            },
+            release,
+        }
+    })
+    const acquireCompleteMessageTargetForIntent = acquireTarget
+    const acquireCompleteMessageTarget = acquireTarget
+    const withCompleteSelectedConversation = vi.fn()
+    const operations = {
+        captureMessageEditIntent,
+        acquireCompleteMessageTargetForIntent,
+        acquireCompleteMessageTarget,
+        withCompleteSelectedConversation,
+    } as unknown as SelectedConversationOperations
+    return {
+        message,
+        metadataCharacter,
+        completeConversation,
+        operations,
+        captureMessageEditIntent,
+        acquireCompleteMessageTargetForIntent,
+        acquireCompleteMessageTarget,
+        completeCharacter,
+        session,
+        withCompleteSelectedConversation,
+        release,
+    }
+}
+
 describe('Chat frozen capture presentation', () => {
     let target: HTMLDivElement
     let mounted: ReturnType<typeof mount> | undefined
 
     beforeEach(() => {
         parserCalls.length = 0
+        actionMocks.runTrigger.mockReset()
+        actionMocks.runLuaButtonTrigger.mockReset()
         live.db = {
             theme: 'cardboard',
             iconsize: 25,
@@ -183,6 +300,8 @@ describe('Chat frozen capture presentation', () => {
             memoryLimitThickness: 9,
             characters: [],
         }
+        runtime.activeSession = null
+        runtime.persistent = {}
         target = document.createElement('div')
         document.body.append(target)
     })
@@ -477,6 +596,186 @@ describe('Chat frozen capture presentation', () => {
             'data-parser-projection',
         )).toBe('bounded')
         expect(target.querySelector('.button-icon-edit')).not.toBeNull()
+    })
+
+    test('delays windowed edit promotion until save and commits against the original row target', async () => {
+        const harness = makeWindowedEditHarness()
+        live.db = {
+            ...live.db,
+            theme: 'cardboard',
+            characters: [harness.metadataCharacter],
+            translator: '',
+            useChatCopy: false,
+            enableBookmark: false,
+            swipe: false,
+            clickToEdit: false,
+        }
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: harness.message.data,
+                name: 'Live Character',
+                role: 'char',
+                idx: 1,
+                totalLength: 2,
+                isLastMemory: false,
+                viewportRow: {
+                    key: 'row-1' as ConversationViewportKey,
+                    absoluteIndex: 1,
+                    message: harness.message,
+                    sourceVersion: 3,
+                },
+                viewportSourceToken: 'source-a',
+                selectedConversationOperations: harness.operations,
+                captureViewportTarget: () => null,
+            },
+        })
+
+        const editButton = await vi.waitFor(() => {
+            const button = target.querySelector<HTMLButtonElement>('.button-icon-edit')
+            expect(button).not.toBeNull()
+            return button!
+        })
+        editButton.click()
+        expect(harness.captureMessageEditIntent).toHaveBeenCalledOnce()
+        expect(harness.acquireCompleteMessageTargetForIntent).not.toHaveBeenCalled()
+
+        const editor = await vi.waitFor(() => {
+            const textarea = target.querySelector<HTMLTextAreaElement>('.message-edit-area')
+            expect(textarea).not.toBeNull()
+            return textarea!
+        })
+        editor.value = 'Saved after promotion'
+        editor.dispatchEvent(new Event('input', { bubbles: true }))
+        editButton.click()
+
+        await vi.waitFor(() => {
+            expect(harness.completeConversation.message[1].data).toBe('Saved after promotion')
+            expect(harness.acquireCompleteMessageTargetForIntent).toHaveBeenCalledWith(
+                expect.objectContaining({ rowKey: 'row-1' }),
+                'edit-message',
+            )
+            expect(harness.release).toHaveBeenCalledOnce()
+        })
+    })
+
+    test('promotes and releases a windowed message operation before removing its row', async () => {
+        const harness = makeWindowedEditHarness()
+        live.db = {
+            ...live.db,
+            theme: 'cardboard',
+            characters: [harness.metadataCharacter],
+            translator: '',
+            useChatCopy: false,
+            enableBookmark: false,
+            swipe: false,
+            askRemoval: false,
+            instantRemove: false,
+        }
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: harness.message.data,
+                name: 'Live Character',
+                role: 'char',
+                idx: 1,
+                totalLength: 2,
+                isLastMemory: false,
+                viewportRow: {
+                    key: 'row-1' as ConversationViewportKey,
+                    absoluteIndex: 1,
+                    message: harness.message,
+                    sourceVersion: 3,
+                },
+                viewportSourceToken: 'source-a',
+                selectedConversationOperations: harness.operations,
+                captureViewportTarget: () => null,
+            },
+        })
+
+        const removeButton = await vi.waitFor(() => {
+            const button = target.querySelector<HTMLButtonElement>('.button-icon-remove')
+            expect(button).not.toBeNull()
+            return button!
+        })
+        removeButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+
+        await vi.waitFor(() => {
+            expect(harness.acquireCompleteMessageTarget).toHaveBeenCalledWith(1, 'remove-message')
+            expect(harness.session.totalMessages).toBe(1)
+            expect(harness.release).toHaveBeenCalledOnce()
+        })
+    })
+
+    test('runs a manual windowed trigger only inside the complete conversation gateway', async () => {
+        const harness = makeWindowedEditHarness()
+        live.db = {
+            ...live.db,
+            theme: 'cardboard',
+            characters: [harness.metadataCharacter],
+            translator: '',
+            useChatCopy: false,
+            enableBookmark: false,
+            swipe: false,
+        }
+        const requireCurrent = vi.fn(() => ({
+            character: harness.completeCharacter,
+            conversation: harness.completeConversation,
+            session: harness.session,
+            selection: {
+                characterId: harness.completeCharacter.chaId,
+                conversationId: harness.completeConversation.id!,
+                navigationGeneration: 1,
+                storeRevision: 7,
+            },
+        }))
+        harness.withCompleteSelectedConversation.mockImplementation(
+            async (_reason, operation) => operation({ requireCurrent }),
+        )
+        actionMocks.runTrigger.mockResolvedValue(null)
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: harness.message.data,
+                name: 'Live Character',
+                role: 'char',
+                idx: 1,
+                totalLength: 2,
+                isLastMemory: false,
+                viewportRow: {
+                    key: 'row-1' as ConversationViewportKey,
+                    absoluteIndex: 1,
+                    message: harness.message,
+                    sourceVersion: 3,
+                },
+                viewportSourceToken: 'source-a',
+                selectedConversationOperations: harness.operations,
+                captureViewportTarget: () => null,
+            },
+        })
+
+        const body = await vi.waitFor(() => {
+            const element = target.querySelector<HTMLElement>('[data-chat-body-probe]')
+            expect(element).not.toBeNull()
+            return element!
+        })
+        const trigger = document.createElement('button')
+        trigger.setAttribute('risu-trigger', 'manual-test')
+        body.append(trigger)
+        trigger.click()
+
+        await vi.waitFor(() => {
+            expect(harness.withCompleteSelectedConversation).toHaveBeenCalledWith(
+                'manual-chat-trigger',
+                expect.any(Function),
+            )
+            expect(actionMocks.runTrigger).toHaveBeenCalledWith(
+                harness.completeCharacter,
+                'manual',
+                expect.objectContaining({ chat: harness.completeConversation }),
+            )
+            expect(requireCurrent).toHaveBeenCalledTimes(2)
+        })
     })
 
     test('renders each frozen group turn with the same names as the normal Chat presentation', async () => {

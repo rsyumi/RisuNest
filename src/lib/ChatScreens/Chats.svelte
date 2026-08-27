@@ -39,6 +39,7 @@
         LiveChatParserProjection,
         LiveChatParserProjectionResolver,
     } from 'src/ts/selectedConversationLiveParserProjection'
+    import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
 
     let {
         messages,
@@ -54,6 +55,7 @@
         userIconPortrait,
         viewportSource = null,
         parserProjectionResolver,
+        selectedConversationOperations,
         hasNewUnreadMessage = $bindable(false),
     }: {
         messages?: Message[]
@@ -69,6 +71,7 @@
         userIconPortrait?: boolean
         viewportSource?: ConversationViewportSource | null
         parserProjectionResolver?: LiveChatParserProjectionResolver
+        selectedConversationOperations?: SelectedConversationOperations
         hasNewUnreadMessage?: boolean
     } = $props()
 
@@ -772,6 +775,8 @@
                         captureViewportTarget: viewportRow && source
                             ? () => source.captureMessageTarget(viewportRow.key)
                             : undefined,
+                        viewportSourceToken: viewportRow ? sourceSnapshot?.sourceToken : undefined,
+                        selectedConversationOperations,
                         bookmarked,
                         isLastMemory: false,
                         idx: index,

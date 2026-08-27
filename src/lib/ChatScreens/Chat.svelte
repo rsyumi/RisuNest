@@ -17,7 +17,7 @@
     import { language } from "../../lang"
     import { alertClear, alertConfirm, alertInput, alertNormal, alertRequestData, alertWait } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
-    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type Message, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
+    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type character as CharacterRecord, type Message, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
     import { selectedCharID } from "../../ts/stores.svelte"
     import { HideIconStore, ReloadGUIPointer, selIdState } from "../../ts/stores.svelte"
     import AutoresizeArea from "../UI/GUI/TextAreaResizable.svelte"
@@ -42,7 +42,12 @@
     import { safeStructuredClone } from 'src/ts/polyfill'
     import type { ConversationViewportRow } from 'src/ts/conversationViewportSource'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
-    import type { character as CharacterRecord, groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
+    import type { groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
+    import type {
+        SelectedConversationMessageEditIntent,
+        SelectedConversationOperations,
+    } from 'src/ts/selectedConversationOperations'
+    import { SelectedConversationPromotionStaleError } from 'src/ts/storage/activeWorkingSet.svelte'
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -53,6 +58,12 @@
     let bodyRoot:HTMLElement|null = $state(null)
     let editTarget: CapturedChatMessageTarget | null = null
     let partialEditTarget: CapturedChatMessageTarget | null = null
+    let editIntent: SelectedConversationMessageEditIntent | null = null
+    let partialEditIntent: SelectedConversationMessageEditIntent | null = null
+    interface AcquiredChatMessageTarget {
+        readonly target: CapturedChatMessageTarget
+        release(): void
+    }
     interface Props {
         message?: string;
         name?: string;
@@ -82,7 +93,9 @@
         captureMessage?: DeepReadonly<Message>;
         captureParserIndex?: number;
         viewportRow?: ConversationViewportRow;
+        viewportSourceToken?: string;
         captureViewportTarget?: () => CapturedChatMessageTarget | null;
+        selectedConversationOperations?: SelectedConversationOperations;
         bookmarked?: boolean;
         parserProjection?: BoundedLiveChatParserProjection;
     }
@@ -116,7 +129,9 @@
         captureMessage,
         captureParserIndex = idx,
         viewportRow,
+        viewportSourceToken,
         captureViewportTarget,
+        selectedConversationOperations,
         bookmarked,
         parserProjection,
     }: Props = $props();
@@ -235,52 +250,134 @@
         })
     }
 
-    function beginEdit() {
-        editTarget = captureCurrentMessage()
-        editDraft = message
-        editMode = editTarget !== null
+    async function acquireCurrentMessage(
+        reason: string,
+    ): Promise<AcquiredChatMessageTarget | null> {
+        if (viewportRow && selectedConversationOperations) {
+            try {
+                return await selectedConversationOperations.acquireCompleteMessageTarget(
+                    viewportRow.absoluteIndex,
+                    reason,
+                )
+            } catch (error) {
+                if (error instanceof SelectedConversationPromotionStaleError) return null
+                throw error
+            }
+        }
+        const target = captureCurrentMessage()
+        return target ? { target, release() {} } : null
     }
 
-    async function rm(e:MouseEvent, rec?:boolean){
-        await removeChatMessage({
-            absoluteIndex: idx,
-            captureTarget: captureViewportTarget,
-            shiftKey: e.shiftKey,
-            recursive: rec ?? false,
-            askRemoval: DBState.db.askRemoval ?? false,
-            instantRemove: DBState.db.instantRemove ?? false,
-            captureCurrent: captureCurrentChat,
-            getCurrentSession: currentConversationSession,
-            confirmRemoval: () => alertConfirm(language.removeChat),
-            confirmInstantRemoval: () => alertConfirm(language.instantRemoveConfirm),
+    function captureViewportEditIntent(): SelectedConversationMessageEditIntent | null {
+        if (!viewportRow || !viewportSourceToken || !selectedConversationOperations) return null
+        return selectedConversationOperations.captureMessageEditIntent({
+            absoluteIndex: viewportRow.absoluteIndex,
+            sourceToken: viewportSourceToken,
+            sourceVersion: viewportRow.sourceVersion,
+            rowKey: viewportRow.key,
+            message: viewportRow.message,
         })
     }
 
-    function edit(){
-        const target = editTarget ?? captureCurrentMessage()
-        editTarget = null
-        if (!target) return false
-        const result = saveCapturedChatMessage(target, chatMessageContext, editDraft)
-        if (result.saved) {
-            message = result.displayData
-            displaya(result.displayData)
+    async function acquireEditMessage(
+        intent: SelectedConversationMessageEditIntent | null,
+        target: CapturedChatMessageTarget | null,
+        reason: string,
+    ): Promise<AcquiredChatMessageTarget | null> {
+        if (intent && selectedConversationOperations) {
+            try {
+                return await selectedConversationOperations.acquireCompleteMessageTargetForIntent(
+                    intent,
+                    reason,
+                )
+            } catch (error) {
+                if (error instanceof SelectedConversationPromotionStaleError) return null
+                throw error
+            }
         }
-        return result.saved
+        return target ? { target, release() {} } : null
     }
 
-    function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
-        if (idx >= 0) {
-            const target = partialEditTarget
-            partialEditTarget = null
-            if (!target) return
-            const result = saveCapturedChatMessage(
-                target,
-                chatMessageContext,
-                e.detail.newData,
-            )
+    function beginEdit() {
+        editIntent = captureViewportEditIntent()
+        editTarget = editIntent ? null : captureCurrentMessage()
+        editDraft = message
+        editMode = editIntent !== null || editTarget !== null
+    }
+
+    function beginPartialEdit() {
+        partialEditIntent = captureViewportEditIntent()
+        partialEditTarget = partialEditIntent ? null : captureCurrentMessage()
+    }
+
+    async function rm(e:MouseEvent, rec?:boolean){
+        const acquired = await acquireCurrentMessage('remove-message')
+        if (!acquired) return
+        try {
+            await removeChatMessage({
+                absoluteIndex: idx,
+                captureTarget: () => acquired.target,
+                shiftKey: e.shiftKey,
+                recursive: rec ?? false,
+                askRemoval: DBState.db.askRemoval ?? false,
+                instantRemove: DBState.db.instantRemove ?? false,
+                captureCurrent: captureCurrentChat,
+                getCurrentSession: currentConversationSession,
+                confirmRemoval: () => alertConfirm(language.removeChat),
+                confirmInstantRemoval: () => alertConfirm(language.instantRemoveConfirm),
+            })
+        } finally {
+            acquired.release()
+        }
+    }
+
+    async function edit(){
+        const retainedIntent = editIntent
+        const retainedTarget = editTarget
+        editIntent = null
+        editTarget = null
+        const acquired = await acquireEditMessage(
+            retainedIntent,
+            retainedTarget,
+            'edit-message',
+        )
+        if (!acquired) return false
+        try {
+            const result = saveCapturedChatMessage(acquired.target, chatMessageContext, editDraft)
             if (result.saved) {
                 message = result.displayData
                 displaya(result.displayData)
+            }
+            return result.saved
+        } finally {
+            acquired.release()
+        }
+    }
+
+    async function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
+        if (idx >= 0) {
+            const retainedIntent = partialEditIntent
+            const retainedTarget = partialEditTarget
+            partialEditIntent = null
+            partialEditTarget = null
+            const acquired = await acquireEditMessage(
+                retainedIntent,
+                retainedTarget,
+                'partial-edit-message',
+            )
+            if (!acquired) return
+            try {
+                const result = saveCapturedChatMessage(
+                    acquired.target,
+                    chatMessageContext,
+                    e.detail.newData,
+                )
+                if (result.saved) {
+                    message = result.displayData
+                    displaya(result.displayData)
+                }
+            } finally {
+                acquired.release()
             }
         }
     }
@@ -408,11 +505,6 @@
     }
 
     async function handleButtonTriggerWithin(event: UIEvent) {
-        const currentChar = getCurrentCharacter()
-        if(!currentChar || currentChar.type === 'group'){
-            return
-        }
-
         const target = event.target as HTMLElement
         const origin = target.closest('[risu-trigger], [risu-btn]')
         if (!origin) {
@@ -423,23 +515,51 @@
         const triggerId = origin.getAttribute('risu-id')
         const btnEvent = origin.getAttribute('risu-btn')
 
-        const triggerResult =
-            triggerName ?
-                await runTrigger(currentChar, 'manual', {
-                    chat: getCurrentChat(),
-                    manualName: triggerName,
-                    triggerId: triggerId || undefined,
-                }) :
-            btnEvent ?
-                await runLuaButtonTrigger(currentChar, btnEvent) :
-            null
-
-        if(triggerResult) {
-            setCurrentChat(triggerResult.chat)
-            ReloadChatPointer.update((v) => {
-                v[idx] = (v[idx] ?? 0) + 1
-                return v
+        const runManualTrigger = async (
+            currentChar: CharacterRecord,
+            currentChat: ReturnType<typeof getCurrentChat>,
+        ) => triggerName
+            ? runTrigger(currentChar, 'manual', {
+                chat: currentChat,
+                manualName: triggerName,
+                triggerId: triggerId || undefined,
             })
+            : btnEvent
+                ? runLuaButtonTrigger(currentChar, btnEvent)
+                : null
+        if (selectedConversationOperations) {
+            try {
+                await selectedConversationOperations.withCompleteSelectedConversation(
+                    'manual-chat-trigger',
+                    async (context) => {
+                        const authority = context.requireCurrent()
+                        if (authority.character.type === 'group') return
+                        const triggerResult = await runManualTrigger(
+                            authority.character,
+                            authority.conversation,
+                        )
+                        context.requireCurrent()
+                        if (triggerResult) setCurrentChat(triggerResult.chat)
+                        if (triggerResult) ReloadChatPointer.update((v) => {
+                            v[idx] = (v[idx] ?? 0) + 1
+                            return v
+                        })
+                    },
+                )
+            } catch (error) {
+                if (!(error instanceof SelectedConversationPromotionStaleError)) throw error
+            }
+        } else {
+            const currentChar = getCurrentCharacter()
+            if(!currentChar || currentChar.type === 'group') return
+            const triggerResult = await runManualTrigger(currentChar, getCurrentChat())
+            if(triggerResult) {
+                setCurrentChat(triggerResult.chat)
+                ReloadChatPointer.update((v) => {
+                    v[idx] = (v[idx] ?? 0) + 1
+                    return v
+                })
+            }
         }
         
         if(triggerName && triggerId) {
@@ -573,6 +693,7 @@
         }} />
     {:else if editMode}
         <AutoresizeArea bind:value={editDraft} handleLongPress={() => {
+            editIntent = null
             editTarget = null
             editMode = false
         }} />
@@ -648,7 +769,7 @@
                     {bodyRoot}
                     blockEditEnabled={DBState.db.enableBlockPartialEdit}
                     dragEditEnabled={DBState.db.enableDragPartialEdit}
-                    on:start={() => partialEditTarget = captureCurrentMessage()}
+                    on:start={beginPartialEdit}
                     on:save={handlePartialEditSave}
                 />
             {/if}
@@ -989,13 +1110,12 @@
         </button>
     {/if}
     {#if idx > -1 && !isOptimizedStreamingMessage}
-        <button class={"flex items-center hover:text-blue-500 transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={() => {
+        <button class={"flex items-center hover:text-blue-500 transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={async () => {
             if(!editMode){
                 beginEdit()
             }
             else{
-                edit()
-                editMode = false
+                if (await edit()) editMode = false
             }
         }}>
             <PencilIcon size={20}/>
@@ -1031,10 +1151,14 @@
     
     {#if DBState.db.enableBookmark}
         <button class="flex items-center hover:text-blue-500 transition-colors button-icon-bookmark {isBookmarked ? 'text-yellow-400' : ''}" onclick={async () => {
-            const target = captureCurrentMessage()
-            if (!target) return
-            await sleep(1)
-            await toggleBookmark(target)
+            const acquired = await acquireCurrentMessage('toggle-bookmark')
+            if (!acquired) return
+            try {
+                await sleep(1)
+                await toggleBookmark(acquired.target)
+            } finally {
+                acquired.release()
+            }
         }}>
             <BookmarkIcon size={20}/>
             {#if showNames}
@@ -1043,19 +1167,23 @@
         </button>
     {/if}
 
-    <button class="flex items-center hover:text-blue-500 transition-colors" onclick={async () => {
-        const target = captureCurrentMessage()
-        if (!target) return
-        await sleep(1)
-        await createCapturedConversationBranch({
-            target,
-            context: chatMessageContext,
-            runtime: getPersistentDataRuntime(),
-            createFolderOnBranch: DBState.db.createFolderOnBranch === true,
-            createId: uuidv4,
-            createBranchName: (sourceName) => createChatCopyName(sourceName, 'Branch'),
-            navigateToBranch: changeChatTo,
-        })
+    <button class="flex items-center hover:text-blue-500 transition-colors button-icon-branch" onclick={async () => {
+        const acquired = await acquireCurrentMessage('create-message-branch')
+        if (!acquired) return
+        try {
+            await sleep(1)
+            await createCapturedConversationBranch({
+                target: acquired.target,
+                context: chatMessageContext,
+                runtime: getPersistentDataRuntime(),
+                createFolderOnBranch: DBState.db.createFolderOnBranch === true,
+                createId: uuidv4,
+                createBranchName: (sourceName) => createChatCopyName(sourceName, 'Branch'),
+                navigateToBranch: changeChatTo,
+            })
+        } finally {
+            acquired.release()
+        }
     }}>
         <SplitIcon size={20}/>
         {#if showNames}
@@ -1063,11 +1191,15 @@
         {/if}
     </button>
 
-    <button class="flex items-center hover:text-blue-500 transition-colors" onclick={async () => {
-        const target = captureCurrentMessage()
-        if (!target) return
-        await sleep(1)
-        toggleCapturedMessageDisabled(target, chatMessageContext, 'message')
+    <button class="flex items-center hover:text-blue-500 transition-colors button-icon-disable" onclick={async () => {
+        const acquired = await acquireCurrentMessage('toggle-message-disabled')
+        if (!acquired) return
+        try {
+            await sleep(1)
+            toggleCapturedMessageDisabled(acquired.target, chatMessageContext, 'message')
+        } finally {
+            acquired.release()
+        }
     }}>
         <PowerOff size={20}/>
         {#if showNames}
@@ -1075,11 +1207,15 @@
         {/if}
     </button>
 
-    <button class="flex items-center hover:text-blue-500 transition-colors" onclick={async () => {
-        const target = captureCurrentMessage()
-        if (!target) return
-        await sleep(1)
-        toggleCapturedMessageDisabled(target, chatMessageContext, 'allBefore')
+    <button class="flex items-center hover:text-blue-500 transition-colors button-icon-disable-above" onclick={async () => {
+        const acquired = await acquireCurrentMessage('toggle-messages-above-disabled')
+        if (!acquired) return
+        try {
+            await sleep(1)
+            toggleCapturedMessageDisabled(acquired.target, chatMessageContext, 'allBefore')
+        } finally {
+            acquired.release()
+        }
     }}>
         <Scissors size={20}/>
         {#if showNames}
@@ -1335,13 +1471,18 @@
                     )}
                         <span class="chat-width text-xl border-darkborderc flex items-center text-textcolor">
                             <span>{presentedRole === 'char' ? 'Assistant' : 'User'}</span>
-                            <button class="ml-2 text-textcolor2 hover:text-textcolor" onclick={() => {
-                                const target = captureCurrentMessage()
-                                if (!target || !toggleCapturedMessageRole(target, chatMessageContext)) return
-                                ReloadChatPointer.update((v) => {
-                                    v[idx] = (v[idx] ?? 0) + 1
-                                    return v
-                                })
+                            <button class="ml-2 text-textcolor2 hover:text-textcolor button-icon-toggle-role" onclick={async () => {
+                                const acquired = await acquireCurrentMessage('toggle-message-role')
+                                if (!acquired) return
+                                try {
+                                    if (!toggleCapturedMessageRole(acquired.target, chatMessageContext)) return
+                                    ReloadChatPointer.update((v) => {
+                                        v[idx] = (v[idx] ?? 0) + 1
+                                        return v
+                                    })
+                                } finally {
+                                    acquired.release()
+                                }
                             }}><ArrowLeftRightIcon size="18" /></button>
                         </span>
                     {:else if !blankMessage && !hideCaptureIcon}

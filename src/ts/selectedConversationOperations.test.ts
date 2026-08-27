@@ -11,6 +11,11 @@ import {
     createSelectedConversationOperations,
     type SelectedConversationOperationsDependencies,
 } from './selectedConversationOperations'
+import type {
+    ConversationViewportKey,
+    ConversationViewportSnapshot,
+    ConversationViewportSource,
+} from './conversationViewportSource'
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -93,6 +98,23 @@ function makeHarness(options: {
         : options.selection
     let session: ActiveConversationSession | null = current.session
     const defaultLease = makeLease(current, selection ?? undefined)
+    let viewportRow = {
+        key: 'persistent-source|3|1' as ConversationViewportKey,
+        absoluteIndex: 1,
+        message: { role: 'char', data: 'one' } as Message,
+        sourceVersion: 3,
+    }
+    let viewportSnapshot: ConversationViewportSnapshot = {
+        sourceToken: 'persistent-source',
+        version: 3,
+        totalMessages: 3,
+        keyAt: (absoluteIndex: number) => absoluteIndex === 1 ? viewportRow.key : undefined,
+        indexOfKey: (key: ConversationViewportKey) => key === viewportRow.key ? 1 : -1,
+        rowAt: (absoluteIndex: number) => absoluteIndex === 1 ? viewportRow : undefined,
+    }
+    const viewportSource = {
+        snapshot: () => viewportSnapshot,
+    } as unknown as ConversationViewportSource
     const acquireCompleteConversation = vi.fn(async (
         reason: string,
         target: SelectedConversationTarget,
@@ -105,6 +127,7 @@ function makeHarness(options: {
             conversation: current.conversation,
         }),
         getCurrentSession: () => session,
+        getCurrentViewportSource: () => viewportSource,
     }
     return {
         operations: createSelectedConversationOperations(dependencies),
@@ -123,6 +146,12 @@ function makeHarness(options: {
         },
         setSession(next: ActiveConversationSession | null) {
             session = next
+        },
+        setViewportRow(next: typeof viewportRow) {
+            viewportRow = next
+        },
+        setViewportSnapshot(next: typeof viewportSnapshot) {
+            viewportSnapshot = next
         },
     }
 }
@@ -164,6 +193,7 @@ describe('selected conversation complete-operation gateway', () => {
                 return { character: current.character, conversation: current.conversation }
             },
             getCurrentSession: () => session,
+            getCurrentViewportSource: () => null,
             acquireCompleteConversation: async () => {
                 promoted = true
                 current = complete
@@ -325,6 +355,149 @@ describe('selected conversation complete-operation gateway', () => {
         acquired?.release()
         acquired?.release()
         expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it('promotes an edit intent against its original selected conversation target', async () => {
+        const original = makeSelection('character-a', 'conversation-a', 1, 7)
+        const harness = makeHarness({ selection: original })
+        const intent = harness.operations.captureMessageEditIntent({
+            absoluteIndex: 1,
+            sourceToken: 'persistent-source',
+            sourceVersion: 3,
+            rowKey: 'persistent-source|3|1' as ConversationViewportKey,
+            message: { role: 'char', data: 'one' },
+        })
+        expect(intent).not.toBeNull()
+
+        harness.setSelection(makeSelection('character-a', 'conversation-a', 1, 7))
+        const acquired = await harness.operations.acquireCompleteMessageTargetForIntent(
+            intent!,
+            'save-windowed-edit',
+        )
+
+        expect(harness.acquireCompleteConversation).toHaveBeenCalledWith(
+            'save-windowed-edit',
+            original,
+        )
+        expect(acquired?.target.message.data).toBe('one')
+        expect(harness.defaultLease.release).not.toHaveBeenCalled()
+        acquired?.release()
+        expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it('rejects an edit intent when the promoted message no longer matches its evidence', async () => {
+        const harness = makeHarness()
+        harness.setViewportRow({
+            key: 'persistent-source|3|1' as ConversationViewportKey,
+            absoluteIndex: 1,
+            message: { role: 'char', data: 'expected' },
+            sourceVersion: 3,
+        })
+        const intent = harness.operations.captureMessageEditIntent({
+            absoluteIndex: 1,
+            sourceToken: 'persistent-source',
+            sourceVersion: 3,
+            rowKey: 'persistent-source|3|1' as ConversationViewportKey,
+            message: { role: 'char', data: 'expected' },
+        })
+
+        await expect(harness.operations.acquireCompleteMessageTargetForIntent(
+            intent!,
+            'stale-windowed-edit',
+        )).resolves.toBeNull()
+        expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it('does not retarget an edit intent after the selected conversation changes', async () => {
+        const original = makeSelection('character-a', 'conversation-a', 1, 7)
+        const harness = makeHarness({ selection: original })
+        const intent = harness.operations.captureMessageEditIntent({
+            absoluteIndex: 1,
+            sourceToken: 'persistent-source',
+            sourceVersion: 3,
+            rowKey: 'persistent-source|3|1' as ConversationViewportKey,
+            message: { role: 'char', data: 'one' },
+        })
+        harness.setSelection(makeSelection('character-b', 'conversation-b', 2, 8))
+
+        await expect(harness.operations.acquireCompleteMessageTargetForIntent(
+            intent!,
+            'stale-windowed-edit',
+        )).rejects.toBeInstanceOf(SelectedConversationPromotionStaleError)
+        expect(harness.acquireCompleteConversation).toHaveBeenCalledWith(
+            'stale-windowed-edit',
+            original,
+        )
+    })
+
+    it('captures immutable edit evidence and compares it structurally after promotion', async () => {
+        const originalMessage: Message = {
+            data: 'one',
+            role: 'char',
+        }
+        const current = makeCurrent('character-a', 'conversation-a', [
+            { role: 'user', data: 'zero' },
+            { role: 'char', data: 'one' },
+        ])
+        const harness = makeHarness({ current })
+        harness.setViewportRow({
+            key: 'persistent-source|3|1' as ConversationViewportKey,
+            absoluteIndex: 1,
+            message: originalMessage,
+            sourceVersion: 3,
+        })
+        const intent = harness.operations.captureMessageEditIntent({
+            absoluteIndex: 1,
+            sourceToken: 'persistent-source',
+            sourceVersion: 3,
+            rowKey: 'persistent-source|3|1' as ConversationViewportKey,
+            message: originalMessage,
+        })
+        expect(intent).not.toBeNull()
+        originalMessage.data = 'mutated after capture'
+
+        const acquired = await harness.operations.acquireCompleteMessageTargetForIntent(
+            intent!,
+            'structural-evidence',
+        )
+
+        expect(acquired).not.toBeNull()
+        acquired?.release()
+    })
+
+    it.each([
+        ['source token', { sourceToken: 'other-source' }],
+        ['source version', { sourceVersion: 4 }],
+        ['row key', { key: 'other-key' as ConversationViewportKey }],
+        ['absolute index', { absoluteIndex: 2 }],
+        ['message evidence', { message: { role: 'char', data: 'other' } as Message }],
+    ] as const)('rejects edit intent capture when the current viewport %s differs', (_label, change) => {
+        const harness = makeHarness()
+        const baselineRow = {
+            key: 'persistent-source|3|1' as ConversationViewportKey,
+            absoluteIndex: 1,
+            message: { role: 'char', data: 'one' } as Message,
+            sourceVersion: 3,
+        }
+        const row = { ...baselineRow, ...change }
+        harness.setViewportRow(row)
+        harness.setViewportSnapshot({
+            sourceToken: 'sourceToken' in change ? change.sourceToken : 'persistent-source',
+            version: 3,
+            totalMessages: 3,
+            keyAt: (absoluteIndex) => absoluteIndex === row.absoluteIndex ? row.key : undefined,
+            indexOfKey: (key) => key === row.key ? row.absoluteIndex : -1,
+            rowAt: (absoluteIndex) => absoluteIndex === row.absoluteIndex ? row : undefined,
+        })
+
+        expect(harness.operations.captureMessageEditIntent({
+            absoluteIndex: 1,
+            sourceToken: 'persistent-source',
+            sourceVersion: 3,
+            rowKey: 'persistent-source|3|1' as ConversationViewportKey,
+            message: { role: 'char', data: 'one' },
+        })).toBeNull()
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
     })
 
     it('invokes the operation before a queued post-acquire navigation invalidates authority', async () => {

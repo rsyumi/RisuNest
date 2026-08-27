@@ -3,6 +3,13 @@ import type {
     CurrentChatMessageTarget,
 } from './chatMessageUi'
 import type { ActiveConversationSession } from './storage/activeConversationSession'
+import type { Message } from './storage/database.svelte'
+import type {
+    ConversationViewportKey,
+    ConversationViewportSource,
+} from './conversationViewportSource'
+import { safeStructuredClone } from './polyfill'
+import isEqual from 'lodash/isEqual'
 import {
     SelectedConversationPromotionStaleError,
     type CompleteConversationLease,
@@ -22,6 +29,7 @@ export interface SelectedConversationOperationsDependencies {
     ): Promise<CompleteConversationLease>
     captureCurrent(): CurrentChatMessageTarget | null
     getCurrentSession(): ActiveConversationSession | null
+    getCurrentViewportSource(): ConversationViewportSource | null
 }
 
 export interface CompleteSelectedConversationAuthority extends CurrentChatMessageTarget {
@@ -39,6 +47,23 @@ export interface AcquiredCompleteMessageTarget {
     release(): void
 }
 
+export interface SelectedConversationMessageEditIntent {
+    readonly selection: SelectedConversationTarget
+    readonly absoluteIndex: number
+    readonly sourceToken: string
+    readonly sourceVersion: number
+    readonly rowKey: ConversationViewportKey
+    readonly messageEvidence: Readonly<Message>
+}
+
+export interface CaptureSelectedConversationMessageEditIntentInput {
+    readonly absoluteIndex: number
+    readonly sourceToken: string
+    readonly sourceVersion: number
+    readonly rowKey: ConversationViewportKey
+    readonly message: Readonly<Message>
+}
+
 export interface SelectedConversationOperations {
     withCompleteSelectedConversation<T>(
         reason: string,
@@ -46,6 +71,13 @@ export interface SelectedConversationOperations {
     ): Promise<T | null>
     acquireCompleteMessageTarget(
         absoluteIndex: number,
+        reason: string,
+    ): Promise<AcquiredCompleteMessageTarget | null>
+    captureMessageEditIntent(
+        input: CaptureSelectedConversationMessageEditIntentInput,
+    ): SelectedConversationMessageEditIntent | null
+    acquireCompleteMessageTargetForIntent(
+        intent: SelectedConversationMessageEditIntent,
         reason: string,
     ): Promise<AcquiredCompleteMessageTarget | null>
 }
@@ -64,8 +96,8 @@ export function createSelectedConversationOperations(
             context: CompleteSelectedConversationContext,
             authority: CompleteSelectedConversationAuthority,
         ) => T,
+        captured = dependencies.captureSelectedConversationTarget(),
     ): Promise<StartedCompleteConversation<T> | null> => {
-        const captured = dependencies.captureSelectedConversationTarget()
         if (!captured) return null
 
         const lease = await dependencies.acquireCompleteConversation(reason, captured)
@@ -105,6 +137,76 @@ export function createSelectedConversationOperations(
             absoluteIndex,
             reason,
         ): Promise<AcquiredCompleteMessageTarget | null> {
+            const selection = dependencies.captureSelectedConversationTarget()
+            if (!selection) return null
+            return acquireCompleteMessageTarget(selection, absoluteIndex, reason)
+        },
+
+        captureMessageEditIntent(input): SelectedConversationMessageEditIntent | null {
+            const selection = dependencies.captureSelectedConversationTarget()
+            const snapshot = dependencies.getCurrentViewportSource()?.snapshot()
+            const row = snapshot?.rowAt(input.absoluteIndex)
+            if (
+                !selection ||
+                !Number.isSafeInteger(input.absoluteIndex) ||
+                input.absoluteIndex < 0 ||
+                typeof input.sourceToken !== 'string' ||
+                input.sourceToken.length === 0 ||
+                !Number.isSafeInteger(input.sourceVersion) ||
+                input.sourceVersion < 0 ||
+                typeof input.rowKey !== 'string' ||
+                input.rowKey.length === 0 ||
+                !snapshot ||
+                snapshot.sourceToken !== input.sourceToken ||
+                snapshot.version !== input.sourceVersion ||
+                row?.absoluteIndex !== input.absoluteIndex ||
+                row.key !== input.rowKey ||
+                row.sourceVersion !== input.sourceVersion ||
+                !isEqual(row.message, input.message)
+            ) return null
+            let messageEvidence: Readonly<Message>
+            try {
+                messageEvidence = Object.freeze(safeStructuredClone(input.message))
+            } catch {
+                return null
+            }
+            return Object.freeze({
+                selection,
+                absoluteIndex: input.absoluteIndex,
+                sourceToken: input.sourceToken,
+                sourceVersion: input.sourceVersion,
+                rowKey: input.rowKey,
+                messageEvidence,
+            })
+        },
+
+        async acquireCompleteMessageTargetForIntent(
+            intent,
+            reason,
+        ): Promise<AcquiredCompleteMessageTarget | null> {
+            const acquired = await acquireCompleteMessageTarget(
+                intent.selection,
+                intent.absoluteIndex,
+                reason,
+            )
+            if (!acquired) return null
+            let matchesEvidence = false
+            try {
+                matchesEvidence = isEqual(acquired.target.message, intent.messageEvidence)
+            } catch {
+                matchesEvidence = false
+            }
+            if (matchesEvidence) return acquired
+            acquired.release()
+            return null
+        },
+    }
+
+    async function acquireCompleteMessageTarget(
+        selection: SelectedConversationTarget,
+        absoluteIndex: number,
+        reason: string,
+    ): Promise<AcquiredCompleteMessageTarget | null> {
             if (!Number.isSafeInteger(absoluteIndex) || absoluteIndex < 0) return null
             const started = await startCompleteConversation(
                 reason,
@@ -125,6 +227,7 @@ export function createSelectedConversationOperations(
                         throw new SelectedConversationPromotionStaleError()
                     }
                 },
+                selection,
             )
             if (!started) return null
             const release = idempotentRelease(started.lease)
@@ -136,7 +239,6 @@ export function createSelectedConversationOperations(
                 target: started.value,
                 release,
             }
-        },
     }
 }
 

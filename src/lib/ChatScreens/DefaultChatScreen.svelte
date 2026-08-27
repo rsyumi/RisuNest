@@ -28,10 +28,10 @@
     import Button from '../UI/GUI/Button.svelte';
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
     import { getActiveConversationSession, getPersistentDataRuntime } from '../../ts/storage/persistentDataRuntime.svelte';
+    import type { ActiveConversationSession } from '../../ts/storage/activeConversationSession';
     import {
         appendConversationMessage,
         captureConversationMutationTarget,
-        isConversationMutationOwnerCurrent,
         isConversationMutationTargetCurrent,
         refreshConversationMutationTarget,
         type ConversationMutationTarget,
@@ -83,6 +83,21 @@
         createSelectedConversationLiveParserProjectionResolver,
     } from '../../ts/selectedConversationLiveParserProjection';
     import type { CurrentChatMessageTarget } from '../../ts/chatMessageUi';
+    import {
+        createSelectedConversationOperations,
+        type CompleteSelectedConversationContext,
+    } from '../../ts/selectedConversationOperations';
+    import { SelectedConversationPromotionStaleError } from '../../ts/storage/activeWorkingSet.svelte';
+
+    interface ConversationOperationAuthority {
+        character: Database['characters'][number]
+        conversation: ChatRecord
+        session: ActiveConversationSession | null
+    }
+
+    interface ConversationOperationContext {
+        requireCurrent(): ConversationOperationAuthority
+    }
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -105,6 +120,20 @@
     let isScrollingToMessage = $state(false)
     let { openModuleList = $bindable(false), openChatList = $bindable(false), customStyle = '' }: Props = $props();
     const persistentRuntime = getPersistentDataRuntime()
+    const selectedConversationOperations = createSelectedConversationOperations({
+        captureSelectedConversationTarget: () =>
+            persistentRuntime.captureSelectedConversationTarget(),
+        acquireCompleteConversation: (reason, target) =>
+            persistentRuntime.acquireCompleteConversation(reason, target),
+        captureCurrent: () => {
+            const character = DBState.db.characters[$selectedCharID]
+            const conversation = character?.chats[character.chatPage]
+            return character && conversation ? { character, conversation } : null
+        },
+        getCurrentSession: () => persistentRuntime.getActiveConversationSession(),
+        getCurrentViewportSource: () =>
+            persistentRuntime.getActiveConversationViewportSource(),
+    })
     let viewportBindingRevision = $state(0)
     const selectedConversationViewport = new SelectedConversationViewportBinding(
         persistentRuntime,
@@ -145,30 +174,57 @@
     )
     const scrollRequestGuard = new LatestChatScrollRequestGuard()
 
-    function captureCurrentConversationTarget(): ConversationMutationTarget | null {
-        const character = DBState.db.characters[$selectedCharID]
-        const conversation = character?.chats[character.chatPage]
-        if (!character || !conversation) return null
+    function requireConversationMutationTarget(
+        context: ConversationOperationContext,
+    ): ConversationMutationTarget {
+        const authority = context.requireCurrent()
         return captureConversationMutationTarget(
-            character,
-            conversation,
-            getActiveConversationSession(),
+            authority.character,
+            authority.conversation,
+            authority.session,
         )
+    }
+
+    async function runSelectedConversationOperation<T>(
+        reason: string,
+        operation: (context: ConversationOperationContext) => T | Promise<T>,
+    ): Promise<T | null> {
+        try {
+            if (persistentRuntime.captureSelectedConversationTarget()) {
+                return await selectedConversationOperations.withCompleteSelectedConversation(
+                    reason,
+                    operation as (context: CompleteSelectedConversationContext) => T | Promise<T>,
+                )
+            }
+            const character = DBState.db.characters[$selectedCharID]
+            const conversation = character?.chats[character.chatPage]
+            if (!character || !conversation || isMetadataOnlySelectedConversation(conversation)) {
+                return null
+            }
+            const session = persistentRuntime.getActiveConversationSession()
+            const context: ConversationOperationContext = {
+                requireCurrent() {
+                    const currentCharacter = DBState.db.characters[$selectedCharID]
+                    const currentConversation = currentCharacter?.chats[currentCharacter.chatPage]
+                    if (
+                        currentCharacter !== character ||
+                        currentConversation !== conversation ||
+                        persistentRuntime.getActiveConversationSession() !== session
+                    ) throw new SelectedConversationPromotionStaleError()
+                    return { character, conversation, session }
+                },
+            }
+            context.requireCurrent()
+            return await operation(context)
+        } catch (error) {
+            if (error instanceof SelectedConversationPromotionStaleError) return null
+            throw error
+        }
     }
 
     function conversationTargetIsCurrent(target: ConversationMutationTarget): boolean {
         const character = DBState.db.characters[$selectedCharID]
         return isConversationMutationTargetCurrent(
-            target,
-            character,
-            character?.chats[character.chatPage],
-            getActiveConversationSession(),
-        )
-    }
-
-    function conversationOwnerIsCurrent(target: ConversationMutationTarget): boolean {
-        const character = DBState.db.characters[$selectedCharID]
-        return isConversationMutationOwnerCurrent(
             target,
             character,
             character?.chats[character.chatPage],
@@ -282,18 +338,29 @@
         if($doingChat){
             return
         }
-        let mutationTarget = captureCurrentConversationTarget()
-        if (!mutationTarget) return
+        return runSelectedConversationOperation(
+            continueResponse ? 'continue-response' : 'send-message',
+            (context) => sendMainComplete(context, continueResponse),
+        )
+    }
+
+    async function sendMainComplete(
+        context: ConversationOperationContext,
+        continueResponse: boolean,
+    ) {
+        let mutationTarget = requireConversationMutationTarget(context)
         const character = mutationTarget.character
         let messages = mutationTarget.conversation.message
 
         if(messageInput.startsWith('/')){
             const commandProcessed = await processMultiCommand(messageInput)
+            context.requireCurrent()
             if(commandProcessed !== false){
                 messageInput = ''
                 return
             }
-            if (!conversationTargetIsCurrent(mutationTarget)) return
+            mutationTarget = requireConversationMutationTarget(context)
+            messages = mutationTarget.conversation.message
         }
 
         if(fileInput.length > 0){
@@ -326,7 +393,10 @@
                         { chat: mutationTarget.conversation },
                     ),
                     processInput: () => processScript(character, messageInput, 'editinput'),
-                    isTargetCurrent: () => conversationTargetIsCurrent(mutationTarget),
+                    isTargetCurrent: () => {
+                        context.requireCurrent()
+                        return conversationTargetIsCurrent(mutationTarget)
+                    },
                     createMessage: (data) => ({
                         role: 'user',
                         data,
@@ -334,7 +404,9 @@
                         name: $ConnectionOpenStore ? DBState.db.username : null
                     }),
                 })
+                context.requireCurrent()
                 if (!appended) return
+                mutationTarget = requireConversationMutationTarget(context)
             }
             else{
                 appendConversationMessage(mutationTarget, {
@@ -348,13 +420,13 @@
         messageInput = ''
         messageInputTranslate = ''
         rerollHistory = null
-        const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
-        if (!refreshedTarget) return
-        mutationTarget = refreshedTarget
+        mutationTarget = requireConversationMutationTarget(context)
         await sleep(10)
-        if (!conversationTargetIsCurrent(mutationTarget)) return
+        context.requireCurrent()
+        mutationTarget = requireConversationMutationTarget(context)
         updateInputSizeAll()
-        await sendChatMain(continueResponse)
+        await sendChatMainComplete(context, continueResponse)
+        context.requireCurrent()
 
     }
 
@@ -362,8 +434,14 @@
         if($doingChat){
             return
         }
-        const mutationTarget = captureCurrentConversationTarget()
-        if (!mutationTarget) return
+        return runSelectedConversationOperation(
+            'reroll-response',
+            (context) => rerollComplete(context),
+        )
+    }
+
+    async function rerollComplete(context: ConversationOperationContext) {
+        const mutationTarget = requireConversationMutationTarget(context)
         let history = getCurrentRerollHistory(mutationTarget)
         const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
         if(genId){
@@ -401,15 +479,22 @@
         rerollHistory = refreshConversationRerollHistory(history, truncatedTarget)
         if (!rerollHistory) return
         openMenu = false
-        await sendChatMain()
+        await sendChatMainComplete(context)
+        context.requireCurrent()
     }
 
     async function unReroll() {
         if($doingChat){
             return
         }
-        const mutationTarget = captureCurrentConversationTarget()
-        if (!mutationTarget) return
+        return runSelectedConversationOperation(
+            'unreroll-response',
+            (context) => unRerollComplete(context),
+        )
+    }
+
+    function unRerollComplete(context: ConversationOperationContext) {
+        const mutationTarget = requireConversationMutationTarget(context)
         const history = getCurrentRerollHistory(mutationTarget)
         const result = handleDefaultChatUnreroll({
             target: mutationTarget,
@@ -428,8 +513,17 @@
     let abortController:null|AbortController = null
 
     async function sendChatMain(continued:boolean = false) {
-        const mutationTarget = captureCurrentConversationTarget()
-        if (!mutationTarget) return
+        return runSelectedConversationOperation(
+            continued ? 'continue-generation' : 'generate-response',
+            (context) => sendChatMainComplete(context, continued),
+        )
+    }
+
+    async function sendChatMainComplete(
+        context: ConversationOperationContext,
+        continued:boolean = false,
+    ) {
+        const mutationTarget = requireConversationMutationTarget(context)
         const previousLength = mutationTarget.conversation.message.length
         messageInput = ''
         abortController = new AbortController()
@@ -438,9 +532,8 @@
                 signal:abortController.signal,
                 continue:continued
             })
-            const refreshedTarget = conversationOwnerIsCurrent(mutationTarget)
-                ? refreshCurrentConversationTarget(mutationTarget)
-                : null
+            context.requireCurrent()
+            const refreshedTarget = requireConversationMutationTarget(context)
             if (
                 refreshedTarget &&
                 previousLength < refreshedTarget.conversation.message.length
@@ -485,6 +578,30 @@
                 autoMode = false
             }
         }
+    }
+
+    async function preLoadSelectedChat() {
+        return runSelectedConversationOperation(
+            'preload-cold-conversation',
+            async (context) => {
+                const authority = context.requireCurrent()
+                await preLoadChat($selectedCharID, authority.character.chatPage)
+                context.requireCurrent()
+            },
+        )
+    }
+
+    async function appendPlaygroundMessage() {
+        return runSelectedConversationOperation(
+            'append-playground-message',
+            (context) => {
+                const target = requireConversationMutationTarget(context)
+                appendConversationMessage(target, {
+                    role: 'char',
+                    data: '',
+                })
+            },
+        )
     }
 
     let { userIconPortrait, currentUsername, userIcon } = $derived.by(() => {
@@ -1122,21 +1239,7 @@
                         <MenuIcon />
                     </button>
                 {:else}
-                    <div onclick={(e) => {
-                        const character = DBState.db.characters[$selectedCharID]
-                        const chat = character.chats[character.chatPage]
-                        const message = {
-                            role: 'char',
-                            data: ''
-                        } as Message
-                        const target = captureConversationMutationTarget(
-                            character,
-                            chat,
-                            getActiveConversationSession(),
-                        )
-                        appendConversationMessage(target, message)
-                        if (!target.session) character.chats[character.chatPage] = chat
-                    }}
+                    <div onclick={() => appendPlaygroundMessage()}
                          class="peer-focus:border-textcolor mr-2 flex border-y border-r border-darkborderc justify-center items-center text-textcolor p-3 rounded-r-md hover:bg-blue-500 hover:text-white transition-colors"
                          style:height={inputHeight}
                     >
@@ -1224,7 +1327,7 @@
             {/if}
 
             {#if firstCurrentMessage?.data?.startsWith(coldStorageHeader)}
-                {#await preLoadChat($selectedCharID, DBState.db.characters[$selectedCharID].chatPage)}
+                {#await preLoadSelectedChat()}
                     <div class="w-full flex justify-center text-textcolor2 italic mb-12">
                         {language.loadingChatData}
                     </div>
@@ -1249,6 +1352,9 @@
                 messages={conversationViewportSource ? undefined : currentChat}
                 viewportSource={conversationViewportSource}
                 parserProjectionResolver={liveParserProjectionResolver}
+                selectedConversationOperations={conversationViewportSource
+                    ? selectedConversationOperations
+                    : undefined}
                 onReroll={reroll}
                 unReroll={unReroll}
                 onFirstMessageReroll={() => {
