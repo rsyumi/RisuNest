@@ -266,7 +266,7 @@ pub fn collect_staged_migration_roots(repository_root: &Path) -> io::Result<Vec<
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid journal file name"))?;
         validate_migration_id(migration_id)?;
         let mut file = OpenOptions::new().read(true).open(&path)?;
-        read_migration_status(&mut file, Some(migration_id), false)?;
+        let status = read_migration_status(&mut file, Some(migration_id), false)?;
         let mut roots = AssetRootSet::default();
         scan_journal_records(&mut file, false, |record| {
             if let MigrationJournalRecord::Pin {
@@ -284,6 +284,11 @@ pub fn collect_staged_migration_roots(repository_root: &Path) -> io::Result<Vec<
             }
             Ok(())
         })?;
+        if !status.ready {
+            roots
+                .blockers
+                .insert(format!("staged-migration-unready:{migration_id}"));
+        }
         root_sets.push(roots);
     }
     Ok(root_sets)
@@ -651,6 +656,12 @@ pub struct AssetGcDryRunReport {
     pub deletion_enabled: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AssetGcDryRunPage {
+    pub(crate) report: AssetGcDryRunReport,
+    pub(crate) next_cursor: Option<String>,
+}
+
 pub fn dry_run_mark_and_sweep(
     cas: &PayloadCas,
     candidates: impl IntoIterator<Item = AssetGcCandidate>,
@@ -977,7 +988,10 @@ mod tests {
             vec![collectable.content_hash.clone()]
         );
         assert_eq!(report.potential_delete_bytes, collectable.byte_size);
-        assert!(report.blockers.is_empty());
+        assert_eq!(
+            report.blockers,
+            vec!["staged-migration-unready:migration-gc-pin".to_owned()]
+        );
         assert!(!report.deletion_enabled);
         assert!(cas
             .stat_object(&collectable.content_hash)

@@ -55,6 +55,10 @@ impl Drop for StagingFile {
 }
 
 impl PayloadCas {
+    pub(crate) fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
+
     pub fn new(repository_root: impl AsRef<Path>) -> io::Result<Self> {
         let repository_root = absolute_path(repository_root.as_ref())?;
         reject_link_components(&repository_root)?;

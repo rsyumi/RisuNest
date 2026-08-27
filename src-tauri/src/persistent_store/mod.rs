@@ -1,3 +1,4 @@
+pub(crate) mod asset_object_catalog;
 pub(crate) mod commands;
 mod commit;
 pub(crate) mod export;
@@ -17,6 +18,7 @@ mod query;
 mod schema;
 mod snapshot;
 
+pub(crate) use asset_object_catalog::{AssetObjectCatalog, AssetObjectCatalogPage};
 pub(crate) use commands::PersistentStoreState;
 pub(crate) use snapshot::RevisionReadLease;
 
@@ -927,6 +929,22 @@ impl PreparedReplaceCommit {
 }
 
 impl PersistentStore {
+    pub(crate) fn asset_object_catalog(&mut self) -> AssetObjectCatalog<'_> {
+        AssetObjectCatalog::new(&mut self.connection)
+    }
+
+    pub(crate) fn query_asset_object_catalog(
+        &self,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> StoreResult<AssetObjectCatalogPage> {
+        asset_object_catalog::query(&self.connection, limit, cursor)
+    }
+
+    pub(crate) fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
+
     pub(crate) fn open(app_data_dir: &Path) -> StoreResult<Self> {
         let persistent_dir = app_data_dir.join("persistent");
         let snapshots_dir = persistent_dir.join("snapshots");
@@ -1553,13 +1571,15 @@ impl PersistentStore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn asset_gc_dry_run(
         &self,
-        candidates: &[crate::asset_repository::migration_gc::AssetGcCandidate],
+        limit: i64,
+        cursor: Option<&str>,
         now_ms: i64,
         minimum_grace_ms: i64,
-    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunReport> {
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        use crate::asset_repository::job_pins::collect_durable_cas_job_roots;
         use crate::asset_repository::migration_gc::{
             collect_staged_migration_roots, dry_run_mark_and_sweep,
-            read_snapshot_asset_root_sidecar,
+            read_snapshot_asset_root_sidecar, AssetGcDryRunPage,
         };
 
         let persistent_dir = self
@@ -1580,15 +1600,21 @@ impl PersistentStore {
             roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
         }
         roots.extend(collect_staged_migration_roots(repository_root)?);
+        roots.push(collect_durable_cas_job_roots(repository_root));
+        #[cfg(not(unix))]
+        roots.push(crate::asset_repository::migration_gc::AssetRootSet {
+            blockers: ["cas-directory-sync-unverified".to_owned()].into(),
+            ..Default::default()
+        });
+        let candidates = self.query_asset_object_catalog(limit, cursor)?;
         let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
-        dry_run_mark_and_sweep(
-            &cas,
-            candidates.iter().cloned(),
-            roots,
-            now_ms,
-            minimum_grace_ms,
-        )
-        .map_err(StoreError::from)
+        let report =
+            dry_run_mark_and_sweep(&cas, candidates.items, roots, now_ms, minimum_grace_ms)
+                .map_err(StoreError::from)?;
+        Ok(AssetGcDryRunPage {
+            report,
+            next_cursor: candidates.next_cursor,
+        })
     }
 
     pub(crate) fn get_app_kv(&self, key: &str) -> StoreResult<Option<Value>> {

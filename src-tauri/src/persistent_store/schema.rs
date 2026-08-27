@@ -2,7 +2,7 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 11;
+pub(super) const SCHEMA_VERSION: u32 = 12;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -30,6 +30,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
         8 => migrate_v8_to_v10(connection)?,
         9 => migrate_v9_to_v10(connection)?,
         10 => {}
+        11 => return migrate_v11_to_v12(connection),
         SCHEMA_VERSION => return Ok(()),
         _ => {
             return Err(StoreError::Store {
@@ -37,7 +38,8 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
             });
         }
     }
-    migrate_v10_to_v11(connection)
+    migrate_v10_to_v11(connection)?;
+    migrate_v11_to_v12(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -230,6 +232,27 @@ fn migrate_v10_to_v11(connection: &mut Connection) -> StoreResult<()> {
         );
         INSERT INTO cold_payload_authority (generation, value)
         SELECT generation, json_object('format', 'legacy') FROM root;
+        ",
+    )?;
+    transaction.pragma_update(None, "user_version", 11)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v11_to_v12(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        CREATE TABLE asset_objects (
+            object_hash TEXT PRIMARY KEY CHECK (
+                length(object_hash) = 64
+                AND object_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+            created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+        );
+        CREATE INDEX asset_objects_created
+            ON asset_objects (created_at_ms, object_hash);
         ",
     )?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;

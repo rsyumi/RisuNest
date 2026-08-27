@@ -4650,7 +4650,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        10
+        12
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -5602,16 +5602,16 @@ fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
 }
 
 #[test]
-fn fresh_schema_v11_contains_dual_authority_and_empty_p4_logical_tables() {
-    let directory = tempfile::tempdir().expect("create fresh v11 directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v11 store");
+fn fresh_schema_v12_contains_dual_authority_and_empty_p4_logical_tables() {
+    let directory = tempfile::tempdir().expect("create fresh v12 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v12 store");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        11
+        12
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -5654,6 +5654,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
             INSERT INTO snapshot_leases (lease, generation, revision, created_at)
                 VALUES ('snapshot-v10-cold', 'snapshot-v10-cold', 0, 4102444800000);
             DROP TABLE cold_payload_authority;
+            DROP TABLE asset_objects;
             PRAGMA user_version = 10;
             "#,
         )
@@ -5668,7 +5669,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated cold schema version"),
-        11
+        12
     );
     assert_cold_v11_authority_schema(&connection, 2);
     for generation in ["revision-0", "snapshot-v10-cold"] {
@@ -5737,6 +5738,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             DROP TABLE logical_sync_generations;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP TABLE asset_objects;
             PRAGMA user_version = 8;
             "#,
         )
@@ -5757,7 +5759,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        10
+        12
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -5886,6 +5888,7 @@ fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
             DROP TABLE logical_sync_generations;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 8;
             "#,
@@ -5988,6 +5991,7 @@ fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
             DROP TABLE cold_payload_authority;
+            DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 9;
             "#,
@@ -6061,7 +6065,7 @@ fn schema_v10_logical_rows_survive_snapshot_restore_and_reopen() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read restored schema version"),
-        10
+        12
     );
     assert_logical_schema_fixture(&restored.connection);
     drop(restored);
@@ -6084,6 +6088,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE cold_aliases;
              DROP TABLE cold_payload_authority;
              DROP TABLE asset_repository_authority;
+             DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
              DROP TABLE logical_message_page_sources;
@@ -6112,7 +6117,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -6130,6 +6135,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .execute_batch(
             "DROP TABLE cold_payload_authority;
              DROP TABLE asset_repository_authority;
+             DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
              DROP TABLE logical_message_page_sources;
@@ -6147,7 +6153,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -6253,6 +6259,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE cold_aliases;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
             DROP TABLE logical_message_page_sources;
@@ -6271,7 +6278,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -6343,6 +6350,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE cold_aliases;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
             DROP TABLE logical_message_page_sources;
@@ -6372,7 +6380,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -6462,7 +6470,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 
     let snapshot_rows: i64 = store
         .connection
@@ -6603,7 +6611,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        10
+        12
     );
     assert_eq!(
         store
@@ -6631,7 +6639,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        10
+        12
     );
     assert_eq!(
         store
@@ -6672,7 +6680,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -6697,7 +6705,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -6835,7 +6843,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -6977,7 +6985,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -7123,7 +7131,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 11);
+    assert_eq!(integer_pragma("user_version"), 12);
 }
 
 #[test]
@@ -7282,6 +7290,8 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
 
 #[test]
 fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
@@ -7311,25 +7321,28 @@ fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
     store
         .commit_asset_alias(&replacement, first.revision)
         .unwrap();
-    let candidates = [
-        crate::asset_repository::migration_gc::AssetGcCandidate {
-            object_hash: original_payload.content_hash.clone(),
-            byte_size: original_payload.byte_size,
-            created_at_ms: 0,
-        },
-        crate::asset_repository::migration_gc::AssetGcCandidate {
-            object_hash: replacement_payload.content_hash.clone(),
-            byte_size: replacement_payload.byte_size,
-            created_at_ms: 0,
-        },
-        crate::asset_repository::migration_gc::AssetGcCandidate {
-            object_hash: collectable_payload.content_hash.clone(),
-            byte_size: collectable_payload.byte_size,
-            created_at_ms: 0,
-        },
-    ];
+    store
+        .asset_object_catalog()
+        .register(
+            &[
+                AssetObjectRegistration {
+                    object_hash: original_payload.content_hash.clone(),
+                    byte_size: original_payload.byte_size,
+                },
+                AssetObjectRegistration {
+                    object_hash: replacement_payload.content_hash.clone(),
+                    byte_size: replacement_payload.byte_size,
+                },
+                AssetObjectRegistration {
+                    object_hash: collectable_payload.content_hash.clone(),
+                    byte_size: collectable_payload.byte_size,
+                },
+            ],
+            0,
+        )
+        .expect("register GC candidates");
 
-    let leased = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    let leased = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
     assert!(leased
         .marked_hashes
         .contains(&original_payload.content_hash));
@@ -7342,7 +7355,7 @@ fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
     );
 
     store.release_revision(&lease.lease).unwrap();
-    let released = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    let released = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
     assert_eq!(
         released.marked_hashes,
         vec![replacement_payload.content_hash]
@@ -7364,6 +7377,8 @@ fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
 
 #[test]
 fn asset_gc_dry_run_keeps_detached_export_roots_until_reader_release() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
@@ -7392,20 +7407,24 @@ fn asset_gc_dry_run_keeps_detached_export_roots_until_reader_release() {
     store
         .commit_asset_alias(&replacement, first.revision)
         .unwrap();
-    let candidates = [
-        crate::asset_repository::migration_gc::AssetGcCandidate {
-            object_hash: original_payload.content_hash.clone(),
-            byte_size: original_payload.byte_size,
-            created_at_ms: 0,
-        },
-        crate::asset_repository::migration_gc::AssetGcCandidate {
-            object_hash: replacement_payload.content_hash.clone(),
-            byte_size: replacement_payload.byte_size,
-            created_at_ms: 0,
-        },
-    ];
+    store
+        .asset_object_catalog()
+        .register(
+            &[
+                AssetObjectRegistration {
+                    object_hash: original_payload.content_hash.clone(),
+                    byte_size: original_payload.byte_size,
+                },
+                AssetObjectRegistration {
+                    object_hash: replacement_payload.content_hash.clone(),
+                    byte_size: replacement_payload.byte_size,
+                },
+            ],
+            0,
+        )
+        .expect("register GC candidates");
 
-    let detached = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    let detached = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
     assert!(detached
         .marked_hashes
         .contains(&original_payload.content_hash));
@@ -7416,7 +7435,7 @@ fn asset_gc_dry_run_keeps_detached_export_roots_until_reader_release() {
 
     let reader = prepared.take_reader().expect("take detached reader");
     prepared.release(reader).expect("release detached reader");
-    let released = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    let released = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
     assert_eq!(
         released.marked_hashes,
         vec![replacement_payload.content_hash]
@@ -7923,7 +7942,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 12;")
+                .execute_batch("PRAGMA user_version = 13;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
@@ -7945,6 +7964,275 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             .join("pending-restore.json")
             .exists());
     }
+}
+
+#[test]
+fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
+    let directory = tempfile::tempdir().expect("create v12 schema directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v12 store");
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read v12 version"),
+        12
+    );
+    assert_eq!(
+        table_columns(&store.connection, "asset_objects")
+            .into_iter()
+            .map(|column| column.0)
+            .collect::<Vec<_>>(),
+        ["object_hash", "byte_size", "created_at_ms"]
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_objects", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count fresh catalog"),
+        0
+    );
+    assert!(super::GENERATION_TABLES
+        .iter()
+        .all(|(table, _)| *table != "asset_objects"));
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM cold_payload_authority", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count cold authority rows"),
+        1
+    );
+}
+
+#[test]
+fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
+    let directory = tempfile::tempdir().expect("create v11 migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch("DROP TABLE asset_objects; PRAGMA user_version = 11;")
+        .expect("create v11 fixture");
+    drop(store);
+    let sentinel = directory
+        .path()
+        .join("assets-v2/objects/aa/untracked-v11-object");
+    fs::create_dir_all(sentinel.parent().expect("read sentinel parent"))
+        .expect("create sentinel shard");
+    fs::write(&sentinel, b"not a catalog candidate").expect("write sentinel object");
+
+    let migrated = PersistentStore::open(directory.path()).expect("migrate v11 store");
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read migrated version"),
+        12
+    );
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_objects", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count empty migrated catalog"),
+        0
+    );
+    assert_eq!(
+        fs::read(sentinel).expect("read untracked sentinel"),
+        b"not a catalog candidate"
+    );
+}
+
+#[test]
+fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
+    let directory = tempfile::tempdir().expect("create v12 collision directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            "DROP TABLE asset_objects;
+             CREATE TABLE asset_objects (collision_marker TEXT NOT NULL);
+             PRAGMA user_version = 11;",
+        )
+        .expect("create colliding v11 fixture");
+    drop(store);
+
+    assert!(PersistentStore::open(directory.path()).is_err());
+    let connection = Connection::open(directory.path().join("persistent/persistent.db"))
+        .expect("reopen colliding v11 fixture");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read rolled-back version"),
+        11
+    );
+    assert_eq!(
+        table_columns(&connection, "asset_objects")
+            .into_iter()
+            .map(|column| column.0)
+            .collect::<Vec<_>>(),
+        ["collision_marker"]
+    );
+}
+
+#[test]
+fn asset_object_catalog_is_idempotent_conflict_safe_and_stably_paged() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    let directory = tempfile::tempdir().expect("create catalog directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let first = AssetObjectRegistration {
+        object_hash: "11".repeat(32),
+        byte_size: 11,
+    };
+    let second = AssetObjectRegistration {
+        object_hash: "22".repeat(32),
+        byte_size: 22,
+    };
+    let third = AssetObjectRegistration {
+        object_hash: "33".repeat(32),
+        byte_size: 33,
+    };
+    store
+        .asset_object_catalog()
+        .register(&[first.clone()], 5)
+        .expect("register first object");
+    store
+        .asset_object_catalog()
+        .register(&[first.clone()], 99)
+        .expect("re-register same object");
+    store
+        .asset_object_catalog()
+        .register(&[second.clone(), third.clone()], 5)
+        .expect("register remaining objects");
+    assert!(store
+        .asset_object_catalog()
+        .register(
+            &[AssetObjectRegistration {
+                object_hash: first.object_hash.clone(),
+                byte_size: 12,
+            }],
+            10,
+        )
+        .is_err());
+    assert!(store
+        .asset_object_catalog()
+        .register(&[first.clone()], -1)
+        .is_err());
+    assert!(store
+        .asset_object_catalog()
+        .register(
+            &[AssetObjectRegistration {
+                object_hash: "not-a-hash".to_owned(),
+                byte_size: 1,
+            }],
+            10,
+        )
+        .is_err());
+
+    let first_page = store
+        .query_asset_object_catalog(2, None)
+        .expect("query first page");
+    assert_eq!(
+        first_page
+            .items
+            .iter()
+            .map(|item| (&item.object_hash, item.created_at_ms))
+            .collect::<Vec<_>>(),
+        [(&first.object_hash, 5), (&second.object_hash, 5)]
+    );
+    let second_page = store
+        .query_asset_object_catalog(2, first_page.next_cursor.as_deref())
+        .expect("query second page");
+    assert_eq!(second_page.items.len(), 1);
+    assert_eq!(second_page.items[0].object_hash, third.object_hash);
+    assert!(second_page.next_cursor.is_none());
+    assert!(store.query_asset_object_catalog(0, None).is_err());
+    assert!(store
+        .query_asset_object_catalog(1, Some("not-an-opaque-cursor"))
+        .is_err());
+}
+
+#[test]
+fn snapshot_restore_without_newer_catalog_rows_leaves_objects_untracked() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    let directory = tempfile::tempdir().expect("create catalog restore directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let snapshot = store
+        .snapshot_create("before-catalog-registration")
+        .expect("create empty-catalog snapshot");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"survives without restored inventory")
+        .expect("prepare untracked object");
+    store
+        .asset_object_catalog()
+        .register(
+            &[AssetObjectRegistration {
+                object_hash: prepared.content_hash.clone(),
+                byte_size: prepared.byte_size,
+            }],
+            1,
+        )
+        .expect("register post-snapshot object");
+    store
+        .snapshot_restore_request(Path::new(&snapshot.path))
+        .expect("request empty-catalog restore");
+    drop(store);
+
+    let restored = PersistentStore::open(directory.path()).expect("restore catalog snapshot");
+    assert!(restored
+        .query_asset_object_catalog(16, None)
+        .expect("query restored catalog")
+        .items
+        .is_empty());
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash)
+            .expect("stat surviving object"),
+        Some(prepared.byte_size)
+    );
+}
+
+#[test]
+fn asset_gc_catalog_retains_future_rows_and_aborts_on_size_mismatch() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    let directory = tempfile::tempdir().expect("create conservative catalog directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"future catalog object")
+        .expect("prepare future object");
+    store
+        .asset_object_catalog()
+        .register(
+            &[AssetObjectRegistration {
+                object_hash: prepared.content_hash.clone(),
+                byte_size: prepared.byte_size,
+            }],
+            200,
+        )
+        .expect("register future catalog object");
+
+    let future = store
+        .asset_gc_dry_run(16, None, 100, 10)
+        .expect("classify future catalog row");
+    assert_eq!(
+        future.report.grace_retained_hashes,
+        vec![prepared.content_hash.clone()]
+    );
+    assert!(!future.report.deletion_enabled);
+
+    store
+        .connection
+        .execute(
+            "UPDATE asset_objects SET byte_size = byte_size + 1 WHERE object_hash = ?1",
+            [&prepared.content_hash],
+        )
+        .expect("corrupt catalog size fixture");
+    assert!(store.asset_gc_dry_run(16, None, 300, 10).is_err());
 }
 
 #[test]
