@@ -34,8 +34,10 @@ describe('peer bidirectional settings surface', () => {
     it('locks overlapping controls for retained operations and can dismiss a terminal result', () => {
         expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained')
         expect(peerCloneSettingsSource).toContain('disabled={!bidirectionalEnabled || bidirectionalBusy || bidirectionalOperationRetained}')
-        expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained || !bidirectionalPairingInput')
+        expect(peerCloneSettingsSource).toContain("|| ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)")
+        expect(peerCloneSettingsSource).toContain('|| !bidirectionalPairingInput}')
         expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained || device.revoked')
+        expect(peerCloneSettingsSource).toContain("disabled={bidirectionalBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}")
         expect(peerCloneSettingsSource).toContain('bidirectionalController.acknowledge()')
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.acknowledge')
         expect(peerCloneSettingsSource).toContain("bidirectionalOperationPhase === 'sourceUnavailable'")

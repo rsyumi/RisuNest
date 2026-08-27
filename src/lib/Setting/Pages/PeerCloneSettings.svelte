@@ -695,7 +695,7 @@
             >{language.peerBidirectional.start}</Button>
             <Button
                 styled="danger"
-                disabled={bidirectionalBusy || bidirectionalOperationRetained || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
+                disabled={bidirectionalBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
                 onclick={stopBidirectionalSource}
             >{language.peerBidirectional.stop}</Button>
         </div>
@@ -750,7 +750,11 @@
         ></textarea>
         <Button
             className="mt-2"
-            disabled={!bidirectionalEnabled || bidirectionalBusy || bidirectionalOperationRetained || !bidirectionalPairingInput}
+            disabled={!bidirectionalEnabled
+                || bidirectionalBusy
+                || bidirectionalOperationRetained
+                || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)
+                || !bidirectionalPairingInput}
             onclick={syncBidirectional}
         >{language.peerBidirectional.sync}</Button>
 
