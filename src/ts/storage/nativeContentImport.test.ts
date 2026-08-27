@@ -601,6 +601,45 @@ describe('native prepared content import', () => {
         ])
     })
 
+    it('aborts the unsealed CAS session when a running cancellation drains to success', async () => {
+        const controller = new AbortController()
+        const calls: string[] = []
+        let statusCount = 0
+
+        const result = prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            { signal: controller.signal },
+            nativeDependencies(
+                async (command) => {
+                    calls.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? contentStatus('running', 'reading-source')
+                            : contentStatus('succeeded', 'complete', preparedContent)
+                    }
+                    if (command === 'native_file_job_cancel') return 'too-late'
+                    if (command === 'asset_cas_job_release') return null
+                    if (command === 'native_file_job_forget') return null
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                async () => controller.abort(),
+            ),
+        )
+
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+        expect(calls).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'asset_cas_job_release',
+            'native_file_job_forget',
+        ])
+    })
+
     it('returns AbortError when cancellation races with terminal success', async () => {
         const controller = new AbortController()
         const calls: string[] = []

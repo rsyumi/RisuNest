@@ -795,22 +795,26 @@ export async function prepareNativeContentImport(
         catch {}
     }
     const releaseAndForget = async (outcome: 'committed' | 'aborted'): Promise<void> => {
+        let releaseFailed = false
         let releaseError: unknown
         try {
             await releaseCasJob(started.jobId, outcome, dependencies.invoke)
         }
         catch (error) {
+            releaseFailed = true
             releaseError = error
         }
+        let forgetFailed = false
         let forgetError: unknown
         try {
             await forget()
         }
         catch (error) {
+            forgetFailed = true
             forgetError = error
         }
-        if (releaseError) throw releaseError
-        if (forgetError) throw forgetError
+        if (releaseFailed) throw releaseError
+        if (forgetFailed) throw forgetError
     }
     const abortAndForgetBestEffort = async (): Promise<void> => {
         try {
@@ -823,15 +827,20 @@ export async function prepareNativeContentImport(
             cancellationRequested = true
             await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
         }
+        let terminal: NativeFileJobStatus
         while (true) {
             const status = await invokeNative(dependencies, 'native_file_job_status', {
                 jobId: started.jobId,
             }) as NativeFileJobStatus
             if (reportStatus) options.onStatus?.(status)
-            if (isTerminalJob(status)) break
+            if (isTerminalJob(status)) {
+                terminal = status
+                break
+            }
             await dependencies.wait(options.pollIntervalMs ?? 100)
         }
-        await forgetBestEffort()
+        if (terminal.state === 'succeeded') await abortAndForgetBestEffort()
+        else await forgetBestEffort()
     }
 
     let lastStatus: NativeFileJobStatus | undefined
