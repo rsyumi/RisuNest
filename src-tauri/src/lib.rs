@@ -15,7 +15,7 @@ mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
-#[cfg(any(test, target_os = "windows"))]
+#[cfg(any(test, target_os = "windows", target_os = "android"))]
 mod regex_shadow;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -478,7 +478,7 @@ pub fn run() {
                         .join("screenshot-output"),
                 ),
             );
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
         })
@@ -588,9 +588,9 @@ pub fn run() {
             persistent_store::commands::pds_get_app_kv,
             persistent_store::commands::pds_set_app_kv,
             persistent_store::commands::pds_remove_app_kv,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "android"))]
             regex_shadow::regex_execute_batch,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "android"))]
             regex_shadow::regex_cancel_batch,
         ])
         .run(tauri::generate_context!())

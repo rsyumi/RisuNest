@@ -4,6 +4,7 @@ import type { RegexSafePlan } from './regexSafePlan'
 import {
     NativeRegexBatchRejectedError,
     executeNativeRegexBatch,
+    isNativeRegexTauriRuntime,
     tryExecuteNativeRegexBatch,
     type NativeRegexBatchDependencies,
     type NativeRegexBatchRouteDependencies,
@@ -36,6 +37,15 @@ function dependencies(
 }
 
 describe('native regex batch adapter', () => {
+    it.each([
+        ['Windows Tauri', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', {}, true],
+        ['Android Tauri', 'Mozilla/5.0 (Linux; Android 15)', {}, true],
+        ['macOS Tauri', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', {}, false],
+        ['browser Web', 'Mozilla/5.0 (Linux; Android 15)', undefined, false],
+    ] as const)('detects the supported %s runtime', (_name, userAgent, tauriInternals, expected) => {
+        expect(isNativeRegexTauriRuntime(userAgent, tauriInternals)).toBe(expected)
+    })
+
     it('returns a complete ordered batch result from the Tauri command', async () => {
         const invoke = vi.fn(async () => ({ data: 'bbb', errors: [] }))
 
@@ -136,13 +146,13 @@ describe('native regex batch adapter', () => {
         expect(invoke).toHaveBeenNthCalledWith(2, 'regex_cancel_batch', { requestId })
     })
 
-    it('routes only the measured 500-rule and 256 KiB Windows Tauri boundary', async () => {
+    it('routes only the bounded 500-rule and 256 KiB supported Tauri boundary', async () => {
         const fixture = makeRegexFixture(500, 256 * 1024)
         const input = fixture.input.slice(0, 256 * 1024)
         const plan = getRegexExecutionPlan(fixture.scripts, 'editoutput')
         const invoke = vi.fn(async () => ({ data: 'native-output', errors: [] }))
         const routeDependencies: NativeRegexBatchRouteDependencies = {
-            isWindowsTauri: () => true,
+            isSupportedTauri: () => true,
             invoke,
         }
 
@@ -164,7 +174,7 @@ describe('native regex batch adapter', () => {
         _name,
         ruleCount,
         inputBytes,
-        isWindowsTauri,
+        isSupportedTauri,
     ) => {
         const fixture = makeRegexFixture(ruleCount, inputBytes)
         const plan = getRegexExecutionPlan(fixture.scripts, 'editoutput')
@@ -174,7 +184,7 @@ describe('native regex batch adapter', () => {
             plan,
             fixture.input.slice(0, inputBytes),
             {},
-            { isWindowsTauri: () => isWindowsTauri, invoke },
+            { isSupportedTauri: () => isSupportedTauri, invoke },
         )).resolves.toBeUndefined()
         expect(invoke).not.toHaveBeenCalled()
     })
@@ -189,7 +199,7 @@ describe('native regex batch adapter', () => {
             plan,
             fixture.input.slice(0, 256 * 1024),
             {},
-            { isWindowsTauri: () => true, invoke },
+            { isSupportedTauri: () => true, invoke },
         )).resolves.toBeUndefined()
         expect(invoke).not.toHaveBeenCalled()
     })

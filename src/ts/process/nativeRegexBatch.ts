@@ -29,7 +29,7 @@ export interface NativeRegexBatchDependencies {
 }
 
 export interface NativeRegexBatchRouteDependencies extends NativeRegexBatchDependencies {
-    isWindowsTauri(): boolean
+    isSupportedTauri(): boolean
 }
 
 const productionDependencies: NativeRegexBatchDependencies = {
@@ -37,11 +37,18 @@ const productionDependencies: NativeRegexBatchDependencies = {
     createRequestId: () => globalThis.crypto.randomUUID(),
 }
 
+export function isNativeRegexTauriRuntime(
+    userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent,
+    tauriInternals = (globalThis as typeof globalThis & {
+        __TAURI_INTERNALS__?: unknown
+    }).__TAURI_INTERNALS__,
+): boolean {
+    return Boolean(tauriInternals) && /Windows|Android/i.test(userAgent)
+}
+
 const productionRouteDependencies: NativeRegexBatchRouteDependencies = {
     ...productionDependencies,
-    isWindowsTauri: () => Boolean(
-        (globalThis as typeof globalThis & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__,
-    ) && typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent),
+    isSupportedTauri: () => isNativeRegexTauriRuntime(),
 }
 
 export class NativeRegexBatchRejectedError extends Error {
@@ -118,7 +125,7 @@ export async function tryExecuteNativeRegexBatch(
     dependencies: NativeRegexBatchRouteDependencies = productionRouteDependencies,
 ): Promise<RegexExecutionResult | undefined> {
     if (
-        !dependencies.isWindowsTauri()
+        !dependencies.isSupportedTauri()
         || executionPlan.entries.length !== NATIVE_REGEX_BATCH_RULES
     ) {
         return undefined
