@@ -156,6 +156,10 @@ export async function activatePreparedNativeCharacterContent(
     const character = await dependencies.map({
         card,
         assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),
+        ...(content.portraitLogicalId === undefined
+            ? {}
+            : { portraitLogicalId: content.portraitLogicalId }),
+        ...(content.module === undefined ? {} : { module: content.module }),
     })
     if (!character) return null
 

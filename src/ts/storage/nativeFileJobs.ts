@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import { isTauri } from '../platform'
+import type { PreparedNativeCharacterCardModule } from '../characterCards'
 import {
     copyNativeExportToAndroidSaf,
     type AndroidSafDestinationRequest,
@@ -43,9 +44,11 @@ export interface PreparedContentAssetDescriptor {
 }
 
 export interface PreparedNativeContent {
-    format: 'json-card'
+    format: 'json-card' | 'charx-card' | 'appended-charx-jpeg'
     metadata: Record<string, unknown>
     assets: PreparedContentAssetDescriptor[]
+    portraitLogicalId?: string
+    module?: PreparedNativeCharacterCardModule
 }
 
 export interface NativeFileJobStatus {
@@ -185,7 +188,7 @@ function preparedContentError(message: string): NativeFileJobError {
 
 function requiredDescriptorString(
     value: unknown,
-    field: keyof PreparedContentAssetDescriptor,
+    field: string,
 ): string {
     if (typeof value !== 'string' || value.length === 0) {
         throw preparedContentError(`Prepared content asset ${field} must be a nonempty string`)
@@ -198,7 +201,11 @@ function validatePreparedContent(value: unknown): PreparedNativeContent {
         throw preparedContentError('Prepared content must be an object')
     }
     const content = value as Record<string, unknown>
-    if (content.format !== 'json-card') {
+    if (
+        content.format !== 'json-card'
+        && content.format !== 'charx-card'
+        && content.format !== 'appended-charx-jpeg'
+    ) {
         throw preparedContentError('Prepared content format is unsupported')
     }
     if (
@@ -210,6 +217,12 @@ function validatePreparedContent(value: unknown): PreparedNativeContent {
     }
     if (!Array.isArray(content.assets)) {
         throw preparedContentError('Prepared content assets must be an array')
+    }
+    const expectedContentFields = ['assets', 'format', 'metadata']
+    if (content.portraitLogicalId !== undefined) expectedContentFields.push('portraitLogicalId')
+    if (content.module !== undefined) expectedContentFields.push('module')
+    if (Object.keys(content).sort().join('\0') !== expectedContentFields.sort().join('\0')) {
+        throw preparedContentError('Prepared content fields are invalid')
     }
     const expectedFields = [
         'referenceKey',
@@ -247,8 +260,13 @@ function validatePreparedContent(value: unknown): PreparedNativeContent {
             throw preparedContentError(`Prepared content asset ${index} ext is invalid`)
         }
         const logicalId = requiredDescriptorString(asset.logicalId, 'logicalId')
-        if (logicalId !== `assets/${objectHash}.${ext}`) {
+        const logicalPrefix = `assets/${objectHash}.`
+        if (!logicalId.startsWith(logicalPrefix)) {
             throw preparedContentError(`Prepared content asset ${index} logicalId does not match its object`)
+        }
+        const logicalSuffix = logicalId.slice(logicalPrefix.length)
+        if (logicalSuffix.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(logicalSuffix)) {
+            throw preparedContentError(`Prepared content asset ${index} logicalId suffix is invalid`)
         }
         if (typeof asset.name !== 'string') {
             throw preparedContentError(`Prepared content asset ${index} name must be a string`)
@@ -264,10 +282,40 @@ function validatePreparedContent(value: unknown): PreparedNativeContent {
             ext,
         }
     })
+    let portraitLogicalId: string | undefined
+    if (content.portraitLogicalId !== undefined) {
+        portraitLogicalId = requiredDescriptorString(content.portraitLogicalId, 'portraitLogicalId')
+        if (!assets.some((asset) => asset.logicalId === portraitLogicalId)) {
+            throw preparedContentError('Prepared content portraitLogicalId must reference a prepared asset')
+        }
+    }
+    let module: PreparedNativeCharacterCardModule | undefined
+    if (content.module !== undefined) {
+        if (typeof content.module !== 'object' || content.module === null || Array.isArray(content.module)) {
+            throw preparedContentError('Prepared content module must be an object')
+        }
+        const rawModule = content.module as Record<string, unknown>
+        const expectedModuleFields = ['lorebook', 'regex', 'trigger']
+        if (!Object.keys(rawModule).every((field) => expectedModuleFields.includes(field))) {
+            throw preparedContentError('Prepared content module fields are invalid')
+        }
+        for (const field of expectedModuleFields) {
+            if (rawModule[field] !== undefined && !Array.isArray(rawModule[field])) {
+                throw preparedContentError(`Prepared content module ${field} must be an array`)
+            }
+        }
+        module = {
+            ...(rawModule.trigger === undefined ? {} : { trigger: rawModule.trigger as PreparedNativeCharacterCardModule['trigger'] }),
+            ...(rawModule.regex === undefined ? {} : { regex: rawModule.regex as PreparedNativeCharacterCardModule['regex'] }),
+            ...(rawModule.lorebook === undefined ? {} : { lorebook: rawModule.lorebook as PreparedNativeCharacterCardModule['lorebook'] }),
+        }
+    }
     return {
-        format: 'json-card',
+        format: content.format,
         metadata: content.metadata as Record<string, unknown>,
         assets,
+        ...(portraitLogicalId === undefined ? {} : { portraitLogicalId }),
+        ...(module === undefined ? {} : { module }),
     }
 }
 

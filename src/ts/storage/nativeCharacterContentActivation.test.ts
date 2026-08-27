@@ -157,6 +157,43 @@ describe('prepared native character content activation', () => {
         expect(await create(null)).toEqual(mappedCharacter())
     })
 
+    it('passes a CharX portrait and module overlay to the mapper while committing only ordinary asset aliases', async () => {
+        const charxContent = {
+            ...content,
+            format: 'charx-card',
+            portraitLogicalId: content.assets[0].logicalId,
+            module: { trigger: [], regex: [], lorebook: [] },
+        } as PreparedNativeContent
+        const deps = dependencies()
+
+        await activatePreparedNativeCharacterContent(charxContent, deps)
+
+        expect(deps.map).toHaveBeenCalledWith({
+            card: content.metadata,
+            assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),
+            portraitLogicalId: content.assets[0].logicalId,
+            module: { trigger: [], regex: [], lorebook: [] },
+        })
+        const options = vi.mocked(deps.upsert).mock.calls[0][3]
+        expect(options?.assetAliases).toEqual(expect.arrayContaining([
+            expect.objectContaining({ kind: 'asset', key: content.assets[0].logicalId }),
+        ]))
+        expect(options?.assetAliases).not.toEqual(expect.arrayContaining([
+            expect.objectContaining({ kind: 'inlay' }),
+        ]))
+        for (const alias of options?.assetAliases ?? []) {
+            expect(Object.keys(alias).sort()).toEqual([
+                'ext',
+                'key',
+                'kind',
+                'mime',
+                'name',
+                'objectHash',
+                'size',
+            ])
+        }
+    })
+
     it('returns a normal declined outcome without preparing or publishing anything', async () => {
         const deps = dependencies({ map: vi.fn(async (): Promise<false> => false) })
 

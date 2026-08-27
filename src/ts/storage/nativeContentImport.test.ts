@@ -105,6 +105,68 @@ describe('native prepared content import', () => {
         expect(receipt.content.assets[0].name).toBe('')
     })
 
+    it('accepts CharX descriptors with a member portrait, module arrays, and duplicate logical IDs', async () => {
+        const charxContent = {
+            ...preparedContent,
+            format: 'appended-charx-jpeg',
+            portraitLogicalId: `assets/${'ab'.repeat(32)}.cas-portrait`,
+            module: { trigger: [], regex: [], lorebook: [] },
+            assets: [
+                {
+                    ...preparedContent.assets[0],
+                    logicalId: `assets/${'ab'.repeat(32)}.cas-portrait`,
+                },
+                {
+                    ...preparedContent.assets[0],
+                    referenceKey: 'data.assets.1.uri',
+                    token: 'staged-token-2',
+                    logicalId: `assets/${'ab'.repeat(32)}.cas-portrait`,
+                },
+            ],
+        }
+
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.jpg' },
+            'card.jpg',
+            {},
+            nativeDependencies(async (command) => {
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', charxContent as PreparedNativeContent)
+                }
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        expect(receipt.content).toEqual(charxContent)
+    })
+
+    it.each([
+        ['non-member portrait', { portraitLogicalId: `assets/${'cd'.repeat(32)}.portrait` }, 'portraitLogicalId must reference a prepared asset'],
+        ['non-array module field', { module: { trigger: {} } }, 'module trigger must be an array'],
+        ['unsafe logical suffix', { assets: [{ ...preparedContent.assets[0], logicalId: `assets/${'ab'.repeat(32)}../png` }] }, 'logicalId suffix is invalid'],
+    ])('rejects invalid CharX %s', async (_case, changes, expectedMessage) => {
+        const invalidContent = {
+            ...preparedContent,
+            format: 'charx-card',
+            ...changes,
+        }
+
+        await expect(prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.charx' },
+            'card.charx',
+            {},
+            nativeDependencies(async (command) => {
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', invalidContent as PreparedNativeContent)
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )).rejects.toThrow(expectedMessage)
+    })
+
     it('forgets retained staging only after activation is confirmed and the job is terminal', async () => {
         const calls: string[] = []
         const receipt = await prepareNativeContentImport(
