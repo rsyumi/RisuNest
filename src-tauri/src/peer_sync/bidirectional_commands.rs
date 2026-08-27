@@ -243,6 +243,15 @@ enum LocalMergeOutcome {
     LocalCommitted,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResumeLocalCommittedOutcome {
+    Completed(PeerBidirectionalCompletedResult),
+    SourceUnavailable {
+        operation_id: String,
+        committed_revision: i64,
+    },
+}
+
 #[derive(Default)]
 struct MeasuredTransferTotals {
     objects: Cell<u64>,
@@ -777,6 +786,79 @@ fn complete_bidirectional_local_after_remote_apply(
     Ok(result)
 }
 
+fn resume_bidirectional_local_committed_with_remote<F>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    operation_id: &str,
+    request_remote: F,
+) -> Result<ResumeLocalCommittedOutcome, PeerSyncError>
+where
+    F: FnOnce(
+        &PeerBidirectionalOperationContext,
+        i64,
+        &SyncGenerationIdentity,
+        &[u8],
+    ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>,
+{
+    let operation = PeerBidirectionalOperationJournal::new(app_root)
+        .load()?
+        .ok_or_else(|| {
+            PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
+        })?;
+    let (context, committed_revision, shared_generation) = match operation {
+        PeerBidirectionalDurableOperation::LocalCommitted {
+            context,
+            committed_revision,
+            shared_generation,
+            ..
+        } if context.operation_id == operation_id => {
+            (context, committed_revision, shared_generation)
+        }
+        other if other.operation_id() != operation_id => {
+            return Err(PeerSyncError::Validation(
+                "another bidirectional operation is retained".to_owned(),
+            ));
+        }
+        _ => {
+            return Err(PeerSyncError::Validation(
+                "bidirectional operation is not ready to resume".to_owned(),
+            ));
+        }
+    };
+    let active = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    let active_identity = SyncGenerationIdentity {
+        generation_id: active.manifest.generation,
+        manifest_hash: active.manifest_hash,
+        generation_sequence: active.manifest.generation_sequence,
+    };
+    if active_identity != shared_generation {
+        return Err(PeerSyncError::ActivationConflict {
+            expected: Some(shared_generation.manifest_hash),
+            actual: Some(active_identity.manifest_hash),
+        });
+    }
+    let remote = match request_remote(
+        &context,
+        committed_revision,
+        &shared_generation,
+        &active.manifest_bytes,
+    ) {
+        Ok(remote) => remote,
+        Err(PeerSyncError::Transport(_)) => {
+            return Ok(ResumeLocalCommittedOutcome::SourceUnavailable {
+                operation_id: operation_id.to_owned(),
+                committed_revision,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    complete_bidirectional_local_after_remote_apply(store, cas, app_root, operation_id, remote)
+        .map(ResumeLocalCommittedOutcome::Completed)
+}
+
 fn now_millis() -> Result<i64, PeerSyncError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1115,6 +1197,93 @@ mod tests {
         };
         journal.store(&completed).unwrap();
         assert_eq!(journal.load().unwrap(), Some(completed));
+    }
+
+    #[test]
+    fn source_unavailable_preserves_local_committed_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174012";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    shared.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174013";
+        let mut retained_context = context(operation_id);
+        retained_context.credential.source_device_id = peer_id.to_owned();
+        retained_context.previous_shared = shared.clone();
+        retained_context.previous_local = shared.clone();
+        let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: retained_context,
+            committed_revision: 0,
+            shared_generation: shared.clone(),
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&retained).unwrap();
+        drop(store);
+        let mut reopened = PersistentStore::open(directory.path()).unwrap();
+
+        let outcome = resume_bidirectional_local_committed_with_remote(
+            &mut reopened,
+            &cas,
+            directory.path(),
+            operation_id,
+            |_context, _revision, _shared, _manifest| {
+                Err(PeerSyncError::Transport(
+                    "peer source is offline".to_owned(),
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ResumeLocalCommittedOutcome::SourceUnavailable {
+                operation_id: operation_id.to_owned(),
+                committed_revision: 0,
+            }
+        );
+        assert_eq!(journal.load().unwrap(), Some(retained));
+        assert_eq!(
+            reopened
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            crate::persistent_store::SyncDeviceAckState {
+                shared_identity: shared.clone(),
+                local_identity: shared,
+            }
+        );
     }
 
     #[test]
