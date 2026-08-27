@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { getAndroidSafExportSourceId } from './androidSafBridge'
 import {
     acknowledgeRecoveredNativeRestores,
     reconcileNativeFileJobsBeforeBootstrap,
@@ -356,6 +357,38 @@ describe('native file job bootstrap reconciliation', () => {
         await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
         await vi.waitFor(() => {
             expect(calls).toEqual(['native_file_job_list', 'native_file_job_forget'])
+        })
+    })
+
+    it('cleans an unclaimed character CharX handoff when the Android SAF bridge is unavailable', async () => {
+        const calls: string[] = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174004.charx'
+        const dependencies = {
+            invoke: vi.fn(async (command: string) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('charx-export', 'succeeded', 'complete'),
+                    kind: 'export-character-charx' as const,
+                    result: {
+                        ...restoreStatus('charx-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }]
+                if (command === 'native_character_charx_handoff_cleanup') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+            androidSafExportId: () => getAndroidSafExportSourceId(),
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        await vi.waitFor(() => {
+            expect(calls).toEqual([
+                'native_file_job_list',
+                'native_character_charx_handoff_cleanup',
+                'native_file_job_forget',
+            ])
         })
     })
 

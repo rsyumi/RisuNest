@@ -460,9 +460,11 @@ export function getAndroidSafExportStatus(
 }
 
 export function getAndroidSafExportSourceId(
-    bridge: AndroidSafJavascriptBridge = productionBridge(),
+    bridge: AndroidSafJavascriptBridge | undefined = (window as Window & {
+        RisuSafBridge?: AndroidSafJavascriptBridge
+    }).RisuSafBridge,
 ): string | null {
-    const exportId = bridge.getExportSourceId?.()
+    const exportId = bridge?.getExportSourceId?.()
     return typeof exportId === 'string'
         && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(exportId)
         ? exportId
