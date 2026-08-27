@@ -5,6 +5,7 @@ import {
     capturePersistentMutationToken,
 } from './persistentDataRuntime.svelte'
 import {
+    NativeFileJobActivationCommittedError,
     NativeFileJobError,
     type NativeFileJobOptions,
     type NativeFileJobSource,
@@ -76,6 +77,7 @@ export async function importNativeJpegAsset(
     const fence = await dependencies.acquireFence(token)
     let jobId: string | undefined
     let cancellationRequested = false
+    let retainJobForRecovery = false
     try {
         if (options.signal?.aborted) throw abortError()
         const started = await dependencies.invoke('native_file_job_start', {
@@ -126,14 +128,20 @@ export async function importNativeJpegAsset(
                 'Native JPEG asset import returned an invalid payload hash',
             )
         }
-        await fence.refreshCommittedWorkingSet(terminal.result.revision)
+        try {
+            await fence.refreshCommittedWorkingSet(terminal.result.revision)
+        }
+        catch (error) {
+            retainJobForRecovery = true
+            throw new NativeFileJobActivationCommittedError(terminal.result.revision, error)
+        }
         return {
             revision: terminal.result.revision,
             logicalId: `assets/${hash}.${extension}`,
         }
     }
     finally {
-        if (jobId) {
+        if (jobId && !retainJobForRecovery) {
             try {
                 await dependencies.invoke('native_file_job_forget', { jobId })
             }

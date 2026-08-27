@@ -9,6 +9,7 @@ import {
     importNativeJpegAsset,
     type NativeJpegAssetImportDependencies,
 } from './nativeJpegAssetImport'
+import type { NativeFileJobActivationCommittedError } from './nativeFileJobs'
 
 function dependencies(statuses: unknown[]): NativeJpegAssetImportDependencies {
     const invoke = vi.fn(async (command: string) => {
@@ -127,5 +128,46 @@ describe('native JPEG asset import', () => {
         const fence = await vi.mocked(deps.acquireFence).mock.results[0].value
         expect(fence.refreshCommittedWorkingSet).not.toHaveBeenCalled()
         expect(fence.release).toHaveBeenCalledOnce()
+    })
+
+    it('retains committed success for recovery when refreshing the renderer fails', async () => {
+        const deps = dependencies([{
+            jobId: 'jpeg-job',
+            kind: 'import-jpeg-asset',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4, completedItems: 1 },
+            result: {
+                revision: 8,
+                sourceBytes: 4,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+            },
+        }])
+        vi.mocked(deps.acquireFence).mockResolvedValueOnce({
+            refreshCommittedWorkingSet: vi.fn(async () => {
+                throw new Error('refresh unavailable')
+            }),
+            release: vi.fn(),
+        })
+
+        await expect(importNativeJpegAsset({
+            source: { type: 'desktopPath', path: 'C:\\chosen\\portrait.jpg' },
+            displayName: 'portrait.jpg',
+            destination: { kind: 'current-character-image', characterId: 'character-1' },
+        }, {}, deps)).rejects.toEqual(expect.objectContaining({
+            name: 'NativeFileJobActivationCommittedError',
+            code: 'activation-committed-refresh-failed',
+            committedRevision: 8,
+            recoveryRequired: true,
+        } satisfies Partial<NativeFileJobActivationCommittedError>))
+
+        expect(deps.invoke).not.toHaveBeenCalledWith('native_file_job_forget', {
+            jobId: 'jpeg-job',
+        })
+        const acquiredFence = await vi.mocked(deps.acquireFence).mock.results[0].value
+        expect(acquiredFence.release).toHaveBeenCalledOnce()
     })
 })
