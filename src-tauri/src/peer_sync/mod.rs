@@ -1,5 +1,5 @@
 mod android_client;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 mod android_jni;
 mod client;
 #[cfg(desktop)]

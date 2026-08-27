@@ -232,6 +232,13 @@ impl LanCloneClient {
         &self.session_url
     }
 
+    pub(crate) fn target_identity(&self) -> Result<(&str, &str, &str), PeerSyncError> {
+        let manifest_id = self.manifest_id.as_deref().ok_or_else(|| {
+            PeerSyncError::Protocol("LAN clone manifest identity is missing".to_owned())
+        })?;
+        Ok((&self.endpoint, &self.session_id, manifest_id))
+    }
+
     pub(crate) fn matches_target(
         &self,
         endpoint: &str,

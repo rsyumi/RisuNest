@@ -1155,6 +1155,367 @@ fn android_clone_cancel_cannot_be_downgraded_by_a_late_pause() {
     );
 }
 
+#[test]
+fn android_clone_registry_recovers_one_persisted_job_without_exposing_the_bearer() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+    assert_eq!(claimed.phase, AndroidCloneJobPhase::Ready);
+    assert_eq!(claimed.endpoint, endpoint);
+    assert_eq!(claimed.session_id, pairing.session_id);
+    assert_eq!(claimed.manifest_id, pairing.manifest_id);
+    assert!(!serde_json::to_string(&claimed).unwrap().contains("bearer"));
+    drop(registry);
+
+    let reopened =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    assert_eq!(reopened.current().unwrap(), Some(claimed));
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    fs::write(
+        app_root
+            .path()
+            .join("peer-clone-jobs")
+            .join(&claimed.job_id)
+            .join("status.json"),
+        serde_json::to_vec(&json!({
+            "schema": "risunest.android-peer-clone-status/v1",
+            "phase": "downloading",
+            "completedBytes": 1,
+            "totalBytes": 64,
+            "error": null,
+            "committedRevision": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.current().unwrap().unwrap().phase,
+        AndroidCloneJobPhase::Downloading
+    );
+    drop(registry);
+
+    let reopened =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    assert_eq!(
+        reopened.current().unwrap().unwrap().phase,
+        AndroidCloneJobPhase::Paused
+    );
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_removes_a_pre_ownership_partial_claim_after_restart() {
+    let app_root = tempfile::tempdir().unwrap();
+    let job_id = "11111111-1111-4111-8111-111111111111";
+    let job_root = app_root.path().join("peer-clone-jobs").join(job_id);
+    fs::create_dir_all(&job_root).unwrap();
+
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+
+    assert!(registry.current().unwrap().is_none());
+    assert!(!job_root.exists());
+}
+
+#[test]
+fn android_clone_registry_recovers_a_renamed_deletion_tombstone() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    drop(registry);
+    let jobs_root = app_root.path().join("peer-clone-jobs");
+    let tombstone = jobs_root.join(format!(".deleting-{}", claimed.job_id));
+    fs::rename(jobs_root.join(&claimed.job_id), &tombstone).unwrap();
+    let sibling = jobs_root.join("sibling.keep");
+    fs::write(&sibling, b"keep").unwrap();
+
+    let reopened =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+
+    assert!(reopened.current().unwrap().is_none());
+    assert!(!tombstone.exists());
+    assert!(!jobs_root.join("current.json").exists());
+    assert_eq!(fs::read(sibling).unwrap(), b"keep");
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_rejects_a_second_target_until_the_owned_job_is_resolved() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+    let error = registry
+        .claim(
+            &endpoint,
+            "22222222-2222-4222-8222-222222222222",
+            &"c".repeat(64),
+            &"d".repeat(64),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, PeerSyncError::Validation(_)));
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_marks_a_transport_interruption_paused_for_foreground_resume() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    host.stop().unwrap();
+
+    assert!(matches!(
+        registry.download(&claimed.job_id, &TransferCancellation::new()),
+        Err(PeerSyncError::Transport(_))
+    ));
+    assert_eq!(
+        registry.current().unwrap().unwrap().phase,
+        AndroidCloneJobPhase::Paused
+    );
+}
+
+#[test]
+fn android_clone_registry_reclaims_a_durable_cancel_marker_during_restart() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    registry.request_cancel(&claimed.job_id).unwrap();
+    drop(registry);
+
+    let reopened =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+
+    assert!(reopened.current().unwrap().is_none());
+    assert!(!app_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(claimed.job_id)
+        .exists());
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_waits_for_explicit_lossless_activation_and_cleans_after_commit() {
+    let source_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source_cas = crate::asset_repository::PayloadCas::new(source_root.path()).unwrap();
+    let target_cas = crate::asset_repository::PayloadCas::new(target_root.path()).unwrap();
+    let mut source_store =
+        crate::persistent_store::PersistentStore::open(source_root.path()).unwrap();
+    let mut target_store =
+        crate::persistent_store::PersistentStore::open(target_root.path()).unwrap();
+    seed_android_product_store(&mut source_store, "Source");
+    seed_android_product_store(&mut target_store, "Target");
+    let prepared = prepare_lossless_clone_session(
+        &mut source_store,
+        &source_cas,
+        1,
+        &source_root.path().join("preparation"),
+        &source_root.path().join("session"),
+        &crate::local_backup::NeverCancelled,
+    )
+    .unwrap();
+    let mut host = LanCloneHost::prepare(prepared);
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+    registry
+        .download(&claimed.job_id, &TransferCancellation::new())
+        .unwrap();
+    let verified_job_root = target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id);
+    let verified_job = AndroidResumableCloneJob::open(&verified_job_root).unwrap();
+    assert!(!verified_job.request_cancel_for_platform_stop().unwrap());
+    assert!(!verified_job_root.join("cancel.requested").exists());
+
+    drop(registry);
+    host.stop().unwrap();
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+
+    assert_eq!(
+        registry.current().unwrap().unwrap().phase,
+        AndroidCloneJobPhase::VerifiedAwaitingActivation
+    );
+    assert_eq!(target_store.revision().unwrap(), 1);
+    assert_eq!(
+        target_store.read_root(None).unwrap().value["username"],
+        "Target"
+    );
+
+    let revision = registry
+        .finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &target_root.path().join("peer-clone-activation"),
+            1,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+
+    assert_eq!(revision, 2);
+    assert_eq!(
+        target_store.read_root(None).unwrap().value["username"],
+        "Source"
+    );
+    let committed = registry.current().unwrap().unwrap();
+    assert_eq!(committed.committed_revision, Some(2));
+    assert!(target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id)
+        .exists());
+    assert_eq!(
+        registry.request_cancel(&claimed.job_id).unwrap_err(),
+        PeerSyncError::AlreadyActivated
+    );
+
+    registry.release(&claimed.job_id).unwrap();
+
+    assert!(registry.current().unwrap().is_none());
+    assert!(!target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id)
+        .exists());
+}
+
+fn seed_android_product_store(
+    store: &mut crate::persistent_store::PersistentStore,
+    username: &str,
+) {
+    let staging = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(
+            &staging,
+            &json!({
+                "username": username,
+                "botPresetsId": 0,
+                "personas": [{ "id": "persona" }],
+                "selectedPersona": 0,
+                "enabledModules": [],
+                "characterOrder": [],
+                "modules": [],
+                "loadouts": [],
+                "plugins": [],
+                "pluginCustomStorage": {},
+            }),
+        )
+        .unwrap();
+    store
+        .replace_put_presets(&staging, &[json!({ "name": "preset" })])
+        .unwrap();
+    store.replace_commit(&staging, Some(0)).unwrap();
+}
+
 fn assert_lan_stop_is_bounded(mut host: LanCloneHost, stalled: TcpStream) {
     const STOP_DEADLINE: Duration = Duration::from_secs(1);
     let (result_tx, result_rx) = mpsc::channel();
