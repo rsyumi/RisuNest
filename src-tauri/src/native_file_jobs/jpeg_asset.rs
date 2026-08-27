@@ -174,6 +174,27 @@ fn update_character_image(
 }
 
 pub(super) fn import_jpeg_asset(
+    source: OpenedJobSource,
+    display_name: &str,
+    destination: JpegAssetDestination,
+    expected_revision: i64,
+    repository_root: &std::path::Path,
+    store: PersistentStore,
+    job: &JobControl,
+) -> Result<JobResultSummary, NativeJobError> {
+    import_jpeg_asset_with_before_commit(
+        source,
+        display_name,
+        destination,
+        expected_revision,
+        repository_root,
+        store,
+        job,
+        || Ok(()),
+    )
+}
+
+fn import_jpeg_asset_with_before_commit(
     mut source: OpenedJobSource,
     display_name: &str,
     destination: JpegAssetDestination,
@@ -181,6 +202,7 @@ pub(super) fn import_jpeg_asset(
     repository_root: &std::path::Path,
     mut store: PersistentStore,
     job: &JobControl,
+    before_commit: impl FnOnce() -> Result<(), NativeJobError>,
 ) -> Result<JobResultSummary, NativeJobError> {
     job.start(JobPhase::ReadingSource)
         .map_err(|error| job_state_error(job, error))?;
@@ -289,6 +311,7 @@ pub(super) fn import_jpeg_asset(
             .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
         job.set_phase(JobPhase::ActivatingDatabase)
             .map_err(|error| job_state_error(job, error))?;
+        before_commit()?;
         let committed = store
             .commit_with_asset_aliases(
                 &WorkingSetCommit {
@@ -316,6 +339,7 @@ pub(super) fn import_jpeg_asset(
             warning_codes: Vec::new(),
             handoff_path: None,
             recovery_path: None,
+            publication: None,
         })
     })();
 
@@ -340,11 +364,13 @@ pub(super) fn import_jpeg_asset(
 mod tests {
     use super::super::JobKind;
     use super::*;
+    use crate::asset_repository::job_pins::collect_durable_cas_job_roots;
     use crate::asset_repository::owner_manifest_codec::{
         encode_owner_manifest, OwnerManifestEntry,
     };
     use crate::persistent_store::{AssetOwnerHead, PersistentStore};
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Cursor, Write};
     use zip::write::FileOptions;
@@ -668,5 +694,87 @@ mod tests {
                 .value,
             owner_head
         );
+    }
+
+    #[test]
+    fn final_revision_race_preserves_destination_and_releases_durable_cas_root() {
+        let (directory, store, character_id, owner_head) = open_fixture();
+        let bytes = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+        let object_hash = hex::encode(Sha256::digest(bytes));
+        let source_path = directory.path().join("portrait.jpeg");
+        fs::write(&source_path, bytes).expect("write JPEG source");
+        let job = job();
+        let job_id = job.id();
+
+        let error = import_jpeg_asset_with_before_commit(
+            opened_source(&source_path, bytes.len() as u64),
+            "portrait.jpeg",
+            JpegAssetDestination::CurrentCharacterImage {
+                character_id: character_id.clone(),
+            },
+            2,
+            directory.path(),
+            store,
+            &job,
+            || {
+                let mut racing_store =
+                    PersistentStore::open(directory.path()).expect("open racing store");
+                let mut root = racing_store
+                    .read_root(None)
+                    .expect("read racing root")
+                    .value;
+                root["username"] = Value::String("revision-race".to_owned());
+                racing_store
+                    .commit(&WorkingSetCommit {
+                        expected_revision: 2,
+                        root: Some(root),
+                        replace_presets: None,
+                        character: None,
+                        character_details: None,
+                        replace_character: None,
+                        add_character: None,
+                        conversations: None,
+                        delete_character_id: None,
+                        plugin_storage: None,
+                        asset_owner_heads: None,
+                    })
+                    .expect("win final revision race");
+                Ok(())
+            },
+        )
+        .expect_err("reject stale JPEG activation");
+
+        assert_eq!(error.code, "revision-conflict");
+        let reopened = PersistentStore::open(directory.path()).expect("reopen store");
+        assert_eq!(reopened.revision().expect("read revision"), 3);
+        assert_eq!(
+            reopened
+                .read_character(&character_id, None)
+                .expect("read character")
+                .expect("character")
+                .value["image"],
+            "assets/previous.png"
+        );
+        assert_eq!(
+            reopened
+                .read_asset_owner_head(&owner_head.owner, None)
+                .expect("read owner head")
+                .expect("owner head")
+                .value,
+            owner_head
+        );
+        assert!(!directory
+            .path()
+            .join("assets-v2")
+            .join("job-pins")
+            .join(format!("job-{job_id}.journal"))
+            .exists());
+        let durable_roots = collect_durable_cas_job_roots(directory.path());
+        assert!(!durable_roots.object_hashes.contains(&object_hash));
+        let gc = reopened
+            .asset_gc_dry_run(16, None, i64::MAX, 0)
+            .expect("classify abandoned JPEG object")
+            .report;
+        assert!(gc.potential_delete_hashes.contains(&object_hash));
     }
 }
