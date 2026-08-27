@@ -1247,31 +1247,26 @@ export class SaveCoordinator {
                     if (!previous) uniqueAliases.set(alias.key, canonicalClone(alias))
                 }
                 const uniqueAliasValues = [...uniqueAliases.values()]
-                const existingAliases = new Map<string, AssetAlias>()
                 for (let index = 0; index < uniqueAliasValues.length; index += 512) {
                     signal?.throwIfAborted()
-                    const keys = uniqueAliasValues
-                        .slice(index, index + 512)
-                        .map((alias) => alias.key)
+                    const batchAliases = uniqueAliasValues.slice(index, index + 512)
+                    const keys = batchAliases.map((alias) => alias.key)
                     const existing = await reader.readAssetAliasesByKeys('asset', keys)
                     signal?.throwIfAborted()
                     this.assertReadRevision(revision, existing.revision)
-                    for (const alias of existing.value) existingAliases.set(alias.key, alias)
-                }
-                for (const alias of uniqueAliasValues) {
-                    signal?.throwIfAborted()
-                    const existing = existingAliases.get(alias.key)
-                    if (!existing) {
-                        aliases.push(alias)
-                        continue
-                    }
-                    if (
-                        existing.objectHash !== alias.objectHash
-                        || existing.size !== alias.size
-                    ) {
-                        throw new PersistentRootModuleAppendRejectedError(
-                            `Imported module alias conflicts with existing ${alias.key}`,
-                        )
+                    const existingByKey = new Map(existing.value.map((alias) => [alias.key, alias]))
+                    for (const alias of batchAliases) {
+                        signal?.throwIfAborted()
+                        const stored = existingByKey.get(alias.key)
+                        if (!stored) {
+                            aliases.push(alias)
+                            continue
+                        }
+                        if (stored.objectHash !== alias.objectHash || stored.size !== alias.size) {
+                            throw new PersistentRootModuleAppendRejectedError(
+                                `Imported module alias conflicts with existing ${alias.key}`,
+                            )
+                        }
                     }
                 }
                 const modules = Array.isArray(root.modules) ? root.modules : []

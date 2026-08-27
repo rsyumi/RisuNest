@@ -650,6 +650,10 @@ describe('SaveCoordinator', () => {
         expect(readAssetAliasesByKeys).toHaveBeenCalledOnce()
         expect(commit.mock.calls[0][0].assetAliases).toEqual([])
 
+        const conflictingReadAssetAliasesByKeys = vi.fn(async () => ({
+            revision: 7,
+            value: [{ ...existing, objectHash: 'b'.repeat(64) }],
+        }))
         const conflictingCoordinator = new SaveCoordinator({
             store: {
                 ...store,
@@ -657,10 +661,7 @@ describe('SaveCoordinator', () => {
                     revision: 7,
                     readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                     readAssetOwnerHead: vi.fn(async () => null),
-                    readAssetAliasesByKeys: vi.fn(async () => ({
-                        revision: 7,
-                        value: [{ ...existing, objectHash: 'b'.repeat(64) }],
-                    })),
+                    readAssetAliasesByKeys: conflictingReadAssetAliasesByKeys,
                     release: vi.fn(async () => undefined),
                 })),
             } as unknown as PersistentDataStore,
@@ -672,9 +673,17 @@ describe('SaveCoordinator', () => {
 
         await expect(conflictingCoordinator.appendPersistentRootModule('native-risum-import', {
             module: { id: 'conflict', name: 'Conflict', description: '' },
-            assetAliases: [incoming],
+            assetAliases: [
+                incoming,
+                ...Array.from({ length: 512 }, (_, index) => ({
+                    ...incoming,
+                    key: `assets/conflict-${index}.bin`,
+                    objectHash: index.toString(16).padStart(64, '0'),
+                })),
+            ],
             ownerHead: { present: false, manifestHash: null, entryCount: 0 },
         })).rejects.toThrow(/alias conflicts/i)
+        expect(conflictingReadAssetAliasesByKeys).toHaveBeenCalledOnce()
     })
 
     it('looks up 513 unique aliases in stable batches and commits only missing aliases', async () => {
