@@ -41,6 +41,8 @@
     import type { DeepReadonly, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import { safeStructuredClone } from 'src/ts/polyfill'
     import type { ConversationViewportRow } from 'src/ts/conversationViewportSource'
+    import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
+    import type { character as CharacterRecord, groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -82,6 +84,7 @@
         viewportRow?: ConversationViewportRow;
         captureViewportTarget?: () => CapturedChatMessageTarget | null;
         bookmarked?: boolean;
+        parserProjection?: BoundedLiveChatParserProjection;
     }
 
     let {
@@ -115,6 +118,7 @@
         viewportRow,
         captureViewportTarget,
         bookmarked,
+        parserProjection,
     }: Props = $props();
 
     let editDraft = $state(message)
@@ -155,19 +159,25 @@
                     ?.message?.[idx]?.role ?? role,
     )
 
-    function captureParserChara() {
-        const character = captureContext?.parserContext.character
+    function parserContext() {
+        return captureContext?.parserContext ?? parserProjection?.context.parserContext
+    }
+
+    function parserChara(): string | CharacterRecord | GroupChatRecord {
+        const character = parserContext()?.character as CharacterRecord | GroupChatRecord
         return character?.type === 'group' ? name : character
     }
 
-    function captureParserArgs() {
-        if (!captureContext) return {}
-        const parser = captureContext.parserContext
+    function parserArgs() {
+        const parser = parserContext()
+        if (!parser) return {}
         return {
             db: parser.database,
-            chara: captureParserChara(),
+            chara: parserChara(),
             chatID: idx,
-            projectedChatID: captureParserIndex,
+            projectedChatID: captureContext
+                ? captureParserIndex
+                : parserProjection?.projectedChatID,
             historyOffset: parser.historyOffset,
             userName: parser.userName,
             personaPrompt: parser.personaPrompt,
@@ -178,7 +188,7 @@
             globalChatVariables: parser.globalChatVariables,
             currentTime: parser.currentTime,
             triggerId: parser.triggerId,
-            role: captureMessage?.role,
+            role: captureMessage?.role ?? presentedRole,
         } as unknown as Parameters<typeof risuChatParser>[1]
     }
 
@@ -296,9 +306,29 @@
             return msgDisplay
         }
         if(!DBState.db.legacyTranslation){
-            return await ParseMarkdown(msgDisplay, character, 'pretranslate', idx, getCbsCondition())
+            return await ParseMarkdown(
+                msgDisplay,
+                parserProjection ? parserChara() : character,
+                'pretranslate',
+                idx,
+                getCbsCondition(),
+                parserProjection ? {
+                    scriptContext: parserProjection.context,
+                    projectedChatID: parserProjection.projectedChatID,
+                } : undefined,
+            )
         }
-        return await ParseMarkdown(msgDisplay, character, 'notrim', idx, getCbsCondition())
+        return await ParseMarkdown(
+            msgDisplay,
+            parserProjection ? parserChara() : character,
+            'notrim',
+            idx,
+            getCbsCondition(),
+            parserProjection ? {
+                scriptContext: parserProjection.context,
+                projectedChatID: parserProjection.projectedChatID,
+            } : undefined,
+        )
     }
 
     async function loadTranslationForEdit() {
@@ -321,7 +351,7 @@
             rmVar: true,
             visualize: true,
             cbsConditions: getCbsCondition(),
-            ...captureParserArgs(),
+            ...parserArgs(),
         })
     }
 
@@ -368,7 +398,7 @@
             const parser = new DOMParser()
             const doc = parser.parseFromString(risuChatParser(html ?? '', {
                 cbsConditions: getCbsCondition(),
-                ...captureParserArgs(),
+                ...parserArgs(),
             }), 'text/html')
             return doc.body   
         } catch (error) {
@@ -608,7 +638,8 @@
                     {onCaptureSettled}
                     {onCaptureError}
                     {captureContext}
-                    {captureParserIndex} />
+                    {captureParserIndex}
+                    {parserProjection} />
             {/key}
             {#if !captureContext && idx >= 0 && !editMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
                 <PartialEditController
@@ -674,7 +705,14 @@
     {#if DBState.db.useChatCopy && !blankMessage}
     <button class="flex items-center hover:text-blue-500 transition-colors button-icon-copy" onclick={async ()=>{
         const copyText = renderRawStreaming
-            ? risuChatParser(rawStreamingText, {chara: name, chatID: idx, rmVar: true, visualize: true, cbsConditions: getCbsCondition()})
+            ? risuChatParser(rawStreamingText, {
+                chara: name,
+                chatID: idx,
+                rmVar: true,
+                visualize: true,
+                cbsConditions: getCbsCondition(),
+                ...parserArgs(),
+            })
             : msgDisplay
         if(window.navigator.clipboard.write){
             try {
@@ -686,11 +724,15 @@
                 const doc = parser.parseFromString(
                     await ParseMarkdown(
                         copyText,
-                        getCurrentCharacter(),
+                        parserProjection ? parserChara() : getCurrentCharacter(),
                         'normal',
                         idx,
                         getCbsCondition(),
-                        { deferredInlays },
+                        {
+                            deferredInlays,
+                            scriptContext: parserProjection?.context,
+                            projectedChatID: parserProjection?.projectedChatID,
+                        },
                     )
                 , 'text/html')
                 await withResolvedDeferredInlaySources(doc, deferredInlays, async () => {

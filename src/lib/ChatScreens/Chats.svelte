@@ -30,9 +30,15 @@
     import type {
         ConversationViewportPin as ConversationSourcePin,
         ConversationViewportKey,
+        ConversationViewportRow,
         ConversationViewportSnapshot,
         ConversationViewportSource,
     } from 'src/ts/conversationViewportSource'
+    import type {
+        BoundedLiveChatParserProjection,
+        LiveChatParserProjection,
+        LiveChatParserProjectionResolver,
+    } from 'src/ts/selectedConversationLiveParserProjection'
 
     let {
         messages,
@@ -47,6 +53,7 @@
         userIcon,
         userIconPortrait,
         viewportSource = null,
+        parserProjectionResolver,
         hasNewUnreadMessage = $bindable(false),
     }: {
         messages?: Message[]
@@ -61,12 +68,14 @@
         userIcon: string
         userIconPortrait?: boolean
         viewportSource?: ConversationViewportSource | null
+        parserProjectionResolver?: LiveChatParserProjectionResolver
         hasNewUnreadMessage?: boolean
     } = $props()
 
     const ESTIMATED_MESSAGE_HEIGHT = 256
     const VIEWPORT_OVERSCAN = 8
     const MEASURED_HEIGHT_CACHE_LIMIT = 256
+    const PARSER_PROJECTION_RETRY_DELAY_MS = 250
 
     type ChatInstance = {
         updateStreamingDisplay?: (state: {
@@ -91,6 +100,20 @@
     let playingMedia = new Map<string, Set<EventTarget>>()
     let sourcePins = new Map<string, ConversationSourcePin>()
     let sourceLoads = new Map<string, AbortController>()
+    interface RowParserProjectionState {
+        readonly controller: AbortController
+        readonly navigationGeneration: number
+        readonly source: ConversationViewportSource
+        readonly sourceToken: string
+        readonly sourceVersion: number
+        readonly row: ConversationViewportRow
+        readonly totalMessages: number
+        readonly renderSignature: ChatRenderSignature
+        projection: LiveChatParserProjection | null
+        failed: boolean
+        retryTimer: ReturnType<typeof setTimeout> | null
+    }
+    let rowParserProjections = new Map<string, RowParserProjectionState>()
     let sourceUnsubscribe: (() => void) | null = null
     let activeViewportSource: ConversationViewportSource | null = null
     let sourceUpdateRevision = $state(0)
@@ -719,9 +742,26 @@
                 parserCharacterStamp,
             })
             const previousSignature = renderSignatures.get(key)
+            let parserProjection: BoundedLiveChatParserProjection | undefined
+            if (sourceSnapshot && viewportRow && activeViewportSource && parserProjectionResolver) {
+                const projectionState = ensureRowParserProjection(
+                    key,
+                    viewportRow,
+                    totalMessages,
+                    renderSignature,
+                    sourceSnapshot,
+                )
+                if (!projectionState.projection) {
+                    orderedElements.push(element)
+                    continue
+                }
+                if (projectionState.projection.kind === 'bounded') {
+                    parserProjection = projectionState.projection
+                }
+            }
             if (!areChatRenderSignaturesEqual(previousSignature, renderSignature)) {
                 const source = activeViewportSource
-                releaseRowRuntimeState(key)
+                releaseRowRuntimeState(key, true)
                 unmountInstance(key)
                 element.replaceChildren()
                 const instance = mount(Chat, {
@@ -750,6 +790,7 @@
                         isOptimizedStreamingMessage: activeStreamingMessage,
                         streamingOptimizationMode: performanceMode,
                         rawStreamingText: message.data,
+                        parserProjection,
                     },
                 })
                 mountInstances.set(key, instance)
@@ -875,7 +916,8 @@
         renderSignatures.delete(key)
     }
 
-    function releaseRowRuntimeState(key: string): void {
+    function releaseRowRuntimeState(key: string, preserveParserProjection = false): void {
+        if (!preserveParserProjection) releaseRowParserProjection(key)
         const media = playingMedia.get(key)
         playingMedia.delete(key)
         pinReasons.delete(key)
@@ -887,6 +929,102 @@
                 // The component teardown below remains the resource owner.
             }
         }
+    }
+
+    function ensureRowParserProjection(
+        key: string,
+        row: ConversationViewportRow,
+        totalMessages: number,
+        renderSignature: ChatRenderSignature,
+        sourceSnapshot: ConversationViewportSnapshot,
+    ): RowParserProjectionState {
+        const source = activeViewportSource!
+        const existing = rowParserProjections.get(key)
+        if (
+            existing
+            && existing.source === source
+            && existing.sourceToken === sourceSnapshot.sourceToken
+            && existing.sourceVersion === sourceSnapshot.version
+            && existing.row.key === row.key
+            && existing.row.absoluteIndex === row.absoluteIndex
+            && existing.row.sourceVersion === row.sourceVersion
+            && existing.totalMessages === totalMessages
+            && areChatRenderSignaturesEqual(existing.renderSignature, renderSignature)
+        ) return existing
+
+        releaseRowRuntimeState(key)
+        unmountInstance(key)
+        renderSignatures.delete(key)
+        const controller = new AbortController()
+        const state: RowParserProjectionState = {
+            controller,
+            navigationGeneration,
+            source,
+            sourceToken: sourceSnapshot.sourceToken,
+            sourceVersion: sourceSnapshot.version,
+            row,
+            totalMessages,
+            renderSignature,
+            projection: null,
+            failed: false,
+            retryTimer: null,
+        }
+        rowParserProjections.set(key, state)
+        void parserProjectionResolver!.resolve({
+            row,
+            totalMessages,
+            signal: controller.signal,
+            isCurrent: () => isRowParserProjectionCurrent(key, state),
+        }).then((projection) => {
+            if (!isRowParserProjectionCurrent(key, state)) {
+                if (projection.kind === 'complete') projection.release()
+                return
+            }
+            state.projection = projection
+            reconcileViewport()
+        }).catch(() => {
+            if (!isRowParserProjectionCurrent(key, state)) return
+            state.failed = true
+            state.retryTimer = setTimeout(() => {
+                if (!isRowParserProjectionCurrent(key, state)) return
+                rowParserProjections.delete(key)
+                state.controller.abort()
+                reconcileViewport()
+            }, PARSER_PROJECTION_RETRY_DELAY_MS)
+        })
+        return state
+    }
+
+    function isRowParserProjectionCurrent(
+        key: string,
+        state: RowParserProjectionState,
+    ): boolean {
+        if (
+            state.controller.signal.aborted
+            || rowParserProjections.get(key) !== state
+            || navigationGeneration !== state.navigationGeneration
+            || activeViewportSource !== state.source
+        ) return false
+        const snapshot = currentSourceSnapshot()
+        if (
+            !snapshot
+            || snapshot.sourceToken !== state.sourceToken
+            || snapshot.version !== state.sourceVersion
+            || snapshot.totalMessages !== state.totalMessages
+        ) return false
+        const currentRow = snapshot.rowAt(state.row.absoluteIndex)
+        return currentRow?.key === state.row.key
+            && currentRow.sourceVersion === state.row.sourceVersion
+    }
+
+    function releaseRowParserProjection(key: string): void {
+        const state = rowParserProjections.get(key)
+        if (!state) return
+        rowParserProjections.delete(key)
+        state.controller.abort()
+        if (state.retryTimer !== null) clearTimeout(state.retryTimer)
+        if (state.projection?.kind === 'complete') state.projection.release()
+        state.projection = null
     }
 
     function clearMountedRows(): void {

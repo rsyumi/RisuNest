@@ -12,6 +12,8 @@
     import { onDestroy, tick } from 'svelte'
     import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
+    import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
+    import type { character as CharacterRecord, groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -31,6 +33,7 @@
         onCaptureError?: (generation: number, error: unknown) => void
         captureContext?: FrozenChatScreenshotRenderContext
         captureParserIndex?: number
+        parserProjection?: BoundedLiveChatParserProjection
     }
 
     let {
@@ -51,6 +54,7 @@
         onCaptureError,
         captureContext,
         captureParserIndex = idx,
+        parserProjection,
     }: Props =  $props()
 
     // svelte-ignore non_reactive_update
@@ -74,12 +78,23 @@
     let activeParseJob: ChatBodyParseJob|null = null
     let parseGeneration = 0
 
-    function captureParserChara() {
+    function parserChara(): string | CharacterRecord | GroupChatRecord {
         const parserCharacter = captureContext?.parserContext.character
-        return parserCharacter?.type === 'group' ? name : parserCharacter
+            ?? parserProjection?.context.parserContext.character
+        const character = parserCharacter as CharacterRecord | GroupChatRecord
+        return character?.type === 'group' ? name : character
     }
 
-    function captureScriptContext(): ProcessScriptCaptureContext | undefined {
+    function parserScriptContext(): ProcessScriptCaptureContext | undefined {
+        if (parserProjection) {
+            return {
+                ...parserProjection.context,
+                parserContext: {
+                    ...parserProjection.context.parserContext,
+                    chara: parserChara(),
+                },
+            }
+        }
         if (!captureContext) return undefined
         return {
             presetRegex: captureContext.presetRegex,
@@ -89,18 +104,20 @@
             dynamicAssetsEditDisplay: captureContext.settings.dynamicAssetsEditDisplay,
             parserContext: {
                 ...captureContext.parserContext,
-                chara: captureParserChara(),
+                chara: parserChara(),
             },
         } as ProcessScriptCaptureContext
     }
 
-    function captureTranslationContext(): TranslateHTMLContext | undefined {
-        const scriptContext = captureScriptContext()
+    function parserTranslationContext(): TranslateHTMLContext | undefined {
+        const scriptContext = parserScriptContext()
         if (!scriptContext) return undefined
         return {
             scriptContext,
-            projectedChatID: captureParserIndex,
-            chara: captureParserChara() as unknown as TranslateHTMLContext['chara'],
+            projectedChatID: captureContext
+                ? captureParserIndex
+                : parserProjection?.projectedChatID ?? idx,
+            chara: parserChara() as unknown as TranslateHTMLContext['chara'],
             cbsConditions: getCbsCondition(),
         }
     }
@@ -118,13 +135,18 @@
     }
 
     function finalizeParsedMarkup(value: string) {
-        const trimmed = captureContext
+        const settings = captureContext?.settings ?? DBState.db
+        const scriptContext = parserScriptContext()
+        const projectedChatID = captureContext
+            ? captureParserIndex
+            : parserProjection?.projectedChatID
+        const trimmed = scriptContext
             ? trimMarkdown(value, {
-                hideAllImages: captureContext.settings.hideAllImages,
-                returnCSSError: captureContext.settings.returnCSSError,
-                parserContext: captureScriptContext()?.parserContext,
+                hideAllImages: settings.hideAllImages,
+                returnCSSError: settings.returnCSSError,
+                parserContext: scriptContext.parserContext,
                 chatID: idx,
-                projectedChatID: captureParserIndex,
+                projectedChatID,
                 cbsConditions: getCbsCondition(),
             })
             : trimMarkdown(value)
@@ -152,23 +174,26 @@
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
+        const renderCharacter = parserProjection ? parserChara() : charArg
         const translationCharacter = (
-            captureContext?.character ?? charArg
+            captureContext?.character ?? (parserProjection ? parserChara() : charArg)
         ) as string | simpleCharacterArgument
         const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
-            ParseMarkdown(value, charArg, mode, chatID, getCbsCondition(), {
+            ParseMarkdown(value, renderCharacter, mode, chatID, getCbsCondition(), {
                 deferredInlays: job.deferredInlays,
-                moduleAssets: captureContext?.moduleAssets,
+                moduleAssets: captureContext?.moduleAssets ?? parserProjection?.context.moduleAssets,
                 assetWidth: captureContext?.settings.assetWidth,
                 hideAllImages: captureContext?.settings.hideAllImages,
                 legacyMediaFindings: captureContext?.settings.legacyMediaFindings,
                 assetMaxDifference: captureContext?.settings.assetMaxDifference,
                 characterImageSource: captureContext?.characterImageSource,
                 userImageSource: captureContext?.userImageSource,
-                scriptContext: captureScriptContext(),
+                scriptContext: parserScriptContext(),
                 markdownSettings: captureMarkdownSettings(),
                 returnCSSError: captureContext?.settings.returnCSSError,
-                projectedChatID: captureContext ? captureParserIndex : undefined,
+                projectedChatID: captureContext
+                    ? captureParserIndex
+                    : parserProjection?.projectedChatID,
             })
         )
         // track 'translated' and 'retranslate' state
@@ -232,7 +257,7 @@
                         translationCharacter,
                         chatID,
                         retranslate,
-                        captureTranslationContext(),
+                        parserTranslationContext(),
                     )
                     translating = false
                     const marked = await parseForRender(data, mode)
@@ -249,7 +274,7 @@
                         translationCharacter,
                         chatID,
                         retranslate,
-                        captureTranslationContext(),
+                        parserTranslationContext(),
                     ), captureMarkdownSettings())
                     translating = false
                     lastParsedQueue = translated
@@ -265,7 +290,7 @@
                         translationCharacter,
                         chatID,
                         retranslate,
-                        captureTranslationContext(),
+                        parserTranslationContext(),
                     )
                     translating = false
                     lastParsedQueue = translated

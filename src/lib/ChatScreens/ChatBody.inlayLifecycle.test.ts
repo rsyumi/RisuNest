@@ -553,6 +553,61 @@ describe('ChatBody deferred inlay lifecycle', () => {
         )
     })
 
+    test('passes a bounded live parser projection with absolute and projected indices', async () => {
+        parserMocks.ParseMarkdown.mockResolvedValue('<span>projected</span>')
+        const capture = minimalCaptureContext()
+        capture.parserContext.historyOffset = 4
+        capture.parserContext.character.chats[0].message = [
+            { role: 'char', data: 'previous' },
+            { role: 'user', data: 'nearby' },
+            { role: 'char', data: 'current' },
+        ]
+        capture.parserContext.database.characters[0] = capture.parserContext.character
+        const parserProjection = {
+            kind: 'bounded' as const,
+            characterId: 'frozen-character',
+            conversationId: 'conversation',
+            revision: 1,
+            totalMessages: 7,
+            chatID: 6,
+            projectedChatID: 2,
+            historyOffset: 4,
+            messages: capture.parserContext.character.chats[0].message,
+            context: {
+                presetRegex: capture.presetRegex,
+                moduleRegexScripts: capture.moduleRegexScripts,
+                moduleAssets: capture.moduleAssets,
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                parserContext: capture.parserContext,
+            },
+        }
+
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                idx: 6,
+                name: 'Projected Character',
+                parserProjection: parserProjection as any,
+            },
+        })
+
+        await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalled())
+        expect(parserMocks.ParseMarkdown.mock.calls[0]).toEqual([
+            'first',
+            expect.objectContaining({ chaId: 'frozen-character' }),
+            'notrim',
+            6,
+            expect.objectContaining({ chatRole: 'char' }),
+            expect.objectContaining({
+                projectedChatID: 2,
+                scriptContext: expect.objectContaining({
+                    parserContext: expect.objectContaining({ historyOffset: 4 }),
+                }),
+            }),
+        ])
+    })
+
     test('does not report capture settled after a pending body is destroyed', async () => {
         const pendingParse = deferred<string>()
         parserMocks.ParseMarkdown.mockReturnValue(pendingParse.promise)

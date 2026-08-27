@@ -12,6 +12,7 @@ const parserCalls = vi.hoisted(() => [] as Array<{
     role?: string
     chatID?: number
     projectedChatID?: number
+    historyOffset?: number
 }>)
 
 vi.mock('./ChatBody.svelte', async () => ({
@@ -47,6 +48,7 @@ vi.mock('src/ts/process/scripts', () => ({
             role: arg.role,
             chatID: arg.chatID,
             projectedChatID: arg.projectedChatID,
+            historyOffset: (arg as any).historyOffset,
         })
         if (!value.includes('{{char}}')) return value
         if (typeof arg.chara === 'string') return value.replaceAll('{{char}}', arg.chara)
@@ -89,6 +91,7 @@ vi.mock('src/ts/process/files/inlayRenderSource', () => ({
 }))
 vi.mock('src/ts/process/files/chatCopyInlays', () => ({ copyImageSourceToDataUrl: vi.fn() }))
 
+import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
 import Chat from './Chat.svelte'
 import ChatCaptureBatchHarness from './ChatCaptureBatchHarness.test.svelte'
 
@@ -404,6 +407,76 @@ describe('Chat frozen capture presentation', () => {
         ).toBe(message.data))
         expect(target.querySelector('[data-chat-id=""]')).not.toBeNull()
         expect(indexReads).not.toHaveBeenCalled()
+    })
+
+    test('uses a bounded live parser projection without capture-only UI semantics', async () => {
+        const projected = context()
+        const parserContext = projected.parserContext as ProcessScriptCaptureContext['parserContext']
+        parserContext.historyOffset = 4
+        parserContext.character.chats[0].message = [
+            { role: 'char', data: 'previous' },
+            { role: 'user', data: 'nearby' },
+            { role: 'char', data: '{{char}}' },
+        ] as any
+        parserContext.database.characters[0] = parserContext.character
+        const parserProjection = {
+            kind: 'bounded' as const,
+            characterId: 'frozen',
+            conversationId: parserContext.character.chats[0].id ?? 'live-chat',
+            revision: 1,
+            totalMessages: 7,
+            chatID: 6,
+            projectedChatID: 2,
+            historyOffset: 4,
+            messages: parserContext.character.chats[0].message,
+            context: {
+                presetRegex: projected.presetRegex,
+                moduleRegexScripts: projected.moduleRegexScripts,
+                moduleAssets: projected.moduleAssets,
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                parserContext,
+            },
+        }
+        live.db = {
+            ...live.db,
+            theme: '',
+            clickToEdit: false,
+            characters: [{
+                type: 'character',
+                name: 'Live Character',
+                chaId: 'live-character',
+                chatPage: 0,
+                chats: [{ id: 'live-chat', message: [] }],
+                ttsMode: 'none',
+            }],
+        }
+
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: '{{char}}',
+                name: 'Live Character',
+                role: 'char',
+                idx: 6,
+                totalLength: 7,
+                isLastMemory: false,
+                parserProjection: parserProjection as any,
+            },
+        })
+
+        await vi.waitFor(() => expect(
+            target.querySelector('[data-chat-body-probe]')?.textContent,
+        ).toBe('Frozen Character'))
+        expect(parserCalls).toContainEqual(expect.objectContaining({
+            chatID: 6,
+            projectedChatID: 2,
+            historyOffset: 4,
+        }))
+        expect(target.querySelector('[data-chat-body-probe]')?.getAttribute(
+            'data-parser-projection',
+        )).toBe('bounded')
+        expect(target.querySelector('.button-icon-edit')).not.toBeNull()
     })
 
     test('renders each frozen group turn with the same names as the normal Chat presentation', async () => {

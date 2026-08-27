@@ -5,6 +5,8 @@ export interface ChatProbeMount {
     image: string
     character: unknown
     bookmarked?: boolean
+    parserProjectionKind?: 'bounded'
+    projectedChatID?: number
 }
 
 export interface ChatProbeStreamingUpdate {

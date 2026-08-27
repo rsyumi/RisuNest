@@ -12,7 +12,7 @@
     import { isExpTranslator, translate } from "../../ts/translator/translator";
     import { alertError, alertNormal, showHypaV2Alert } from "../../ts/alert";
     import sendSound from '../../etc/send.mp3'
-    import { processScript } from "src/ts/process/scripts";
+    import { processScript, type ProcessScriptCaptureContext } from "src/ts/process/scripts";
     import { stopTTS } from "src/ts/process/tts";
     import MainMenu from '../UI/MainMenu.svelte';
     import AssetInput from './AssetInput.svelte';
@@ -71,11 +71,18 @@
     import { createAndroidScreenshotArchiveWriter, createNativeScreenshotArchiveWriter, describeScreenshotPublicationError } from 'src/ts/nativeScreenshotArchiveWriter';
     import { isTauri, isTauriAndroid, isTauriDesktop } from 'src/ts/platform';
     import { isAndroidSafFileJobsEnabled } from 'src/ts/storage/androidSafBridge';
-    import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules } from 'src/ts/process/modules';
+    import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules, getModuleTriggers } from 'src/ts/process/modules';
     import { ColorSchemeTypeStore } from 'src/ts/gui/colorscheme';
     import { HideIconStore } from 'src/ts/stores.svelte';
     import { SelectedConversationViewportBinding } from '../../ts/selectedConversationViewportBinding';
     import { isMetadataOnlySelectedConversation } from '../../ts/storage/selectedConversationLifecycle';
+    import { pluginV2 } from '../../ts/plugins/plugins.svelte';
+    import {
+        bindCompleteLiveParserContextAuthority,
+        collectLiveChatParserUnsafeDependencies,
+        createSelectedConversationLiveParserProjectionResolver,
+    } from '../../ts/selectedConversationLiveParserProjection';
+    import type { CurrentChatMessageTarget } from '../../ts/chatMessageUi';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -764,6 +771,67 @@
         }
     }
 
+    function captureCurrentParserConversation(): CurrentChatMessageTarget | null {
+        const character = DBState.db.characters[$selectedCharID]
+        const conversation = character?.chats[character.chatPage]
+        return character && conversation ? { character, conversation } : null
+    }
+
+    function createBoundedLiveParserContext(
+        current: CurrentChatMessageTarget,
+    ): ProcessScriptCaptureContext {
+        return {
+            presetRegex: DBState.db.presetRegex ?? [],
+            moduleRegexScripts: getModuleRegexScripts(),
+            moduleAssets: getModuleAssets(),
+            dynamicAssets: DBState.db.dynamicAssets,
+            dynamicAssetsEditDisplay: DBState.db.dynamicAssetsEditDisplay,
+            parserContext: createCaptureParserContext(
+                current.character,
+                current.conversation,
+            ),
+        }
+    }
+
+    function createCompleteLiveParserContext(
+        current: CurrentChatMessageTarget,
+    ): ProcessScriptCaptureContext {
+        return bindCompleteLiveParserContextAuthority(
+            createBoundedLiveParserContext(current),
+            current,
+        )
+    }
+
+    const liveParserProjectionResolver = createSelectedConversationLiveParserProjectionResolver({
+        runtime: persistentRuntime,
+        maxProjectionMessages: 256,
+        captureCurrent: captureCurrentParserConversation,
+        createBoundedContextSeed: createBoundedLiveParserContext,
+        createCompleteContext: createCompleteLiveParserContext,
+        parserSource: (current) => ({
+            guiHTML: DBState.db.theme === 'customHTML' ? DBState.db.guiHTML : '',
+            presetRegex: DBState.db.presetRegex ?? [],
+            characterRegex: current.character.customscript ?? [],
+            moduleRegex: getModuleRegexScripts(),
+        }),
+        unsafeDependencies: (current) => {
+            const moduleTriggers = getModuleTriggers()
+            const triggers = current.character.type === 'group'
+                ? moduleTriggers
+                : [...(current.character.triggerscript ?? []), ...moduleTriggers]
+            const regexScripts = [
+                ...(DBState.db.presetRegex ?? []),
+                ...(current.character.customscript ?? []),
+                ...getModuleRegexScripts(),
+            ]
+            return collectLiveChatParserUnsafeDependencies({
+                triggers,
+                pluginV2EditDisplay: pluginV2.editdisplay.size > 0,
+                regexScripts,
+            })
+        },
+    })
+
     async function startScreenshot(start: number, end: number) {
         const dialogSnapshot = screenshotDialogSnapshot
         const sourceLease = screenshotSourceLease
@@ -1180,6 +1248,7 @@
                 bind:this={chatsInstance}
                 messages={conversationViewportSource ? undefined : currentChat}
                 viewportSource={conversationViewportSource}
+                parserProjectionResolver={liveParserProjectionResolver}
                 onReroll={reroll}
                 unReroll={unReroll}
                 onFirstMessageReroll={() => {

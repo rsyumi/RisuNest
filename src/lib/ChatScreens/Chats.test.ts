@@ -9,6 +9,11 @@ import {
     SynchronousSessionConversationViewportSource,
 } from 'src/ts/conversationViewportSource'
 import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
+import type {
+    LiveChatParserProjection,
+    LiveChatParserProjectionResolver,
+} from 'src/ts/selectedConversationLiveParserProjection'
+import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
 
 const imageMocks = vi.hoisted(() => ({
     mode: 'normal',
@@ -201,6 +206,57 @@ function makePersistentViewportSource(messages: readonly Message[]) {
         totalMessages: messages.length,
         rowBudget: 64,
     })
+}
+
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((done) => { resolve = done })
+    return { promise, resolve }
+}
+
+function boundedProjection(
+    currentCharacter: character,
+    absoluteIndex: number,
+): LiveChatParserProjection {
+    const historyOffset = Math.max(0, absoluteIndex - 1)
+    const projectedCharacter = makeCharacter(
+        Array.from(
+            { length: absoluteIndex - historyOffset + 1 },
+            (_, offset) => makeMessage(historyOffset + offset),
+        ),
+    )
+    const context: ProcessScriptCaptureContext = {
+        presetRegex: [],
+        moduleRegexScripts: [],
+        moduleAssets: [],
+        dynamicAssets: false,
+        dynamicAssetsEditDisplay: false,
+        parserContext: {
+            database: { characters: [projectedCharacter] } as any,
+            character: projectedCharacter,
+            userName: 'User',
+            personaPrompt: '',
+            modules: [],
+            moduleLorebooks: [],
+            selectedCharID: 0,
+            chatVariables: {},
+            globalChatVariables: {},
+            currentTime: 1,
+            historyOffset,
+        },
+    }
+    return {
+        kind: 'bounded',
+        characterId: currentCharacter.chaId,
+        conversationId: currentCharacter.chats[0].id!,
+        revision: 1,
+        totalMessages: absoluteIndex + 1,
+        chatID: absoluteIndex,
+        projectedChatID: absoluteIndex - historyOffset,
+        historyOffset,
+        messages: projectedCharacter.chats[0].message,
+        context,
+    }
 }
 
 function probeElements(target: HTMLElement): HTMLElement[] {
@@ -549,6 +605,125 @@ describe('Chats imperative mount lifecycle', () => {
             [...messages].reverse().map((entry) => entry.data),
         )
         expect(probeElements(target).every((element) => element.dataset.index !== undefined)).toBe(true)
+    })
+
+    test('does not mount a live parser before a source row projection is ready', async () => {
+        const messages = [makeMessage(0)]
+        const source = makePersistentViewportSource(messages)
+        const pending = deferred<LiveChatParserProjection>()
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(() => pending.promise),
+        }
+        const currentCharacter = makeMetadataOnlyCharacter()
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+
+        await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalledOnce())
+        expect(probeElements(target)).toHaveLength(0)
+
+        pending.resolve(boundedProjection(currentCharacter, 0))
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        expect(chatMountProbe.mounts.find((entry) => entry.index === 0)).toMatchObject({
+            index: 0,
+            parserProjectionKind: 'bounded',
+            projectedChatID: 0,
+        })
+    })
+
+    test('releases stale and mounted complete projections exactly once', async () => {
+        const messages = [makeMessage(0)]
+        const firstSource = makePersistentViewportSource(messages)
+        const secondSource = makePersistentViewportSource(messages)
+        const first = deferred<LiveChatParserProjection>()
+        const firstRelease = vi.fn()
+        const secondRelease = vi.fn()
+        let calls = 0
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async (): Promise<LiveChatParserProjection> => {
+                calls += 1
+                if (calls === 1) return first.promise
+                return {
+                    kind: 'complete',
+                    characterId: 'character-id',
+                    conversationId: 'chat-room-id',
+                    revision: 1,
+                    totalMessages: 1,
+                    chatID: 0,
+                    projectedChatID: 0,
+                    historyOffset: 0,
+                    reasons: [],
+                    release: secondRelease,
+                }
+            }),
+        }
+        const currentCharacter = makeMetadataOnlyCharacter()
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: firstSource,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalledOnce())
+
+        ;(mounted as HarnessInstance).setViewportSource(secondSource)
+        await tick()
+        first.resolve({
+            kind: 'complete',
+            characterId: 'character-id',
+            conversationId: 'chat-room-id',
+            revision: 1,
+            totalMessages: 1,
+            chatID: 0,
+            projectedChatID: 0,
+            historyOffset: 0,
+            reasons: ['projection-budget'],
+            release: firstRelease,
+        })
+
+        await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        expect(firstRelease).toHaveBeenCalledOnce()
+        expect(secondRelease).not.toHaveBeenCalled()
+
+        await unmount(mounted)
+        mounted = undefined
+        expect(firstRelease).toHaveBeenCalledOnce()
+        expect(secondRelease).toHaveBeenCalledOnce()
+    })
+
+    test('keeps the row unparsed and retries a transient projection failure', async () => {
+        const messages = [makeMessage(0)]
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn()
+                .mockRejectedValueOnce(new Error('transient read failure'))
+                .mockResolvedValueOnce(boundedProjection(currentCharacter, 0)),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+
+        await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalledOnce())
+        expect(probeElements(target)).toHaveLength(0)
+        await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        expect(chatMountProbe.mounts.find((entry) => entry.index === 0)).toMatchObject({
+            parserProjectionKind: 'bounded',
+        })
     })
 
     test('refreshes mounted bookmark presentation after a source metadata mutation', async () => {

@@ -2,6 +2,7 @@
     import { onDestroy, onMount } from 'svelte'
     import type { StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
     import { chatMountProbe } from './chatMountProbe'
+    import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
 
     let {
         message,
@@ -10,6 +11,7 @@
         character,
         rawStreamingText,
         bookmarked = false,
+        parserProjection,
     }: {
         message: string
         idx: number
@@ -17,6 +19,7 @@
         character: unknown
         rawStreamingText: string
         bookmarked?: boolean
+        parserProjection?: BoundedLiveChatParserProjection
     } = $props()
 
     const instanceId = chatMountProbe.nextInstanceId++
@@ -37,7 +40,16 @@
 
     onMount(() => {
         displayedStreamingText = rawStreamingText
-        chatMountProbe.mounts.push({ instanceId, message, index: idx, image: img, character, bookmarked })
+        chatMountProbe.mounts.push({
+            instanceId,
+            message,
+            index: idx,
+            image: img,
+            character,
+            bookmarked,
+            parserProjectionKind: parserProjection?.kind,
+            projectedChatID: parserProjection?.projectedChatID,
+        })
     })
 
     onDestroy(() => {

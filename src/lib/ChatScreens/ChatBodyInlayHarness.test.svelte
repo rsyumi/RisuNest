@@ -2,6 +2,7 @@
     import ChatBody from './ChatBody.svelte'
     import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import type { simpleCharacterArgument } from 'src/ts/parser/parser.svelte'
+    import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
 
     interface Props {
         initialTranslated?: boolean
@@ -11,6 +12,7 @@
         idx?: number
         captureParserIndex?: number
         name?: string
+        parserProjection?: BoundedLiveChatParserProjection
     }
 
     let {
@@ -21,6 +23,7 @@
         idx = 0,
         captureParserIndex = idx,
         name = 'Frozen Character',
+        parserProjection,
     }: Props = $props()
     let message = $state('first')
     let raw = $state(false)
@@ -53,5 +56,6 @@
         {onCaptureError}
         {captureContext}
         {captureParserIndex}
+        {parserProjection}
     />
 </div>

@@ -3,15 +3,18 @@
     import Chats from './Chats.svelte'
     import type { ChatViewportHandle, ChatViewportJumpOptions } from 'src/ts/chatViewport'
     import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
+    import type { LiveChatParserProjectionResolver } from 'src/ts/selectedConversationLiveParserProjection'
 
     let {
         initialMessages,
         initialCharacter,
         initialViewportSource = null,
+        parserProjectionResolver,
     }: {
         initialMessages?: Message[]
         initialCharacter: character
         initialViewportSource?: ConversationViewportSource | null
+        parserProjectionResolver?: LiveChatParserProjectionResolver
     } = $props()
 
     let messages = $state<Message[] | undefined>()
@@ -95,6 +98,7 @@
         bind:this={chats}
         {messages}
         {viewportSource}
+        {parserProjectionResolver}
         {currentCharacter}
         onReroll={() => {}}
         unReroll={() => {}}
