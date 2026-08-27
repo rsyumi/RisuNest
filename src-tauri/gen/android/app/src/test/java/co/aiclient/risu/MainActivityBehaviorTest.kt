@@ -15,6 +15,8 @@ class MainActivityBehaviorTest {
   fun `native SAF routing spools only restore and recognized character candidates`() {
     assertEquals(true, shouldUseNativeFileJobSpool("backup.risudat"))
     assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISUDAT"))
+    assertEquals(true, shouldUseNativeFileJobSpool("backup.risulossless"))
+    assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISULOSSLESS"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.charx"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.json"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.jpg"))
@@ -372,6 +374,83 @@ class MainActivityBehaviorTest {
     assertEquals(true, script.contains("11111111-1111-4111-8111-111111111111"))
     assertEquals(true, script.contains("a\\\"b\\\\c\\nd.risudat"))
     assertEquals(false, script.contains("/data/opened"))
+  }
+
+  @Test
+  fun `lossless source picker uses its dedicated event without changing opened file state`() {
+    val script = androidLosslessSourcePickedScript(
+      requestId = "11111111-1111-4111-8111-111111111111",
+      batch = SafSpoolBatch(
+        ready = listOf(
+          SafSpoolReady(
+            token = "22222222-2222-4222-8222-222222222222",
+            displayName = "backup.risulossless",
+            bytes = 9,
+            totalBytes = 9,
+          ),
+        ),
+        failures = emptyList(),
+      ),
+    )
+
+    assertEquals(true, script.contains("risu-android-lossless-source-picked"))
+    assertEquals(true, script.contains("\"requestId\":\"11111111-1111-4111-8111-111111111111\""))
+    assertEquals(true, script.contains("backup.risulossless"))
+    assertEquals(false, script.contains("tauriOpenedFileSpools"))
+    assertEquals(false, script.contains("risu-android-spool-ready"))
+  }
+
+  @Test
+  fun `lossless source replay retains the general opened file spool event`() {
+    val script = androidSpoolBatchScript(
+      requestId = "11111111-1111-4111-8111-111111111111",
+      batch = SafSpoolBatch(
+        ready = listOf(
+          SafSpoolReady(
+            token = "22222222-2222-4222-8222-222222222222",
+            displayName = "backup.risulossless",
+            bytes = 9,
+            totalBytes = 9,
+          ),
+        ),
+        failures = emptyList(),
+      ),
+    )
+
+    assertEquals(true, script.contains("risu-android-spool-ready"))
+    assertEquals(false, script.contains("risu-android-lossless-source-picked"))
+  }
+
+  @Test
+  fun `restored lossless picker result uses the general replayable spool event`() {
+    val batch = SafSpoolBatch(
+      ready = listOf(
+        SafSpoolReady(
+          token = "22222222-2222-4222-8222-222222222222",
+          displayName = "backup.risulossless",
+          bytes = 9,
+          totalBytes = 9,
+        ),
+      ),
+      failures = emptyList(),
+    )
+
+    val restored = androidLosslessSourceResultScript(
+      "11111111-1111-4111-8111-111111111111",
+      batch,
+      restored = true,
+    )
+    val live = androidLosslessSourceResultScript(
+      "11111111-1111-4111-8111-111111111111",
+      batch,
+      restored = false,
+    )
+
+    assertEquals(true, restored.contains("risu-android-spool-ready"))
+    assertEquals(true, restored.contains("tauriOpenedFileSpools"))
+    assertEquals(false, restored.contains("risu-android-lossless-source-picked"))
+    assertEquals(true, live.contains("risu-android-lossless-source-picked"))
+    assertEquals(false, live.contains("risu-android-spool-ready"))
   }
 
   @Test

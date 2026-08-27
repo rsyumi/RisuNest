@@ -57,6 +57,8 @@ private const val RENDERER_RECOVERY_MARKER = "renderer-recovery-warning"
 private const val SAF_PROGRESS_INTERVAL_MILLIS = 100L
 private const val OPENED_FILE_INTENT_CONSUMED = "co.aiclient.risu.OPENED_FILE_INTENT_CONSUMED"
 private const val OPENED_FILE_FINGERPRINT_STATE = "risu.opened-file-fingerprint"
+private const val LOSSLESS_SOURCE_REQUEST_STATE = "risu.lossless-source-request"
+private const val LOSSLESS_SOURCE_CANCELLED_STATE = "risu.lossless-source-cancelled"
 private const val TAG = "RisuNative"
 
 internal typealias RendererRecoveryFailureLogger = (step: String, error: Throwable) -> Unit
@@ -260,6 +262,12 @@ private data class PendingSafDestination(
   val cancellation: AtomicBoolean,
 )
 
+private data class PendingLosslessSource(
+  val requestId: String,
+  val cancellation: AtomicBoolean,
+  val restored: Boolean = false,
+)
+
 internal class LifecycleFlushDispatcher(
   private val dispatch: (String) -> Unit,
 ) {
@@ -329,9 +337,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val safProgressDispatchMillis = ConcurrentHashMap<String, Long>()
   private val deliveredSpoolTokens = ConcurrentHashMap.newKeySet<String>()
   private var pendingSafDestination: PendingSafDestination? = null
-  private val safDestinationSlot = SafDestinationSlot()
+  private val safPickerSlot = SafDestinationSlot()
   private val safDestinationStateLock = Any()
   private var consumedOpenedFileFingerprint: String? = null
+  private var pendingLosslessSource: PendingLosslessSource? = null
   private val safDestinationStateStore by lazy {
     SafDestinationStateStore(
       File(dataDir, "native-file-jobs/android-saf-destination.json"),
@@ -341,6 +350,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val safDestinationPicker = registerForActivityResult(
     ActivityResultContracts.CreateDocument("application/octet-stream"),
     ::onSafDestinationSelected,
+  )
+  private val losslessSourcePicker = registerForActivityResult(
+    ActivityResultContracts.OpenDocument(),
+    ::onLosslessSourceSelected,
   )
   private val rendererRecoveryMarker by lazy {
     val preferences = getSharedPreferences(NATIVE_RESILIENCE_PREFERENCES, MODE_PRIVATE)
@@ -372,6 +385,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     consumedOpenedFileFingerprint = savedInstanceState?.getString(OPENED_FILE_FINGERPRINT_STATE)
+    savedInstanceState?.let { state ->
+      state.getString(LOSSLESS_SOURCE_REQUEST_STATE)
+        ?.takeIf(::isCanonicalUuidV4)
+        ?.let { requestId ->
+          val cancellation = AtomicBoolean(
+            state.getBoolean(LOSSLESS_SOURCE_CANCELLED_STATE, false),
+          )
+          pendingLosslessSource = PendingLosslessSource(requestId, cancellation, restored = true)
+          safSourceCancellations[requestId] = cancellation
+          safPickerSlot.acquireRestored()
+        }
+    }
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
@@ -481,6 +506,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     consumedOpenedFileFingerprint?.let {
       outState.putString(OPENED_FILE_FINGERPRINT_STATE, it)
     }
+    pendingLosslessSource?.let { pending ->
+      outState.putString(LOSSLESS_SOURCE_REQUEST_STATE, pending.requestId)
+      outState.putBoolean(LOSSLESS_SOURCE_CANCELLED_STATE, pending.cancellation.get())
+    }
     super.onSaveInstanceState(outState)
   }
 
@@ -497,6 +526,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safSourceCancellations.values.forEach { it.set(true) }
     safDestinationCancellations.values.forEach { it.set(true) }
     pendingSafDestination = null
+    pendingLosslessSource = null
     safScope.cancel()
     safSourceCancellations.clear()
     safDestinationCancellations.clear()
@@ -585,13 +615,38 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   private inner class SafBridge {
     @JavascriptInterface
+    fun pickLosslessSource(requestId: String) {
+      if (!isCanonicalUuidV4(requestId)) return
+      if (!safPickerSlot.tryAcquire()) {
+        dispatchLosslessSourceBatch(
+          requestId,
+          SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.risulossless", "source-busy"))),
+        )
+        return
+      }
+      val cancellation = AtomicBoolean(false)
+      if (safSourceCancellations.putIfAbsent(requestId, cancellation) != null) {
+        safPickerSlot.release()
+        dispatchLosslessSourceBatch(
+          requestId,
+          SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.risulossless", "source-busy"))),
+        )
+        return
+      }
+      safScope.launch {
+        pendingLosslessSource = PendingLosslessSource(requestId, cancellation)
+        losslessSourcePicker.launch(arrayOf("application/octet-stream"))
+      }
+    }
+
+    @JavascriptInterface
     fun copyExport(
       requestId: String,
       sourcePath: String,
       suggestedName: String,
     ) {
       if (!isCanonicalUuidV4(requestId)) return
-      if (!safDestinationSlot.tryAcquire()) {
+      if (!safPickerSlot.tryAcquire()) {
         safScope.launch {
           val busy = destinationTerminalRecord(
             requestId = requestId,
@@ -688,7 +743,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         terminalRecord?.let { record ->
           if (ownsPersistedState) persistTerminalIfPossible(record)
           safDestinationCancellations.remove(requestId, cancellation)
-          safDestinationSlot.release()
+          safPickerSlot.release()
           dispatchSafDestination(record, terminalMessage)
         }
       }
@@ -750,6 +805,86 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
+  private fun onLosslessSourceSelected(uri: Uri?) {
+    val pending = pendingLosslessSource ?: return
+    pendingLosslessSource = null
+    if (uri == null) {
+      finishLosslessSourcePick(pending, SafSpoolBatch(emptyList(), emptyList()))
+      return
+    }
+    safScope.launch {
+      val copyContext = currentCoroutineContext()
+      val batch = try {
+        val store = safSpoolStore()
+        val source = withContext(Dispatchers.IO) {
+          store.cleanupStale()
+          contentResolverSource(uri)
+        }
+        if (!source.displayName.endsWith(".risulossless", ignoreCase = true)) {
+          SafSpoolBatch(
+            emptyList(),
+            listOf(SafSpoolFailure(source.displayName, "unsupported-source")),
+          )
+        } else {
+          spoolOpenedFilesOnIo(
+            store,
+            listOf(source),
+            isCancelled = { pending.cancellation.get() || !copyContext.isActive },
+            onProgress = { progress ->
+              dispatchSafProgress(
+                requestId = pending.requestId,
+                operation = "source-copy",
+                copiedBytes = progress.copiedBytes,
+                totalBytes = progress.totalBytes,
+                token = progress.token,
+                dispatchKey = "${pending.requestId}:${progress.token}",
+                isActive = { safSourceCancellations[pending.requestId] === pending.cancellation },
+              )
+            },
+          )
+        }
+      } catch (error: Exception) {
+        SafSpoolBatch(
+          emptyList(),
+          listOf(SafSpoolFailure("backup.risulossless", "source-copy-failed")),
+        )
+      }
+      if (!copyContext.isActive) return@launch
+      val terminalBatch = if (pending.cancellation.get()) {
+        val remaining = withContext(Dispatchers.IO) {
+          val store = safSpoolStore()
+          batch.ready.filterNot { store.discardReady(it.token) }
+        }
+        SafSpoolBatch(
+          remaining,
+          remaining.map { SafSpoolFailure(it.displayName, "cleanup-failed") },
+        )
+      } else {
+        batch
+      }
+      finishLosslessSourcePick(pending, terminalBatch)
+    }
+  }
+
+  private fun finishLosslessSourcePick(
+    pending: PendingLosslessSource,
+    batch: SafSpoolBatch,
+  ) {
+    safSourceCancellations.remove(pending.requestId, pending.cancellation)
+    safProgressDispatchMillis.keys.removeAll {
+      it == pending.requestId || it.startsWith("${pending.requestId}:")
+    }
+    safPickerSlot.release()
+    lifecycleWebView?.evaluateJavascript(
+      androidLosslessSourceResultScript(pending.requestId, batch, pending.restored),
+      null,
+    )
+  }
+
+  private fun dispatchLosslessSourceBatch(requestId: String, batch: SafSpoolBatch) {
+    lifecycleWebView?.evaluateJavascript(androidLosslessSourcePickedScript(requestId, batch), null)
+  }
+
   private fun onSafDestinationSelected(uri: Uri?) {
     val pending = pendingSafDestination ?: restorePendingSafDestination() ?: run {
       cleanupUnclaimedSafDestination(uri)
@@ -778,7 +913,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         }
         safDestinationCancellations.remove(pending.requestId, pending.cancellation)
         safProgressDispatchMillis.remove(pending.requestId)
-        if (persisted) safDestinationSlot.release()
+        if (persisted) safPickerSlot.release()
         dispatchSafDestination(failure, "Android SAF destination state could not be persisted")
         return@launch
       }
@@ -795,7 +930,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       if (selectedState.isTerminal()) {
         safDestinationCancellations.remove(pending.requestId, pending.cancellation)
         safProgressDispatchMillis.remove(pending.requestId)
-        safDestinationSlot.release()
+        safPickerSlot.release()
         dispatchSafDestination(selectedState, destinationMessage(selectedState))
         return@launch
       }
@@ -881,7 +1016,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         terminalMessage,
         destinationUri,
       )
-      safDestinationSlot.release()
+      safPickerSlot.release()
       dispatchSafDestination(publishedRecord, publishedMessage)
     }
   }
@@ -1076,12 +1211,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     val record = loadSafDestinationState() ?: return
     when (decideSafDestinationRecovery(record, hasRestoredActivityState)) {
       SafDestinationRecoveryAction.WAIT_FOR_PICKER -> {
-        safDestinationSlot.acquireRestored()
+        safPickerSlot.acquireRestored()
         pendingSafDestination = restorePendingSafDestination()
         schedulePendingDestinationExpiry(record)
       }
       SafDestinationRecoveryAction.CLEAN_PARTIAL -> {
-        safDestinationSlot.acquireRestored()
+        safPickerSlot.acquireRestored()
         safScope.launch {
           try {
             val destinationUri = record.destinationUri?.let(Uri::parse)
@@ -1108,12 +1243,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             persistTerminalIfPossible(terminal)
             dispatchSafDestination(terminal, destinationMessage(terminal))
           } finally {
-            safDestinationSlot.release()
+            safPickerSlot.release()
           }
         }
       }
       SafDestinationRecoveryAction.FAIL_INTERRUPTED -> {
-        safDestinationSlot.acquireRestored()
+        safPickerSlot.acquireRestored()
         safScope.launch {
           try {
             val wasCancelling = record.phase == SafDestinationPhase.CANCELLING
@@ -1132,7 +1267,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             persistTerminalIfPossible(terminal)
             dispatchSafDestination(terminal, destinationMessage(terminal))
           } finally {
-            safDestinationSlot.release()
+            safPickerSlot.release()
           }
         }
       }
@@ -1157,7 +1292,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           pendingSafDestination = null
         }
         safDestinationCancellations.remove(terminal.requestId)
-        safDestinationSlot.release()
+        safPickerSlot.release()
         dispatchSafDestination(terminal, destinationMessage(terminal))
       }
     }, delayMillis)
@@ -1280,7 +1415,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   private fun replayReadySpools(webView: WebView) {
-    val requestId = UUID.randomUUID().toString()
     safScope.launch {
       val ready = withContext(Dispatchers.IO) {
         val store = safSpoolStore()
@@ -1291,7 +1425,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       }
       if (ready.isEmpty() || lifecycleWebView !== webView) return@launch
       webView.evaluateJavascript(
-        androidSpoolBatchScript(requestId, SafSpoolBatch(ready, emptyList())),
+        androidSpoolBatchScript(UUID.randomUUID().toString(), SafSpoolBatch(ready, emptyList())),
         null,
       )
     }

@@ -59,7 +59,7 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
 export { nativeFileOperation }
 
 export const importRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions = {}) =>
-    runSharedNativeFileOperation('import', ({ signal, onStatus, setBlocking }) =>
+    runSharedNativeFileOperation('import', 'risu-save-import', ({ signal, onStatus, setBlocking }) =>
         importRisuSaveFromPicker({
             ...options,
             signal,
@@ -74,7 +74,7 @@ export const importRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions
         }, productionDependencies))
 
 export const exportRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions = {}) =>
-    runSharedNativeFileOperation('export', ({ signal, onStatus }) =>
+    runSharedNativeFileOperation('export', 'risu-save-export', ({ signal, onStatus }) =>
         exportRisuSaveFromPicker({
             ...options,
             signal,

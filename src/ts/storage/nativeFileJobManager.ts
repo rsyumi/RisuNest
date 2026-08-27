@@ -17,17 +17,31 @@ export interface SharedNativeFileOperationContext {
 export const nativeFileOperation = writable<NativeFileOperationState | null>(null)
 
 let activeOperation: Promise<unknown> | null = null
+let activeOperationKey: string | null = null
 let activeController: AbortController | null = null
 let externalAndroidOperationTail: Promise<void> = Promise.resolve()
 
+export class NativeFileOperationBusyError extends Error {
+    constructor() {
+        super('Another native file operation is already running')
+        this.name = 'NativeFileOperationBusyError'
+    }
+}
+
 export function runSharedNativeFileOperation<T>(
     kind: NativeFileOperationState['kind'],
+    operationKey: string,
     operation: (context: SharedNativeFileOperationContext) => Promise<T>,
 ): Promise<T> {
-    if (activeOperation) return activeOperation as Promise<T>
+    if (activeOperation) {
+        return activeOperationKey === operationKey
+            ? activeOperation as Promise<T>
+            : Promise.reject(new NativeFileOperationBusyError())
+    }
 
     const controller = new AbortController()
     activeController = controller
+    activeOperationKey = operationKey
     nativeFileOperation.set({ kind, blocking: false })
     const update = (patch: Partial<NativeFileOperationState>) => {
         nativeFileOperation.update((current) => current ? { ...current, ...patch } : current)
@@ -40,6 +54,7 @@ export function runSharedNativeFileOperation<T>(
     }).finally(() => {
         if (activeOperation !== promise) return
         activeOperation = null
+        activeOperationKey = null
         activeController = null
         nativeFileOperation.set(null)
     })
@@ -58,7 +73,11 @@ export function runExternalAndroidNativeFileOperation<T>(
             }
             catch {}
         }
-        return await runSharedNativeFileOperation(kind, operation)
+        return await runSharedNativeFileOperation(
+            kind,
+            `external-android:${kind}`,
+            operation,
+        )
     })
     externalAndroidOperationTail = queued.then(
         () => undefined,

@@ -19,6 +19,7 @@ private const val SPOOL_STAGING_PREFIX = ".spooling-"
 private const val SPOOL_CLEANUP_PREFIX = ".cleanup-"
 private val NATIVE_FILE_JOB_SPOOL_SUFFIXES = listOf(
   ".risudat",
+  ".risulossless",
   ".charx",
   ".json",
   ".jpeg",
@@ -675,6 +676,32 @@ internal fun androidSpoolBatchScript(requestId: String, batch: SafSpoolBatch): S
     "\"failures\":[...(window.tauriOpenedFileSpools?.failures??[]),...[$failures]]}"
   return "window.tauriOpenedFileSpools=$pending;" +
     "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$value}));"
+}
+
+internal fun androidLosslessSourcePickedScript(requestId: String, batch: SafSpoolBatch): String {
+  val ready = batch.ready.joinToString(",") { source ->
+    "{" +
+      "\"token\":${jsonString(source.token)}," +
+      "\"displayName\":${jsonString(source.displayName)}," +
+      "\"bytes\":${source.bytes}," +
+      (source.totalBytes?.let { "\"totalBytes\":$it" } ?: "\"totalBytes\":null") +
+      "}"
+  }
+  val failures = batch.failures.joinToString(",") { failure ->
+    "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
+  }
+  val detail = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
+  return "window.dispatchEvent(new CustomEvent('risu-android-lossless-source-picked',{detail:$detail}));"
+}
+
+internal fun androidLosslessSourceResultScript(
+  requestId: String,
+  batch: SafSpoolBatch,
+  restored: Boolean,
+): String = if (restored) {
+  androidSpoolBatchScript(requestId, batch)
+} else {
+  androidLosslessSourcePickedScript(requestId, batch)
 }
 
 internal fun androidSafProgressScript(

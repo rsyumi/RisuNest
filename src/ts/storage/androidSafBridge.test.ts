@@ -8,6 +8,7 @@ import {
     getActiveAndroidSafSourceRequestIds,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
+    pickAndroidLosslessBackupSource,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
 
@@ -103,6 +104,150 @@ describe('Android SAF bridge', () => {
             displayName: 'card.charx',
             bytes: 2_000,
         })
+    })
+
+    it('receives a lossless picker result as an owned spool token', async () => {
+        const listeners = new Map<string, Set<(event: Event) => void>>()
+        const progress = vi.fn()
+        const pickLosslessSource = vi.fn((requestId: string) => queueMicrotask(() => {
+            for (const listener of listeners.get('risu-android-saf-progress') ?? []) {
+                listener(new CustomEvent('risu-android-saf-progress', { detail: {
+                    requestId,
+                    operation: 'source-copy',
+                    copiedBytes: 5_000,
+                    totalBytes: 10_000,
+                    token: null,
+                } }))
+            }
+            for (const listener of listeners.get('risu-android-lossless-source-picked') ?? []) {
+                listener(new CustomEvent('risu-android-lossless-source-picked', { detail: {
+                    requestId,
+                    ready: [{
+                        token: '55555555-5555-4555-8555-555555555555',
+                        displayName: 'chosen.risulossless',
+                        bytes: 10_000,
+                    }],
+                    failures: [],
+                } }))
+            }
+        }))
+
+        const source = await pickAndroidLosslessBackupSource({ onProgress: progress }, {
+            createRequestId: () => 'source-picker-1',
+            bridge: { copyExport: vi.fn(), pickLosslessSource },
+            addEventListener: (name, listener) => {
+                const registered = listeners.get(name) ?? new Set()
+                registered.add(listener)
+                listeners.set(name, registered)
+            },
+            removeEventListener: (name, listener) => listeners.get(name)?.delete(listener),
+        })
+
+        expect(source).toEqual({
+            type: 'androidSpool',
+            token: '55555555-5555-4555-8555-555555555555',
+        })
+        expect(pickLosslessSource).toHaveBeenCalledExactlyOnceWith('source-picker-1')
+        expect(progress).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+            copiedBytes: 5_000,
+            totalBytes: 10_000,
+        }))
+        expect([...listeners.values()].every((registered) => registered.size === 0)).toBe(true)
+    })
+
+    it('treats closing the Android lossless picker as cancellation', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const source = await pickAndroidLosslessBackupSource({}, {
+            createRequestId: () => 'source-picker-2',
+            bridge: {
+                copyExport: vi.fn(),
+                pickLosslessSource: () => queueMicrotask(() => {
+                    for (const listener of listeners) {
+                        listener(new CustomEvent('risu-android-lossless-source-picked', {
+                            detail: { requestId: 'source-picker-2', ready: [], failures: [] },
+                        }))
+                    }
+                }),
+            },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        expect(source).toBeNull()
+        expect(listeners.size).toBe(0)
+    })
+
+    it('cancels the native lossless picker when the shared operation is aborted', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const cancelSource = vi.fn()
+        const discardSource = vi.fn(() => true)
+        const controller = new AbortController()
+        const pending = pickAndroidLosslessBackupSource({ signal: controller.signal }, {
+            createRequestId: () => 'source-picker-3',
+            bridge: {
+                copyExport: vi.fn(),
+                pickLosslessSource: vi.fn(),
+                cancelSource,
+                discardSource,
+            },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        controller.abort()
+
+        expect(cancelSource).toHaveBeenCalledExactlyOnceWith('source-picker-3')
+        expect(listeners.size).toBe(1)
+
+        for (const listener of [...listeners]) {
+            listener(new CustomEvent('risu-android-lossless-source-picked', { detail: {
+                requestId: 'source-picker-3',
+                ready: [{
+                    token: '66666666-6666-4666-8666-666666666666',
+                    displayName: 'late.risulossless',
+                    bytes: 10,
+                }],
+                failures: [],
+            } }))
+        }
+
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        expect(discardSource).toHaveBeenCalledExactlyOnceWith(
+            '66666666-6666-4666-8666-666666666666',
+        )
+        expect(listeners.size).toBe(0)
+    })
+
+    it('reports cleanup failure when a cancelled picker leaves a ready spool', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const controller = new AbortController()
+        const pending = pickAndroidLosslessBackupSource({ signal: controller.signal }, {
+            createRequestId: () => 'source-picker-4',
+            bridge: {
+                copyExport: vi.fn(),
+                pickLosslessSource: vi.fn(),
+                cancelSource: vi.fn(),
+                discardSource: vi.fn(() => false),
+            },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        controller.abort()
+        for (const listener of [...listeners]) {
+            listener(new CustomEvent('risu-android-lossless-source-picked', { detail: {
+                requestId: 'source-picker-4',
+                ready: [{
+                    token: '77777777-7777-4777-8777-777777777777',
+                    displayName: 'late.risulossless',
+                    bytes: 10,
+                }],
+                failures: [],
+            } }))
+        }
+
+        await expect(pending).rejects.toMatchObject({ code: 'cleanup-failed' })
+        expect(listeners.size).toBe(0)
     })
 
     it('asks the native picker to publish an owned export while keeping bytes outside TypeScript', async () => {

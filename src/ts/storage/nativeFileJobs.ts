@@ -9,6 +9,7 @@ import {
 import type { PreparedImmutablePayload } from './payloadCas'
 import {
     copyNativeExportToAndroidSaf,
+    discardAndroidSafSource,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
@@ -143,6 +144,7 @@ export interface NativeFileJobDependencies {
     isTauri(): boolean
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     wait(milliseconds: number): Promise<void>
+    discardAndroidSource?(token: string): boolean
 }
 
 export interface NativeLosslessBackupDependencies extends NativeFileJobDependencies {
@@ -153,6 +155,7 @@ const productionDependencies: NativeFileJobDependencies = {
     isTauri: () => isTauri,
     invoke: (command, args) => args === undefined ? invoke(command) : invoke(command, args),
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    discardAndroidSource: (token) => discardAndroidSafSource(token),
 }
 
 const productionLosslessDependencies: NativeLosslessBackupDependencies = {
@@ -418,6 +421,26 @@ async function invokeNative(
     }
 }
 
+function abortBeforeNativeRestoreStart(
+    source: NativeFileJobSource,
+    dependencies: NativeFileJobDependencies,
+): never {
+    let discarded = source.type !== 'androidSpool'
+    if (source.type === 'androidSpool') {
+        try {
+            discarded = dependencies.discardAndroidSource?.(source.token) === true
+        }
+        catch {}
+    }
+    if (!discarded) {
+        throw new NativeFileJobError(
+            'cleanup-failed',
+            'Cancelled Android source could not be discarded before native restore start',
+        )
+    }
+    throw abortError()
+}
+
 async function runNativeReplacementRestore(
     kind: 'restore-block-risu-save' | 'restore-lossless-backup',
     mutationReason: string,
@@ -432,12 +455,16 @@ async function runNativeReplacementRestore(
     if (!dependencies.isTauri()) {
         throw new Error(`${operation} requires Tauri`)
     }
-    if (options.signal?.aborted) throw abortError()
+    if (options.signal?.aborted) {
+        abortBeforeNativeRestoreStart(source, dependencies)
+    }
 
     const mutationToken = await runtime.capturePersistentMutationToken(
         mutationReason,
     )
-    if (options.signal?.aborted) throw abortError()
+    if (options.signal?.aborted) {
+        abortBeforeNativeRestoreStart(source, dependencies)
+    }
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind,
@@ -769,6 +796,19 @@ export async function runNativeLosslessBackupExport(
                 sourcePath: managedSource,
                 suggestedName: destination.suggestedName,
                 signal: options.signal,
+                onProgress: (progress) => options.onStatus?.({
+                    ...terminal,
+                    state: 'running',
+                    phase: 'publishing-destination',
+                    progress: {
+                        completedBytes: progress.copiedBytes,
+                        ...(progress.totalBytes === null
+                            ? { totalBytes: committedResult?.sourceBytes }
+                            : { totalBytes: progress.totalBytes }),
+                        completedItems: 0,
+                        totalItems: 1,
+                    },
+                }),
             })
             if (published.bytes !== committedResult.sourceBytes) {
                 throw new NativeFileJobError(

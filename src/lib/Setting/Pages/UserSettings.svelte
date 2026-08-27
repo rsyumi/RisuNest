@@ -10,7 +10,7 @@
     import { isTauri, isNodeServer, isTauriAndroid, isTauriDesktop } from "src/ts/platform"
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
-    import { LoadLocalBackup, SaveLocalBackup, SavePartialLocalBackup } from "src/ts/drive/backuplocal";
+    import { LoadLocalBackup, SavePartialLocalBackup } from "src/ts/drive/backuplocal";
     import { openSyncConflictBackups } from "src/ts/storage/sync/syncConflictRestore";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
@@ -36,6 +36,10 @@
         importRisuSaveFromSystemPicker,
         nativeFileOperation,
     } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
+    import {
+        exportLocalBackupFromSystemPicker,
+        restoreLocalBackupFromSystemPicker,
+    } from "src/ts/storage/losslessBackupFileRouteProduction.svelte";
     import { cancelActiveNativeFileOperation } from "src/ts/storage/nativeFileJobManager";
     import { onDestroy } from "svelte";
     import PeerCloneSettings from "./PeerCloneSettings.svelte";
@@ -105,6 +109,23 @@
         }
     }
 
+    async function runLocalBackupOperation(kind: 'import' | 'export'): Promise<void> {
+        if(risuSaveOperation) return
+        try {
+            const result = kind === 'import'
+                ? await restoreLocalBackupFromSystemPicker()
+                : await exportLocalBackupFromSystemPicker()
+            if(!result || result.mode === 'legacy') return
+            alertNormal(
+                result.warningCodes.includes('cleanup-failed')
+                    ? language.risuSaveCleanupWarning
+                    : 'Success',
+            )
+        } catch(error) {
+            showRisuSaveError(error)
+        }
+    }
+
     onDestroy(() => {
         drivePopup.close()
     })
@@ -146,9 +167,10 @@
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.account} & {language.files}</h2>
 
 <Button
+    disabled={risuSaveOperation !== null}
     onclick={async () => {
         if(await alertConfirm(language.backupConfirm)){
-            SaveLocalBackup()
+            await runLocalBackupOperation('export')
         }
     }} className="mt-2">
     {language.saveBackupLocal}
@@ -164,9 +186,10 @@
 </Button>
 
 <Button
+    disabled={risuSaveOperation !== null}
     onclick={async () => {
         if((await alertConfirm(language.backupLoadConfirm)) && (await alertConfirm(language.backupLoadConfirm2))){
-            LoadLocalBackup()
+            await runLocalBackupOperation('import')
         }
     }} className="mt-2">
     {language.loadBackupLocal}
@@ -187,17 +210,18 @@
         {language.exportRisuSave}
     </Button>
 
-    {#if risuSaveOperation}
-        <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2">
-            <span>{risuSaveProgressText(risuSaveStatus)}</span>
-            <Button
-                styled="outlined"
-                size="sm"
-                onclick={cancelActiveNativeFileOperation}>
-                {language.cancelRisuSaveOperation}
-            </Button>
-        </div>
-    {/if}
+{/if}
+
+{#if risuSaveOperation}
+    <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2">
+        <span>{risuSaveProgressText(risuSaveStatus)}</span>
+        <Button
+            styled="outlined"
+            size="sm"
+            onclick={cancelActiveNativeFileOperation}>
+            {language.cancelRisuSaveOperation}
+        </Button>
+    </div>
 {/if}
 
 {#if isTauri}

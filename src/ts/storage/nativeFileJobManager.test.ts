@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
     cancelActiveNativeFileOperation,
+    NativeFileOperationBusyError,
     nativeFileOperation,
     runExternalAndroidNativeFileOperation,
     runSharedNativeFileOperation,
@@ -26,8 +27,8 @@ describe('renderer-lifetime native file job manager', () => {
             return await new Promise<string>((resolve) => finish = resolve)
         })
 
-        const first = runSharedNativeFileOperation('import', operation)
-        const second = runSharedNativeFileOperation('import', operation)
+        const first = runSharedNativeFileOperation('import', 'risu-save-import', operation)
+        const second = runSharedNativeFileOperation('import', 'risu-save-import', operation)
 
         expect(first).toBe(second)
         expect(operation).toHaveBeenCalledOnce()
@@ -40,7 +41,7 @@ describe('renderer-lifetime native file job manager', () => {
 
     it('cancels only through the explicit manager action', async () => {
         let observedSignal!: AbortSignal
-        const promise = runSharedNativeFileOperation('export', async ({ signal }) => {
+        const promise = runSharedNativeFileOperation('export', 'lossless-backup-export', async ({ signal }) => {
             observedSignal = signal
             return await new Promise<never>((_resolve, reject) => {
                 signal.addEventListener('abort', () => reject(signal.reason))
@@ -57,7 +58,7 @@ describe('renderer-lifetime native file job manager', () => {
         let releaseActive!: () => void
         let releaseFirstEvent!: () => void
         const calls: string[] = []
-        const active = runSharedNativeFileOperation('import', async () => {
+        const active = runSharedNativeFileOperation('import', 'active-import', async () => {
             calls.push('active')
             await new Promise<void>((resolve) => releaseActive = resolve)
             return 'active'
@@ -85,5 +86,25 @@ describe('renderer-lifetime native file job manager', () => {
         await expect(firstEvent).resolves.toBe('first-event')
         await expect(secondEvent).resolves.toBe('second-event')
         expect(calls).toEqual(['active', 'first-event', 'second-event'])
+    })
+
+    it('rejects a different operation instead of returning the active result', async () => {
+        let finish!: () => void
+        const first = runSharedNativeFileOperation(
+            'import',
+            'lossless-backup-import',
+            () => new Promise<void>((resolve) => finish = resolve),
+        )
+        const conflicting = vi.fn(async () => 'wrong-result')
+
+        await expect(runSharedNativeFileOperation(
+            'import',
+            'risu-save-import',
+            conflicting,
+        )).rejects.toBeInstanceOf(NativeFileOperationBusyError)
+        expect(conflicting).not.toHaveBeenCalled()
+
+        finish()
+        await first
     })
 })

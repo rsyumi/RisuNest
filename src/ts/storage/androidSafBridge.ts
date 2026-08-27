@@ -1,6 +1,7 @@
 import type { NativeFileJobSource } from './nativeFileJobs'
 
 const SPOOL_EVENT = 'risu-android-spool-ready'
+const LOSSLESS_SOURCE_EVENT = 'risu-android-lossless-source-picked'
 const DESTINATION_EVENT = 'risu-android-saf-destination'
 const PROGRESS_EVENT = 'risu-android-saf-progress'
 const activeDestinationRequestIds = new Set<string>()
@@ -74,7 +75,8 @@ export async function consumeAndroidSpoolBatch(
 ): Promise<void> {
     for (const failure of batch.failures) consumer.failed?.(failure)
     for (const source of batch.ready) {
-        if (!source.displayName.toLocaleLowerCase('en-US').endsWith('.risudat')) {
+        const lowerName = source.displayName.toLocaleLowerCase('en-US')
+        if (!lowerName.endsWith('.risudat') && !lowerName.endsWith('.risulossless')) {
             consumer.unsupported(source)
             continue
         }
@@ -126,6 +128,7 @@ export interface AndroidSafJavascriptBridge {
     ): void
     cancelExport?(requestId: string): boolean | void
     cancelSource?(requestId: string): void
+    pickLosslessSource?(requestId: string): void
     discardSource?(token: string): boolean
     getActiveSourceRequestIds?(): string
     getExportStatus?(): string | null
@@ -133,6 +136,18 @@ export interface AndroidSafJavascriptBridge {
 }
 
 export interface AndroidSafDestinationDependencies {
+    createRequestId(): string
+    bridge: AndroidSafJavascriptBridge
+    addEventListener(name: string, listener: (event: Event) => void): void
+    removeEventListener(name: string, listener: (event: Event) => void): void
+}
+
+export interface AndroidLosslessSourcePickerOptions {
+    signal?: AbortSignal
+    onProgress?(progress: AndroidSafProgress): void
+}
+
+export interface AndroidLosslessSourcePickerDependencies {
     createRequestId(): string
     bridge: AndroidSafJavascriptBridge
     addEventListener(name: string, listener: (event: Event) => void): void
@@ -174,6 +189,114 @@ export class AndroidSafDestinationError extends Error {
         super(message)
         this.name = 'AndroidSafDestinationError'
     }
+}
+
+export class AndroidSafSourceError extends Error {
+    constructor(readonly code: string, message: string) {
+        super(message)
+        this.name = 'AndroidSafSourceError'
+    }
+}
+
+export function pickAndroidLosslessBackupSource(
+    options: AndroidLosslessSourcePickerOptions = {},
+    dependencies: AndroidLosslessSourcePickerDependencies = productionDependencies,
+): Promise<NativeFileJobSource | null> {
+    if (options.signal?.aborted) {
+        return Promise.reject(new DOMException(
+            'Android lossless backup selection was cancelled',
+            'AbortError',
+        ))
+    }
+    const requestId = dependencies.createRequestId()
+    return new Promise((resolve, reject) => {
+        let settled = false
+        let aborted = false
+        const cleanup = () => {
+            options.signal?.removeEventListener('abort', onAbort)
+            dependencies.removeEventListener(LOSSLESS_SOURCE_EVENT, onEvent)
+            if (options.onProgress) {
+                dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
+            }
+        }
+        const finish = (callback: () => void) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            callback()
+        }
+        const onAbort = () => {
+            if (settled) return
+            aborted = true
+            options.signal?.removeEventListener('abort', onAbort)
+            if (options.onProgress) {
+                dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
+            }
+            dependencies.bridge.cancelSource?.(requestId)
+        }
+        const onEvent = (event: Event) => {
+            const batch = (event as CustomEvent<AndroidSpoolBatch>).detail
+            if (!batch || batch.requestId !== requestId) return
+            if (aborted) {
+                let cleanupFailed = false
+                for (const source of batch.ready) {
+                    if (dependencies.bridge.discardSource?.(source.token) !== true) {
+                        cleanupFailed = true
+                    }
+                }
+                finish(() => cleanupFailed
+                    ? reject(new AndroidSafSourceError(
+                        'cleanup-failed',
+                        'Cancelled Android backup source could not be cleaned up',
+                    ))
+                    : reject(new DOMException(
+                        'Android lossless backup selection was cancelled',
+                        'AbortError',
+                    )))
+                return
+            }
+            const failure = batch.failures[0]
+            if (failure) {
+                finish(() => reject(new AndroidSafSourceError(
+                    failure.code,
+                    `${failure.displayName}: ${failure.code}`,
+                )))
+                return
+            }
+            const source = batch.ready[0]
+            if (!source) {
+                finish(() => resolve(null))
+                return
+            }
+            if (!source.displayName.toLocaleLowerCase('en-US').endsWith('.risulossless')) {
+                finish(() => reject(new AndroidSafSourceError(
+                    'unsupported-format',
+                    `${source.displayName}: unsupported-format`,
+                )))
+                return
+            }
+            finish(() => resolve({ type: 'androidSpool', token: source.token }))
+        }
+        const onProgress = (event: Event) => {
+            const progress = (event as CustomEvent<AndroidSafProgress>).detail
+            if (progress?.requestId === requestId && progress.operation === 'source-copy') {
+                options.onProgress?.(progress)
+            }
+        }
+        dependencies.addEventListener(LOSSLESS_SOURCE_EVENT, onEvent)
+        if (options.onProgress) {
+            dependencies.addEventListener(PROGRESS_EVENT, onProgress)
+        }
+        options.signal?.addEventListener('abort', onAbort, { once: true })
+        try {
+            const pick = dependencies.bridge.pickLosslessSource
+            if (!pick) throw new Error('Android lossless backup picker is unavailable')
+            pick.call(dependencies.bridge, requestId)
+        }
+        catch (error) {
+            finish(() => reject(error))
+        }
+    })
 }
 
 function androidSafAbortError(

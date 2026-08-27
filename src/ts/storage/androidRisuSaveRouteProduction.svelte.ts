@@ -18,6 +18,7 @@ import {
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
     runNativeBlockRisuSaveRestore,
+    runNativeLosslessBackupRestore,
 } from './nativeFileJobs'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 
@@ -155,10 +156,13 @@ export function registerAndroidRisuSaveRoute(): void {
                 alertError(`${source.displayName}: discard-failed`)
             }
         },
-        restore: async ({ source }) => {
+        restore: async ({ source, displayName }) => {
+            const lossless = displayName.toLocaleLowerCase('en-US').endsWith('.risulossless')
             const result = await runExternalAndroidNativeFileOperation(
                 'import',
-                ({ signal, onStatus, setBlocking }) => runNativeBlockRisuSaveRestore(
+                ({ signal, onStatus, setBlocking }) => (lossless
+                    ? runNativeLosslessBackupRestore
+                    : runNativeBlockRisuSaveRestore)(
                     getPersistentDataRuntime(),
                     source,
                     {

@@ -267,6 +267,7 @@ describe('native file jobs', () => {
 
     it('hands a managed lossless export to Android SAF and cleans the native source', async () => {
         const events: string[] = []
+        const observedStatuses: NativeFileJobStatus[] = []
         const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174002.risulossless'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
@@ -291,7 +292,7 @@ describe('native file jobs', () => {
         const result = await runNativeLosslessBackupExport(
             { revision: 22, flushPendingData: async () => undefined },
             { type: 'androidSaf', suggestedName: 'backup.risulossless' },
-            {},
+            { onStatus: (status) => observedStatuses.push(status) },
             {
                 isTauri: () => true,
                 invoke: async (command, args) => {
@@ -305,6 +306,13 @@ describe('native file jobs', () => {
                 wait: async () => undefined,
                 copyToAndroidSaf: async (request) => {
                     events.push(`saf:${request.sourcePath}:${request.suggestedName}`)
+                    request.onProgress?.({
+                        requestId: 'android-export',
+                        operation: 'destination-copy',
+                        copiedBytes: 2048,
+                        totalBytes: 4096,
+                        token: null,
+                    })
                     return {
                         bytes: 4096,
                         warningCodes: ['android-saf-provider-not-atomic'],
@@ -315,6 +323,11 @@ describe('native file jobs', () => {
 
         expect(result.handoffPath).toBeUndefined()
         expect(result.warningCodes).toEqual(['android-saf-provider-not-atomic'])
+        expect(observedStatuses.at(-1)).toMatchObject({
+            state: 'running',
+            phase: 'publishing-destination',
+            progress: { completedBytes: 2048, totalBytes: 4096 },
+        })
         expect(events).toEqual([
             'native_file_job_start:{"request":{"kind":"export-lossless-backup","expectedRevision":22}}',
             'native_file_job_status:{"jobId":"lossless-export"}',
@@ -498,6 +511,110 @@ describe('native file jobs', () => {
             },
         )).rejects.toMatchObject({ name: 'AbortError' })
         expect(commands).toEqual([])
+    })
+
+    it('discards an unclaimed Android source when cancellation arrives during mutation capture', async () => {
+        const controller = new AbortController()
+        const token = '2c4d33fe-2e29-4625-bb1e-c8d1084f9557'
+        const commands: string[] = []
+        const discarded: string[] = []
+
+        await expect(runNativeLosslessBackupRestore(
+            restoreRuntime(2, { capture: () => controller.abort() }),
+            { type: 'androidSpool', token },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                discardAndroidSource: (sourceToken) => {
+                    discarded.push(sourceToken)
+                    return true
+                },
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+        expect(discarded).toEqual([token])
+        expect(commands).toEqual([])
+    })
+
+    it('discards an unclaimed Android source when restore starts already cancelled', async () => {
+        const controller = new AbortController()
+        const token = '2c4d33fe-2e29-4625-bb1e-c8d1084f9557'
+        const discarded: string[] = []
+        controller.abort()
+
+        await expect(runNativeLosslessBackupRestore(
+            restoreRuntime(2),
+            { type: 'androidSpool', token },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                discardAndroidSource: (sourceToken) => {
+                    discarded.push(sourceToken)
+                    return true
+                },
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+        expect(discarded).toEqual([token])
+    })
+
+    it('reports cleanup failure when an unclaimed Android source cannot be discarded', async () => {
+        const controller = new AbortController()
+        controller.abort()
+
+        await expect(runNativeLosslessBackupRestore(
+            restoreRuntime(2),
+            {
+                type: 'androidSpool',
+                token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+            },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                discardAndroidSource: () => false,
+            },
+        )).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'cleanup-failed',
+        })
+    })
+
+    it('normalizes Android source discard exceptions as cleanup failure', async () => {
+        const controller = new AbortController()
+        controller.abort()
+
+        await expect(runNativeLosslessBackupRestore(
+            restoreRuntime(2),
+            {
+                type: 'androidSpool',
+                token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+            },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                discardAndroidSource: () => {
+                    throw new Error('bridge unavailable')
+                },
+            },
+        )).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'cleanup-failed',
+        })
     })
 
     it('cancels staged data instead of activating when a live edit invalidates the token', async () => {
