@@ -1186,6 +1186,7 @@ mod tests {
                 &[json!({
                     "type": "character",
                     "chaId": "projected-character",
+                    "name": "Projected Character",
                     "image": resource,
                     "emotionImages": [["happy", resource]],
                     "additionalAssets": [["additional", resource]],
