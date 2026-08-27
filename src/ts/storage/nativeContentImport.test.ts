@@ -28,6 +28,45 @@ const preparedContent: PreparedNativeContent = {
     }],
 }
 
+const preparedRisumContent = {
+    casSessionId: 'content-1',
+    format: 'risu-module',
+    metadata: {
+        id: 'source-id',
+        name: 'Native module',
+        unknownFutureField: { retained: true },
+        assets: [
+            ['duplicate', '', 'PNG'],
+            ['duplicate', '', 'bin'],
+        ],
+    },
+    assets: [
+        {
+            position: 0,
+            logicalId: `assets/${'ab'.repeat(32)}.PNG`,
+            objectHash: 'ab'.repeat(32),
+            byteSize: 4,
+            mime: '',
+            name: '',
+            ext: 'PNG',
+        },
+        {
+            position: 1,
+            logicalId: `assets/${'cd'.repeat(32)}.bin`,
+            objectHash: 'cd'.repeat(32),
+            byteSize: 0,
+            mime: '',
+            name: '',
+            ext: 'bin',
+        },
+    ],
+    ownerHead: {
+        present: true,
+        manifestHash: 'ef'.repeat(32),
+        entryCount: 2,
+    },
+} as const
+
 function contentStatus(
     state: NativeFileJobStatus['state'],
     phase: NativeFileJobStatus['phase'],
@@ -51,6 +90,45 @@ function nativeDependencies(
 }
 
 describe('native prepared content import', () => {
+    it('accepts an occurrence-based RISUM receipt and seals it using only the job id', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\module.risum' },
+            'module.risum',
+            {},
+            nativeDependencies(async (command, args) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus(
+                        'succeeded',
+                        'complete',
+                        preparedRisumContent as unknown as PreparedNativeContent,
+                    )
+                }
+                if (
+                    command === 'asset_cas_job_seal_prepared_content'
+                    || command === 'asset_cas_job_release'
+                    || command === 'native_file_job_forget'
+                ) return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        expect(receipt.content).toEqual(preparedRisumContent)
+        await receipt.sealPreparedContent()
+        await receipt.confirmActivated()
+
+        expect(calls.slice(2)).toEqual([
+            ['asset_cas_job_seal_prepared_content', { sessionId: 'content-1' }],
+            ['asset_cas_job_release', { sessionId: 'content-1', outcome: 'committed' }],
+            ['native_file_job_forget', { jobId: 'content-1' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('ownerManifest')
+        expect(JSON.stringify(calls)).not.toContain('contentAssets')
+        expect(JSON.stringify(calls.slice(2))).not.toContain('path')
+    })
+
     it('returns a validated metadata-only receipt and retains the native job', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const receipt = await prepareNativeContentImport(

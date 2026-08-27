@@ -11,6 +11,11 @@ import { DBState, HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } f
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
+import { isTauriDesktop } from '../platform'
+import { open } from '@tauri-apps/plugin-dialog'
+import { readFile } from '@tauri-apps/plugin-fs'
+import type { NativeFileJobOptions, NativeFileJobSource } from '../storage/nativeFileJobs'
+import { importDesktopNativeModulePath } from '../storage/nativeModuleFileRoute'
 
 export interface MCPModule{
     url: string
@@ -32,6 +37,29 @@ export interface RisuModule{
     customModuleToggle?:string
     mcp?:MCPModule
     icon?:string
+}
+
+export async function importPreparedNativeModuleContent(input: {
+    source: NativeFileJobSource
+    displayName: string
+}, options: NativeFileJobOptions = {}): Promise<
+    { kind: 'declined' } | { kind: 'imported'; value: string }
+> {
+    const [{ runNativePreparedContentRoute }, { activatePreparedNativeModuleContent }] = await Promise.all([
+        import('../storage/nativePreparedContentRoute'),
+        import('../storage/nativeModuleContentActivation'),
+    ])
+    const result = await runNativePreparedContentRoute(
+        input.source,
+        input.displayName,
+        {
+            map: async (content) => content,
+            activate: (content, lifecycle) =>
+                activatePreparedNativeModuleContent(content, lifecycle),
+        },
+        options,
+    )
+    return result ? { kind: 'imported', value: result.moduleId } : { kind: 'declined' }
 }
 
 export async function exportModule(module:RisuModule, arg:{
@@ -254,7 +282,32 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
 }
 
 export async function importModule(){
-    const f = await selectSingleFile(['json', 'lorebook', 'risum', 'charx'])
+    let desktopFile:{name:string,data:Uint8Array}|undefined
+    if(isTauriDesktop){
+        const selected = await open({
+            multiple: false,
+            directory: false,
+            filters: [{
+                name: 'json, lorebook, risum, charx',
+                extensions: ['json', 'lorebook', 'risum', 'charx'],
+            }],
+        })
+        if(typeof selected !== 'string') return
+        const displayName = selected.split(/[\\/]/).at(-1) || selected
+        if(displayName.split('.').at(-1)?.toLocaleLowerCase('en-US') === 'risum'){
+            const result = await importDesktopNativeModulePath(selected, {
+                readDesktopPath: readFile,
+                nativeImport: importPreparedNativeModuleContent,
+                legacyImport: async () => {
+                    throw new Error('Desktop RISUM legacy import is not reachable')
+                },
+            })
+            if(result.kind === 'imported') alertNormal(language.successImport)
+            return
+        }
+        desktopFile = { name: displayName, data: await readFile(selected) }
+    }
+    const f = desktopFile ?? await selectSingleFile(['json', 'lorebook', 'risum', 'charx'])
     if(!f){
         return
     }

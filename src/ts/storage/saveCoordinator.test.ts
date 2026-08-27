@@ -143,6 +143,128 @@ describe('SaveCoordinator', () => {
         return { database, added }
     }
 
+    it('atomically appends a root module while carrying every occurrence owner head', async () => {
+        const database = makeDatabase()
+        database.modules = [
+            { id: 'duplicate', name: 'First', description: '', assets: [] },
+            { id: 'duplicate', name: 'Second', description: '' },
+        ]
+        database.personas = [
+            { name: 'With module', embeddedModule: { id: 'embedded', name: 'Embedded', assets: [] } },
+            { name: 'Without module' },
+        ] as Database['personas']
+        const existingHeads = new Map([
+            ['root-module-assets:0', {
+                owner: { kind: 'root-module-assets', index: 0 },
+                present: true,
+                manifestHash: '1'.repeat(64),
+                entryCount: 0,
+            }],
+            ['root-module-assets:1', {
+                owner: { kind: 'root-module-assets', index: 1 },
+                present: false,
+                manifestHash: null,
+                entryCount: 0,
+            }],
+            ['persona-embedded-module-assets:0', {
+                owner: { kind: 'persona-embedded-module-assets', index: 0 },
+                present: true,
+                manifestHash: '2'.repeat(64),
+                entryCount: 0,
+            }],
+        ])
+        const readAssetOwnerHead = vi.fn(async (owner: { kind: string; index?: number }) => {
+            const head = existingHeads.get(`${owner.kind}:${owner.index}`)
+            return head ? { revision: 7, value: structuredClone(head) } : null
+        })
+        const release = vi.fn(async () => undefined)
+        const commit = vi.fn(async () => ({ revision: 8 }))
+        const publishRootWorkingSet = vi.fn((root) => Object.assign(database, root))
+        const store = {
+            commit,
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead,
+                release,
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishRootWorkingSet,
+        })
+        coordinator.initialize(7, database)
+        const alias = {
+            kind: 'asset' as const,
+            key: `assets/${'a'.repeat(64)}.PNG`,
+            objectHash: 'a'.repeat(64),
+            size: 4,
+            mime: '',
+            name: '',
+            ext: 'PNG',
+        }
+
+        await coordinator.appendPersistentRootModule('native-risum-import', {
+            module: {
+                id: 'new-id',
+                name: 'Imported',
+                description: '',
+                assets: [['same', alias.key, 'PNG']],
+            },
+            assetAliases: [alias],
+            ownerHead: {
+                present: true,
+                manifestHash: '3'.repeat(64),
+                entryCount: 1,
+            },
+        })
+
+        expect(readAssetOwnerHead.mock.calls.map(([owner]) => owner)).toEqual([
+            { kind: 'root-module-assets', index: 0 },
+            { kind: 'root-module-assets', index: 1 },
+            { kind: 'persona-embedded-module-assets', index: 0 },
+        ])
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            root: expect.objectContaining({
+                modules: [
+                    { id: 'duplicate', name: 'First', description: '', assets: [] },
+                    { id: 'duplicate', name: 'Second', description: '' },
+                    {
+                        id: 'new-id',
+                        name: 'Imported',
+                        description: '',
+                        assets: [['same', alias.key, 'PNG']],
+                    },
+                ],
+            }),
+            assetAliases: [alias],
+            assetOwnerHeads: [
+                existingHeads.get('root-module-assets:0'),
+                existingHeads.get('root-module-assets:1'),
+                existingHeads.get('persona-embedded-module-assets:0'),
+                {
+                    owner: { kind: 'root-module-assets', index: 2 },
+                    present: true,
+                    manifestHash: '3'.repeat(64),
+                    entryCount: 1,
+                },
+            ],
+        })
+        expect(release).toHaveBeenCalledOnce()
+        expect(publishRootWorkingSet).toHaveBeenCalledOnce()
+        expect(database.modules.at(-1)).toEqual({
+            id: 'new-id',
+            name: 'Imported',
+            description: '',
+            assets: [['same', alias.key, 'PNG']],
+        })
+        expect(coordinator.revision).toBe(8)
+    })
+
     it('adopts a successful storage-only revision without changing dirty state or baselines', async () => {
         const database = makeDatabase()
         const commit = vi.fn()

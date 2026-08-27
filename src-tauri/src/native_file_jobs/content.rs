@@ -5,9 +5,11 @@ use super::{
     },
     content_cancelled, open_regular_file_no_follow, JobControl, JobPhase, JobProgress,
     NativeJobError, OpenedJobSource, PreparedContent, PreparedContentAsset, PreparedContentFormat,
-    PreparedContentModule,
+    PreparedContentModule, PreparedContentOwnerHead,
 };
-use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
+use crate::asset_repository::job_pins::{
+    CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
+};
 use crate::asset_repository::{PayloadCas, PreparedPayload};
 use crate::import_export_jobs::png_card::{
     parse_png_card, PngCardError, PngCardLimits, PngCardParseResult, StagedPngPayload,
@@ -17,6 +19,7 @@ use crate::import_export_jobs::{
     ImportLimits, JobStaging, JsonCardPayload, ParsedJsonCard,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -192,6 +195,7 @@ pub(super) fn prepare_content(
             | ContentKind::PngCard
             | ContentKind::CharxCard
             | ContentKind::AppendedCharxJpeg
+            | ContentKind::RisuModule
     );
     if !supported {
         return match kind {
@@ -199,14 +203,14 @@ pub(super) fn prepare_content(
                 "unsupported-without-destination",
                 "ordinary JPEG import requires an asset destination",
             )),
-            ContentKind::RisuModule | ContentKind::Unknown => Err(NativeJobError::new(
+            ContentKind::Unknown => Err(NativeJobError::new(
                 "invalid-input",
-                "content preparation accepts JSON, PNG, and CharX character cards only",
+                "content preparation accepts JSON, PNG, CharX, and RISUM content only",
             )),
             _ => unreachable!("supported content kinds were handled above"),
         };
     }
-    let cas_session = begin_content_cas_session(repository_root, job)?;
+    let mut cas_session = begin_content_cas_session(repository_root, job)?;
     let cas = match open_payload_cas(repository_root) {
         Ok(cas) => cas,
         Err(error) => return Err(abort_failed_content_session(cas_session, error)),
@@ -225,6 +229,9 @@ pub(super) fn prepare_content(
             spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested()).and_then(
                 |()| prepare_charx_content(&spool_path, display_name, owned_directory, &cas, job),
             )
+        }
+        ContentKind::RisuModule => {
+            prepare_risum_content(&mut source, owned_directory, &cas, &mut cas_session, job)
         }
         _ => unreachable!("unsupported content kinds returned before opening a CAS session"),
     };
@@ -320,6 +327,7 @@ fn prepare_png_content(
         cas_session_id: String::new(),
         portrait_logical_id: Some(portrait_logical_id),
         module: None,
+        owner_head: None,
     })
 }
 
@@ -378,6 +386,7 @@ fn promote_png_payload(
     Ok(PreparedContentAsset {
         reference_key: token.to_owned(),
         token: token.to_owned(),
+        position: None,
         logical_id: format!("assets/{object_hash}.png"),
         name: format!("{object_hash}.png"),
         object_hash,
@@ -412,6 +421,7 @@ fn prepare_json_content(
         cas_session_id: String::new(),
         portrait_logical_id: None,
         module: None,
+        owner_head: None,
     })
 }
 
@@ -490,7 +500,188 @@ fn prepare_charx_content(
         cas_session_id: String::new(),
         portrait_logical_id,
         module,
+        owner_head: None,
     })
+}
+
+fn prepare_risum_content(
+    source: &mut OpenedJobSource,
+    owned_directory: &Path,
+    cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    source
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
+    let parsed = parse_risum(
+        &mut source.file,
+        &staging,
+        &content_import_limits(),
+        &|| job.is_cancel_requested(),
+    )
+    .map_err(native_format_error)?;
+    let mut module = parsed
+        .metadata
+        .get("module")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| NativeJobError::new("invalid-input", "Risu module metadata is invalid"))?;
+    let assets_present = module.contains_key("assets");
+    if let Some(metadata_assets) = module.get_mut("assets").and_then(Value::as_array_mut) {
+        for (position, tuple) in metadata_assets.iter_mut().enumerate() {
+            let tuple = tuple.as_array_mut().ok_or_else(|| {
+                NativeJobError::new(
+                    "invalid-input",
+                    format!("Risu module asset {position} must be a tuple"),
+                )
+            })?;
+            if tuple.len() < 3 {
+                return Err(NativeJobError::new(
+                    "invalid-input",
+                    format!("Risu module asset {position} tuple is incomplete"),
+                ));
+            }
+            tuple[1] = Value::String(String::new());
+        }
+    }
+    let mut assets = Vec::with_capacity(parsed.assets.len());
+    let mut manifest_entries = Vec::with_capacity(parsed.assets.len());
+    for asset in parsed.assets {
+        if job.is_cancel_requested() {
+            return Err(content_cancelled());
+        }
+        let extension = validate_risum_extension(&asset.declared_extension)?;
+        let staged_path = owned_directory.join(&asset.payload.staged_name);
+        let staged = open_regular_file_no_follow(&staged_path)?;
+        if staged.total_bytes != asset.payload.byte_size {
+            return Err(NativeJobError::new(
+                "invalid-source",
+                "staged Risu module asset length changed",
+            ));
+        }
+        let mut reader = CancellableReader {
+            inner: staged.file,
+            job,
+        };
+        let prepared = cas_session
+            .prepare_reader(cas, &mut reader, CasObjectRole::DirectObject)
+            .map_err(|error| {
+                if job.is_cancel_requested() {
+                    content_cancelled()
+                } else {
+                    NativeJobError::new("store-error", error.to_string())
+                }
+            })?;
+        if prepared.content_hash != asset.payload.sha256
+            || prepared.byte_size != asset.payload.byte_size
+        {
+            return Err(NativeJobError::new(
+                "invalid-source",
+                "staged Risu module asset changed before CAS preparation",
+            ));
+        }
+        let logical_id = format!("assets/{}.{}", prepared.content_hash, extension);
+        let tuple = module
+            .get("assets")
+            .and_then(Value::as_array)
+            .and_then(|values| values.get(asset.position))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                NativeJobError::new("invalid-input", "Risu module asset tuple is invalid")
+            })?;
+        manifest_entries.push(crate::owner_manifest_codec::OwnerManifestEntry {
+            tuple: [
+                tuple[0]
+                    .as_str()
+                    .ok_or_else(|| {
+                        NativeJobError::new(
+                            "invalid-input",
+                            "Risu module asset name must be a string",
+                        )
+                    })?
+                    .to_owned(),
+                logical_id.clone(),
+                tuple[2]
+                    .as_str()
+                    .ok_or_else(|| {
+                        NativeJobError::new(
+                            "invalid-input",
+                            "Risu module asset extension must be a string",
+                        )
+                    })?
+                    .to_owned(),
+            ],
+            payload_hash: Some(
+                hex::decode(&prepared.content_hash)
+                    .expect("prepared payload hash is hexadecimal")
+                    .try_into()
+                    .expect("prepared payload hash is SHA-256"),
+            ),
+        });
+        assets.push(PreparedContentAsset {
+            reference_key: String::new(),
+            token: String::new(),
+            position: Some(asset.position),
+            logical_id,
+            object_hash: prepared.content_hash,
+            byte_size: prepared.byte_size,
+            mime: String::new(),
+            name: String::new(),
+            ext: extension.to_owned(),
+        });
+    }
+    let owner_head = if assets_present {
+        let bytes = crate::owner_manifest_codec::encode_owner_manifest(&manifest_entries)
+            .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
+        let prepared = cas_session
+            .prepare_bytes(cas, &bytes, CasObjectRole::OwnerManifest)
+            .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
+        let expected_hash = hex::encode(Sha256::digest(&bytes));
+        if prepared.content_hash != expected_hash {
+            return Err(NativeJobError::new(
+                "store-error",
+                "prepared Risu module owner manifest identity mismatch",
+            ));
+        }
+        PreparedContentOwnerHead {
+            present: true,
+            manifest_hash: Some(prepared.content_hash),
+            entry_count: manifest_entries.len(),
+        }
+    } else {
+        PreparedContentOwnerHead {
+            present: false,
+            manifest_hash: None,
+            entry_count: 0,
+        }
+    };
+    Ok(PreparedContent {
+        format: PreparedContentFormat::RisuModule,
+        metadata: Value::Object(module),
+        assets,
+        cas_session_id: String::new(),
+        portrait_logical_id: None,
+        module: None,
+        owner_head: Some(owner_head),
+    })
+}
+
+fn validate_risum_extension(extension: &str) -> Result<&str, NativeJobError> {
+    if extension.is_empty()
+        || extension.len() > 32
+        || !extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-'))
+    {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "Risu module asset extension is invalid",
+        ));
+    }
+    Ok(extension)
 }
 
 fn promote_archive_asset_occurrences(
@@ -534,6 +725,7 @@ fn promote_archive_asset_occurrences(
         assets.push(PreparedContentAsset {
             reference_key: token.clone(),
             token,
+            position: None,
             logical_id: format!("assets/{}.{}", promoted_payload.content_hash, suffix),
             object_hash: promoted_payload.content_hash,
             byte_size: promoted_payload.byte_size,
@@ -618,6 +810,7 @@ fn promote_json_assets(
         assets.push(PreparedContentAsset {
             token: reference_key.clone(),
             reference_key,
+            position: None,
             logical_id: format!("assets/{}.{}", promoted.content_hash, suffix),
             object_hash: promoted.content_hash,
             byte_size: promoted.byte_size,
@@ -737,6 +930,7 @@ fn promote_jpeg_prefix(
     Ok(PreparedContentAsset {
         reference_key: token.clone(),
         token,
+        position: None,
         logical_id: format!("assets/{object_hash}.jpg"),
         object_hash,
         byte_size: promoted.byte_size,

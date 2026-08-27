@@ -146,6 +146,9 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
                 } : null,
             )
         },
+        publishRootWorkingSet(root) {
+            Object.assign(getDatabase(), root)
+        },
         publishCharacterMutation(state) {
             const database = getDatabase()
             publishPersistentCharacterMutationToWorkingSet(
@@ -349,6 +352,12 @@ export const mutatePersistentPresets = (
     reason: string,
     mutate: PersistentPresetMutation,
 ): Promise<void> => getPersistentDataRuntime().mutatePersistentPresets(reason, mutate)
+export const appendPersistentRootModule = (
+    input: import('./saveCoordinator').PersistentRootModuleAppend,
+): Promise<void> => getPersistentDataRuntime().appendPersistentRootModule(
+    'native-risum-import',
+    input,
+)
 export const mutatePersistentCharacterDetail = (
     characterId: string,
     reason: string,

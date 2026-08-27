@@ -427,6 +427,93 @@ pub(crate) async fn asset_cas_job_finalize_content(
     .map_err(|error| format!("failed to join content CAS finalization: {error}"))?
 }
 
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_seal_prepared_content(
+    app: AppHandle,
+    native_jobs: State<'_, NativeFileJobState>,
+    session_id: String,
+) -> Result<(), String> {
+    let content = native_jobs
+        .prepared_content_receipt(&session_id)
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    if content.format != crate::native_file_jobs::PreparedContentFormat::RisuModule {
+        return Err("prepared content does not own native RISUM roots".to_owned());
+    }
+    let mut expected = content
+        .assets
+        .iter()
+        .map(|asset| {
+            (
+                asset.object_hash.clone(),
+                asset.byte_size,
+                CasObjectRole::DirectObject,
+            )
+        })
+        .collect::<Vec<_>>();
+    let owner_head = content
+        .owner_head
+        .as_ref()
+        .ok_or_else(|| "prepared RISUM content has no owner head".to_owned())?;
+    if owner_head.present {
+        if owner_head.entry_count != content.assets.len() {
+            return Err("prepared RISUM owner head count does not match its assets".to_owned());
+        }
+        let manifest_hash = owner_head
+            .manifest_hash
+            .as_ref()
+            .ok_or_else(|| "prepared RISUM owner head has no manifest hash".to_owned())?;
+        let root = repository_root(&app)?;
+        let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
+        let manifest_size = cas
+            .stat_object(manifest_hash)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "prepared RISUM owner manifest is missing".to_owned())?;
+        expected.push((
+            manifest_hash.clone(),
+            manifest_size,
+            CasObjectRole::OwnerManifest,
+        ));
+    } else if owner_head.manifest_hash.is_some()
+        || owner_head.entry_count != 0
+        || !content.assets.is_empty()
+    {
+        return Err("absent RISUM owner head is inconsistent".to_owned());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = repository_root(&app)?;
+        let state = app.state::<DurableCasJobState>();
+        let mut jobs = state
+            .jobs
+            .lock()
+            .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+        if !jobs.contains_key(&session_id) {
+            let recovered =
+                DurableCasJob::open(&root, &session_id).map_err(|error| error.to_string())?;
+            jobs.insert(session_id.clone(), recovered);
+        }
+        let job = jobs
+            .get_mut(&session_id)
+            .expect("recovered CAS job session must be present");
+        if job.kind() != CasJobKind::CardOrModuleContentImport
+            || job.is_sealed()
+            || job.is_released()
+            || !job.has_exact_pins(&expected)
+        {
+            return Err("prepared RISUM CAS pin set does not match its receipt".to_owned());
+        }
+        persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
+            job.seal(
+                store,
+                now_ms().map_err(|message| StoreError::Store { message })?,
+            )
+            .map_err(StoreError::from)
+        })
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("failed to join prepared content CAS seal: {error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

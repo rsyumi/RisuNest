@@ -10,6 +10,7 @@ import type {
     PersistentRoot,
     WorkingSetCommit,
 } from './persistentDataStore'
+import type { RisuModule } from '../process/modules'
 import { RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { isConversationSummaryStub } from './conversationResidency'
@@ -57,6 +58,7 @@ export interface SaveCoordinatorDependencies {
     replaceDatabase(database: Database): void
     /** Publishes the committed preset state synchronously and must not throw. */
     publishPresetWorkingSet?(state: PersistentPresetMutationResult): void
+    publishRootWorkingSet?(root: RootDatabase): void
     /** Publishes one committed character mutation synchronously and must not throw. */
     publishCharacterMutation?(state: PersistentCharacterMutationResult): void
     isIncompleteWorkingSet?(database: Database): boolean
@@ -698,6 +700,12 @@ export interface PersistentCompleteCharacterUpsertOptions {
     assetOwnerHeads?: readonly PersistentCharacterAssetOwnerHead[]
 }
 
+export interface PersistentRootModuleAppend {
+    module: RisuModule
+    assetAliases: readonly Extract<AssetAlias, { kind: 'asset' }>[]
+    ownerHead: Omit<AssetOwnerHead, 'owner'>
+}
+
 function defaultClock(): SaveCoordinatorClock {
     return {
         setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
@@ -1177,6 +1185,76 @@ export class SaveCoordinator {
             }
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
+        })
+    }
+
+    appendPersistentRootModule(
+        reason: string,
+        input: PersistentRootModuleAppend,
+    ): Promise<void> {
+        this.assertInitialized()
+        this.assertPersistentMutationAllowed()
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            await this.flushIterations(reason, true)
+            const revision = this.revision
+            const operationStart = this.capture()
+            const lease = await this.dependencies.store.acquireRevision(revision)
+            const snapshot = await withPersistentRevisionLease(lease, async (reader) => {
+                this.assertReadRevision(revision, reader.revision)
+                const rootValue = await reader.readRoot()
+                this.assertReadRevision(revision, rootValue.revision)
+                const root = canonicalClone(rootValue.value)
+                const ownerHeads: AssetOwnerHead[] = []
+                const modules = Array.isArray(root.modules) ? root.modules : []
+                for (let index = 0; index < modules.length; index++) {
+                    const value = await reader.readAssetOwnerHead({
+                        kind: 'root-module-assets',
+                        index,
+                    })
+                    if (!value) continue
+                    this.assertReadRevision(revision, value.revision)
+                    ownerHeads.push(canonicalClone(value.value))
+                }
+                const personas = Array.isArray(root.personas) ? root.personas : []
+                for (let index = 0; index < personas.length; index++) {
+                    if (!personas[index]?.embeddedModule) continue
+                    const value = await reader.readAssetOwnerHead({
+                        kind: 'persona-embedded-module-assets',
+                        index,
+                    })
+                    if (!value) continue
+                    this.assertReadRevision(revision, value.revision)
+                    ownerHeads.push(canonicalClone(value.value))
+                }
+                return { root, ownerHeads }
+            })
+            if (this.capture().rootCanonical !== operationStart.rootCanonical) {
+                throw new Error('Persistent root changed during module import')
+            }
+            const modules = Array.isArray(snapshot.root.modules)
+                ? snapshot.root.modules
+                : []
+            const moduleIndex = modules.length
+            snapshot.root.modules = [...modules, canonicalClone(input.module)]
+            const ownerHead: AssetOwnerHead = {
+                owner: { kind: 'root-module-assets', index: moduleIndex },
+                ...canonicalClone(input.ownerHead),
+            } as AssetOwnerHead
+            const committed = await this.dependencies.store.commit({
+                expectedRevision: revision,
+                root: snapshot.root,
+                assetAliases: [...canonicalClone(input.assetAliases)],
+                assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
+            })
+            this.currentRevision = committed.revision
+            this.dirtyGeneration++
+            this.rootBaseline = canonicalJson(snapshot.root)
+            this.dependencies.publishRootWorkingSet?.(snapshot.root)
+            this.dependencies.onLocalRevision?.(committed.revision)
+            this.pendingByteCount = 0
+            this.lastBackgroundErrorMessage = null
+            await this.finishExplicitCommit(committed.revision)
         })
     }
 

@@ -126,6 +126,14 @@ export async function finalizeContentCasJob(
     }), 'Native content CAS finalizer')
 }
 
+export async function sealPreparedContentCasJob(
+    sessionId: string,
+    invokeCommand: InvokeCommand = invoke,
+): Promise<void> {
+    pinSessionId(sessionId, 'Native prepared content CAS seal')
+    await invokeCommand('asset_cas_job_seal_prepared_content', { sessionId })
+}
+
 export async function releaseCasJob(
     sessionId: string,
     outcome: NativeCasReleaseOutcome,

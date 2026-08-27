@@ -261,19 +261,32 @@ pub(crate) enum PreparedContentFormat {
     PngCard,
     CharxCard,
     AppendedCharxJpeg,
+    RisuModule,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PreparedContentAsset {
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) reference_key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) position: Option<usize>,
     pub(crate) logical_id: String,
     pub(crate) object_hash: String,
     pub(crate) byte_size: u64,
     pub(crate) mime: String,
     pub(crate) name: String,
     pub(crate) ext: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreparedContentOwnerHead {
+    pub(crate) present: bool,
+    pub(crate) manifest_hash: Option<String>,
+    pub(crate) entry_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -296,6 +309,8 @@ pub(crate) struct PreparedContent {
     pub(crate) portrait_logical_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) module: Option<PreparedContentModule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_head: Option<PreparedContentOwnerHead>,
 }
 
 #[derive(Debug)]
@@ -1822,6 +1837,43 @@ impl NativeFileJobState {
             .iter()
             .map(|asset| (asset.object_hash.clone(), asset.byte_size))
             .collect())
+    }
+
+    pub(crate) fn prepared_content_receipt(
+        &self,
+        job_id: &str,
+    ) -> Result<PreparedContent, NativeJobError> {
+        let job = self
+            .registry
+            .lookup(job_id)
+            .map_err(|error| NativeJobError::new("store-error", error))?
+            .ok_or_else(|| NativeJobError::new("invalid-input", "native content job is missing"))?;
+        let status = job
+            .status
+            .lock()
+            .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
+        if status.kind != JobKind::PrepareContentImport
+            || status.state != JobState::Succeeded
+            || status.phase != JobPhase::Complete
+        {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "native content receipt is not terminal and successful",
+            ));
+        }
+        let prepared = status.prepared_content.clone().ok_or_else(|| {
+            NativeJobError::new(
+                "invalid-input",
+                "successful native content job has no prepared receipt",
+            )
+        })?;
+        if prepared.cas_session_id != job_id {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "native content receipt CAS session does not match its job",
+            ));
+        }
+        Ok(prepared)
     }
 
     pub(crate) fn list(&self) -> Result<Vec<JobStatus>, NativeJobError> {
@@ -3945,6 +3997,32 @@ mod tests {
         (source, base)
     }
 
+    fn risum_fixture(module: Value, assets: &[&[u8]]) -> Vec<u8> {
+        let map = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
+        let encode = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| map[*byte as usize])
+                .collect::<Vec<_>>()
+        };
+        let metadata = encode(
+            serde_json::to_string(&json!({ "type": "risuModule", "module": module }))
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut bytes = vec![111, 0];
+        bytes.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&metadata);
+        for asset in assets {
+            let encoded = encode(asset);
+            bytes.push(1);
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes.push(0);
+        bytes
+    }
+
     fn wait_for_content_job(state: &NativeFileJobState, job_id: &str) -> JobStatus {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -4508,6 +4586,127 @@ mod tests {
         );
         assert!(state.forget(&started.job_id).unwrap());
         assert!(state.status(&started.job_id).is_err());
+    }
+
+    #[test]
+    fn content_prepare_risum_preserves_occurrences_and_prepares_native_owner_roots() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("module.RISUM");
+        fs::write(
+            &source,
+            risum_fixture(
+                json!({
+                    "id": "source-id",
+                    "name": "Native module",
+                    "unknownFutureField": { "retained": true },
+                    "assets": [
+                        ["duplicate", "legacy-a", "PNG"],
+                        ["duplicate", "legacy-b", "bin"]
+                    ]
+                }),
+                &[b"exact ordinary bytes", b""],
+            ),
+        )
+        .unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "module.RISUM");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Succeeded);
+        let content = prepared.prepared_content.as_ref().expect("prepared RISUM");
+        let serialized = serde_json::to_value(content).unwrap();
+        assert_eq!(
+            serialized.pointer("/format").and_then(Value::as_str),
+            Some("risu-module")
+        );
+        assert_eq!(
+            serialized.pointer("/metadata/id"),
+            Some(&json!("source-id"))
+        );
+        assert_eq!(
+            serialized.pointer("/metadata/unknownFutureField/retained"),
+            Some(&json!(true))
+        );
+        assert_eq!(serialized.pointer("/assets/0/position"), Some(&json!(0)));
+        assert_eq!(serialized.pointer("/assets/1/position"), Some(&json!(1)));
+        assert_eq!(serialized.pointer("/assets/0/ext"), Some(&json!("PNG")));
+        assert_eq!(serialized.pointer("/assets/1/ext"), Some(&json!("bin")));
+        assert!(serialized.pointer("/assets/0/token").is_none());
+        assert!(serialized.pointer("/assets/0/referenceKey").is_none());
+        assert_eq!(serialized.pointer("/ownerHead/present"), Some(&json!(true)));
+        assert_eq!(serialized.pointer("/ownerHead/entryCount"), Some(&json!(2)));
+        assert_eq!(content.cas_session_id, started.job_id);
+        let encoded = serde_json::to_string(content).unwrap();
+        assert!(!encoded.contains("stagedPath"));
+        assert!(!encoded.contains("legacy-a"));
+        assert!(!encoded.contains("exact ordinary bytes"));
+
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert_eq!(
+            cas.read_object(
+                serialized
+                    .pointer("/assets/0/objectHash")
+                    .and_then(Value::as_str)
+                    .unwrap()
+            )
+            .unwrap(),
+            Some(b"exact ordinary bytes".to_vec())
+        );
+        assert_eq!(
+            cas.read_object(
+                serialized
+                    .pointer("/assets/1/objectHash")
+                    .and_then(Value::as_str)
+                    .unwrap()
+            )
+            .unwrap(),
+            Some(Vec::new())
+        );
+        let session = crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .unwrap();
+        assert_eq!(session.pin_count(), 3);
+        assert!(!session.is_sealed());
+    }
+
+    #[test]
+    fn content_prepare_risum_distinguishes_absent_and_present_empty_assets() {
+        for (name, module, expected_present, expected_pins) in [
+            ("absent.risum", json!({ "name": "Absent" }), false, 0),
+            (
+                "empty.risum",
+                json!({ "name": "Empty", "assets": [] }),
+                true,
+                1,
+            ),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let source = directory.path().join(name);
+            fs::write(&source, risum_fixture(module, &[])).unwrap();
+            let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+            let started = start_test_content_job(&state, &source, name);
+            let prepared = wait_for_content_job(&state, &started.job_id);
+            let content = prepared.prepared_content.as_ref().expect("prepared RISUM");
+            let serialized = serde_json::to_value(content).unwrap();
+            assert_eq!(
+                serialized.pointer("/ownerHead/present"),
+                Some(&json!(expected_present))
+            );
+            assert_eq!(
+                serialized.pointer("/metadata/assets").is_some(),
+                expected_present
+            );
+            let session = crate::asset_repository::job_pins::DurableCasJob::open(
+                directory.path(),
+                &started.job_id,
+            )
+            .unwrap();
+            assert_eq!(session.pin_count(), expected_pins);
+            assert!(!session.is_sealed());
+        }
     }
 
     #[test]
@@ -5147,6 +5346,7 @@ mod tests {
             cas_session_id: job.id(),
             portrait_logical_id: None,
             module: None,
+            owner_head: None,
         }
     }
 
@@ -5535,6 +5735,7 @@ mod tests {
                     cas_session_id: content_id.clone(),
                     portrait_logical_id: None,
                     module: None,
+                    owner_head: None,
                 }),
                 Ok(()),
             )
@@ -5579,6 +5780,7 @@ mod tests {
                 PreparedContentAsset {
                     reference_key: "first".to_owned(),
                     token: "first".to_owned(),
+                    position: None,
                     logical_id: format!("assets/{}.png", "1".repeat(64)),
                     object_hash: "1".repeat(64),
                     byte_size: 4,
@@ -5589,6 +5791,7 @@ mod tests {
                 PreparedContentAsset {
                     reference_key: "second".to_owned(),
                     token: "second".to_owned(),
+                    position: None,
                     logical_id: format!("assets/{}.json", "2".repeat(64)),
                     object_hash: "2".repeat(64),
                     byte_size: 7,
@@ -5600,6 +5803,7 @@ mod tests {
             cas_session_id: session_id,
             portrait_logical_id: None,
             module: None,
+            owner_head: None,
         }
     }
 

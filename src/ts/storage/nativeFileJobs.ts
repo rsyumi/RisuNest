@@ -5,6 +5,7 @@ import type { PreparedNativeCharacterCardModule } from '../characterCards'
 import {
     finalizeContentCasJob,
     releaseCasJob,
+    sealPreparedContentCasJob,
 } from './nativeAssetRepository'
 import type { PreparedImmutablePayload } from './payloadCas'
 import {
@@ -55,11 +56,12 @@ export type NativeOfficialAccountSnapshotRestoreResult =
         sourceSha256: string
         recoveryPath?: string
         warningCodes: string[]
-    }
+}
 
-export interface PreparedContentAssetDescriptor {
-    referenceKey: string
-    token: string
+interface PreparedContentAssetDescriptorBase {
+    referenceKey?: string
+    token?: string
+    position?: number
     logicalId: string
     objectHash: string
     byteSize: number
@@ -68,13 +70,37 @@ export interface PreparedContentAssetDescriptor {
     ext: string
 }
 
+export interface PreparedCardContentAssetDescriptor extends PreparedContentAssetDescriptorBase {
+    referenceKey: string
+    token: string
+}
+
+export interface PreparedRisumContentAssetDescriptor extends PreparedContentAssetDescriptorBase {
+    position: number
+}
+
+export type PreparedContentAssetDescriptor =
+    | PreparedCardContentAssetDescriptor
+    | PreparedRisumContentAssetDescriptor
+
+export type PreparedRisumOwnerHead =
+    | { present: false; manifestHash: null; entryCount: 0 }
+    | { present: true; manifestHash: string; entryCount: number }
+
 export interface PreparedNativeContent {
     casSessionId: string
-    format: 'json-card' | 'png-card' | 'charx-card' | 'appended-charx-jpeg'
+    format: 'json-card' | 'png-card' | 'charx-card' | 'appended-charx-jpeg' | 'risu-module'
     metadata: Record<string, unknown>
     assets: PreparedContentAssetDescriptor[]
     portraitLogicalId?: string
     module?: PreparedNativeCharacterCardModule
+    ownerHead?: PreparedRisumOwnerHead
+}
+
+export interface PreparedNativeRisumContent extends PreparedNativeContent {
+    format: 'risu-module'
+    assets: PreparedRisumContentAssetDescriptor[]
+    ownerHead: PreparedRisumOwnerHead
 }
 
 interface NativeOfficialPublicationCommonResult {
@@ -201,6 +227,7 @@ export interface NativeFileJobOptions {
 
 export interface PreparedNativeContentActivationLifecycle {
     prepareOwnerManifestAndSeal(bytes: Uint8Array): Promise<PreparedImmutablePayload>
+    sealPreparedContent?(): Promise<void>
 }
 
 export interface PreparedNativeContentReceipt extends PreparedNativeContentActivationLifecycle {
@@ -317,6 +344,7 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         && content.format !== 'png-card'
         && content.format !== 'charx-card'
         && content.format !== 'appended-charx-jpeg'
+        && content.format !== 'risu-module'
     ) {
         throw preparedContentError('Prepared content format is unsupported')
     }
@@ -337,12 +365,22 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
     const expectedContentFields = ['assets', 'casSessionId', 'format', 'metadata']
     if (content.portraitLogicalId !== undefined) expectedContentFields.push('portraitLogicalId')
     if (content.module !== undefined) expectedContentFields.push('module')
+    if (content.ownerHead !== undefined) expectedContentFields.push('ownerHead')
     if (Object.keys(content).sort().join('\0') !== expectedContentFields.sort().join('\0')) {
         throw preparedContentError('Prepared content fields are invalid')
     }
-    const expectedFields = [
+    const expectedCardFields = [
         'referenceKey',
         'token',
+        'logicalId',
+        'objectHash',
+        'byteSize',
+        'mime',
+        'name',
+        'ext',
+    ].sort()
+    const expectedRisumFields = [
+        'position',
         'logicalId',
         'objectHash',
         'byteSize',
@@ -356,6 +394,8 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
             throw preparedContentError(`Prepared content asset ${index} must be an object`)
         }
         const asset = value as Record<string, unknown>
+        const risum = content.format === 'risu-module'
+        const expectedFields = risum ? expectedRisumFields : expectedCardFields
         if (Object.keys(asset).sort().join('\0') !== expectedFields.join('\0')) {
             throw preparedContentError(`Prepared content asset ${index} fields are invalid`)
         }
@@ -366,11 +406,14 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         if (!Number.isSafeInteger(asset.byteSize) || (asset.byteSize as number) < 0) {
             throw preparedContentError(`Prepared content asset ${index} byteSize is invalid`)
         }
-        const token = requiredDescriptorString(asset.token, 'token')
-        if (tokens.has(token)) {
-            throw preparedContentError(`Prepared content asset ${index} token is duplicated`)
+        let token: string | undefined
+        if (!risum) {
+            token = requiredDescriptorString(asset.token, 'token')
+            if (tokens.has(token)) {
+                throw preparedContentError(`Prepared content asset ${index} token is duplicated`)
+            }
+            tokens.add(token)
         }
-        tokens.add(token)
         const ext = requiredDescriptorString(asset.ext, 'ext')
         if (ext.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(ext)) {
             throw preparedContentError(`Prepared content asset ${index} ext is invalid`)
@@ -391,12 +434,26 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
             throw preparedContentError(`Prepared content asset ${index} mime must be a string`)
         }
         const mime = asset.mime
-        if (mime.length === 0 && content.format !== 'png-card') {
+        if (mime.length === 0 && content.format !== 'png-card' && !risum) {
             throw preparedContentError(`Prepared content asset ${index} mime must be a nonempty string`)
+        }
+        if (risum) {
+            if (!Number.isSafeInteger(asset.position) || asset.position !== index) {
+                throw preparedContentError(`Prepared RISUM asset ${index} position is invalid`)
+            }
+            return {
+                position: index,
+                logicalId,
+                objectHash,
+                byteSize: asset.byteSize as number,
+                mime,
+                name: asset.name,
+                ext,
+            }
         }
         return {
             referenceKey: requiredDescriptorString(asset.referenceKey, 'referenceKey'),
-            token,
+            token: token!,
             logicalId,
             objectHash,
             byteSize: asset.byteSize as number,
@@ -405,10 +462,47 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
             ext,
         }
     })
+    if (content.format === 'risu-module') {
+        if (content.portraitLogicalId !== undefined || content.module !== undefined) {
+            throw preparedContentError('Prepared RISUM content cannot contain card fields')
+        }
+        if (typeof content.ownerHead !== 'object' || content.ownerHead === null || Array.isArray(content.ownerHead)) {
+            throw preparedContentError('Prepared RISUM ownerHead must be an object')
+        }
+        const ownerHead = content.ownerHead as Record<string, unknown>
+        if (Object.keys(ownerHead).sort().join('\0') !== ['entryCount', 'manifestHash', 'present'].join('\0')) {
+            throw preparedContentError('Prepared RISUM ownerHead fields are invalid')
+        }
+        if (typeof ownerHead.present !== 'boolean') {
+            throw preparedContentError('Prepared RISUM ownerHead present is invalid')
+        }
+        if (!Number.isSafeInteger(ownerHead.entryCount) || (ownerHead.entryCount as number) < 0) {
+            throw preparedContentError('Prepared RISUM ownerHead entryCount is invalid')
+        }
+        if (ownerHead.present) {
+            if (typeof ownerHead.manifestHash !== 'string' || !/^[0-9a-f]{64}$/.test(ownerHead.manifestHash)) {
+                throw preparedContentError('Prepared RISUM ownerHead manifestHash is invalid')
+            }
+            if (ownerHead.entryCount !== assets.length) {
+                throw preparedContentError('Prepared RISUM ownerHead entryCount does not match assets')
+            }
+        }
+        else if (ownerHead.manifestHash !== null || ownerHead.entryCount !== 0 || assets.length !== 0) {
+            throw preparedContentError('Absent RISUM ownerHead must have no assets')
+        }
+        return {
+            casSessionId,
+            format: 'risu-module',
+            metadata: content.metadata as Record<string, unknown>,
+            assets: assets as PreparedRisumContentAssetDescriptor[],
+            ownerHead: ownerHead as PreparedRisumOwnerHead,
+        }
+    }
+    const cardAssets = assets as PreparedCardContentAssetDescriptor[]
     let portraitLogicalId: string | undefined
     if (content.portraitLogicalId !== undefined) {
         portraitLogicalId = requiredDescriptorString(content.portraitLogicalId, 'portraitLogicalId')
-        if (!assets.some((asset) => asset.logicalId === portraitLogicalId)) {
+        if (!cardAssets.some((asset) => asset.logicalId === portraitLogicalId)) {
             throw preparedContentError('Prepared content portraitLogicalId must reference a prepared asset')
         }
     }
@@ -435,7 +529,7 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         if (!portraitLogicalId) {
             throw preparedContentError('Prepared PNG portraitLogicalId is required')
         }
-        const portrait = assets[0]
+        const portrait = cardAssets[0]
         if (!portrait || portrait.logicalId !== portraitLogicalId) {
             throw preparedContentError('Prepared PNG portrait must be the first asset')
         }
@@ -449,7 +543,7 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         ) {
             throw preparedContentError('Prepared PNG portrait descriptor is invalid')
         }
-        for (const [index, asset] of assets.slice(1).entries()) {
+        for (const [index, asset] of cardAssets.slice(1).entries()) {
             if (asset.token !== asset.referenceKey) {
                 throw preparedContentError(`Prepared PNG embedded asset ${index} token must equal referenceKey`)
             }
@@ -490,7 +584,7 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         casSessionId,
         format: content.format,
         metadata: content.metadata as Record<string, unknown>,
-        assets,
+        assets: cardAssets,
         ...(portraitLogicalId === undefined ? {} : { portraitLogicalId }),
         ...(module === undefined ? {} : { module }),
     }
@@ -1411,6 +1505,36 @@ export async function prepareNativeContentImport(
                 lifecycleState = 'finalized'
                 return prepared
             }
+            const sealPreparedContent = async (): Promise<void> => {
+                if (lifecycleState !== 'unfinalized') {
+                    throw new Error('Native content can only be finalized once')
+                }
+                lifecycleState = 'finalizing'
+                finalizerOperation = sealPreparedContentCasJob(
+                    started.jobId,
+                    dependencies.invoke,
+                ).then(() => ({
+                    contentHash: '0'.repeat(64),
+                    byteSize: 0,
+                    physicalKey: '',
+                    deduplicated: true,
+                }))
+                try {
+                    await finalizerOperation
+                }
+                catch (error) {
+                    if (!cancellationDuringFinalize) settle(() => releaseAndForget('aborted'))
+                    try { await settlement }
+                    catch {}
+                    throw error
+                }
+                if (cancellationDuringFinalize) {
+                    try { await settlement }
+                    catch {}
+                    throw abortError()
+                }
+                lifecycleState = 'finalized'
+            }
             const confirmActivated = async (): Promise<void> => {
                 if (lifecycleState === 'settled') return
                 if (lifecycleState !== 'finalized') {
@@ -1446,6 +1570,7 @@ export async function prepareNativeContentImport(
                     ...(status.warningCodes ?? []),
                 ])].slice(0, 16),
                 prepareOwnerManifestAndSeal,
+                sealPreparedContent,
                 confirmActivated,
                 cancel,
             }

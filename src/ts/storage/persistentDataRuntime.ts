@@ -214,6 +214,7 @@ export interface PersistentDataRuntimeStateAdapter {
         forceScalableProjection?: boolean,
     ): void
     publishPresetWorkingSet?(state: PersistentPresetMutationResult): void
+    publishRootWorkingSet?(root: RootDatabase): void
     publishCharacterMutation?(state: PersistentCharacterMutationResult): void
     installCompleteDatabase?(database: Database): void
     restoreSelection?(characterId: string | null, conversationId: string | null): void
@@ -283,6 +284,10 @@ export interface PersistentDataRuntime {
         mutations: readonly PluginStorageMutation[],
     ): Promise<void>
     mutatePersistentPresets(reason: string, mutate: PersistentPresetMutation): Promise<void>
+    appendPersistentRootModule(
+        reason: string,
+        input: import('./saveCoordinator').PersistentRootModuleAppend,
+    ): Promise<void>
     mutatePersistentCharacterDetail(
         characterId: string,
         reason: string,
@@ -459,6 +464,7 @@ export function createPersistentDataRuntime(
             dependencies.state.replaceDatabase(database, activeCharacterIds)
         },
         publishPresetWorkingSet: dependencies.state.publishPresetWorkingSet,
+        publishRootWorkingSet: dependencies.state.publishRootWorkingSet,
         publishCharacterMutation: dependencies.state.publishCharacterMutation,
         isIncompleteWorkingSet: (database) =>
             hasIncompletePersistentWorkingSet(database, workingSetResidency),
@@ -608,6 +614,8 @@ export function createPersistentDataRuntime(
             coordinator.mutatePersistentPluginStorage(reason, mutations),
         mutatePersistentPresets: (reason, mutate) =>
             coordinator.mutatePersistentPresets(reason, mutate),
+        appendPersistentRootModule: (reason, input) =>
+            coordinator.appendPersistentRootModule(reason, input),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
         deletePersistentCharacterWithGroupReferences: (characterId, reason) =>

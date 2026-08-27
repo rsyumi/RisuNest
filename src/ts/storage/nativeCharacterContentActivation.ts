@@ -162,6 +162,10 @@ export async function activatePreparedNativeCharacterContent(
     dependencies: NativeCharacterContentActivationDependencies = productionDependencies,
     signal?: AbortSignal,
 ): Promise<NativeCharacterContentActivationResult | null> {
+    if (content.format === 'risu-module') {
+        throw new UnsupportedPreparedNativeCharacterCardError()
+    }
+    const cardAssets = content.assets as import('./nativeFileJobs').PreparedCardContentAssetDescriptor[]
     throwIfAborted(signal)
     const card = content.format === 'png-card'
         ? await dependencies.decodePng(content.metadata as PreparedNativePngCardMetadata)
@@ -170,7 +174,7 @@ export async function activatePreparedNativeCharacterContent(
     if (!card) return null
     const character = await dependencies.map({
         card,
-        assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),
+        assets: cardAssets.map(({ token, logicalId }) => ({ token, logicalId })),
         ...(content.portraitLogicalId === undefined
             ? {}
             : { portraitLogicalId: content.portraitLogicalId }),

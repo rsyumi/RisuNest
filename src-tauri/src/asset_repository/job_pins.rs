@@ -364,6 +364,25 @@ impl DurableCasJob {
         self.state.pins.len()
     }
 
+    pub(crate) fn has_exact_pins(&self, pins: &[(String, u64, CasObjectRole)]) -> bool {
+        let mut expected = BTreeMap::new();
+        for (object_hash, byte_size, role) in pins {
+            if expected
+                .insert(
+                    object_hash.clone(),
+                    PinDescriptor {
+                        byte_size: *byte_size,
+                        role: *role,
+                    },
+                )
+                .is_some_and(|existing| existing.byte_size != *byte_size || existing.role != *role)
+            {
+                return false;
+            }
+        }
+        self.state.pins == expected
+    }
+
     pub(crate) fn kind(&self) -> CasJobKind {
         self.state.kind
     }
