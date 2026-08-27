@@ -1,0 +1,657 @@
+use super::{
+    charx::{
+        inspect_charx_file, CharXContainerKind, CharXInspection, CharXLimits, CharXParseError,
+        CharXParseErrorCode, ParsedCharXDescriptor, StagedPayloadDescriptor,
+    },
+    content_cancelled, open_regular_file_no_follow, JobControl, JobPhase, JobProgress,
+    NativeJobError, OpenedJobSource, PreparedContent, PreparedContentAsset, PreparedContentFormat,
+    PreparedContentModule,
+};
+use crate::asset_repository::{PayloadCas, PreparedPayload};
+use crate::import_export_jobs::{
+    classify_content, parse_json_card, parse_risum, ContentKind, FormatError, FormatErrorKind,
+    ImportLimits, JobStaging, JsonCardPayload, ParsedJsonCard,
+};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_MODULE_OVERLAY_ITEMS: usize = 256;
+const ZIP_LOCAL_FILE_HEADER_BYTES: u64 = 30;
+const ZIP_LOCAL_VARIABLE_HEADER_MAX_BYTES: u64 = u16::MAX as u64 * 2;
+const ZIP_DATA_DESCRIPTOR_MAX_BYTES: u64 = 24;
+const ZIP_FOOTER_MAX_BYTES: u64 = 22 + 20 + 56 + u16::MAX as u64;
+
+#[derive(Clone)]
+struct PromotedPayload {
+    content_hash: String,
+    byte_size: u64,
+}
+
+struct CancellableReader<'a, R> {
+    inner: R,
+    job: &'a JobControl,
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.job.is_cancel_requested() {
+            return Err(io::Error::other("content preparation was cancelled"));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+pub(super) fn spool_opened_source(
+    source: &mut OpenedJobSource,
+    destination: &Path,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<(), NativeJobError> {
+    if is_cancelled() {
+        return Err(content_cancelled());
+    }
+    source
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    let mut remove_partial = true;
+    let result = (|| {
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+        while copied < source.total_bytes {
+            if is_cancelled() {
+                return Err(content_cancelled());
+            }
+            let remaining = (source.total_bytes - copied).min(buffer.len() as u64) as usize;
+            let read = source
+                .file
+                .read(&mut buffer[..remaining])
+                .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+            if read == 0 {
+                return Err(NativeJobError::new(
+                    "invalid-source",
+                    "source ended before its opened length",
+                ));
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+            copied += read as u64;
+        }
+        if is_cancelled() {
+            return Err(content_cancelled());
+        }
+        let mut extra = [0_u8; 1];
+        if source
+            .file
+            .read(&mut extra)
+            .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?
+            != 0
+        {
+            return Err(NativeJobError::new(
+                "invalid-source",
+                "source grew after it was opened",
+            ));
+        }
+        output
+            .flush()
+            .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+        output
+            .sync_all()
+            .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+        remove_partial = false;
+        Ok(())
+    })();
+    drop(output);
+    if remove_partial {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+pub(super) fn max_charx_spool_bytes() -> u64 {
+    let limits = CharXLimits::default();
+    let per_entry_overhead = ZIP_LOCAL_FILE_HEADER_BYTES
+        .checked_add(ZIP_LOCAL_VARIABLE_HEADER_MAX_BYTES)
+        .and_then(|value| value.checked_add(ZIP_DATA_DESCRIPTOR_MAX_BYTES))
+        .expect("CharX local ZIP overhead must fit in u64");
+    let local_overhead = (limits.max_entries as u64)
+        .checked_mul(per_entry_overhead)
+        .expect("CharX local ZIP overhead must fit in u64");
+    limits
+        .max_total_decoded_bytes
+        .checked_add(limits.max_directory_bytes)
+        .and_then(|value| value.checked_add(local_overhead))
+        .and_then(|value| value.checked_add(ZIP_FOOTER_MAX_BYTES))
+        .expect("CharX raw source limit must fit in u64")
+}
+
+pub(super) fn spool_charx_source(
+    source: &mut OpenedJobSource,
+    destination: &Path,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<(), NativeJobError> {
+    if is_cancelled() {
+        return Err(content_cancelled());
+    }
+    if source.total_bytes > max_charx_spool_bytes() {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "CharX source exceeds its raw container limit",
+        ));
+    }
+    spool_opened_source(source, destination, is_cancelled)
+}
+
+pub(super) fn prepare_content(
+    mut source: OpenedJobSource,
+    display_name: &str,
+    owned_directory: &Path,
+    repository_root: &Path,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    if job.is_cancel_requested() {
+        return Err(content_cancelled());
+    }
+    job.start(JobPhase::ReadingSource).map_err(|error| {
+        if job.is_cancel_requested() {
+            content_cancelled()
+        } else {
+            NativeJobError::new("store-error", error)
+        }
+    })?;
+    job.set_progress(JobProgress {
+        completed_bytes: 0,
+        total_bytes: Some(source.total_bytes),
+        completed_items: 0,
+        total_items: None,
+    })
+    .map_err(|error| NativeJobError::new("store-error", error))?;
+
+    let classifier_limits = content_classification_limits();
+    let kind = classify_content(display_name, &mut source.file, &classifier_limits, &|| {
+        job.is_cancel_requested()
+    })
+    .map_err(native_format_error)?;
+    let prepared = match kind {
+        ContentKind::JsonCard => prepare_json_content(
+            &mut source,
+            owned_directory,
+            repository_root,
+            &content_import_limits(),
+            job,
+        )?,
+        ContentKind::CharxCard | ContentKind::AppendedCharxJpeg => {
+            let spool_path = owned_directory.join("source.charx");
+            spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested())?;
+            prepare_charx_content(
+                &spool_path,
+                display_name,
+                owned_directory,
+                repository_root,
+                job,
+            )?
+        }
+        ContentKind::JpegAsset => {
+            return Err(NativeJobError::new(
+                "unsupported-without-destination",
+                "ordinary JPEG import requires an asset destination",
+            ));
+        }
+        ContentKind::RisuModule | ContentKind::Unknown => {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "content preparation accepts Character Card v3 JSON and CharX cards only",
+            ));
+        }
+    };
+    let item_count = prepared.assets.len() as u64;
+    job.set_progress(JobProgress {
+        completed_bytes: source.total_bytes,
+        total_bytes: Some(source.total_bytes),
+        completed_items: item_count,
+        total_items: Some(item_count),
+    })
+    .map_err(|error| NativeJobError::new("store-error", error))?;
+    Ok(prepared)
+}
+
+fn prepare_json_content(
+    source: &mut OpenedJobSource,
+    owned_directory: &Path,
+    repository_root: &Path,
+    limits: &ImportLimits,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    source
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
+    let parsed = parse_json_card(&mut source.file, &staging, limits, &|| {
+        job.is_cancel_requested()
+    })
+    .map_err(native_format_error)?;
+    let ParsedJsonCard { metadata, payloads } = parsed;
+    let cas = open_payload_cas(repository_root)?;
+    let assets = promote_json_assets(&metadata, payloads, owned_directory, &cas, job)?;
+    Ok(PreparedContent {
+        format: PreparedContentFormat::JsonCard,
+        metadata,
+        assets,
+        portrait_logical_id: None,
+        module: None,
+    })
+}
+
+fn prepare_charx_content(
+    spool_path: &Path,
+    display_name: &str,
+    owned_directory: &Path,
+    repository_root: &Path,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    let inspection = inspect_charx_file(
+        spool_path,
+        display_name,
+        owned_directory,
+        CharXLimits::default(),
+        || job.is_cancel_requested(),
+    )
+    .map_err(native_charx_error)?;
+    let descriptor = match inspection {
+        CharXInspection::Card(descriptor) => descriptor,
+        CharXInspection::OrdinaryJpegAsset(_) => {
+            return Err(NativeJobError::new(
+                "unsupported-without-destination",
+                "ordinary JPEG import requires an asset destination",
+            ));
+        }
+    };
+    let module = parse_root_module_overlay(&descriptor, owned_directory, job)?;
+    let mut metadata: Value = serde_json::from_str(&descriptor.card_json).map_err(|error| {
+        NativeJobError::new(
+            "invalid-input",
+            format!("CharX card metadata is invalid: {error}"),
+        )
+    })?;
+    rewrite_archive_asset_occurrences(&descriptor, &mut metadata)?;
+    let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
+    let serialized_metadata = serde_json::to_vec(&metadata).map_err(|error| {
+        NativeJobError::new(
+            "invalid-input",
+            format!("CharX card metadata cannot be staged: {error}"),
+        )
+    })?;
+    let parsed = parse_json_card(
+        &mut std::io::Cursor::new(serialized_metadata),
+        &staging,
+        &content_import_limits(),
+        &|| job.is_cancel_requested(),
+    )
+    .map_err(native_format_error)?;
+    let ParsedJsonCard { metadata, payloads } = parsed;
+    let cas = open_payload_cas(repository_root)?;
+    let mut assets = promote_archive_asset_occurrences(&descriptor, &cas, job)?;
+    assets.extend(promote_json_assets(
+        &metadata,
+        payloads,
+        owned_directory,
+        &cas,
+        job,
+    )?);
+    let portrait_logical_id = match descriptor.container_kind {
+        CharXContainerKind::CharX => None,
+        CharXContainerKind::AppendedCharXJpeg => {
+            let portrait = promote_jpeg_prefix(spool_path, descriptor.archive_offset, &cas, job)?;
+            let logical_id = portrait.logical_id.clone();
+            assets.push(portrait);
+            Some(logical_id)
+        }
+    };
+    let format = match descriptor.container_kind {
+        CharXContainerKind::CharX => PreparedContentFormat::CharxCard,
+        CharXContainerKind::AppendedCharXJpeg => PreparedContentFormat::AppendedCharxJpeg,
+    };
+    Ok(PreparedContent {
+        format,
+        metadata,
+        assets,
+        portrait_logical_id,
+        module,
+    })
+}
+
+fn promote_archive_asset_occurrences(
+    descriptor: &ParsedCharXDescriptor,
+    cas: &PayloadCas,
+    job: &JobControl,
+) -> Result<Vec<PreparedContentAsset>, NativeJobError> {
+    let payloads = descriptor
+        .payloads
+        .iter()
+        .map(|payload| (payload.normalized_name.as_str(), payload))
+        .collect::<HashMap<_, _>>();
+    let mut promoted = HashMap::<String, PromotedPayload>::new();
+    let mut assets = Vec::with_capacity(descriptor.asset_references.len());
+    for reference in &descriptor.asset_references {
+        if job.is_cancel_requested() {
+            return Err(content_cancelled());
+        }
+        let payload = payloads
+            .get(reference.normalized_name.as_str())
+            .ok_or_else(|| {
+                NativeJobError::new(
+                    "invalid-input",
+                    "CharX card reference has no staged payload",
+                )
+            })?;
+        let promoted_payload = match promoted.get(&reference.normalized_name) {
+            Some(promoted_payload) => promoted_payload.clone(),
+            None => {
+                let promoted_payload = promote_staged_payload(cas, payload, job)?;
+                promoted.insert(reference.normalized_name.clone(), promoted_payload.clone());
+                promoted_payload
+            }
+        };
+        let token = format!("native-charx-{}", reference.order);
+        let suffix = storage_suffix(payload.normalized_extension.as_deref());
+        let ext = reference
+            .declared_extension
+            .clone()
+            .unwrap_or_else(|| suffix.clone());
+        assets.push(PreparedContentAsset {
+            reference_key: token.clone(),
+            token,
+            logical_id: format!("assets/{}.{}", promoted_payload.content_hash, suffix),
+            object_hash: promoted_payload.content_hash,
+            byte_size: promoted_payload.byte_size,
+            mime: payload.mime_type.clone(),
+            name: reference.display_name.clone().unwrap_or_default(),
+            ext,
+        });
+    }
+    Ok(assets)
+}
+
+fn rewrite_archive_asset_occurrences(
+    descriptor: &ParsedCharXDescriptor,
+    metadata: &mut Value,
+) -> Result<(), NativeJobError> {
+    let payloads = descriptor
+        .payloads
+        .iter()
+        .map(|payload| payload.normalized_name.as_str())
+        .collect::<HashSet<_>>();
+    for reference in &descriptor.asset_references {
+        if !payloads.contains(reference.normalized_name.as_str()) {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "CharX card reference has no staged payload",
+            ));
+        }
+        let uri_pointer = format!("/data/assets/{}/uri", reference.order);
+        let uri = metadata.pointer_mut(&uri_pointer).ok_or_else(|| {
+            NativeJobError::new("invalid-input", "CharX card reference cannot be rewritten")
+        })?;
+        *uri = Value::String(format!("__asset:native-charx-{}", reference.order));
+    }
+    Ok(())
+}
+
+fn promote_json_assets(
+    metadata: &Value,
+    payloads: Vec<JsonCardPayload>,
+    staging_root: &Path,
+    cas: &PayloadCas,
+    job: &JobControl,
+) -> Result<Vec<PreparedContentAsset>, NativeJobError> {
+    let mut assets = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        if job.is_cancel_requested() {
+            return Err(content_cancelled());
+        }
+        let JsonCardPayload {
+            json_pointer,
+            reference_key,
+            media_type,
+            extension,
+            payload,
+            ..
+        } = payload;
+        let staged_path = staging_root.join(&payload.staged_name);
+        let staged = StagedPayloadDescriptor {
+            original_name: payload.staged_name.clone(),
+            normalized_name: payload.staged_name,
+            extension: Some(extension.clone()),
+            normalized_extension: Some(extension.to_ascii_lowercase()),
+            mime_type: media_type.clone(),
+            decoded_size: payload.byte_size,
+            compressed_size: payload.byte_size,
+            crc32: 0,
+            sha256: payload.sha256,
+            staged_path,
+            card_asset_types: Vec::new(),
+        };
+        let promoted = promote_staged_payload(cas, &staged, job)?;
+        let name_pointer = json_pointer
+            .strip_suffix("/uri")
+            .map(|pointer| format!("{pointer}/name"));
+        let name = name_pointer
+            .as_deref()
+            .and_then(|pointer| metadata.pointer(pointer))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let suffix = storage_suffix(Some(&extension));
+        assets.push(PreparedContentAsset {
+            token: reference_key.clone(),
+            reference_key,
+            logical_id: format!("assets/{}.{}", promoted.content_hash, suffix),
+            object_hash: promoted.content_hash,
+            byte_size: promoted.byte_size,
+            mime: media_type,
+            name,
+            ext: extension,
+        });
+    }
+    Ok(assets)
+}
+
+fn promote_staged_payload(
+    cas: &PayloadCas,
+    payload: &StagedPayloadDescriptor,
+    job: &JobControl,
+) -> Result<PromotedPayload, NativeJobError> {
+    if job.is_cancel_requested() {
+        return Err(content_cancelled());
+    }
+    let staged = open_regular_file_no_follow(&payload.staged_path)?.file;
+    let promoted = prepare_cancellable_payload(cas, staged, job)?;
+    if promoted.content_hash != payload.sha256 || promoted.byte_size != payload.decoded_size {
+        return Err(NativeJobError::new(
+            "store-error",
+            "promoted content does not match its staged payload",
+        ));
+    }
+    if job.is_cancel_requested() {
+        return Err(content_cancelled());
+    }
+    Ok(PromotedPayload {
+        content_hash: promoted.content_hash,
+        byte_size: promoted.byte_size,
+    })
+}
+
+fn parse_root_module_overlay(
+    descriptor: &ParsedCharXDescriptor,
+    owned_directory: &Path,
+    job: &JobControl,
+) -> Result<Option<PreparedContentModule>, NativeJobError> {
+    let Some(module_payload) = descriptor
+        .payloads
+        .iter()
+        .find(|payload| payload.normalized_name == "module.risum")
+    else {
+        return Ok(None);
+    };
+    let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
+    let mut source = open_regular_file_no_follow(&module_payload.staged_path)?.file;
+    let parsed = parse_risum(&mut source, &staging, &content_import_limits(), &|| {
+        job.is_cancel_requested()
+    })
+    .map_err(native_format_error)?;
+    let module = parsed
+        .metadata
+        .get("module")
+        .and_then(Value::as_object)
+        .ok_or_else(|| NativeJobError::new("invalid-input", "Risu module metadata is invalid"))?;
+    Ok(Some(PreparedContentModule {
+        trigger: bounded_module_array(module, "trigger")?.unwrap_or_default(),
+        regex: bounded_module_array(module, "regex")?.unwrap_or_default(),
+        lorebook: bounded_module_array(module, "lorebook")?,
+    }))
+}
+
+fn bounded_module_array(
+    module: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<Vec<Value>>, NativeJobError> {
+    let Some(value) = module.get(field) else {
+        return Ok(None);
+    };
+    let values = value.as_array().ok_or_else(|| {
+        NativeJobError::new(
+            "invalid-input",
+            format!("Risu module {field} must be an array"),
+        )
+    })?;
+    if values.len() > MAX_MODULE_OVERLAY_ITEMS {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            format!("Risu module {field} exceeds its item limit"),
+        ));
+    }
+    Ok(Some(values.clone()))
+}
+
+fn promote_jpeg_prefix(
+    spool_path: &Path,
+    archive_offset: u64,
+    cas: &PayloadCas,
+    job: &JobControl,
+) -> Result<PreparedContentAsset, NativeJobError> {
+    if archive_offset == 0 {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "appended CharX JPEG has no portrait prefix",
+        ));
+    }
+    if job.is_cancel_requested() {
+        return Err(content_cancelled());
+    }
+    let source = open_regular_file_no_follow(spool_path)?;
+    let promoted = prepare_cancellable_payload(cas, source.file.take(archive_offset), job)?;
+    if promoted.byte_size != archive_offset {
+        return Err(NativeJobError::new(
+            "invalid-source",
+            "appended CharX JPEG portrait prefix is truncated",
+        ));
+    }
+    if job.is_cancel_requested() {
+        return Err(content_cancelled());
+    }
+    let token = "native-appended-portrait".to_owned();
+    let object_hash = promoted.content_hash;
+    Ok(PreparedContentAsset {
+        reference_key: token.clone(),
+        token,
+        logical_id: format!("assets/{object_hash}.jpg"),
+        object_hash,
+        byte_size: promoted.byte_size,
+        mime: "image/jpeg".to_owned(),
+        name: String::new(),
+        ext: "jpg".to_owned(),
+    })
+}
+
+fn open_payload_cas(repository_root: &Path) -> Result<PayloadCas, NativeJobError> {
+    PayloadCas::new(repository_root)
+        .map_err(|error| NativeJobError::new("store-error", error.to_string()))
+}
+
+fn prepare_cancellable_payload<R: Read>(
+    cas: &PayloadCas,
+    reader: R,
+    job: &JobControl,
+) -> Result<PreparedPayload, NativeJobError> {
+    let mut reader = CancellableReader { inner: reader, job };
+    cas.prepare_reader(&mut reader).map_err(|error| {
+        if job.is_cancel_requested() {
+            content_cancelled()
+        } else {
+            NativeJobError::new("store-error", error.to_string())
+        }
+    })
+}
+
+fn content_import_limits() -> ImportLimits {
+    ImportLimits {
+        max_metadata_bytes: 8 * 1024 * 1024,
+        max_payload_bytes: 64 * 1024 * 1024,
+        max_aggregate_payload_bytes: 256 * 1024 * 1024,
+        max_payload_count: 256,
+        max_container_entries: 4096,
+        max_container_directory_bytes: 32 * 1024 * 1024,
+        charx_probe_metadata_bytes: 8 * 1024 * 1024,
+    }
+}
+
+fn content_classification_limits() -> ImportLimits {
+    let charx_limits = CharXLimits::default();
+    let mut limits = content_import_limits();
+    limits.max_container_entries = charx_limits.max_entries;
+    limits.max_container_directory_bytes = charx_limits.max_directory_bytes;
+    limits.charx_probe_metadata_bytes = charx_limits.max_metadata_bytes;
+    limits
+}
+
+fn storage_suffix(extension: Option<&str>) -> String {
+    let extension = extension.unwrap_or("bin");
+    if !extension.is_empty()
+        && extension.len() <= 32
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-'))
+    {
+        extension.to_ascii_lowercase()
+    } else {
+        "bin".to_owned()
+    }
+}
+
+fn native_format_error(error: FormatError) -> NativeJobError {
+    let code = match error.kind {
+        FormatErrorKind::Cancelled => "cancelled",
+        FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => "invalid-input",
+        FormatErrorKind::Io => "invalid-source",
+    };
+    NativeJobError::new(code, error.message)
+}
+
+fn native_charx_error(error: CharXParseError) -> NativeJobError {
+    let code = match error.code() {
+        CharXParseErrorCode::Cancelled => "cancelled",
+        CharXParseErrorCode::Io => "invalid-source",
+        _ => "invalid-input",
+    };
+    NativeJobError::new(code, error.to_string())
+}

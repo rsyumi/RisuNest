@@ -1,4 +1,5 @@
 pub mod charx;
+mod content;
 pub mod screenshot_output;
 
 mod lossless;
@@ -6,18 +7,12 @@ mod lossless;
 #[cfg(test)]
 mod screenshot_output_test;
 
-use crate::asset_repository::PayloadCas;
-use crate::import_export_jobs::{
-    classify_content, parse_json_card, ContentKind, FormatError, FormatErrorKind, ImportLimits,
-    JobStaging, ParsedJsonCard,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -150,6 +145,8 @@ pub(crate) struct NativeFileJobStarted {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PreparedContentFormat {
     JsonCard,
+    CharxCard,
+    AppendedCharxJpeg,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -167,10 +164,23 @@ pub(crate) struct PreparedContentAsset {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PreparedContentModule {
+    pub(crate) trigger: Vec<Value>,
+    pub(crate) regex: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lorebook: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PreparedContent {
     pub(crate) format: PreparedContentFormat,
     pub(crate) metadata: Value,
     pub(crate) assets: Vec<PreparedContentAsset>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) portrait_logical_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) module: Option<PreparedContentModule>,
 }
 
 #[derive(Debug)]
@@ -1057,7 +1067,7 @@ impl NativeFileJobState {
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
-            let outcome = prepare_json_content(
+            let outcome = content::prepare_content(
                 opened_source,
                 &display_name,
                 &owned_directory,
@@ -1344,147 +1354,10 @@ impl NativeFileJobState {
     }
 }
 
-fn prepare_json_content(
-    mut source: OpenedJobSource,
-    display_name: &str,
-    owned_directory: &Path,
-    repository_root: &Path,
-    job: &JobControl,
-) -> Result<PreparedContent, NativeJobError> {
-    if job.is_cancel_requested() {
-        return Err(content_cancelled());
-    }
-    job.start(JobPhase::ReadingSource).map_err(|error| {
-        if job.is_cancel_requested() {
-            content_cancelled()
-        } else {
-            NativeJobError::new("store-error", error)
-        }
-    })?;
-    job.set_progress(JobProgress {
-        completed_bytes: 0,
-        total_bytes: Some(source.total_bytes),
-        completed_items: 0,
-        total_items: None,
-    })
-    .map_err(|error| NativeJobError::new("store-error", error))?;
-    let limits = content_import_limits();
-    let kind = classify_content(display_name, &mut source.file, &limits, &|| {
-        job.is_cancel_requested()
-    })
-    .map_err(native_format_error)?;
-    if kind != ContentKind::JsonCard {
-        return Err(NativeJobError::new(
-            "invalid-input",
-            "content preparation currently accepts JSON cards only",
-        ));
-    }
-    source
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
-    let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
-    let parsed = parse_json_card(&mut source.file, &staging, &limits, &|| {
-        job.is_cancel_requested()
-    })
-    .map_err(native_format_error)?;
-    let prepared = promote_json_content(parsed, owned_directory, repository_root, job)?;
-    job.set_progress(JobProgress {
-        completed_bytes: source.total_bytes,
-        total_bytes: Some(source.total_bytes),
-        completed_items: prepared.assets.len() as u64,
-        total_items: Some(prepared.assets.len() as u64),
-    })
-    .map_err(|error| NativeJobError::new("store-error", error))?;
-    Ok(prepared)
-}
-
 fn is_bounded_content_display_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= 180
         && !name.chars().any(|character| character.is_control())
-}
-
-fn content_import_limits() -> ImportLimits {
-    ImportLimits {
-        max_metadata_bytes: 8 * 1024 * 1024,
-        max_payload_bytes: 64 * 1024 * 1024,
-        max_aggregate_payload_bytes: 256 * 1024 * 1024,
-        max_payload_count: 256,
-        max_container_entries: 4096,
-        max_container_directory_bytes: 32 * 1024 * 1024,
-        charx_probe_metadata_bytes: 8 * 1024 * 1024,
-    }
-}
-
-fn promote_json_content(
-    parsed: ParsedJsonCard,
-    staging_root: &Path,
-    repository_root: &Path,
-    job: &JobControl,
-) -> Result<PreparedContent, NativeJobError> {
-    let cas = PayloadCas::new(repository_root)
-        .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
-    let ParsedJsonCard { metadata, payloads } = parsed;
-    let mut assets = Vec::with_capacity(payloads.len());
-    for payload in payloads {
-        if job.is_cancel_requested() {
-            return Err(content_cancelled());
-        }
-        let staged_path = staging_root.join(&payload.payload.staged_name);
-        let mut staged = open_regular_file_no_follow(&staged_path)?.file;
-        let promoted = cas
-            .prepare_reader(&mut staged)
-            .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
-        if promoted.content_hash != payload.payload.sha256
-            || promoted.byte_size != payload.payload.byte_size
-        {
-            return Err(NativeJobError::new(
-                "store-error",
-                "promoted content does not match its staged payload",
-            ));
-        }
-        if job.is_cancel_requested() {
-            return Err(content_cancelled());
-        }
-        let name_pointer = payload
-            .json_pointer
-            .strip_suffix("/uri")
-            .map(|pointer| format!("{pointer}/name"));
-        let name = name_pointer
-            .as_deref()
-            .and_then(|pointer| metadata.pointer(pointer))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let reference_key = payload.reference_key;
-        let object_hash = promoted.content_hash;
-        let logical_id = format!("assets/{object_hash}.{}", payload.extension);
-        assets.push(PreparedContentAsset {
-            token: reference_key.clone(),
-            reference_key,
-            logical_id,
-            object_hash,
-            byte_size: promoted.byte_size,
-            mime: payload.media_type,
-            name,
-            ext: payload.extension,
-        });
-    }
-    Ok(PreparedContent {
-        format: PreparedContentFormat::JsonCard,
-        metadata,
-        assets,
-    })
-}
-
-fn native_format_error(error: FormatError) -> NativeJobError {
-    let code = match error.kind {
-        FormatErrorKind::Cancelled => "cancelled",
-        FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => "invalid-input",
-        FormatErrorKind::Io => "invalid-source",
-    };
-    NativeJobError::new(code, error.message)
 }
 
 fn content_cancelled() -> NativeJobError {
@@ -2479,10 +2352,13 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::io::{Cursor, Write};
     use std::sync::Barrier;
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     fn result(revision: i64) -> JobResultSummary {
         JobResultSummary {
@@ -2584,6 +2460,163 @@ mod tests {
         )
         .unwrap();
         fs::write(spool.join("source.json"), manifest).unwrap();
+    }
+
+    fn encoded_risum_overlay() -> Vec<u8> {
+        const RPACK_MAP: &[u8; 512] = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
+        let metadata = br#"{"type":"risuModule","module":{"trigger":[{"comment":"native trigger"}],"regex":[{"comment":"native regex"}],"lorebook":[{"comment":"native lore"}],"assets":[]}}"#;
+        let encoded = metadata
+            .iter()
+            .map(|byte| RPACK_MAP[*byte as usize])
+            .collect::<Vec<_>>();
+        let mut risum = vec![111, 0];
+        risum.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        risum.extend_from_slice(&encoded);
+        risum.push(0);
+        risum
+    }
+
+    fn charx_fixture(appended_jpeg_prefix: Option<&[u8]>) -> Vec<u8> {
+        let card = br#"{
+            "spec":"chara_card_v3",
+            "data":{
+                "name":"Prepared CharX",
+                "extensions":{},
+                "assets":[
+                    {"type":"icon","uri":"embeded://images/portrait.JPEG","name":"portrait","ext":"JPEG"},
+                    {"type":"x-risu-asset","uri":"__asset:assets/config.JSON","name":"config","ext":"JSON"},
+                    {"type":"emotion","uri":"embeded://images/portrait.JPEG","name":"portrait duplicate","ext":"JPEG"},
+                    {"type":"x-risu-asset","uri":"data:image/png;base64,AQIDBA==","name":"inline","ext":"png"}
+                ]
+            }
+        }"#;
+        let risum = encoded_risum_overlay();
+        let entries: [(&str, &[u8]); 5] = [
+            ("card.json", card),
+            ("images/portrait.JPEG", b"\xff\xd8\xff\xd9"),
+            ("assets/config.JSON", br#"{"mode":"strict"}"#),
+            ("module.risum", &risum),
+            ("unused.bin", b"unreferenced payload"),
+        ];
+        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            archive
+                .start_file(
+                    name,
+                    FileOptions::default().compression_method(CompressionMethod::Stored),
+                )
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        let mut output = appended_jpeg_prefix.unwrap_or(&[]).to_vec();
+        output.extend_from_slice(&archive.finish().unwrap().into_inner());
+        output
+    }
+
+    fn wait_for_content_job(state: &NativeFileJobState, job_id: &str) -> JobStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = state.status(job_id).unwrap();
+            if status.state.is_terminal() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "content preparation timed out");
+            thread::yield_now();
+        }
+    }
+
+    fn start_test_content_job(
+        state: &NativeFileJobState,
+        source: &Path,
+        display_name: &str,
+    ) -> NativeFileJobStarted {
+        state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::DesktopPath {
+                    path: source.to_string_lossy().into_owned(),
+                },
+                display_name: display_name.to_owned(),
+            })
+            .expect("start content preparation")
+    }
+
+    #[test]
+    fn opened_source_spooling_copies_the_open_handle_bytes() {
+        let directory = TempDir::new().unwrap();
+        let source_path = directory.path().join("selected.charx");
+        let original = b"opened-handle-content";
+        fs::write(&source_path, original).unwrap();
+        let mut source = open_regular_file_no_follow(&source_path).unwrap();
+        let spool_path = directory.path().join("job-source.charx");
+
+        content::spool_opened_source(&mut source, &spool_path, &|| false).unwrap();
+
+        assert_eq!(fs::read(spool_path).unwrap(), original);
+    }
+
+    #[test]
+    fn opened_source_spooling_rejects_early_eof_without_a_partial_spool() {
+        let directory = TempDir::new().unwrap();
+        let source_path = directory.path().join("truncated.charx");
+        fs::write(&source_path, b"short").unwrap();
+        let mut source = open_regular_file_no_follow(&source_path).unwrap();
+        source.total_bytes += 1;
+        let spool_path = directory.path().join("job-source.charx");
+
+        let error = content::spool_opened_source(&mut source, &spool_path, &|| false)
+            .expect_err("source ending early must be rejected");
+
+        assert_eq!(error.code, "invalid-source");
+        assert!(!spool_path.exists());
+    }
+
+    #[test]
+    fn opened_source_spooling_rejects_growth_without_a_partial_spool() {
+        let directory = TempDir::new().unwrap();
+        let source_path = directory.path().join("growing.charx");
+        fs::write(&source_path, b"longer").unwrap();
+        let mut source = open_regular_file_no_follow(&source_path).unwrap();
+        source.total_bytes -= 1;
+        let spool_path = directory.path().join("job-source.charx");
+
+        let error = content::spool_opened_source(&mut source, &spool_path, &|| false)
+            .expect_err("source growth must be rejected");
+
+        assert_eq!(error.code, "invalid-source");
+        assert!(!spool_path.exists());
+    }
+
+    #[test]
+    fn cancelled_opened_source_spooling_removes_the_partial_copy() {
+        let directory = TempDir::new().unwrap();
+        let source_path = directory.path().join("cancelled.charx");
+        fs::write(&source_path, b"cancelled").unwrap();
+        let mut source = open_regular_file_no_follow(&source_path).unwrap();
+        let spool_path = directory.path().join("job-source.charx");
+
+        let error = content::spool_opened_source(&mut source, &spool_path, &|| true)
+            .expect_err("cancelled spooling must fail");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(!spool_path.exists());
+    }
+
+    #[test]
+    fn charx_spooling_rejects_raw_sources_over_the_derived_container_cap_before_creation() {
+        let directory = TempDir::new().unwrap();
+        let source_path = directory.path().join("oversized.charx");
+        fs::write(&source_path, b"small fixture").unwrap();
+        let mut source = open_regular_file_no_follow(&source_path).unwrap();
+        let raw_cap = content::max_charx_spool_bytes();
+        assert!(raw_cap > charx::CharXLimits::default().max_total_decoded_bytes);
+        source.total_bytes = raw_cap + 1;
+        let spool_path = directory.path().join("job-source.charx");
+
+        let error = content::spool_charx_source(&mut source, &spool_path, &|| false)
+            .expect_err("raw CharX sources over the container cap must be rejected");
+
+        assert_eq!(error.code, "invalid-input");
+        assert!(!spool_path.exists());
     }
 
     #[test]
@@ -3020,6 +3053,198 @@ mod tests {
     }
 
     #[test]
+    fn content_prepare_charx_promotes_only_referenced_assets_with_distinct_tokens() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("prepared.charx");
+        fs::write(&source, charx_fixture(None)).unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "prepared.charx");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Succeeded);
+        let content = prepared
+            .prepared_content
+            .as_ref()
+            .expect("prepared CharX content");
+        let serialized = serde_json::to_value(content).unwrap();
+        assert_eq!(
+            serialized.pointer("/format").and_then(Value::as_str),
+            Some("charx-card")
+        );
+        assert_eq!(content.assets.len(), 4);
+        assert_eq!(
+            content
+                .metadata
+                .pointer("/data/assets/0/uri")
+                .and_then(Value::as_str),
+            Some("__asset:native-charx-0")
+        );
+        assert_eq!(
+            content
+                .metadata
+                .pointer("/data/assets/1/uri")
+                .and_then(Value::as_str),
+            Some("__asset:native-charx-1")
+        );
+        assert_eq!(
+            content
+                .metadata
+                .pointer("/data/assets/2/uri")
+                .and_then(Value::as_str),
+            Some("__asset:native-charx-2")
+        );
+        assert_eq!(
+            content
+                .metadata
+                .pointer("/data/assets/3/uri")
+                .and_then(Value::as_str),
+            Some("__asset:native-data-3")
+        );
+
+        let first_portrait = content
+            .assets
+            .iter()
+            .find(|asset| asset.token == "native-charx-0")
+            .expect("first portrait occurrence");
+        let config = content
+            .assets
+            .iter()
+            .find(|asset| asset.token == "native-charx-1")
+            .expect("config occurrence");
+        let duplicate_portrait = content
+            .assets
+            .iter()
+            .find(|asset| asset.token == "native-charx-2")
+            .expect("second portrait occurrence");
+        let inline = content
+            .assets
+            .iter()
+            .find(|asset| asset.token == "native-data-3")
+            .expect("data URI occurrence");
+        assert_eq!(first_portrait.reference_key, "native-charx-0");
+        assert_eq!(duplicate_portrait.reference_key, "native-charx-2");
+        assert_eq!(first_portrait.object_hash, duplicate_portrait.object_hash);
+        assert_eq!(first_portrait.logical_id, duplicate_portrait.logical_id);
+        assert!(first_portrait.logical_id.ends_with(".jpeg"));
+        assert_eq!(first_portrait.ext, "JPEG");
+        assert!(config.logical_id.ends_with(".json"));
+        assert_eq!(config.ext, "JSON");
+        assert_eq!(config.mime, "application/json");
+        assert_eq!(inline.ext, "png");
+        assert_eq!(inline.mime, "image/png");
+        assert_eq!(inline.byte_size, 4);
+        assert_eq!(
+            serialized
+                .pointer("/module/trigger/0/comment")
+                .and_then(Value::as_str),
+            Some("native trigger")
+        );
+        assert_eq!(
+            serialized
+                .pointer("/module/regex/0/comment")
+                .and_then(Value::as_str),
+            Some("native regex")
+        );
+        assert_eq!(
+            serialized
+                .pointer("/module/lorebook/0/comment")
+                .and_then(Value::as_str),
+            Some("native lore")
+        );
+        let serialized_text = serde_json::to_string(content).unwrap();
+        assert!(!serialized_text.contains("unreferenced payload"));
+        assert!(!serialized_text.contains("stagedPath"));
+        assert!(!serialized_text.contains("module.risum"));
+
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert_eq!(
+            cas.read_object(&first_portrait.object_hash).unwrap(),
+            Some(vec![0xff, 0xd8, 0xff, 0xd9])
+        );
+        assert_eq!(
+            cas.read_object(&config.object_hash).unwrap(),
+            Some(br#"{"mode":"strict"}"#.to_vec())
+        );
+        assert_eq!(
+            cas.read_object(&inline.object_hash).unwrap(),
+            Some(vec![1, 2, 3, 4])
+        );
+        use sha2::{Digest as _, Sha256};
+        let unused_hash = hex::encode(Sha256::digest(b"unreferenced payload"));
+        assert_eq!(cas.stat_object(&unused_hash).unwrap(), None);
+        assert!(!directory
+            .path()
+            .join("native-file-jobs/jobs")
+            .join(&started.job_id)
+            .exists());
+    }
+
+    #[test]
+    fn content_prepare_appended_charx_jpeg_promotes_the_exact_jpeg_prefix() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("prepared.jpeg");
+        let prefix = b"\xff\xd8\xff\xe0RisuNest\xff\xd9";
+        fs::write(&source, charx_fixture(Some(prefix))).unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "prepared.jpeg");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Succeeded);
+        let content = prepared
+            .prepared_content
+            .as_ref()
+            .expect("prepared appended CharX JPEG content");
+        let serialized = serde_json::to_value(content).unwrap();
+        assert_eq!(
+            serialized.pointer("/format").and_then(Value::as_str),
+            Some("appended-charx-jpeg")
+        );
+        let portrait_logical_id = serialized
+            .pointer("/portraitLogicalId")
+            .and_then(Value::as_str)
+            .expect("portrait logical ID");
+        assert!(portrait_logical_id.ends_with(".jpg"));
+        let portrait = content
+            .assets
+            .iter()
+            .find(|asset| asset.logical_id == portrait_logical_id)
+            .expect("portrait logical ID references a prepared asset");
+        assert_eq!(portrait.token, "native-appended-portrait");
+        assert_eq!(portrait.reference_key, "native-appended-portrait");
+        assert_eq!(portrait.ext, "jpg");
+        assert_eq!(portrait.mime, "image/jpeg");
+        assert_eq!(portrait.byte_size, prefix.len() as u64);
+        assert_eq!(prepared.progress.completed_items, 5);
+        assert_eq!(prepared.progress.total_items, Some(5));
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert_eq!(
+            cas.read_object(&portrait.object_hash).unwrap(),
+            Some(prefix.to_vec())
+        );
+    }
+
+    #[test]
+    fn content_prepare_ordinary_jpeg_returns_the_stable_destination_error_without_cas_output() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("ordinary.jpeg");
+        fs::write(&source, b"\xff\xd8\xff\xd9").unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "ordinary.jpeg");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Failed);
+        assert_eq!(
+            prepared.error.as_ref().map(|error| error.code.as_str()),
+            Some("unsupported-without-destination")
+        );
+        assert!(prepared.prepared_content.is_none());
+        assert!(!directory.path().join("assets-v2").exists());
+    }
+
+    #[test]
     fn content_cancel_during_preparation_finishes_cancelled_and_cleans_staging() {
         let directory = TempDir::new().unwrap();
         let persistent = directory.path().join("persistent");
@@ -3278,6 +3503,8 @@ mod tests {
                     format: PreparedContentFormat::JsonCard,
                     metadata: serde_json::json!({"spec": "chara_card_v3"}),
                     assets: Vec::new(),
+                    portrait_logical_id: None,
+                    module: None,
                 }),
                 Ok(()),
             )
