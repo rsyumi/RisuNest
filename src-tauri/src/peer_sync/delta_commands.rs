@@ -430,37 +430,14 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
             expected_revision,
             remote_manifest_bytes,
         );
-        match bootstrap {
-            Ok(()) => {
-                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
-                return Ok(PeerDeltaPullResult::NoChanges {
-                    revision: expected_revision,
-                    transferred_objects: 0,
-                    transferred_bytes: 0,
-                });
-            }
-            Err(PeerSyncError::Validation(message))
-                if message.contains("remote content differs") =>
-            {
-                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-                return Ok(PeerDeltaPullResult::FullCloneRequired {
-                    reason: "noExactCommonBase",
-                });
-            }
-            Err(error) => {
-                if !job.borrow().is_sealed() {
-                    let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-                }
-                return Err(error);
-            }
-        }
+        return finish_bootstrap(&job, expected_revision, bootstrap);
     }
 
     let plan = match target.build_ready_plan(expected_revision) {
         Ok(plan) => plan,
         Err(error) => {
             drop(target);
-            return classify_plan_error(error, expected_revision);
+            return classify_plan_error(error);
         }
     };
     let local_hashes = local
@@ -525,43 +502,56 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
             if !job.borrow().is_sealed() {
                 let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
             }
-            classify_plan_error(error, plan.expected_local_revision)
+            classify_plan_error(error)
         }
     }
 }
 
-fn pull_logical_delta_from_app_root<S: LogicalDeltaObjectSource + ?Sized>(
-    app_root: &Path,
-    source_device_id: &str,
+fn finish_bootstrap(
+    job: &RefCell<DurableCasJob>,
     expected_revision: i64,
-    remote_manifest_bytes: &[u8],
-    remote_source: &mut S,
+    bootstrap: Result<(), PeerSyncError>,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
-    let cas = PayloadCas::new(app_root)?;
-    let mut store = PersistentStore::open(app_root).map_err(store_error)?;
-    pull_logical_delta(
-        &mut store,
-        &cas,
-        app_root,
-        source_device_id,
-        expected_revision,
-        remote_manifest_bytes,
-        remote_source,
-    )
+    match bootstrap {
+        Ok(()) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            Ok(PeerDeltaPullResult::NoChanges {
+                revision: expected_revision,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+            })
+        }
+        Err(PeerSyncError::Validation(message)) if message.contains("remote content differs") => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            Ok(PeerDeltaPullResult::FullCloneRequired {
+                reason: "noExactCommonBase",
+            })
+        }
+        Err(error @ PeerSyncError::ActivationConflict { .. }) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            classify_plan_error(error)
+        }
+        Err(error) => {
+            if !job.borrow().is_sealed() {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
+            Err(error)
+        }
+    }
 }
 
-fn classify_plan_error(
-    error: PeerSyncError,
-    expected_local_revision: i64,
-) -> Result<PeerDeltaPullResult, PeerSyncError> {
+fn open_peer_delta_store(store: &PersistentStore) -> Result<PersistentStore, StoreError> {
+    store.open_native_job_store()
+}
+
+fn classify_plan_error(error: PeerSyncError) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match error {
         PeerSyncError::LogicalMergeConflict { .. } => Ok(PeerDeltaPullResult::Conflict {
             reason: "localAndRemoteChanged",
         }),
-        PeerSyncError::ActivationConflict { expected, .. } => {
-            let expected_revision = expected_local_revision.to_string();
+        PeerSyncError::ActivationConflict { expected, actual } => {
             Ok(PeerDeltaPullResult::Conflict {
-                reason: if expected.as_deref() == Some(expected_revision.as_str()) {
+                reason: if activation_conflict_is_revision(&expected, &actual) {
                     "staleRevision"
                 } else {
                     "localAndRemoteChanged"
@@ -570,6 +560,15 @@ fn classify_plan_error(
         }
         error => Err(error),
     }
+}
+
+fn activation_conflict_is_revision(expected: &Option<String>, actual: &Option<String>) -> bool {
+    expected
+        .as_deref()
+        .is_some_and(|value| value.parse::<i64>().is_ok())
+        && actual
+            .as_deref()
+            .is_some_and(|value| value.parse::<i64>().is_ok())
 }
 
 fn classify_activation_conflict(
@@ -697,7 +696,14 @@ pub async fn peer_delta_pull(
             .map_err(|error| error.to_string())?;
         let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let source_device_id = client.source_device_id().to_owned();
-        pull_logical_delta_from_app_root(
+        let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {
+            open_peer_delta_store(store)
+        })
+        .map_err(|error| error.to_string())?;
+        let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
+        pull_logical_delta(
+            &mut store,
+            &cas,
             &app_root,
             &source_device_id,
             expected_revision,
@@ -809,6 +815,7 @@ fn store_error(error: StoreError) -> PeerSyncError {
 mod tests {
     use super::*;
     use crate::{
+        asset_repository::job_pins::{collect_durable_cas_job_roots, CasObjectRole},
         peer_sync::{
             logical_delta::{
                 build_logical_manifest, BuiltLogicalManifest, LogicalManifest,
@@ -940,12 +947,9 @@ mod tests {
     #[test]
     fn typed_merge_conflict_projects_to_the_product_conflict_result() {
         assert_eq!(
-            classify_plan_error(
-                PeerSyncError::LogicalMergeConflict {
-                    record: "plugin:shared".to_owned(),
-                },
-                7
-            )
+            classify_plan_error(PeerSyncError::LogicalMergeConflict {
+                record: "plugin:shared".to_owned(),
+            })
             .unwrap(),
             PeerDeltaPullResult::Conflict {
                 reason: "localAndRemoteChanged",
@@ -956,13 +960,10 @@ mod tests {
     #[test]
     fn planning_revision_cas_conflict_projects_as_stale_revision() {
         assert_eq!(
-            classify_plan_error(
-                PeerSyncError::ActivationConflict {
-                    expected: Some("7".to_owned()),
-                    actual: Some("8".to_owned()),
-                },
-                7,
-            )
+            classify_plan_error(PeerSyncError::ActivationConflict {
+                expected: Some("7".to_owned()),
+                actual: Some("8".to_owned()),
+            })
             .unwrap(),
             PeerDeltaPullResult::Conflict {
                 reason: "staleRevision",
@@ -973,18 +974,72 @@ mod tests {
     #[test]
     fn planning_base_cas_conflict_projects_as_local_and_remote_changed() {
         assert_eq!(
-            classify_plan_error(
-                PeerSyncError::ActivationConflict {
-                    expected: Some("a".repeat(64)),
-                    actual: Some("c".repeat(64)),
-                },
-                7,
-            )
+            classify_plan_error(PeerSyncError::ActivationConflict {
+                expected: Some("a".repeat(64)),
+                actual: Some("c".repeat(64)),
+            })
             .unwrap(),
             PeerDeltaPullResult::Conflict {
                 reason: "localAndRemoteChanged",
             }
         );
+    }
+
+    #[test]
+    fn changed_retry_revision_cas_conflict_projects_as_stale_revision() {
+        assert_eq!(
+            classify_plan_error(PeerSyncError::ActivationConflict {
+                expected: Some("8".to_owned()),
+                actual: Some("9".to_owned()),
+            })
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_revision_conflict_releases_its_sealed_durable_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "bootstrap-conflict",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .unwrap(),
+        );
+        job.borrow_mut()
+            .prepare_bytes(&cas, b"bootstrap manifest", CasObjectRole::DirectObject)
+            .unwrap();
+        job.borrow_mut().seal(&mut store, 0).unwrap();
+        assert!(!collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .is_empty());
+
+        assert_eq!(
+            finish_bootstrap(
+                &job,
+                7,
+                Err(PeerSyncError::ActivationConflict {
+                    expected: Some("7".to_owned()),
+                    actual: Some("8".to_owned()),
+                }),
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
+            }
+        );
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+        assert_eq!(store.revision().unwrap(), 0);
     }
 
     fn activation_conflict_plan() -> ReadyLogicalDeltaPlan {
@@ -1219,9 +1274,17 @@ mod tests {
         )
         .unwrap();
         let remote = remote_root_manifest(&local.manifest, "remote-slow", json!({"side":"remote"}));
-        drop(setup);
-
-        let managed_store = Arc::new(Mutex::new(PersistentStore::open(directory.path()).unwrap()));
+        let export_lease = setup.acquire_revision(0).unwrap();
+        let exported = setup.export_risu_save(&export_lease.lease, true).unwrap();
+        let exported_path = PathBuf::from(&exported.path);
+        let ownership_path = exported_path.with_extension("lease");
+        let managed_store = Arc::new(Mutex::new(setup));
+        let mut pull_store = {
+            let managed = managed_store.lock().unwrap();
+            open_peer_delta_store(&managed).unwrap()
+        };
+        assert!(exported_path.is_file());
+        assert!(ownership_path.is_file());
         let (opened_tx, opened_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let root = directory.path().to_path_buf();
@@ -1237,7 +1300,16 @@ mod tests {
         };
         let pull = thread::spawn(move || {
             let mut source = source;
-            pull_logical_delta_from_app_root(&root, peer, 0, &remote_bytes, &mut source)
+            let cas = PayloadCas::new(&root).unwrap();
+            pull_logical_delta(
+                &mut pull_store,
+                &cas,
+                &root,
+                peer,
+                0,
+                &remote_bytes,
+                &mut source,
+            )
         });
         opened_rx.recv().unwrap();
 
@@ -1250,6 +1322,8 @@ mod tests {
                 .value,
             json!({})
         );
+        assert!(exported_path.is_file());
+        assert!(ownership_path.is_file());
         release_tx.send(()).unwrap();
         assert_eq!(
             pull.join().unwrap().unwrap(),
