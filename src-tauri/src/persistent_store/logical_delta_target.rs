@@ -764,7 +764,16 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
                 "logical delta payload {hash} is unavailable for CAS promotion"
             ))
         })?;
-        verify_reader(&mut reader, hash, expected_size)
+        verify_reader(&mut reader, hash, expected_size)?;
+        if let Some(job) = self.durable_job {
+            job.borrow_mut().pin_existing(
+                self.cas,
+                hash,
+                expected_size,
+                CasObjectRole::DirectObject,
+            )?;
+        }
+        Ok(())
     }
 
     fn prepare_put(
@@ -3204,6 +3213,7 @@ mod tests {
     use super::*;
     use crate::{
         asset_repository::{
+            job_pins::CasJobKind,
             owner_manifest_codec::{encode_owner_manifest, OwnerManifestEntry},
             PayloadCas,
         },
@@ -3955,6 +3965,73 @@ mod tests {
             target.promote_payload_object(&BTreeMap::new(), &expected_hash),
             Err(PeerSyncError::WholeObjectHashMismatch { object }) if object == expected_hash
         ));
+    }
+
+    #[test]
+    fn existing_payload_cas_reuse_is_pinned_before_durable_job_seal() {
+        let (directory, mut store, cas) = open_fixture();
+        let payload = b"existing remote payload".to_vec();
+        let payload_hash = hash(&payload);
+        let remote = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "remote-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("remote-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Asset {
+                    logical_key: "remote-asset".to_owned(),
+                },
+                LogicalRecordEnvelope::Asset {
+                    object_hash: Some(payload_hash.clone()),
+                    size: payload.len() as u64,
+                    metadata: encode_asset_alias_metadata(&LogicalAssetAliasMetadata {
+                        mime: "application/octet-stream".to_owned(),
+                        name: "asset".to_owned(),
+                        ext: "bin".to_owned(),
+                        inlay_type: None,
+                        width: None,
+                        height: None,
+                        metadata: json!({}),
+                    })
+                    .unwrap(),
+                },
+                vec![descriptor(&payload)],
+            )],
+        })
+        .expect("build asset remote manifest");
+        cas.prepare_bytes(&payload)
+            .expect("prepare existing remote payload");
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "logical-existing-payload",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .expect("begin durable logical target job"),
+        );
+        let mut target = PersistentLogicalDeltaTarget::new_with_durable_job(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "local-0",
+            &remote.manifest_bytes,
+            &directory.path().join("logical-delta-staging"),
+            &job,
+        )
+        .expect("open durable CAS verification target");
+
+        target
+            .promote_payload_object(&BTreeMap::new(), &payload_hash)
+            .expect("reuse verified existing payload");
+        target
+            .seal_durable_job()
+            .expect("seal durable logical target job");
+
+        let roots = job.borrow().root_set().expect("read sealed job roots");
+        assert!(roots.object_hashes.contains(&payload_hash));
     }
 
     #[test]

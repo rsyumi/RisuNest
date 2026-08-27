@@ -1221,7 +1221,7 @@ fn handle_request(
             if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
                 return respond_empty(stream, 400);
             }
-            logical_object(stream, shared, &object, stopped)
+            logical_object(stream, shared, &device, &object, stopped)
         }
         _ => respond_empty(stream, 405),
     }
@@ -1441,6 +1441,7 @@ fn range(
 fn logical_object(
     stream: &mut TcpStream,
     shared: &LanShared,
+    device_id: &str,
     object: &str,
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
@@ -1457,8 +1458,19 @@ fn logical_object(
         hash: object.to_owned(),
         size,
     })?;
-    write_response_head(stream, 200, &[("ETag", &quoted(object))], size)?;
-    copy_exact_response(stream, reader.as_mut(), size, stopped)
+    set_current_object(shared, device_id, Some(object));
+    let result = write_response_head(stream, 200, &[("ETag", &quoted(object))], size)
+        .and_then(|_| copy_exact_response(stream, reader.as_mut(), size, stopped));
+    set_current_object(shared, device_id, None);
+    result
+}
+
+#[cfg(desktop)]
+fn set_current_object(shared: &LanShared, device_id: &str, object: Option<&str>) {
+    if let Some(device) = shared.devices.lock().unwrap().get_mut(device_id) {
+        device.info.current_object = object.map(str::to_owned);
+        device.info.last_seen_unix_ms = now_ms();
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2122,6 +2134,43 @@ mod timeout_tests {
         }
     }
 
+    struct DelayedLogicalFixtureSource {
+        object_hash: String,
+        bytes: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl LogicalDeltaObjectSource for DelayedLogicalFixtureSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            if object.hash != self.object_hash {
+                return Err(PeerSyncError::Storage(
+                    "delayed logical fixture object is absent".to_owned(),
+                ));
+            }
+            Ok(Box::new(DelayedFirstRead {
+                inner: Cursor::new(self.bytes.clone()),
+                delay: Some(self.delay),
+            }))
+        }
+    }
+
+    struct DelayedFirstRead {
+        inner: Cursor<Vec<u8>>,
+        delay: Option<Duration>,
+    }
+
+    impl Read for DelayedFirstRead {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if let Some(delay) = self.delay.take() {
+                thread::sleep(delay);
+            }
+            self.inner.read(output)
+        }
+    }
+
     #[test]
     fn logical_session_reuses_claim_bearer_revoke_and_bounded_object_routes() {
         let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
@@ -2189,10 +2238,6 @@ mod timeout_tests {
         let devices = host.devices();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].verified_bytes, 0);
-        assert_eq!(
-            devices[0].current_object.as_deref(),
-            Some(record_hash.as_str())
-        );
         let mut received = Vec::new();
         reader.read_to_end(&mut received).unwrap();
         assert_eq!(received, record_bytes);
@@ -2277,6 +2322,107 @@ mod timeout_tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].verified_bytes, 0);
         assert_eq!(devices[0].current_object, None);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn backpressured_logical_object_opens_without_waiting_for_control_progress() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "backpressured-plugin".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value": "remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let record_hash = built.record_objects[0].object.hash.clone();
+        let record_bytes = built.record_objects[0].object.bytes.clone();
+        let logical = PreparedLogicalLanSession::new(
+            "00000000-0000-4000-8000-000000000062",
+            "00000000-0000-4000-8000-000000000063",
+            built.manifest_hash,
+            built.manifest_bytes,
+            built
+                .manifest
+                .objects
+                .iter()
+                .map(|object| LogicalDeltaObject {
+                    hash: object.hash.clone(),
+                    size: object.size,
+                })
+                .collect(),
+            Box::new(DelayedLogicalFixtureSource {
+                object_hash: record_hash.clone(),
+                bytes: record_bytes.clone(),
+                delay: Duration::from_millis(600),
+            }),
+        )
+        .unwrap();
+        let mut host = LanCloneHost::prepare_logical(logical);
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let mut client = LanLogicalDeltaClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let control_timeout = Duration::from_millis(400);
+        client.control_timeout = control_timeout;
+
+        let started = Instant::now();
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: record_hash.clone(),
+                size: record_bytes.len() as u64,
+            })
+            .unwrap();
+        let opened_in = started.elapsed();
+        let current_while_streaming = host.devices()[0].current_object.clone();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+
+        assert!(
+            opened_in < control_timeout,
+            "logical object open waited {opened_in:?} for control progress"
+        );
+        assert_eq!(
+            current_while_streaming.as_deref(),
+            Some(record_hash.as_str())
+        );
+        assert_eq!(received, record_bytes);
+        assert_eq!(host.devices()[0].verified_bytes, received.len() as u64);
+        assert_eq!(host.devices()[0].current_object, None);
+
+        let dropped_reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: record_hash.clone(),
+                size: record_bytes.len() as u64,
+            })
+            .unwrap();
+        assert_eq!(
+            host.devices()[0].current_object.as_deref(),
+            Some(record_hash.as_str())
+        );
+        drop(dropped_reader);
+        let clear_deadline = Instant::now() + Duration::from_secs(2);
+        while host.devices()[0].current_object.is_some() && Instant::now() < clear_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.devices()[0].current_object, None);
+        assert_eq!(host.devices()[0].verified_bytes, received.len() as u64);
         host.stop().unwrap();
     }
 
@@ -2520,16 +2666,13 @@ impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
                 "logical delta object response identity is invalid".to_owned(),
             ));
         }
-        let reporter = self.progress_reporter();
-        let _ = reporter.report_current(Some(&object.hash));
         Ok(Box::new(LogicalProgressReader {
             inner: response,
-            reporter,
+            reporter: self.progress_reporter(),
             expected_hash: object.hash.clone(),
             expected_size: object.size,
             received_size: 0,
             hasher: Sha256::new(),
-            cleared: false,
             completed: false,
         }))
     }
@@ -2597,18 +2740,11 @@ struct LogicalProgressReader {
     expected_size: u64,
     received_size: u64,
     hasher: Sha256,
-    cleared: bool,
     completed: bool,
 }
 
 #[cfg(desktop)]
 impl LogicalProgressReader {
-    fn clear_current(&mut self) {
-        if !self.cleared {
-            self.cleared = self.reporter.report_current(None).is_ok();
-        }
-    }
-
     fn finish_if_verified(&mut self) {
         if self.completed {
             return;
@@ -2616,9 +2752,7 @@ impl LogicalProgressReader {
         let hash = hex::encode(self.hasher.clone().finalize());
         if self.received_size == self.expected_size && hash == self.expected_hash {
             self.completed = true;
-            self.cleared = self.reporter.complete_object(self.expected_size).is_ok();
-        } else {
-            self.clear_current();
+            let _ = self.reporter.complete_object(self.expected_size);
         }
     }
 }
@@ -2645,17 +2779,7 @@ impl Read for LogicalProgressReader {
                 self.hasher.update(&output[..read]);
                 Ok(read)
             }
-            Err(error) => {
-                self.clear_current();
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
-    }
-}
-
-#[cfg(desktop)]
-impl Drop for LogicalProgressReader {
-    fn drop(&mut self) {
-        self.clear_current();
     }
 }
