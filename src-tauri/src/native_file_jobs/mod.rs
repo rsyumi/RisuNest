@@ -1021,7 +1021,11 @@ impl NativeFileJobState {
                 kind,
                 Some(task.expected_revision()),
                 warning_codes.clone(),
-                require_restore_finalization && kind == JobKind::RestoreBlockRisuSave,
+                require_restore_finalization
+                    && matches!(
+                        kind,
+                        JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+                    ),
             )
             .map_err(|error| NativeJobError::new("store-error", error))?;
         let job_id = job.id();
@@ -1744,7 +1748,10 @@ impl JobRegistry {
             kind,
             expected_revision,
             warning_codes,
-            kind == JobKind::RestoreBlockRisuSave,
+            matches!(
+                kind,
+                JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+            ),
         )
     }
 
@@ -2365,7 +2372,7 @@ mod tests {
     fn lossless_restore_reuses_the_existing_finalize_and_too_late_cancel_boundary() {
         let registry = JobRegistry::default();
         let job = registry
-            .create_internal(JobKind::RestoreLosslessBackup, Some(4), Vec::new(), true)
+            .create_with_context(JobKind::RestoreLosslessBackup, Some(4), Vec::new())
             .unwrap();
         job.start(JobPhase::ReadingSource).unwrap();
         job.set_phase(JobPhase::StagingDatabase).unwrap();
