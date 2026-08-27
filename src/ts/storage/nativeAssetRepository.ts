@@ -117,18 +117,12 @@ export async function sealCasJob(
 export async function finalizeContentCasJob(
     sessionId: string,
     ownerManifest: Uint8Array,
-    contentAssets: readonly { objectHash: string; byteSize: number }[],
     invokeCommand: InvokeCommand = invoke,
 ): Promise<PreparedImmutablePayload> {
     pinSessionId(sessionId, 'Native content CAS finalizer')
-    for (const asset of contentAssets) {
-        objectPhysicalKey(asset.objectHash)
-        safeSize(asset.byteSize, 'Native content CAS finalizer')
-    }
     return preparedPayload(await invokeCommand('asset_cas_job_finalize_content', {
         sessionId,
         ownerManifest: Array.from(ownerManifest),
-        contentAssets,
     }), 'Native content CAS finalizer')
 }
 

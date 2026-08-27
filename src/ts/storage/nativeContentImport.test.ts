@@ -85,18 +85,9 @@ describe('native prepared content import', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('finalizes one owner manifest with all asset metadata, commits, then forgets', async () => {
+    it('finalizes one owner manifest without descriptor echo, commits, then forgets', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const manifestHash = 'cd'.repeat(32)
-        const collisionContent: PreparedNativeContent = {
-            ...preparedContent,
-            assets: [{
-                ...preparedContent.assets[0],
-                objectHash: manifestHash,
-                logicalId: `assets/${manifestHash}.png`,
-                byteSize: 3,
-            }],
-        }
         const receipt = await prepareNativeContentImport(
             { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
             'card.json',
@@ -105,7 +96,7 @@ describe('native prepared content import', () => {
                 calls.push([command, args])
                 if (command === 'native_file_job_start') return { jobId: 'content-1' }
                 if (command === 'native_file_job_status') {
-                    return contentStatus('succeeded', 'complete', collisionContent)
+                    return contentStatus('succeeded', 'complete', preparedContent)
                 }
                 if (command === 'asset_cas_job_finalize_content') return {
                     contentHash: manifestHash,
@@ -129,11 +120,11 @@ describe('native prepared content import', () => {
             ['asset_cas_job_finalize_content', {
                 sessionId: 'content-1',
                 ownerManifest: [1, 2, 3],
-                contentAssets: [{ objectHash: manifestHash, byteSize: 3 }],
             }],
             ['asset_cas_job_release', { sessionId: 'content-1', outcome: 'committed' }],
             ['native_file_job_forget', { jobId: 'content-1' }],
         ])
+        expect(JSON.stringify(calls)).not.toContain('contentAssets')
     })
 
     it('rejects a mismatched CAS session and aborts the actual job session before forgetting', async () => {

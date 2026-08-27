@@ -893,7 +893,6 @@ export async function prepareNativeContentImport(
                 const prepared = await finalizeContentCasJob(
                     started.jobId,
                     bytes,
-                    content.assets.map(({ objectHash, byteSize }) => ({ objectHash, byteSize })),
                     dependencies.invoke,
                 )
                 lifecycleState = 'finalized'

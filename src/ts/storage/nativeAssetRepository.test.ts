@@ -146,7 +146,7 @@ describe('native asset repository adapters', () => {
         ])
     })
 
-    it('finalizes one content session with an owner manifest and asset metadata in one IPC', async () => {
+    it('finalizes one content session without echoing asset descriptors through IPC', async () => {
         const manifestHash = '66'.repeat(32)
         const invoke = vi.fn(async () => ({
             contentHash: manifestHash,
@@ -158,10 +158,6 @@ describe('native asset repository adapters', () => {
         await expect(finalizeContentCasJob(
             'content-1',
             Uint8Array.of(1, 2, 3),
-            [
-                { objectHash: '77'.repeat(32), byteSize: 10 },
-                { objectHash: manifestHash, byteSize: 3 },
-            ],
             invoke,
         )).resolves.toMatchObject({ contentHash: manifestHash, byteSize: 3 })
 
@@ -169,10 +165,7 @@ describe('native asset repository adapters', () => {
         expect(invoke).toHaveBeenCalledWith('asset_cas_job_finalize_content', {
             sessionId: 'content-1',
             ownerManifest: [1, 2, 3],
-            contentAssets: [
-                { objectHash: '77'.repeat(32), byteSize: 10 },
-                { objectHash: manifestHash, byteSize: 3 },
-            ],
         })
+        expect(JSON.stringify(invoke.mock.calls)).not.toContain('contentAssets')
     })
 })
