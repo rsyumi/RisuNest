@@ -971,6 +971,19 @@ fn complete_bidirectional_local_after_remote_apply(
             "bidirectional remote receipt differs from shared generation".to_owned(),
         ));
     }
+    let remote_changed = if remote.committed_revision == context.expected_remote_revision {
+        false
+    } else if context
+        .expected_remote_revision
+        .checked_add(1)
+        .is_some_and(|revision| remote.committed_revision == revision)
+    {
+        true
+    } else {
+        return Err(PeerSyncError::Validation(
+            "bidirectional remote receipt has an unexpected revision".to_owned(),
+        ));
+    };
     let active = store
         .seal_or_initialize_active_logical_generation(cas)
         .map_err(store_error)?;
@@ -1022,10 +1035,10 @@ fn complete_bidirectional_local_after_remote_apply(
             PeerSyncError::Validation("bidirectional transfer byte count overflow".to_owned())
         })?;
     let result = PeerBidirectionalCompletedResult {
-        kind: if !changed && transferred_objects == 0 {
-            "noChanges".to_owned()
-        } else {
+        kind: if changed || remote_changed {
             "updated".to_owned()
+        } else {
+            "noChanges".to_owned()
         },
         operation_id: operation_id.to_owned(),
         revision: committed_revision,
@@ -1574,6 +1587,129 @@ mod tests {
         };
         journal.store(&completed).unwrap();
         assert_eq!(journal.load().unwrap(), Some(completed));
+    }
+
+    #[test]
+    fn zero_transfer_remote_revision_advance_completes_as_updated() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174025";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    shared.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174026";
+        let mut retained_context = context(operation_id);
+        retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        retained_context.credential.source_device_id = peer_id.to_owned();
+        retained_context.expected_remote_revision = 4;
+        retained_context.previous_shared = shared.clone();
+        retained_context.previous_local = shared.clone();
+        let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: retained_context,
+            committed_revision: 0,
+            shared_generation: shared.clone(),
+            changed: false,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+
+        journal.store(&retained).unwrap();
+        let unchanged = complete_bidirectional_local_after_remote_apply(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            LanBidirectionalRemoteApplyReceipt {
+                committed_revision: 4,
+                committed_generation: LanBidirectionalGeneration {
+                    generation_id: shared.generation_id.clone(),
+                    manifest_hash: shared.manifest_hash.clone(),
+                    generation_sequence: shared.generation_sequence.clone(),
+                },
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backup: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(unchanged.kind, "noChanges");
+
+        journal.store(&retained).unwrap();
+        let record_only = complete_bidirectional_local_after_remote_apply(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            LanBidirectionalRemoteApplyReceipt {
+                committed_revision: 5,
+                committed_generation: LanBidirectionalGeneration {
+                    generation_id: shared.generation_id.clone(),
+                    manifest_hash: shared.manifest_hash.clone(),
+                    generation_sequence: shared.generation_sequence.clone(),
+                },
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backup: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(record_only.kind, "updated");
+        assert_eq!(record_only.transferred_objects, 0);
+        assert_eq!(record_only.transferred_bytes, 0);
+
+        journal.store(&retained).unwrap();
+        assert!(matches!(
+            complete_bidirectional_local_after_remote_apply(
+                &mut store,
+                &cas,
+                directory.path(),
+                operation_id,
+                LanBidirectionalRemoteApplyReceipt {
+                    committed_revision: 6,
+                    committed_generation: LanBidirectionalGeneration {
+                        generation_id: shared.generation_id,
+                        manifest_hash: shared.manifest_hash,
+                        generation_sequence: shared.generation_sequence,
+                    },
+                    transferred_objects: 0,
+                    transferred_bytes: 0,
+                    backup: None,
+                },
+            ),
+            Err(PeerSyncError::Validation(_))
+        ));
+        assert_eq!(journal.load().unwrap(), Some(retained));
     }
 
     #[test]
