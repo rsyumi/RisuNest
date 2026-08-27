@@ -290,6 +290,18 @@ fn named_tunnel_accepts_only_bounded_tokens_and_bare_public_https_urls() {
         ),
         (
             "eyJ-remotely-managed-tunnel-token",
+            "https://sync.example.com/.",
+        ),
+        (
+            "eyJ-remotely-managed-tunnel-token",
+            "https://sync.example.com/a/..",
+        ),
+        (
+            "eyJ-remotely-managed-tunnel-token",
+            "https://sync.example.com/%2e",
+        ),
+        (
+            "eyJ-remotely-managed-tunnel-token",
             "https://sync.example.com:443",
         ),
         ("eyJ-remotely-managed-tunnel-token", "https://127.0.0.1"),

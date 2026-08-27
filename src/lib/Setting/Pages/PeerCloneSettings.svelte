@@ -39,6 +39,12 @@
     let namedTunnelToken = $state('')
     let namedTunnelPublicBaseUrl = $state('')
 
+    $effect(() => {
+        if (sourceMode !== 'named' || sourceStatus.phase !== 'prepared') {
+            namedTunnelToken = ''
+        }
+    })
+
     const sourceEnabled = $derived(!!(
         capabilities?.productionEnabled
         && capabilities.sourceReady

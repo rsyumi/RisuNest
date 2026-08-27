@@ -196,6 +196,15 @@ function hasExplicitAuthorityPort(value: string): boolean {
     return authority.slice(authority.lastIndexOf('@') + 1).includes(':')
 }
 
+function hasBareAuthorityPath(value: string): boolean {
+    const remainder = value.slice(value.indexOf('://') + 3)
+    const pathStart = remainder.indexOf('/')
+    if (pathStart < 0) return true
+    const pathEndOffset = remainder.slice(pathStart).search(/[?#]/)
+    const pathEnd = pathEndOffset < 0 ? remainder.length : pathStart + pathEndOffset
+    return remainder.slice(pathStart, pathEnd) === '/'
+}
+
 function isAllowedLanHost(hostname: string): boolean {
     const ipv4 = parseIpv4(hostname)
     if (!ipv4) return false
@@ -233,6 +242,7 @@ function endpointFor(sessionId: string, value: string): string {
         && isAllowedLanHost(endpoint.hostname)
     const tunnel = endpoint.protocol === 'https:'
         && !hasExplicitAuthorityPort(value)
+        && hasBareAuthorityPath(value)
         && isAllowedPublicHttpsHost(endpoint.hostname)
     if (!lan && !tunnel) return invalidPairingUri()
     return endpoint.toString()

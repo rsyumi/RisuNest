@@ -262,6 +262,9 @@ impl TunnelMode {
         if has_explicit_authority_port(expected_public_base_url) {
             return Err(TunnelError::InvalidNamedConfiguration);
         }
+        if !has_bare_authority_path(expected_public_base_url) {
+            return Err(TunnelError::InvalidNamedConfiguration);
+        }
         let expected_public_base_url = Url::parse(expected_public_base_url)
             .map_err(|_| TunnelError::InvalidNamedConfiguration)?;
         let is_public_domain = matches!(
@@ -718,6 +721,18 @@ fn has_explicit_authority_port(value: &str) -> bool {
         .next()
         .unwrap_or_default()
         .contains(':')
+}
+
+fn has_bare_authority_path(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let Some(path_start) = remainder.find('/') else {
+        return true;
+    };
+    let path = &remainder[path_start..];
+    let path_end = path.find(['?', '#']).unwrap_or(path.len());
+    &path[..path_end] == "/"
 }
 
 impl<P: TunnelProcess, S: PeerSession> Drop for TunnelStartFailure<P, S> {

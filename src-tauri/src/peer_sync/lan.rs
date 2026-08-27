@@ -1354,7 +1354,11 @@ pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError
         };
         return Ok(format!("http://{host}:{port}"));
     }
-    if url.scheme() == "https" && valid_public_domain && !has_explicit_authority_port(value) {
+    if url.scheme() == "https"
+        && valid_public_domain
+        && !has_explicit_authority_port(value)
+        && has_bare_authority_path(value)
+    {
         return Ok(format!("https://{}", url.host_str().unwrap()));
     }
     Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))
@@ -1375,6 +1379,18 @@ fn has_explicit_authority_port(value: &str) -> bool {
         return authority[bracket + 1..].starts_with(':');
     }
     authority.contains(':')
+}
+
+fn has_bare_authority_path(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let Some(path_start) = remainder.find('/') else {
+        return true;
+    };
+    let path = &remainder[path_start..];
+    let path_end = path.find(['?', '#']).unwrap_or(path.len());
+    &path[..path_end] == "/"
 }
 
 #[cfg(test)]
@@ -1411,6 +1427,9 @@ mod endpoint_tests {
             "https://sync.example.com:8443",
             "https://user@sync.example.com",
             "https://sync.example.com/path",
+            "https://sync.example.com/.",
+            "https://sync.example.com/a/..",
+            "https://sync.example.com/%2e",
             "https://sync.example.com/?query=value",
             "https://sync.example.com/#fragment",
         ] {
