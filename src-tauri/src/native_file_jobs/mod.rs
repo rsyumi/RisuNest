@@ -1330,6 +1330,47 @@ impl NativeFileJobState {
             .map_err(|error| NativeJobError::new("store-error", error))
     }
 
+    pub(crate) fn content_asset_receipt(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<(String, u64)>, NativeJobError> {
+        let job = self
+            .registry
+            .lookup(job_id)
+            .map_err(|error| NativeJobError::new("store-error", error))?
+            .ok_or_else(|| NativeJobError::new("invalid-input", "native content job is missing"))?;
+        let status = job
+            .status
+            .lock()
+            .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
+        if status.kind != JobKind::PrepareContentImport
+            || status.state != JobState::Succeeded
+            || status.phase != JobPhase::Complete
+        {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "native content receipt is not terminal and successful",
+            ));
+        }
+        let prepared = status.prepared_content.as_ref().ok_or_else(|| {
+            NativeJobError::new(
+                "invalid-input",
+                "successful native content job has no prepared receipt",
+            )
+        })?;
+        if prepared.cas_session_id != job_id {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "native content receipt CAS session does not match its job",
+            ));
+        }
+        Ok(prepared
+            .assets
+            .iter()
+            .map(|asset| (asset.object_hash.clone(), asset.byte_size))
+            .collect())
+    }
+
     pub(crate) fn list(&self) -> Result<Vec<JobStatus>, NativeJobError> {
         self.registry
             .list()
@@ -3784,6 +3825,88 @@ mod tests {
             .any(|status| status.job_id == content_id));
         assert!(registry.forget(&content_id).unwrap());
         assert!(registry.status(&content_id).is_err());
+    }
+
+    fn retained_content_fixture(session_id: String) -> PreparedContent {
+        PreparedContent {
+            format: PreparedContentFormat::JsonCard,
+            metadata: serde_json::json!({"spec": "chara_card_v3"}),
+            assets: vec![
+                PreparedContentAsset {
+                    reference_key: "first".to_owned(),
+                    token: "first".to_owned(),
+                    logical_id: format!("assets/{}.png", "1".repeat(64)),
+                    object_hash: "1".repeat(64),
+                    byte_size: 4,
+                    mime: "image/png".to_owned(),
+                    name: "first".to_owned(),
+                    ext: "png".to_owned(),
+                },
+                PreparedContentAsset {
+                    reference_key: "second".to_owned(),
+                    token: "second".to_owned(),
+                    logical_id: format!("assets/{}.json", "2".repeat(64)),
+                    object_hash: "2".repeat(64),
+                    byte_size: 7,
+                    mime: "application/json".to_owned(),
+                    name: "second".to_owned(),
+                    ext: "json".to_owned(),
+                },
+            ],
+            cas_session_id: session_id,
+            portrait_logical_id: None,
+            module: None,
+        }
+    }
+
+    #[test]
+    fn succeeded_native_content_receipt_is_the_asset_descriptor_authority() {
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let job = state
+            .registry
+            .create(JobKind::PrepareContentImport)
+            .unwrap();
+        let job_id = job.id();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.finish_content_job(Ok(retained_content_fixture(job_id.clone())), Ok(()))
+            .unwrap();
+
+        let receipt = state.content_asset_receipt(&job_id).unwrap();
+
+        assert_eq!(receipt, vec![("1".repeat(64), 4), ("2".repeat(64), 7)]);
+    }
+
+    #[test]
+    fn native_content_receipt_rejects_missing_and_nonterminal_jobs() {
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        assert!(state.content_asset_receipt("missing-job").is_err());
+        let queued = state
+            .registry
+            .create(JobKind::PrepareContentImport)
+            .unwrap();
+
+        assert!(state.content_asset_receipt(&queued.id()).is_err());
+    }
+
+    #[test]
+    fn native_content_receipt_rejects_a_mismatched_cas_session() {
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let job = state
+            .registry
+            .create(JobKind::PrepareContentImport)
+            .unwrap();
+        let job_id = job.id();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.finish_content_job(
+            Ok(retained_content_fixture("different-session".to_owned())),
+            Ok(()),
+        )
+        .unwrap();
+
+        assert!(state.content_asset_receipt(&job_id).is_err());
     }
 
     #[test]

@@ -3,17 +3,16 @@ use super::{PayloadCas, PreparedPayload};
 use crate::asset_repository::owner_manifest_codec::{
     decode_owner_manifest, encode_owner_manifest, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
 };
+use crate::native_file_jobs::NativeFileJobState;
 use crate::persistent_store::{self, PersistentStoreState, StoreError};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, ErrorKind};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ContentDirectObject {
     object_hash: String,
     byte_size: u64,
@@ -382,10 +381,19 @@ fn invalid_content_finalization<T>(message: &str) -> io::Result<T> {
 #[tauri::command(async)]
 pub(crate) async fn asset_cas_job_finalize_content(
     app: AppHandle,
+    native_jobs: State<'_, NativeFileJobState>,
     session_id: String,
     owner_manifest: Vec<u8>,
-    content_assets: Vec<ContentDirectObject>,
 ) -> Result<PreparedPayload, String> {
+    let content_assets = native_jobs
+        .content_asset_receipt(&session_id)
+        .map_err(|error| format!("{}: {}", error.code, error.message))?
+        .into_iter()
+        .map(|(object_hash, byte_size)| ContentDirectObject {
+            object_hash,
+            byte_size,
+        })
+        .collect::<Vec<_>>();
     tauri::async_runtime::spawn_blocking(move || {
         let root = repository_root(&app)?;
         let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
