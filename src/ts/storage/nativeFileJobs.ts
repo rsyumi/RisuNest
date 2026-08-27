@@ -139,6 +139,7 @@ export interface NativeFileJobStatus {
         | 'export-block-risu-save'
         | 'restore-lossless-backup'
         | 'export-lossless-backup'
+        | 'export-character-charx'
         | 'restore-legacy-local-backup'
         | 'export-legacy-local-backup'
         | 'prepare-content-import'
@@ -217,6 +218,13 @@ export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
 
 export interface NativeFileExportJobOptions extends NativeFileJobOptions {
     omitAccount?: boolean
+}
+
+export interface NativeCharacterCharxExportInput {
+    characterId: string
+    destination: string
+    card: Record<string, unknown>
+    module: Record<string, unknown>
 }
 
 export type NativeLosslessBackupDestination =
@@ -901,6 +909,93 @@ export function runNativeBlockRisuSaveExport(
         options,
         dependencies,
     )
+}
+
+export async function runNativeCharacterCharxExport(
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    input: NativeCharacterCharxExportInput,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native character CharX export requires Tauri')
+    }
+    if (options.signal?.aborted) throw abortError()
+
+    await runtime.flushPendingData('native-character-charx-export')
+    if (options.signal?.aborted) throw abortError()
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request: {
+            kind: 'export-character-charx',
+            destination: input.destination,
+            expectedRevision: runtime.revision,
+            characterId: input.characterId,
+            card: input.card,
+            module: input.module,
+        },
+    }) as { jobId: string; warningCodes?: string[] }
+    let cancellationRequested = false
+    let terminal: NativeFileJobStatus | undefined
+
+    while (!terminal) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (isTerminalJob(status)) terminal = status
+        else await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+
+    let outcomeFailed = false
+    let result: NativeFileJobResult | undefined
+    try {
+        if (terminal.state === 'cancelled') throw abortError()
+        if (terminal.state !== 'succeeded') {
+            throw new NativeFileJobError(
+                terminal.error?.code ?? 'export-failed',
+                terminal.error?.message ?? 'Native character CharX export failed',
+            )
+        }
+        if (!terminal.result) {
+            throw new NativeFileJobError(
+                'missing-result',
+                'Native character CharX export returned no result',
+            )
+        }
+        result = {
+            ...terminal.result,
+            warningCodes: [...new Set([
+                ...(started.warningCodes ?? []),
+                ...terminal.result.warningCodes,
+            ])].slice(0, 16),
+        }
+        return result
+    }
+    catch (error) {
+        outcomeFailed = true
+        throw error
+    }
+    finally {
+        try {
+            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+        }
+        catch (error) {
+            if (result) {
+                result.warningCodes = [
+                    ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
+                    'cleanup-failed',
+                ]
+            }
+            else if (!outcomeFailed) throw error
+        }
+    }
 }
 
 export function runNativeLegacyLocalBackupExport(

@@ -9,6 +9,7 @@ import {
     runNativeLegacyLocalBackupExport,
     runNativeLegacyLocalBackupRestore,
     runNativeLosslessBackupExport,
+    runNativeCharacterCharxExport,
     runNativeLosslessBackupRestore,
     runNativeOfficialPublicationAttempt,
     resumeNativeOfficialPublication,
@@ -62,6 +63,90 @@ function restoreRuntime(
 }
 
 describe('native file jobs', () => {
+    it('exports one leased character CharX without payload bytes in IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const terminal: NativeFileJobStatus = {
+            jobId: 'character-export',
+            kind: 'export-character-charx',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: {
+                completedBytes: 8192,
+                totalBytes: 8192,
+                completedItems: 3,
+                totalItems: 3,
+            },
+            result: {
+                revision: 31,
+                sourceBytes: 8192,
+                sourceSha256: 'c'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+            },
+        }
+        const card = {
+            spec: 'chara_card_v3',
+            spec_version: '3.0',
+            data: {
+                name: 'Leased',
+                extensions: { risuai: {} },
+                assets: [{ type: 'icon', uri: 'ccdefault:', name: 'main', ext: 'png' }],
+            },
+        }
+        const module = {
+            name: 'Leased Module',
+            description: 'Module for Leased',
+            id: 'module-id',
+            trigger: [],
+            regex: [],
+            lorebook: [],
+        }
+
+        const result = await runNativeCharacterCharxExport(
+            {
+                revision: 31,
+                flushPendingData: async (reason) => calls.push([`flush:${reason}`, undefined]),
+            },
+            {
+                characterId: 'character-id',
+                destination: 'C:\\chosen\\Leased.charx',
+                card,
+                module,
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result).toEqual(terminal.result)
+        expect(calls).toEqual([
+            ['flush:native-character-charx-export', undefined],
+            ['native_file_job_start', {
+                request: {
+                    kind: 'export-character-charx',
+                    destination: 'C:\\chosen\\Leased.charx',
+                    expectedRevision: 31,
+                    characterId: 'character-id',
+                    card,
+                    module,
+                },
+            }],
+            ['native_file_job_status', { jobId: 'character-export' }],
+            ['native_file_job_forget', { jobId: 'character-export' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
     it('restores an official snapshot without transferring its database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const events: string[] = []
