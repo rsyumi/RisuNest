@@ -1,3 +1,4 @@
+use super::charx::CharXLimits;
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::asset_repository::PayloadCas;
 use crate::persistent_store::export::{self, destination};
@@ -12,7 +13,6 @@ use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const CARD_METADATA_LIMIT: usize = 8 * 1024 * 1024;
 const RPACK_MAP: &[u8; 512] = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
 
 pub(crate) fn export_character_charx(
@@ -34,6 +34,7 @@ pub(crate) fn export_character_charx(
         owned_directory,
         destination_path,
         job,
+        CharXLimits::default(),
     );
     finish_with_lease(outcome, &prepared, reader)
 }
@@ -47,6 +48,7 @@ fn export_character_charx_with_reader(
     owned_directory: &Path,
     destination_path: &Path,
     job: &JobControl,
+    limits: CharXLimits,
 ) -> Result<JobResultSummary, NativeJobError> {
     if job.is_cancel_requested() {
         return Err(cancelled(
@@ -63,10 +65,32 @@ fn export_character_charx_with_reader(
     .map_err(store_error)?;
     validate_character_identity(&character, character_id, &card)?;
     validate_module_overlay(&character, &card, &module)?;
-    let asset_count = card_assets_mut(&mut card)?.len();
-    let total_items = u64::try_from(asset_count)
-        .unwrap_or(u64::MAX)
-        .saturating_add(2);
+    let assets = card_assets_mut(&mut card)?;
+    let asset_count = assets.len();
+    let embedded_asset_count = assets.iter().try_fold(0_usize, |count, asset| {
+        embedded_asset_key(asset, &character).and_then(|key| {
+            key.map_or(Ok(count), |_| {
+                count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_input("character CharX entry count overflowed"))
+            })
+        })
+    })?;
+    let entry_count = embedded_asset_count
+        .checked_add(2)
+        .ok_or_else(|| invalid_input("character CharX entry count overflowed"))?;
+    if entry_count > limits.max_entries {
+        return Err(invalid_input(format!(
+            "character CharX has {entry_count} entries, limit is {}",
+            limits.max_entries
+        )));
+    }
+    let total_items = u64::try_from(
+        asset_count
+            .checked_add(2)
+            .ok_or_else(|| invalid_input("character CharX item count overflowed"))?,
+    )
+    .map_err(|_| invalid_input("character CharX entry count is invalid"))?;
     job.set_progress(JobProgress {
         completed_bytes: 0,
         total_bytes: None,
@@ -86,6 +110,7 @@ fn export_character_charx_with_reader(
     let mut archive = ZipWriter::new(BufWriter::with_capacity(COPY_BUFFER_BYTES, file));
     let mut completed_bytes = 0_u64;
     let mut completed_items = 0_u64;
+    let mut decoded_bytes = 0_u64;
 
     let assets = card_assets_mut(&mut card)?;
     for (index, asset) in assets.iter_mut().enumerate() {
@@ -107,13 +132,24 @@ fn export_character_charx_with_reader(
         };
         let alias = export::pinned_asset_alias(&reader.connection, &reader.target, &key)
             .map_err(store_error)?;
+        reserve_decoded_entry(
+            &mut decoded_bytes,
+            u64::try_from(alias.size)
+                .map_err(|_| invalid_input("pinned character asset size is invalid"))?,
+            "character asset",
+            limits,
+        )?;
         let hash = alias.object_hash.as_deref().ok_or_else(|| {
             invalid_input(format!(
                 "pinned character asset has no native payload: {key}"
             ))
         })?;
-        let extension = validate_extension(&alias.ext)?;
-        let archive_path = archive_asset_path(asset, index, extension)?;
+        let extension = asset
+            .get("ext")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("CCv3 asset extension must be a string"))?;
+        let extension = validate_extension(extension)?.to_owned();
+        let archive_path = archive_asset_path(asset, index, &extension)?;
         asset
             .as_object_mut()
             .expect("validated card asset object")
@@ -124,7 +160,7 @@ fn export_character_charx_with_reader(
         asset
             .as_object_mut()
             .expect("validated card asset object")
-            .insert("ext".to_owned(), Value::String(extension.to_owned()));
+            .insert("ext".to_owned(), Value::String(extension));
 
         let source_file = repository
             .open_object(hash)
@@ -150,7 +186,7 @@ fn export_character_charx_with_reader(
         .map_err(job_error)?;
     }
 
-    write_module_overlay(&mut archive, module, job)?;
+    write_module_overlay(&mut archive, module, job, &mut decoded_bytes, limits)?;
     completed_items += 1;
     job.set_progress(JobProgress {
         completed_bytes,
@@ -159,7 +195,7 @@ fn export_character_charx_with_reader(
         total_items: Some(total_items),
     })
     .map_err(job_error)?;
-    write_card_metadata(&mut archive, &card, job)?;
+    write_card_metadata(&mut archive, &card, job, &mut decoded_bytes, limits)?;
     completed_items += 1;
     let mut output = archive.finish().map_err(zip_error)?;
     output.flush().map_err(io_error)?;
@@ -410,6 +446,29 @@ fn validate_extension(extension: &str) -> Result<&str, NativeJobError> {
     Ok(extension)
 }
 
+fn reserve_decoded_entry(
+    total: &mut u64,
+    entry_bytes: u64,
+    description: &str,
+    limits: CharXLimits,
+) -> Result<(), NativeJobError> {
+    if entry_bytes > limits.max_entry_decoded_bytes {
+        return Err(invalid_input(format!(
+            "{description} exceeds the CharX per-entry limit"
+        )));
+    }
+    let next = total
+        .checked_add(entry_bytes)
+        .ok_or_else(|| invalid_input("character CharX decoded size overflowed"))?;
+    if next > limits.max_total_decoded_bytes {
+        return Err(invalid_input(
+            "character CharX exceeds the aggregate decoded size limit",
+        ));
+    }
+    *total = next;
+    Ok(())
+}
+
 fn archive_asset_path(
     asset: &Value,
     index: usize,
@@ -467,6 +526,8 @@ fn write_module_overlay(
     archive: &mut ZipWriter<BufWriter<File>>,
     module: Value,
     job: &JobControl,
+    decoded_bytes: &mut u64,
+    limits: CharXLimits,
 ) -> Result<(), NativeJobError> {
     if job.is_cancel_requested() {
         return Err(cancelled(
@@ -484,6 +545,11 @@ fn write_module_overlay(
         .collect();
     let encoded_len = u32::try_from(encoded.len())
         .map_err(|_| invalid_input("module overlay exceeds RISUM V0 size"))?;
+    let entry_bytes = u64::try_from(encoded.len())
+        .ok()
+        .and_then(|bytes| bytes.checked_add(7))
+        .ok_or_else(|| invalid_input("module overlay size overflowed"))?;
+    reserve_decoded_entry(decoded_bytes, entry_bytes, "module overlay", limits)?;
     archive
         .start_file(
             "module.risum",
@@ -502,6 +568,8 @@ fn write_card_metadata(
     archive: &mut ZipWriter<BufWriter<File>>,
     card: &Value,
     job: &JobControl,
+    decoded_bytes: &mut u64,
+    limits: CharXLimits,
 ) -> Result<(), NativeJobError> {
     if job.is_cancel_requested() {
         return Err(cancelled(
@@ -510,9 +578,15 @@ fn write_card_metadata(
     }
     let metadata = serde_json::to_vec_pretty(card)
         .map_err(|error| invalid_input(format!("CCv3 metadata is invalid: {error}")))?;
-    if metadata.len() > CARD_METADATA_LIMIT {
+    if metadata.len() as u64 > limits.max_metadata_bytes {
         return Err(invalid_input("CCv3 metadata exceeds the 8 MiB limit"));
     }
+    reserve_decoded_entry(
+        decoded_bytes,
+        metadata.len() as u64,
+        "CCv3 metadata",
+        limits,
+    )?;
     archive
         .start_file(
             "card.json",
@@ -660,7 +734,7 @@ mod tests {
                 ),
             },
             owner_manifest_codec::OwnerManifestEntry {
-                tuple: ["first".to_owned(), shared.key.clone(), shared.ext.clone()],
+                tuple: ["second".to_owned(), shared.key.clone(), "bIn".to_owned()],
                 payload_hash: Some(
                     hex::decode(shared.object_hash.as_ref().unwrap())
                         .unwrap()
@@ -684,7 +758,7 @@ mod tests {
             }],
             "additionalAssets": [
                 ["first", shared.key.clone(), "BIN"],
-                ["first", shared.key.clone(), "BIN"]
+                ["second", shared.key.clone(), "bIn"]
             ],
             "emotionImages": [["happy", emotion.key.clone()]],
             "triggerscript": [{"comment": "trigger"}],
@@ -745,7 +819,7 @@ mod tests {
                 "assets": [
                     {"type": "x-custom", "uri": cc.key.clone(), "name": "custom", "ext": "DAT"},
                     {"type": "x-risu-asset", "uri": shared.key.clone(), "name": "first", "ext": "BIN"},
-                    {"type": "x-risu-asset", "uri": shared.key.clone(), "name": "first", "ext": "BIN"},
+                    {"type": "x-risu-asset", "uri": shared.key.clone(), "name": "second", "ext": "bIn"},
                     {"type": "emotion", "uri": emotion.key.clone(), "name": "happy", "ext": "png"},
                     {"type": "icon", "uri": "ccdefault:", "name": "main", "ext": "png"}
                 ]
@@ -834,7 +908,7 @@ mod tests {
                 .iter()
                 .map(|payload| payload.extension.clone().unwrap())
                 .collect::<Vec<_>>(),
-            ["DAT", "BIN", "BIN", "WEBP", "PNG"]
+            ["DAT", "BIN", "bIn", "png", "png"]
         );
         assert_eq!(
             parsed
@@ -877,6 +951,79 @@ mod tests {
 
         assert_eq!(error.code, "cancelled");
         assert_eq!(fs::read(destination).unwrap(), b"previous CharX");
+    }
+
+    #[test]
+    fn native_charx_export_rejects_accepted_limits_before_destination_publication() {
+        let base = CharXLimits::default();
+        for (limits, expected_message) in [
+            (
+                CharXLimits {
+                    max_entries: 6,
+                    ..base
+                },
+                "entries",
+            ),
+            (
+                CharXLimits {
+                    max_entry_decoded_bytes: 10,
+                    ..base
+                },
+                "per-entry",
+            ),
+            (
+                CharXLimits {
+                    max_total_decoded_bytes: 25,
+                    ..base
+                },
+                "aggregate",
+            ),
+            (
+                CharXLimits {
+                    max_metadata_bytes: 1,
+                    ..base
+                },
+                "metadata",
+            ),
+        ] {
+            let mut fixture = fixture();
+            let mut prepared = fixture
+                .store
+                .prepare_risu_save_export(fixture.revision)
+                .unwrap();
+            let reader = prepared.take_reader().unwrap();
+            let owned = fixture.directory.path().join("owned");
+            let chosen = fixture.directory.path().join("chosen");
+            fs::create_dir(&owned).unwrap();
+            fs::create_dir(&chosen).unwrap();
+            let destination = chosen.join("current.charx");
+            fs::write(&destination, b"previous CharX").unwrap();
+            let job = JobRegistry::default()
+                .create(JobKind::ExportCharacterCharx)
+                .unwrap();
+
+            let error = export_character_charx_with_reader(
+                &prepared,
+                &reader,
+                "current-character",
+                fixture.card,
+                fixture.module,
+                &owned,
+                &destination,
+                &job,
+                limits,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code, "invalid-input");
+            assert!(
+                error.message.contains(expected_message),
+                "{}",
+                error.message
+            );
+            assert_eq!(fs::read(destination).unwrap(), b"previous CharX");
+            prepared.release(reader).unwrap();
+        }
     }
 
     #[test]

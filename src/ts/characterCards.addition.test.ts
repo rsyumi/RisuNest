@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     }),
     alertCardExport: vi.fn(),
     alertConfirm: vi.fn(),
+    alertError: vi.fn(),
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
     saveAsset: vi.fn(),
     compressImage: vi.fn(async (_data: Uint8Array) => new Uint8Array([99])),
@@ -40,7 +41,7 @@ vi.mock('./storage/database.svelte', () => ({
 vi.mock('./alert', () => ({
     alertCardExport: mocks.alertCardExport,
     alertConfirm: mocks.alertConfirm,
-    alertError: vi.fn(),
+    alertError: mocks.alertError,
     alertInput: vi.fn(),
     alertMd: vi.fn(),
     alertNormal: vi.fn(),
@@ -578,13 +579,14 @@ describe('character card additions', () => {
         const input = mocks.exportNativeCharacterCharxFromPicker.mock.calls[0][0]
         expect(input.characterId).toBe('native-card')
         expect(input.suggestedName).toBe('Native card.charx')
-        expect(input.card).toMatchObject({
+        const projected = input.projectCharacter(character)
+        expect(projected.card).toMatchObject({
             spec: 'chara_card_v3',
             data: { extensions: { risuai: {} } },
         })
-        expect(input.card.data.extensions.risuai).not.toHaveProperty('triggerscript')
-        expect(input.card.data.extensions.risuai).not.toHaveProperty('customScripts')
-        expect(input.module).toMatchObject({
+        expect(projected.card.data.extensions.risuai).not.toHaveProperty('triggerscript')
+        expect(projected.card.data.extensions.risuai).not.toHaveProperty('customScripts')
+        expect(projected.module).toMatchObject({
             name: 'Native card Module',
             trigger: character.triggerscript,
             regex: character.customscript,
@@ -592,6 +594,24 @@ describe('character card additions', () => {
         })
         expect(mocks.readImage).not.toHaveBeenCalled()
         expect(mocks.charxWrites).toEqual([])
+    })
+
+    it('shows the established export error alert when native CharX export fails', async () => {
+        const error = new Error('destination is full')
+        mocks.database.characters = [{
+            type: 'character',
+            name: 'Native card',
+            image: 'assets/avatar.png',
+            chats: [],
+            chaId: 'native-card',
+            globalLore: [],
+        }]
+        mocks.alertCardExport.mockResolvedValue({ type: '', type2: 'charx' } as any)
+        mocks.exportNativeCharacterCharxFromPicker.mockRejectedValue(error)
+
+        await expect(exportChar(0)).resolves.toBe('')
+
+        expect(mocks.alertError).toHaveBeenCalledWith(error)
     })
 
     it('keeps ordinary asset bytes exact in the JavaScript JSON export fallback', async () => {

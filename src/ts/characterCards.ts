@@ -751,25 +751,39 @@ export async function exportChar(charaID:number):Promise<string> {
     const option = await alertCardExport()
     if(option.type === ''){
         if(option.type2 === 'charx'){
-            const card = createBaseV3(char)
-            const module:RisuModule = {
-                name: `${char.name} Module`,
-                description: `Module for ${char.name}`,
-                id: v4(),
-                trigger: card.data.extensions.risuai.triggerscript ?? [],
-                regex: card.data.extensions.risuai.customScripts ?? [],
-                lorebook: char.globalLore ?? [],
+            try {
+                const nativeResult = await exportNativeCharacterCharxFromPicker({
+                    characterId: char.chaId,
+                    suggestedName: `${char.name || 'character'}.charx`,
+                    projectCharacter: (leasedDetail) => {
+                        const leasedCharacter = {
+                            ...safeStructuredClone(leasedDetail),
+                            chats: [],
+                        } as character
+                        const card = createBaseV3(leasedCharacter)
+                        const module:RisuModule = {
+                            name: `${leasedCharacter.name} Module`,
+                            description: `Module for ${leasedCharacter.name}`,
+                            id: v4(),
+                            trigger: card.data.extensions.risuai.triggerscript ?? [],
+                            regex: card.data.extensions.risuai.customScripts ?? [],
+                            lorebook: leasedCharacter.globalLore ?? [],
+                        }
+                        delete card.data.extensions.risuai.triggerscript
+                        delete card.data.extensions.risuai.customScripts
+                        return {
+                            card: card as unknown as Record<string, unknown>,
+                            module: module as unknown as Record<string, unknown>,
+                        }
+                    },
+                })
+                if(nativeResult !== undefined){
+                    if(nativeResult) alertNormal(language.successExport)
+                    return ''
+                }
             }
-            delete card.data.extensions.risuai.triggerscript
-            delete card.data.extensions.risuai.customScripts
-            const nativeResult = await exportNativeCharacterCharxFromPicker({
-                characterId: char.chaId,
-                suggestedName: `${char.name || 'character'}.charx`,
-                card: card as unknown as Record<string, unknown>,
-                module: module as unknown as Record<string, unknown>,
-            })
-            if(nativeResult !== undefined){
-                if(nativeResult) alertNormal(language.successExport)
+            catch(error){
+                alertError(error)
                 return ''
             }
         }

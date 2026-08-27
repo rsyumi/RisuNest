@@ -1,6 +1,9 @@
 import { save } from '@tauri-apps/plugin-dialog'
 
 import { isTauriDesktop } from '../platform'
+import type { CharacterDetail, DataRevision } from './persistentDataStore'
+import { getPersistentDataStore } from './persistentDataStoreFactory'
+import { assertPinnedRevision, withPersistentRevisionLease } from './persistentRecordIterator'
 import {
     runNativeCharacterCharxExport,
     type NativeCharacterCharxExportInput,
@@ -12,8 +15,10 @@ import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 interface NativeCharacterCharxPickerInput {
     characterId: string
     suggestedName: string
-    card: Record<string, unknown>
-    module: Record<string, unknown>
+    projectCharacter(character: CharacterDetail): {
+        card: Record<string, unknown>
+        module: Record<string, unknown>
+    }
 }
 
 interface NativeCharacterCharxExportRuntime {
@@ -25,8 +30,8 @@ interface NativeCharacterCharxExportRouteDependencies {
     isDesktop(): boolean
     chooseDestination(suggestedName: string): Promise<string | null>
     runtime(): NativeCharacterCharxExportRuntime
+    readCharacter(characterId: string, revision: DataRevision): Promise<CharacterDetail>
     runExport(
-        runtime: NativeCharacterCharxExportRuntime,
         input: NativeCharacterCharxExportInput,
         options?: NativeFileJobOptions,
     ): Promise<NativeFileJobResult>
@@ -39,6 +44,15 @@ const productionDependencies: NativeCharacterCharxExportRouteDependencies = {
         filters: [{ name: 'CharX', extensions: ['charx'] }],
     }),
     runtime: getPersistentDataRuntime,
+    readCharacter: async (characterId, revision) => {
+        const lease = await getPersistentDataStore().acquireRevision(revision)
+        return withPersistentRevisionLease(lease, async (reader) => {
+            const found = await reader.readCharacter(characterId)
+            if (!found) throw new Error(`Character ${characterId} is missing from revision ${revision}`)
+            assertPinnedRevision(revision, found.revision, `Character ${characterId}`)
+            return found.value
+        })
+    },
     runExport: runNativeCharacterCharxExport,
 }
 
@@ -50,13 +64,19 @@ export async function exportNativeCharacterCharxFromPicker(
     if (!dependencies.isDesktop()) return undefined
     const destination = await dependencies.chooseDestination(input.suggestedName)
     if (!destination) return null
+    const runtime = dependencies.runtime()
+    await runtime.flushPendingData('native-character-charx-export')
+    if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
+    const expectedRevision = runtime.revision
+    const character = await dependencies.readCharacter(input.characterId, expectedRevision)
+    const projected = input.projectCharacter(character)
     return dependencies.runExport(
-        dependencies.runtime(),
         {
             characterId: input.characterId,
             destination,
-            card: input.card,
-            module: input.module,
+            expectedRevision,
+            card: projected.card,
+            module: projected.module,
         },
         options,
     )

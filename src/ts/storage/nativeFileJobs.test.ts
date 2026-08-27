@@ -105,14 +105,9 @@ describe('native file jobs', () => {
 
         const result = await runNativeCharacterCharxExport(
             {
-                revision: 31,
-                flushPendingData: async (reason) => {
-                    calls.push([`flush:${reason}`, undefined])
-                },
-            },
-            {
                 characterId: 'character-id',
                 destination: 'C:\\chosen\\Leased.charx',
+                expectedRevision: 31,
                 card,
                 module,
             },
@@ -132,7 +127,6 @@ describe('native file jobs', () => {
 
         expect(result).toEqual(terminal.result)
         expect(calls).toEqual([
-            ['flush:native-character-charx-export', undefined],
             ['native_file_job_start', {
                 request: {
                     kind: 'export-character-charx',

@@ -9,28 +9,42 @@ vi.mock('./persistentDataRuntime.svelte', () => ({
 import { exportNativeCharacterCharxFromPicker } from './nativeCharacterCharxExportRoute'
 
 describe('native character CharX export route', () => {
-    it('publishes a desktop CharX for the exact current character metadata', async () => {
+    it('projects metadata from the exact leased revision after destination selection', async () => {
         const calls: unknown[] = []
-        const card = { spec: 'chara_card_v3', data: { name: 'Current' } }
-        const module = { name: 'Current Module', id: 'module-id' }
+        const capturedBeforePicker = { name: 'Before picker', desc: 'old description' }
+        const leasedCharacter = { name: 'After picker', desc: 'new description' }
+        let persistentCharacter = capturedBeforePicker
 
         const result = await exportNativeCharacterCharxFromPicker(
             {
                 characterId: 'current-character',
                 suggestedName: 'Current.charx',
-                card,
-                module,
+                projectCharacter: (character) => {
+                    calls.push(['project', character])
+                    return {
+                        card: { spec: 'chara_card_v3', data: { ...character } },
+                        module: { name: `${character.name} Module`, id: 'module-id' },
+                    }
+                },
             },
             {},
             {
                 isDesktop: () => true,
                 chooseDestination: async (name) => {
                     calls.push(['pick', name])
+                    persistentCharacter = leasedCharacter
                     return 'C:\\chosen\\Current.charx'
                 },
-                runtime: () => ({ revision: 9, flushPendingData: async () => undefined }),
-                runExport: async (runtime, input) => {
-                    calls.push(['export', runtime.revision, input])
+                runtime: () => ({
+                    revision: 9,
+                    flushPendingData: async (reason) => { calls.push(['flush', reason]) },
+                }),
+                readCharacter: async (characterId, revision) => {
+                    calls.push(['read', characterId, revision])
+                    return persistentCharacter as never
+                },
+                runExport: async (input) => {
+                    calls.push(['export', input])
                     return {
                         revision: 9,
                         sourceBytes: 1024,
@@ -46,11 +60,15 @@ describe('native character CharX export route', () => {
         expect(result?.characterCount).toBe(1)
         expect(calls).toEqual([
             ['pick', 'Current.charx'],
-            ['export', 9, {
+            ['flush', 'native-character-charx-export'],
+            ['read', 'current-character', 9],
+            ['project', leasedCharacter],
+            ['export', {
                 characterId: 'current-character',
                 destination: 'C:\\chosen\\Current.charx',
-                card,
-                module,
+                expectedRevision: 9,
+                card: { spec: 'chara_card_v3', data: { ...leasedCharacter } },
+                module: { name: 'After picker Module', id: 'module-id' },
             }],
         ])
     })
@@ -62,14 +80,17 @@ describe('native character CharX export route', () => {
         const input = {
             characterId: 'current-character',
             suggestedName: 'Current.charx',
-            card: { spec: 'chara_card_v3' },
-            module: {},
+            projectCharacter: () => ({
+                card: { spec: 'chara_card_v3' },
+                module: {},
+            }),
         }
 
         await expect(exportNativeCharacterCharxFromPicker(input, {}, {
             isDesktop: () => false,
             chooseDestination: async () => 'unused',
             runtime: () => ({ revision: 1, flushPendingData: async () => undefined }),
+            readCharacter: async () => { throw new Error('must not read') },
             runExport,
         })).resolves.toBeUndefined()
 
@@ -77,6 +98,7 @@ describe('native character CharX export route', () => {
             isDesktop: () => true,
             chooseDestination: async () => null,
             runtime: () => ({ revision: 1, flushPendingData: async () => undefined }),
+            readCharacter: async () => { throw new Error('must not read') },
             runExport,
         })).resolves.toBeNull()
     })

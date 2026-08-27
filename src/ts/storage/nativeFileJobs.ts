@@ -223,6 +223,7 @@ export interface NativeFileExportJobOptions extends NativeFileJobOptions {
 export interface NativeCharacterCharxExportInput {
     characterId: string
     destination: string
+    expectedRevision: number
     card: Record<string, unknown>
     module: Record<string, unknown>
 }
@@ -912,10 +913,6 @@ export function runNativeBlockRisuSaveExport(
 }
 
 export async function runNativeCharacterCharxExport(
-    runtime: {
-        readonly revision: number
-        flushPendingData(reason: string): Promise<void>
-    },
     input: NativeCharacterCharxExportInput,
     options: NativeFileJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
@@ -924,14 +921,11 @@ export async function runNativeCharacterCharxExport(
         throw new Error('Native character CharX export requires Tauri')
     }
     if (options.signal?.aborted) throw abortError()
-
-    await runtime.flushPendingData('native-character-charx-export')
-    if (options.signal?.aborted) throw abortError()
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind: 'export-character-charx',
             destination: input.destination,
-            expectedRevision: runtime.revision,
+            expectedRevision: input.expectedRevision,
             characterId: input.characterId,
             card: input.card,
             module: input.module,
