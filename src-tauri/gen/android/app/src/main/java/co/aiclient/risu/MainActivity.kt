@@ -46,6 +46,7 @@ private const val EXIT_FLUSH_TIMEOUT_MILLIS = 1_500L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
 private const val SAF_BRIDGE_NAME = "RisuSafBridge"
+private const val PEER_CLONE_BRIDGE_NAME = "RisuPeerCloneBridge"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
@@ -387,6 +388,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       removeJavascriptBridge = {
         webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME)
         webView.removeJavascriptInterface(SAF_BRIDGE_NAME)
+        webView.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
       },
       destroyView = webView::destroy,
       clearReference = {
@@ -403,6 +405,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     super.onWebViewCreate(webView)
     lifecycleWebView = webView
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
+    webView.addJavascriptInterface(PeerCloneBridge(), PEER_CLONE_BRIDGE_NAME)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       deliveredSpoolTokens.clear()
       webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
@@ -459,7 +462,17 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     )
   }
 
+  override fun onStart() {
+    super.onStart()
+    updateForegroundPeerCloneLifecycle(currentPeerCloneTransferMode(), foreground = true) {
+      runCatching { PeerCloneNativeBridge.setForegroundAllowed(it) }
+    }
+  }
+
   override fun onStop() {
+    updateForegroundPeerCloneLifecycle(currentPeerCloneTransferMode(), foreground = false) {
+      runCatching { PeerCloneNativeBridge.setForegroundAllowed(it) }
+    }
     lifecycleFlushDispatcher.onStop()
     super.onStop()
   }
@@ -489,6 +502,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safDestinationCancellations.clear()
     safProgressDispatchMillis.clear()
     lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
+    lifecycleWebView?.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
     super.onDestroy()
   }
 
@@ -549,6 +563,25 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       mainHandler.post { coldRestartDispatcher.restart() }
     }
   }
+
+  private inner class PeerCloneBridge {
+    @JavascriptInterface
+    fun transferMode(): String = peerCloneTransferModeWire(currentPeerCloneTransferMode())
+
+    @JavascriptInterface
+    fun schedule(jobId: String): String = peerCloneScheduleResultWire(
+      PeerCloneTransferScheduler.schedule(this@MainActivity, jobId),
+    )
+
+    @JavascriptInterface
+    fun cancel(jobId: String): Boolean =
+      PeerCloneTransferScheduler.cancel(this@MainActivity, jobId)
+  }
+
+  private fun currentPeerCloneTransferMode() = peerCloneTransferMode(
+    experimentalEnabled = BuildConfig.ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT,
+    sdkInt = Build.VERSION.SDK_INT,
+  )
 
   private inner class SafBridge {
     @JavascriptInterface

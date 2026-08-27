@@ -9,10 +9,10 @@ class PeerCloneTransferTest {
   private val jobId = "11111111-1111-4111-8111-111111111111"
 
   @Test
-  fun `peer clone stays disabled until physical Android lifecycle validation`() {
-    assertEquals(false, BuildConfig.ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT)
+  fun `peer clone client is enabled while background work remains API 34 only`() {
+    assertEquals(true, BuildConfig.ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT)
     assertEquals(
-      PeerCloneTransferMode.DISABLED,
+      PeerCloneTransferMode.USER_INITIATED_DATA_TRANSFER,
       peerCloneTransferMode(
         experimentalEnabled = BuildConfig.ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT,
         sdkInt = 34,
@@ -21,15 +21,33 @@ class PeerCloneTransferTest {
   }
 
   @Test
-  fun `Android 13 remains unsupported without a foreground service fallback`() {
+  fun `Android 13 uses the foreground native route without enabling background work`() {
     assertEquals(
-      PeerCloneTransferMode.UNSUPPORTED_ANDROID_VERSION,
+      PeerCloneTransferMode.FOREGROUND,
       peerCloneTransferMode(experimentalEnabled = true, sdkInt = 33),
     )
     assertEquals(
       PeerCloneTransferMode.USER_INITIATED_DATA_TRANSFER,
       peerCloneTransferMode(experimentalEnabled = true, sdkInt = 34),
     )
+    assertEquals(
+      PeerCloneTransferMode.DISABLED,
+      peerCloneTransferMode(experimentalEnabled = false, sdkInt = 34),
+    )
+  }
+
+  @Test
+  fun `Javascript bridge exposes only the bounded transfer contract`() {
+    assertEquals("foreground", peerCloneTransferModeWire(PeerCloneTransferMode.FOREGROUND))
+    assertEquals(
+      "uidt",
+      peerCloneTransferModeWire(PeerCloneTransferMode.USER_INITIATED_DATA_TRANSFER),
+    )
+    assertEquals("disabled", peerCloneTransferModeWire(PeerCloneTransferMode.DISABLED))
+    assertEquals("scheduled", peerCloneScheduleResultWire(PeerCloneScheduleResult.SCHEDULED))
+    assertEquals("disabled", peerCloneScheduleResultWire(PeerCloneScheduleResult.DISABLED))
+    assertEquals("rejected", peerCloneScheduleResultWire(PeerCloneScheduleResult.INVALID_JOB_ID))
+    assertEquals("rejected", peerCloneScheduleResultWire(PeerCloneScheduleResult.REJECTED))
   }
 
   @Test
@@ -65,11 +83,11 @@ class PeerCloneTransferTest {
   }
 
   @Test
-  fun `user and app cancellation clean native state and never reschedule`() {
+  fun `job callback cancellation marks native state without blocking on cleanup`() {
     listOf(PeerCloneStopCause.USER, PeerCloneStopCause.APP_CANCELLED).forEach { cause ->
       assertEquals(
         PeerCloneStopDecision(
-          nativeAction = PeerCloneNativeStopAction.CANCEL_AND_CLEANUP,
+          nativeAction = PeerCloneNativeStopAction.REQUEST_CANCEL_RETAIN_STATE,
           shouldReschedule = false,
         ),
         peerCloneStopDecision(cause),
@@ -78,10 +96,11 @@ class PeerCloneTransferTest {
   }
 
   @Test
-  fun `explicit cancel retains scheduler ownership until native cleanup completes`() {
+  fun `explicit cancel stops scheduler before native cleanup`() {
     val operations = mutableListOf<String>()
 
     val cancelled = cancelPeerCloneTransfer(
+      cancelScheduledJob = { operations.add("scheduler-cancel") },
       cancelAndCleanupNative = {
         operations.add("native-cleanup")
         true
@@ -89,14 +108,15 @@ class PeerCloneTransferTest {
     )
 
     assertTrue(cancelled)
-    assertEquals(listOf("native-cleanup"), operations)
+    assertEquals(listOf("scheduler-cancel", "native-cleanup"), operations)
   }
 
   @Test
-  fun `failed native cleanup retains scheduler ownership for a later retry`() {
+  fun `failed native cleanup reports failure after scheduler cancellation`() {
     val operations = mutableListOf<String>()
 
     val cancelled = cancelPeerCloneTransfer(
+      cancelScheduledJob = { operations.add("scheduler-cancel") },
       cancelAndCleanupNative = {
         operations.add("native-cleanup")
         false
@@ -104,7 +124,7 @@ class PeerCloneTransferTest {
     )
 
     assertFalse(cancelled)
-    assertEquals(listOf("native-cleanup"), operations)
+    assertEquals(listOf("scheduler-cancel", "native-cleanup"), operations)
   }
 
   @Test
@@ -155,6 +175,47 @@ class PeerCloneTransferTest {
     assertTrue(
       peerCloneCompletionDecision(PeerCloneNativeResult.RETRYABLE_INTERRUPTION)
         .shouldReschedule,
+    )
+  }
+
+  @Test
+  fun `terminal transfer failure retains bounded native status for explicit cleanup`() {
+    assertEquals(
+      PeerCloneCompletionDecision(
+        retainNativeState = true,
+        shouldReschedule = false,
+      ),
+      peerCloneCompletionDecision(PeerCloneNativeResult.TERMINAL_FAILURE),
+    )
+  }
+
+  @Test
+  fun `native resume exception is terminal and never requests UIDT rescheduling`() {
+    val result = peerCloneNativeResult { error("JNI unavailable") }
+
+    assertEquals(PeerCloneNativeResult.TERMINAL_FAILURE, result)
+    assertFalse(peerCloneCompletionDecision(result).shouldReschedule)
+  }
+
+  @Test
+  fun `activity lifecycle changes native admission only for foreground clone work`() {
+    val transitions = mutableListOf<Pair<PeerCloneTransferMode, Boolean>>()
+
+    PeerCloneTransferMode.entries.forEach { mode ->
+      updateForegroundPeerCloneLifecycle(mode, foreground = true) {
+        transitions.add(mode to it)
+      }
+      updateForegroundPeerCloneLifecycle(mode, foreground = false) {
+        transitions.add(mode to it)
+      }
+    }
+
+    assertEquals(
+      listOf(
+        PeerCloneTransferMode.FOREGROUND to true,
+        PeerCloneTransferMode.FOREGROUND to false,
+      ),
+      transitions,
     )
   }
 }

@@ -31,7 +31,7 @@ private const val PEER_CLONE_CANCEL_ACTION = "co.aiclient.risu.CANCEL_PEER_CLONE
 
 internal enum class PeerCloneTransferMode {
   DISABLED,
-  UNSUPPORTED_ANDROID_VERSION,
+  FOREGROUND,
   USER_INITIATED_DATA_TRANSFER,
 }
 
@@ -40,8 +40,14 @@ internal fun peerCloneTransferMode(
   sdkInt: Int,
 ): PeerCloneTransferMode = when {
   !experimentalEnabled -> PeerCloneTransferMode.DISABLED
-  sdkInt < 34 -> PeerCloneTransferMode.UNSUPPORTED_ANDROID_VERSION
+  sdkInt < 34 -> PeerCloneTransferMode.FOREGROUND
   else -> PeerCloneTransferMode.USER_INITIATED_DATA_TRANSFER
+}
+
+internal fun peerCloneTransferModeWire(mode: PeerCloneTransferMode): String = when (mode) {
+  PeerCloneTransferMode.DISABLED -> "disabled"
+  PeerCloneTransferMode.FOREGROUND -> "foreground"
+  PeerCloneTransferMode.USER_INITIATED_DATA_TRANSFER -> "uidt"
 }
 
 internal fun peerClonePersistedExtras(jobId: String): Map<String, String> =
@@ -56,8 +62,20 @@ internal inline fun startPeerCloneTransfer(
 }
 
 internal inline fun cancelPeerCloneTransfer(
+  cancelScheduledJob: () -> Unit,
   cancelAndCleanupNative: () -> Boolean,
-): Boolean = cancelAndCleanupNative()
+): Boolean {
+  cancelScheduledJob()
+  return cancelAndCleanupNative()
+}
+
+internal inline fun updateForegroundPeerCloneLifecycle(
+  mode: PeerCloneTransferMode,
+  foreground: Boolean,
+  updateNativeAdmission: (Boolean) -> Unit,
+) {
+  if (mode == PeerCloneTransferMode.FOREGROUND) updateNativeAdmission(foreground)
+}
 
 internal fun interface PeerCloneNativeProgress {
   fun onProgress(transferredBytes: Long)
@@ -91,7 +109,7 @@ internal enum class PeerCloneStopCause {
 
 internal enum class PeerCloneNativeStopAction {
   PAUSE_RETAIN_STATE,
-  CANCEL_AND_CLEANUP,
+  REQUEST_CANCEL_RETAIN_STATE,
 }
 
 internal data class PeerCloneStopDecision(
@@ -107,7 +125,7 @@ internal fun peerCloneStopDecision(cause: PeerCloneStopCause) = when (cause) {
   PeerCloneStopCause.USER,
   PeerCloneStopCause.APP_CANCELLED,
   -> PeerCloneStopDecision(
-    nativeAction = PeerCloneNativeStopAction.CANCEL_AND_CLEANUP,
+    nativeAction = PeerCloneNativeStopAction.REQUEST_CANCEL_RETAIN_STATE,
     shouldReschedule = false,
   )
 }
@@ -142,12 +160,20 @@ internal fun peerCloneCompletionDecision(result: PeerCloneNativeResult) = when (
   )
   PeerCloneNativeResult.COMPLETED_ACTIVATED,
   PeerCloneNativeResult.CANCELLED,
-  PeerCloneNativeResult.TERMINAL_FAILURE,
   -> PeerCloneCompletionDecision(
     retainNativeState = false,
     shouldReschedule = false,
   )
+  PeerCloneNativeResult.TERMINAL_FAILURE -> PeerCloneCompletionDecision(
+    retainNativeState = true,
+    shouldReschedule = false,
+  )
 }
+
+internal inline fun peerCloneNativeResult(
+  resume: () -> Int,
+): PeerCloneNativeResult = runCatching { PeerCloneNativeResult.fromWireCode(resume()) }
+  .getOrDefault(PeerCloneNativeResult.TERMINAL_FAILURE)
 
 internal object PeerCloneNativeBridge {
   init {
@@ -156,12 +182,14 @@ internal object PeerCloneNativeBridge {
 
   @JvmStatic external fun resume(
     jobId: String,
-    filesRoot: String,
+    appDataRoot: String,
     progress: PeerCloneNativeProgress,
   ): Int
   @JvmStatic external fun pause(jobId: String): Boolean
-  @JvmStatic external fun cancelAndCleanup(jobId: String, filesRoot: String): Boolean
-  @JvmStatic external fun cleanupCompleted(jobId: String, filesRoot: String): Boolean
+  @JvmStatic external fun setForegroundAllowed(allowed: Boolean): Boolean
+  @JvmStatic external fun requestCancel(jobId: String, appDataRoot: String): Boolean
+  @JvmStatic external fun cancelAndCleanup(jobId: String, appDataRoot: String): Boolean
+  @JvmStatic external fun cleanupCompleted(jobId: String, appDataRoot: String): Boolean
 }
 
 internal enum class PeerCloneScheduleResult {
@@ -172,8 +200,17 @@ internal enum class PeerCloneScheduleResult {
   REJECTED,
 }
 
+internal fun peerCloneScheduleResultWire(result: PeerCloneScheduleResult): String = when (result) {
+  PeerCloneScheduleResult.SCHEDULED -> "scheduled"
+  PeerCloneScheduleResult.DISABLED -> "disabled"
+  PeerCloneScheduleResult.UNSUPPORTED_ANDROID_VERSION,
+  PeerCloneScheduleResult.INVALID_JOB_ID,
+  PeerCloneScheduleResult.REJECTED,
+  -> "rejected"
+}
+
 internal object PeerCloneTransferScheduler {
-  fun schedule(context: Context, jobId: String, expectedDownloadBytes: Long?): PeerCloneScheduleResult {
+  fun schedule(context: Context, jobId: String): PeerCloneScheduleResult {
     if (!isCanonicalUuidV4(jobId)) return PeerCloneScheduleResult.INVALID_JOB_ID
     return when (
       peerCloneTransferMode(
@@ -182,10 +219,10 @@ internal object PeerCloneTransferScheduler {
       )
     ) {
       PeerCloneTransferMode.DISABLED -> PeerCloneScheduleResult.DISABLED
-      PeerCloneTransferMode.UNSUPPORTED_ANDROID_VERSION ->
+      PeerCloneTransferMode.FOREGROUND ->
         PeerCloneScheduleResult.UNSUPPORTED_ANDROID_VERSION
       PeerCloneTransferMode.USER_INITIATED_DATA_TRANSFER ->
-        scheduleApi34(context, jobId, expectedDownloadBytes)
+        scheduleApi34(context, jobId)
     }
   }
 
@@ -194,8 +231,11 @@ internal object PeerCloneTransferScheduler {
       return false
     }
     return cancelPeerCloneTransfer(
+      cancelScheduledJob = {
+        context.getSystemService(JobScheduler::class.java).cancel(peerCloneSchedulerId(jobId))
+      },
       cancelAndCleanupNative = {
-        runCatching { PeerCloneNativeBridge.cancelAndCleanup(jobId, context.filesDir.absolutePath) }
+        runCatching { PeerCloneNativeBridge.cancelAndCleanup(jobId, context.dataDir.absolutePath) }
           .getOrDefault(false)
       },
     )
@@ -205,19 +245,16 @@ internal object PeerCloneTransferScheduler {
   private fun scheduleApi34(
     context: Context,
     jobId: String,
-    expectedDownloadBytes: Long?,
   ): PeerCloneScheduleResult {
     val extras = PersistableBundle().apply {
       peerClonePersistedExtras(jobId).forEach(::putString)
     }
-    val downloadBytes = expectedDownloadBytes?.takeIf { it >= 0 }
-      ?: JobInfo.NETWORK_BYTES_UNKNOWN.toLong()
     val info = JobInfo.Builder(
       peerCloneSchedulerId(jobId),
       ComponentName(context, PeerCloneTransferJobService::class.java),
     )
       .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-      .setEstimatedNetworkBytes(downloadBytes, 0L)
+      .setEstimatedNetworkBytes(JobInfo.NETWORK_BYTES_UNKNOWN.toLong(), 0L)
       .setExtras(extras)
       .setUserInitiated(true)
       .build()
@@ -251,10 +288,10 @@ class PeerCloneTransferJobService : JobService() {
       launchNativeTransfer = {
         transferScope.launch {
           val notificationProgress = PeerCloneNotificationProgress()
-          val result = runCatching {
+          val result = peerCloneNativeResult {
             runPeerCloneNativeTransfer(
               resume = { progress ->
-                PeerCloneNativeBridge.resume(jobId, filesDir.absolutePath, progress)
+                PeerCloneNativeBridge.resume(jobId, dataDir.absolutePath, progress)
               },
               updateNotification = { transferredBytes ->
                 if (
@@ -266,14 +303,10 @@ class PeerCloneTransferJobService : JobService() {
               },
             )
           }
-            .fold(
-              onSuccess = PeerCloneNativeResult::fromWireCode,
-              onFailure = { PeerCloneNativeResult.RETRYABLE_INTERRUPTION },
-            )
           val decision = peerCloneCompletionDecision(result)
           if (activeJobs.remove(params.jobId, jobId)) {
             if (!decision.retainNativeState) {
-              runCatching { PeerCloneNativeBridge.cleanupCompleted(jobId, filesDir.absolutePath) }
+              runCatching { PeerCloneNativeBridge.cleanupCompleted(jobId, dataDir.absolutePath) }
             }
             jobFinished(params, decision.shouldReschedule)
           }
@@ -291,8 +324,8 @@ class PeerCloneTransferJobService : JobService() {
     when (decision.nativeAction) {
       PeerCloneNativeStopAction.PAUSE_RETAIN_STATE ->
         runCatching { PeerCloneNativeBridge.pause(jobId) }
-      PeerCloneNativeStopAction.CANCEL_AND_CLEANUP ->
-        runCatching { PeerCloneNativeBridge.cancelAndCleanup(jobId, filesDir.absolutePath) }
+      PeerCloneNativeStopAction.REQUEST_CANCEL_RETAIN_STATE ->
+        runCatching { PeerCloneNativeBridge.requestCancel(jobId, dataDir.absolutePath) }
     }
     return decision.shouldReschedule
   }

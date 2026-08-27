@@ -19,7 +19,7 @@ val enableExperimentalSafFileJobs = providers
 val enableExperimentalPeerCloneClient = providers
     .gradleProperty("risuEnableExperimentalPeerCloneClient")
     .map { it.equals("true", ignoreCase = true) }
-    .orElse(false)
+    .orElse(true)
 
 android {
     compileSdk = 36
