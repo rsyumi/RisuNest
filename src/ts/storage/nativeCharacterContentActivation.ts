@@ -106,7 +106,7 @@ function preparedAliases(
 async function prepareAdditionalAssetOwnerHead(
     character: character,
     aliases: readonly PersistentCharacterAssetAlias[],
-    prepareManifest: PreparedNativeContentActivationLifecycle['prepareOwnerManifest'],
+    prepareManifest: PreparedNativeContentActivationLifecycle['prepareOwnerManifestAndSeal'],
 ): Promise<PersistentCharacterAssetOwnerHead> {
     const aliasesByKey = new Map(aliases.map((alias) => [alias.key, alias]))
     const additionalAssets = character.additionalAssets ?? []
@@ -167,9 +167,8 @@ export async function activatePreparedNativeCharacterContent(
     const assetOwnerHead = await prepareAdditionalAssetOwnerHead(
         character,
         assetAliases,
-        lifecycle.prepareOwnerManifest,
+        lifecycle.prepareOwnerManifestAndSeal,
     )
-    await lifecycle.sealForActivation()
     await dependencies.upsert(
         character.chaId,
         'native-content-import',

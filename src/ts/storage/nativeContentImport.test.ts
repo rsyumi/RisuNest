@@ -85,9 +85,18 @@ describe('native prepared content import', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('prepares one owner manifest in the existing session, seals, commits, then forgets', async () => {
+    it('finalizes one owner manifest with all asset metadata, commits, then forgets', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const manifestHash = 'cd'.repeat(32)
+        const collisionContent: PreparedNativeContent = {
+            ...preparedContent,
+            assets: [{
+                ...preparedContent.assets[0],
+                objectHash: manifestHash,
+                logicalId: `assets/${manifestHash}.png`,
+                byteSize: 3,
+            }],
+        }
         const receipt = await prepareNativeContentImport(
             { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
             'card.json',
@@ -96,35 +105,32 @@ describe('native prepared content import', () => {
                 calls.push([command, args])
                 if (command === 'native_file_job_start') return { jobId: 'content-1' }
                 if (command === 'native_file_job_status') {
-                    return contentStatus('succeeded', 'complete', preparedContent)
+                    return contentStatus('succeeded', 'complete', collisionContent)
                 }
-                if (command === 'asset_cas_job_prepare') return {
+                if (command === 'asset_cas_job_finalize_content') return {
                     contentHash: manifestHash,
                     byteSize: 3,
                     physicalKey: `assets-v2/objects/cd/${manifestHash.slice(2)}`,
                     deduplicated: false,
                 }
                 if (
-                    command === 'asset_cas_job_seal'
-                    || command === 'asset_cas_job_release'
+                    command === 'asset_cas_job_release'
                     || command === 'native_file_job_forget'
                 ) return null
                 throw new Error(`Unexpected command: ${command}`)
             }),
         )
 
-        await expect(receipt.prepareOwnerManifest(Uint8Array.of(1, 2, 3)))
+        await expect(receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1, 2, 3)))
             .resolves.toMatchObject({ contentHash: manifestHash, byteSize: 3 })
-        await receipt.sealForActivation()
         await receipt.confirmActivated()
 
         expect(calls.slice(2)).toEqual([
-            ['asset_cas_job_prepare', {
+            ['asset_cas_job_finalize_content', {
                 sessionId: 'content-1',
-                data: [1, 2, 3],
-                role: 'owner-manifest',
+                ownerManifest: [1, 2, 3],
+                contentAssets: [{ objectHash: manifestHash, byteSize: 3 }],
             }],
-            ['asset_cas_job_seal', { sessionId: 'content-1' }],
             ['asset_cas_job_release', { sessionId: 'content-1', outcome: 'committed' }],
             ['native_file_job_forget', { jobId: 'content-1' }],
         ])
@@ -188,7 +194,7 @@ describe('native prepared content import', () => {
         ])
     })
 
-    it('retains the journal and native job when the seal response is ambiguous', async () => {
+    it('retains the journal but forgets the native job when the finalizer response is ambiguous', async () => {
         const calls: string[] = []
         const receipt = await prepareNativeContentImport(
             { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
@@ -200,30 +206,148 @@ describe('native prepared content import', () => {
                 if (command === 'native_file_job_status') {
                     return contentStatus('succeeded', 'complete', preparedContent)
                 }
-                if (command === 'asset_cas_job_prepare') return {
-                    contentHash: 'cd'.repeat(32),
-                    byteSize: 1,
-                    physicalKey: `assets-v2/objects/cd/${'cd'.repeat(32).slice(2)}`,
-                    deduplicated: false,
-                }
-                if (command === 'asset_cas_job_seal') throw new Error('response lost')
+                if (command === 'asset_cas_job_finalize_content') throw new Error('response lost')
+                if (command === 'native_file_job_forget') return null
                 throw new Error(`Unexpected command: ${command}`)
             }),
         )
 
-        await receipt.prepareOwnerManifest(Uint8Array.of(1))
-        await expect(receipt.sealForActivation()).rejects.toThrow('response lost')
+        await expect(receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1)))
+            .rejects.toThrow('response lost')
         await receipt.cancel()
 
         expect(calls).toEqual([
             'native_file_job_start',
             'native_file_job_status',
-            'asset_cas_job_prepare',
-            'asset_cas_job_seal',
+            'asset_cas_job_finalize_content',
+            'native_file_job_forget',
         ])
     })
 
-    it('retains the sealed journal when database activation becomes ambiguous', async () => {
+    it('rejects a concurrent finalizer call before sending a second IPC', async () => {
+        const manifestHash = 'cd'.repeat(32)
+        let resolveFinalize!: (value: unknown) => void
+        const pendingFinalize = new Promise((resolve) => {
+            resolveFinalize = resolve
+        })
+        const finalizeCalls: string[] = []
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            {},
+            nativeDependencies(async (command) => {
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', preparedContent)
+                }
+                if (command === 'asset_cas_job_finalize_content') {
+                    finalizeCalls.push(command)
+                    return pendingFinalize
+                }
+                if (command === 'native_file_job_forget') return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        const first = receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1))
+        await expect(receipt.prepareOwnerManifestAndSeal(Uint8Array.of(2)))
+            .rejects.toThrow(/only be finalized once/i)
+        resolveFinalize({
+            contentHash: manifestHash,
+            byteSize: 1,
+            physicalKey: `assets-v2/objects/cd/${manifestHash.slice(2)}`,
+            deduplicated: false,
+        })
+        await first
+        await receipt.cancel()
+
+        expect(finalizeCalls).toEqual(['asset_cas_job_finalize_content'])
+    })
+
+    it('attempts native job forget when committed release fails', async () => {
+        const calls: string[] = []
+        const manifestHash = 'cd'.repeat(32)
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            {},
+            nativeDependencies(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', preparedContent)
+                }
+                if (command === 'asset_cas_job_finalize_content') return {
+                    contentHash: manifestHash,
+                    byteSize: 1,
+                    physicalKey: `assets-v2/objects/cd/${manifestHash.slice(2)}`,
+                    deduplicated: false,
+                }
+                if (command === 'asset_cas_job_release') throw new Error('release response lost')
+                if (command === 'native_file_job_forget') return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        await receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1))
+        await expect(receipt.confirmActivated()).rejects.toThrow('release response lost')
+
+        expect(calls.slice(-2)).toEqual(['asset_cas_job_release', 'native_file_job_forget'])
+    })
+
+    it('does not release a missing CAS journal after a terminal native failure', async () => {
+        const calls: string[] = []
+
+        await expect(prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            {},
+            nativeDependencies(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    const status = contentStatus('failed', 'complete')
+                    status.error = { code: 'bad-card', message: 'bad card' }
+                    return status
+                }
+                if (command === 'native_file_job_forget') return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )).rejects.toThrow('bad card')
+
+        expect(calls).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+    })
+
+    it('forgets validated staging even when pre-finalize abort release fails', async () => {
+        const calls: string[] = []
+
+        await expect(prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            {},
+            nativeDependencies(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', {
+                        ...preparedContent,
+                        casSessionId: 'wrong',
+                    })
+                }
+                if (command === 'asset_cas_job_release') throw new Error('release response lost')
+                if (command === 'native_file_job_forget') return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )).rejects.toThrow(/casSessionId must match/i)
+
+        expect(calls.slice(-2)).toEqual(['asset_cas_job_release', 'native_file_job_forget'])
+    })
+
+    it('retains the finalized journal but forgets the native job when database activation is ambiguous', async () => {
         const calls: string[] = []
         const receipt = await prepareNativeContentImport(
             { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
@@ -235,13 +359,13 @@ describe('native prepared content import', () => {
                 if (command === 'native_file_job_status') {
                     return contentStatus('succeeded', 'complete', preparedContent)
                 }
-                if (command === 'asset_cas_job_prepare') return {
+                if (command === 'asset_cas_job_finalize_content') return {
                     contentHash: 'cd'.repeat(32),
                     byteSize: 1,
                     physicalKey: `assets-v2/objects/cd/${'cd'.repeat(32).slice(2)}`,
                     deduplicated: false,
                 }
-                if (command === 'asset_cas_job_seal') return null
+                if (command === 'native_file_job_forget') return null
                 throw new Error(`Unexpected command: ${command}`)
             }),
         )
@@ -253,8 +377,7 @@ describe('native prepared content import', () => {
                 prepare: vi.fn(async () => receipt),
                 map: vi.fn(async (value) => value),
                 activate: vi.fn(async (_content, lifecycle) => {
-                    await lifecycle.prepareOwnerManifest(Uint8Array.of(1))
-                    await lifecycle.sealForActivation()
+                    await lifecycle.prepareOwnerManifestAndSeal(Uint8Array.of(1))
                     throw new Error('upsert response lost')
                 }),
             },
@@ -263,8 +386,8 @@ describe('native prepared content import', () => {
         expect(calls).toEqual([
             'native_file_job_start',
             'native_file_job_status',
-            'asset_cas_job_prepare',
-            'asset_cas_job_seal',
+            'asset_cas_job_finalize_content',
+            'native_file_job_forget',
         ])
     })
 
@@ -273,8 +396,7 @@ describe('native prepared content import', () => {
             jobId: 'content-1',
             content: preparedContent,
             warningCodes: [],
-            prepareOwnerManifest: vi.fn(),
-            sealForActivation: vi.fn(),
+            prepareOwnerManifestAndSeal: vi.fn(),
             confirmActivated: vi.fn(async () => undefined),
             cancel: vi.fn(async () => undefined),
         }
@@ -388,27 +510,25 @@ describe('native prepared content import', () => {
                 if (command === 'native_file_job_status') {
                     return contentStatus('succeeded', 'complete', preparedContent)
                 }
-                if (command === 'asset_cas_job_prepare') return {
+                if (command === 'asset_cas_job_finalize_content') return {
                     contentHash: 'cd'.repeat(32),
                     byteSize: 1,
                     physicalKey: `assets-v2/objects/cd/${'cd'.repeat(32).slice(2)}`,
                     deduplicated: false,
                 }
-                if (command === 'asset_cas_job_seal' || command === 'asset_cas_job_release') return true
+                if (command === 'asset_cas_job_release') return true
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
             }),
         )
 
         expect(calls).toEqual(['native_file_job_start', 'native_file_job_status'])
-        await receipt.prepareOwnerManifest(Uint8Array.of(1))
-        await receipt.sealForActivation()
+        await receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1))
         await receipt.confirmActivated()
         expect(calls).toEqual([
             'native_file_job_start',
             'native_file_job_status',
-            'asset_cas_job_prepare',
-            'asset_cas_job_seal',
+            'asset_cas_job_finalize_content',
             'asset_cas_job_release',
             'native_file_job_forget',
         ])
@@ -477,7 +597,6 @@ describe('native prepared content import', () => {
             'native_file_job_status',
             'native_file_job_cancel',
             'native_file_job_status',
-            'asset_cas_job_release',
             'native_file_job_forget',
         ])
     })
@@ -618,8 +737,7 @@ describe('native prepared content import', () => {
             jobId: 'content-1',
             content: preparedContent,
             warningCodes: [],
-            prepareOwnerManifest: vi.fn(),
-            sealForActivation: vi.fn(),
+            prepareOwnerManifestAndSeal: vi.fn(),
             confirmActivated: vi.fn(async () => { events.push('confirmed') }),
             cancel: vi.fn(async () => { events.push('cancelled') }),
         }
@@ -651,8 +769,7 @@ describe('native prepared content import', () => {
             jobId: 'content-1',
             content: preparedContent,
             warningCodes: [],
-            prepareOwnerManifest: vi.fn(),
-            sealForActivation: vi.fn(),
+            prepareOwnerManifestAndSeal: vi.fn(),
             confirmActivated: vi.fn(async () => { throw new Error('forget failed') }),
             cancel: vi.fn(async () => undefined),
         }
@@ -677,8 +794,7 @@ describe('native prepared content import', () => {
             jobId: 'content-1',
             content: preparedContent,
             warningCodes: [],
-            prepareOwnerManifest: vi.fn(),
-            sealForActivation: vi.fn(),
+            prepareOwnerManifestAndSeal: vi.fn(),
             confirmActivated: vi.fn(async () => { throw new Error('forget failed') }),
             cancel: vi.fn(async () => undefined),
         }
@@ -702,8 +818,7 @@ describe('native prepared content import', () => {
             jobId: 'content-1',
             content: preparedContent,
             warningCodes: [],
-            prepareOwnerManifest: vi.fn(),
-            sealForActivation: vi.fn(),
+            prepareOwnerManifestAndSeal: vi.fn(),
             confirmActivated: vi.fn(async () => undefined),
             cancel: vi.fn(async () => undefined),
         }

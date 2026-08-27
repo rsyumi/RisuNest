@@ -3,9 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../platform'
 import type { PreparedNativeCharacterCardModule } from '../characterCards'
 import {
-    prepareCasObject,
+    finalizeContentCasJob,
     releaseCasJob,
-    sealCasJob,
 } from './nativeAssetRepository'
 import type { PreparedImmutablePayload } from './payloadCas'
 import {
@@ -116,8 +115,7 @@ export interface NativeFileJobOptions {
 }
 
 export interface PreparedNativeContentActivationLifecycle {
-    prepareOwnerManifest(bytes: Uint8Array): Promise<PreparedImmutablePayload>
-    sealForActivation(): Promise<void>
+    prepareOwnerManifestAndSeal(bytes: Uint8Array): Promise<PreparedImmutablePayload>
 }
 
 export interface PreparedNativeContentReceipt extends PreparedNativeContentActivationLifecycle {
@@ -796,14 +794,29 @@ export async function prepareNativeContentImport(
         }
         catch {}
     }
+    const releaseAndForget = async (outcome: 'committed' | 'aborted'): Promise<void> => {
+        let releaseError: unknown
+        try {
+            await releaseCasJob(started.jobId, outcome, dependencies.invoke)
+        }
+        catch (error) {
+            releaseError = error
+        }
+        let forgetError: unknown
+        try {
+            await forget()
+        }
+        catch (error) {
+            forgetError = error
+        }
+        if (releaseError) throw releaseError
+        if (forgetError) throw forgetError
+    }
     const abortAndForgetBestEffort = async (): Promise<void> => {
         try {
-            await releaseCasJob(started.jobId, 'aborted', dependencies.invoke)
+            await releaseAndForget('aborted')
         }
-        catch {
-            return
-        }
-        await forgetBestEffort()
+        catch {}
     }
     const cancelAndDrain = async (reportStatus = true): Promise<void> => {
         if (!cancellationRequested) {
@@ -818,7 +831,7 @@ export async function prepareNativeContentImport(
             if (isTerminalJob(status)) break
             await dependencies.wait(options.pollIntervalMs ?? 100)
         }
-        await abortAndForgetBestEffort()
+        await forgetBestEffort()
     }
 
     let lastStatus: NativeFileJobStatus | undefined
@@ -836,7 +849,8 @@ export async function prepareNativeContentImport(
             lastStatus = status
             options.onStatus?.(status)
             if (options.signal?.aborted) {
-                if (isTerminalJob(status)) await abortAndForgetBestEffort()
+                if (status.state === 'succeeded') await abortAndForgetBestEffort()
+                else if (isTerminalJob(status)) await forgetBestEffort()
                 else await cancelAndDrain()
                 cleanupAttempted = true
                 throw abortError()
@@ -846,7 +860,7 @@ export async function prepareNativeContentImport(
                 continue
             }
             if (status.state === 'cancelled') {
-                await abortAndForgetBestEffort()
+                await forgetBestEffort()
                 cleanupAttempted = true
                 throw abortError()
             }
@@ -855,52 +869,41 @@ export async function prepareNativeContentImport(
                     status.error?.code ?? 'content-prepare-failed',
                     status.error?.message ?? 'Native content preparation failed',
                 )
-                await abortAndForgetBestEffort()
+                await forgetBestEffort()
                 cleanupAttempted = true
                 throw error
             }
 
             const content = validatePreparedContent(status.preparedContent, started.jobId)
-            let lifecycleState: 'unsealed' | 'sealing' | 'sealed' | 'releasing' | 'released' = 'unsealed'
-            let ownerManifestPrepared = false
-            const prepareOwnerManifest = async (bytes: Uint8Array): Promise<PreparedImmutablePayload> => {
-                if (lifecycleState !== 'unsealed' || ownerManifestPrepared) {
-                    throw new Error('Native content owner manifest can only be prepared once before sealing')
+            let lifecycleState: 'unfinalized' | 'finalizing' | 'finalized' | 'settled' = 'unfinalized'
+            const prepareOwnerManifestAndSeal = async (bytes: Uint8Array): Promise<PreparedImmutablePayload> => {
+                if (lifecycleState !== 'unfinalized') {
+                    throw new Error('Native content can only be finalized once')
                 }
-                const prepared = await prepareCasObject(
+                lifecycleState = 'finalizing'
+                const prepared = await finalizeContentCasJob(
                     started.jobId,
                     bytes,
-                    'owner-manifest',
+                    content.assets.map(({ objectHash, byteSize }) => ({ objectHash, byteSize })),
                     dependencies.invoke,
                 )
-                ownerManifestPrepared = true
+                lifecycleState = 'finalized'
                 return prepared
             }
-            const sealForActivation = async (): Promise<void> => {
-                if (lifecycleState !== 'unsealed' || !ownerManifestPrepared) {
-                    throw new Error('Native content must prepare one owner manifest before sealing')
-                }
-                lifecycleState = 'sealing'
-                await sealCasJob(started.jobId, dependencies.invoke)
-                lifecycleState = 'sealed'
-            }
             const confirmActivated = async (): Promise<void> => {
-                if (lifecycleState === 'released') return
-                if (lifecycleState !== 'sealed') {
-                    throw new Error('Native content activation cannot be confirmed before sealing')
+                if (lifecycleState === 'settled') return
+                if (lifecycleState !== 'finalized') {
+                    throw new Error('Native content activation cannot be confirmed before finalizing')
                 }
-                lifecycleState = 'releasing'
-                await releaseCasJob(started.jobId, 'committed', dependencies.invoke)
-                lifecycleState = 'released'
-                await forget()
+                lifecycleState = 'settled'
+                await releaseAndForget('committed')
             }
             const cancel = async (): Promise<void> => {
-                if (lifecycleState === 'released') return
-                if (lifecycleState !== 'unsealed') return
-                lifecycleState = 'releasing'
-                await releaseCasJob(started.jobId, 'aborted', dependencies.invoke)
-                lifecycleState = 'released'
-                await forget()
+                if (lifecycleState === 'settled') return
+                const shouldAbort = lifecycleState === 'unfinalized'
+                lifecycleState = 'settled'
+                if (shouldAbort) await releaseAndForget('aborted')
+                else await forget()
             }
             return {
                 jobId: started.jobId,
@@ -909,8 +912,7 @@ export async function prepareNativeContentImport(
                     ...(started.warningCodes ?? []),
                     ...(status.warningCodes ?? []),
                 ])].slice(0, 16),
-                prepareOwnerManifest,
-                sealForActivation,
+                prepareOwnerManifestAndSeal,
                 confirmActivated,
                 cancel,
             }
@@ -918,8 +920,11 @@ export async function prepareNativeContentImport(
     }
     catch (error) {
         if (!cleanupAttempted) {
-            if (lastStatus && isTerminalJob(lastStatus)) {
+            if (lastStatus?.state === 'succeeded') {
                 await abortAndForgetBestEffort()
+            }
+            else if (lastStatus && isTerminalJob(lastStatus)) {
+                await forgetBestEffort()
             }
             else {
                 try {

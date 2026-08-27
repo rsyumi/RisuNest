@@ -95,13 +95,12 @@ function lifecycle(
     overrides: Partial<PreparedNativeContentActivationLifecycle> = {},
 ): PreparedNativeContentActivationLifecycle {
     return {
-        prepareOwnerManifest: vi.fn(async (bytes): Promise<PreparedImmutablePayload> => ({
+        prepareOwnerManifestAndSeal: vi.fn(async (bytes): Promise<PreparedImmutablePayload> => ({
             contentHash: await ownerManifestIdentity(bytes),
             byteSize: bytes.byteLength,
             physicalKey: 'unused-by-activation',
             deduplicated: false,
         })),
-        sealForActivation: vi.fn(async () => undefined),
         ...overrides,
     }
 }
@@ -116,8 +115,8 @@ describe('prepared native character content activation', () => {
             }),
         })
         const session = lifecycle({
-            prepareOwnerManifest: vi.fn(async (bytes) => {
-                events.push('prepare-owner-manifest')
+            prepareOwnerManifestAndSeal: vi.fn(async (bytes) => {
+                events.push('finalize')
                 return {
                     contentHash: await ownerManifestIdentity(bytes),
                     byteSize: bytes.byteLength,
@@ -125,14 +124,11 @@ describe('prepared native character content activation', () => {
                     deduplicated: false,
                 }
             }),
-            sealForActivation: vi.fn(async () => {
-                events.push('seal')
-            }),
         })
 
         await activatePreparedNativeCharacterContent(content, session, deps)
 
-        expect(events).toEqual(['prepare-owner-manifest', 'seal', 'upsert'])
+        expect(events).toEqual(['finalize', 'upsert'])
     })
 
     it('commits ordinary aliases and the exact ordered owner manifest with the character', async () => {
@@ -146,8 +142,8 @@ describe('prepared native character content activation', () => {
             card: content.metadata,
             assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),
         })
-        expect(session.prepareOwnerManifest).toHaveBeenCalledOnce()
-        const manifestBytes = vi.mocked(session.prepareOwnerManifest).mock.calls[0][0]
+        expect(session.prepareOwnerManifestAndSeal).toHaveBeenCalledOnce()
+        const manifestBytes = vi.mocked(session.prepareOwnerManifestAndSeal).mock.calls[0][0]
         expect(decodeOwnerManifest(manifestBytes)).toEqual([
             {
                 tuple: ['config', `assets/${secondHash}.json`, 'json'],
@@ -159,7 +155,6 @@ describe('prepared native character content activation', () => {
             },
         ])
         const expectedManifestHash = await ownerManifestIdentity(manifestBytes)
-        expect(session.sealForActivation).toHaveBeenCalledOnce()
         expect(deps.upsert).toHaveBeenCalledWith(
             'character-1',
             'native-content-import',
@@ -286,8 +281,7 @@ describe('prepared native character content activation', () => {
 
         await expect(activatePreparedNativeCharacterContent(content, session, deps)).resolves.toBeNull()
 
-        expect(session.prepareOwnerManifest).not.toHaveBeenCalled()
-        expect(session.sealForActivation).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
@@ -301,7 +295,7 @@ describe('prepared native character content activation', () => {
         }, session, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
 
         expect(deps.map).not.toHaveBeenCalled()
-        expect(session.prepareOwnerManifest).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
@@ -330,7 +324,7 @@ describe('prepared native character content activation', () => {
 
         await activatePreparedNativeCharacterContent(content, session, deps)
 
-        const manifestBytes = vi.mocked(session.prepareOwnerManifest).mock.calls[0][0]
+        const manifestBytes = vi.mocked(session.prepareOwnerManifestAndSeal).mock.calls[0][0]
         expect(decodeOwnerManifest(manifestBytes)).toEqual([])
         expect(deps.upsert).toHaveBeenCalledWith(
             'character-1',
@@ -354,14 +348,14 @@ describe('prepared native character content activation', () => {
         await expect(activatePreparedNativeCharacterContent(content, session, deps))
             .rejects.toThrow(/missing prepared asset alias/i)
 
-        expect(session.prepareOwnerManifest).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
     it('rejects a manifest CAS identity mismatch before the database commit', async () => {
         const deps = dependencies()
         const session = lifecycle({
-            prepareOwnerManifest: vi.fn(async (bytes) => ({
+            prepareOwnerManifestAndSeal: vi.fn(async (bytes) => ({
                 contentHash: 'ff'.repeat(32),
                 byteSize: bytes.byteLength,
                 physicalKey: 'wrong-object',
@@ -372,7 +366,6 @@ describe('prepared native character content activation', () => {
         await expect(activatePreparedNativeCharacterContent(content, session, deps))
             .rejects.toThrow(/manifest CAS identity mismatch/i)
 
-        expect(session.sealForActivation).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
@@ -387,6 +380,6 @@ describe('prepared native character content activation', () => {
         await expect(activatePreparedNativeCharacterContent(content, session, deps))
             .rejects.toThrow('revision conflict')
 
-        expect(session.sealForActivation).toHaveBeenCalledOnce()
+        expect(session.prepareOwnerManifestAndSeal).toHaveBeenCalledOnce()
     })
 })
