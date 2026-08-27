@@ -263,7 +263,7 @@ pub(crate) enum AssetRepositoryAuthorityState {
 }
 
 impl AssetRepositoryAuthorityState {
-    fn validate(&self) -> StoreResult<()> {
+    pub(crate) fn validate(&self) -> StoreResult<()> {
         let migration_id = match self {
             Self::Legacy => return Ok(()),
             Self::Preparing {
@@ -320,7 +320,7 @@ pub(crate) enum ColdPayloadAuthorityState {
 }
 
 impl ColdPayloadAuthorityState {
-    fn validate(&self) -> StoreResult<()> {
+    pub(crate) fn validate(&self) -> StoreResult<()> {
         let migration_id = match self {
             Self::Legacy => return Ok(()),
             Self::Preparing {

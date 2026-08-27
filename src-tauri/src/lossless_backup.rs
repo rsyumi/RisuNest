@@ -334,6 +334,11 @@ fn asset_repository_authority_extension(
             "lossless asset repository authority extension has unsupported fields",
         ));
     }
+    authority.validate().map_err(|error| {
+        invalid_manifest(format!(
+            "invalid lossless asset repository authority extension: {error}"
+        ))
+    })?;
     Ok(Some(authority))
 }
 
@@ -356,6 +361,11 @@ fn cold_payload_authority_extension(
             "lossless cold payload authority extension has unsupported fields",
         ));
     }
+    authority.validate().map_err(|error| {
+        invalid_manifest(format!(
+            "invalid lossless cold payload authority extension: {error}"
+        ))
+    })?;
     Ok(Some(authority))
 }
 
@@ -2106,6 +2116,8 @@ fn read_manifest(
         ));
     }
     validate_manifest(&manifest)?;
+    asset_repository_authority_extension(&manifest)?;
+    cold_payload_authority_extension(&manifest)?;
     Ok(manifest)
 }
 
@@ -3432,6 +3444,59 @@ mod tests {
             store.read_cold_payload_authority(None).unwrap().value,
             ColdPayloadAuthorityState::Legacy
         );
+    }
+
+    #[test]
+    fn verifier_rejects_unsupported_known_authority_extensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let extensions = [
+            json!({
+                "assetRepositoryAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-migration",
+                    "compatibilityHash": "ab".repeat(32),
+                    "unsupported": true,
+                }
+            }),
+            json!({
+                "coldPayloadAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-cold-migration",
+                    "compatibilityHash": "cd".repeat(32),
+                    "unsupported": true,
+                }
+            }),
+            json!({
+                "assetRepositoryAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-migration",
+                    "compatibilityHash": "not-a-sha256",
+                }
+            }),
+            json!({
+                "coldPayloadAuthority": {
+                    "format": "preparing",
+                    "migrationId": "lossless-test-cold-migration",
+                    "sourceRevision": -1,
+                }
+            }),
+        ];
+        for (index, extension) in extensions.into_iter().enumerate() {
+            let incoming = production_package_with_extensions(
+                directory.path(),
+                &format!("Invalid authority {index}"),
+                b"invalid-authority",
+                extension,
+            );
+
+            let error = verify_lossless_package_v1(
+                &mut Cursor::new(incoming),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code, LosslessErrorCode::InvalidManifest);
+        }
     }
 
     #[test]
