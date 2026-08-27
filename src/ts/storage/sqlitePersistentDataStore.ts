@@ -298,8 +298,24 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
     ): Promise<{ revision: DataRevision }> {
+        const coldAuthority = await this.readColdPayloadAuthority()
+        if (coldAuthority.value.format === 'preparing') {
+            throw new Error('Active cold payload generation cannot be preparing')
+        }
+        if (expectedRevision !== undefined && coldAuthority.revision !== expectedRevision) {
+            throw new RevisionConflictError(expectedRevision, coldAuthority.revision)
+        }
+        const preserveColdPayloads = coldAuthority.value.format === 'v2'
+        const commitRevision = expectedRevision
+            ?? (preserveColdPayloads ? coldAuthority.revision : undefined)
         const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
         try {
+            if (preserveColdPayloads) {
+                await invokeStore<void>('pds_replace_preserve_cold_payloads', {
+                    stagingId,
+                    expectedRevision: coldAuthority.revision,
+                })
+            }
             const { characters, botPresets, ...root } = database
             await invokeStore<void>('pds_replace_put_root', { stagingId, root })
             await invokeStore<void>('pds_replace_put_presets', {
@@ -320,7 +336,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             }
             return await invokeStore('pds_replace_commit', {
                 stagingId,
-                ...(expectedRevision === undefined ? {} : { expectedRevision }),
+                ...(commitRevision === undefined ? {} : { expectedRevision: commitRevision }),
             })
         } catch (error) {
             try {

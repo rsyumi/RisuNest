@@ -705,6 +705,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         expectedRevision: DataRevision,
     ): Promise<{ revision: DataRevision }> {
         validateColdAlias(alias)
+        if (alias.objectHash === null) {
+            throw new TypeError('Cold payload v2 alias objectHash cannot be null')
+        }
         const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
         try {
             const active = await this.readActive(transaction)
@@ -922,6 +925,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const revision = active.revision + 1
             const generation = this.generationFor(revision)
             await this.stageDatabase(transaction, databaseValue, generation, assetAliases)
+            await this.preserveColdPayloadsForReplacement(
+                transaction,
+                active.generation,
+                generation,
+            )
             if (!(await this.generationIsLeased(transaction, active.generation))) {
                 await this.deleteGenerationFromTransaction(transaction, active.generation)
             }
@@ -1932,6 +1940,24 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )
         }
         return targetGeneration
+    }
+
+    private async preserveColdPayloadsForReplacement(
+        transaction: IDBTransaction,
+        sourceGeneration: string,
+        targetGeneration: string,
+    ): Promise<void> {
+        const authority = await this.readColdPayloadAuthorityRecord(transaction, sourceGeneration)
+        if (authority.format === 'preparing') {
+            throw new Error('Active cold payload generation cannot be preparing')
+        }
+        if (authority.format === 'legacy') return
+        await this.copyGeneration(
+            transaction.objectStore('coldAliases'),
+            sourceGeneration,
+            targetGeneration,
+        )
+        this.putColdPayloadAuthority(transaction, targetGeneration, authority)
     }
 
     private async generationIsLeased(

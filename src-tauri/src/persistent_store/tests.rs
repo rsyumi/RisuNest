@@ -3541,7 +3541,7 @@ fn sha256(bytes: &[u8]) -> String {
 
 #[test]
 fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
-    let (_directory, mut store, database) = open_fixture();
+    let (directory, mut store, database) = open_fixture();
     let alias = AssetAlias {
         key: "assets/lease.bin".to_owned(),
         object_hash: Some("11".repeat(32)),
@@ -3560,10 +3560,14 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
         "22".repeat(32),
         1,
     );
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open payload CAS");
+    let prepared_cold = cas
+        .prepare_bytes(b"cold-data")
+        .expect("prepare leased cold payload");
     let cold = ColdAlias {
         key: "cold/lease".to_owned(),
-        object_hash: Some("33".repeat(32)),
-        size: 9,
+        object_hash: Some(prepared_cold.content_hash),
+        size: prepared_cold.byte_size as i64,
         metadata: json!({ "codec": "fixture" }),
     };
     let mut final_root = staged_root(&database);
@@ -5124,6 +5128,124 @@ fn cold_authority_marker_rejects_preparing_and_activates_v2_with_the_generation(
             revision: activated.revision,
             value: authority,
         }
+    );
+}
+
+#[test]
+fn staged_v2_cold_authority_rejects_missing_and_wrong_sized_cas_objects() {
+    let directory = tempfile::tempdir().expect("create staged cold validation directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let authority = ColdPayloadAuthorityState::V2 {
+        migration_id: "cold-restore".to_owned(),
+        compatibility_hash: "7a".repeat(32),
+    };
+    let missing = ColdAlias {
+        key: "cold/missing".to_owned(),
+        object_hash: Some("7b".repeat(32)),
+        size: 4,
+        metadata: json!({}),
+    };
+    let missing_staging = store.replace_begin().expect("begin missing CAS staging");
+    store
+        .replace_put_cold_aliases(&missing_staging.staging_id, &[missing])
+        .expect("stage missing cold alias");
+    store
+        .replace_put_cold_payload_authority(&missing_staging.staging_id, &authority)
+        .expect("stage missing cold authority");
+    assert!(matches!(
+        store.replace_commit(&missing_staging.staging_id, Some(0)),
+        Err(StoreError::Validation { .. })
+    ));
+
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"four")
+        .expect("prepare wrong-sized object");
+    let wrong_size = ColdAlias {
+        key: "cold/wrong-size".to_owned(),
+        object_hash: Some(prepared.content_hash),
+        size: 5,
+        metadata: json!({}),
+    };
+    let wrong_staging = store.replace_begin().expect("begin wrong-size staging");
+    store
+        .replace_put_cold_aliases(&wrong_staging.staging_id, &[wrong_size])
+        .expect("stage wrong-sized cold alias");
+    store
+        .replace_put_cold_payload_authority(&wrong_staging.staging_id, &authority)
+        .expect("stage wrong-sized cold authority");
+    assert!(matches!(
+        store.replace_commit(&wrong_staging.staging_id, Some(0)),
+        Err(StoreError::Validation { .. })
+    ));
+    assert_eq!(store.revision().expect("read unchanged revision"), 0);
+}
+
+#[test]
+fn database_only_replace_preserves_active_v2_cold_payloads_across_reopen() {
+    let directory = tempfile::tempdir().expect("create cold preservation directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"preserved-cold")
+        .expect("prepare preserved cold object");
+    let alias = ColdAlias {
+        key: "cold/preserved".to_owned(),
+        object_hash: Some(prepared.content_hash.clone()),
+        size: prepared.byte_size as i64,
+        metadata: json!({ "source": "database-only-restore" }),
+    };
+    let expected_authority = ColdPayloadAuthorityState::V2 {
+        migration_id: "cold-preservation".to_owned(),
+        compatibility_hash: "7c".repeat(32),
+    };
+    let migrated = store
+        .activate_cold_payload_migration(&ColdPayloadMigrationInput {
+            source_revision: 0,
+            migration_id: "cold-preservation".to_owned(),
+            compatibility_hash: "7c".repeat(32),
+            cold_aliases: vec![alias.clone()],
+        })
+        .expect("activate cold payload authority");
+
+    let staging = store.replace_begin().expect("begin database replacement");
+    store
+        .replace_preserve_cold_payloads(&staging.staging_id, migrated.revision)
+        .expect("preserve active cold payloads");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "username": "Restored database" }),
+        )
+        .expect("stage restored root");
+    let replaced = store
+        .replace_commit(&staging.staging_id, Some(migrated.revision))
+        .expect("activate restored database");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen persistent store");
+    assert_eq!(
+        reopened
+            .read_cold_payload_authority(None)
+            .expect("read preserved authority"),
+        super::Versioned {
+            revision: replaced.revision,
+            value: expected_authority,
+        }
+    );
+    assert_eq!(
+        reopened
+            .list_cold_aliases(None)
+            .expect("list preserved aliases"),
+        super::Versioned {
+            revision: replaced.revision,
+            value: vec![alias],
+        }
+    );
+    assert_eq!(
+        cas.read_object(&prepared.content_hash)
+            .expect("read preserved CAS object"),
+        Some(b"preserved-cold".to_vec())
     );
 }
 

@@ -27,6 +27,7 @@ const state = vi.hoisted(() => ({
         backupName: string
         value: unknown
     }>,
+    restoreEvents: [] as string[],
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
 }))
 
@@ -101,6 +102,7 @@ vi.mock('../process/coldstorage.svelte', () => ({
         .map((character) => character.coldstorage)
         .filter((key): key is string => Boolean(key)),
     setLocalColdStorageItem: vi.fn(async (key: string, value: unknown) => {
+        state.restoreEvents.push(`cold:${key}`)
         state.localCold.set(key, structuredClone(value))
         return true
     }),
@@ -165,6 +167,7 @@ describe('Drive restore cold snapshot assets', () => {
         state.runtime = null
         state.snapshotSeenByColdStorage = null
         state.coldStoragePayloads = []
+        state.restoreEvents = []
     })
 
     it('materializes the selected Drive cold asset before publishing the accepted revision', async () => {
@@ -221,6 +224,7 @@ describe('Drive restore cold snapshot assets', () => {
         })
         state.replacePersistentDatabase.mockImplementation(async (candidate, reason) => {
             expect(reason).toBe('drive-restore')
+            state.restoreEvents.push('database')
             revision = (await store.replaceFromDatabase(structuredClone(candidate))).revision
         })
         state.publishCurrentOfficialRevision.mockImplementation(async () => {
@@ -261,6 +265,7 @@ describe('Drive restore cold snapshot assets', () => {
         expect(accountWrites).toContain('assets/drive-only.png')
         expect(accountWrites).not.toContain('assets/account-only.png')
         expect(accountWrites.at(-1)).toBe('database/database.bin')
+        expect(state.restoreEvents).toEqual([`cold:${coldKey}`, 'database'])
         expect(state.forageInit).not.toHaveBeenCalled()
         expect(state.alertError).not.toHaveBeenCalled()
     })

@@ -1294,6 +1294,14 @@ impl PersistentStore {
         commit::replace_put_cold_payload_authority(&mut self.connection, staging_id, authority)
     }
 
+    pub(crate) fn replace_preserve_cold_payloads(
+        &mut self,
+        staging_id: &str,
+        expected_revision: i64,
+    ) -> StoreResult<()> {
+        commit::replace_preserve_cold_payloads(&mut self.connection, staging_id, expected_revision)
+    }
+
     pub(crate) fn replace_put_cold_aliases(
         &mut self,
         staging_id: &str,
@@ -1321,6 +1329,30 @@ impl PersistentStore {
         self.finish_prepared_replace(authorized)
     }
 
+    fn verify_staged_cold_payload_objects(&self, staging_id: &str) -> StoreResult<()> {
+        let authority = commit::read_cold_payload_authority(&self.connection, staging_id)?;
+        if !matches!(authority, ColdPayloadAuthorityState::V2 { .. }) {
+            return Ok(());
+        }
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let mut statement = self.connection.prepare(
+            "SELECT key, object_hash, size, metadata
+             FROM cold_aliases WHERE generation = ?1 ORDER BY key ASC",
+        )?;
+        let mut rows = statement.query([staging_id])?;
+        while let Some(row) = rows.next()? {
+            let metadata: String = row.get(3)?;
+            let alias = ColdAlias {
+                key: row.get(0)?,
+                object_hash: row.get(1)?,
+                size: row.get(2)?,
+                metadata: serde_json::from_str(&metadata)?,
+            };
+            verify_cold_alias_object(&cas, &alias)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_replace_commit(
         &self,
         staging_id: &str,
@@ -1328,6 +1360,7 @@ impl PersistentStore {
     ) -> StoreResult<PreparedReplaceCommit> {
         let revision =
             commit::validate_replace_commit(&self.connection, staging_id, expected_revision)?;
+        self.verify_staged_cold_payload_objects(staging_id)?;
         Ok(PreparedReplaceCommit {
             staging_id: staging_id.to_owned(),
             revision,
@@ -1340,6 +1373,7 @@ impl PersistentStore {
         &mut self,
         prepared: SnapshotAuthorizedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
+        self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
         commit::replace_commit(
             &mut self.connection,
             &prepared.staging_id,
@@ -1353,6 +1387,7 @@ impl PersistentStore {
         key: &str,
         value: &Value,
     ) -> StoreResult<RevisionResult> {
+        self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
         commit::replace_commit_with_app_kv(
             &mut self.connection,
             &prepared.staging_id,

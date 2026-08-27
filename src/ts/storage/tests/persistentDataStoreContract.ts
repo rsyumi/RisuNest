@@ -739,6 +739,45 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
+        it('preserves v2 cold authority and aliases across a database-only replacement', async () => {
+            const { store, reopen } = await createHarness()
+            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const alias: ColdAlias = {
+                key: 'conversation/restored',
+                objectHash: '49'.repeat(32),
+                size: 23,
+                metadata: { source: 'restored-before-database' },
+            }
+            const activated = await store.activateColdPayloadMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'cold-restore-preserve',
+                compatibilityHash: '4a'.repeat(32),
+                coldAliases: [alias],
+            })
+            const replacement = structuredClone(fixtureDatabase)
+            replacement.username = 'Restored after cold payloads'
+
+            const replaced = await store.replaceFromDatabase(replacement, activated.revision)
+
+            expect(await store.readColdPayloadAuthority()).toEqual({
+                revision: replaced.revision,
+                value: {
+                    format: 'v2',
+                    migrationId: 'cold-restore-preserve',
+                    compatibilityHash: '4a'.repeat(32),
+                },
+            })
+            expect(await store.listColdAliases()).toEqual({
+                revision: replaced.revision,
+                value: [alias],
+            })
+            const reopened = await reopen()
+            expect(await reopened.readColdAlias(alias.key)).toEqual({
+                revision: replaced.revision,
+                value: alias,
+            })
+        })
+
         it('copy-on-write isolates cold alias commits and deletes from a pinned revision', async () => {
             const { store } = await createHarness()
             const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
@@ -826,6 +865,26 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 revision: initial.revision,
                 value: [],
             })
+        })
+
+        it('rejects a null object hash in a normal v2 cold mutation', async () => {
+            const { store } = await createHarness()
+            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const activated = await store.activateColdPayloadMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'cold-no-legacy-fallback',
+                compatibilityHash: '69'.repeat(32),
+                coldAliases: [],
+            })
+
+            await expect(store.commitColdAlias({
+                key: 'conversation/null-hash',
+                objectHash: null,
+                size: 0,
+                metadata: {},
+            }, activated.revision)).rejects.toThrow('objectHash')
+            expect((await store.readRoot()).revision).toBe(activated.revision)
+            expect((await store.listColdAliases()).value).toEqual([])
         })
 
         it('activates staged zero-byte and missing-payload aliases across reopen', async () => {

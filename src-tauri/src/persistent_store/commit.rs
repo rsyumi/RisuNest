@@ -675,6 +675,44 @@ pub(super) fn replace_put_cold_payload_authority(
     Ok(())
 }
 
+pub(super) fn replace_preserve_cold_payloads(
+    connection: &mut Connection,
+    staging_id: &str,
+    expected_revision: i64,
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    let actual_revision = current_revision(&transaction)?;
+    if actual_revision != expected_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual: actual_revision,
+        });
+    }
+    let active = active_generation(&transaction)?;
+    let authority = read_cold_payload_authority(&transaction, &active)?;
+    if matches!(authority, ColdPayloadAuthorityState::Preparing { .. }) {
+        return Err(validation(
+            "Active cold payload generation cannot be preparing",
+        ));
+    }
+    if matches!(authority, ColdPayloadAuthorityState::V2 { .. }) {
+        transaction.execute(
+            "DELETE FROM cold_aliases WHERE generation = ?1",
+            [staging_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+             SELECT ?1, key, object_hash, size, metadata
+             FROM cold_aliases WHERE generation = ?2",
+            params![staging_id, active],
+        )?;
+        put_cold_payload_authority(&transaction, staging_id, &authority)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn put_asset_repository_authority(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -962,7 +1000,7 @@ fn require_activatable_authority(connection: &Connection, staging_id: &str) -> S
     Ok(())
 }
 
-fn read_cold_payload_authority(
+pub(super) fn read_cold_payload_authority(
     connection: &Connection,
     generation: &str,
 ) -> StoreResult<ColdPayloadAuthorityState> {

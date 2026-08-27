@@ -4,7 +4,7 @@ import type { BlobStore } from '../storage/blobStore'
 import type { Database } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import type { PersistentDataRuntime } from '../storage/persistentDataRuntime'
-import { decodeRisuSave } from '../storage/risuSave'
+import { decodeRisuSave, encodeRisuSaveLegacy } from '../storage/risuSave'
 import { risuSaveFixtureDatabase } from '../storage/tests/risuSaveFixtures'
 import { getBackupInlayName } from './backupAssets'
 
@@ -25,6 +25,9 @@ const state = vi.hoisted(() => ({
     }>,
     missingColdStorageKeys: [] as string[],
     invalidColdStorageKeys: [] as string[],
+    restoredCold: new Map<string, unknown>(),
+    restoreEvents: [] as string[],
+    replacePersistentDatabase: vi.fn(async (_database: Database, _reason: string) => undefined),
     confirmColdStorage: vi.fn(async () => true),
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
 }))
@@ -81,7 +84,9 @@ vi.mock('../storage/database.svelte', () => ({
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => state.runtime,
     publishCurrentOfficialRevision: vi.fn(async () => undefined),
-    replacePersistentDatabase: vi.fn(async () => undefined),
+    replacePersistentDatabase: (database: Database, reason: string) => (
+        state.replacePersistentDatabase(database, reason)
+    ),
 }))
 
 vi.mock('../process/coldstorage.svelte', () => ({
@@ -94,11 +99,24 @@ vi.mock('../process/coldstorage.svelte', () => ({
         }
     }),
     confirmIncompleteColdStorageOperation: state.confirmColdStorage,
-    getColdStorageBackupKey: vi.fn(),
-    getColdStorageItem: vi.fn(),
-    isColdStorageBackupData: vi.fn(),
-    listColdDataKeys: vi.fn(async () => []),
-    setLocalColdStorageItem: vi.fn(),
+    getColdStorageBackupKey: (name: string) => {
+        const match = /^coldstorage_(.+)\.json$/.exec(name)
+        return match?.[1] ?? null
+    },
+    getColdStorageItem: async (key: string) => structuredClone(state.restoredCold.get(key) ?? null),
+    isColdStorageBackupData: (value: unknown) => Boolean(
+        value
+        && typeof value === 'object'
+        && ('character' in value || 'message' in value),
+    ),
+    listColdDataKeys: async (database: Database) => database.characters
+        .map((character) => character.coldstorage)
+        .filter((key): key is string => Boolean(key)),
+    setLocalColdStorageItem: vi.fn(async (key: string, value: unknown) => {
+        state.restoreEvents.push(`cold:${key}`)
+        state.restoredCold.set(key, structuredClone(value))
+        return true
+    }),
 }))
 
 vi.mock('src/ts/platform', () => ({
@@ -141,6 +159,12 @@ describe('local backup persistent snapshot', () => {
         state.coldStoragePayloads = []
         state.missingColdStorageKeys = []
         state.invalidColdStorageKeys = []
+        state.restoredCold.clear()
+        state.restoreEvents = []
+        state.replacePersistentDatabase.mockReset().mockImplementation(async (_database, reason) => {
+            expect(reason).toBe('local-backup')
+            state.restoreEvents.push('database')
+        })
         state.blobStore = emptyBlobStore()
         state.nativeFileClose.mockClear()
         state.fullReadFile.mockClear()
@@ -156,6 +180,61 @@ describe('local backup persistent snapshot', () => {
             }),
             close: state.nativeFileClose,
         })
+    })
+
+    it('restores cold payloads before replacing the local backup database', async () => {
+        const coldKey = 'local-restore-cold'
+        const database = structuredClone(risuSaveFixtureDatabase) as Database
+        database.characters[0].coldstorage = coldKey
+        const cold = { message: [{ role: 'user', data: 'restored cold payload' }] }
+        const encodeEntry = (name: string, data: Uint8Array) => {
+            const encodedName = new TextEncoder().encode(name)
+            const record = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
+            const view = new DataView(record.buffer)
+            view.setUint32(0, encodedName.byteLength, true)
+            record.set(encodedName, 4)
+            view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
+            record.set(data, 8 + encodedName.byteLength)
+            return record
+        }
+        const entries = [
+            encodeEntry(`coldstorage_${coldKey}.json`, new TextEncoder().encode(JSON.stringify(cold))),
+            encodeEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')),
+        ]
+        const archive = new Uint8Array(entries.reduce((sum, entry) => sum + entry.byteLength, 0))
+        let offset = 0
+        for (const entry of entries) {
+            archive.set(entry, offset)
+            offset += entry.byteLength
+        }
+        const file = {
+            size: archive.byteLength,
+            stream: () => new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(archive)
+                    controller.close()
+                },
+            }),
+        } as File
+        const input = {
+            type: '',
+            accept: '',
+            files: [file],
+            onchange: null as null | (() => Promise<void>),
+            click: vi.fn(),
+            remove: vi.fn(),
+        }
+        const createElement = vi.spyOn(document, 'createElement')
+            .mockReturnValueOnce(input as unknown as HTMLInputElement)
+        const { LoadLocalBackup } = await import('./backuplocal')
+
+        LoadLocalBackup()
+        await input.onchange?.()
+        createElement.mockRestore()
+
+        expect(state.restoreEvents).toEqual([`cold:${coldKey}`, 'database'])
+        expect(state.restoredCold.get(coldKey)).toEqual(cold)
+        expect(state.replacePersistentDatabase).toHaveBeenCalledOnce()
     })
 
     it('writes database and cold enumeration from the flushed store revision', async () => {
