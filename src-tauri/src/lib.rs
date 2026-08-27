@@ -563,6 +563,7 @@ pub fn run() {
             asset_repository::commands::asset_cas_job_prepare,
             asset_repository::commands::asset_cas_job_pin_existing,
             asset_repository::commands::asset_cas_job_seal,
+            asset_repository::commands::asset_cas_job_finalize_content,
             asset_repository::commands::asset_cas_job_release,
             native_file_jobs::native_file_job_start,
             native_file_jobs::native_file_job_status,

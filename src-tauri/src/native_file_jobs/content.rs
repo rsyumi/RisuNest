@@ -7,9 +7,7 @@ use super::{
     NativeJobError, OpenedJobSource, PreparedContent, PreparedContentAsset, PreparedContentFormat,
     PreparedContentModule,
 };
-use crate::asset_repository::job_pins::{
-    CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
-};
+use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
 use crate::asset_repository::{PayloadCas, PreparedPayload};
 use crate::import_export_jobs::{
     classify_content, parse_json_card, parse_risum, ContentKind, FormatError, FormatErrorKind,
@@ -202,7 +200,7 @@ pub(super) fn prepare_content(
             _ => unreachable!("supported content kinds were handled above"),
         };
     }
-    let mut cas_session = begin_content_cas_session(repository_root, job)?;
+    let cas_session = begin_content_cas_session(repository_root, job)?;
     let cas = match open_payload_cas(repository_root) {
         Ok(cas) => cas,
         Err(error) => return Err(abort_failed_content_session(cas_session, error)),
@@ -213,22 +211,12 @@ pub(super) fn prepare_content(
             owned_directory,
             &content_import_limits(),
             &cas,
-            &mut cas_session,
             job,
         ),
         ContentKind::CharxCard | ContentKind::AppendedCharxJpeg => {
             let spool_path = owned_directory.join("source.charx");
             spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested()).and_then(
-                |()| {
-                    prepare_charx_content(
-                        &spool_path,
-                        display_name,
-                        owned_directory,
-                        &cas,
-                        &mut cas_session,
-                        job,
-                    )
-                },
+                |()| prepare_charx_content(&spool_path, display_name, owned_directory, &cas, job),
             )
         }
         _ => unreachable!("unsupported content kinds returned before opening a CAS session"),
@@ -260,7 +248,6 @@ fn prepare_json_content(
     owned_directory: &Path,
     limits: &ImportLimits,
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<PreparedContent, NativeJobError> {
     source
@@ -273,7 +260,7 @@ fn prepare_json_content(
     })
     .map_err(native_format_error)?;
     let ParsedJsonCard { metadata, payloads } = parsed;
-    let assets = promote_json_assets(&metadata, payloads, owned_directory, cas, cas_session, job)?;
+    let assets = promote_json_assets(&metadata, payloads, owned_directory, cas, job)?;
     Ok(PreparedContent {
         format: PreparedContentFormat::JsonCard,
         metadata,
@@ -289,7 +276,6 @@ fn prepare_charx_content(
     display_name: &str,
     owned_directory: &Path,
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<PreparedContent, NativeJobError> {
     let inspection = inspect_charx_file(
@@ -332,20 +318,18 @@ fn prepare_charx_content(
     )
     .map_err(native_format_error)?;
     let ParsedJsonCard { metadata, payloads } = parsed;
-    let mut assets = promote_archive_asset_occurrences(&descriptor, cas, cas_session, job)?;
+    let mut assets = promote_archive_asset_occurrences(&descriptor, cas, job)?;
     assets.extend(promote_json_assets(
         &metadata,
         payloads,
         owned_directory,
         cas,
-        cas_session,
         job,
     )?);
     let portrait_logical_id = match descriptor.container_kind {
         CharXContainerKind::CharX => None,
         CharXContainerKind::AppendedCharXJpeg => {
-            let portrait =
-                promote_jpeg_prefix(spool_path, descriptor.archive_offset, cas, cas_session, job)?;
+            let portrait = promote_jpeg_prefix(spool_path, descriptor.archive_offset, cas, job)?;
             let logical_id = portrait.logical_id.clone();
             assets.push(portrait);
             Some(logical_id)
@@ -368,7 +352,6 @@ fn prepare_charx_content(
 fn promote_archive_asset_occurrences(
     descriptor: &ParsedCharXDescriptor,
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<Vec<PreparedContentAsset>, NativeJobError> {
     let payloads = descriptor
@@ -393,7 +376,7 @@ fn promote_archive_asset_occurrences(
         let promoted_payload = match promoted.get(&reference.normalized_name) {
             Some(promoted_payload) => promoted_payload.clone(),
             None => {
-                let promoted_payload = promote_staged_payload(cas, cas_session, payload, job)?;
+                let promoted_payload = promote_staged_payload(cas, payload, job)?;
                 promoted.insert(reference.normalized_name.clone(), promoted_payload.clone());
                 promoted_payload
             }
@@ -448,7 +431,6 @@ fn promote_json_assets(
     payloads: Vec<JsonCardPayload>,
     staging_root: &Path,
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<Vec<PreparedContentAsset>, NativeJobError> {
     let mut assets = Vec::with_capacity(payloads.len());
@@ -478,7 +460,7 @@ fn promote_json_assets(
             staged_path,
             card_asset_types: Vec::new(),
         };
-        let promoted = promote_staged_payload(cas, cas_session, &staged, job)?;
+        let promoted = promote_staged_payload(cas, &staged, job)?;
         let name_pointer = json_pointer
             .strip_suffix("/uri")
             .map(|pointer| format!("{pointer}/name"));
@@ -505,7 +487,6 @@ fn promote_json_assets(
 
 fn promote_staged_payload(
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     payload: &StagedPayloadDescriptor,
     job: &JobControl,
 ) -> Result<PromotedPayload, NativeJobError> {
@@ -513,7 +494,7 @@ fn promote_staged_payload(
         return Err(content_cancelled());
     }
     let staged = open_regular_file_no_follow(&payload.staged_path)?.file;
-    let promoted = prepare_cancellable_payload(cas, cas_session, staged, job)?;
+    let promoted = prepare_cancellable_payload(cas, staged, job)?;
     if promoted.content_hash != payload.sha256 || promoted.byte_size != payload.decoded_size {
         return Err(NativeJobError::new(
             "store-error",
@@ -585,7 +566,6 @@ fn promote_jpeg_prefix(
     spool_path: &Path,
     archive_offset: u64,
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<PreparedContentAsset, NativeJobError> {
     if archive_offset == 0 {
@@ -598,8 +578,7 @@ fn promote_jpeg_prefix(
         return Err(content_cancelled());
     }
     let source = open_regular_file_no_follow(spool_path)?;
-    let promoted =
-        prepare_cancellable_payload(cas, cas_session, source.file.take(archive_offset), job)?;
+    let promoted = prepare_cancellable_payload(cas, source.file.take(archive_offset), job)?;
     if promoted.byte_size != archive_offset {
         return Err(NativeJobError::new(
             "invalid-source",
@@ -630,20 +609,17 @@ fn open_payload_cas(repository_root: &Path) -> Result<PayloadCas, NativeJobError
 
 fn prepare_cancellable_payload<R: Read>(
     cas: &PayloadCas,
-    cas_session: &mut DurableCasJob,
     reader: R,
     job: &JobControl,
 ) -> Result<PreparedPayload, NativeJobError> {
     let mut reader = CancellableReader { inner: reader, job };
-    cas_session
-        .prepare_reader(cas, &mut reader, CasObjectRole::DirectObject)
-        .map_err(|error| {
-            if job.is_cancel_requested() {
-                content_cancelled()
-            } else {
-                NativeJobError::new("store-error", error.to_string())
-            }
-        })
+    cas.prepare_reader(&mut reader).map_err(|error| {
+        if job.is_cancel_requested() {
+            content_cancelled()
+        } else {
+            NativeJobError::new("store-error", error.to_string())
+        }
+    })
 }
 
 fn begin_content_cas_session(

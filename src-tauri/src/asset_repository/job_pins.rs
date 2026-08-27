@@ -203,6 +203,69 @@ impl DurableCasJob {
         self.record_pin(object_hash, byte_size, role)
     }
 
+    pub(crate) fn pin_existing_batch(
+        &mut self,
+        cas: &PayloadCas,
+        pins: &[(String, u64, CasObjectRole)],
+    ) -> io::Result<()> {
+        self.ensure_preparable()?;
+        self.ensure_cas(cas)?;
+        let mut pending = BTreeMap::<String, PinDescriptor>::new();
+        for (object_hash, byte_size, role) in pins {
+            validate_hash(object_hash)?;
+            let descriptor = PinDescriptor {
+                byte_size: *byte_size,
+                role: *role,
+            };
+            if let Some(existing) = self.state.pins.get(object_hash) {
+                if *existing != descriptor {
+                    return invalid_data("CAS job contains a conflicting object pin");
+                }
+                continue;
+            }
+            if pending
+                .insert(object_hash.clone(), descriptor)
+                .is_some_and(|existing| existing != descriptor)
+            {
+                return invalid_data("CAS job batch contains a conflicting object pin");
+            }
+        }
+        if self
+            .state
+            .pins
+            .len()
+            .checked_add(pending.len())
+            .is_none_or(|count| count > MAX_DURABLE_CAS_JOB_PINS)
+        {
+            return invalid_data("CAS job exceeds the bounded pin limit");
+        }
+        for (object_hash, pin) in &pending {
+            match cas.stat_object(object_hash)? {
+                Some(actual_size) if actual_size == pin.byte_size => {}
+                Some(_) => return invalid_data("existing CAS object size does not match its pin"),
+                None => return invalid_data("existing CAS object is missing"),
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut file = OpenOptions::new().append(true).open(&self.journal_path)?;
+        for (object_hash, pin) in pending {
+            let record = JobJournalRecord::Pin {
+                sequence: self.state.next_sequence,
+                job_id: self.state.job_id.clone(),
+                object_hash: object_hash.clone(),
+                byte_size: pin.byte_size,
+                object_role: pin.role,
+            };
+            write_record(&mut file, &record, false)?;
+            self.state.pins.insert(object_hash, pin);
+            self.state.next_sequence += 1;
+        }
+        file.flush()?;
+        file.sync_data()
+    }
+
     pub(crate) fn seal(
         &mut self,
         store: &mut PersistentStore,

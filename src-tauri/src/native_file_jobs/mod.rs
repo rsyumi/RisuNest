@@ -3130,9 +3130,14 @@ mod tests {
             session.kind(),
             crate::asset_repository::job_pins::CasJobKind::CardOrModuleContentImport
         );
-        assert_eq!(session.pin_count(), 1);
+        assert_eq!(session.pin_count(), 0);
         assert!(!session.is_sealed());
         assert!(!session.is_released());
+        assert!(
+            crate::asset_repository::job_pins::collect_durable_cas_job_roots(directory.path(),)
+                .blockers
+                .contains(&format!("job-pin-unsealed:{}", started.job_id))
+        );
 
         assert_eq!(
             state.cancel(&started.job_id).unwrap(),
@@ -3269,7 +3274,7 @@ mod tests {
             &started.job_id,
         )
         .expect("prepared CharX keeps its durable CAS session");
-        assert_eq!(session.pin_count(), 3);
+        assert_eq!(session.pin_count(), 0);
         assert!(!session.is_sealed());
         assert!(!session.is_released());
         assert!(!directory
@@ -3328,7 +3333,7 @@ mod tests {
             &started.job_id,
         )
         .expect("appended CharX keeps its durable CAS session");
-        assert_eq!(session.pin_count(), 4);
+        assert_eq!(session.pin_count(), 0);
         assert!(!session.is_sealed());
         assert!(!session.is_released());
     }
@@ -3412,18 +3417,17 @@ mod tests {
         repository_root: &Path,
         job: &JobControl,
     ) -> PreparedContent {
-        use crate::asset_repository::job_pins::{CasJobKind, CasObjectRole, DurableCasJob};
+        use crate::asset_repository::job_pins::{CasJobKind, DurableCasJob};
         let cas = crate::asset_repository::PayloadCas::new(repository_root).unwrap();
-        let mut session = DurableCasJob::begin(
+        let session = DurableCasJob::begin(
             repository_root,
             &job.id(),
             CasJobKind::CardOrModuleContentImport,
             1,
         )
         .unwrap();
-        session
-            .prepare_bytes(&cas, b"prepared", CasObjectRole::DirectObject)
-            .unwrap();
+        cas.prepare_bytes(b"prepared").unwrap();
+        assert_eq!(session.pin_count(), 0);
         PreparedContent {
             format: PreparedContentFormat::JsonCard,
             metadata: serde_json::json!({"spec":"chara_card_v3","data":{"name":"Prepared"}}),

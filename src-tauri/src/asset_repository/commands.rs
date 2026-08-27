@@ -1,10 +1,23 @@
 use super::job_pins::{CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob};
 use super::{PayloadCas, PreparedPayload};
+use crate::asset_repository::owner_manifest_codec::{
+    decode_owner_manifest, encode_owner_manifest, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
+};
 use crate::persistent_store::{self, PersistentStoreState, StoreError};
-use std::collections::HashMap;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Cursor, ErrorKind};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContentDirectObject {
+    object_hash: String,
+    byte_size: u64,
+}
 
 pub(crate) struct DurableCasJobState {
     jobs: Mutex<HashMap<String, DurableCasJob>>,
@@ -236,4 +249,363 @@ pub(crate) async fn asset_cas_stat_object(
     })
     .await
     .map_err(|error| format!("failed to join CAS stat operation: {error}"))?
+}
+
+fn finalize_content_job(
+    job: &mut DurableCasJob,
+    cas: &PayloadCas,
+    store: &mut crate::persistent_store::PersistentStore,
+    owner_manifest: &[u8],
+    direct_objects: &[ContentDirectObject],
+    created_at_ms: i64,
+) -> io::Result<PreparedPayload> {
+    if job.kind() != CasJobKind::CardOrModuleContentImport {
+        return invalid_content_finalization("CAS job is not a content import session");
+    }
+    if job.is_sealed() || job.is_released() || job.pin_count() != 0 {
+        return invalid_content_finalization("content import CAS session is not fresh");
+    }
+    if created_at_ms < 0 {
+        return invalid_content_finalization(
+            "content import finalization time must be nonnegative",
+        );
+    }
+    if owner_manifest.len() > OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES {
+        return invalid_content_finalization("owner manifest exceeds its canonical byte limit");
+    }
+    if direct_objects.len() > super::job_pins::MAX_DURABLE_CAS_JOB_PINS {
+        return invalid_content_finalization("content import direct object list exceeds its limit");
+    }
+    let decoded = decode_owner_manifest(owner_manifest)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+    if encode_owner_manifest(&decoded)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?
+        != owner_manifest
+    {
+        return invalid_content_finalization("owner manifest bytes are not canonical");
+    }
+    let owner_hash = hex::encode(Sha256::digest(owner_manifest));
+    let owner_size = owner_manifest.len() as u64;
+    let mut complete = BTreeMap::<String, (u64, CasObjectRole)>::new();
+    for object in direct_objects {
+        validate_content_object_hash(&object.object_hash)?;
+        if object.byte_size > i64::MAX as u64 {
+            return invalid_content_finalization(
+                "content import direct object exceeds the catalog size limit",
+            );
+        }
+        match complete.get(&object.object_hash) {
+            Some((byte_size, CasObjectRole::DirectObject)) if *byte_size == object.byte_size => {}
+            Some(_) => {
+                return invalid_content_finalization(
+                    "content import direct object has conflicting sizes",
+                )
+            }
+            None => {
+                complete.insert(
+                    object.object_hash.clone(),
+                    (object.byte_size, CasObjectRole::DirectObject),
+                );
+            }
+        }
+    }
+    if let Some((byte_size, _)) = complete.get(&owner_hash) {
+        if *byte_size != owner_size {
+            return invalid_content_finalization(
+                "owner manifest hash has a conflicting direct object size",
+            );
+        }
+    }
+    complete.insert(
+        owner_hash.clone(),
+        (owner_size, CasObjectRole::OwnerManifest),
+    );
+    if complete.len() > super::job_pins::MAX_DURABLE_CAS_JOB_PINS {
+        return invalid_content_finalization("content import CAS pin set exceeds its limit");
+    }
+    for (object_hash, (byte_size, role)) in &complete {
+        if *role == CasObjectRole::OwnerManifest {
+            continue;
+        }
+        match cas.stat_object(object_hash)? {
+            Some(actual_size) if actual_size == *byte_size => {}
+            Some(_) => {
+                return invalid_content_finalization(
+                    "content import direct object size does not match CAS",
+                )
+            }
+            None => return invalid_content_finalization("content import direct object is missing"),
+        }
+    }
+
+    let mut reader = Cursor::new(owner_manifest);
+    let prepared = job.prepare_reader(cas, &mut reader, CasObjectRole::OwnerManifest)?;
+    if prepared.content_hash != owner_hash || prepared.byte_size != owner_size {
+        return invalid_content_finalization("prepared owner manifest does not match exact bytes");
+    }
+    let direct_pins = complete
+        .into_iter()
+        .filter(|(_, (_, role))| *role == CasObjectRole::DirectObject)
+        .map(|(object_hash, (byte_size, role))| (object_hash, byte_size, role))
+        .collect::<Vec<_>>();
+    job.pin_existing_batch(cas, &direct_pins)?;
+    job.seal(store, created_at_ms)?;
+    Ok(prepared)
+}
+
+fn validate_content_object_hash(hash: &str) -> io::Result<()> {
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    invalid_content_finalization("content import object hash must be lowercase SHA-256")
+}
+
+fn invalid_content_finalization<T>(message: &str) -> io::Result<T> {
+    Err(io::Error::new(ErrorKind::InvalidData, message))
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_finalize_content(
+    app: AppHandle,
+    session_id: String,
+    owner_manifest: Vec<u8>,
+    direct_objects: Vec<ContentDirectObject>,
+) -> Result<PreparedPayload, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = repository_root(&app)?;
+        let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
+        let state = app.state::<DurableCasJobState>();
+        let mut jobs = state
+            .jobs
+            .lock()
+            .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+        if !jobs.contains_key(&session_id) {
+            let recovered =
+                DurableCasJob::open(&root, &session_id).map_err(|error| error.to_string())?;
+            jobs.insert(session_id.clone(), recovered);
+        }
+        let job = jobs
+            .get_mut(&session_id)
+            .expect("recovered CAS job session must be present");
+        persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
+            finalize_content_job(
+                job,
+                &cas,
+                store,
+                &owner_manifest,
+                &direct_objects,
+                now_ms().map_err(|message| StoreError::Store { message })?,
+            )
+            .map_err(StoreError::from)
+        })
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("failed to join content CAS finalization: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asset_repository::job_pins::{
+        collect_durable_cas_job_roots, CasJobKind, DurableCasJob,
+    };
+    use crate::asset_repository::owner_manifest_codec::{
+        encode_owner_manifest, OwnerManifestEntry,
+    };
+    use crate::persistent_store::PersistentStore;
+    use tempfile::TempDir;
+
+    fn owner_manifest() -> Vec<u8> {
+        encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: [
+                "character".to_owned(),
+                "card-1".to_owned(),
+                "icon".to_owned(),
+            ],
+            payload_hash: None,
+        }])
+        .unwrap()
+    }
+
+    fn begin_content_job(root: &std::path::Path, id: &str) -> DurableCasJob {
+        DurableCasJob::begin(root, id, CasJobKind::CardOrModuleContentImport, 1).unwrap()
+    }
+
+    #[test]
+    fn content_finalizer_prioritizes_owner_manifest_when_a_direct_hash_matches() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let manifest = owner_manifest();
+        let existing = cas.prepare_bytes(&manifest).unwrap();
+        let mut job = begin_content_job(directory.path(), "content-owner-priority");
+
+        let prepared = finalize_content_job(
+            &mut job,
+            &cas,
+            &mut store,
+            &manifest,
+            &[ContentDirectObject {
+                object_hash: existing.content_hash.clone(),
+                byte_size: existing.byte_size,
+            }],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.content_hash, existing.content_hash);
+        assert_eq!(prepared.byte_size, manifest.len() as u64);
+        assert_eq!(
+            cas.read_object(&prepared.content_hash).unwrap(),
+            Some(manifest)
+        );
+        assert!(job.is_sealed());
+        assert_eq!(job.pin_count(), 1);
+        let roots = job.root_set().unwrap();
+        assert_eq!(roots.manifest_hashes, [prepared.content_hash].into());
+        assert!(roots.object_hashes.is_empty());
+    }
+
+    #[test]
+    fn content_finalizer_normalizes_exact_direct_duplicates_and_rejects_size_conflicts() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let direct = cas.prepare_bytes(b"direct object").unwrap();
+        let manifest = owner_manifest();
+        let duplicate = ContentDirectObject {
+            object_hash: direct.content_hash.clone(),
+            byte_size: direct.byte_size,
+        };
+        let mut normalized = begin_content_job(directory.path(), "content-normalized");
+
+        finalize_content_job(
+            &mut normalized,
+            &cas,
+            &mut store,
+            &manifest,
+            &[duplicate.clone(), duplicate.clone()],
+            2,
+        )
+        .unwrap();
+
+        assert!(normalized.is_sealed());
+        assert_eq!(normalized.pin_count(), 2);
+
+        let mut conflict = begin_content_job(directory.path(), "content-conflict");
+        let error = finalize_content_job(
+            &mut conflict,
+            &cas,
+            &mut store,
+            &manifest,
+            &[
+                duplicate,
+                ContentDirectObject {
+                    object_hash: direct.content_hash,
+                    byte_size: direct.byte_size + 1,
+                },
+            ],
+            2,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(conflict.pin_count(), 0);
+        assert!(!conflict.is_sealed());
+    }
+
+    #[test]
+    fn content_finalizer_rejects_the_wrong_job_kind_before_writing() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut job =
+            DurableCasJob::begin(directory.path(), "wrong-kind", CasJobKind::PeerClone, 1).unwrap();
+        let manifest = owner_manifest();
+        let manifest_hash = hex::encode(Sha256::digest(&manifest));
+
+        let error =
+            finalize_content_job(&mut job, &cas, &mut store, &manifest, &[], 2).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(job.pin_count(), 0);
+        assert!(!job.is_sealed());
+        assert_eq!(cas.stat_object(&manifest_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn content_finalizer_validates_all_direct_objects_before_manifest_prepare() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let manifest = owner_manifest();
+        let manifest_hash = hex::encode(Sha256::digest(&manifest));
+        let mut job = begin_content_job(directory.path(), "content-missing-direct");
+
+        let error = finalize_content_job(
+            &mut job,
+            &cas,
+            &mut store,
+            &manifest,
+            &[ContentDirectObject {
+                object_hash: "0".repeat(64),
+                byte_size: 1,
+            }],
+            2,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(job.pin_count(), 0);
+        assert!(!job.is_sealed());
+        assert_eq!(cas.stat_object(&manifest_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn content_finalizer_seals_manifest_and_direct_pins_into_catalog_and_gc_roots() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let direct = cas.prepare_bytes(b"direct object").unwrap();
+        let manifest = owner_manifest();
+        let mut job = begin_content_job(directory.path(), "content-finalized");
+
+        let prepared = finalize_content_job(
+            &mut job,
+            &cas,
+            &mut store,
+            &manifest,
+            &[ContentDirectObject {
+                object_hash: direct.content_hash.clone(),
+                byte_size: direct.byte_size,
+            }],
+            7,
+        )
+        .unwrap();
+
+        assert!(job.is_sealed());
+        assert_eq!(job.pin_count(), 2);
+        let roots = collect_durable_cas_job_roots(directory.path());
+        assert_eq!(
+            roots.manifest_hashes,
+            [prepared.content_hash.clone()].into()
+        );
+        assert_eq!(roots.object_hashes, [direct.content_hash.clone()].into());
+        assert!(roots.blockers.is_empty());
+        let catalog = store.query_asset_object_catalog(16, None).unwrap();
+        assert_eq!(catalog.items.len(), 2);
+        assert!(catalog
+            .items
+            .iter()
+            .any(|item| item.object_hash == prepared.content_hash));
+        assert!(catalog
+            .items
+            .iter()
+            .any(|item| item.object_hash == direct.content_hash));
+    }
 }
