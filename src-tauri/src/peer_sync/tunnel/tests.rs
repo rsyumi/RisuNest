@@ -1091,3 +1091,36 @@ fn nonblocking_lifecycle_reports_cleanup_pending_until_stop_retry() {
 fn windows_launcher_uses_create_no_window() {
     assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
 }
+
+#[cfg(windows)]
+#[test]
+fn closing_the_tunnel_job_terminates_its_child() {
+    let job = KillOnCloseJob::create().unwrap();
+    let mut child = Command::new("ping")
+        .args(["-t", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    if let Err(error) = job.assign(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("failed to assign test child to job: {error}");
+    }
+
+    drop(job);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("job close did not terminate its child");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}

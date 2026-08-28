@@ -464,7 +464,7 @@ pub fn run() {
             .plugin(tauri_plugin_updater::Builder::new().build());
     }
 
-    builder
+    let app = builder
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
@@ -700,8 +700,22 @@ pub fn run() {
             #[cfg(any(target_os = "windows", target_os = "android"))]
             regex_shadow::regex_cancel_batch,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        #[cfg(desktop)]
+        if run_event_requires_peer_clone_shutdown(&event) {
+            app.state::<peer_sync::commands::PeerCloneCommandState>()
+                .shutdown_for_exit();
+        }
+        #[cfg(not(desktop))]
+        let _ = (app, event);
+    });
+}
+
+#[cfg(desktop)]
+fn run_event_requires_peer_clone_shutdown(event: &tauri::RunEvent) -> bool {
+    matches!(event, tauri::RunEvent::Exit)
 }
 
 fn header_map_to_json(header_map: &HeaderMap) -> serde_json::Value {
@@ -713,4 +727,17 @@ fn header_map_to_json(header_map: &HeaderMap) -> serde_json::Value {
         );
     }
     json!(map)
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+    #[test]
+    fn peer_clone_shutdown_is_requested_only_for_the_final_exit_event() {
+        assert!(super::run_event_requires_peer_clone_shutdown(
+            &tauri::RunEvent::Exit
+        ));
+        assert!(!super::run_event_requires_peer_clone_shutdown(
+            &tauri::RunEvent::Ready
+        ));
+    }
 }

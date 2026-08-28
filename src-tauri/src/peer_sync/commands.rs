@@ -447,6 +447,31 @@ impl PeerCloneCommandState {
         })
     }
 
+    pub(crate) fn shutdown_for_exit(&self) {
+        let Some((mut host, mut tunnel, mut failed_tunnel)) =
+            self.runtime.lock().ok().and_then(|mut runtime| {
+                runtime.source.as_mut().map(|source| {
+                    (
+                        source.host.take(),
+                        source.tunnel.take(),
+                        source.failed_tunnel.take(),
+                    )
+                })
+            })
+        else {
+            return;
+        };
+        if let Some(tunnel) = tunnel.as_mut() {
+            let _ = tunnel.stop();
+        }
+        if let Some(failed_tunnel) = failed_tunnel.as_mut() {
+            let _ = failed_tunnel.stop();
+        }
+        if let Some(host) = host.as_mut() {
+            let _ = host.stop();
+        }
+    }
+
     pub fn prepare_source(
         &self,
         store: &mut PersistentStore,
@@ -2191,6 +2216,40 @@ mod tests {
     }
 
     #[test]
+    fn app_exit_shutdown_releases_runtime_before_stopping_the_tunnel() {
+        let fixture = TunnelSourceFixture::prepare("https://quick-id.trycloudflare.com/");
+        fixture
+            .source
+            .start_tunnel(&fixture.session_id, PeerCloneTunnelStart::Quick)
+            .unwrap();
+        let session_root = fixture.source.source_session_root_for_test().unwrap();
+        let stop_pause = Arc::new(Barrier::new(2));
+        fixture.launcher_state.lock().unwrap().stop_pause = Some(Arc::clone(&stop_pause));
+
+        let source = fixture.source.clone();
+        let shutdown = thread::spawn(move || source.shutdown_for_exit());
+        stop_pause.wait();
+
+        let status_source = fixture.source.clone();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || status_tx.send(status_source.source_status()).unwrap());
+        assert_eq!(
+            status_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .phase,
+            PeerCloneSourcePhase::Running
+        );
+        assert!(session_root.exists());
+
+        stop_pause.wait();
+        shutdown.join().unwrap();
+        assert_eq!(fixture.launcher_state.lock().unwrap().stop_calls, 1);
+        assert!(session_root.exists());
+    }
+
+    #[test]
     fn product_tunnel_natural_exit_reaps_the_source_session() {
         let fixture = TunnelSourceFixture::prepare("https://quick-id.trycloudflare.com/");
         fixture
@@ -2747,6 +2806,8 @@ mod tests {
         stop_failures: usize,
         lifecycle: SourceTunnelLifecycle,
         launch_pause: Option<Arc<Barrier>>,
+        stop_pause: Option<Arc<Barrier>>,
+        stop_calls: usize,
         seen_origin: Option<SocketAddr>,
         seen_token: Option<String>,
     }
@@ -2759,6 +2820,8 @@ mod tests {
                 stop_failures: 0,
                 lifecycle: SourceTunnelLifecycle::Running,
                 launch_pause: None,
+                stop_pause: None,
+                stop_calls: 0,
                 seen_origin: None,
                 seen_token: None,
             }
@@ -2835,14 +2898,20 @@ mod tests {
         }
 
         fn stop(&mut self) -> Result<(), String> {
-            {
+            let pause = {
                 let mut state = self.state.lock().unwrap();
+                state.stop_calls += 1;
                 if state.stop_failures != 0 {
                     state.stop_failures -= 1;
                     return Err(
                         "https://quick-id.trycloudflare.com/tunnel-check/probe-secret".to_owned(),
                     );
                 }
+                state.stop_pause.clone()
+            };
+            if let Some(pause) = pause {
+                pause.wait();
+                pause.wait();
             }
             if let Some(host) = self.host.as_mut() {
                 host.stop().map_err(|_| "reflected public URL".to_owned())?;
