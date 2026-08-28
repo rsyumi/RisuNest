@@ -116,15 +116,64 @@ fn peer_staging_entry_is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
     }
 }
 
+fn peer_staging_path_is_ordinary_directory(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_dir() && !peer_staging_entry_is_symlink_or_reparse(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to inspect peer sync staging path {}: {error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 fn sweep_peer_logical_staging_directories(app_root: &Path) {
     for peer_root in ["peer-delta", "peer-bidirectional"] {
-        let staging_root = app_root.join(peer_root).join("staging");
-        let Ok(entries) = fs::read_dir(&staging_root) else {
+        let peer_root = app_root.join(peer_root);
+        if !peer_staging_path_is_ordinary_directory(&peer_root) {
             continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+        }
+        let staging_root = peer_root.join("staging");
+        if !peer_staging_path_is_ordinary_directory(&staging_root) {
+            continue;
+        }
+        let entries = match fs::read_dir(&staging_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to read peer sync staging root {}: {error}",
+                    staging_root.display()
+                );
                 continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to enumerate peer sync staging root {}: {error}",
+                        staging_root.display()
+                    );
+                    continue;
+                }
+            };
+            let entry_path = entry.path();
+            let metadata = match fs::symlink_metadata(&entry_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to inspect peer sync staging entry {}: {error}",
+                        entry_path.display()
+                    );
+                    continue;
+                }
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -135,7 +184,14 @@ fn sweep_peer_logical_staging_directories(app_root: &Path) {
                 metadata.is_dir(),
                 peer_staging_entry_is_symlink_or_reparse(&metadata),
             ) {
-                let _ = fs::remove_dir_all(entry.path());
+                match fs::remove_dir_all(&entry_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => eprintln!(
+                        "warning: failed to remove peer sync staging directory {}: {error}",
+                        entry_path.display()
+                    ),
+                }
             }
         }
     }
@@ -792,6 +848,43 @@ mod tests {
             fs::read(target.join("sentinel")).expect("read preserved link target"),
             b"preserve target"
         );
+    }
+
+    #[test]
+    fn startup_sweep_does_not_traverse_linked_peer_roots() {
+        for peer_root in ["peer-delta", "peer-bidirectional"] {
+            let directory = tempdir().expect("create temporary directory");
+            let app_root = directory.path().join("app");
+            let external_peer_root = directory.path().join("external-peer-root");
+            create_staging_directory(&external_peer_root, "", CANONICAL_STAGING_NAME);
+            fs::create_dir(&app_root).expect("create app root");
+            create_directory_link(&external_peer_root, &app_root.join(peer_root));
+
+            sweep_peer_logical_staging_directories(&app_root);
+
+            assert!(external_peer_root
+                .join("staging")
+                .join(CANONICAL_STAGING_NAME)
+                .is_dir());
+        }
+    }
+
+    #[test]
+    fn startup_sweep_does_not_traverse_linked_staging_roots() {
+        for peer_root in ["peer-delta", "peer-bidirectional"] {
+            let directory = tempdir().expect("create temporary directory");
+            let app_root = directory.path().join("app");
+            let external_staging_root = directory.path().join("external-staging-root");
+            fs::create_dir_all(external_staging_root.join(CANONICAL_STAGING_NAME))
+                .expect("create external staging directory");
+            let peer_root_path = app_root.join(peer_root);
+            fs::create_dir_all(&peer_root_path).expect("create peer root");
+            create_directory_link(&external_staging_root, &peer_root_path.join("staging"));
+
+            sweep_peer_logical_staging_directories(&app_root);
+
+            assert!(external_staging_root.join(CANONICAL_STAGING_NAME).is_dir());
+        }
     }
 
     #[test]
