@@ -6,7 +6,10 @@ use super::{
 #[cfg(desktop)]
 use super::{LogicalDeltaObject, LogicalDeltaObjectSource, PreparedCloneSession};
 #[cfg(desktop)]
-use crate::asset_repository::PayloadCas;
+use crate::{
+    asset_repository::PayloadCas,
+    local_backup::{AtomicCancellation, CancellationProbe},
+};
 use serde::{Deserialize, Serialize};
 #[cfg(desktop)]
 use sha2::{Digest, Sha256};
@@ -1039,7 +1042,7 @@ enum RequestReadError {
 fn handle_connection(
     mut stream: TcpStream,
     shared: &LanShared,
-    stopped: &AtomicBool,
+    stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
     let request = match read_request(&mut stream, stopped) {
         Ok(request) => request,
@@ -1236,7 +1239,7 @@ fn handle_request(
     stream: &mut TcpStream,
     request: HttpRequest,
     shared: &LanShared,
-    stopped: &AtomicBool,
+    stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
     let prefix = format!("/v1/sessions/{}", shared.session.session_id());
     let tunnel_probe_prefix = format!("{prefix}/tunnel-check/");
@@ -1278,7 +1281,7 @@ fn handle_request(
         return bidirectional_registration(stream, request, shared, &device);
     }
     if request.url == format!("{prefix}/remote-apply") {
-        return bidirectional_remote_apply(stream, request, shared, &device);
+        return bidirectional_remote_apply(stream, request, shared, &device, stopped);
     }
     let object_prefix = format!("{prefix}/objects/");
     let Some(object) = request.url.strip_prefix(&object_prefix).map(str::to_owned) else {
@@ -1504,6 +1507,7 @@ fn bidirectional_remote_apply(
     request: HttpRequest,
     shared: &LanShared,
     device_id: &str,
+    stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
     if request.method != "POST" {
         return respond_empty(stream, 405);
@@ -1522,7 +1526,8 @@ fn bidirectional_remote_apply(
         .session
         .bidirectional_control()
         .expect("checked bidirectional session");
-    match control.remote_apply(session, request) {
+    let cancellation = AtomicCancellation::new(Arc::clone(stopped));
+    match control.remote_apply(session, request, &cancellation) {
         Ok(receipt) if receipt.is_valid() => respond_json(stream, 200, &receipt),
         Err(PeerSyncError::ActivationConflict { .. } | PeerSyncError::StaleManifest { .. }) => {
             respond_empty(stream, 409)
@@ -1664,6 +1669,7 @@ pub(crate) trait LanBidirectionalControl: Send + Sync {
         &self,
         session: LanBidirectionalSession,
         request: LanBidirectionalRemoteApplyRequest,
+        cancellation: &dyn CancellationProbe,
     ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>;
 }
 
@@ -2225,8 +2231,7 @@ mod timeout_tests {
         },
         LogicalDeltaObject, LogicalDeltaObjectSource,
     };
-    use std::collections::BTreeMap;
-    use std::io::Cursor;
+    use std::{collections::BTreeMap, io::Cursor, sync::mpsc};
 
     static LOGICAL_LAN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2595,6 +2600,7 @@ mod timeout_tests {
         registrations: Mutex<Vec<LanBidirectionalSession>>,
         remote_apply_delay: Mutex<Option<Duration>>,
         remote_apply_error: Mutex<Option<PeerSyncError>>,
+        remote_apply_started: Mutex<Option<mpsc::Sender<()>>>,
     }
 
     impl LanBidirectionalControl for BidirectionalControlFixture {
@@ -2611,7 +2617,21 @@ mod timeout_tests {
             &self,
             _session: LanBidirectionalSession,
             request: LanBidirectionalRemoteApplyRequest,
+            cancellation: &dyn CancellationProbe,
         ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+            if let Some(started) = self.remote_apply_started.lock().unwrap().take() {
+                started.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !cancellation.is_cancelled() {
+                    if Instant::now() >= deadline {
+                        return Err(PeerSyncError::Storage(
+                            "fixture did not receive source cancellation".to_owned(),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                return Err(PeerSyncError::Cancelled);
+            }
             if let Some(delay) = self.remote_apply_delay.lock().unwrap().take() {
                 thread::sleep(delay);
             }
@@ -2626,6 +2646,56 @@ mod timeout_tests {
                 backup: None,
             })
         }
+    }
+
+    #[test]
+    fn p5_source_stop_cancels_remote_apply_and_joins_the_host() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        *control.remote_apply_started.lock().unwrap() = Some(started_tx);
+        let session_id = "00000000-0000-4000-8000-000000000082";
+        let source_device_id = "00000000-0000-4000-8000-000000000083";
+        let target_device_id = "00000000-0000-4000-8000-000000000084";
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                session_id,
+                source_device_id,
+                Arc::clone(&control),
+            ));
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanBidirectionalLogicalClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+            target_device_id,
+        )
+        .unwrap();
+        let request = LanBidirectionalRemoteApplyRequest {
+            operation_id: "00000000-0000-4000-8000-000000000085".to_owned(),
+            source_endpoint: endpoint,
+            source_session_id: pairing.session_id,
+            source_manifest_id: pairing.manifest_id.clone(),
+            source_claim: pairing.claim,
+            expected_source_revision: 0,
+            expected_source_generation: LanBidirectionalGeneration {
+                generation_id: "generation-1".to_owned(),
+                manifest_hash: pairing.manifest_id.clone(),
+                generation_sequence: "1".to_owned(),
+            },
+            expected_common_base_manifest_hash: pairing.manifest_id,
+            backup_losing_side: false,
+        };
+        let requester = thread::spawn(move || client.request_remote_apply(request));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let stop_started = Instant::now();
+        host.stop().unwrap();
+
+        assert!(stop_started.elapsed() < Duration::from_secs(1));
+        assert!(requester.join().unwrap().is_err());
     }
 
     fn prepared_bidirectional_logical_session(

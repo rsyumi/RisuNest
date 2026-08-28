@@ -1,9 +1,13 @@
 use super::PeerSyncError;
-use crate::{asset_repository::PayloadCas, peer_sync::logical_delta::decode_logical_record_key};
+use crate::{
+    asset_repository::PayloadCas,
+    local_backup::{CancellationProbe, NeverCancelled},
+    peer_sync::logical_delta::decode_logical_record_key,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
+    io::{self, Read},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +180,7 @@ where
         source,
         target,
         |_| Ok(()),
+        &NeverCancelled,
     )
 }
 
@@ -187,6 +192,7 @@ pub(crate) fn execute_logical_delta_pull_with_pre_activation<S, T, F>(
     source: &mut S,
     target: &mut T,
     before_activation: F,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<LogicalDeltaActivation, PeerSyncError>
 where
     S: LogicalDeltaObjectSource,
@@ -196,12 +202,14 @@ where
     let mut stage = target.begin(plan)?;
     let result = (|| {
         if target.can_activate_without_transfer(&stage) {
+            check_cancelled(cancellation)?;
             before_activation(&LogicalDeltaTransferSelection {
                 reused_from_local_manifest: Vec::new(),
                 reused_from_cas: Vec::new(),
                 missing_objects: Vec::new(),
             })?;
             target.prepare_activation(&mut stage)?;
+            check_cancelled(cancellation)?;
             return target.activate_database_and_base_if_current(
                 &mut stage,
                 plan.expected_local_revision,
@@ -216,15 +224,23 @@ where
             target_cas,
             remote_object_sizes,
         )?;
+        check_cancelled(cancellation)?;
         before_activation(&selection)?;
         for object in selection.missing_objects() {
             let mut source_reader = source.open_object(object)?;
-            let mut verified_reader = VerifiedObjectReader::new(source_reader.as_mut());
-            target.stage_payload(&mut stage, object, &mut verified_reader)?;
+            let mut cancellable_reader = CancellableReader {
+                inner: source_reader.as_mut(),
+                cancellation,
+            };
+            let mut verified_reader = VerifiedObjectReader::new(&mut cancellable_reader);
+            let staged = target.stage_payload(&mut stage, object, &mut verified_reader);
+            check_cancelled(cancellation)?;
+            staged?;
             verified_reader.finish(object)?;
         }
         target.stage_database_changes(&mut stage, plan)?;
         target.prepare_activation(&mut stage)?;
+        check_cancelled(cancellation)?;
         target.activate_database_and_base_if_current(
             &mut stage,
             plan.expected_local_revision,
@@ -246,6 +262,31 @@ where
                 "{primary}; logical delta staging abort failed: {abort}"
             ))),
         },
+    }
+}
+
+fn check_cancelled(cancellation: &dyn CancellationProbe) -> Result<(), PeerSyncError> {
+    if cancellation.is_cancelled() {
+        Err(PeerSyncError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+struct CancellableReader<'a> {
+    inner: &'a mut dyn Read,
+    cancellation: &'a dyn CancellationProbe,
+}
+
+impl Read for CancellableReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "logical delta transfer cancelled",
+            ));
+        }
+        self.inner.read(output)
     }
 }
 
@@ -434,11 +475,19 @@ mod tests {
         LogicalDeltaObject, LogicalDeltaObjectSource, LogicalDeltaStagedTarget,
         ReadyLogicalDeltaPlan,
     };
-    use crate::{asset_repository::PayloadCas, peer_sync::PeerSyncError};
+    use crate::{
+        asset_repository::PayloadCas,
+        local_backup::{AtomicCancellation, NeverCancelled},
+        peer_sync::PeerSyncError,
+    };
     use sha2::{Digest, Sha256};
     use std::{
         collections::{BTreeMap, BTreeSet},
         io::{Cursor, Read},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
 
     fn hash(bytes: &[u8]) -> String {
@@ -586,6 +635,7 @@ mod tests {
         events: Vec<String>,
         aborts: usize,
         fail_database_stage: bool,
+        cancel_on_prepare: Option<Arc<AtomicBool>>,
     }
 
     impl FixtureTarget {
@@ -598,6 +648,7 @@ mod tests {
                 events: Vec::new(),
                 aborts: 0,
                 fail_database_stage: false,
+                cancel_on_prepare: None,
             }
         }
     }
@@ -645,6 +696,9 @@ mod tests {
 
         fn prepare_activation(&mut self, _stage: &mut Self::Stage) -> Result<(), PeerSyncError> {
             self.events.push("prepare".to_owned());
+            if let Some(cancelled) = &self.cancel_on_prepare {
+                cancelled.store(true, Ordering::SeqCst);
+            }
             Ok(())
         }
 
@@ -916,6 +970,7 @@ mod tests {
                     "simulated durable evidence failure".to_owned(),
                 ))
             },
+            &NeverCancelled,
         )
         .unwrap_err();
 
@@ -933,6 +988,45 @@ mod tests {
         assert_eq!(target.aborts, 1);
         assert!(!target.events.iter().any(|event| event == "database"));
         assert!(!target.events.iter().any(|event| event == "prepare"));
+        assert_eq!(target.events.last().map(String::as_str), Some("abort"));
+        assert!(!target.events.iter().any(|event| event == "activate"));
+    }
+
+    #[test]
+    fn cancellation_after_prepare_aborts_before_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), payload)]),
+            content_gets: 0,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let mut target = FixtureTarget::new();
+        target.cancel_on_prepare = Some(cancelled);
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash, b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.active_base, "1".repeat(64));
+        assert_eq!(target.aborts, 1);
         assert_eq!(target.events.last().map(String::as_str), Some("abort"));
         assert!(!target.events.iter().any(|event| event == "activate"));
     }

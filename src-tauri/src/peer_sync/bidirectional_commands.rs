@@ -17,11 +17,12 @@ use crate::{
         job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
         PayloadCas,
     },
-    local_backup::NeverCancelled,
+    local_backup::{CancellationProbe, NeverCancelled},
     lossless_backup::{
         create_and_verify_lossless_backup_v1_report,
         create_and_verify_peer_bidirectional_backup_v1_report,
-        verify_lossless_package_v1_for_production, LosslessPeerSourceBinding,
+        verify_lossless_package_v1_for_production, LosslessError, LosslessErrorCode,
+        LosslessPeerSourceBinding,
     },
     persistent_store::{
         self, logical_delta_source::LogicalDeltaSourceSession, LogicalDeltaConflictKind,
@@ -569,6 +570,7 @@ fn verify_bidirectional_backup_receipt(
     side: PeerBidirectionalBackupSide,
     expected_source: &SyncGenerationIdentity,
     expected_package_id: Option<&str>,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
     #[cfg(test)]
     BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
@@ -578,9 +580,8 @@ fn verify_bidirectional_backup_receipt(
             "bidirectional backup path is not a regular file".to_owned(),
         ));
     }
-    let verified =
-        verify_lossless_package_v1_for_production(&mut File::open(path)?, &NeverCancelled)
-            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    let verified = verify_lossless_package_v1_for_production(&mut File::open(path)?, cancellation)
+        .map_err(peer_backup_error)?;
     if verified
         .manifest
         .extensions
@@ -650,6 +651,7 @@ fn verify_source_prepared_backup(
         PeerBidirectionalBackupSide::Remote,
         &evidence.expected_source_generation,
         Some(&backup.package_id),
+        &NeverCancelled,
     )?;
     if verified.path != backup.path {
         return Err(PeerSyncError::Storage(
@@ -731,6 +733,7 @@ fn ensure_bidirectional_backup_receipt(
     side: PeerBidirectionalBackupSide,
     expected_source: &SyncGenerationIdentity,
     bound_package_id: Option<&str>,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<VerifiedBidirectionalBackupReceipt, PeerSyncError> {
     let backup_path = bidirectional_backup_path(app_root, operation_id, side.clone());
     let backup_root = backup_path.parent().ok_or_else(|| {
@@ -745,6 +748,7 @@ fn ensure_bidirectional_backup_receipt(
             side.clone(),
             expected_source,
             bound_package_id,
+            cancellation,
         ) {
             Ok(receipt) => {
                 #[cfg(not(windows))]
@@ -777,6 +781,7 @@ fn ensure_bidirectional_backup_receipt(
             side.clone(),
             expected_source,
             None,
+            cancellation,
         ) {
             Ok(receipt) => {
                 replace_file_atomic(&temporary, &backup_path)?;
@@ -795,7 +800,7 @@ fn ensure_bidirectional_backup_receipt(
         store,
         expected_revision,
         &source_binding,
-        &NeverCancelled,
+        cancellation,
     ) {
         Ok(report) => {
             match fs::symlink_metadata(&backup_path) {
@@ -807,6 +812,7 @@ fn ensure_bidirectional_backup_receipt(
                         side.clone(),
                         expected_source,
                         bound_package_id,
+                        cancellation,
                     ) {
                         Ok(receipt) => {
                             fs::remove_file(&temporary)?;
@@ -834,7 +840,15 @@ fn ensure_bidirectional_backup_receipt(
                 published: true,
             })
         }
-        Err(error) => Err(PeerSyncError::Storage(error.to_string())),
+        Err(error) => Err(peer_backup_error(error)),
+    }
+}
+
+fn peer_backup_error(error: LosslessError) -> PeerSyncError {
+    if error.code == LosslessErrorCode::Cancelled {
+        PeerSyncError::Cancelled
+    } else {
+        PeerSyncError::Storage(error.to_string())
     }
 }
 
@@ -1441,6 +1455,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
                 PeerBidirectionalBackupSide::Local,
                 &local_generation,
                 Some(&receipt.package_id),
+                &NeverCancelled,
             )?;
         } else {
             backups.push(
@@ -1453,6 +1468,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
                     PeerBidirectionalBackupSide::Local,
                     &local_generation,
                     None,
+                    &NeverCancelled,
                 )?
                 .into_receipt(),
             );
@@ -1571,6 +1587,7 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
         None,
         None,
         None,
+        &NeverCancelled,
     )
     .map(VerifiedRemoteApplyReceipt::into_receipt)
 }
@@ -1592,6 +1609,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     source_device_id: Option<&str>,
     retained_source: Option<&SourcePreparedEvidence>,
     retained_source_job_id: Option<&str>,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<VerifiedRemoteApplyReceipt, PeerSyncError> {
     if uuid::Uuid::parse_str(operation_id)
         .map(|value| value.to_string() != operation_id)
@@ -1663,6 +1681,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
                         PeerBidirectionalBackupSide::Remote,
                         expected_losing_generation,
                         None,
+                        cancellation,
                     )?;
                     Some(VerifiedBidirectionalBackupReceipt {
                         receipt,
@@ -1731,6 +1750,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             PeerBidirectionalBackupSide::Remote,
             expected_losing_generation,
             bound_package_id,
+            cancellation,
         )?;
         debug_assert!(bound_package_id.is_none() || !verified.published);
         Some(verified)
@@ -1955,6 +1975,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             }
             Ok(())
         },
+        cancellation,
     );
     let (transferred_objects, transferred_bytes) = measured_source.totals();
     drop(target);
@@ -2513,6 +2534,7 @@ fn verify_source_remote_backup(
         PeerBidirectionalBackupSide::Remote,
         expected_source,
         Some(&backup.package_id),
+        &NeverCancelled,
     )?;
     Ok(())
 }
@@ -2841,6 +2863,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
         &self,
         session: LanBidirectionalSession,
         request: LanBidirectionalRemoteApplyRequest,
+        cancellation: &dyn CancellationProbe,
     ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
         self.validate_session(&session)?;
         let cas = PayloadCas::new(&self.app_root)?;
@@ -2935,6 +2958,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
             Some(&self.source_device_id),
             retained_source.as_ref(),
             retained_source_job_id.as_deref(),
+            cancellation,
         )?;
         let evidence = PeerBidirectionalOperationJournal::new(&self.app_root)
             .load()?
@@ -4342,6 +4366,7 @@ mod tests {
             job_pins::{collect_durable_cas_job_roots, CasObjectRole},
             PayloadCas,
         },
+        local_backup::AtomicCancellation,
         peer_sync::logical_delta::{
             build_logical_manifest, encode_logical_manifest, LogicalManifestBuilderInput,
             LogicalRecordEnvelope, LogicalRecordLocator, ProjectedLogicalRecord,
@@ -4356,7 +4381,10 @@ mod tests {
     use std::{
         collections::BTreeMap,
         io::Cursor,
-        sync::{mpsc, Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
         thread,
     };
 
@@ -4715,6 +4743,7 @@ mod tests {
                 PeerBidirectionalBackupSide::Local,
                 &source,
                 None,
+                &NeverCancelled,
             )
             .unwrap_err();
 
@@ -4764,6 +4793,7 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             None,
+            &NeverCancelled,
         )
         .unwrap()
         .into_receipt();
@@ -4778,6 +4808,7 @@ mod tests {
                 PeerBidirectionalBackupSide::Local,
                 &source,
                 Some(&receipt.package_id),
+                &NeverCancelled,
             )
             .unwrap(),
             receipt
@@ -4839,6 +4870,7 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             None,
+            &NeverCancelled,
         )
         .unwrap()
         .into_receipt();
@@ -4888,6 +4920,7 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             None,
+            &NeverCancelled,
         )
         .unwrap()
         .into_receipt();
@@ -4904,6 +4937,7 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             Some(&receipt.package_id),
+            &NeverCancelled,
         )
         .unwrap_err();
         assert!(matches!(error, PeerSyncError::Storage(_)));
@@ -4942,6 +4976,7 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             None,
+            &NeverCancelled,
         )
         .is_err());
         assert!(final_path.exists());
@@ -4957,6 +4992,7 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             None,
+            &NeverCancelled,
         )
         .is_err());
         assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
@@ -4972,11 +5008,98 @@ mod tests {
             PeerBidirectionalBackupSide::Local,
             &source,
             None,
+            &NeverCancelled,
         )
         .unwrap();
         assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
         assert!(!recovered.published);
         assert_eq!(Path::new(&recovered.receipt.path), final_path);
+    }
+
+    #[test]
+    fn source_backup_cancellation_preserves_authority_and_removes_incomplete_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer_id = "123e4567-e89b-42d3-a456-426614174097";
+        let operation_id = "123e4567-e89b-42d3-a456-426614174098";
+        let source = SyncGenerationIdentity {
+            generation_id: active.manifest.generation.clone(),
+            manifest_hash: active.manifest_hash.clone(),
+            generation_sequence: active.manifest.generation_sequence.clone(),
+        };
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &active.manifest.generation,
+            1,
+            &active.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    source.clone(),
+                    0,
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap();
+        let expected_ack = store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let expected_common = store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Remote,
+            &source,
+            None,
+            &AtomicCancellation::new(Arc::clone(&cancelled)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_ack
+        );
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_common
+        );
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert!(!bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        )
+        .exists());
     }
 
     fn remote_disjoint_manifest(
@@ -5878,6 +6001,7 @@ mod tests {
             Some(source_device_id),
             None,
             None,
+            &NeverCancelled,
         )
         .unwrap()
         .into_receipt();
@@ -5959,7 +6083,7 @@ mod tests {
         request.source_claim = pairing.claim;
         SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT.with(|enabled| enabled.set(true));
         let retry_error = control
-            .remote_apply(session.clone(), request.clone())
+            .remote_apply(session.clone(), request.clone(), &NeverCancelled)
             .unwrap_err();
         assert!(
             matches!(&retry_error, PeerSyncError::Storage(message) if message.contains("pre-activation")),
@@ -5986,7 +6110,7 @@ mod tests {
 
         assert_eq!(
             control
-                .remote_apply(session.clone(), request.clone())
+                .remote_apply(session.clone(), request.clone(), &NeverCancelled)
                 .unwrap(),
             receipt.clone()
         );
@@ -6007,14 +6131,14 @@ mod tests {
         ));
         assert_eq!(
             control
-                .remote_apply(session.clone(), request.clone())
+                .remote_apply(session.clone(), request.clone(), &NeverCancelled)
                 .unwrap(),
             receipt
         );
         let mut mismatched_backup = request.clone();
         mismatched_backup.backup_losing_side = true;
         assert!(matches!(
-            control.remote_apply(session.clone(), mismatched_backup),
+            control.remote_apply(session.clone(), mismatched_backup, &NeverCancelled),
             Err(PeerSyncError::Validation(_))
         ));
 
@@ -6034,7 +6158,7 @@ mod tests {
         }
         journal.store(&mismatched).unwrap();
         assert!(matches!(
-            control.remote_apply(session, request),
+            control.remote_apply(session, request, &NeverCancelled),
             Err(PeerSyncError::Storage(_) | PeerSyncError::Validation(_))
         ));
     }
@@ -6107,6 +6231,7 @@ mod tests {
             Some(source_device_id),
             None,
             None,
+            &NeverCancelled,
         )
         .unwrap()
         .into_receipt();
@@ -6159,7 +6284,9 @@ mod tests {
         );
 
         assert_eq!(
-            control.remote_apply(session, request).unwrap(),
+            control
+                .remote_apply(session, request, &NeverCancelled)
+                .unwrap(),
             receipt.clone()
         );
         drop(control);
@@ -6275,6 +6402,7 @@ mod tests {
             Some(source_device_id),
             Some(&evidence),
             Some(durable_job_id),
+            &NeverCancelled,
         )
         .unwrap_err();
 
@@ -8682,7 +8810,9 @@ mod tests {
             &session.session_id,
             source_device_id,
         );
-        let error = control.remote_apply(session, request).unwrap_err();
+        let error = control
+            .remote_apply(session, request, &NeverCancelled)
+            .unwrap_err();
         drop(control);
         let store = PersistentStore::open(directory.path()).unwrap();
 
@@ -8865,7 +8995,7 @@ mod tests {
 
         SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         let error = control
-            .remote_apply(session.clone(), request.clone())
+            .remote_apply(session.clone(), request.clone(), &NeverCancelled)
             .unwrap_err();
         assert!(
             matches!(error, PeerSyncError::Storage(message) if message.contains("source-prepared"))
@@ -8939,7 +9069,7 @@ mod tests {
 
         SOURCE_AFTER_PREPARED_STORE_PANIC.with(|enabled| enabled.set(true));
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            control.remote_apply(session.clone(), request.clone())
+            control.remote_apply(session.clone(), request.clone(), &NeverCancelled)
         }));
         assert!(crashed.is_err());
         drop(control);
@@ -9005,7 +9135,7 @@ mod tests {
         );
         SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT.with(|enabled| enabled.set(true));
         let handoff_error = recovery_control
-            .remote_apply(session.clone(), request.clone())
+            .remote_apply(session.clone(), request.clone(), &NeverCancelled)
             .unwrap_err();
         assert!(
             matches!(&handoff_error, PeerSyncError::Storage(message) if message.contains("pre-activation")),
@@ -9091,7 +9221,7 @@ mod tests {
 
         SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT.with(|enabled| enabled.set(true));
         let observer_error = recovery_control
-            .remote_apply(session.clone(), request.clone())
+            .remote_apply(session.clone(), request.clone(), &NeverCancelled)
             .unwrap_err();
         assert!(
             matches!(&observer_error, PeerSyncError::Storage(message) if message.contains("pre-activation")),
@@ -9133,7 +9263,7 @@ mod tests {
         SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         SOURCE_COMPLETE_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         let error = recovery_control
-            .remote_apply(session.clone(), request.clone())
+            .remote_apply(session.clone(), request.clone(), &NeverCancelled)
             .unwrap_err();
         assert!(SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.replace(false)));
         assert!(
