@@ -5,11 +5,21 @@ import type { LocalColdStorageRuntime } from './localColdStorageRuntime'
 const mocks = vi.hoisted(() => {
     let rootRevision = 4
     let coordinatorRevision = 4
+    let nextAssetPutFailure: unknown
+    let nextAssetPostReadFailure: unknown
+    let pendingRootReadFailure: unknown
     const adoptedRevisions: number[] = []
     const lockOrder: string[] = []
     const assetDispatcher: BlobStore = {
         put: vi.fn(async (key, data, metadata) => {
             rootRevision++
+            if (nextAssetPutFailure !== undefined) {
+                const failure = nextAssetPutFailure
+                nextAssetPutFailure = undefined
+                pendingRootReadFailure = nextAssetPostReadFailure
+                nextAssetPostReadFailure = undefined
+                throw failure
+            }
             return { ...metadata, key, size: data.byteLength }
         }),
         putNewInlayImage: vi.fn(async (key, data, input) => {
@@ -58,6 +68,11 @@ const mocks = vi.hoisted(() => {
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => {
             lockOrder.push('root:read')
+            if (pendingRootReadFailure !== undefined) {
+                const failure = pendingRootReadFailure
+                pendingRootReadFailure = undefined
+                throw failure
+            }
             return { revision: rootRevision, value: {} }
         }),
         readAssetRepositoryAuthority: vi.fn(async () => ({
@@ -91,6 +106,10 @@ const mocks = vi.hoisted(() => {
         gate,
         lockOrder,
         rawStore,
+        rejectNextAssetPut(error: unknown, postReadError?: unknown) {
+            nextAssetPutFailure = error
+            nextAssetPostReadFailure = postReadError
+        },
         runStorageOnlyMutation,
     }
 })
@@ -217,5 +236,45 @@ describe('persistent storage runtime routing', () => {
             'root:read',
         ])
         await expect(mocks.flushPendingData()).resolves.toBeUndefined()
+    })
+
+    it('adopts a committed native asset revision before rethrowing a later write failure', async () => {
+        await initializePersistentStorage()
+        const store = configuredAssetStore
+        if (!store) throw new Error('Active BlobStore was not configured')
+        const failure = new Error('durable session release failed after alias commit')
+        const previousRevision = mocks.adoptedRevisions.at(-1) ?? 4
+        const revisionOffset = mocks.adoptedRevisions.length
+        mocks.rejectNextAssetPut(failure)
+
+        await expect(store.put('assets/committed.png', new Uint8Array([4]), {
+            kind: 'asset',
+            mime: 'image/png',
+            name: 'committed.png',
+            ext: 'png',
+        })).rejects.toBe(failure)
+
+        expect(mocks.adoptedRevisions.slice(revisionOffset)).toEqual([previousRevision + 1])
+        await expect(mocks.flushPendingData()).resolves.toBeUndefined()
+    })
+
+    it('preserves both failures when a committed write and its revision read fail', async () => {
+        await initializePersistentStorage()
+        const store = configuredAssetStore
+        if (!store) throw new Error('Active BlobStore was not configured')
+        const writeFailure = new Error('durable session release failed after alias commit')
+        const readFailure = new Error('root revision read failed')
+        mocks.rejectNextAssetPut(writeFailure, readFailure)
+
+        const failure = await store.put('assets/uncertain.png', new Uint8Array([5]), {
+            kind: 'asset',
+            mime: 'image/png',
+            name: 'uncertain.png',
+            ext: 'png',
+        }).catch((error: unknown) => error)
+
+        expect(failure).toBeInstanceOf(AggregateError)
+        expect((failure as AggregateError).errors).toEqual([writeFailure, readFailure])
+        await expect(mocks.flushPendingData()).rejects.toThrow('stale revision')
     })
 })

@@ -85,15 +85,29 @@ function createCoordinatorOwnedAssetBlobStore(
 ): BlobStore {
     const mutate = async <T>(key: string, operation: () => Promise<T>): Promise<T> => {
         let result!: T
+        let operationFailure: { error: unknown } | null = null
         await getPersistentDataRuntime().runStorageOnlyMutation((expectedRevision) =>
             authority.gate.runKeyedWrite(key, async () => {
                 const before = await authority.rawStore.readRoot()
                 if (before.revision !== expectedRevision) {
                     throw new RevisionConflictError(expectedRevision, before.revision)
                 }
-                result = await operation()
-                return (await authority.rawStore.readRoot()).revision
+                try {
+                    result = await operation()
+                } catch (error) {
+                    operationFailure = { error }
+                }
+                try {
+                    return (await authority.rawStore.readRoot()).revision
+                } catch (error) {
+                    if (!operationFailure) throw error
+                    throw new AggregateError(
+                        [operationFailure.error, error],
+                        `Asset mutation and revision read failed for ${key}`,
+                    )
+                }
             }))
+        if (operationFailure) throw operationFailure.error
         return result
     }
     const coordinated: BlobStore = {
