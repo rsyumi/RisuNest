@@ -24,9 +24,15 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
     androidSafExportId: () => getAndroidSafExportSourceId(),
 }
 
-function characterCharxHandoffId(path: string): string | null {
-    return /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.charx$/
-        .exec(path)?.[1] ?? null
+function androidSafHandoffId(status: NativeFileJobStatus): string | null {
+    const path = status.result?.handoffPath
+    if (!path) return null
+    const pattern = status.kind === 'export-lossless-backup'
+        ? /(?:^|[\\/])risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risulossless$/
+        : status.kind === 'export-character-charx'
+            ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.charx$/
+            : null
+    return pattern?.exec(path)?.[1] ?? null
 }
 
 export function shouldReconcileNativeFileJobs(
@@ -81,6 +87,11 @@ async function reconcileExportInBackground(
         }) as NativeFileJobStatus
     }
     try {
+        const handoffId = androidSafHandoffId(status)
+        if (handoffId && dependencies.androidSafExportId?.() === handoffId) {
+            retainNativeJob = true
+            return
+        }
         if (status.kind === 'export-lossless-backup' && status.result?.handoffPath) {
             await dependencies.invoke('native_lossless_handoff_cleanup', {
                 path: status.result.handoffPath,
@@ -92,11 +103,6 @@ async function reconcileExportInBackground(
             })
         }
         else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
-            const handoffId = characterCharxHandoffId(status.result.handoffPath)
-            if (handoffId && dependencies.androidSafExportId?.() === handoffId) {
-                retainNativeJob = true
-                return
-            }
             retainNativeJob = true
             await dependencies.invoke('native_character_charx_handoff_cleanup', {
                 path: status.result.handoffPath,
