@@ -227,6 +227,7 @@ where
         check_cancelled(cancellation)?;
         before_activation(&selection)?;
         for object in selection.missing_objects() {
+            check_cancelled(cancellation)?;
             let mut source_reader = source.open_object(object)?;
             let mut cancellable_reader = CancellableReader {
                 inner: source_reader.as_mut(),
@@ -236,7 +237,9 @@ where
             let staged = target.stage_payload(&mut stage, object, &mut verified_reader);
             check_cancelled(cancellation)?;
             staged?;
-            verified_reader.finish(object)?;
+            let verified = verified_reader.finish(object);
+            check_cancelled(cancellation)?;
+            verified?;
         }
         target.stage_database_changes(&mut stage, plan)?;
         target.prepare_activation(&mut stage)?;
@@ -281,10 +284,7 @@ struct CancellableReader<'a> {
 impl Read for CancellableReader<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if self.cancellation.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "logical delta transfer cancelled",
-            ));
+            return Err(io::Error::other("logical delta transfer cancelled"));
         }
         self.inner.read(output)
     }
@@ -477,15 +477,15 @@ mod tests {
     };
     use crate::{
         asset_repository::PayloadCas,
-        local_backup::{AtomicCancellation, NeverCancelled},
+        local_backup::{AtomicCancellation, CancellationProbe, NeverCancelled},
         peer_sync::PeerSyncError,
     };
     use sha2::{Digest, Sha256};
     use std::{
         collections::{BTreeMap, BTreeSet},
-        io::{Cursor, Read},
+        io::{self, Cursor, Read},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -992,6 +992,97 @@ mod tests {
         assert!(!target.events.iter().any(|event| event == "activate"));
     }
 
+    struct CancellingSource {
+        object: Vec<u8>,
+        cancelled: Arc<AtomicBool>,
+        content_gets: usize,
+    }
+
+    impl LogicalDeltaObjectSource for CancellingSource {
+        fn open_object(
+            &mut self,
+            _object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            self.content_gets += 1;
+            Ok(Box::new(CancelAfterFirstRead {
+                inner: Cursor::new(self.object.clone()),
+                cancelled: Arc::clone(&self.cancelled),
+                first_read: true,
+            }))
+        }
+    }
+
+    struct CancelAfterFirstRead {
+        inner: Cursor<Vec<u8>>,
+        cancelled: Arc<AtomicBool>,
+        first_read: bool,
+    }
+
+    struct CancelBetweenObjects {
+        first_object_eof: Arc<AtomicBool>,
+        checks_after_eof: AtomicUsize,
+    }
+
+    impl CancellationProbe for CancelBetweenObjects {
+        fn is_cancelled(&self) -> bool {
+            if !self.first_object_eof.load(Ordering::SeqCst) {
+                return false;
+            }
+            self.checks_after_eof.fetch_add(1, Ordering::SeqCst) >= 2
+        }
+    }
+
+    struct EofSignallingSource {
+        objects: BTreeMap<String, Vec<u8>>,
+        first_object_eof: Arc<AtomicBool>,
+        content_gets: usize,
+    }
+
+    impl LogicalDeltaObjectSource for EofSignallingSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            self.content_gets += 1;
+            let bytes = self
+                .objects
+                .get(&object.hash)
+                .cloned()
+                .ok_or_else(|| PeerSyncError::Storage("missing fixture object".to_owned()))?;
+            Ok(Box::new(EofSignallingReader {
+                inner: Cursor::new(bytes),
+                eof: Arc::clone(&self.first_object_eof),
+            }))
+        }
+    }
+
+    struct EofSignallingReader {
+        inner: Cursor<Vec<u8>>,
+        eof: Arc<AtomicBool>,
+    }
+
+    impl Read for EofSignallingReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(output)?;
+            if read == 0 {
+                self.eof.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+    }
+
+    impl Read for CancelAfterFirstRead {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let limit = output.len().min(4);
+            let read = self.inner.read(&mut output[..limit])?;
+            if self.first_read && read != 0 {
+                self.first_read = false;
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+    }
+
     #[test]
     fn cancellation_after_prepare_aborts_before_activation() {
         let directory = tempfile::tempdir().unwrap();
@@ -1028,6 +1119,142 @@ mod tests {
         assert_eq!(target.active_base, "1".repeat(64));
         assert_eq!(target.aborts, 1);
         assert_eq!(target.events.last().map(String::as_str), Some("abort"));
+        assert!(!target.events.iter().any(|event| event == "activate"));
+    }
+
+    #[test]
+    fn cancellation_during_stage_payload_aborts_without_retrying_the_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let mut source = CancellingSource {
+            object: payload,
+            cancelled,
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash, b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.content_gets, 1);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.aborts, 1);
+        assert!(!target.events.iter().any(|event| event == "database"));
+        assert!(!target.events.iter().any(|event| event == "activate"));
+    }
+
+    #[test]
+    fn cancellation_in_pre_activation_callback_starts_no_object_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), payload)]),
+            content_gets: 0,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let mut target = FixtureTarget::new();
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash, b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+            |_| {
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.content_gets, 0);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.aborts, 1);
+        assert!(!target
+            .events
+            .iter()
+            .any(|event| event.starts_with("payload:")));
+        assert!(!target.events.iter().any(|event| event == "database"));
+    }
+
+    #[test]
+    fn cancellation_between_objects_starts_no_second_object_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let first_payload = b"first-remote-payload".to_vec();
+        let second_payload = b"second-remote-payload".to_vec();
+        let first_hash = hash(&first_payload);
+        let second_hash = hash(&second_payload);
+        let plan = ready_plan(
+            vec![
+                put("r1:asset:WyJhIl0", first_hash.clone(), vec![]),
+                put("r1:asset:WyJiIl0", second_hash.clone(), vec![]),
+            ],
+            vec![first_hash.clone(), second_hash.clone()],
+        );
+        let first_object_eof = Arc::new(AtomicBool::new(false));
+        let cancellation = CancelBetweenObjects {
+            first_object_eof: Arc::clone(&first_object_eof),
+            checks_after_eof: AtomicUsize::new(0),
+        };
+        let mut source = EofSignallingSource {
+            objects: BTreeMap::from([
+                (first_hash.clone(), first_payload),
+                (second_hash.clone(), second_payload),
+            ]),
+            first_object_eof,
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([
+                (first_hash, b"first-remote-payload".len() as u64),
+                (second_hash, b"second-remote-payload".len() as u64),
+            ]),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.content_gets, 1);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.aborts, 1);
+        assert!(!target.events.iter().any(|event| event == "database"));
         assert!(!target.events.iter().any(|event| event == "activate"));
     }
 

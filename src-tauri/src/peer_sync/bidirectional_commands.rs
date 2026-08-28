@@ -57,6 +57,7 @@ thread_local! {
     static SOURCE_PREPARED_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_PREPARED_STORE_PANIC: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+    static SOURCE_AFTER_BACKUP_PUBLISH_CANCEL_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
     static BACKUP_FULL_VERIFICATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
@@ -849,6 +850,21 @@ fn peer_backup_error(error: LosslessError) -> PeerSyncError {
         PeerSyncError::Cancelled
     } else {
         PeerSyncError::Storage(error.to_string())
+    }
+}
+
+fn remove_newly_published_backup_after_cancellation(
+    path: Option<&Path>,
+) -> Result<(), PeerSyncError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PeerSyncError::Storage(format!(
+            "source cancellation could not remove its newly published backup: {error}"
+        ))),
     }
 }
 
@@ -1757,6 +1773,11 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     } else {
         None
     };
+    let newly_published_backup = verified_backup.as_ref().and_then(|verified| {
+        verified.published.then(|| {
+            bidirectional_backup_path(app_root, operation_id, PeerBidirectionalBackupSide::Remote)
+        })
+    });
     let backup = verified_backup.as_ref().map(|verified| {
         let receipt = verified.receipt();
         LanBidirectionalBackupReceipt {
@@ -1764,6 +1785,14 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             path: receipt.path.clone(),
         }
     });
+    let cancel_after_backup = cancellation.is_cancelled();
+    #[cfg(test)]
+    let cancel_after_backup = cancel_after_backup
+        || SOURCE_AFTER_BACKUP_PUBLISH_CANCEL_FAILPOINT.with(|enabled| enabled.replace(false));
+    if cancel_after_backup {
+        remove_newly_published_backup_after_cancellation(newly_published_backup.as_deref())?;
+        return Err(PeerSyncError::Cancelled);
+    }
     let (durable_job_id, stage_with_durable_job, durable_job) =
         if let Some(retained_job_id) = retained_source_job_id {
             match DurableCasJob::open(app_root, retained_job_id) {
@@ -1996,6 +2025,11 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
         Err(error) => {
             if prepared_evidence.borrow().is_none() {
                 let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+                if error == PeerSyncError::Cancelled {
+                    remove_newly_published_backup_after_cancellation(
+                        newly_published_backup.as_deref(),
+                    )?;
+                }
             }
             return Err(error);
         }
@@ -5100,6 +5134,156 @@ mod tests {
             PeerBidirectionalBackupSide::Remote,
         )
         .exists());
+    }
+
+    fn assert_source_post_publish_cancellation(preexisting_backup: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer_id = "123e4567-e89b-42d3-a456-426614174095";
+        let source_device_id = "123e4567-e89b-42d3-a456-426614174096";
+        let operation_id = "123e4567-e89b-42d3-a456-426614174097";
+        let source_identity = SyncGenerationIdentity {
+            generation_id: active.manifest.generation.clone(),
+            manifest_hash: active.manifest_hash.clone(),
+            generation_sequence: active.manifest.generation_sequence.clone(),
+        };
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &active.manifest.generation,
+            1,
+            &active.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    source_identity.clone(),
+                    0,
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap();
+        let expected_ack = store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let expected_common = store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let backup_path = bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        );
+        let preexisting_bytes = if preexisting_backup {
+            let ensured = ensure_bidirectional_backup_receipt(
+                &mut store,
+                &cas,
+                directory.path(),
+                operation_id,
+                1,
+                PeerBidirectionalBackupSide::Remote,
+                &source_identity,
+                &NeverCancelled,
+            )
+            .unwrap();
+            assert!(ensured.published);
+            Some(fs::read(&backup_path).unwrap())
+        } else {
+            None
+        };
+        fs::create_dir_all(directory.path().join("assets-v2").join("job-pins")).unwrap();
+        let jobs_before = durable_job_journal_ids(directory.path());
+        let shared_generation = LanBidirectionalGeneration {
+            generation_id: active.manifest.generation.clone(),
+            manifest_hash: active.manifest_hash.clone(),
+            generation_sequence: active.manifest.generation_sequence.clone(),
+        };
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            reads: 0,
+        };
+        SOURCE_AFTER_BACKUP_PUBLISH_CANCEL_FAILPOINT.with(|enabled| enabled.set(true));
+
+        let error = apply_bidirectional_remote_shared_inner(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            peer_id,
+            1,
+            &source_identity.manifest_hash,
+            &source_identity,
+            shared_generation,
+            &active.manifest_bytes,
+            &mut source,
+            true,
+            Some(source_device_id),
+            None,
+            None,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.reads, 0);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_ack
+        );
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_common
+        );
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(durable_job_journal_ids(directory.path()), jobs_before);
+        match preexisting_bytes {
+            Some(bytes) => assert_eq!(fs::read(&backup_path).unwrap(), bytes),
+            None => assert!(!backup_path.exists()),
+        }
+    }
+
+    #[test]
+    fn cancellation_after_new_backup_publication_removes_the_unbound_backup() {
+        assert_source_post_publish_cancellation(false);
+    }
+
+    #[test]
+    fn cancellation_after_existing_backup_verification_preserves_the_bound_backup() {
+        assert_source_post_publish_cancellation(true);
+    }
+
+    #[test]
+    fn source_backup_cancellation_surfaces_cleanup_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let owned_directory = directory.path().join("not-a-backup-file");
+        fs::create_dir(&owned_directory).unwrap();
+
+        let error =
+            remove_newly_published_backup_after_cancellation(Some(&owned_directory)).unwrap_err();
+
+        assert!(
+            matches!(error, PeerSyncError::Storage(message) if message.contains("newly published backup"))
+        );
+        assert!(owned_directory.is_dir());
     }
 
     fn remote_disjoint_manifest(
