@@ -65,6 +65,49 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
 }
 
 describe('peer bidirectional controller', () => {
+    it('retains one source action and its busy state for remounted subscribers', async () => {
+        let finishStart!: (status: PeerBidirectionalStatus['source']) => void
+        const start = vi.fn(() => new Promise<PeerBidirectionalStatus['source']>((resolve) => {
+            finishStart = resolve
+        }))
+        const stop = vi.fn(async () => undefined)
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                status: async () => ({
+                    source: { phase: 'prepared', sessionId: 'session-source', devices: [] },
+                }),
+                start,
+                stop,
+            }),
+        })
+        await controller.initialize()
+
+        const first = controller.start('session-source')
+        const remountedSnapshots: PeerBidirectionalStatus['source'][] = []
+        const unsubscribe = controller.subscribe((snapshot) => {
+            if (snapshot.sourceBusy) remountedSnapshots.push(snapshot.sourceStatus)
+        })
+
+        expect(controller.snapshot().sourceBusy).toBe(true)
+        expect(controller.start('session-source')).toBe(first)
+        await expect(controller.stop('session-source')).rejects.toThrow(
+            'different peer sync source action is already running',
+        )
+        expect(start).toHaveBeenCalledTimes(1)
+        expect(stop).not.toHaveBeenCalled()
+        expect(remountedSnapshots).toHaveLength(1)
+
+        finishStart({
+            phase: 'running',
+            sessionId: 'session-source',
+            pairingUri: 'pairing',
+            devices: [],
+        })
+        await first
+        expect(controller.snapshot().sourceBusy).toBe(false)
+        unsubscribe()
+    })
+
     it('projects and resumes a durable target-prepared operation without a fake result', async () => {
         const completed: PeerBidirectionalCompletedResult = {
             kind: 'noChanges',

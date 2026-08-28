@@ -425,9 +425,26 @@ impl PeerBidirectionalDurableOperation {
                 operation_id: context.operation_id.clone(),
                 committed_revision: *committed_revision,
             }),
-            Self::Completed { result, .. } => Some(PeerBidirectionalStatusOperation::Completed {
-                result: result.clone(),
-            }),
+            Self::Completed {
+                source_binding,
+                result,
+                ..
+            } => {
+                let mut result = result.clone();
+                if source_binding.is_some() {
+                    for backup in &mut result.backups {
+                        backup.side = match backup.side {
+                            PeerBidirectionalBackupSide::Local => {
+                                PeerBidirectionalBackupSide::Remote
+                            }
+                            PeerBidirectionalBackupSide::Remote => {
+                                PeerBidirectionalBackupSide::Local
+                            }
+                        };
+                    }
+                }
+                Some(PeerBidirectionalStatusOperation::Completed { result })
+            }
         }
     }
 }
@@ -13735,6 +13752,63 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn source_completed_status_projects_its_backup_as_local_without_mutating_the_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let binding = SourcePreparedEvidence {
+            operation_id: "123e4567-e89b-42d3-a456-426614174148".to_owned(),
+            source_device_id: "123e4567-e89b-42d3-a456-426614174149".to_owned(),
+            target_device_id: "123e4567-e89b-42d3-a456-426614174150".to_owned(),
+            expected_source_revision: 7,
+            previous_shared: generation("shared-source-view", "2", 'a'),
+            expected_source_generation: generation("source-view", "3", 'b'),
+            shared_generation: LanBidirectionalGeneration {
+                generation_id: "shared-source-view-next".to_owned(),
+                manifest_hash: "c".repeat(64),
+                generation_sequence: "4".to_owned(),
+            },
+            incoming_revision: 9,
+            transferred_objects: 2,
+            transferred_bytes: 19,
+            backup_required: true,
+            backup: Some(LanBidirectionalBackupReceipt {
+                package_id: "d".repeat(64),
+                path: "peer-bidirectional/backups/source-view.risulossless".to_owned(),
+            }),
+        };
+        let receipt = binding.receipt_at(8).unwrap();
+        let completed = PeerBidirectionalDurableOperation::Completed {
+            schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: Some(receipt),
+            source_binding: Some(binding.clone()),
+            result: PeerBidirectionalCompletedResult {
+                kind: "updated".to_owned(),
+                operation_id: binding.operation_id.clone(),
+                revision: 8,
+                remote_revision: binding.incoming_revision,
+                transferred_objects: binding.transferred_objects,
+                transferred_bytes: binding.transferred_bytes,
+                backups: vec![PeerBidirectionalBackupReceipt {
+                    package_id: binding.backup.as_ref().unwrap().package_id.clone(),
+                    side: PeerBidirectionalBackupSide::Remote,
+                    path: binding.backup.as_ref().unwrap().path.clone(),
+                }],
+            },
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&completed).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        let status = PeerBidirectionalCommandState::default()
+            .status(directory.path(), &mut store)
+            .unwrap();
+        let Some(PeerBidirectionalStatusOperation::Completed { result }) = status.operation else {
+            panic!("expected completed source status");
+        };
+        assert_eq!(result.backups[0].side, PeerBidirectionalBackupSide::Local);
+        assert_eq!(journal.load().unwrap(), Some(completed));
     }
 
     #[test]

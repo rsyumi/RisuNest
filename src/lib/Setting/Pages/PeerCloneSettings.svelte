@@ -78,6 +78,7 @@
     let bidirectionalResult = $state<PeerBidirectionalSyncResult>()
     let bidirectionalOperationRetained = $state(false)
     let bidirectionalBusy = $state(false)
+    let bidirectionalSourceBusy = $state(false)
     let bidirectionalSourceError = $state('')
     let bidirectionalOperationError = $state('')
     let bidirectionalInputError = $state('')
@@ -123,6 +124,7 @@
     const bidirectionalBackups = $derived(
         bidirectionalResult && 'backups' in bidirectionalResult ? bidirectionalResult.backups : [],
     )
+    const bidirectionalControlBusy = $derived(bidirectionalBusy || bidirectionalSourceBusy)
 
     function reportError(cause: unknown): void {
         error = cause instanceof Error ? cause.message : String(cause)
@@ -322,6 +324,7 @@
         bidirectionalOperationPhase = snapshot.operationPhase
         bidirectionalResult = snapshot.operationResult
         bidirectionalOperationRetained = snapshot.operationRetained
+        bidirectionalSourceBusy = snapshot.sourceBusy
         bidirectionalSourceError = snapshot.sourceError
         bidirectionalOperationError = snapshot.operationError
     }
@@ -695,7 +698,7 @@
         <div class="mt-2 flex flex-wrap gap-2">
             <Button
                 disabled={!bidirectionalEnabled
-                    || bidirectionalBusy
+                    || bidirectionalControlBusy
                     || (bidirectionalOperationRetained
                         && !['completed', 'sourcePrepared'].includes(bidirectionalOperationPhase))}
                 onclick={prepareBidirectionalSource}
@@ -704,7 +707,7 @@
             </Button>
             <Button
                 disabled={!bidirectionalEnabled
-                    || bidirectionalBusy
+                    || bidirectionalControlBusy
                     || (bidirectionalOperationRetained
                         && !['completed', 'sourcePrepared'].includes(bidirectionalOperationPhase))
                     || bidirectionalSourceStatus.phase !== 'prepared'}
@@ -712,7 +715,7 @@
             >{language.peerBidirectional.start}</Button>
             <Button
                 styled="danger"
-                disabled={bidirectionalBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
+                disabled={bidirectionalControlBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
                 onclick={stopBidirectionalSource}
             >{language.peerBidirectional.stop}</Button>
         </div>
@@ -730,7 +733,7 @@
             ></textarea>
             <Button
                 className="mt-2"
-                disabled={bidirectionalBusy}
+                disabled={bidirectionalControlBusy}
                 onclick={() => navigator.clipboard.writeText(bidirectionalSourcePairingUri)}
             >{language.peerBidirectional.copyLink}</Button>
         {/if}
@@ -740,11 +743,11 @@
             <ul class="mt-1 flex flex-col gap-2">
                 {#each bidirectionalSourceStatus.devices as device (device.deviceId)}
                     <li class="flex items-center justify-between gap-2 rounded-md bg-bgcolor p-2 text-sm">
-                        <span>{device.deviceId}</span>
+                        <span>{device.deviceId} ({device.transferredBytes.toLocaleString()} bytes)</span>
                         <Button
                             size="sm"
                             styled="danger"
-                            disabled={bidirectionalBusy || bidirectionalOperationRetained || device.revoked}
+                            disabled={bidirectionalControlBusy || bidirectionalOperationRetained || device.revoked}
                             onclick={() => revokeBidirectionalDevice(device.deviceId)}
                         >{language.peerBidirectional.revoke}</Button>
                     </li>
@@ -768,7 +771,7 @@
         <Button
             className="mt-2"
             disabled={!bidirectionalEnabled
-                || bidirectionalBusy
+                || bidirectionalControlBusy
                 || (bidirectionalOperationRetained
                     && ![
                         'awaitingConflict',
@@ -794,30 +797,30 @@
                 </ul>
                 <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.backupWarning}</p>
                 <div class="mt-2 flex flex-wrap gap-2">
-                    <Button disabled={bidirectionalBusy} onclick={() => resolveBidirectional('local')}>
+                    <Button disabled={bidirectionalControlBusy} onclick={() => resolveBidirectional('local')}>
                         {language.peerBidirectional.keepLocal}
                     </Button>
-                    <Button disabled={bidirectionalBusy} onclick={() => resolveBidirectional('remote')}>
+                    <Button disabled={bidirectionalControlBusy} onclick={() => resolveBidirectional('remote')}>
                         {language.peerBidirectional.keepRemote}</Button>
                 </div>
             </div>
         {:else if bidirectionalOperationPhase === 'sourceUnavailable'}
             <p class="mt-2 text-sm text-draculared">{language.peerBidirectional.sourceUnavailable}</p>
-            <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
+            <Button className="mt-2" disabled={bidirectionalControlBusy} onclick={resumeBidirectional}>
                 {language.peerBidirectional.resume}
             </Button>
         {:else if bidirectionalOperationPhase === 'refreshPending'}
             <p class="mt-2 text-sm text-draculared">{language.peerBidirectional.refreshPending}</p>
-            <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
+            <Button className="mt-2" disabled={bidirectionalControlBusy} onclick={resumeBidirectional}>
                 {language.peerBidirectional.retryRefresh}
             </Button>
         {:else if bidirectionalOperationPhase === 'localCommitted'}
             <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.resumeRequired}</p>
-            <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
+            <Button className="mt-2" disabled={bidirectionalControlBusy} onclick={resumeBidirectional}>
                 {language.peerBidirectional.resume}
             </Button>
         {:else if bidirectionalOperationPhase === 'targetPrepared'}
-            <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
+            <Button className="mt-2" disabled={bidirectionalControlBusy} onclick={resumeBidirectional}>
                 {language.peerBidirectional.resume}
             </Button>
         {:else if bidirectionalResult?.kind === 'noChanges'}
@@ -841,7 +844,7 @@
                 'awaitingConflict',
             ].includes(bidirectionalOperationPhase)
             && ['idle', 'stopped'].includes(bidirectionalSourceStatus.phase)}
-            <Button className="mt-2" styled="danger" disabled={bidirectionalBusy} onclick={abandonBidirectional}>
+            <Button className="mt-2" styled="danger" disabled={bidirectionalControlBusy} onclick={abandonBidirectional}>
                 {language.peerBidirectional.abandon}
             </Button>
         {/if}
@@ -849,7 +852,7 @@
         {#if bidirectionalOperationPhase === 'completed'}
             <Button
                 className="mt-2"
-                disabled={bidirectionalBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
+                disabled={bidirectionalControlBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
                 onclick={acknowledgeBidirectional}
             >
                 {language.peerBidirectional.acknowledge}

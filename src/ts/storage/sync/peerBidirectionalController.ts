@@ -30,6 +30,7 @@ export interface PeerBidirectionalControllerSnapshot {
     operationResult?: PeerBidirectionalSyncResult
     operationId?: string
     operationRetained: boolean
+    sourceBusy: boolean
     sourceError: string
     operationError: string
 }
@@ -84,6 +85,7 @@ export function createPeerBidirectionalController(options: {
         sourcePairingUri: '',
         operationPhase: 'idle',
         operationRetained: false,
+        sourceBusy: false,
         sourceError: '',
         operationError: '',
     }
@@ -94,6 +96,7 @@ export function createPeerBidirectionalController(options: {
     let sourcePollEpoch = 0
     let operationErrorOwner = 0
     let sourceRefreshErrorOwner: number | undefined
+    let activeSourceAction: { key: string; promise: Promise<unknown> } | undefined
     let activeOperation: { key: string; promise: Promise<PeerBidirectionalSyncResult> } | undefined
     let refreshRetry: {
         key: string
@@ -169,24 +172,36 @@ export function createPeerBidirectionalController(options: {
             )
         }
     }
-    const runSource = async <T>(
+    const runSource = <T>(
+        key: string,
         operation: () => Promise<T>,
         allowRetained: boolean | 'rehost' = false,
     ): Promise<T> => {
+        if (activeSourceAction) {
+            if (activeSourceAction.key === key) {
+                return activeSourceAction.promise as Promise<T>
+            }
+            return Promise.reject(new Error('A different peer sync source action is already running'))
+        }
         const retainedAllowed = allowRetained === true
             || (allowRetained === 'rehost'
                 && ['completed', 'sourcePrepared'].includes(snapshot.operationPhase))
         if (snapshot.operationRetained && !retainedAllowed) {
-            throw new Error('A retained peer sync operation must be resolved first')
+            return Promise.reject(new Error('A retained peer sync operation must be resolved first'))
         }
-        try {
-            const result = await operation()
+        const promise = Promise.resolve().then(operation).then((result) => {
             update({ sourceError: '' })
             return result
-        } catch (cause) {
+        }).catch((cause) => {
             update({ sourceError: cause instanceof Error ? cause.message : String(cause) })
             throw cause
-        }
+        }).finally(() => {
+            activeSourceAction = undefined
+            update({ sourceBusy: false })
+        })
+        activeSourceAction = { key, promise }
+        update({ sourceBusy: true })
+        return promise
     }
     const runOperation = (
         key: string,
@@ -323,20 +338,20 @@ export function createPeerBidirectionalController(options: {
             })
             return initialization
         },
-        prepare: () => runSource(async () => {
+        prepare: () => runSource('prepare', async () => {
             const sourceStatus = await options.facade.prepare()
             sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: '' })
             return sourceStatus
         }, 'rehost'),
-        start: (sessionId: string) => runSource(async () => {
+        start: (sessionId: string) => runSource(`start:${sessionId}`, async () => {
             const sourceStatus = await options.facade.start(sessionId)
             sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
             beginSourcePolling()
             return sourceStatus
         }, 'rehost'),
-        stop: (sessionId: string) => runSource(async () => {
+        stop: (sessionId: string) => runSource(`stop:${sessionId}`, async () => {
             await options.facade.stop(sessionId)
             stopSourcePolling()
             sourcePollEpoch += 1
@@ -347,12 +362,15 @@ export function createPeerBidirectionalController(options: {
                 ...operationSnapshot(status.operation),
             })
         }, true),
-        revoke: (sessionId: string, deviceId: string) => runSource(async () => {
-            await options.facade.revoke(sessionId, deviceId)
-            const status = await options.facade.status()
-            sourcePollEpoch += 1
-            update({ sourceStatus: status.source })
-        }),
+        revoke: (sessionId: string, deviceId: string) => runSource(
+            `revoke:${sessionId}:${deviceId}`,
+            async () => {
+                await options.facade.revoke(sessionId, deviceId)
+                const status = await options.facade.status()
+                sourcePollEpoch += 1
+                update({ sourceStatus: status.source })
+            },
+        ),
         sync(pairingUri: string) {
             const key = `pairing:${pairingUri}`
             if (activeOperation) {

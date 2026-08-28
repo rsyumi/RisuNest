@@ -7,6 +7,7 @@ const controllerMocks = vi.hoisted(() => {
     const listeners = new Set<() => void>()
     let operationPhase: 'idle' | 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'targetPrepared' | 'refreshPending' | 'completed' = 'idle'
     let sourcePhase: 'stopped' | 'prepared' | 'running' = 'stopped'
+    let sourceBusy = false
     let revoked = false
     const snapshot = () => ({
         capabilities: {
@@ -63,6 +64,7 @@ const controllerMocks = vi.hoisted(() => {
                       }
                     : undefined,
         operationRetained: operationPhase !== 'idle',
+        sourceBusy,
         sourceError: '',
         operationError: '',
     })
@@ -106,6 +108,7 @@ const controllerMocks = vi.hoisted(() => {
         reset() {
             operationPhase = 'idle'
             sourcePhase = 'stopped'
+            sourceBusy = false
             revoked = false
         },
         setOperationPhase(phase: 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'targetPrepared' | 'refreshPending' | 'completed') {
@@ -113,6 +116,10 @@ const controllerMocks = vi.hoisted(() => {
         },
         setSourcePhase(phase: 'stopped' | 'prepared' | 'running') {
             sourcePhase = phase
+        },
+        setSourceBusy(value: boolean) {
+            sourceBusy = value
+            for (const listener of listeners) listener()
         },
     }
 })
@@ -184,6 +191,40 @@ describe('peer bidirectional offline revoke', () => {
         ))
         await tick()
         expect(revoke?.disabled).toBe(true)
+    })
+
+    it('shows transferred bytes for a bidirectional source device', async () => {
+        const target = document.createElement('div')
+        document.body.append(target)
+        mounted = mount(PeerCloneSettings, { target })
+        await tick()
+
+        expect(target.textContent).toContain('device-offline (14 bytes)')
+    })
+
+    it('keeps source actions disabled across remount while the controller reports source busy', async () => {
+        controllerMocks.setSourcePhase('prepared')
+        controllerMocks.setSourceBusy(true)
+        const target = document.createElement('div')
+        document.body.append(target)
+        const assertSourceActionsDisabled = () => {
+            const button = (label: string) => [...target.querySelectorAll<HTMLButtonElement>('button')]
+                .find((candidate) => candidate.textContent?.trim() === label)
+            expect(button('Prepare pairing')?.disabled).toBe(true)
+            expect(button('Start pairing')?.disabled).toBe(true)
+            expect(button('Stop pairing')?.disabled).toBe(true)
+        }
+
+        mounted = mount(PeerCloneSettings, { target })
+        await tick()
+        assertSourceActionsDisabled()
+        await unmount(mounted)
+        mounted = undefined
+        target.replaceChildren()
+
+        mounted = mount(PeerCloneSettings, { target })
+        await tick()
+        assertSourceActionsDisabled()
     })
 
     it.each(['localCommitted', 'sourceUnavailable', 'targetPrepared', 'awaitingConflict'] as const)(

@@ -40,7 +40,7 @@ describe('peer bidirectional settings surface', () => {
         expect(peerCloneSettingsSource).toContain("|| ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)")
         expect(peerCloneSettingsSource).toContain('|| !bidirectionalPairingInput}')
         expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained || device.revoked')
-        expect(peerCloneSettingsSource).toContain("disabled={bidirectionalBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}")
+        expect(peerCloneSettingsSource).toContain("disabled={bidirectionalControlBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}")
         expect(peerCloneSettingsSource).toContain('bidirectionalController.acknowledge()')
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.acknowledge')
         expect(peerCloneSettingsSource).toContain("bidirectionalOperationPhase === 'sourceUnavailable'")
@@ -50,7 +50,7 @@ describe('peer bidirectional settings surface', () => {
 
     it('separates stopped completion dismissal from explicit committed-operation abandonment', () => {
         expect(peerCloneSettingsSource).toContain(
-            "disabled={bidirectionalBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}",
+            "disabled={bidirectionalControlBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}",
         )
         expect(peerCloneSettingsSource).toContain("'targetPrepared'")
         expect(peerCloneSettingsSource).toContain("'awaitingConflict'")
