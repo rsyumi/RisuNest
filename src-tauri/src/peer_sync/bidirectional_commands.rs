@@ -2692,7 +2692,6 @@ fn reconcile_source_operation(
                     receipt,
                     completed_revision,
                 } => {
-                    verify_source_evidence_backup(app_root, &evidence)?;
                     return Ok(SourceOperationReconcile::Completed(
                         evidence,
                         receipt,
