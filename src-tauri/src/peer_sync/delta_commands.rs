@@ -746,7 +746,7 @@ fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
     }
 }
 
-fn load_or_create_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
+pub(crate) fn load_or_create_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
     if path.exists() {
         return read_source_device_id(path);
     }
