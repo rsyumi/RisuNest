@@ -146,6 +146,23 @@ impl PersistentStore {
         library_id: &str,
         device_id: &str,
     ) -> StoreResult<SyncDeviceAckState> {
+        self.sync_device_ack_state_inner(library_id, device_id, false)
+    }
+
+    pub(crate) fn sync_device_ack_state_for_recovery(
+        &self,
+        library_id: &str,
+        device_id: &str,
+    ) -> StoreResult<SyncDeviceAckState> {
+        self.sync_device_ack_state_inner(library_id, device_id, true)
+    }
+
+    fn sync_device_ack_state_inner(
+        &self,
+        library_id: &str,
+        device_id: &str,
+        allow_revoked: bool,
+    ) -> StoreResult<SyncDeviceAckState> {
         validate_library_id(library_id)?;
         validate_device_id(device_id)?;
         let device = load_device(&self.connection, library_id, device_id)?.ok_or_else(|| {
@@ -153,7 +170,9 @@ impl PersistentStore {
                 message: "sync device is not registered".to_owned(),
             }
         })?;
-        if device.status != RegisteredSyncDeviceStatus::Active {
+        if device.status != RegisteredSyncDeviceStatus::Active
+            && !(allow_revoked && device.status == RegisteredSyncDeviceStatus::Revoked)
+        {
             return sync_conflict("only an active sync device has a usable acknowledgement");
         }
         let shared_identity = device.acknowledged_generation;

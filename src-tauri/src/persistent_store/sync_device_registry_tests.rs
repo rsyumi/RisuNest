@@ -1522,6 +1522,63 @@ fn stale_ack_and_revoke_compare_and_swap_states_cannot_both_commit() {
 }
 
 #[test]
+fn recovery_ack_accepts_only_exact_active_or_revoked_evidence() {
+    let directory = tempfile::tempdir().expect("create recovery ACK fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let identity = seed_indexed_manifest(&store, &common);
+    for device_id in ["active", "revoked", "forgotten"] {
+        store
+            .register_verified_sync_device(
+                VerifiedSyncDeviceRegistration::for_test(
+                    "library",
+                    device_id,
+                    identity.clone(),
+                    10,
+                ),
+                0,
+            )
+            .expect("register recovery device");
+    }
+    store
+        .revoke_sync_device("library", "revoked", &identity)
+        .expect("revoke recovery device");
+    store
+        .revoke_sync_device("library", "forgotten", &identity)
+        .expect("revoke forgotten device");
+    store
+        .forget_sync_device("library", "forgotten", &identity)
+        .expect("forget recovery device");
+
+    let active = store
+        .sync_device_ack_state_for_recovery("library", "active")
+        .expect("read active recovery ACK");
+    let revoked = store
+        .sync_device_ack_state_for_recovery("library", "revoked")
+        .expect("read revoked recovery ACK");
+    assert_eq!(active, revoked);
+    assert!(store.sync_device_ack_state("library", "revoked").is_err());
+    assert!(store
+        .sync_device_ack_state_for_recovery("library", "unknown")
+        .is_err());
+    assert!(store
+        .sync_device_ack_state_for_recovery("library", "forgotten")
+        .is_err());
+
+    store
+        .connection
+        .execute(
+            "UPDATE logical_peer_common_bases SET manifest_hash = ?1
+             WHERE library_id = 'library' AND peer_id = 'revoked'",
+            [HASH_A],
+        )
+        .expect("corrupt retained common base");
+    assert!(store
+        .sync_device_ack_state_for_recovery("library", "revoked")
+        .is_err());
+}
+
+#[test]
 fn forgetting_removes_common_base_but_preserves_audit_and_blocks_reuse() {
     let directory = tempfile::tempdir().expect("create lifecycle fixture");
     let mut store = PersistentStore::open(directory.path()).expect("open store");
