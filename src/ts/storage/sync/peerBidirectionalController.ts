@@ -82,7 +82,8 @@ export function createPeerBidirectionalController(options: {
     let initialization: Promise<void> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
     let sourcePolling = false
-    let sourceRefreshError = false
+    let operationErrorOwner = 0
+    let sourceRefreshErrorOwner: number | undefined
     let activeOperation: { key: string; promise: Promise<PeerBidirectionalSyncResult> } | undefined
     let refreshRetry: {
         key: string
@@ -116,8 +117,8 @@ export function createPeerBidirectionalController(options: {
         sourcePolling = true
         try {
             const status = await options.facade.status()
-            const clearSourceRefreshError = sourceRefreshError
-            sourceRefreshError = false
+            const clearSourceRefreshError = sourceRefreshErrorOwner === operationErrorOwner
+            if (clearSourceRefreshError) sourceRefreshErrorOwner = undefined
             update({
                 sourceStatus: status.source,
                 sourcePairingUri: status.source.phase === 'running'
@@ -130,7 +131,8 @@ export function createPeerBidirectionalController(options: {
             if (status.source.phase !== 'running') stopSourcePolling()
         } catch (cause) {
             if (cause instanceof PeerBidirectionalRefreshError && cause.status) {
-                sourceRefreshError = true
+                operationErrorOwner += 1
+                sourceRefreshErrorOwner = operationErrorOwner
                 update({
                     sourceStatus: cause.status.source,
                     sourcePairingUri: cause.status.source.pairingUri ?? snapshot.sourcePairingUri,
@@ -186,9 +188,13 @@ export function createPeerBidirectionalController(options: {
             operationResult: snapshot.operationResult,
             operationId: snapshot.operationId,
         } : undefined
+        operationErrorOwner += 1
+        sourceRefreshErrorOwner = undefined
         update({ operationPhase: 'running', operationError: '' })
         const promise = operation().then((result) => {
             refreshRetry = undefined
+            operationErrorOwner += 1
+            sourceRefreshErrorOwner = undefined
             update({
                 operationPhase: resultPhase(result),
                 operationResult: result,
@@ -197,6 +203,8 @@ export function createPeerBidirectionalController(options: {
             })
             return result
         }).catch(async (cause) => {
+            operationErrorOwner += 1
+            sourceRefreshErrorOwner = undefined
             if (cause instanceof PeerBidirectionalRefreshError) {
                 refreshRetry = { key, operation }
                 update({
@@ -281,7 +289,11 @@ export function createPeerBidirectionalController(options: {
             await options.facade.stop(sessionId)
             stopSourcePolling()
             const status = await options.facade.status()
-            update({ sourceStatus: status.source, sourcePairingUri: '' })
+            update({
+                sourceStatus: status.source,
+                sourcePairingUri: '',
+                ...operationSnapshot(status.operation),
+            })
         }, true),
         revoke: (sessionId: string, deviceId: string) => runSource(async () => {
             await options.facade.revoke(sessionId, deviceId)
@@ -336,6 +348,8 @@ export function createPeerBidirectionalController(options: {
             if (!snapshot.operationId || snapshot.operationPhase !== 'completed') return
             try {
                 await options.facade.acknowledge(snapshot.operationId)
+                operationErrorOwner += 1
+                sourceRefreshErrorOwner = undefined
                 update({
                     operationPhase: 'idle',
                     operationResult: undefined,
@@ -343,6 +357,8 @@ export function createPeerBidirectionalController(options: {
                     operationError: '',
                 })
             } catch (cause) {
+                operationErrorOwner += 1
+                sourceRefreshErrorOwner = undefined
                 update({ operationError: cause instanceof Error ? cause.message : String(cause) })
                 throw cause
             }

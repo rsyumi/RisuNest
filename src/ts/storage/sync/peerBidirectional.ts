@@ -233,8 +233,10 @@ export function createPeerBidirectionalFacade(options: {
         promise: Promise<PeerBidirectionalStatus>
     } | undefined
     let refreshedSourceOperation = ''
+    let sourceRefreshHighWater = -1
     let sourcePrepareActive = false
     let sourceStopCompleted = false
+    let sourceStopStatusPending = false
     let targetMutationActive = false
     const requireDesktop = (): void => {
         if (options.platform !== 'desktop') unsupported(options.platform)
@@ -258,6 +260,22 @@ export function createPeerBidirectionalFacade(options: {
             phase: 'localCommitted',
             committedRevision: operation.committedRevision,
         }
+    }
+    const recoveredOperationAdvances = (
+        command: string,
+        args: Record<string, unknown>,
+        operation: PeerBidirectionalDurableOperation,
+    ): boolean => {
+        const operationId = typeof args.operationId === 'string' ? args.operationId : undefined
+        if (!operationId || operation.phase === 'awaitingConflict') return false
+        const recoveredOperationId = operation.phase === 'completed'
+            ? operation.result.operationId
+            : operation.operationId
+        if (recoveredOperationId !== operationId) return false
+        if (command === 'peer_bidirectional_resolve') {
+            return operation.phase === 'localCommitted' || operation.phase === 'completed'
+        }
+        return command === 'peer_bidirectional_resume' && operation.phase === 'completed'
     }
     const refreshTargetResult = async (
         key: string,
@@ -319,11 +337,13 @@ export function createPeerBidirectionalFacade(options: {
                 }
                 if (status.operation) {
                     const recovered = projectOperation(status.operation)
-                    const revision = committedRevision(recovered)
-                    if (revision !== undefined) {
-                        await refreshTargetResult(key, recovered, revision, fence)
+                    if (recoveredOperationAdvances(command, args, status.operation)) {
+                        const revision = committedRevision(recovered)
+                        if (revision !== undefined) {
+                            await refreshTargetResult(key, recovered, revision, fence)
+                        }
+                        return recovered
                     }
-                    return recovered
                 }
                 throw cause
             }
@@ -339,12 +359,14 @@ export function createPeerBidirectionalFacade(options: {
     }
 
     const releaseStoppedSourceFence = (): void => {
-        if (!sourceStopCompleted || pendingSourceRefresh) return
+        if (!sourceStopCompleted || sourceStopStatusPending || pendingSourceRefresh) return
         const fence = sourceFence
         sourceFence = undefined
         pendingSourceRefresh = undefined
         refreshedSourceOperation = ''
+        sourceRefreshHighWater = -1
         sourceStopCompleted = false
+        sourceStopStatusPending = false
         fence?.release()
     }
 
@@ -393,9 +415,12 @@ export function createPeerBidirectionalFacade(options: {
         status: PeerBidirectionalStatus,
     ): { key: string; revision: number } | undefined => {
         if (status.operation?.phase === 'completed') {
+            const revision = status.operation.result.revision
+            if (sourceFence && revision < sourceRefreshHighWater) return undefined
+            if (sourceFence) sourceRefreshHighWater = Math.max(sourceRefreshHighWater, revision)
             return {
-                key: `${status.operation.result.operationId}:${status.operation.result.revision}`,
-                revision: status.operation.result.revision,
+                key: `${status.operation.result.operationId}:${revision}`,
+                revision,
             }
         }
         return undefined
@@ -433,7 +458,9 @@ export function createPeerBidirectionalFacade(options: {
                 })
                 sourceFence = fence
                 refreshedSourceOperation = ''
+                sourceRefreshHighWater = -1
                 sourceStopCompleted = false
+                sourceStopStatusPending = false
                 return status
             } catch (cause) {
                 fence?.release()
@@ -449,32 +476,59 @@ export function createPeerBidirectionalFacade(options: {
         },
         async status() {
             requireDesktop()
-            if (pendingSourceRefresh) {
+            if (pendingSourceRefresh && !sourceStopStatusPending) {
                 const pending = pendingSourceRefresh
                 return refreshSourceStatus(pending.status, pending.key, pending.revision)
             }
+            const completesStopStatus = sourceStopStatusPending && sourceStopCompleted
             const status = await nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
             const committed = committedSourceOperation(status)
-            const refreshed = committed
-                ? refreshSourceStatus(status, committed.key, committed.revision)
-                : status
-            if (!committed) releaseStoppedSourceFence()
-            return refreshed
+            if (committed) {
+                const refreshed = refreshSourceStatus(status, committed.key, committed.revision)
+                if (completesStopStatus) sourceStopStatusPending = false
+                const result = await refreshed
+                releaseStoppedSourceFence()
+                return result
+            }
+            if (sourceStopStatusPending && pendingSourceRefresh) {
+                const pending = pendingSourceRefresh
+                const refreshed = refreshSourceStatus(pending.status, pending.key, pending.revision)
+                if (completesStopStatus) sourceStopStatusPending = false
+                await refreshed
+                releaseStoppedSourceFence()
+                return status
+            }
+            if (completesStopStatus) sourceStopStatusPending = false
+            releaseStoppedSourceFence()
+            return status
         },
         async stop(sessionId) {
             requireDesktop()
+            sourceStopStatusPending = true
             if (!sourceStopCompleted) {
-                await nativeInvoke('peer_bidirectional_stop', { sessionId })
+                try {
+                    await nativeInvoke('peer_bidirectional_stop', { sessionId })
+                } catch (cause) {
+                    sourceStopStatusPending = false
+                    throw cause
+                }
                 sourceStopCompleted = true
             }
             const status = await nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
             const committed = committedSourceOperation(status)
             if (committed) {
-                await refreshSourceStatus(status, committed.key, committed.revision)
+                const refreshed = refreshSourceStatus(status, committed.key, committed.revision)
+                sourceStopStatusPending = false
+                await refreshed
+                releaseStoppedSourceFence()
             } else if (pendingSourceRefresh) {
                 const pending = pendingSourceRefresh
-                await refreshSourceStatus(pending.status, pending.key, pending.revision)
+                const refreshed = refreshSourceStatus(pending.status, pending.key, pending.revision)
+                sourceStopStatusPending = false
+                await refreshed
+                releaseStoppedSourceFence()
             } else {
+                sourceStopStatusPending = false
                 releaseStoppedSourceFence()
             }
         },

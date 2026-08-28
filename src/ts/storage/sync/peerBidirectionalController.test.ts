@@ -120,7 +120,7 @@ describe('peer bidirectional controller', () => {
         }
     })
 
-    it('does not clear an acknowledge error during an unrelated successful source poll', async () => {
+    it('does not clear a later acknowledge error when source refresh recovery succeeds', async () => {
         vi.useFakeTimers()
         try {
             const completed: PeerBidirectionalSyncResult = {
@@ -132,18 +132,32 @@ describe('peer bidirectional controller', () => {
                 transferredBytes: 0,
                 backups: [],
             }
+            const completedStatus: PeerBidirectionalStatus = {
+                source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                operation: { phase: 'completed', result: completed },
+            }
+            let statusCalls = 0
             const controller = createPeerBidirectionalController({
                 sourcePollMilliseconds: 10,
                 facade: facade({
-                    status: async () => ({
-                        source: { phase: 'running', sessionId: 'session-source', devices: [] },
-                        operation: { phase: 'completed', result: completed },
-                    }),
+                    status: async () => {
+                        statusCalls += 1
+                        if (statusCalls === 2) {
+                            throw new PeerBidirectionalRefreshError(
+                                completed,
+                                new Error('source refresh failed'),
+                                completedStatus,
+                            )
+                        }
+                        return completedStatus
+                    },
                     acknowledge: async () => { throw new Error('acknowledge failed') },
                 }),
             })
 
             await controller.initialize()
+            await vi.advanceTimersByTimeAsync(10)
+            expect(controller.snapshot().operationError).toBe('source refresh failed')
             await expect(controller.acknowledge()).rejects.toThrow('acknowledge failed')
             await vi.advanceTimersByTimeAsync(10)
             expect(controller.snapshot()).toMatchObject({
@@ -584,6 +598,42 @@ describe('peer bidirectional controller', () => {
             await expect(controller.stop('session-source')).resolves.toBeUndefined()
             expect(stop).toHaveBeenCalledWith('session-source')
         }
+    })
+
+    it('projects completion and backup receipts discovered while stopping the source', async () => {
+        const completed: PeerBidirectionalSyncResult = {
+            kind: 'updated',
+            operationId: 'operation-stop-projection',
+            revision: 8,
+            remoteRevision: 9,
+            transferredObjects: 1,
+            transferredBytes: 12,
+            backups: [{ packageId: 'backup-stop', side: 'local', path: 'stop.risulossless' }],
+        }
+        let statusCalls = 0
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                status: async () => {
+                    statusCalls += 1
+                    if (statusCalls === 1) {
+                        return { source: { phase: 'running', sessionId: 'session-source', devices: [] } }
+                    }
+                    return {
+                        source: { phase: 'stopped', sessionId: 'session-source', devices: [] },
+                        operation: { phase: 'completed', result: completed },
+                    }
+                },
+            }),
+        })
+
+        await controller.initialize()
+        await controller.stop('session-source')
+        expect(controller.snapshot()).toMatchObject({
+            sourceStatus: { phase: 'stopped' },
+            operationPhase: 'completed',
+            operationResult: completed,
+            operationRetained: true,
+        })
     })
 
     it('projects source-unavailable as a recoverable retained operation', async () => {

@@ -500,6 +500,145 @@ describe('peer bidirectional facade', () => {
         expect(events.filter((event) => event === 'release')).toHaveLength(1)
     })
 
+    it('does not execute a delayed lower revision after stop observes a higher revision', async () => {
+        const events: string[] = []
+        let finishDelayedStatus!: (value: unknown) => void
+        let finishHigherRefresh!: () => void
+        let statusCalls = 0
+        const base = runtime(events)
+        const statusForRevision = (revision: number) => ({
+            source: { phase: 'running' as const, sessionId: 'session-source', devices: [] },
+            operation: {
+                phase: 'completed' as const,
+                result: {
+                    kind: 'updated' as const,
+                    operationId: 'operation-high-water',
+                    revision,
+                    remoteRevision: 9,
+                    transferredObjects: 1,
+                    transferredBytes: 12,
+                    backups: [],
+                },
+            },
+        })
+        const invoke = vi.fn((command: string) => {
+            if (command === 'peer_bidirectional_prepare') {
+                return Promise.resolve({ phase: 'prepared', sessionId: 'session-source', devices: [] })
+            }
+            if (command === 'peer_bidirectional_status') {
+                statusCalls += 1
+                if (statusCalls === 1) {
+                    return new Promise((resolve) => {
+                        finishDelayedStatus = resolve
+                    })
+                }
+                return Promise.resolve(statusForRevision(9))
+            }
+            return Promise.resolve(undefined)
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: {
+                ...base,
+                async acquirePersistentMutationFence(token) {
+                    const fence = await base.acquirePersistentMutationFence(token)
+                    return {
+                        ...fence,
+                        async refreshCommittedWorkingSet(revision) {
+                            events.push(`refresh:${revision}`)
+                            if (revision === 9) {
+                                await new Promise<void>((resolve) => {
+                                    finishHigherRefresh = resolve
+                                })
+                            }
+                        },
+                    }
+                },
+            },
+        })
+
+        await facade.prepare()
+        const delayedPoll = facade.status()
+        await vi.waitFor(() => expect(statusCalls).toBe(1))
+        const stopping = facade.stop('session-source')
+        await vi.waitFor(() => expect(events).toContain('refresh:9'))
+        finishDelayedStatus(statusForRevision(8))
+        await Promise.resolve()
+        finishHigherRefresh()
+        await Promise.all([delayedPoll, stopping])
+        expect(events.filter((event) => event.startsWith('refresh:'))).toEqual(['refresh:9'])
+    })
+
+    it('holds the fence until mandatory post-stop status is fetched', async () => {
+        const events: string[] = []
+        let finishPreStopRefresh!: () => void
+        let finishStopStatus!: (value: unknown) => void
+        let statusCalls = 0
+        const base = runtime(events)
+        const statusForRevision = (revision: number) => ({
+            source: { phase: 'running' as const, sessionId: 'session-source', devices: [] },
+            operation: {
+                phase: 'completed' as const,
+                result: {
+                    kind: 'updated' as const,
+                    operationId: 'operation-stop-status-gate',
+                    revision,
+                    remoteRevision: 9,
+                    transferredObjects: 1,
+                    transferredBytes: 12,
+                    backups: [],
+                },
+            },
+        })
+        const invoke = vi.fn((command: string) => {
+            if (command === 'peer_bidirectional_prepare') {
+                return Promise.resolve({ phase: 'prepared', sessionId: 'session-source', devices: [] })
+            }
+            if (command === 'peer_bidirectional_status') {
+                statusCalls += 1
+                if (statusCalls === 1) return Promise.resolve(statusForRevision(8))
+                return new Promise((resolve) => {
+                    finishStopStatus = resolve
+                })
+            }
+            return Promise.resolve(undefined)
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: {
+                ...base,
+                async acquirePersistentMutationFence(token) {
+                    const fence = await base.acquirePersistentMutationFence(token)
+                    return {
+                        ...fence,
+                        async refreshCommittedWorkingSet(revision) {
+                            events.push(`refresh:${revision}`)
+                            if (revision === 8) {
+                                await new Promise<void>((resolve) => {
+                                    finishPreStopRefresh = resolve
+                                })
+                            }
+                        },
+                    }
+                },
+            },
+        })
+
+        await facade.prepare()
+        const polling = facade.status()
+        await vi.waitFor(() => expect(events).toContain('refresh:8'))
+        const stopping = facade.stop('session-source')
+        await vi.waitFor(() => expect(statusCalls).toBe(2))
+        finishPreStopRefresh()
+        await polling
+        expect(events).not.toContain('release')
+        finishStopStatus(statusForRevision(9))
+        await stopping
+        expect(events.slice(-2)).toEqual(['refresh:9', 'release'])
+    })
+
     it('releases a stopped source fence after repeated refresh failures eventually recover', async () => {
         const events: string[] = []
         let refreshCalls = 0
@@ -626,11 +765,11 @@ describe('peer bidirectional facade', () => {
         expect(events.slice(-2)).toEqual(['refresh:8', 'release'])
     })
 
-    it('returns the recovered durable local commit after a lost native response', async () => {
+    it('returns the recovered durable local commit after a lost resolve response', async () => {
         const events: string[] = []
         const invoke = vi.fn(async (command: string) => {
             events.push(`invoke:${command}`)
-            if (command === 'peer_bidirectional_sync') throw new Error('native response lost')
+            if (command === 'peer_bidirectional_resolve') throw new Error('native response lost')
             if (command === 'peer_bidirectional_status') {
                 return {
                     source: { phase: 'idle', devices: [] },
@@ -648,7 +787,7 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
         })
 
-        await expect(facade.sync(pairingUri)).resolves.toEqual({
+        await expect(facade.resolve('operation-response-loss', 'local')).resolves.toEqual({
             kind: 'resumeRequired',
             operationId: 'operation-response-loss',
             phase: 'localCommitted',
@@ -659,6 +798,34 @@ describe('peer bidirectional facade', () => {
             'refresh:8',
             'release',
         ])
+    })
+
+    it('does not suppress a failed resolve when the awaiting-conflict status is unchanged', async () => {
+        const events: string[] = []
+        const conflict = {
+            phase: 'awaitingConflict' as const,
+            result: {
+                kind: 'conflict' as const,
+                operationId: 'operation-unchanged-conflict',
+                conflicts: [{ key: 'r1:root', type: 'sameRecord' as const }],
+                localManifestHash: 'a'.repeat(64),
+                remoteManifestHash: 'b'.repeat(64),
+            },
+        }
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'peer_bidirectional_resolve') throw new Error('backup creation failed')
+            if (command === 'peer_bidirectional_status') {
+                return { source: { phase: 'idle', devices: [] }, operation: conflict }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime(events),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.resolve('operation-unchanged-conflict', 'remote')).rejects.toThrow('backup creation failed')
+        expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
     })
 
     it('returns explicit same-record conflicts without refreshing the renderer', async () => {
