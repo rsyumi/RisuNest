@@ -58,6 +58,7 @@ thread_local! {
     static SOURCE_AFTER_PREPARED_STORE_PANIC: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_BACKUP_PUBLISH_CANCEL_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+    static BACKUP_CREATE_RACE_CANCEL_FAILPOINT: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
     static BACKUP_FULL_VERIFICATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
@@ -775,7 +776,7 @@ fn ensure_bidirectional_backup_receipt(
     let (backup_staging, temporary) =
         bidirectional_backup_staging_paths(app_root, operation_id, side.clone());
     fs::create_dir_all(&backup_staging)?;
-    match fs::symlink_metadata(&temporary) {
+    let temporary_created_by_invocation = match fs::symlink_metadata(&temporary) {
         Ok(_) => match verify_bidirectional_backup_receipt(
             &temporary,
             operation_id,
@@ -790,11 +791,14 @@ fn ensure_bidirectional_backup_receipt(
                 return Ok(published_backup_receipt(receipt, &backup_path));
             }
             Err(PeerSyncError::Cancelled) => return Err(PeerSyncError::Cancelled),
-            Err(_) => fs::remove_file(&temporary)?,
+            Err(_) => {
+                fs::remove_file(&temporary)?;
+                true
+            }
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
         Err(error) => return Err(error.into()),
-    }
+    };
     let source_binding = lossless_source_binding(operation_id, side.clone(), expected_source);
     match create_and_verify_peer_bidirectional_backup_v1_report(
         &temporary,
@@ -806,6 +810,13 @@ fn ensure_bidirectional_backup_receipt(
         cancellation,
     ) {
         Ok(report) => {
+            #[cfg(test)]
+            if let Some(cancelled) =
+                BACKUP_CREATE_RACE_CANCEL_FAILPOINT.with(|slot| slot.borrow_mut().take())
+            {
+                fs::copy(&temporary, &backup_path)?;
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             match fs::symlink_metadata(&backup_path) {
                 Ok(_) => {
                     match verify_bidirectional_backup_receipt(
@@ -826,7 +837,20 @@ fn ensure_bidirectional_backup_receipt(
                                 published: false,
                             });
                         }
-                        Err(PeerSyncError::Cancelled) => return Err(PeerSyncError::Cancelled),
+                        Err(PeerSyncError::Cancelled) => {
+                            if temporary_created_by_invocation {
+                                match fs::remove_file(&temporary) {
+                                    Ok(()) => {}
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                    Err(error) => {
+                                        return Err(PeerSyncError::Storage(format!(
+                                            "source cancellation could not remove its backup temp: {error}"
+                                        )))
+                                    }
+                                }
+                            }
+                            return Err(PeerSyncError::Cancelled);
+                        }
                         Err(error) if bound_package_id.is_some() => return Err(error),
                         Err(_) => fs::remove_file(&backup_path)?,
                     }
@@ -5454,6 +5478,117 @@ mod tests {
         assert_eq!(fs::read(&temporary).unwrap(), expected_bytes);
         assert!(!final_path.exists());
         assert_eq!(store.revision().unwrap(), expected_revision);
+        assert_eq!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            expected_operation
+        );
+        assert_eq!(durable_job_journal_ids(directory.path()), expected_jobs);
+    }
+
+    #[test]
+    fn cancelled_create_race_preserves_the_final_and_removes_the_owned_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let source = SyncGenerationIdentity {
+            generation_id: active.manifest.generation.clone(),
+            manifest_hash: active.manifest_hash.clone(),
+            generation_sequence: active.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174092";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &active.manifest.generation,
+            1,
+            &active.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    source.clone(),
+                    0,
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174091";
+        let expected_revision = store.revision().unwrap();
+        let expected_ack = store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let expected_common = store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let expected_operation = PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap();
+        let expected_jobs = durable_job_journal_ids(directory.path());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        BACKUP_CREATE_RACE_CANCEL_FAILPOINT.with(|slot| slot.replace(Some(Arc::clone(&cancelled))));
+
+        let error = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Remote,
+            &source,
+            None,
+            &AtomicCancellation::new(Arc::clone(&cancelled)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert!(cancelled.load(Ordering::SeqCst));
+        let final_path = bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        );
+        assert!(!fs::read(&final_path).unwrap().is_empty());
+        verify_bidirectional_backup_receipt(
+            &final_path,
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Remote,
+            &source,
+            None,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let (_, temporary) = bidirectional_backup_staging_paths(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        );
+        assert!(!temporary.exists());
+        assert_eq!(store.revision().unwrap(), expected_revision);
+        assert_eq!(
+            store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_ack
+        );
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_common
+        );
         assert_eq!(
             PeerBidirectionalOperationJournal::new(directory.path())
                 .load()
