@@ -747,6 +747,8 @@ fn ensure_bidirectional_backup_receipt(
             bound_package_id,
         ) {
             Ok(receipt) => {
+                #[cfg(not(windows))]
+                sync_destination_parent(&backup_path)?;
                 return Ok(VerifiedBidirectionalBackupReceipt {
                     receipt,
                     published: false,
@@ -808,6 +810,8 @@ fn ensure_bidirectional_backup_receipt(
                     ) {
                         Ok(receipt) => {
                             fs::remove_file(&temporary)?;
+                            #[cfg(not(windows))]
+                            sync_destination_parent(&backup_path)?;
                             return Ok(VerifiedBidirectionalBackupReceipt {
                                 receipt,
                                 published: false,
@@ -4313,6 +4317,11 @@ fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSync
 #[cfg(not(windows))]
 fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
     fs::rename(source, destination)?;
+    sync_destination_parent(destination)
+}
+
+#[cfg(not(windows))]
+fn sync_destination_parent(destination: &Path) -> Result<(), PeerSyncError> {
     #[cfg(test)]
     if ATOMIC_PARENT_SYNC_FAILPOINT.with(|enabled| enabled.replace(false)) {
         return Err(PeerSyncError::Storage(
@@ -4904,16 +4913,71 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn non_windows_parent_sync_failure_keeps_the_published_file() {
+    fn non_windows_existing_final_retries_parent_sync_after_publication_failure() {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source.tmp");
-        let destination = directory.path().join("published.bin");
-        fs::write(&source, b"durable bytes").unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let source = SyncGenerationIdentity {
+            generation_id: active.manifest.generation,
+            manifest_hash: active.manifest_hash,
+            generation_sequence: active.manifest.generation_sequence,
+        };
+        let operation_id = "123e4567-e89b-42d3-a456-426614174098";
+        let final_path = bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Local,
+        );
         ATOMIC_PARENT_SYNC_FAILPOINT.with(|enabled| enabled.set(true));
 
-        assert!(replace_file_atomic(&source, &destination).is_err());
-        assert!(!source.exists());
-        assert_eq!(fs::read(destination).unwrap(), b"durable bytes");
+        assert!(ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Local,
+            &source,
+            None,
+        )
+        .is_err());
+        assert!(final_path.exists());
+
+        BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
+        ATOMIC_PARENT_SYNC_FAILPOINT.with(|enabled| enabled.set(true));
+        assert!(ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Local,
+            &source,
+            None,
+        )
+        .is_err());
+        assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
+        assert!(final_path.exists());
+
+        BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
+        let recovered = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Local,
+            &source,
+            None,
+        )
+        .unwrap();
+        assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
+        assert!(!recovered.published);
+        assert_eq!(Path::new(&recovered.receipt.path), final_path);
     }
 
     fn remote_disjoint_manifest(
