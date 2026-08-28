@@ -53,6 +53,23 @@ describe('peer bidirectional facade', () => {
         await expect(peer.status()).resolves.toEqual(status)
     })
 
+    it('preserves a durable target-prepared operation in status', async () => {
+        const status = {
+            source: { phase: 'idle' as const, devices: [] },
+            operation: { phase: 'targetPrepared' as const, operationId: 'operation-target-prepared' },
+        }
+        const nativeInvoke = vi.fn(async (command: string) => {
+            if (command === 'peer_bidirectional_status') return status
+            throw new Error(`Unexpected command: ${command}`)
+        })
+        const peer = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: nativeInvoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(peer.status()).resolves.toEqual(status)
+    })
+
     it('parses only the dedicated strict desktop pairing form', () => {
         expect(parsePeerBidirectionalUri(pairingUri)).toEqual({
             endpoint: 'http://192.168.1.20:32146',

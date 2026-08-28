@@ -770,7 +770,12 @@
             disabled={!bidirectionalEnabled
                 || bidirectionalBusy
                 || (bidirectionalOperationRetained
-                    && !['localCommitted', 'sourceUnavailable'].includes(bidirectionalOperationPhase))
+                    && ![
+                        'awaitingConflict',
+                        'targetPrepared',
+                        'localCommitted',
+                        'sourceUnavailable',
+                    ].includes(bidirectionalOperationPhase))
                 || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)
                 || !bidirectionalPairingInput}
             onclick={syncBidirectional}
@@ -781,6 +786,7 @@
         {:else if bidirectionalOperationPhase === 'awaitingConflict' && bidirectionalResult?.kind === 'conflict'}
             <div class="mt-3 rounded-md border border-draculared p-3">
                 <p class="font-bold text-draculared">{language.peerBidirectional.conflictTitle}</p>
+                <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.conflictReconnectHelp}</p>
                 <ul class="mt-2 list-disc pl-5 text-sm">
                     {#each bidirectionalResult.conflicts as conflict (conflict.key)}
                         <li>{conflict.key}: {language.peerBidirectional[conflict.type]}</li>
@@ -810,6 +816,10 @@
             <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
                 {language.peerBidirectional.resume}
             </Button>
+        {:else if bidirectionalOperationPhase === 'targetPrepared'}
+            <Button className="mt-2" disabled={bidirectionalBusy} onclick={resumeBidirectional}>
+                {language.peerBidirectional.resume}
+            </Button>
         {:else if bidirectionalResult?.kind === 'noChanges'}
             <p class="mt-2 text-sm text-textcolor2">{language.peerBidirectional.noChanges}</p>
         {:else if bidirectionalResult?.kind === 'updated'}
@@ -823,7 +833,13 @@
             <p class="mt-2 text-sm text-draculared">{language.peerBidirectional.stale}</p>
         {/if}
 
-        {#if ['localCommitted', 'sourceUnavailable', 'sourcePrepared'].includes(bidirectionalOperationPhase)
+        {#if [
+                'localCommitted',
+                'sourceUnavailable',
+                'sourcePrepared',
+                'targetPrepared',
+                'awaitingConflict',
+            ].includes(bidirectionalOperationPhase)
             && ['idle', 'stopped'].includes(bidirectionalSourceStatus.phase)}
             <Button className="mt-2" styled="danger" disabled={bidirectionalBusy} onclick={abandonBidirectional}>
                 {language.peerBidirectional.abandon}

@@ -101,6 +101,10 @@ export type PeerBidirectionalDurableOperation =
           operationId: string
       }
     | {
+          phase: 'targetPrepared'
+          operationId: string
+      }
+    | {
           phase: 'awaitingConflict'
           result: Extract<PeerBidirectionalSyncResult, { kind: 'conflict' }>
       }
@@ -256,7 +260,7 @@ export function createPeerBidirectionalFacade(options: {
     const projectOperation = (
         operation: PeerBidirectionalDurableOperation,
     ): PeerBidirectionalSyncResult | undefined => {
-        if (operation.phase === 'sourcePrepared') return undefined
+        if (operation.phase === 'sourcePrepared' || operation.phase === 'targetPrepared') return undefined
         if (operation.phase === 'awaitingConflict' || operation.phase === 'completed') {
             return operation.result
         }
@@ -273,7 +277,12 @@ export function createPeerBidirectionalFacade(options: {
         operation: PeerBidirectionalDurableOperation,
     ): boolean => {
         const operationId = typeof args.operationId === 'string' ? args.operationId : undefined
-        if (!operationId || operation.phase === 'awaitingConflict' || operation.phase === 'sourcePrepared') {
+        if (
+            !operationId
+            || operation.phase === 'awaitingConflict'
+            || operation.phase === 'sourcePrepared'
+            || operation.phase === 'targetPrepared'
+        ) {
             return false
         }
         const recoveredOperationId = operation.phase === 'completed'

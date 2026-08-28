@@ -1837,6 +1837,7 @@ export const languageEnglish = {
         syncing: "Exchanging and verifying changes...",
         invalidLink: "The bidirectional sync link is invalid.",
         conflictTitle: "Both devices changed the same record",
+        conflictReconnectHelp: "Reconnect a restarted peer with a fresh link before choosing a version.",
         sameRecord: "changed on both devices",
         deleteVsEdit: "deleted on one device and edited on the other",
         keepLocal: "Keep this device's version",

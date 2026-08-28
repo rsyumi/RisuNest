@@ -65,6 +65,194 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
 }
 
 describe('peer bidirectional controller', () => {
+    it('projects and resumes a durable target-prepared operation without a fake result', async () => {
+        const completed: PeerBidirectionalCompletedResult = {
+            kind: 'noChanges',
+            operationId: 'operation-target-prepared',
+            revision: 8,
+            remoteRevision: 8,
+            transferredObjects: 0,
+            transferredBytes: 0,
+            backups: [],
+        }
+        const resume = vi.fn(async () => completed)
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                resume,
+                status: async () => ({
+                    source: { phase: 'idle', devices: [] },
+                    operation: {
+                        phase: 'targetPrepared',
+                        operationId: 'operation-target-prepared',
+                    },
+                } as unknown as PeerBidirectionalStatus),
+            }),
+        })
+        await controller.initialize()
+
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'targetPrepared',
+            operationId: 'operation-target-prepared',
+            operationResult: undefined,
+            operationRetained: true,
+        })
+        await expect(controller.resume()).resolves.toEqual(completed)
+        expect(resume).toHaveBeenCalledWith('operation-target-prepared')
+    })
+
+    it.each(['targetPrepared', 'awaitingConflict'] as const)(
+        'keeps retained %s state when fresh-link recovery fails',
+        async (retainedPhase) => {
+            const conflict: PeerBidirectionalSyncResult = {
+                kind: 'conflict',
+                operationId: 'operation-reconnect',
+                conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
+                localManifestHash: 'a'.repeat(64),
+                remoteManifestHash: 'b'.repeat(64),
+            }
+            const operation = retainedPhase === 'targetPrepared'
+                ? {
+                      phase: 'targetPrepared' as const,
+                      operationId: 'operation-reconnect',
+                  }
+                : { phase: 'awaitingConflict' as const, result: conflict }
+            const sync = vi.fn(async () => { throw new Error('fresh peer unavailable') })
+            const controller = createPeerBidirectionalController({
+                facade: facade({
+                    sync,
+                    status: async () => ({
+                        source: { phase: 'idle', devices: [] },
+                        operation,
+                    } as unknown as PeerBidirectionalStatus),
+                }),
+            })
+            await controller.initialize()
+
+            await expect(controller.sync('pairing-fresh')).rejects.toThrow('fresh peer unavailable')
+
+            expect(sync).toHaveBeenCalledWith('pairing-fresh')
+            expect(controller.snapshot()).toMatchObject({
+                operationPhase: retainedPhase,
+                operationId: 'operation-reconnect',
+                operationResult: retainedPhase === 'awaitingConflict' ? conflict : undefined,
+                operationRetained: true,
+                operationError: 'fresh peer unavailable',
+            })
+        },
+    )
+
+    it('keeps target-prepared state when resume fails', async () => {
+        const resume = vi.fn(async () => { throw new Error('resume peer unavailable') })
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                resume,
+                status: async () => ({
+                    source: { phase: 'idle', devices: [] },
+                    operation: {
+                        phase: 'targetPrepared',
+                        operationId: 'operation-target-prepared',
+                    },
+                } as unknown as PeerBidirectionalStatus),
+            }),
+        })
+        await controller.initialize()
+
+        await expect(controller.resume()).rejects.toThrow('resume peer unavailable')
+
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'targetPrepared',
+            operationId: 'operation-target-prepared',
+            operationResult: undefined,
+            operationRetained: true,
+            operationError: 'resume peer unavailable',
+        })
+    })
+
+    it('refreshes status after clearing a target-prepared operation', async () => {
+        const acknowledge = vi.fn(async () => undefined)
+        let acknowledged = false
+        acknowledge.mockImplementation(async () => { acknowledged = true })
+        const status = vi.fn(async () => acknowledged
+            ? idleStatus()
+            : ({
+                  source: { phase: 'idle', devices: [] },
+                  operation: {
+                      phase: 'targetPrepared',
+                      operationId: 'operation-target-prepared',
+                  },
+              } as unknown as PeerBidirectionalStatus))
+        const controller = createPeerBidirectionalController({
+            facade: facade({ acknowledge, status }),
+        })
+        await controller.initialize()
+
+        await controller.abandon()
+
+        expect(acknowledge).toHaveBeenCalledWith('operation-target-prepared')
+        expect(status).toHaveBeenCalledTimes(2)
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'idle',
+            operationId: undefined,
+            operationRetained: false,
+        })
+    })
+
+    it('abandons an awaiting conflict explicitly', async () => {
+        const conflict: PeerBidirectionalSyncResult = {
+            kind: 'conflict',
+            operationId: 'operation-conflict-abandon',
+            conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
+            localManifestHash: 'a'.repeat(64),
+            remoteManifestHash: 'b'.repeat(64),
+        }
+        const acknowledge = vi.fn(async () => undefined)
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                acknowledge,
+                status: async () => ({
+                    source: { phase: 'idle', devices: [] },
+                    operation: { phase: 'awaitingConflict', result: conflict },
+                }),
+            }),
+        })
+        await controller.initialize()
+
+        await controller.abandon()
+
+        expect(acknowledge).toHaveBeenCalledWith('operation-conflict-abandon')
+        expect(controller.snapshot()).toMatchObject({ operationPhase: 'idle', operationRetained: false })
+    })
+
+    it('preserves an awaiting conflict when abandon fails', async () => {
+        const conflict: PeerBidirectionalSyncResult = {
+            kind: 'conflict',
+            operationId: 'operation-conflict-retained',
+            conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
+            localManifestHash: 'a'.repeat(64),
+            remoteManifestHash: 'b'.repeat(64),
+        }
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                acknowledge: async () => { throw new Error('clear failed') },
+                status: async () => ({
+                    source: { phase: 'idle', devices: [] },
+                    operation: { phase: 'awaitingConflict', result: conflict },
+                }),
+            }),
+        })
+        await controller.initialize()
+
+        await expect(controller.abandon()).rejects.toThrow('clear failed')
+
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'awaitingConflict',
+            operationId: 'operation-conflict-retained',
+            operationResult: conflict,
+            operationRetained: true,
+            operationError: 'clear failed',
+        })
+    })
+
     it('projects a durable source-prepared operation after restart without a resume result', async () => {
         const controller = createPeerBidirectionalController({
             facade: facade({
@@ -901,7 +1089,7 @@ describe('peer bidirectional controller', () => {
         })
     })
 
-    it('rejects source and new sync commands while an operation is retained', async () => {
+    it('rejects source prepare but permits fresh-link recovery for an awaiting conflict', async () => {
         const prepare = vi.fn(async () => ({ phase: 'prepared' as const, sessionId: 'session', devices: [] }))
         const sync = vi.fn(async () => ({
             kind: 'noChanges' as const,
@@ -934,9 +1122,9 @@ describe('peer bidirectional controller', () => {
         await controller.initialize()
 
         await expect(controller.prepare()).rejects.toThrow('retained peer sync operation')
-        await expect(controller.sync('pairing-new')).rejects.toThrow('retained peer sync operation')
+        await expect(controller.sync('pairing-new')).resolves.toMatchObject({ kind: 'noChanges' })
         expect(prepare).not.toHaveBeenCalled()
-        expect(sync).not.toHaveBeenCalled()
+        expect(sync).toHaveBeenCalledWith('pairing-new')
     })
 
     it('keeps a committed renderer-refresh failure recoverable through resume', async () => {
@@ -1197,7 +1385,7 @@ describe('peer bidirectional controller', () => {
         })
     })
 
-    it.each(['awaitingConflict', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
+    it.each(['awaitingConflict', 'targetPrepared', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
         'keeps source prepare and start blocked while %s is retained',
         async (retainedPhase) => {
             const conflict: PeerBidirectionalSyncResult = {
@@ -1226,6 +1414,11 @@ describe('peer bidirectional controller', () => {
                         source: { phase: 'stopped', devices: [] },
                         operation: retainedPhase === 'awaitingConflict'
                             ? { phase: 'awaitingConflict', result: conflict }
+                            : retainedPhase === 'targetPrepared'
+                                ? {
+                                      phase: 'targetPrepared',
+                                      operationId: 'operation-source-blocked',
+                                  }
                             : retainedPhase === 'refreshPending'
                                 ? undefined
                                 : {
@@ -1257,16 +1450,9 @@ describe('peer bidirectional controller', () => {
         },
     )
 
-    it.each(['awaitingConflict', 'completed', 'refreshPending'] as const)(
+    it.each(['completed', 'refreshPending'] as const)(
         'continues to reject fresh pairing sync while %s is retained',
         async (retainedPhase) => {
-            const conflict: PeerBidirectionalSyncResult = {
-                kind: 'conflict',
-                operationId: 'operation-blocked',
-                conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
-                localManifestHash: 'a'.repeat(64),
-                remoteManifestHash: 'b'.repeat(64),
-            }
             const completed: PeerBidirectionalSyncResult = {
                 kind: 'noChanges',
                 operationId: 'operation-blocked',
@@ -1289,9 +1475,7 @@ describe('peer bidirectional controller', () => {
                         source: { phase: 'idle', devices: [] },
                         operation: retainedPhase === 'completed'
                             ? { phase: 'completed', result: completed }
-                            : retainedPhase === 'awaitingConflict'
-                                ? { phase: 'awaitingConflict', result: conflict }
-                                : undefined,
+                            : undefined,
                     }),
                 }),
             })

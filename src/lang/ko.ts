@@ -1617,6 +1617,7 @@ export const languageKorean = {
         syncing: "변경 사항을 교환하고 검증하는 중...",
         invalidLink: "양방향 동기화 링크가 잘못되었습니다.",
         conflictTitle: "두 기기에서 같은 레코드를 변경했습니다",
+        conflictReconnectHelp: "버전을 선택하기 전에 다시 시작한 다른 기기를 새 링크로 연결하세요.",
         sameRecord: "두 기기에서 변경됨",
         deleteVsEdit: "한 기기에서 삭제되고 다른 기기에서 편집됨",
         keepLocal: "이 기기 버전 유지",

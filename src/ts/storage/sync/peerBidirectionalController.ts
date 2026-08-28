@@ -14,6 +14,7 @@ export type PeerBidirectionalOperationPhase =
     | 'running'
     | 'awaitingConflict'
     | 'sourcePrepared'
+    | 'targetPrepared'
     | 'localCommitted'
     | 'sourceUnavailable'
     | 'refreshPending'
@@ -44,7 +45,7 @@ function operationSnapshot(
             operationId: operation.result.operationId,
         }
     }
-    if (operation.phase === 'sourcePrepared') {
+    if (operation.phase === 'sourcePrepared' || operation.phase === 'targetPrepared') {
         return {
             operationPhase: operation.phase,
             operationId: operation.operationId,
@@ -103,6 +104,7 @@ export function createPeerBidirectionalController(options: {
         'running',
         'awaitingConflict',
         'sourcePrepared',
+        'targetPrepared',
         'localCommitted',
         'sourceUnavailable',
         'refreshPending',
@@ -358,7 +360,12 @@ export function createPeerBidirectionalController(options: {
             }
             if (
                 snapshot.operationRetained
-                && !['localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)
+                && ![
+                    'awaitingConflict',
+                    'targetPrepared',
+                    'localCommitted',
+                    'sourceUnavailable',
+                ].includes(snapshot.operationPhase)
             ) {
                 return Promise.reject(new Error('A retained peer sync operation must be resolved first'))
             }
@@ -390,7 +397,10 @@ export function createPeerBidirectionalController(options: {
             if (activeOperation) {
                 return runOperation(key, () => options.facade.resume(operationId ?? ''))
             }
-            if (!operationId || !['localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)) {
+            if (
+                !operationId
+                || !['targetPrepared', 'localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)
+            ) {
                 return Promise.reject(new Error('No peer sync operation can be resumed'))
             }
             return runOperation(
@@ -409,12 +419,18 @@ export function createPeerBidirectionalController(options: {
         async abandon(): Promise<void> {
             if (
                 !snapshot.operationId
-                || !['localCommitted', 'sourceUnavailable', 'sourcePrepared'].includes(snapshot.operationPhase)
+                || ![
+                    'awaitingConflict',
+                    'sourcePrepared',
+                    'targetPrepared',
+                    'localCommitted',
+                    'sourceUnavailable',
+                ].includes(snapshot.operationPhase)
                 || ['prepared', 'running'].includes(snapshot.sourceStatus.phase)
             ) return
             await clearRetainedOperation(
                 snapshot.operationId,
-                snapshot.operationPhase === 'sourcePrepared',
+                ['sourcePrepared', 'targetPrepared'].includes(snapshot.operationPhase),
             )
         },
     }

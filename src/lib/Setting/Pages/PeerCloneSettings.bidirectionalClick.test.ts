@@ -5,7 +5,7 @@ import { mount, tick, unmount } from 'svelte'
 
 const controllerMocks = vi.hoisted(() => {
     const listeners = new Set<() => void>()
-    let operationPhase: 'idle' | 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'refreshPending' | 'completed' = 'idle'
+    let operationPhase: 'idle' | 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'targetPrepared' | 'refreshPending' | 'completed' = 'idle'
     let sourcePhase: 'stopped' | 'prepared' | 'running' = 'stopped'
     let revoked = false
     const snapshot = () => ({
@@ -83,6 +83,7 @@ const controllerMocks = vi.hoisted(() => {
             for (const listener of listeners) listener()
         }),
         sync: vi.fn(async () => undefined),
+        resume: vi.fn(async () => undefined),
         abandon: vi.fn(async () => undefined),
         revoke: vi.fn(async (_sessionId: string, deviceId: string) => {
             if (deviceId === 'device-offline') revoked = true
@@ -107,7 +108,7 @@ const controllerMocks = vi.hoisted(() => {
             sourcePhase = 'stopped'
             revoked = false
         },
-        setOperationPhase(phase: 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'refreshPending' | 'completed') {
+        setOperationPhase(phase: 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'targetPrepared' | 'refreshPending' | 'completed') {
             operationPhase = phase
         },
         setSourcePhase(phase: 'stopped' | 'prepared' | 'running') {
@@ -185,7 +186,7 @@ describe('peer bidirectional offline revoke', () => {
         expect(revoke?.disabled).toBe(true)
     })
 
-    it.each(['localCommitted', 'sourceUnavailable'] as const)(
+    it.each(['localCommitted', 'sourceUnavailable', 'targetPrepared', 'awaitingConflict'] as const)(
         'submits a fresh pairing URI while %s is retained',
         async (operationPhase) => {
             controllerMocks.setOperationPhase(operationPhase)
@@ -208,6 +209,40 @@ describe('peer bidirectional offline revoke', () => {
             await vi.waitFor(() => expect(controllerMocks.bidirectional.sync).toHaveBeenCalledWith(pairingUri))
         },
     )
+
+    it('offers resume and abandon for a target-prepared operation', async () => {
+        controllerMocks.setOperationPhase('targetPrepared')
+        const target = document.createElement('div')
+        document.body.append(target)
+        mounted = mount(PeerCloneSettings, { target })
+        await tick()
+        const button = (label: string) => [...target.querySelectorAll<HTMLButtonElement>('button')]
+            .find((candidate) => candidate.textContent?.trim() === label)
+
+        expect(button('Resume sync')?.disabled).toBe(false)
+        expect(button('Abandon pending sync')?.disabled).toBe(false)
+        button('Resume sync')?.click()
+        await vi.waitFor(() => expect(controllerMocks.bidirectional.resume).toHaveBeenCalledTimes(1))
+        await vi.waitFor(() => expect(button('Abandon pending sync')?.disabled).toBe(false))
+        button('Abandon pending sync')?.click()
+        await vi.waitFor(() => expect(controllerMocks.bidirectional.abandon).toHaveBeenCalledTimes(1))
+    })
+
+    it('offers abandon and reconnection guidance for an awaiting conflict', async () => {
+        controllerMocks.setOperationPhase('awaitingConflict')
+        const target = document.createElement('div')
+        document.body.append(target)
+        mounted = mount(PeerCloneSettings, { target })
+        await tick()
+
+        expect(target.textContent).toContain('Reconnect a restarted peer with a fresh link before choosing a version.')
+        expect(target.textContent).toContain('The losing version receives a verified lossless backup before replacement.')
+        const abandon = [...target.querySelectorAll<HTMLButtonElement>('button')]
+            .find((button) => button.textContent?.trim() === 'Abandon pending sync')
+        expect(abandon?.disabled).toBe(false)
+        abandon?.click()
+        await vi.waitFor(() => expect(controllerMocks.bidirectional.abandon).toHaveBeenCalledTimes(1))
+    })
 
     it.each(['completed', 'sourcePrepared'] as const)(
         'prepares and starts a source while %s is retained',
@@ -258,7 +293,7 @@ describe('peer bidirectional offline revoke', () => {
         },
     )
 
-    it.each(['awaitingConflict', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
+    it.each(['awaitingConflict', 'targetPrepared', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
         'keeps source prepare disabled while %s is retained',
         async (operationPhase) => {
             controllerMocks.setOperationPhase(operationPhase)

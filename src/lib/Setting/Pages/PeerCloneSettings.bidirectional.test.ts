@@ -20,6 +20,9 @@ describe('peer bidirectional settings surface', () => {
         expect(languageEnglish.peerBidirectional.keepRemote).toContain('other device')
         expect(languageKorean.peerBidirectional?.keepLocal).toContain('이 기기')
         expect(languageKorean.peerBidirectional?.keepRemote).toContain('다른 기기')
+        expect(peerCloneSettingsSource).toContain('language.peerBidirectional.conflictReconnectHelp')
+        expect(languageEnglish.peerBidirectional.conflictReconnectHelp).toContain('fresh link')
+        expect(languageKorean.peerBidirectional?.conflictReconnectHelp).toContain('새 링크')
     })
 
     it('shows durable backup and resume states', () => {
@@ -49,9 +52,8 @@ describe('peer bidirectional settings surface', () => {
         expect(peerCloneSettingsSource).toContain(
             "disabled={bidirectionalBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}",
         )
-        expect(peerCloneSettingsSource).toContain(
-            "['localCommitted', 'sourceUnavailable', 'sourcePrepared'].includes(bidirectionalOperationPhase)",
-        )
+        expect(peerCloneSettingsSource).toContain("'targetPrepared'")
+        expect(peerCloneSettingsSource).toContain("'awaitingConflict'")
         expect(peerCloneSettingsSource).toContain('await alertConfirm(language.peerBidirectional.abandonConfirm)')
         expect(peerCloneSettingsSource).toContain('bidirectionalController.abandon()')
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.abandon')
