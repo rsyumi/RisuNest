@@ -330,8 +330,11 @@ let gatedProductionStore: BlobStore | null = null
 export function configureActiveBlobStore(
     gate: StorageMutationGate,
     authoritative: BlobStore = deferredStore,
+    options: { alreadyGuarded?: boolean } = {},
 ): void {
-    gatedProductionStore = createGatedBlobStore(authoritative, gate)
+    gatedProductionStore = options.alreadyGuarded
+        ? authoritative
+        : createGatedBlobStore(authoritative, gate)
 }
 
 export function getLegacyBlobStore(): BlobStore {

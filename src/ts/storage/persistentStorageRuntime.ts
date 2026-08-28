@@ -5,6 +5,7 @@ import { createLocalColdStorageRuntime } from './localColdStorageRuntime'
 import { getPersistentStorageAuthority } from './persistentDataStoreFactory'
 import {
     configureActiveBlobStore,
+    createGatedBlobStore,
     getLegacyBlobStore,
     getPlatformBlobKeyValueBackend,
 } from './platformBlobStore'
@@ -33,6 +34,7 @@ import {
     createLegacyTauriColdPayloadStore,
 } from './platformColdPayloadStore'
 import { RevisionConflictError } from './persistentDataStore'
+import type { BlobStore } from './blobStore'
 import type { ColdPayloadStore } from './coldPayloadStore'
 import type { PersistentStorageAuthority } from './persistentStorageAuthority'
 
@@ -77,6 +79,54 @@ function createConfiguredColdPayloadStore(
         : createGatedColdPayloadStore(store, authority.gate)
 }
 
+function createCoordinatorOwnedAssetBlobStore(
+    store: BlobStore,
+    authority: PersistentStorageAuthority,
+): BlobStore {
+    const mutate = async <T>(key: string, operation: () => Promise<T>): Promise<T> => {
+        let result!: T
+        await getPersistentDataRuntime().runStorageOnlyMutation((expectedRevision) =>
+            authority.gate.runKeyedWrite(key, async () => {
+                const before = await authority.rawStore.readRoot()
+                if (before.revision !== expectedRevision) {
+                    throw new RevisionConflictError(expectedRevision, before.revision)
+                }
+                result = await operation()
+                return (await authority.rawStore.readRoot()).revision
+            }))
+        return result
+    }
+    const coordinated: BlobStore = {
+        async put(key, data, metadata) {
+            const ownedData = data.slice()
+            const ownedMetadata = { ...metadata }
+            return mutate(key, () => store.put(key, ownedData, ownedMetadata))
+        },
+        read: (key, range) => store.read(key, range),
+        stat: (key) => store.stat(key),
+        list: (query) => store.list(query),
+        remove: (key) => mutate(key, () => store.remove(key)),
+        resolveUrl: (key) => store.resolveUrl(key),
+    }
+    if (store.putNewInlayImage) {
+        coordinated.putNewInlayImage = (key, data, input) => {
+            const ownedData = data.slice()
+            const ownedInput = { ...input }
+            return mutate(key, () => store.putNewInlayImage!(key, ownedData, ownedInput))
+        }
+    }
+    return coordinated
+}
+
+function createConfiguredAssetBlobStore(
+    store: BlobStore,
+    authority: PersistentStorageAuthority,
+): BlobStore {
+    return isTauri
+        ? createCoordinatorOwnedAssetBlobStore(store, authority)
+        : createGatedBlobStore(store, authority.gate)
+}
+
 async function installPersistentStorage(): Promise<void> {
     const authority = getPersistentStorageAuthority()
     await authority.rawStore.open()
@@ -115,7 +165,11 @@ async function installPersistentStorage(): Promise<void> {
     await selectRuntimeColdPayloadStore(coldSelection)
     configureActiveBlobStore(
         authority.gate,
-        createRuntimeAssetRepositoryDispatcher(selection),
+        createConfiguredAssetBlobStore(
+            createRuntimeAssetRepositoryDispatcher(selection),
+            authority,
+        ),
+        { alreadyGuarded: true },
     )
     configureLocalColdStorageRuntime(
         createLocalColdStorageRuntime(createConfiguredColdPayloadStore(
@@ -187,7 +241,11 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
         await selectRuntimeColdPayloadStore(coldSelection)
         configureActiveBlobStore(
             authority.gate,
-            createRuntimeAssetRepositoryDispatcher(selection),
+            createConfiguredAssetBlobStore(
+                createRuntimeAssetRepositoryDispatcher(selection),
+                authority,
+            ),
+            { alreadyGuarded: true },
         )
         configureLocalColdStorageRuntime(
             createLocalColdStorageRuntime(createConfiguredColdPayloadStore(

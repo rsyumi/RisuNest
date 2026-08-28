@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from 'vitest'
 import {
+    configureActiveBlobStore,
     createBackedBlobStore,
     createBrowserBlobBackend,
     createGatedBlobStore,
@@ -9,11 +10,16 @@ import {
     createTauriCasObjectUrl,
     createTauriBlobStore,
     createTauriNativeMediaUrl,
+    getBlobStore,
     physicalBlobKeys,
     readBlobForFacade,
 } from './platformBlobStore'
 import { SeekMode } from '@tauri-apps/plugin-fs'
-import { createInRealmStorageLockManager, createStorageMutationGate } from './storageMutationGate'
+import {
+    createInRealmStorageLockManager,
+    createStorageMutationGate,
+    type StorageMutationGate,
+} from './storageMutationGate'
 
 function memoryBackend() {
     const values = new Map<string, Uint8Array>()
@@ -139,6 +145,50 @@ describe('platform BlobStore', () => {
         await store.remove('assets/a')
         expect(events).toEqual(['lock'])
         expect(await store.read('assets/a')).toBeNull()
+    })
+
+    test('gates a supplied authoritative store by default', async () => {
+        const runKeyedWrite = vi.fn(async (
+            _key: string,
+            operation: () => Promise<unknown>,
+        ) => operation())
+        const gate: StorageMutationGate = {
+            runWrite: (operation) => operation(),
+            runKeyedWrite<T>(key: string, operation: () => Promise<T>) {
+                return runKeyedWrite(key, operation) as Promise<T>
+            },
+            runTransition: (operation) => operation(),
+        }
+        const authoritative = createBackedBlobStore(memoryBackend().backend)
+        configureActiveBlobStore(gate, authoritative)
+
+        await getBlobStore().put('assets/a', new Uint8Array([1]), {
+            kind: 'asset', mime: 'application/octet-stream', name: 'a', ext: '',
+        })
+
+        expect(runKeyedWrite).toHaveBeenCalledTimes(1)
+    })
+
+    test('does not gate an already-guarded authoritative store a second time', async () => {
+        const runKeyedWrite = vi.fn(async (
+            _key: string,
+            operation: () => Promise<unknown>,
+        ) => operation())
+        const gate: StorageMutationGate = {
+            runWrite: (operation) => operation(),
+            runKeyedWrite<T>(key: string, operation: () => Promise<T>) {
+                return runKeyedWrite(key, operation) as Promise<T>
+            },
+            runTransition: (operation) => operation(),
+        }
+        const authoritative = createBackedBlobStore(memoryBackend().backend)
+        configureActiveBlobStore(gate, authoritative, { alreadyGuarded: true })
+
+        await getBlobStore().put('assets/a', new Uint8Array([1]), {
+            kind: 'asset', mime: 'application/octet-stream', name: 'a', ext: '',
+        })
+
+        expect(runKeyedWrite).not.toHaveBeenCalled()
     })
 
     test('owns blob bytes before a deferred write gate proceeds', async () => {
