@@ -713,6 +713,93 @@ pub(super) fn replace_preserve_cold_payloads(
     Ok(())
 }
 
+pub(super) fn replace_preserve_repositories(
+    connection: &mut Connection,
+    staging_id: &str,
+    expected_revision: Option<i64>,
+) -> StoreResult<i64> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    let actual_revision = current_revision(&transaction)?;
+    if let Some(expected) = expected_revision {
+        if actual_revision != expected {
+            return Err(StoreError::RevisionConflict {
+                expected,
+                actual: actual_revision,
+            });
+        }
+    }
+    let active = active_generation(&transaction)?;
+    let asset_authority = read_asset_repository_authority(&transaction, &active)?;
+    if matches!(
+        asset_authority,
+        AssetRepositoryAuthorityState::Preparing { .. }
+    ) {
+        return Err(validation(
+            "Active asset repository generation cannot be preparing",
+        ));
+    }
+    let cold_authority = read_cold_payload_authority(&transaction, &active)?;
+    if matches!(cold_authority, ColdPayloadAuthorityState::Preparing { .. }) {
+        return Err(validation(
+            "Active cold payload generation cannot be preparing",
+        ));
+    }
+    let source_root = replacement_root(&transaction, &active)?;
+    let staged_root = replacement_root(&transaction, staging_id)?;
+    let owner_heads = replacement_owner_heads(&transaction, &active)?;
+    let retained_owner_heads = owner_heads
+        .iter()
+        .map(|head| -> StoreResult<Option<&AssetOwnerHead>> {
+            let source = replacement_owner_tuple(&transaction, &active, &source_root, &head.owner)?;
+            let staged =
+                replacement_owner_tuple(&transaction, staging_id, &staged_root, &head.owner)?;
+            Ok((source.is_some() && source == staged).then_some(head))
+        })
+        .collect::<StoreResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    transaction.execute(
+        "DELETE FROM asset_aliases WHERE generation = ?1",
+        [staging_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO asset_aliases (
+            generation, logical_key, object_hash, kind, size, mime, name, ext,
+            inlay_type, width, height, metadata
+         )
+         SELECT ?1, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height, metadata
+         FROM asset_aliases WHERE generation = ?2",
+        params![staging_id, active],
+    )?;
+    put_asset_repository_authority(&transaction, staging_id, &asset_authority)?;
+
+    transaction.execute(
+        "DELETE FROM cold_aliases WHERE generation = ?1",
+        [staging_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+         SELECT ?1, key, object_hash, size, metadata
+         FROM cold_aliases WHERE generation = ?2",
+        params![staging_id, active],
+    )?;
+    put_cold_payload_authority(&transaction, staging_id, &cold_authority)?;
+
+    transaction.execute(
+        "DELETE FROM asset_owner_heads WHERE generation = ?1",
+        [staging_id],
+    )?;
+    for head in retained_owner_heads {
+        put_asset_owner_head(&transaction, staging_id, head)?;
+    }
+    transaction.commit()?;
+    Ok(actual_revision)
+}
+
 fn put_asset_repository_authority(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -807,6 +894,165 @@ pub(super) fn staged_owner_entries<'a>(
                 .ok_or_else(|| validation("Asset owner property must be an array when present"))
         })
         .transpose()
+}
+
+#[derive(PartialEq)]
+enum ReplacementOwnerTuple {
+    Absent,
+    Present(Vec<Value>),
+}
+
+fn replacement_root(connection: &Connection, generation: &str) -> StoreResult<Value> {
+    let stored: String = connection.query_row(
+        "SELECT value FROM root WHERE generation = ?1",
+        [generation],
+        |row| row.get(0),
+    )?;
+    let value: Value = serde_json::from_str(&stored)?;
+    if !value.is_object() {
+        return Err(validation("Replacement root must be an object"));
+    }
+    Ok(value)
+}
+
+fn replacement_owner_heads(
+    connection: &Connection,
+    generation: &str,
+) -> StoreResult<Vec<AssetOwnerHead>> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT owner_kind, owner_locator, present, manifest_hash, entry_count
+             FROM asset_owner_heads WHERE generation = ?1
+             ORDER BY owner_kind ASC, owner_locator ASC",
+        )?;
+        let rows = statement.query_map([generation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    rows.into_iter()
+        .map(
+            |(owner_kind, owner_locator, present, manifest_hash, entry_count)| {
+                let owner = match owner_kind.as_str() {
+                    "character-additional-assets" => AssetOwnerLocator::CharacterAdditionalAssets {
+                        character_id: owner_locator,
+                    },
+                    "root-module-assets" => AssetOwnerLocator::RootModuleAssets {
+                        index: replacement_owner_index(&owner_locator)?,
+                    },
+                    "persona-embedded-module-assets" => {
+                        AssetOwnerLocator::PersonaEmbeddedModuleAssets {
+                            index: replacement_owner_index(&owner_locator)?,
+                        }
+                    }
+                    _ => return Err(validation("Stored asset owner kind is invalid")),
+                };
+                let head = AssetOwnerHead {
+                    owner,
+                    present,
+                    manifest_hash,
+                    entry_count,
+                };
+                head.validate()?;
+                Ok(head)
+            },
+        )
+        .collect()
+}
+
+fn replacement_owner_index(value: &str) -> StoreResult<i64> {
+    let index = value
+        .parse::<i64>()
+        .map_err(|_| validation("Stored asset owner locator is invalid"))?;
+    if index.to_string() != value {
+        return Err(validation("Stored asset owner locator is noncanonical"));
+    }
+    Ok(index)
+}
+
+fn replacement_owner_tuple(
+    connection: &Connection,
+    generation: &str,
+    root: &Value,
+    owner: &AssetOwnerLocator,
+) -> StoreResult<Option<ReplacementOwnerTuple>> {
+    let root = root
+        .as_object()
+        .ok_or_else(|| validation("Replacement root must be an object"))?;
+    match owner {
+        AssetOwnerLocator::CharacterAdditionalAssets { character_id } => {
+            let detail: Option<String> = connection
+                .query_row(
+                    "SELECT detail FROM characters
+                     WHERE generation = ?1 AND character_id = ?2",
+                    params![generation, character_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(detail) = detail else {
+                return Ok(None);
+            };
+            replacement_owner_tuple_from_parent(&serde_json::from_str(&detail)?, "additionalAssets")
+        }
+        AssetOwnerLocator::RootModuleAssets { index } => {
+            let Some(modules) = root.get("modules") else {
+                return Ok(None);
+            };
+            let modules = modules
+                .as_array()
+                .ok_or_else(|| validation("Replacement modules must be an array"))?;
+            let Some(module) = usize::try_from(*index)
+                .ok()
+                .and_then(|index| modules.get(index))
+            else {
+                return Ok(None);
+            };
+            replacement_owner_tuple_from_parent(module, "assets")
+        }
+        AssetOwnerLocator::PersonaEmbeddedModuleAssets { index } => {
+            let Some(personas) = root.get("personas") else {
+                return Ok(None);
+            };
+            let personas = personas
+                .as_array()
+                .ok_or_else(|| validation("Replacement personas must be an array"))?;
+            let Some(module) = usize::try_from(*index)
+                .ok()
+                .and_then(|index| personas.get(index))
+                .and_then(Value::as_object)
+                .and_then(|persona| persona.get("embeddedModule"))
+            else {
+                return Ok(None);
+            };
+            replacement_owner_tuple_from_parent(module, "assets")
+        }
+    }
+}
+
+fn replacement_owner_tuple_from_parent(
+    parent: &Value,
+    property: &str,
+) -> StoreResult<Option<ReplacementOwnerTuple>> {
+    let parent = parent
+        .as_object()
+        .ok_or_else(|| validation("Replacement asset owner parent must be an object"))?;
+    match parent.get(property) {
+        None => Ok(Some(ReplacementOwnerTuple::Absent)),
+        Some(entries) => Ok(Some(ReplacementOwnerTuple::Present(
+            entries
+                .as_array()
+                .ok_or_else(|| {
+                    validation("Replacement asset owner property must be an array when present")
+                })?
+                .clone(),
+        ))),
+    }
 }
 
 pub(super) fn replace_put_cold_aliases(
@@ -998,6 +1244,26 @@ fn require_activatable_authority(connection: &Connection, staging_id: &str) -> S
         }
     }
     Ok(())
+}
+
+fn read_asset_repository_authority(
+    connection: &Connection,
+    generation: &str,
+) -> StoreResult<AssetRepositoryAuthorityState> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM asset_repository_authority WHERE generation = ?1",
+            [generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(AssetRepositoryAuthorityState::Legacy);
+    };
+    let authority: AssetRepositoryAuthorityState = serde_json::from_str(&stored)
+        .map_err(|_| validation("Asset repository authority state is invalid"))?;
+    authority.validate()?;
+    Ok(authority)
 }
 
 pub(super) fn read_cold_payload_authority(

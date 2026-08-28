@@ -28,8 +28,6 @@ class NativeStoreBoundary {
                 const { characters: _characters, botPresets: _botPresets, ...root } = this.database
                 return { revision: this.revision, value: structuredClone(root) }
             }
-            case 'pds_read_cold_payload_authority':
-                return { revision: this.revision, value: { format: 'legacy' } }
             case 'pds_replace_begin': {
                 const stagingId = `staging-${++this.stagingSequence}`
                 this.staging.set(stagingId, { root: null, presets: [], characters: [] })
@@ -53,6 +51,13 @@ class NativeStoreBoundary {
                 const staging = this.requireStaging(args.stagingId)
                 staging.characters.push(...structuredClone(args.characters as Database['characters']))
                 return undefined
+            }
+            case 'pds_replace_preserve_repositories': {
+                const expectedRevision = args.expectedRevision as number | undefined
+                if (expectedRevision !== undefined && expectedRevision !== this.revision) {
+                    throw { code: 'revision-conflict', expected: expectedRevision, actual: this.revision }
+                }
+                return { revision: this.revision }
             }
             case 'pds_replace_commit': {
                 const stagingId = args.stagingId as string

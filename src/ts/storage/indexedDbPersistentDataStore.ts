@@ -115,6 +115,51 @@ function ownArrayProperty(value: object, key: string): unknown[] | undefined {
     return property
 }
 
+interface ReplacementOwnerTuple {
+    present: boolean
+    entries: unknown[]
+}
+
+function replacementOwnerTupleFromParent(
+    parent: object | undefined,
+    property: string,
+): ReplacementOwnerTuple | null {
+    if (!parent) return null
+    const entries = ownArrayProperty(parent, property)
+    return entries === undefined
+        ? { present: false, entries: [] }
+        : { present: true, entries }
+}
+
+function replacementOwnerTupleFromDatabase(
+    database: Database,
+    owner: AssetOwnerLocator,
+): ReplacementOwnerTuple | null {
+    if (owner.kind === 'character-additional-assets') {
+        return replacementOwnerTupleFromParent(
+            database.characters.find((character) => character.chaId === owner.characterId),
+            'additionalAssets',
+        )
+    }
+    if (owner.kind === 'root-module-assets') {
+        return replacementOwnerTupleFromParent(database.modules?.[owner.index], 'assets')
+    }
+    return replacementOwnerTupleFromParent(
+        database.personas?.[owner.index]?.embeddedModule,
+        'assets',
+    )
+}
+
+function replacementOwnerTuplesEqual(
+    left: ReplacementOwnerTuple | null,
+    right: ReplacementOwnerTuple | null,
+): boolean {
+    return left !== null
+        && right !== null
+        && left.present === right.present
+        && JSON.stringify(left.entries) === JSON.stringify(right.entries)
+}
+
 function commitCharacterParents(input: WorkingSetCommit): Map<string, CharacterDetail> {
     const parents = new Map<string, CharacterDetail>()
     for (const character of [
@@ -942,12 +987,21 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             const revision = active.revision + 1
             const generation = this.generationFor(revision)
-            await this.stageDatabase(transaction, databaseValue, generation, assetAliases)
-            await this.preserveColdPayloadsForReplacement(
+            await this.stageDatabase(transaction, databaseValue, generation, [])
+            await this.preserveRepositoriesForReplacement(
                 transaction,
                 active.generation,
                 generation,
+                databaseValue,
             )
+            for (const alias of assetAliases) {
+                validateAssetAlias(alias)
+                transaction.objectStore('assetAliases').put({
+                    key: this.assetAliasKey(generation, alias.kind, alias.key),
+                    generation,
+                    value: structuredClone(alias),
+                } satisfies StoredRecord<AssetAlias>)
+            }
             if (!(await this.generationIsLeased(transaction, active.generation))) {
                 await this.deleteGenerationFromTransaction(transaction, active.generation)
             }
@@ -2021,22 +2075,103 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return targetGeneration
     }
 
-    private async preserveColdPayloadsForReplacement(
+    private async preserveRepositoriesForReplacement(
         transaction: IDBTransaction,
         sourceGeneration: string,
         targetGeneration: string,
+        replacementDatabase: Database,
     ): Promise<void> {
-        const authority = await this.readColdPayloadAuthorityRecord(transaction, sourceGeneration)
-        if (authority.format === 'preparing') {
+        const sourceRootRecord = (await requestResult(
+            transaction.objectStore('root').get(sourceGeneration),
+        )) as StoredRecord<PersistentRoot> | undefined
+        if (!sourceRootRecord) throw new Error('Persistent active generation root is missing')
+        if (sourceRootRecord.generation !== sourceGeneration) {
+            throw new TypeError('Persistent root generation does not match its lookup key')
+        }
+
+        const assetAuthorityRecord = (await requestResult(
+            transaction.objectStore('assetRepositoryAuthority').get(sourceGeneration),
+        )) as StoredRecord<AssetRepositoryAuthorityState> | undefined
+        if (assetAuthorityRecord && assetAuthorityRecord.generation !== sourceGeneration) {
+            throw new TypeError(
+                'Persistent asset repository authority marker generation is invalid',
+            )
+        }
+        const assetAuthority = assetAuthorityRecord
+            ? parseAssetRepositoryAuthorityState(assetAuthorityRecord.value)
+            : { format: 'legacy' as const }
+        if (assetAuthority.format === 'preparing') {
+            throw new Error('Active asset repository generation cannot be preparing')
+        }
+        await this.copyGeneration(
+            transaction.objectStore('assetAliases'),
+            sourceGeneration,
+            targetGeneration,
+        )
+        this.putAssetRepositoryAuthority(transaction, targetGeneration, assetAuthority)
+
+        const coldAuthority = await this.readColdPayloadAuthorityRecord(
+            transaction,
+            sourceGeneration,
+        )
+        if (coldAuthority.format === 'preparing') {
             throw new Error('Active cold payload generation cannot be preparing')
         }
-        if (authority.format === 'legacy') return
         await this.copyGeneration(
             transaction.objectStore('coldAliases'),
             sourceGeneration,
             targetGeneration,
         )
-        this.putColdPayloadAuthority(transaction, targetGeneration, authority)
+        this.putColdPayloadAuthority(transaction, targetGeneration, coldAuthority)
+
+        const ownerHeadRecords = (await requestResult(
+            transaction.objectStore('assetOwnerHeads').index('byGeneration').getAll(sourceGeneration),
+        )) as StoredRecord<AssetOwnerHead>[]
+        for (const record of ownerHeadRecords) {
+            if (record.generation !== sourceGeneration) {
+                throw new TypeError('Asset owner head stored generation does not match its index')
+            }
+            validateAssetOwnerHead(record.value)
+            const sourceTuple = await this.readReplacementOwnerTuple(
+                transaction,
+                sourceGeneration,
+                sourceRootRecord.value,
+                record.value.owner,
+            )
+            const replacementTuple = replacementOwnerTupleFromDatabase(
+                replacementDatabase,
+                record.value.owner,
+            )
+            if (replacementOwnerTuplesEqual(sourceTuple, replacementTuple)) {
+                this.putAssetOwnerHead(transaction, targetGeneration, record.value)
+            }
+        }
+    }
+
+    private async readReplacementOwnerTuple(
+        transaction: IDBTransaction,
+        generation: string,
+        root: PersistentRoot,
+        owner: AssetOwnerLocator,
+    ): Promise<ReplacementOwnerTuple | null> {
+        if (owner.kind === 'character-additional-assets') {
+            const record = (await requestResult(
+                transaction.objectStore('characters').get(
+                    this.characterKey(generation, owner.characterId),
+                ),
+            )) as StoredRecord<CharacterDetail> | undefined
+            if (record && record.generation !== generation) {
+                throw new TypeError('Character stored generation does not match its lookup key')
+            }
+            return replacementOwnerTupleFromParent(record?.value, 'additionalAssets')
+        }
+        if (owner.kind === 'root-module-assets') {
+            return replacementOwnerTupleFromParent(root.modules?.[owner.index], 'assets')
+        }
+        return replacementOwnerTupleFromParent(
+            root.personas?.[owner.index]?.embeddedModule,
+            'assets',
+        )
     }
 
     private async generationIsLeased(

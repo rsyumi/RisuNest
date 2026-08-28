@@ -242,12 +242,12 @@ describe('SqlitePersistentDataStore', () => {
 
     it('replaces a database in staged 16-character batches before committing', async () => {
         mocks.invoke
-            .mockResolvedValueOnce({ revision: 3, value: { format: 'legacy' } })
             .mockResolvedValueOnce({ stagingId: 'staging-1' })
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce({ revision: 3 })
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce({ revision: 4 })
         const database = structuredClone(fixtureDatabase)
@@ -271,7 +271,6 @@ describe('SqlitePersistentDataStore', () => {
         await expect(store.replaceFromDatabase(database, 3, aliases)).resolves.toEqual({ revision: 4 })
 
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_read_cold_payload_authority', {}],
             ['pds_replace_begin'],
             ['pds_replace_put_root', { stagingId: 'staging-1', root }],
             ['pds_replace_put_presets', { stagingId: 'staging-1', presets: botPresets }],
@@ -283,22 +282,19 @@ describe('SqlitePersistentDataStore', () => {
                 'pds_replace_add_characters',
                 { stagingId: 'staging-1', characters: characters.slice(16) },
             ],
+            ['pds_replace_preserve_repositories', {
+                stagingId: 'staging-1',
+                expectedRevision: 3,
+            }],
             ['pds_replace_put_asset_aliases', { stagingId: 'staging-1', aliases }],
             ['pds_replace_commit', { stagingId: 'staging-1', expectedRevision: 3 }],
         ])
     })
 
-    it('preserves v2 cold authority and aliases natively before a staged replacement', async () => {
-        const authority = {
-            format: 'v2' as const,
-            migrationId: 'cold-preserved',
-            compatibilityHash: '71'.repeat(32),
-        }
+    it('preserves active repositories after staging a database replacement', async () => {
         mocks.invoke.mockImplementation(async (command: string) => {
-            if (command === 'pds_read_cold_payload_authority') {
-                return { revision: 7, value: authority }
-            }
             if (command === 'pds_replace_begin') return { stagingId: 'staging-cold-preserved' }
+            if (command === 'pds_replace_preserve_repositories') return { revision: 7 }
             if (command === 'pds_replace_commit') return { revision: 8 }
             return undefined
         })
@@ -308,12 +304,7 @@ describe('SqlitePersistentDataStore', () => {
         await expect(store.replaceFromDatabase(fixtureDatabase, 7)).resolves.toEqual({ revision: 8 })
 
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_read_cold_payload_authority', {}],
             ['pds_replace_begin'],
-            ['pds_replace_preserve_cold_payloads', {
-                stagingId: 'staging-cold-preserved',
-                expectedRevision: 7,
-            }],
             ['pds_replace_put_root', { stagingId: 'staging-cold-preserved', root }],
             ['pds_replace_put_presets', {
                 stagingId: 'staging-cold-preserved',
@@ -322,6 +313,10 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_replace_add_characters', {
                 stagingId: 'staging-cold-preserved',
                 characters,
+            }],
+            ['pds_replace_preserve_repositories', {
+                stagingId: 'staging-cold-preserved',
+                expectedRevision: 7,
             }],
             ['pds_replace_commit', {
                 stagingId: 'staging-cold-preserved',
@@ -333,7 +328,6 @@ describe('SqlitePersistentDataStore', () => {
     it('aborts a failed staged replacement without replacing its primary error', async () => {
         const primaryError = new Error('character batch failed')
         mocks.invoke
-            .mockResolvedValueOnce({ revision: 0, value: { format: 'legacy' } })
             .mockResolvedValueOnce({ stagingId: 'staging-2' })
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
@@ -344,7 +338,6 @@ describe('SqlitePersistentDataStore', () => {
 
         await expect(store.replaceFromDatabase(fixtureDatabase)).rejects.toBe(primaryError)
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_read_cold_payload_authority', {}],
             ['pds_replace_begin'],
             ['pds_replace_put_root', { stagingId: 'staging-2', root }],
             ['pds_replace_put_presets', { stagingId: 'staging-2', presets: botPresets }],
@@ -454,10 +447,8 @@ describe('SqlitePersistentDataStore', () => {
 
     it('splits staged character batches at approximately four MiB', async () => {
         mocks.invoke.mockImplementation(async (command: string) => {
-            if (command === 'pds_read_cold_payload_authority') {
-                return { revision: 4, value: { format: 'legacy' } }
-            }
             if (command === 'pds_replace_begin') return { stagingId: 'staging-large' }
+            if (command === 'pds_replace_preserve_repositories') return { revision: 4 }
             if (command === 'pds_replace_commit') return { revision: 5 }
             return undefined
         })

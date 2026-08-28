@@ -5736,6 +5736,210 @@ fn database_only_replace_preserves_active_v2_cold_payloads_across_reopen() {
 }
 
 #[test]
+fn database_only_replace_preserves_repositories_and_only_matching_owner_heads() {
+    let directory = tempfile::tempdir().expect("create repository preservation directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let mut database = fixture();
+    database["modules"] = json!([
+        {
+            "id": "kept-module",
+            "name": "Kept module",
+            "description": "",
+            "assets": [["kept", "assets/kept.bin", "BIN"]]
+        },
+        {
+            "id": "changed-module",
+            "name": "Changed module",
+            "description": "",
+            "assets": [["old", "assets/old.bin", "BIN"]]
+        }
+    ]);
+    let aliases = vec![
+        AssetAlias {
+            key: "assets/kept.bin".to_owned(),
+            object_hash: Some("61".repeat(32)),
+            kind: "asset".to_owned(),
+            size: 4,
+            mime: "application/octet-stream".to_owned(),
+            name: "Kept".to_owned(),
+            ext: "BIN".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({}),
+        },
+        AssetAlias {
+            key: "assets/old.bin".to_owned(),
+            object_hash: Some("62".repeat(32)),
+            kind: "asset".to_owned(),
+            size: 3,
+            mime: "application/octet-stream".to_owned(),
+            name: "Old".to_owned(),
+            ext: "BIN".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({}),
+        },
+    ];
+    let heads = vec![
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "63".repeat(32),
+            1,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 1 },
+            "64".repeat(32),
+            1,
+        ),
+    ];
+    let asset_authority = AssetRepositoryAuthorityState::V2 {
+        migration_id: "asset-database-replacement".to_owned(),
+        compatibility_hash: "65".repeat(32),
+    };
+    let initial = store
+        .replace_begin()
+        .expect("begin v2 repository generation");
+    store
+        .replace_put_root(&initial.staging_id, &staged_root(&database))
+        .expect("stage v2 repository root");
+    store
+        .replace_put_presets(
+            &initial.staging_id,
+            database["botPresets"].as_array().expect("fixture presets"),
+        )
+        .expect("stage v2 repository presets");
+    store
+        .replace_add_characters(
+            &initial.staging_id,
+            database["characters"]
+                .as_array()
+                .expect("fixture characters"),
+        )
+        .expect("stage v2 repository characters");
+    store
+        .replace_put_asset_aliases(&initial.staging_id, &aliases)
+        .expect("stage v2 aliases");
+    store
+        .replace_put_asset_owner_heads(&initial.staging_id, &heads)
+        .expect("stage v2 owner heads");
+    store
+        .replace_put_asset_repository_authority(&initial.staging_id, &asset_authority)
+        .expect("stage v2 asset authority");
+    let assets_activated = store
+        .replace_commit(&initial.staging_id, Some(0))
+        .expect("activate v2 asset repository");
+
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"cold-database-replacement")
+        .expect("prepare cold replacement object");
+    let cold_alias = ColdAlias {
+        key: "cold/database-replacement".to_owned(),
+        object_hash: Some(prepared.content_hash),
+        size: prepared.byte_size as i64,
+        metadata: json!({ "source": "before-database-replacement" }),
+    };
+    let cold_authority = ColdPayloadAuthorityState::V2 {
+        migration_id: "cold-database-replacement".to_owned(),
+        compatibility_hash: "67".repeat(32),
+    };
+    let cold_activated = store
+        .activate_cold_payload_migration(&ColdPayloadMigrationInput {
+            source_revision: assets_activated.revision,
+            migration_id: "cold-database-replacement".to_owned(),
+            compatibility_hash: "67".repeat(32),
+            cold_aliases: vec![cold_alias.clone()],
+        })
+        .expect("activate cold repository");
+
+    let mut replacement = database;
+    replacement["username"] = json!("Database-only replacement");
+    replacement["modules"][1]["assets"] = json!([["new", "assets/new.bin", "BIN"]]);
+    let staging = store
+        .replace_begin()
+        .expect("begin database-only replacement");
+    store
+        .replace_put_root(&staging.staging_id, &staged_root(&replacement))
+        .expect("stage replacement root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            replacement["botPresets"]
+                .as_array()
+                .expect("replacement presets"),
+        )
+        .expect("stage replacement presets");
+    store
+        .replace_add_characters(
+            &staging.staging_id,
+            replacement["characters"]
+                .as_array()
+                .expect("replacement characters"),
+        )
+        .expect("stage replacement characters");
+    store
+        .replace_preserve_repositories(&staging.staging_id, Some(cold_activated.revision))
+        .expect("preserve active repositories");
+    let replaced = store
+        .replace_commit(&staging.staging_id, Some(cold_activated.revision))
+        .expect("activate database-only replacement");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen persistent store");
+    assert_eq!(
+        reopened
+            .read_asset_repository_authority(None)
+            .expect("read preserved asset authority"),
+        super::Versioned {
+            revision: replaced.revision,
+            value: asset_authority,
+        }
+    );
+    for alias in aliases {
+        assert_eq!(
+            reopened
+                .read_asset_alias("asset", &alias.key, None)
+                .expect("read preserved asset alias")
+                .expect("preserved asset alias exists")
+                .value,
+            alias
+        );
+    }
+    assert_eq!(
+        reopened
+            .read_asset_owner_head(&heads[0].owner, None)
+            .expect("read unchanged owner head")
+            .expect("unchanged owner head exists")
+            .value,
+        heads[0]
+    );
+    assert_eq!(
+        reopened
+            .read_asset_owner_head(&heads[1].owner, None)
+            .expect("read changed owner head"),
+        None
+    );
+    assert_eq!(
+        reopened
+            .read_cold_payload_authority(None)
+            .expect("read preserved cold authority"),
+        super::Versioned {
+            revision: replaced.revision,
+            value: cold_authority,
+        }
+    );
+    assert_eq!(
+        reopened
+            .list_cold_aliases(None)
+            .expect("read preserved cold aliases")
+            .value,
+        vec![cold_alias]
+    );
+}
+
+#[test]
 fn missing_cold_authority_marker_fails_closed() {
     let directory = tempfile::tempdir().expect("create cold authority directory");
     let store = PersistentStore::open(directory.path()).expect("open persistent store");

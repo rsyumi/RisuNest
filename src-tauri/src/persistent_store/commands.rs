@@ -565,6 +565,17 @@ pub(crate) fn pds_replace_preserve_cold_payloads(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_replace_preserve_repositories(
+    state: State<'_, PersistentStoreState>,
+    staging_id: String,
+    expected_revision: Option<i64>,
+) -> Result<RevisionResult, StoreError> {
+    with_store_mut(state, |store| {
+        store.replace_preserve_repositories(&staging_id, expected_revision)
+    })
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_replace_put_cold_aliases(
     state: State<'_, PersistentStoreState>,
     staging_id: String,

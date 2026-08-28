@@ -2298,6 +2298,18 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         })
     }
 
+    fn preserve_active_repositories(
+        &self,
+        staging_id: &str,
+        expected_revision: i64,
+    ) -> crate::persistent_store::StoreResult<()> {
+        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
+            store
+                .replace_preserve_repositories(staging_id, Some(expected_revision))
+                .map(|_| ())
+        })
+    }
+
     fn commit(
         &self,
         staging_id: &str,

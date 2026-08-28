@@ -676,6 +676,7 @@ pub fn run() {
             persistent_store::commands::pds_replace_put_asset_repository_authority,
             persistent_store::commands::pds_replace_put_cold_payload_authority,
             persistent_store::commands::pds_replace_preserve_cold_payloads,
+            persistent_store::commands::pds_replace_preserve_repositories,
             persistent_store::commands::pds_replace_put_cold_aliases,
             persistent_store::commands::pds_replace_commit,
             persistent_store::commands::pds_replace_abort,

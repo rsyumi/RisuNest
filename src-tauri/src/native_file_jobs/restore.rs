@@ -35,6 +35,13 @@ pub(crate) trait ReplacementSink: Send + Sync {
     fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()>;
     fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()>;
     fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()>;
+    fn preserve_active_repositories(
+        &self,
+        _staging_id: &str,
+        _expected_revision: i64,
+    ) -> StoreResult<()> {
+        Ok(())
+    }
     fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult>;
     fn abort(&self, staging_id: &str) -> StoreResult<()>;
 }
@@ -286,6 +293,8 @@ where
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
+        sink.preserve_active_repositories(&staging_id, expected_revision)
+            .map_err(store_error)?;
         let recovery_path = before_activation()?;
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
@@ -1371,6 +1380,7 @@ mod tests {
         store: Mutex<PersistentStore>,
         fail_character_batches: bool,
         abort_calls: AtomicUsize,
+        preserve_calls: AtomicUsize,
     }
 
     impl ReplacementSink for StoreSink {
@@ -1404,6 +1414,19 @@ mod tests {
                 .replace_add_characters(staging_id, characters)
         }
 
+        fn preserve_active_repositories(
+            &self,
+            staging_id: &str,
+            expected_revision: i64,
+        ) -> StoreResult<()> {
+            self.preserve_calls.fetch_add(1, Ordering::AcqRel);
+            self.store
+                .lock()
+                .unwrap()
+                .replace_preserve_repositories(staging_id, Some(expected_revision))
+                .map(|_| ())
+        }
+
         fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
             self.store
                 .lock()
@@ -1433,6 +1456,7 @@ mod tests {
                 store: Mutex::new(store),
                 fail_character_batches: false,
                 abort_calls: AtomicUsize::new(0),
+                preserve_calls: AtomicUsize::new(0),
             },
         )
     }
@@ -1629,6 +1653,7 @@ mod tests {
         assert_eq!(result.preset_count, 1);
         assert_eq!(result.source_bytes, fs::metadata(source).unwrap().len());
         assert_eq!(result.source_sha256.len(), 64);
+        assert_eq!(sink.preserve_calls.load(Ordering::Acquire), 1);
         let store = sink.store.lock().unwrap();
         let restored = store.materialize(Some(2)).unwrap();
         assert_eq!(restored["username"], "Imported");
@@ -2176,6 +2201,7 @@ mod tests {
             store: Mutex::new(store),
             fail_character_batches: false,
             abort_calls: AtomicUsize::new(0),
+            preserve_calls: AtomicUsize::new(0),
         };
         let job = JobRegistry::default()
             .create(JobKind::RestoreBlockRisuSave)

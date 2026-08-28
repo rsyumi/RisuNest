@@ -306,24 +306,8 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
     ): Promise<{ revision: DataRevision }> {
-        const coldAuthority = await this.readColdPayloadAuthority()
-        if (coldAuthority.value.format === 'preparing') {
-            throw new Error('Active cold payload generation cannot be preparing')
-        }
-        if (expectedRevision !== undefined && coldAuthority.revision !== expectedRevision) {
-            throw new RevisionConflictError(expectedRevision, coldAuthority.revision)
-        }
-        const preserveColdPayloads = coldAuthority.value.format === 'v2'
-        const commitRevision = expectedRevision
-            ?? (preserveColdPayloads ? coldAuthority.revision : undefined)
         const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
         try {
-            if (preserveColdPayloads) {
-                await invokeStore<void>('pds_replace_preserve_cold_payloads', {
-                    stagingId,
-                    expectedRevision: coldAuthority.revision,
-                })
-            }
             const { characters, botPresets, ...root } = database
             await invokeStore<void>('pds_replace_put_root', { stagingId, root })
             await invokeStore<void>('pds_replace_put_presets', {
@@ -336,6 +320,13 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                     characters: batch,
                 })
             }
+            const preserved = await invokeStore<{ revision: DataRevision }>(
+                'pds_replace_preserve_repositories',
+                {
+                    stagingId,
+                    ...(expectedRevision === undefined ? {} : { expectedRevision }),
+                },
+            )
             for (const aliases of batches(assetAliases, MAX_STAGED_ASSET_RECORDS)) {
                 await invokeStore<void>('pds_replace_put_asset_aliases', {
                     stagingId,
@@ -344,7 +335,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             }
             return await invokeStore('pds_replace_commit', {
                 stagingId,
-                ...(commitRevision === undefined ? {} : { expectedRevision: commitRevision }),
+                expectedRevision: preserved.revision,
             })
         } catch (error) {
             try {

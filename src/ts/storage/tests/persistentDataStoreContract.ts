@@ -862,6 +862,167 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
+        it('preserves repository aliases and only unchanged owner heads across a database-only replacement', async () => {
+            const { store, reopen } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [
+                {
+                    id: 'kept-module',
+                    name: 'Kept module',
+                    description: '',
+                    assets: [['kept', 'assets/kept.bin', 'BIN']],
+                },
+                {
+                    id: 'changed-module',
+                    name: 'Changed module',
+                    description: '',
+                    assets: [['old', 'assets/old.bin', 'BIN']],
+                },
+            ]
+            database.characters[0].additionalAssets = [
+                ['character', 'assets/character.bin', 'BIN'],
+            ]
+            database.personas = [{
+                name: 'Absent module assets',
+                personaPrompt: '',
+                icon: '',
+                embeddedModule: {
+                    id: 'persona-module',
+                    name: 'Persona module',
+                    description: '',
+                },
+            }]
+            const imported = await store.replaceFromDatabase(database)
+            const aliases: AssetAlias[] = [
+                {
+                    key: 'assets/kept.bin',
+                    objectHash: '61'.repeat(32),
+                    kind: 'asset',
+                    size: 4,
+                    mime: 'application/octet-stream',
+                    name: 'Kept',
+                    ext: 'BIN',
+                },
+                {
+                    key: 'assets/old.bin',
+                    objectHash: '62'.repeat(32),
+                    kind: 'asset',
+                    size: 3,
+                    mime: 'application/octet-stream',
+                    name: 'Old',
+                    ext: 'BIN',
+                },
+            ]
+            const heads: AssetOwnerHead[] = [
+                {
+                    owner: { kind: 'root-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '63'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: { kind: 'root-module-assets', index: 1 },
+                    present: true,
+                    manifestHash: '64'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: {
+                        kind: 'character-additional-assets',
+                        characterId: database.characters[0].chaId,
+                    },
+                    present: true,
+                    manifestHash: '68'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: { kind: 'persona-embedded-module-assets', index: 0 },
+                    present: false,
+                    manifestHash: null,
+                    entryCount: 0,
+                },
+            ]
+            const assetAuthority = {
+                format: 'v2' as const,
+                migrationId: 'asset-database-replacement',
+                compatibilityHash: '65'.repeat(32),
+            }
+            const assetsActivated = await store.activateAssetRepositoryMigration({
+                sourceRevision: imported.revision,
+                migrationId: assetAuthority.migrationId,
+                compatibilityHash: assetAuthority.compatibilityHash,
+                database,
+                assetAliases: aliases,
+                assetOwnerHeads: heads,
+            })
+            const coldAlias: ColdAlias = {
+                key: 'cold/database-replacement',
+                objectHash: '66'.repeat(32),
+                size: 6,
+                metadata: { source: 'before-database-replacement' },
+            }
+            const coldAuthority = {
+                format: 'v2' as const,
+                migrationId: 'cold-database-replacement',
+                compatibilityHash: '67'.repeat(32),
+            }
+            const coldActivated = await store.activateColdPayloadMigration({
+                sourceRevision: assetsActivated.revision,
+                migrationId: coldAuthority.migrationId,
+                compatibilityHash: coldAuthority.compatibilityHash,
+                coldAliases: [coldAlias],
+            })
+            const replacement = structuredClone(database)
+            replacement.username = 'Database-only replacement'
+            replacement.modules[1].assets = [['new', 'assets/new.bin', 'BIN']]
+            replacement.personas[0].embeddedModule!.assets = []
+
+            const replaced = await store.replaceFromDatabase(replacement, coldActivated.revision)
+
+            expect(await store.readAssetRepositoryAuthority()).toEqual({
+                revision: replaced.revision,
+                value: assetAuthority,
+            })
+            expect(await store.listAssetAliases({ limit: 8 })).toEqual({
+                revision: replaced.revision,
+                items: aliases,
+            })
+            const ownerExpectations = [
+                { head: heads[0], retained: true },
+                { head: heads[1], retained: false },
+                { head: heads[2], retained: true },
+                { head: heads[3], retained: false },
+            ]
+            for (const { head, retained } of ownerExpectations) {
+                expect(await store.readAssetOwnerHead(head.owner)).toEqual(retained
+                    ? { revision: replaced.revision, value: head }
+                    : null)
+            }
+            expect(await store.readColdPayloadAuthority()).toEqual({
+                revision: replaced.revision,
+                value: coldAuthority,
+            })
+            expect(await store.listColdAliases()).toEqual({
+                revision: replaced.revision,
+                value: [coldAlias],
+            })
+
+            const reopened = await reopen()
+            expect(await reopened.readAssetAlias({ kind: 'asset', key: aliases[0].key })).toEqual({
+                revision: replaced.revision,
+                value: aliases[0],
+            })
+            for (const { head, retained } of ownerExpectations) {
+                expect(await reopened.readAssetOwnerHead(head.owner)).toEqual(retained
+                    ? { revision: replaced.revision, value: head }
+                    : null)
+            }
+            expect(await reopened.readColdAlias(coldAlias.key)).toEqual({
+                revision: replaced.revision,
+                value: coldAlias,
+            })
+        })
+
         it('copy-on-write isolates cold alias commits and deletes from a pinned revision', async () => {
             const { store } = await createHarness()
             const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

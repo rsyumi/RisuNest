@@ -1524,6 +1524,19 @@ impl PersistentStore {
         commit::replace_preserve_cold_payloads(&mut self.connection, staging_id, expected_revision)
     }
 
+    pub(crate) fn replace_preserve_repositories(
+        &mut self,
+        staging_id: &str,
+        expected_revision: Option<i64>,
+    ) -> StoreResult<RevisionResult> {
+        let revision = commit::replace_preserve_repositories(
+            &mut self.connection,
+            staging_id,
+            expected_revision,
+        )?;
+        Ok(RevisionResult { revision })
+    }
+
     pub(crate) fn replace_put_cold_aliases(
         &mut self,
         staging_id: &str,
