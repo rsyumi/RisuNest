@@ -3219,8 +3219,8 @@ fn build_logical_http_client(
 }
 
 #[cfg(desktop)]
-fn build_bidirectional_remote_apply_client() -> Result<reqwest::blocking::Client, PeerSyncError> {
-    reqwest::blocking::Client::builder()
+fn build_bidirectional_remote_apply_client() -> Result<reqwest::Client, PeerSyncError> {
+    reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -3493,7 +3493,7 @@ impl LanBidirectionalLogicalCredential {
 #[cfg(desktop)]
 pub(crate) struct LanBidirectionalLogicalClient {
     inner: LanLogicalDeltaClient,
-    remote_apply_client: reqwest::blocking::Client,
+    remote_apply_client: reqwest::Client,
     endpoint: String,
     session_id: String,
 }
@@ -3619,48 +3619,59 @@ impl LanBidirectionalLogicalClient {
                 "invalid bidirectional remote apply request".to_owned(),
             ));
         }
-        let response = self
-            .remote_apply_client
-            .post(format!("{}/remote-apply", self.inner.session_url))
-            .bearer_auth(&self.inner.bearer)
-            .json(&request)
-            .send()
-            .map_err(transport)?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            return Err(PeerSyncError::ActivationConflict {
-                expected: None,
-                actual: None,
-            });
-        }
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(PeerSyncError::Transport(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-        if response.content_length().unwrap_or(u64::MAX) > MAX_BODY_BYTES as u64 {
-            return Err(PeerSyncError::Protocol(
-                "bidirectional remote apply response is too large".to_owned(),
-            ));
-        }
-        let mut body = Vec::new();
-        response
-            .take(MAX_BODY_BYTES as u64 + 1)
-            .read_to_end(&mut body)
-            .map_err(transport)?;
-        if body.len() > MAX_BODY_BYTES {
-            return Err(PeerSyncError::Protocol(
-                "bidirectional remote apply response is too large".to_owned(),
-            ));
-        }
-        let receipt = serde_json::from_slice::<LanBidirectionalRemoteApplyReceipt>(&body)
-            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-        if !receipt.is_valid() {
-            return Err(PeerSyncError::Protocol(
-                "invalid bidirectional remote apply response".to_owned(),
-            ));
-        }
-        Ok(receipt)
+        tauri::async_runtime::block_on(async {
+            let mut response = self
+                .remote_apply_client
+                .post(format!("{}/remote-apply", self.inner.session_url))
+                .bearer_auth(&self.inner.bearer)
+                .json(&request)
+                .send()
+                .await
+                .map_err(transport)?;
+            if response.status() == reqwest::StatusCode::CONFLICT {
+                return Err(PeerSyncError::ActivationConflict {
+                    expected: None,
+                    actual: None,
+                });
+            }
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(PeerSyncError::Transport(format!(
+                    "HTTP {}",
+                    response.status()
+                )));
+            }
+            if response.content_length().unwrap_or(u64::MAX) > MAX_BODY_BYTES as u64 {
+                return Err(PeerSyncError::Protocol(
+                    "bidirectional remote apply response is too large".to_owned(),
+                ));
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) =
+                tokio::time::timeout(LOGICAL_OBJECT_IDLE_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| {
+                        PeerSyncError::Transport(
+                            "bidirectional remote apply response read timed out".to_owned(),
+                        )
+                    })?
+                    .map_err(transport)?
+            {
+                if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                    return Err(PeerSyncError::Protocol(
+                        "bidirectional remote apply response is too large".to_owned(),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let receipt = serde_json::from_slice::<LanBidirectionalRemoteApplyReceipt>(&body)
+                .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+            if !receipt.is_valid() {
+                return Err(PeerSyncError::Protocol(
+                    "invalid bidirectional remote apply response".to_owned(),
+                ));
+            }
+            Ok(receipt)
+        })
     }
 }
 
