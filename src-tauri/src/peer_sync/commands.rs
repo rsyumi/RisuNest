@@ -2873,6 +2873,24 @@ mod tests {
         store
             .replace_put_presets(&staging, &[json!({ "name": "preset" })])
             .unwrap();
+        store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &crate::persistent_store::AssetRepositoryAuthorityState::V2 {
+                    migration_id: "peer-clone-test-assets".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        store
+            .replace_put_cold_payload_authority(
+                &staging,
+                &crate::persistent_store::ColdPayloadAuthorityState::V2 {
+                    migration_id: "peer-clone-test-cold".to_owned(),
+                    compatibility_hash: "cd".repeat(32),
+                },
+            )
+            .unwrap();
         store.replace_commit(&staging, Some(0)).unwrap();
     }
 
