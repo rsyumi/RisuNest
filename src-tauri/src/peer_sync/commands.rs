@@ -454,6 +454,8 @@ struct PeerCloneRuntime {
     source_recovery_error: Option<String>,
     source: Option<SourceRuntime>,
     target_claiming: bool,
+    #[cfg(test)]
+    target_claim_pause: Option<Arc<std::sync::Barrier>>,
     target: Option<TargetRuntime>,
 }
 
@@ -1090,6 +1092,13 @@ impl PeerCloneCommandState {
             runtime.target_claiming = true;
             runtime.target.is_some()
         };
+        #[cfg(test)]
+        let target_claim_pause = { self.lock_runtime()?.target_claim_pause.take() };
+        #[cfg(test)]
+        if let Some(pause) = target_claim_pause {
+            pause.wait();
+            pause.wait();
+        }
 
         let claimed = (|| {
             let lan = if rotate_credential {
@@ -1233,6 +1242,15 @@ impl PeerCloneCommandState {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn pause_target_claim_before_network_for_test(
+        &self,
+        pause: Arc<std::sync::Barrier>,
+    ) -> Result<(), PeerSyncError> {
+        self.lock_runtime()?.target_claim_pause = Some(pause);
+        Ok(())
+    }
+
     pub fn resume_target_download(
         &self,
         peer_root: &Path,
@@ -1307,6 +1325,11 @@ impl PeerCloneCommandState {
         self.reap_finished_target_worker()?;
         let paths = target_paths(peer_root, &request)?;
         let mut command_runtime = self.lock_runtime()?;
+        if command_runtime.target_claiming {
+            return Err(PeerSyncError::Protocol(
+                "peer clone target claim is already in progress".to_owned(),
+            ));
+        }
         let (mut client, cancellation) = {
             let target = require_target_mut(&mut command_runtime, &request, &paths.job_root)?;
             let allowed = target.status.phase == PeerCloneTargetPhase::Idle
@@ -3160,6 +3183,131 @@ mod tests {
                 .unwrap();
             reopened.stop_source(&repaired.session_id).unwrap();
         }
+    }
+
+    #[test]
+    fn product_target_repair_reservation_blocks_old_worker_until_credential_rotation_finishes() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let source_peer_root = source_root.path().join("peer-sync");
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_peer_root,
+                &NeverCancelled,
+            )
+            .unwrap();
+        let running = source
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let first_pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+        let first_request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                source.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: first_pairing.session_id.clone(),
+            manifest_id: first_pairing.manifest_id.clone(),
+        };
+        let target_peer_root = target_root.path().join("peer-sync");
+        let target = PeerCloneCommandState::default();
+        target
+            .claim_target(
+                &target_peer_root,
+                &first_request.endpoint,
+                &first_request.session_id,
+                &first_request.manifest_id,
+                &first_pairing.claim,
+            )
+            .unwrap();
+        target
+            .lock_runtime()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .status
+            .phase = PeerCloneTargetPhase::Failed;
+        let credential_path = target_paths(&target_peer_root, &first_request)
+            .unwrap()
+            .credential;
+        let first_credential = fs::read(&credential_path).unwrap();
+
+        source.shutdown_for_exit();
+        drop(source);
+        let reopened = PeerCloneCommandState::initialize(&source_peer_root);
+        let restarted = reopened
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let repaired_pairing = parse_product_pairing(restarted.pairing_uri.as_deref().unwrap());
+        let repaired_request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                reopened.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: repaired_pairing.session_id.clone(),
+            manifest_id: repaired_pairing.manifest_id.clone(),
+        };
+        let claim_pause = Arc::new(Barrier::new(2));
+        target
+            .pause_target_claim_before_network_for_test(Arc::clone(&claim_pause))
+            .unwrap();
+        let claiming_target = target.clone();
+        let claiming_root = target_peer_root.clone();
+        let claiming_request = repaired_request.clone();
+        let repaired_claim = repaired_pairing.claim.clone();
+        let claim = thread::spawn(move || {
+            claiming_target.claim_target(
+                &claiming_root,
+                &claiming_request.endpoint,
+                &claiming_request.session_id,
+                &claiming_request.manifest_id,
+                &repaired_claim,
+            )
+        });
+
+        claim_pause.wait();
+        let devices_before_claim = reopened.source_status().unwrap().devices.len();
+        let credential_before_claim = fs::read(&credential_path).unwrap();
+        let resume_while_claiming =
+            target.resume_target_download(&target_peer_root, first_request.clone());
+        let (phase_while_claiming, worker_started, request_while_claiming) = {
+            let runtime = target.lock_runtime().unwrap();
+            let owned = runtime.target.as_ref().unwrap();
+            (
+                owned.status.phase,
+                owned.worker.is_some(),
+                owned.request.clone(),
+            )
+        };
+
+        claim_pause.wait();
+        let claim_result = claim.join().unwrap();
+        assert_eq!(devices_before_claim, 0);
+        assert_eq!(credential_before_claim, first_credential);
+        assert!(resume_while_claiming.is_err());
+        assert_eq!(phase_while_claiming, PeerCloneTargetPhase::Failed);
+        assert!(!worker_started);
+        assert_eq!(request_while_claiming, first_request);
+        claim_result.unwrap();
+        assert_ne!(fs::read(&credential_path).unwrap(), first_credential);
+        assert_eq!(reopened.source_status().unwrap().devices.len(), 1);
+        target
+            .start_target_download(&target_peer_root, repaired_request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        reopened.stop_source(&repaired_request.session_id).unwrap();
     }
 
     #[test]
