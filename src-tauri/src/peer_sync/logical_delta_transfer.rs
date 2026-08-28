@@ -208,6 +208,7 @@ where
                 reused_from_cas: Vec::new(),
                 missing_objects: Vec::new(),
             })?;
+            check_cancelled(cancellation)?;
             target.prepare_activation(&mut stage)?;
             check_cancelled(cancellation)?;
             return target.activate_database_and_base_if_current(
@@ -226,6 +227,7 @@ where
         )?;
         check_cancelled(cancellation)?;
         before_activation(&selection)?;
+        check_cancelled(cancellation)?;
         for object in selection.missing_objects() {
             check_cancelled(cancellation)?;
             let mut source_reader = source.open_object(object)?;
@@ -636,6 +638,7 @@ mod tests {
         aborts: usize,
         fail_database_stage: bool,
         cancel_on_prepare: Option<Arc<AtomicBool>>,
+        activate_without_transfer: bool,
     }
 
     impl FixtureTarget {
@@ -649,6 +652,7 @@ mod tests {
                 aborts: 0,
                 fail_database_stage: false,
                 cancel_on_prepare: None,
+                activate_without_transfer: false,
             }
         }
     }
@@ -659,6 +663,10 @@ mod tests {
         fn begin(&mut self, _plan: &ReadyLogicalDeltaPlan) -> Result<Self::Stage, PeerSyncError> {
             self.events.push("begin".to_owned());
             Ok(FixtureStage::default())
+        }
+
+        fn can_activate_without_transfer(&self, _stage: &Self::Stage) -> bool {
+            self.activate_without_transfer
         }
 
         fn stage_payload(
@@ -1203,6 +1211,83 @@ mod tests {
             .iter()
             .any(|event| event.starts_with("payload:")));
         assert!(!target.events.iter().any(|event| event == "database"));
+    }
+
+    #[test]
+    fn cancellation_after_empty_transfer_selection_stages_no_database_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"locally-resolvable-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let mut target = FixtureTarget::new();
+        target.locally_resolvable.insert(payload_hash.clone());
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::from([payload_hash.clone()]),
+            &cas,
+            &BTreeMap::from([(payload_hash, payload.len() as u64)]),
+            &mut source,
+            &mut target,
+            |_| {
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.content_gets, 0);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.aborts, 1);
+        assert_eq!(target.events, ["begin", "abort"]);
+    }
+
+    #[test]
+    fn cancellation_after_no_op_callback_prepares_no_activation_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let mut target = FixtureTarget::new();
+        target.activate_without_transfer = true;
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+            &mut source,
+            &mut target,
+            |_| {
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.content_gets, 0);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.aborts, 1);
+        assert_eq!(target.events, ["begin", "abort"]);
     }
 
     #[test]
