@@ -331,7 +331,10 @@ export function createPeerBidirectionalController(options: {
             if (activeOperation) {
                 return runOperation(key, () => options.facade.sync(pairingUri))
             }
-            if (snapshot.operationRetained) {
+            if (
+                snapshot.operationRetained
+                && !['localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)
+            ) {
                 return Promise.reject(new Error('A retained peer sync operation must be resolved first'))
             }
             if (['prepared', 'running'].includes(snapshot.sourceStatus.phase)) {

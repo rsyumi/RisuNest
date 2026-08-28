@@ -759,7 +759,8 @@
             className="mt-2"
             disabled={!bidirectionalEnabled
                 || bidirectionalBusy
-                || bidirectionalOperationRetained
+                || (bidirectionalOperationRetained
+                    && !['localCommitted', 'sourceUnavailable'].includes(bidirectionalOperationPhase))
                 || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)
                 || !bidirectionalPairingInput}
             onclick={syncBidirectional}
