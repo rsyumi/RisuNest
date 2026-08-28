@@ -1893,6 +1893,10 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         }
     }
 
+    fn prepare_activation(&mut self, _stage: &mut Self::Stage) -> Result<(), PeerSyncError> {
+        self.seal_durable_job()
+    }
+
     fn activate_database_and_base_if_current(
         &mut self,
         stage: &mut Self::Stage,

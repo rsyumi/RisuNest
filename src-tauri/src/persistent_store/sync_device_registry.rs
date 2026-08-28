@@ -1,6 +1,7 @@
 use super::{
-    active_generation, current_revision, logical_index::scan_compact_manifest, PersistentStore,
-    StoreError, StoreResult,
+    active_generation, current_revision,
+    logical_index::{logical_generation_descends_from_connection, scan_compact_manifest},
+    PersistentStore, StoreError, StoreResult,
 };
 use crate::peer_sync::logical_delta::{
     hash_logical_manifest, validate_logical_manifest, LogicalManifest,
@@ -506,6 +507,78 @@ impl PersistentStore {
             return validation(
                 "local acknowledgement witness is not the exact active logical generation",
             );
+        }
+        let updated = advance_sync_device_shared_ack_in_transaction(
+            &transaction,
+            library_id,
+            device_id,
+            expected_previous_shared,
+            expected_previous_local,
+            next_shared,
+            proof,
+        )?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn advance_active_sync_device_historical_shared_ack(
+        &mut self,
+        library_id: &str,
+        device_id: &str,
+        expected_local_revision: i64,
+        expected_previous_shared: &SyncGenerationIdentity,
+        expected_previous_local: &SyncGenerationIdentity,
+        next_shared: &SyncGenerationIdentity,
+        shared_manifest: &LogicalManifest,
+        active_identity: &SyncGenerationIdentity,
+    ) -> StoreResult<RegisteredSyncDevice> {
+        if expected_local_revision < 0 {
+            return validation("expected local revision must be nonnegative");
+        }
+        let proof =
+            self.verify_shared_ack_local_proof(next_shared, shared_manifest, next_shared)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision = current_revision(&transaction)?;
+        if actual_revision != expected_local_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_local_revision,
+                actual: actual_revision,
+            });
+        }
+        let active = active_generation(&transaction)?;
+        let local_is_active: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_sync_generations
+                WHERE library_id = ?1 AND generation_id = ?2
+                  AND manifest_hash = ?3 AND generation_sequence = ?4
+                  AND pds_generation = ?5 AND source_revision = ?6
+                  AND state = 'complete' AND completed_at IS NOT NULL
+             )",
+            params![
+                library_id,
+                active_identity.generation_id,
+                active_identity.manifest_hash,
+                active_identity.generation_sequence,
+                active,
+                expected_local_revision,
+            ],
+            |row| row.get(0),
+        )?;
+        if !local_is_active {
+            return validation(
+                "local acknowledgement witness is not the exact active logical generation",
+            );
+        }
+        if !logical_generation_descends_from_connection(
+            &transaction,
+            library_id,
+            &active_identity.generation_id,
+            &next_shared.generation_id,
+        )? {
+            return validation("active logical generation does not descend from the shared ACK");
         }
         let updated = advance_sync_device_shared_ack_in_transaction(
             &transaction,

@@ -50,9 +50,11 @@ const MAX_OPERATION_BYTES: u64 = 1_048_576;
 
 #[cfg(test)]
 thread_local! {
+    static COMPLETE_BEFORE_ACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static COMPLETE_AFTER_ACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_COMPLETE_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_PREPARED_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+    static SOURCE_AFTER_PREPARED_STORE_PANIC: Cell<bool> = const { Cell::new(false) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
 }
 
@@ -1304,6 +1306,7 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
         backup_losing_side,
         None,
         None,
+        None,
     )
 }
 
@@ -1323,6 +1326,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     backup_losing_side: bool,
     source_device_id: Option<&str>,
     retained_source: Option<&SourcePreparedEvidence>,
+    retained_source_job_id: Option<&str>,
 ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
     if uuid::Uuid::parse_str(operation_id)
         .map(|value| value.to_string() != operation_id)
@@ -1456,13 +1460,47 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     } else {
         None
     };
-    let durable_job_id = uuid::Uuid::new_v4().to_string();
-    let job = RefCell::new(DurableCasJob::begin(
-        app_root,
-        &durable_job_id,
-        CasJobKind::LogicalDeltaTarget,
-        now_millis()?,
-    )?);
+    let (durable_job_id, retained_job_to_release, durable_job) =
+        if let Some(retained_job_id) = retained_source_job_id {
+            match DurableCasJob::open(app_root, retained_job_id) {
+                Ok(job) if !job.is_sealed() => (retained_job_id.to_owned(), None, job),
+                Ok(_) => {
+                    let replacement_job_id = uuid::Uuid::new_v4().to_string();
+                    let replacement = DurableCasJob::begin(
+                        app_root,
+                        &replacement_job_id,
+                        CasJobKind::LogicalDeltaTarget,
+                        now_millis()?,
+                    )?;
+                    (
+                        replacement_job_id,
+                        Some(retained_job_id.to_owned()),
+                        replacement,
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                    retained_job_id.to_owned(),
+                    None,
+                    DurableCasJob::begin(
+                        app_root,
+                        retained_job_id,
+                        CasJobKind::LogicalDeltaTarget,
+                        now_millis()?,
+                    )?,
+                ),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            let durable_job_id = uuid::Uuid::new_v4().to_string();
+            let job = DurableCasJob::begin(
+                app_root,
+                &durable_job_id,
+                CasJobKind::LogicalDeltaTarget,
+                now_millis()?,
+            )?;
+            (durable_job_id, None, job)
+        };
+    let job = RefCell::new(durable_job);
     let mut target = match PersistentLogicalDeltaTarget::new_p5_remote_shared_ack_with_durable_job(
         store,
         cas,
@@ -1580,8 +1618,15 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
                     "simulated source-prepared journal failure".to_owned(),
                 ));
             }
+            if let Some(retained_job_id) = retained_job_to_release.as_deref() {
+                release_retained_source_job(app_root, retained_job_id, CasReleaseOutcome::Aborted)?;
+            }
             PeerBidirectionalOperationJournal::new(app_root)
                 .store(&evidence.durable_operation(durable_job_id.clone()))?;
+            #[cfg(test)]
+            if SOURCE_AFTER_PREPARED_STORE_PANIC.with(|enabled| enabled.replace(false)) {
+                panic!("simulated process loss after source-prepared journal store");
+            }
             prepared_evidence.replace(Some(evidence));
             Ok(())
         },
@@ -1720,28 +1765,6 @@ fn complete_bidirectional_local_after_remote_apply(
             "bidirectional remote receipt has an unexpected revision".to_owned(),
         ));
     };
-    let active = store
-        .seal_or_initialize_active_logical_generation(cas)
-        .map_err(store_error)?;
-    let active_identity = SyncGenerationIdentity {
-        generation_id: active.manifest.generation.clone(),
-        manifest_hash: active.manifest_hash.clone(),
-        generation_sequence: active.manifest.generation_sequence.clone(),
-    };
-    let active_is_shared_descendant = retained_remote_apply_receipt.is_some()
-        && store
-            .logical_generation_descends_from(
-                &context.library_id,
-                &active_identity.generation_id,
-                &shared_generation.generation_id,
-            )
-            .map_err(store_error)?;
-    if active_identity != shared_generation && !active_is_shared_descendant {
-        return Err(PeerSyncError::ActivationConflict {
-            expected: Some(shared_generation.manifest_hash),
-            actual: Some(active_identity.manifest_hash),
-        });
-    }
     match retained_remote_apply_receipt {
         Some(retained) if retained != remote => {
             return Err(PeerSyncError::Validation(
@@ -1762,12 +1785,37 @@ fn complete_bidirectional_local_after_remote_apply(
             backups: backups.clone(),
         })?,
     }
+    let active = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    let active_identity = SyncGenerationIdentity {
+        generation_id: active.manifest.generation.clone(),
+        manifest_hash: active.manifest_hash.clone(),
+        generation_sequence: active.manifest.generation_sequence.clone(),
+    };
+    if !store
+        .logical_generation_descends_from(
+            &context.library_id,
+            &active_identity.generation_id,
+            &shared_generation.generation_id,
+        )
+        .map_err(store_error)?
+    {
+        return Err(PeerSyncError::ActivationConflict {
+            expected: Some(shared_generation.manifest_hash),
+            actual: Some(active_identity.manifest_hash),
+        });
+    }
+    #[cfg(test)]
+    if COMPLETE_BEFORE_ACK_FAILPOINT.with(|enabled| enabled.replace(false)) {
+        return Err(PeerSyncError::Storage(
+            "simulated crash before bidirectional acknowledgement".to_owned(),
+        ));
+    }
     let acknowledgement = store
         .sync_device_ack_state(&context.library_id, &context.credential.source_device_id)
         .map_err(store_error)?;
-    if acknowledgement.shared_identity != shared_generation
-        || acknowledgement.local_identity != shared_generation
-    {
+    if acknowledgement.shared_identity != shared_generation {
         let shared = store
             .build_indexed_logical_manifest(&context.library_id, &shared_generation.generation_id)
             .map_err(store_error)?;
@@ -1780,7 +1828,7 @@ fn complete_bidirectional_local_after_remote_apply(
         }
         let active_revision = store.revision().map_err(store_error)?;
         store
-            .advance_active_sync_device_shared_ack(
+            .advance_active_sync_device_historical_shared_ack(
                 &context.library_id,
                 &context.credential.source_device_id,
                 active_revision,
@@ -1798,6 +1846,7 @@ fn complete_bidirectional_local_after_remote_apply(
             "simulated crash after bidirectional acknowledgement".to_owned(),
         ));
     }
+    let completed_revision = store.revision().map_err(store_error)?;
     if let Some(backup) = remote.backup {
         backups.push(PeerBidirectionalBackupReceipt {
             package_id: backup.package_id,
@@ -1822,7 +1871,7 @@ fn complete_bidirectional_local_after_remote_apply(
             "noChanges".to_owned()
         },
         operation_id: operation_id.to_owned(),
-        revision: committed_revision,
+        revision: completed_revision,
         remote_revision: remote.committed_revision,
         transferred_objects,
         transferred_bytes,
@@ -1899,64 +1948,21 @@ where
         )
         .map(ResumeLocalCommittedOutcome::Completed);
     }
-    if store.revision().map_err(store_error)? != committed_revision {
-        journal.abandon(operation_id)?;
-        return Ok(ResumeLocalCommittedOutcome::Stale {
-            operation_id: operation_id.to_owned(),
-            reason: PeerBidirectionalStaleReason::LocalRevision,
-        });
-    }
-    let common_base = store
-        .sync_device_common_base_identity(&context.library_id, &context.credential.source_device_id)
+    let shared = store
+        .build_indexed_logical_manifest(&context.library_id, &shared_generation.generation_id)
         .map_err(store_error)?;
-    if common_base.as_ref() != Some(&context.previous_shared) {
-        journal.abandon(operation_id)?;
-        return Ok(ResumeLocalCommittedOutcome::Stale {
-            operation_id: operation_id.to_owned(),
-            reason: PeerBidirectionalStaleReason::CommonBase,
-        });
-    }
-    let acknowledgement = match store
-        .sync_device_ack_state(&context.library_id, &context.credential.source_device_id)
+    if shared.manifest_hash != shared_generation.manifest_hash
+        || shared.manifest.generation_sequence != shared_generation.generation_sequence
     {
-        Ok(acknowledgement) => acknowledgement,
-        Err(StoreError::Validation { .. }) => {
-            journal.abandon(operation_id)?;
-            return Ok(ResumeLocalCommittedOutcome::Stale {
-                operation_id: operation_id.to_owned(),
-                reason: PeerBidirectionalStaleReason::DeviceAcknowledgement,
-            });
-        }
-        Err(error) => return Err(store_error(error)),
-    };
-    if acknowledgement.shared_identity != context.previous_shared
-        || acknowledgement.local_identity != context.previous_local
-    {
-        journal.abandon(operation_id)?;
-        return Ok(ResumeLocalCommittedOutcome::Stale {
-            operation_id: operation_id.to_owned(),
-            reason: PeerBidirectionalStaleReason::DeviceAcknowledgement,
-        });
-    }
-    let active = store
-        .seal_or_initialize_active_logical_generation(cas)
-        .map_err(store_error)?;
-    let active_identity = SyncGenerationIdentity {
-        generation_id: active.manifest.generation,
-        manifest_hash: active.manifest_hash,
-        generation_sequence: active.manifest.generation_sequence,
-    };
-    if active_identity != shared_generation {
-        return Err(PeerSyncError::ActivationConflict {
-            expected: Some(shared_generation.manifest_hash),
-            actual: Some(active_identity.manifest_hash),
-        });
+        return Err(PeerSyncError::Storage(
+            "retained shared generation differs from its manifest".to_owned(),
+        ));
     }
     let remote = match request_remote(
         &context,
         committed_revision,
         &shared_generation,
-        &active.manifest_bytes,
+        &shared.manifest_bytes,
         remote_backup_required,
     ) {
         Ok(remote) => remote,
@@ -1981,14 +1987,23 @@ where
 
 enum SourceOperationReconcile {
     New,
-    Retry(SourcePreparedEvidence),
-    Completed(SourcePreparedEvidence, LanBidirectionalRemoteApplyReceipt),
+    Retry(SourcePreparedEvidence, String),
+    Completed(
+        SourcePreparedEvidence,
+        LanBidirectionalRemoteApplyReceipt,
+        i64,
+        String,
+    ),
     LegacyCompleted(LanBidirectionalRemoteApplyReceipt),
 }
 
-fn release_retained_source_job(app_root: &Path, durable_job_id: &str) -> Result<(), PeerSyncError> {
+fn release_retained_source_job(
+    app_root: &Path,
+    durable_job_id: &str,
+    outcome: CasReleaseOutcome,
+) -> Result<(), PeerSyncError> {
     match DurableCasJob::open(app_root, durable_job_id) {
-        Ok(mut job) if !job.is_released() => Ok(job.release(CasReleaseOutcome::Aborted)?),
+        Ok(mut job) if !job.is_released() => Ok(job.release(outcome)?),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -2036,7 +2051,7 @@ fn reconcile_source_operation(
                     "bidirectional completed source retry differs from its binding".to_owned(),
                 ));
             }
-            Ok(SourceOperationReconcile::Completed(binding, receipt))
+            Ok(SourceOperationReconcile::LegacyCompleted(receipt))
         }
         PeerBidirectionalDurableOperation::Completed {
             remote_apply_receipt: Some(receipt),
@@ -2085,6 +2100,12 @@ fn reconcile_source_operation(
             let evidence = SourcePreparedEvidence::from_operation(&operation).ok_or_else(|| {
                 PeerSyncError::Storage("source-prepared operation is invalid".to_owned())
             })?;
+            let durable_job_id = match &operation {
+                PeerBidirectionalDurableOperation::SourcePrepared { durable_job_id, .. } => {
+                    durable_job_id.clone()
+                }
+                _ => unreachable!(),
+            };
             if evidence.source_device_id != session.source_device_id
                 || evidence.target_device_id != session.target_device_id
                 || evidence.operation_id != request.operation_id
@@ -2129,13 +2150,7 @@ fn reconcile_source_operation(
                 && acknowledgement.shared_identity == evidence.previous_shared
                 && acknowledgement.local_identity == evidence.expected_source_generation
             {
-                if let PeerBidirectionalDurableOperation::SourcePrepared {
-                    durable_job_id, ..
-                } = operation
-                {
-                    release_retained_source_job(app_root, &durable_job_id)?;
-                }
-                return Ok(SourceOperationReconcile::Retry(evidence));
+                return Ok(SourceOperationReconcile::Retry(evidence, durable_job_id));
             }
             let receipt = evidence.receipt()?;
             let shared = SyncGenerationIdentity {
@@ -2143,12 +2158,25 @@ fn reconcile_source_operation(
                 manifest_hash: evidence.shared_generation.manifest_hash.clone(),
                 generation_sequence: evidence.shared_generation.generation_sequence.clone(),
             };
-            if actual_revision == receipt.committed_revision
+            let active_descends_from_ack = active_identity == acknowledgement.local_identity
+                || store
+                    .logical_generation_descends_from(
+                        PRODUCT_LOGICAL_LIBRARY_ID,
+                        &active_identity.generation_id,
+                        &acknowledgement.local_identity.generation_id,
+                    )
+                    .map_err(store_error)?;
+            if actual_revision >= receipt.committed_revision
                 && common.as_ref() == Some(&shared)
                 && acknowledgement.shared_identity == shared
-                && acknowledgement.local_identity == active_identity
+                && active_descends_from_ack
             {
-                return Ok(SourceOperationReconcile::Completed(evidence, receipt));
+                return Ok(SourceOperationReconcile::Completed(
+                    evidence,
+                    receipt,
+                    actual_revision,
+                    durable_job_id,
+                ));
             }
             Err(PeerSyncError::ActivationConflict {
                 expected: Some(format!(
@@ -2168,6 +2196,7 @@ fn store_source_completed(
     app_root: &Path,
     evidence: SourcePreparedEvidence,
     receipt: &LanBidirectionalRemoteApplyReceipt,
+    completed_revision: i64,
 ) -> Result<(), PeerSyncError> {
     let backups = receipt
         .backup
@@ -2187,7 +2216,7 @@ fn store_source_completed(
             "noChanges".to_owned()
         },
         operation_id: evidence.operation_id.clone(),
-        revision: receipt.committed_revision,
+        revision: completed_revision,
         remote_revision: evidence.incoming_revision,
         transferred_objects: receipt.transferred_objects,
         transferred_bytes: receipt.transferred_bytes,
@@ -2298,14 +2327,26 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
             })?;
             reconcile_source_operation(&mut store, &cas, &self.app_root, &session, &request)?
         };
-        let retained_source = match reconciled {
-            SourceOperationReconcile::Completed(evidence, receipt) => {
-                store_source_completed(&self.app_root, evidence, &receipt)?;
+        let (retained_source, retained_source_job_id) = match reconciled {
+            SourceOperationReconcile::Completed(
+                evidence,
+                receipt,
+                completed_revision,
+                durable_job_id,
+            ) => {
+                release_retained_source_job(
+                    &self.app_root,
+                    &durable_job_id,
+                    CasReleaseOutcome::Committed,
+                )?;
+                store_source_completed(&self.app_root, evidence, &receipt, completed_revision)?;
                 return Ok(receipt);
             }
-            SourceOperationReconcile::Retry(evidence) => Some(evidence),
+            SourceOperationReconcile::Retry(evidence, durable_job_id) => {
+                (Some(evidence), Some(durable_job_id))
+            }
             SourceOperationReconcile::LegacyCompleted(receipt) => return Ok(receipt),
-            SourceOperationReconcile::New => None,
+            SourceOperationReconcile::New => (None, None),
         };
         let mut client = LanLogicalDeltaClient::claim(
             &request.source_endpoint,
@@ -2367,6 +2408,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
             request.backup_losing_side,
             Some(&self.source_device_id),
             retained_source.as_ref(),
+            retained_source_job_id.as_deref(),
         )?;
         let evidence = PeerBidirectionalOperationJournal::new(&self.app_root)
             .load()?
@@ -2383,7 +2425,12 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
                 "simulated source completion journal failure".to_owned(),
             ));
         }
-        store_source_completed(&self.app_root, evidence, &receipt)?;
+        store_source_completed(
+            &self.app_root,
+            evidence,
+            &receipt,
+            receipt.committed_revision,
+        )?;
         Ok(receipt)
     }
 }
@@ -2978,14 +3025,10 @@ fn run_retained_remote_completion(
         } => (*committed_revision, remote_apply_receipt.is_some()),
     };
     let actual_revision = store.revision().map_err(store_error)?;
-    if actual_revision != committed_revision && !has_remote_receipt {
-        PeerBidirectionalOperationJournal::new(app_root).abandon(operation_id)?;
-        return Ok(PeerBidirectionalSyncResult::Stale {
-            operation_id: operation_id.to_owned(),
-            reason: PeerBidirectionalStaleReason::LocalRevision,
-        });
-    }
-    if actual_revision != expected_revision && !has_remote_receipt {
+    if actual_revision == committed_revision
+        && actual_revision != expected_revision
+        && !has_remote_receipt
+    {
         return retained_result(&retained);
     }
     let cas = PayloadCas::new(app_root)?;
@@ -3627,7 +3670,10 @@ fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSync
 mod tests {
     use super::*;
     use crate::{
-        asset_repository::PayloadCas,
+        asset_repository::{
+            job_pins::{collect_durable_cas_job_roots, CasObjectRole},
+            PayloadCas,
+        },
         peer_sync::logical_delta::{
             build_logical_manifest, LogicalManifestBuilderInput, LogicalRecordEnvelope,
             LogicalRecordLocator, ProjectedLogicalRecord,
@@ -4025,7 +4071,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_after_completed_journal_crash_reopens_without_a_second_remote_request() {
+    fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -4089,7 +4135,7 @@ mod tests {
         retained_context.credential.source_device_id = peer_id.to_owned();
         retained_context.expected_remote_revision = 4;
         retained_context.previous_shared = previous.clone();
-        retained_context.previous_local = previous;
+        retained_context.previous_local = previous.clone();
         PeerBidirectionalOperationJournal::new(directory.path())
             .store(&PeerBidirectionalDurableOperation::LocalCommitted {
                 schema: OPERATION_SCHEMA.to_owned(),
@@ -4115,7 +4161,7 @@ mod tests {
             transferred_bytes: 27,
             backup: None,
         };
-        COMPLETE_AFTER_ACK_FAILPOINT.with(|enabled| enabled.set(true));
+        COMPLETE_BEFORE_ACK_FAILPOINT.with(|enabled| enabled.set(true));
 
         assert!(complete_bidirectional_local_after_remote_apply(
             &mut store,
@@ -4130,7 +4176,7 @@ mod tests {
                 .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
                 .unwrap()
                 .shared_identity,
-            shared
+            previous
         );
         store
             .commit(&WorkingSetCommit {
@@ -4166,7 +4212,7 @@ mod tests {
         assert!(matches!(
             resumed,
             ResumeLocalCommittedOutcome::Completed(PeerBidirectionalCompletedResult {
-                revision: 1,
+                revision: 2,
                 remote_revision: 5,
                 transferred_objects: 3,
                 transferred_bytes: 27,
@@ -4478,6 +4524,24 @@ mod tests {
         };
         let journal = PeerBidirectionalOperationJournal::new(directory.path());
         journal.store(&retained).unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"preserved": "offline-descendant"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
         drop(store);
         let mut reopened = PersistentStore::open(directory.path()).unwrap();
 
@@ -4635,7 +4699,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_checks_the_exact_common_base_and_device_ack_before_remote_apply() {
+    fn resume_contacts_the_source_before_abandoning_stale_local_peer_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -4699,13 +4763,16 @@ mod tests {
                 directory.path(),
                 common_base_operation_id,
                 |_context, _revision, _shared, _manifest, _backup_required| {
-                    panic!("stale common base must not contact the remote source")
+                    Err(PeerSyncError::ActivationConflict {
+                        expected: Some("retained-source".to_owned()),
+                        actual: Some("different-source".to_owned()),
+                    })
                 },
             )
             .unwrap(),
             ResumeLocalCommittedOutcome::Stale {
                 operation_id: common_base_operation_id.to_owned(),
-                reason: PeerBidirectionalStaleReason::CommonBase,
+                reason: PeerBidirectionalStaleReason::RemoteGeneration,
             }
         );
 
@@ -4729,7 +4796,7 @@ mod tests {
                 schema: OPERATION_SCHEMA.to_owned(),
                 context: device_ack_context,
                 committed_revision: 0,
-                shared_generation: shared,
+                shared_generation: shared.clone(),
                 changed: false,
                 remote_backup_required: false,
                 remote_apply_receipt: None,
@@ -4745,20 +4812,23 @@ mod tests {
                 directory.path(),
                 device_ack_operation_id,
                 |_context, _revision, _shared, _manifest, _backup_required| {
-                    panic!("stale device acknowledgement must not contact the remote source")
+                    Err(PeerSyncError::ActivationConflict {
+                        expected: Some("retained-source".to_owned()),
+                        actual: Some("different-source".to_owned()),
+                    })
                 },
             )
             .unwrap(),
             ResumeLocalCommittedOutcome::Stale {
                 operation_id: device_ack_operation_id.to_owned(),
-                reason: PeerBidirectionalStaleReason::DeviceAcknowledgement,
+                reason: PeerBidirectionalStaleReason::RemoteGeneration,
             }
         );
         assert!(journal.load().unwrap().is_none());
     }
 
     #[test]
-    fn stale_local_revision_abandons_retained_operation_and_job() {
+    fn remote_generation_rejection_after_local_drift_abandons_the_operation_and_job() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -4766,7 +4836,62 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let operation_id = "123e4567-e89b-42d3-a456-426614174014";
-        let retained_context = context(operation_id);
+        let peer_id = "123e4567-e89b-42d3-a456-426614174002";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    shared.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"shared": "local-commit"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let committed = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let committed_shared = SyncGenerationIdentity {
+            generation_id: committed.manifest.generation,
+            manifest_hash: committed.manifest_hash,
+            generation_sequence: committed.manifest.generation_sequence,
+        };
+        let mut retained_context = context(operation_id);
+        retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        retained_context.credential.source_device_id = peer_id.to_owned();
+        retained_context.previous_shared = shared.clone();
+        retained_context.previous_local = shared.clone();
         let durable_job_id = retained_context.durable_job_id.clone();
         let job = DurableCasJob::begin(
             directory.path(),
@@ -4780,12 +4905,8 @@ mod tests {
             .store(&PeerBidirectionalDurableOperation::LocalCommitted {
                 schema: OPERATION_SCHEMA.to_owned(),
                 context: retained_context,
-                committed_revision: 0,
-                shared_generation: SyncGenerationIdentity {
-                    generation_id: base.manifest.generation,
-                    manifest_hash: base.manifest_hash,
-                    generation_sequence: base.manifest.generation_sequence,
-                },
+                committed_revision: 1,
+                shared_generation: committed_shared.clone(),
                 changed: false,
                 remote_backup_required: false,
                 remote_apply_receipt: None,
@@ -4796,7 +4917,7 @@ mod tests {
             .unwrap();
         store
             .commit(&WorkingSetCommit {
-                expected_revision: 0,
+                expected_revision: 1,
                 root: Some(json!({"advanced": true})),
                 replace_presets: None,
                 character: None,
@@ -4809,6 +4930,9 @@ mod tests {
                 asset_owner_heads: None,
             })
             .unwrap();
+        store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
 
         let outcome = resume_bidirectional_local_committed_with_remote(
             &mut store,
@@ -4816,7 +4940,10 @@ mod tests {
             directory.path(),
             operation_id,
             |_context, _revision, _shared, _manifest, _backup_required| {
-                panic!("stale local state must not contact the remote source")
+                Err(PeerSyncError::ActivationConflict {
+                    expected: Some("retained-source".to_owned()),
+                    actual: Some("different-source".to_owned()),
+                })
             },
         )
         .unwrap();
@@ -4825,7 +4952,7 @@ mod tests {
             outcome,
             ResumeLocalCommittedOutcome::Stale {
                 operation_id: operation_id.to_owned(),
-                reason: PeerBidirectionalStaleReason::LocalRevision,
+                reason: PeerBidirectionalStaleReason::RemoteGeneration,
             }
         );
         assert!(PeerBidirectionalOperationJournal::new(directory.path())
@@ -4878,81 +5005,6 @@ mod tests {
             }
         );
         assert_eq!(journal.load().unwrap(), Some(retained));
-    }
-
-    #[test]
-    fn stale_caller_revision_abandons_a_drifted_local_commit() {
-        let directory = tempfile::tempdir().unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let active = store
-            .seal_or_initialize_active_logical_generation(&cas)
-            .unwrap();
-        let operation_id = "123e4567-e89b-42d3-a456-426614174022";
-        let mut retained_context = context(operation_id);
-        retained_context.durable_job_id = "123e4567-e89b-42d3-a456-426614174023".to_owned();
-        let durable_job_id = retained_context.durable_job_id.clone();
-        drop(
-            DurableCasJob::begin(
-                directory.path(),
-                &durable_job_id,
-                CasJobKind::LogicalDeltaTarget,
-                0,
-            )
-            .unwrap(),
-        );
-        PeerBidirectionalOperationJournal::new(directory.path())
-            .store(&PeerBidirectionalDurableOperation::LocalCommitted {
-                schema: OPERATION_SCHEMA.to_owned(),
-                context: retained_context,
-                committed_revision: 0,
-                shared_generation: SyncGenerationIdentity {
-                    generation_id: active.manifest.generation,
-                    manifest_hash: active.manifest_hash,
-                    generation_sequence: active.manifest.generation_sequence,
-                },
-                changed: false,
-                remote_backup_required: false,
-                remote_apply_receipt: None,
-                transferred_objects: 0,
-                transferred_bytes: 0,
-                backups: vec![],
-            })
-            .unwrap();
-        store
-            .commit(&WorkingSetCommit {
-                expected_revision: 0,
-                root: Some(json!({"drifted": true})),
-                replace_presets: None,
-                character: None,
-                character_details: None,
-                replace_character: None,
-                add_character: None,
-                conversations: None,
-                delete_character_id: None,
-                plugin_storage: None,
-                asset_owner_heads: None,
-            })
-            .unwrap();
-
-        assert_eq!(
-            run_retained_remote_completion(&mut store, directory.path(), operation_id, 0, None,)
-                .unwrap(),
-            PeerBidirectionalSyncResult::Stale {
-                operation_id: operation_id.to_owned(),
-                reason: PeerBidirectionalStaleReason::LocalRevision,
-            }
-        );
-        assert!(PeerBidirectionalOperationJournal::new(directory.path())
-            .load()
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            DurableCasJob::open(directory.path(), &durable_job_id)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::NotFound
-        );
     }
 
     #[test]
@@ -6884,8 +6936,109 @@ mod tests {
         request.source_manifest_id = retry_pairing.manifest_id;
         request.source_claim = retry_pairing.claim;
 
+        SOURCE_AFTER_PREPARED_STORE_PANIC.with(|enabled| enabled.set(true));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            control.remote_apply(session.clone(), request.clone())
+        }));
+        assert!(crashed.is_err());
+        drop(control);
+        let crashed_prepared = PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .unwrap();
+        let crashed_job_id = match &crashed_prepared {
+            PeerBidirectionalDurableOperation::SourcePrepared { durable_job_id, .. } => {
+                durable_job_id.clone()
+            }
+            other => panic!("expected source-prepared crash journal, got {other:?}"),
+        };
+        let crashed_job = DurableCasJob::open(directory.path(), &crashed_job_id).unwrap();
+        assert!(crashed_job.is_sealed());
+        assert!(crashed_job.pin_count() > 0);
+        let crashed_roots = collect_durable_cas_job_roots(directory.path());
+        assert!(!crashed_roots.object_hashes.is_empty());
+        let retained_object_hash = crashed_roots.object_hashes.iter().next().unwrap().clone();
+        let retained_object_size = cas.stat_object(&retained_object_hash).unwrap().unwrap();
+        assert!(!crashed_roots
+            .blockers
+            .contains(&format!("job-pin-unsealed:{crashed_job_id}")));
+        retry_host.stop().unwrap();
+        let handoff_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &retry_remote.manifest.generation,
+        )
+        .unwrap();
+        let handoff_prepared = super::super::lan::PreparedLogicalLanSession::new(
+            &uuid::Uuid::new_v4().to_string(),
+            target_device_id,
+            retry_remote.manifest_hash.clone(),
+            retry_remote.manifest_bytes.clone(),
+            handoff_source.objects().to_vec(),
+            Box::new(handoff_source),
+        )
+        .unwrap();
+        retry_host = LanCloneHost::prepare_logical(handoff_prepared);
+        let handoff_pairing = retry_host.start().unwrap();
+        request.source_endpoint =
+            format!("http://127.0.0.1:{}", retry_host.address().unwrap().port());
+        request.source_session_id = handoff_pairing.session_id;
+        request.source_manifest_id = handoff_pairing.manifest_id;
+        request.source_claim = handoff_pairing.claim;
+
+        let recovery_control = ProductionLanBidirectionalControl::new(
+            directory.path().to_path_buf(),
+            PersistentStore::open(directory.path()).unwrap(),
+            source_session_id,
+            source_device_id,
+        );
+        SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
+        let handoff_error = recovery_control
+            .remote_apply(session.clone(), request.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&handoff_error, PeerSyncError::Storage(message) if message.contains("source-prepared")),
+            "{handoff_error:?}"
+        );
+        let retained_old_job = DurableCasJob::open(directory.path(), &crashed_job_id).unwrap();
+        assert!(retained_old_job.is_sealed());
+        assert_eq!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(crashed_prepared)
+        );
+        assert!(!collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .is_empty());
+        retry_host.stop().unwrap();
+        let completion_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &retry_remote.manifest.generation,
+        )
+        .unwrap();
+        let completion_prepared = super::super::lan::PreparedLogicalLanSession::new(
+            &uuid::Uuid::new_v4().to_string(),
+            target_device_id,
+            retry_remote.manifest_hash.clone(),
+            retry_remote.manifest_bytes.clone(),
+            completion_source.objects().to_vec(),
+            Box::new(completion_source),
+        )
+        .unwrap();
+        retry_host = LanCloneHost::prepare_logical(completion_prepared);
+        let completion_pairing = retry_host.start().unwrap();
+        request.source_endpoint =
+            format!("http://127.0.0.1:{}", retry_host.address().unwrap().port());
+        request.source_session_id = completion_pairing.session_id;
+        request.source_manifest_id = completion_pairing.manifest_id;
+        request.source_claim = completion_pairing.claim;
+
         SOURCE_COMPLETE_STORE_FAILPOINT.with(|enabled| enabled.set(true));
-        let error = control
+        let error = recovery_control
             .remote_apply(session.clone(), request.clone())
             .unwrap_err();
         assert!(
@@ -6897,11 +7050,42 @@ mod tests {
             .unwrap()
             .unwrap();
         let evidence = SourcePreparedEvidence::from_operation(&prepared).unwrap();
+        let committed_job_id = match &prepared {
+            PeerBidirectionalDurableOperation::SourcePrepared { durable_job_id, .. } => {
+                durable_job_id.clone()
+            }
+            other => panic!("expected source-prepared completion journal, got {other:?}"),
+        };
         assert!(evidence.transferred_objects > 0);
         assert!(evidence.transferred_bytes > 0);
         assert!(evidence.backup.is_some());
         let expected = evidence.receipt().unwrap();
+        assert!(matches!(
+            DurableCasJob::open(directory.path(), &crashed_job_id),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
         let mut committed_source = PersistentStore::open(directory.path()).unwrap();
+        let mut retained_committed_job = DurableCasJob::begin(
+            directory.path(),
+            &committed_job_id,
+            CasJobKind::LogicalDeltaTarget,
+            0,
+        )
+        .unwrap();
+        retained_committed_job
+            .pin_existing(
+                &cas,
+                &retained_object_hash,
+                retained_object_size,
+                CasObjectRole::DirectObject,
+            )
+            .unwrap();
+        retained_committed_job
+            .seal(&mut committed_source, 0)
+            .unwrap();
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .contains(&retained_object_hash));
         assert!(matches!(
             PeerBidirectionalCommandState::default().acknowledge(
                 directory.path(),
@@ -6916,12 +7100,31 @@ mod tests {
             .is_some());
         drop(committed_source);
         retry_host.stop().unwrap();
-        drop(control);
+        drop(recovery_control);
 
         let mut source_store = PersistentStore::open(directory.path()).unwrap();
+        source_store
+            .commit(&WorkingSetCommit {
+                expected_revision: expected.committed_revision,
+                root: None,
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: Some(vec![crate::persistent_store::PluginStorageMutation::Set {
+                    key: "source-after-ack".to_owned(),
+                    value: json!({"preserved": true}),
+                }]),
+                asset_owner_heads: None,
+            })
+            .unwrap();
         let source_active = source_store
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
+        let refreshed_source_revision = source_store.revision().unwrap();
         let source = LogicalDeltaSourceSession::open(
             directory.path(),
             directory.path(),
@@ -7011,17 +7214,40 @@ mod tests {
                 backups: vec![],
             })
             .unwrap();
+        target_store
+            .commit(&WorkingSetCommit {
+                expected_revision: target_revision,
+                root: None,
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: Some(vec![crate::persistent_store::PluginStorageMutation::Set {
+                    key: "target-after-response-loss".to_owned(),
+                    value: json!({"preserved": true}),
+                }]),
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        target_store
+            .seal_or_initialize_active_logical_generation(&target_cas)
+            .unwrap();
+        let refreshed_target_revision = target_store.revision().unwrap();
 
         DISCOVER_LAN_IPV4_OVERRIDE.with(|address| address.set(Some(Ipv4Addr::LOCALHOST)));
         let result = run_retained_remote_completion(
             &mut target_store,
             remote_directory.path(),
             &operation_id,
-            target_revision,
+            refreshed_target_revision,
             Some(&client),
         )
         .unwrap();
         let PeerBidirectionalSyncResult::Updated {
+            revision,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -7030,10 +7256,11 @@ mod tests {
         else {
             panic!("expected updated retained completion");
         };
+        assert_eq!(revision, refreshed_target_revision);
         assert_eq!(transferred_objects, expected.transferred_objects);
         assert_eq!(transferred_bytes, expected.transferred_bytes);
         assert_eq!(backups.len(), 1);
-        assert_eq!(inspector.revision().unwrap(), expected.committed_revision);
+        assert_eq!(inspector.revision().unwrap(), refreshed_source_revision);
         assert!(matches!(
             PeerBidirectionalOperationJournal::new(directory.path())
                 .load()
@@ -7041,8 +7268,13 @@ mod tests {
             Some(PeerBidirectionalDurableOperation::Completed {
                 remote_apply_receipt: Some(receipt),
                 source_binding: Some(_),
+                result,
                 ..
-            }) if receipt == expected
+            }) if receipt == expected && result.revision == refreshed_source_revision
+        ));
+        assert!(matches!(
+            DurableCasJob::open(directory.path(), &committed_job_id),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
         ));
         assert_eq!(
             target_store

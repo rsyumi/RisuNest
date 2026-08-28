@@ -98,6 +98,10 @@ pub trait LogicalDeltaStagedTarget {
         plan: &ReadyLogicalDeltaPlan,
     ) -> Result<(), PeerSyncError>;
 
+    fn prepare_activation(&mut self, _stage: &mut Self::Stage) -> Result<(), PeerSyncError> {
+        Ok(())
+    }
+
     /// The expected revision and base checks, database activation, and common-base hash and
     /// generation-sequence update must be one atomic target transaction. An error must mean that
     /// transaction did not commit.
@@ -192,6 +196,7 @@ where
     let mut stage = target.begin(plan)?;
     let result = (|| {
         if target.can_activate_without_transfer(&stage) {
+            target.prepare_activation(&mut stage)?;
             before_activation(&LogicalDeltaTransferSelection {
                 reused_from_local_manifest: Vec::new(),
                 reused_from_cas: Vec::new(),
@@ -218,6 +223,7 @@ where
             verified_reader.finish(object)?;
         }
         target.stage_database_changes(&mut stage, plan)?;
+        target.prepare_activation(&mut stage)?;
         before_activation(&selection)?;
         target.activate_database_and_base_if_current(
             &mut stage,
@@ -637,6 +643,11 @@ mod tests {
             Ok(())
         }
 
+        fn prepare_activation(&mut self, _stage: &mut Self::Stage) -> Result<(), PeerSyncError> {
+            self.events.push("prepare".to_owned());
+            Ok(())
+        }
+
         fn activate_database_and_base_if_current(
             &mut self,
             stage: &mut Self::Stage,
@@ -696,7 +707,7 @@ mod tests {
             activation,
             LogicalDeltaActivation::Activated { revision: 8 }
         );
-        assert_eq!(target.events, ["begin", "database", "activate"]);
+        assert_eq!(target.events, ["begin", "database", "prepare", "activate"]);
     }
 
     #[test]
@@ -794,7 +805,7 @@ mod tests {
             LogicalDeltaActivation::Activated { revision: 8 }
         );
         assert_eq!(source.content_gets, 0);
-        assert_eq!(target.events, ["begin", "database", "activate"]);
+        assert_eq!(target.events, ["begin", "database", "prepare", "activate"]);
     }
 
     #[test]
@@ -865,6 +876,7 @@ mod tests {
                 "begin".to_owned(),
                 format!("payload:{payload_hash}"),
                 "database".to_owned(),
+                "prepare".to_owned(),
                 "activate".to_owned(),
             ]
         );
@@ -919,6 +931,7 @@ mod tests {
         assert_eq!(target.active_revision, 7);
         assert_eq!(target.active_base, "1".repeat(64));
         assert_eq!(target.aborts, 1);
+        assert!(target.events.iter().any(|event| event == "prepare"));
         assert_eq!(target.events.last().map(String::as_str), Some("abort"));
         assert!(!target.events.iter().any(|event| event == "activate"));
     }
