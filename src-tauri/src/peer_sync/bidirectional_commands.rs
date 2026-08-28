@@ -2291,22 +2291,7 @@ fn reconcile_source_operation(
                 }
                 _ => unreachable!(),
             };
-            if evidence.source_device_id != session.source_device_id
-                || evidence.target_device_id != session.target_device_id
-                || evidence.operation_id != request.operation_id
-                || evidence.expected_source_revision != request.expected_source_revision
-                || evidence.expected_source_generation
-                    != (SyncGenerationIdentity {
-                        generation_id: request.expected_source_generation.generation_id.clone(),
-                        manifest_hash: request.expected_source_generation.manifest_hash.clone(),
-                        generation_sequence: request
-                            .expected_source_generation
-                            .generation_sequence
-                            .clone(),
-                    })
-                || evidence.previous_shared.manifest_hash
-                    != request.expected_common_base_manifest_hash
-            {
+            if !completed_source_request_matches(&evidence, session, request) {
                 return Err(PeerSyncError::Validation(
                     "bidirectional source retry differs from retained evidence".to_owned(),
                 ));
@@ -4425,6 +4410,50 @@ mod tests {
                     result.kind = "noChanges".to_owned();
                 }
                 ("kind", operation)
+            },
+            {
+                let mut operation = valid.clone();
+                if let PeerBidirectionalDurableOperation::Completed {
+                    remote_apply_receipt: Some(receipt),
+                    ..
+                } = &mut operation
+                {
+                    receipt.transferred_objects += 1;
+                }
+                ("receipt object total", operation)
+            },
+            {
+                let mut operation = valid.clone();
+                if let PeerBidirectionalDurableOperation::Completed {
+                    remote_apply_receipt: Some(receipt),
+                    ..
+                } = &mut operation
+                {
+                    receipt.transferred_bytes += 1;
+                }
+                ("receipt byte total", operation)
+            },
+            {
+                let mut operation = valid.clone();
+                if let PeerBidirectionalDurableOperation::Completed {
+                    remote_apply_receipt: Some(receipt),
+                    ..
+                } = &mut operation
+                {
+                    receipt.committed_generation.manifest_hash = "e".repeat(64);
+                }
+                ("receipt committed generation", operation)
+            },
+            {
+                let mut operation = valid.clone();
+                if let PeerBidirectionalDurableOperation::Completed {
+                    remote_apply_receipt: Some(receipt),
+                    ..
+                } = &mut operation
+                {
+                    receipt.backup.as_mut().unwrap().path.push_str(".corrupt");
+                }
+                ("receipt backup", operation)
             },
         ];
 
@@ -8375,7 +8404,7 @@ mod tests {
                 committed_revision: target_revision,
                 shared_generation: shared.clone(),
                 changed: true,
-                remote_backup_required: true,
+                remote_backup_required: false,
                 remote_apply_receipt: None,
                 transferred_objects: 0,
                 transferred_bytes: 0,
@@ -8405,6 +8434,35 @@ mod tests {
             .unwrap();
         let refreshed_target_revision = target_store.revision().unwrap();
 
+        DISCOVER_LAN_IPV4_OVERRIDE.with(|address| address.set(Some(Ipv4Addr::LOCALHOST)));
+        assert!(matches!(
+            run_retained_remote_completion(
+                &mut target_store,
+                remote_directory.path(),
+                &operation_id,
+                refreshed_target_revision,
+                Some(&client),
+            )
+            .unwrap(),
+            PeerBidirectionalSyncResult::SourceUnavailable { .. }
+        ));
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::SourcePrepared { .. })
+        ));
+        let target_journal = PeerBidirectionalOperationJournal::new(remote_directory.path());
+        let mut retained_target = target_journal.load().unwrap().unwrap();
+        let PeerBidirectionalDurableOperation::LocalCommitted {
+            remote_backup_required,
+            ..
+        } = &mut retained_target
+        else {
+            panic!("expected retained target operation after source request mismatch");
+        };
+        *remote_backup_required = true;
+        target_journal.store(&retained_target).unwrap();
         DISCOVER_LAN_IPV4_OVERRIDE.with(|address| address.set(Some(Ipv4Addr::LOCALHOST)));
         let result = run_retained_remote_completion(
             &mut target_store,
