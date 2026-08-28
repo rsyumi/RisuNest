@@ -360,9 +360,9 @@
     }
 
     async function revokeBidirectionalDevice(deviceId: string): Promise<void> {
-        if (!bidirectionalSourceStatus.sessionId) return
+        const sessionId = bidirectionalSourceStatus.sessionId ?? ''
         await withBidirectionalBusy(async () => {
-            await bidirectionalController.revoke(bidirectionalSourceStatus.sessionId!, deviceId)
+            await bidirectionalController.revoke(sessionId, deviceId)
         })
     }
 

@@ -699,6 +699,37 @@ describe('peer bidirectional controller', () => {
         })
     })
 
+    it('revokes a durable offline device with the empty session sentinel and refreshes status', async () => {
+        const revoke = vi.fn(async () => undefined)
+        let revoked = false
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                revoke,
+                status: async () => ({
+                    source: {
+                        phase: 'stopped',
+                        devices: [{
+                            deviceId: 'device-offline',
+                            transferredBytes: 14,
+                            lastSeenAt: 1,
+                            revoked,
+                        }],
+                    },
+                }),
+            }),
+        })
+        await controller.initialize()
+        revoked = true
+
+        await controller.revoke('', 'device-offline')
+
+        expect(revoke).toHaveBeenCalledWith('', 'device-offline')
+        expect(controller.snapshot().sourceStatus.devices[0]).toMatchObject({
+            deviceId: 'device-offline',
+            revoked: true,
+        })
+    })
+
     it('projects source-unavailable as a recoverable retained operation', async () => {
         const controller = createPeerBidirectionalController({
             facade: facade({

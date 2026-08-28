@@ -98,6 +98,24 @@ describe('peer bidirectional facade', () => {
         ])
     })
 
+    it.each(['', 'session-source'])(
+        'forwards the existing string session sentinel when revoking a device',
+        async (sessionId) => {
+            const invoke = vi.fn(async () => undefined)
+            const facade = createPeerBidirectionalFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerBidirectionalInvoke,
+            })
+
+            await facade.revoke(sessionId, 'device-durable')
+
+            expect(invoke).toHaveBeenCalledWith('peer_bidirectional_revoke', {
+                sessionId,
+                deviceId: 'device-durable',
+            })
+        },
+    )
+
     it('rejects a target mutation while source preparation is in flight', async () => {
         const events: string[] = []
         let finishPrepare!: (value: unknown) => void
