@@ -2052,7 +2052,28 @@ impl PeerBidirectionalCommandState {
                 return Ok(());
             }
         }
-        journal.acknowledge_completed(operation_id)
+        let Some(operation) = journal.load()? else {
+            return Ok(());
+        };
+        if operation.operation_id() != operation_id {
+            return Err(PeerSyncError::Validation(
+                "another bidirectional operation is retained".to_owned(),
+            ));
+        }
+        match operation {
+            PeerBidirectionalDurableOperation::LocalCommitted { .. } => {
+                journal.abandon(operation_id)
+            }
+            PeerBidirectionalDurableOperation::Completed { .. } => {
+                journal.acknowledge_completed(operation_id)
+            }
+            PeerBidirectionalDurableOperation::AwaitingConflict { .. } => {
+                Err(PeerSyncError::Validation(
+                    "only a completed or source-unavailable bidirectional operation can be acknowledged"
+                        .to_owned(),
+                ))
+            }
+        }
     }
 }
 
@@ -2281,7 +2302,7 @@ fn run_retained_remote_completion(
             "another bidirectional operation is retained".to_owned(),
         ));
     }
-    match &retained {
+    let committed_revision = match &retained {
         PeerBidirectionalDurableOperation::Completed { .. } => {
             return Ok(retained_result(&retained));
         }
@@ -2290,13 +2311,20 @@ fn run_retained_remote_completion(
                 "bidirectional operation is awaiting conflict resolution".to_owned(),
             ));
         }
-        PeerBidirectionalDurableOperation::LocalCommitted { .. } => {}
-    }
-    if store.revision().map_err(store_error)? != expected_revision {
+        PeerBidirectionalDurableOperation::LocalCommitted {
+            committed_revision, ..
+        } => *committed_revision,
+    };
+    let actual_revision = store.revision().map_err(store_error)?;
+    if actual_revision != committed_revision {
+        PeerBidirectionalOperationJournal::new(app_root).abandon(operation_id)?;
         return Ok(PeerBidirectionalSyncResult::Stale {
             operation_id: operation_id.to_owned(),
             reason: PeerBidirectionalStaleReason::LocalRevision,
         });
+    }
+    if actual_revision != expected_revision {
+        return Ok(retained_result(&retained));
     }
     let cas = PayloadCas::new(app_root)?;
     let local_device_id = super::delta_commands::load_or_create_source_device_id(
@@ -3923,6 +3951,227 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn stale_caller_revision_returns_resume_required_when_local_commit_is_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174021";
+        let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            committed_revision: 0,
+            shared_generation: SyncGenerationIdentity {
+                generation_id: active.manifest.generation,
+                manifest_hash: active.manifest_hash,
+                generation_sequence: active.manifest.generation_sequence,
+            },
+            changed: false,
+            remote_backup_required: false,
+            remote_apply_receipt: None,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&retained).unwrap();
+
+        assert_eq!(
+            run_retained_remote_completion(&mut store, directory.path(), operation_id, 1, None,)
+                .unwrap(),
+            PeerBidirectionalSyncResult::ResumeRequired {
+                operation_id: operation_id.to_owned(),
+                phase: "localCommitted",
+                committed_revision: 0,
+            }
+        );
+        assert_eq!(journal.load().unwrap(), Some(retained));
+    }
+
+    #[test]
+    fn stale_caller_revision_abandons_a_drifted_local_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174022";
+        let mut retained_context = context(operation_id);
+        retained_context.durable_job_id = "123e4567-e89b-42d3-a456-426614174023".to_owned();
+        let durable_job_id = retained_context.durable_job_id.clone();
+        drop(
+            DurableCasJob::begin(
+                directory.path(),
+                &durable_job_id,
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .unwrap(),
+        );
+        PeerBidirectionalOperationJournal::new(directory.path())
+            .store(&PeerBidirectionalDurableOperation::LocalCommitted {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: retained_context,
+                committed_revision: 0,
+                shared_generation: SyncGenerationIdentity {
+                    generation_id: active.manifest.generation,
+                    manifest_hash: active.manifest_hash,
+                    generation_sequence: active.manifest.generation_sequence,
+                },
+                changed: false,
+                remote_backup_required: false,
+                remote_apply_receipt: None,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups: vec![],
+            })
+            .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"drifted": true})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            run_retained_remote_completion(&mut store, directory.path(), operation_id, 0, None,)
+                .unwrap(),
+            PeerBidirectionalSyncResult::Stale {
+                operation_id: operation_id.to_owned(),
+                reason: PeerBidirectionalStaleReason::LocalRevision,
+            }
+        );
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            DurableCasJob::open(directory.path(), &durable_job_id)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn acknowledge_abandons_local_commit_and_allows_a_new_authenticated_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer_id = "123e4567-e89b-42d3-a456-426614174024";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        let common = SyncGenerationIdentity {
+            generation_id: base.manifest.generation,
+            manifest_hash: base.manifest_hash,
+            generation_sequence: base.manifest.generation_sequence,
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    common.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"committed": true})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174025";
+        let mut retained_context = context(operation_id);
+        retained_context.credential.source_device_id = peer_id.to_owned();
+        retained_context.durable_job_id = "123e4567-e89b-42d3-a456-426614174026".to_owned();
+        let durable_job_id = retained_context.durable_job_id.clone();
+        drop(
+            DurableCasJob::begin(
+                directory.path(),
+                &durable_job_id,
+                CasJobKind::LogicalDeltaTarget,
+                1,
+            )
+            .unwrap(),
+        );
+        PeerBidirectionalOperationJournal::new(directory.path())
+            .store(&PeerBidirectionalDurableOperation::LocalCommitted {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: retained_context,
+                committed_revision: 1,
+                shared_generation: common.clone(),
+                changed: true,
+                remote_backup_required: true,
+                remote_apply_receipt: None,
+                transferred_objects: 1,
+                transferred_bytes: 1,
+                backups: vec![],
+            })
+            .unwrap();
+        let committed_root = store.read_root(None).unwrap();
+
+        let state = PeerBidirectionalCommandState::default();
+        state.acknowledge(directory.path(), operation_id).unwrap();
+
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.read_root(None).unwrap(), committed_root);
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            Some(common)
+        );
+        assert_eq!(
+            DurableCasJob::open(directory.path(), &durable_job_id)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        attach_local_device_at_existing_base(&mut store, peer_id, 1).unwrap();
+        assert!(state.begin_target().is_ok());
     }
 
     #[test]
