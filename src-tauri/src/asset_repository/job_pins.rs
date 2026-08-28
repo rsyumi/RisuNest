@@ -185,6 +185,22 @@ impl DurableCasJob {
         Ok(prepared)
     }
 
+    pub(crate) fn prepare_reader_expected(
+        &mut self,
+        cas: &PayloadCas,
+        reader: &mut impl Read,
+        expected_content_hash: &str,
+        expected_byte_size: u64,
+        role: CasObjectRole,
+    ) -> io::Result<PreparedPayload> {
+        self.ensure_preparable()?;
+        self.ensure_cas(cas)?;
+        let prepared =
+            cas.prepare_reader_expected(reader, expected_content_hash, expected_byte_size)?;
+        self.record_prepared(cas, &prepared, role)?;
+        Ok(prepared)
+    }
+
     pub(crate) fn pin_existing(
         &mut self,
         cas: &PayloadCas,

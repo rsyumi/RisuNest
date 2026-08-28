@@ -75,6 +75,24 @@ impl PayloadCas {
     }
 
     pub fn prepare_reader(&self, reader: &mut impl Read) -> Result<PreparedPayload, io::Error> {
+        self.prepare_reader_inner(reader, None)
+    }
+
+    pub(crate) fn prepare_reader_expected(
+        &self,
+        reader: &mut impl Read,
+        expected_content_hash: &str,
+        expected_byte_size: u64,
+    ) -> Result<PreparedPayload, io::Error> {
+        validate_content_hash(expected_content_hash)?;
+        self.prepare_reader_inner(reader, Some((expected_content_hash, expected_byte_size)))
+    }
+
+    fn prepare_reader_inner(
+        &self,
+        reader: &mut impl Read,
+        expected: Option<(&str, u64)>,
+    ) -> Result<PreparedPayload, io::Error> {
         self.ensure_repository_root()?;
         let mut directory_entries_synced = true;
         let assets_directory = self.ensure_directory(
@@ -106,6 +124,14 @@ impl PayloadCas {
         directory_entries_synced &= sync_directory(&staging_directory)?;
 
         let content_hash = hex::encode(hasher.finalize());
+        if let Some((expected_content_hash, expected_byte_size)) = expected {
+            if content_hash != expected_content_hash || byte_size != expected_byte_size {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "payload does not match its expected content hash and size",
+                ));
+            }
+        }
         let physical_key = object_physical_key(&content_hash);
         let objects_directory =
             self.ensure_directory(&assets_directory, "objects", &mut directory_entries_synced)?;
@@ -436,6 +462,8 @@ fn sync_directory(_path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{create_staging_file, PayloadCas};
+    use sha2::Digest;
+    use std::io::Cursor;
 
     #[test]
     fn existing_directory_from_a_crash_window_resyncs_its_parent_before_acceptance() {
@@ -482,5 +510,53 @@ mod tests {
             std::fs::read(staging_path).expect("preexisting staging file remains"),
             b"preexisting"
         );
+    }
+
+    #[test]
+    fn expected_prepare_rejects_mismatch_before_canonical_publication() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let expected = b"expected payload";
+        let wrong = b"unexpected data";
+        let expected_hash = hex::encode(sha2::Sha256::digest(expected));
+        let wrong_hash = hex::encode(sha2::Sha256::digest(wrong));
+
+        for _ in 0..3 {
+            let error = cas
+                .prepare_reader_expected(
+                    &mut Cursor::new(wrong),
+                    &expected_hash,
+                    expected.len() as u64,
+                )
+                .expect_err("wrong payload must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(cas.stat_object(&wrong_hash).unwrap(), None);
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("assets-v2").join("staging"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+
+        let prepared = cas
+            .prepare_reader_expected(
+                &mut Cursor::new(expected),
+                &expected_hash,
+                expected.len() as u64,
+            )
+            .expect("exact payload is published");
+        assert_eq!(prepared.content_hash, expected_hash);
+        assert_eq!(prepared.byte_size, expected.len() as u64);
+
+        assert!(cas
+            .prepare_reader_expected(
+                &mut Cursor::new(wrong),
+                &expected_hash,
+                expected.len() as u64,
+            )
+            .is_err());
+        assert_eq!(cas.read_object(&expected_hash).unwrap().unwrap(), expected);
+        assert_eq!(cas.stat_object(&wrong_hash).unwrap(), None);
     }
 }

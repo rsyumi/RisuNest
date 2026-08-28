@@ -1831,12 +1831,9 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         }
         if let Some(job) = self.durable_job {
             let mut exact = ExactSizeReader::new(reader, object.size);
-            let prepared = self.cas.prepare_reader(&mut exact)?;
-            if prepared.content_hash != object.hash || prepared.byte_size != object.size {
-                return validation("logical delta streamed object differs from its manifest");
-            }
-            job.borrow_mut().pin_existing(
+            job.borrow_mut().prepare_reader_expected(
                 self.cas,
+                &mut exact,
                 &object.hash,
                 object.size,
                 CasObjectRole::DirectObject,
@@ -4497,6 +4494,7 @@ mod tests {
 
         let mut wrong = record.bytes.clone();
         wrong[0] ^= 0xff;
+        let wrong_hash = hex::encode(sha2::Sha256::digest(&wrong));
         for _ in 0..3 {
             assert!(target
                 .stage_payload(
@@ -4509,6 +4507,13 @@ mod tests {
                 )
                 .is_err());
             assert_eq!(job.borrow().pin_count(), 1);
+            assert_eq!(cas.stat_object(&wrong_hash).unwrap(), None);
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("assets-v2").join("staging"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
         assert_eq!(cas.stat_object(&record.hash).unwrap(), None);
 
