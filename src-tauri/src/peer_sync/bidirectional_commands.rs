@@ -2226,6 +2226,104 @@ mod tests {
     }
 
     #[test]
+    fn resume_rejects_required_missing_remote_backup_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174032";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    shared.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174031";
+        let mut retained_context = context(operation_id);
+        retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        retained_context.credential.source_device_id = peer_id.to_owned();
+        retained_context.expected_local_revision = 0;
+        retained_context.expected_remote_revision = 4;
+        retained_context.previous_shared = shared.clone();
+        retained_context.previous_local = shared.clone();
+        let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: retained_context,
+            committed_revision: 0,
+            shared_generation: shared.clone(),
+            changed: true,
+            remote_backup_required: true,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&retained).unwrap();
+        let before_root = store.read_root(None).unwrap();
+        let before_ack = store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        drop(store);
+        let mut reopened = PersistentStore::open(directory.path()).unwrap();
+
+        let error = resume_bidirectional_local_committed_with_remote(
+            &mut reopened,
+            &cas,
+            directory.path(),
+            operation_id,
+            |_context, _revision, remote_shared, _manifest, backup_required| {
+                assert!(backup_required);
+                Ok(LanBidirectionalRemoteApplyReceipt {
+                    committed_revision: 4,
+                    committed_generation: LanBidirectionalGeneration {
+                        generation_id: remote_shared.generation_id.clone(),
+                        manifest_hash: remote_shared.manifest_hash.clone(),
+                        generation_sequence: remote_shared.generation_sequence.clone(),
+                    },
+                    transferred_objects: 0,
+                    transferred_bytes: 0,
+                    backup: None,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PeerSyncError::Validation(_)));
+        assert_eq!(journal.load().unwrap(), Some(retained));
+        assert_eq!(reopened.revision().unwrap(), 0);
+        assert_eq!(reopened.read_root(None).unwrap(), before_root);
+        assert_eq!(
+            reopened
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            before_ack
+        );
+    }
+
+    #[test]
     fn resume_checks_the_exact_common_base_and_device_ack_before_remote_apply() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
