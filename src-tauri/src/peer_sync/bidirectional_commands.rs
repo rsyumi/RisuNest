@@ -2152,6 +2152,24 @@ fn reconcile_source_operation(
             {
                 return Ok(SourceOperationReconcile::Retry(evidence, durable_job_id));
             }
+            let precommit_descendant = actual_revision > evidence.expected_source_revision
+                && common.as_ref() == Some(&evidence.previous_shared)
+                && acknowledgement.shared_identity == evidence.previous_shared
+                && acknowledgement.local_identity == evidence.expected_source_generation
+                && store
+                    .logical_generation_descends_from(
+                        PRODUCT_LOGICAL_LIBRARY_ID,
+                        &active_identity.generation_id,
+                        &evidence.expected_source_generation.generation_id,
+                    )
+                    .map_err(store_error)?;
+            if precommit_descendant {
+                PeerBidirectionalOperationJournal::new(app_root).abandon(&evidence.operation_id)?;
+                return Err(PeerSyncError::StaleManifest {
+                    expected: evidence.expected_source_generation.manifest_hash,
+                    received: active_identity.manifest_hash,
+                });
+            }
             let receipt = evidence.receipt()?;
             let shared = SyncGenerationIdentity {
                 generation_id: evidence.shared_generation.generation_id.clone(),
@@ -6717,6 +6735,157 @@ mod tests {
             .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, unknown_target)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn source_prepared_precommit_descendant_is_abandoned_without_losing_the_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let source_device_id = "123e4567-e89b-42d3-a456-426614174086";
+        let target_device_id = "123e4567-e89b-42d3-a456-426614174087";
+        let operation_id = "123e4567-e89b-42d3-a456-426614174088";
+        let previous = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            target_device_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    target_device_id,
+                    previous.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let evidence = SourcePreparedEvidence {
+            operation_id: operation_id.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+            expected_source_revision: 0,
+            previous_shared: previous.clone(),
+            expected_source_generation: previous.clone(),
+            shared_generation: LanBidirectionalGeneration {
+                generation_id: "123e4567-e89b-42d3-a456-426614174089".to_owned(),
+                manifest_hash: "a".repeat(64),
+                generation_sequence: "1".to_owned(),
+            },
+            incoming_revision: 1,
+            transferred_objects: 2,
+            transferred_bytes: 19,
+            backup: None,
+        };
+        let durable_job_id = "123e4567-e89b-42d3-a456-426614174090";
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            durable_job_id,
+            CasJobKind::LogicalDeltaTarget,
+            0,
+        )
+        .unwrap();
+        job.seal(&mut store, 0).unwrap();
+        PeerBidirectionalOperationJournal::new(directory.path())
+            .store(&evidence.durable_operation(durable_job_id.to_owned()))
+            .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"preserved": "source-local-edit"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let session = LanBidirectionalSession {
+            session_id: "123e4567-e89b-42d3-a456-426614174091".to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+        };
+        let request = LanBidirectionalRemoteApplyRequest {
+            operation_id: operation_id.to_owned(),
+            source_endpoint: "http://127.0.0.1:1".to_owned(),
+            source_session_id: "123e4567-e89b-42d3-a456-426614174092".to_owned(),
+            source_manifest_id: "manifest".to_owned(),
+            source_claim: "claim".to_owned(),
+            expected_source_revision: 0,
+            expected_source_generation: LanBidirectionalGeneration {
+                generation_id: previous.generation_id.clone(),
+                manifest_hash: previous.manifest_hash.clone(),
+                generation_sequence: previous.generation_sequence.clone(),
+            },
+            expected_common_base_manifest_hash: previous.manifest_hash.clone(),
+            backup_losing_side: false,
+        };
+
+        drop(store);
+        let control = ProductionLanBidirectionalControl::new(
+            directory.path().to_path_buf(),
+            PersistentStore::open(directory.path()).unwrap(),
+            &session.session_id,
+            source_device_id,
+        );
+        let error = control.remote_apply(session, request).unwrap_err();
+        drop(control);
+        let store = PersistentStore::open(directory.path()).unwrap();
+
+        assert!(matches!(
+            error,
+            PeerSyncError::StaleManifest { .. } | PeerSyncError::ActivationConflict { .. }
+        ));
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.read_root(None).unwrap().value["preserved"],
+            "source-local-edit"
+        );
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, target_device_id)
+                .unwrap(),
+            Some(previous.clone())
+        );
+        assert_eq!(
+            store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, target_device_id)
+                .unwrap()
+                .shared_identity,
+            previous
+        );
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            DurableCasJob::open(directory.path(), durable_job_id)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
