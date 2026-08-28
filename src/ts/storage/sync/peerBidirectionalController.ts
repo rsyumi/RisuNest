@@ -82,6 +82,7 @@ export function createPeerBidirectionalController(options: {
     let initialization: Promise<void> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
     let sourcePolling = false
+    let sourcePollEpoch = 0
     let operationErrorOwner = 0
     let sourceRefreshErrorOwner: number | undefined
     let activeOperation: { key: string; promise: Promise<PeerBidirectionalSyncResult> } | undefined
@@ -115,8 +116,10 @@ export function createPeerBidirectionalController(options: {
     const pollSource = async (): Promise<void> => {
         if (sourcePolling) return
         sourcePolling = true
+        const pollEpoch = sourcePollEpoch
         try {
             const status = await options.facade.status()
+            if (pollEpoch !== sourcePollEpoch) return
             const clearSourceRefreshError = sourceRefreshErrorOwner === operationErrorOwner
             if (clearSourceRefreshError) sourceRefreshErrorOwner = undefined
             update({
@@ -130,6 +133,7 @@ export function createPeerBidirectionalController(options: {
             })
             if (status.source.phase !== 'running') stopSourcePolling()
         } catch (cause) {
+            if (pollEpoch !== sourcePollEpoch) return
             if (cause instanceof PeerBidirectionalRefreshError && cause.status) {
                 operationErrorOwner += 1
                 sourceRefreshErrorOwner = operationErrorOwner
@@ -276,11 +280,13 @@ export function createPeerBidirectionalController(options: {
         },
         prepare: () => runSource(async () => {
             const sourceStatus = await options.facade.prepare()
+            sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: '' })
             return sourceStatus
         }),
         start: (sessionId: string) => runSource(async () => {
             const sourceStatus = await options.facade.start(sessionId)
+            sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
             beginSourcePolling()
             return sourceStatus
@@ -288,6 +294,7 @@ export function createPeerBidirectionalController(options: {
         stop: (sessionId: string) => runSource(async () => {
             await options.facade.stop(sessionId)
             stopSourcePolling()
+            sourcePollEpoch += 1
             const status = await options.facade.status()
             update({
                 sourceStatus: status.source,
@@ -298,6 +305,7 @@ export function createPeerBidirectionalController(options: {
         revoke: (sessionId: string, deviceId: string) => runSource(async () => {
             await options.facade.revoke(sessionId, deviceId)
             const status = await options.facade.status()
+            sourcePollEpoch += 1
             update({ sourceStatus: status.source })
         }),
         sync(pairingUri: string) {

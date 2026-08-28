@@ -800,6 +800,36 @@ describe('peer bidirectional facade', () => {
         ])
     })
 
+    it('refreshes a recovered sync commit without claiming a lost response as success', async () => {
+        const events: string[] = []
+        const invoke = vi.fn(async (command: string) => {
+            events.push(`invoke:${command}`)
+            if (command === 'peer_bidirectional_sync') throw new Error('sync response lost')
+            if (command === 'peer_bidirectional_status') {
+                return {
+                    source: { phase: 'idle', devices: [] },
+                    operation: {
+                        phase: 'localCommitted',
+                        operationId: 'operation-unknown-owner',
+                        committedRevision: 8,
+                    },
+                }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime(events),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.sync(pairingUri)).rejects.toThrow('sync response lost')
+        expect(events.slice(-3)).toEqual([
+            'invoke:peer_bidirectional_status',
+            'refresh:8',
+            'release',
+        ])
+    })
+
     it('does not suppress a failed resolve when the awaiting-conflict status is unchanged', async () => {
         const events: string[] = []
         const conflict = {

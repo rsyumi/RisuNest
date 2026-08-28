@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { createPeerBidirectionalController } from './peerBidirectionalController'
 import type {
+    PeerBidirectionalCompletedResult,
     PeerBidirectionalFacade,
     PeerBidirectionalStatus,
     PeerBidirectionalSyncResult,
@@ -163,6 +164,63 @@ describe('peer bidirectional controller', () => {
             expect(controller.snapshot()).toMatchObject({
                 operationPhase: 'completed',
                 operationError: 'acknowledge failed',
+            })
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('ignores a pre-stop poll that resolves after the stopped status projection', async () => {
+        vi.useFakeTimers()
+        try {
+            const resultForRevision = (revision: number): PeerBidirectionalCompletedResult => ({
+                kind: 'updated',
+                operationId: 'operation-stop-poll-race',
+                revision,
+                remoteRevision: 9,
+                transferredObjects: 1,
+                transferredBytes: 12,
+                backups: [],
+            })
+            let finishPoll!: (status: PeerBidirectionalStatus) => void
+            let statusCalls = 0
+            const controller = createPeerBidirectionalController({
+                sourcePollMilliseconds: 10,
+                facade: facade({
+                    status: () => {
+                        statusCalls += 1
+                        if (statusCalls === 1) {
+                            return Promise.resolve({
+                                source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                            })
+                        }
+                        if (statusCalls === 2) {
+                            return new Promise((resolve) => {
+                                finishPoll = resolve
+                            })
+                        }
+                        return Promise.resolve({
+                            source: { phase: 'stopped', sessionId: 'session-source', devices: [] },
+                            operation: { phase: 'completed', result: resultForRevision(9) },
+                        })
+                    },
+                }),
+            })
+
+            await controller.initialize()
+            await vi.advanceTimersByTimeAsync(10)
+            expect(statusCalls).toBe(2)
+            await controller.stop('session-source')
+            finishPoll({
+                source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                operation: { phase: 'completed', result: resultForRevision(8) },
+            })
+            await Promise.resolve()
+            await Promise.resolve()
+            expect(controller.snapshot()).toMatchObject({
+                sourceStatus: { phase: 'stopped' },
+                operationPhase: 'completed',
+                operationResult: { revision: 9 },
             })
         } finally {
             vi.useRealTimers()

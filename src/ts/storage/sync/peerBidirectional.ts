@@ -221,6 +221,7 @@ export function createPeerBidirectionalFacade(options: {
         result: PeerBidirectionalSyncResult
         revision: number
         fence: MutationFence
+        rejection?: { cause: unknown }
     } | undefined
     let sourceFence: MutationFence | undefined
     let pendingSourceRefresh: {
@@ -282,14 +283,16 @@ export function createPeerBidirectionalFacade(options: {
         result: PeerBidirectionalSyncResult,
         revision: number,
         fence: MutationFence,
+        rejection?: { cause: unknown },
     ): Promise<void> => {
-        pendingRefresh = { key, result, revision, fence }
+        pendingRefresh = { key, result, revision, fence, rejection }
         try {
             await fence.refreshCommittedWorkingSet(revision)
         } catch (cause) {
             throw new PeerBidirectionalRefreshError(result, cause)
         }
         pendingRefresh = undefined
+        if (rejection) throw rejection.cause
     }
     const runMutation = async (
         reason: string,
@@ -314,6 +317,7 @@ export function createPeerBidirectionalFacade(options: {
             }
             pendingRefresh = undefined
             pending.fence.release()
+            if (pending.rejection) throw pending.rejection.cause
             return pending.result
         }
         targetMutationActive = true
@@ -337,13 +341,18 @@ export function createPeerBidirectionalFacade(options: {
                 }
                 if (status.operation) {
                     const recovered = projectOperation(status.operation)
-                    if (recoveredOperationAdvances(command, args, status.operation)) {
-                        const revision = committedRevision(recovered)
-                        if (revision !== undefined) {
-                            await refreshTargetResult(key, recovered, revision, fence)
-                        }
-                        return recovered
+                    const advances = recoveredOperationAdvances(command, args, status.operation)
+                    const revision = committedRevision(recovered)
+                    if (revision !== undefined) {
+                        await refreshTargetResult(
+                            key,
+                            recovered,
+                            revision,
+                            fence,
+                            advances ? undefined : { cause },
+                        )
                     }
+                    if (advances) return recovered
                 }
                 throw cause
             }
