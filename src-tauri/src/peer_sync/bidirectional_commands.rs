@@ -25,8 +25,8 @@ use crate::{
     persistent_store::{
         self, logical_delta_source::LogicalDeltaSourceSession, LogicalDeltaConflictKind,
         LogicalDeltaConflictPolicy, LogicalDeltaPlanResolution, PersistentLogicalDeltaTarget,
-        PersistentStore, RegisteredSyncDeviceStatus, StoreError, SyncGenerationIdentity,
-        VerifiedSyncDeviceRegistration, PRODUCT_LOGICAL_LIBRARY_ID,
+        PersistentStore, RegisteredSyncDevice, RegisteredSyncDeviceStatus, StoreError,
+        SyncGenerationIdentity, VerifiedSyncDeviceRegistration, PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1979,7 +1979,7 @@ impl PeerBidirectionalCommandState {
             control,
             phase: PeerBidirectionalSourcePhase::Prepared,
         });
-        Ok(source_status(&runtime))
+        Ok(source_status(&runtime, &[]))
     }
 
     fn start_source(
@@ -2003,7 +2003,7 @@ impl PeerBidirectionalCommandState {
             &pairing,
         )?);
         source.phase = PeerBidirectionalSourcePhase::Running;
-        Ok(source_status(&runtime))
+        Ok(source_status(&runtime, &[]))
     }
 
     fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
@@ -2017,19 +2017,29 @@ impl PeerBidirectionalCommandState {
 
     fn revoke_source_device(&self, session_id: &str, device_id: &str) -> Result<(), PeerSyncError> {
         let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        if !source.control.revoke(device_id) {
+        let Some(source) = runtime.source.as_mut() else {
+            return Ok(());
+        };
+        if source.session_id != session_id {
             return Err(PeerSyncError::Validation(
-                "peer bidirectional source device is absent".to_owned(),
+                "peer bidirectional source session is absent".to_owned(),
             ));
         }
+        source.control.revoke(device_id);
         Ok(())
     }
 
-    fn status(&self, app_root: &Path) -> Result<PeerBidirectionalStatus, PeerSyncError> {
+    fn status(
+        &self,
+        app_root: &Path,
+        store: &PersistentStore,
+    ) -> Result<PeerBidirectionalStatus, PeerSyncError> {
+        let durable_devices = store
+            .list_sync_devices(PRODUCT_LOGICAL_LIBRARY_ID)
+            .map_err(store_error)?;
         let source = {
             let runtime = self.lock()?;
-            source_status(&runtime)
+            source_status(&runtime, &durable_devices)
         };
         let operation = PeerBidirectionalOperationJournal::new(app_root)
             .load()?
@@ -2092,31 +2102,62 @@ fn require_source<'a>(
         })
 }
 
-fn source_status(runtime: &PeerBidirectionalRuntime) -> PeerBidirectionalSourceStatus {
+fn source_status(
+    runtime: &PeerBidirectionalRuntime,
+    durable_devices: &[RegisteredSyncDevice],
+) -> PeerBidirectionalSourceStatus {
+    let mut devices = durable_devices
+        .iter()
+        .filter(|device| device.status != RegisteredSyncDeviceStatus::Forgotten)
+        .map(|device| {
+            let last_seen_at = device
+                .revoked_at
+                .unwrap_or(device.acknowledged_at)
+                .max(device.acknowledged_at)
+                .max(device.registered_at);
+            (
+                device.device_id.clone(),
+                PeerBidirectionalSourceDevice {
+                    device_id: device.device_id.clone(),
+                    transferred_bytes: 0,
+                    current_object: None,
+                    last_seen_at: u64::try_from(last_seen_at).unwrap_or(u64::MAX),
+                    revoked: device.status != RegisteredSyncDeviceStatus::Active,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let Some(source) = &runtime.source else {
-        return PeerBidirectionalSourceStatus::idle(if runtime.stopped {
+        let mut status = PeerBidirectionalSourceStatus::idle(if runtime.stopped {
             PeerBidirectionalSourcePhase::Stopped
         } else {
             PeerBidirectionalSourcePhase::Idle
         });
+        status.devices = devices.into_values().collect();
+        return status;
     };
+    for device in source.control.devices() {
+        let durable = devices.get(&device.device_id);
+        let last_seen_at = u64::try_from(device.last_seen_unix_ms).unwrap_or(u64::MAX);
+        devices.insert(
+            device.device_id.clone(),
+            PeerBidirectionalSourceDevice {
+                device_id: device.device_id,
+                transferred_bytes: device.verified_bytes,
+                current_object: device.current_object,
+                last_seen_at: durable
+                    .map(|durable| durable.last_seen_at.max(last_seen_at))
+                    .unwrap_or(last_seen_at),
+                revoked: device.revoked || durable.is_some_and(|durable| durable.revoked),
+            },
+        );
+    }
     PeerBidirectionalSourceStatus {
         phase: source.phase.clone(),
         session_id: Some(source.session_id.clone()),
         manifest_id: Some(source.manifest_id.clone()),
         pairing_uri: source.pairing_uri.clone(),
-        devices: source
-            .control
-            .devices()
-            .into_iter()
-            .map(|device| PeerBidirectionalSourceDevice {
-                device_id: device.device_id,
-                transferred_bytes: device.verified_bytes,
-                current_object: device.current_object,
-                last_seen_at: u64::try_from(device.last_seen_unix_ms).unwrap_or(u64::MAX),
-                revoked: device.revoked,
-            })
-            .collect(),
+        devices: devices.into_values().collect(),
     }
 }
 
@@ -2443,8 +2484,9 @@ pub fn peer_bidirectional_status(
     app: AppHandle,
     state: State<'_, PeerBidirectionalCommandState>,
 ) -> Result<PeerBidirectionalStatus, String> {
+    let store = open_command_store(&app).map_err(|error| error.to_string())?;
     state
-        .status(&app_root(&app)?)
+        .status(&app_root(&app)?, &store)
         .map_err(|error| error.to_string())
 }
 
@@ -2467,28 +2509,35 @@ pub fn peer_bidirectional_revoke(
     session_id: String,
     device_id: String,
 ) -> Result<(), String> {
-    let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
     state
         .revoke_source_device(&session_id, &device_id)
         .map_err(|error| error.to_string())?;
+    let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
+    revoke_durable_bidirectional_device(&mut store, &device_id).map_err(|error| error.to_string())
+}
+
+fn revoke_durable_bidirectional_device(
+    store: &mut PersistentStore,
+    device_id: &str,
+) -> Result<(), PeerSyncError> {
     let device = store
         .list_sync_devices(PRODUCT_LOGICAL_LIBRARY_ID)
-        .map_err(|error| error.to_string())?
+        .map_err(store_error)?
         .into_iter()
         .find(|device| device.device_id == device_id);
     match device.map(|device| device.status) {
         Some(RegisteredSyncDeviceStatus::Active) => {
             let acknowledgement = store
                 .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, &device_id)
-                .map_err(|error| error.to_string())?;
+                .map_err(store_error)?;
             store
                 .revoke_sync_device(
                     PRODUCT_LOGICAL_LIBRARY_ID,
-                    &device_id,
+                    device_id,
                     &acknowledgement.shared_identity,
                 )
                 .map(|_| ())
-                .map_err(|error| error.to_string())
+                .map_err(store_error)
         }
         Some(RegisteredSyncDeviceStatus::Revoked | RegisteredSyncDeviceStatus::Forgotten)
         | None => Ok(()),
@@ -5940,11 +5989,12 @@ mod tests {
                 },
             })
             .unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
 
         assert_eq!(
             serde_json::to_value(
                 PeerBidirectionalCommandState::default()
-                    .status(directory.path())
+                    .status(directory.path(), &store)
                     .unwrap()
             )
             .unwrap(),
@@ -6032,13 +6082,24 @@ mod tests {
             claim,
         )
         .unwrap();
-        let claimed_device_id = state.status(directory.path()).unwrap().source.devices[0]
+        let claimed_device_id = state
+            .status(directory.path(), &store)
+            .unwrap()
+            .source
+            .devices[0]
             .device_id
             .clone();
         state
             .revoke_source_device(session_id, &claimed_device_id)
             .unwrap();
-        assert!(state.status(directory.path()).unwrap().source.devices[0].revoked);
+        assert!(
+            state
+                .status(directory.path(), &store)
+                .unwrap()
+                .source
+                .devices[0]
+                .revoked
+        );
         let operation_id = "123e4567-e89b-42d3-a456-426614174087";
         let journal = PeerBidirectionalOperationJournal::new(directory.path());
         journal
@@ -6063,17 +6124,79 @@ mod tests {
         ));
         assert!(journal.load().unwrap().is_some());
         assert_eq!(
-            state.status(directory.path()).unwrap().source.phase,
+            state.status(directory.path(), &store).unwrap().source.phase,
             PeerBidirectionalSourcePhase::Running
         );
         state.stop_source(session_id).unwrap();
         assert_eq!(
-            state.status(directory.path()).unwrap().source.phase,
+            state.status(directory.path(), &store).unwrap().source.phase,
             PeerBidirectionalSourcePhase::Stopped
         );
         assert!(state.begin_target().is_ok());
         state.acknowledge(directory.path(), operation_id).unwrap();
         assert!(journal.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn offline_status_projects_and_idempotently_revokes_a_durable_registered_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer_id = "123e4567-e89b-42d3-a456-426614174099";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        let common = SyncGenerationIdentity {
+            generation_id: base.manifest.generation,
+            manifest_hash: base.manifest_hash,
+            generation_sequence: base.manifest.generation_sequence,
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    common,
+                    17,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let state = PeerBidirectionalCommandState::default();
+
+        let status = state.status(directory.path(), &store).unwrap();
+        assert_eq!(status.source.phase, PeerBidirectionalSourcePhase::Idle);
+        assert_eq!(
+            status.source.devices,
+            vec![PeerBidirectionalSourceDevice {
+                device_id: peer_id.to_owned(),
+                transferred_bytes: 0,
+                current_object: None,
+                last_seen_at: 17,
+                revoked: false,
+            }]
+        );
+
+        state
+            .revoke_source_device("stopped-session", peer_id)
+            .unwrap();
+        revoke_durable_bidirectional_device(&mut store, peer_id).unwrap();
+        revoke_durable_bidirectional_device(&mut store, peer_id).unwrap();
+
+        let status = state.status(directory.path(), &store).unwrap();
+        assert_eq!(status.source.devices.len(), 1);
+        assert!(status.source.devices[0].revoked);
     }
 
     #[test]
