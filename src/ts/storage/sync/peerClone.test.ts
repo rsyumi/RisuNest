@@ -791,6 +791,66 @@ describe('PeerClone facade', () => {
         },
     )
 
+    it.each(['failed', 'cancelled'] as const)(
+        'accepts a fresh pairing only for the same %s transfer identity',
+        async (phase) => {
+            let failDownload = phase === 'failed'
+            const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+                if (command === 'peer_clone_capabilities') return productionCapabilities() as T
+                if (command === 'peer_clone_download' && failDownload) {
+                    failDownload = false
+                    throw new Error('source restarted')
+                }
+                return undefined as T
+            })
+            const facade = createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: replacementRuntime(),
+            })
+            facade.join(pairingUri)
+            facade.confirmDestructiveReplace()
+            if (phase === 'failed') {
+                await expect(facade.download()).rejects.toThrow('source restarted')
+            } else {
+                await facade.download()
+                await facade.cancel()
+            }
+
+            const repairedPairing = pairingUri
+                .replace('192.168.1.4%3A43123', '192.168.1.5%3A43124')
+                .replace(`#claim=${claim}`, `#claim=${'c'.repeat(64)}`)
+            expect(() => facade.join(repairedPairing.replace(
+                '123e4567-e89b-12d3-a456-426614174000',
+                '223e4567-e89b-42d3-a456-426614174000',
+            ))).toThrow('already owned')
+
+            expect(facade.join(repairedPairing).target).toMatchObject({
+                phase: 'joined',
+                pairing: {
+                    endpoint: 'http://192.168.1.5:43124/',
+                    sessionId: '123e4567-e89b-12d3-a456-426614174000',
+                    manifestId: 'a'.repeat(64),
+                    claim: 'c'.repeat(64),
+                },
+            })
+            facade.confirmDestructiveReplace()
+            await facade.download()
+
+            expect(invoke).toHaveBeenLastCalledWith('peer_clone_download', {
+                endpoint: 'http://192.168.1.5:43124/',
+                sessionId: '123e4567-e89b-12d3-a456-426614174000',
+                manifestId: 'a'.repeat(64),
+            })
+            expect(invoke).toHaveBeenCalledWith('peer_clone_claim_client', {
+                endpoint: 'http://192.168.1.5:43124/',
+                sessionId: '123e4567-e89b-12d3-a456-426614174000',
+                manifestId: 'a'.repeat(64),
+                claim: 'c'.repeat(64),
+            })
+        },
+    )
+
     it('allows a different target only after committed refresh and native release complete', async () => {
         const events: string[] = []
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {

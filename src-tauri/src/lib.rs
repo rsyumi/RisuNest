@@ -480,7 +480,9 @@ pub fn run() {
                 ),
             );
             #[cfg(desktop)]
-            app.manage(peer_sync::commands::PeerCloneCommandState::default());
+            app.manage(peer_sync::commands::PeerCloneCommandState::initialize(
+                &app_data_dir.join("peer-clone"),
+            ));
             #[cfg(target_os = "android")]
             app.manage(
                 peer_sync::android_commands::AndroidPeerCloneCommandState::initialize(

@@ -14,7 +14,8 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -363,10 +364,49 @@ impl SourceTunnelLauncher for SystemSourceTunnelLauncher {
     }
 }
 
+const ACTIVE_SOURCE_MARKER_SCHEMA: &str = "risunest.peer-clone-active-source/v1";
+const ACTIVE_SOURCE_MARKER_FILE: &str = "active-source.json";
+const MAX_ACTIVE_SOURCE_MARKER_BYTES: u64 = 4 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActiveSourceMarker {
+    schema: String,
+    directory_id: String,
+    session_id: String,
+    manifest_id: String,
+}
+
+impl ActiveSourceMarker {
+    fn new(directory_id: String, session_id: String, manifest_id: String) -> Self {
+        Self {
+            schema: ACTIVE_SOURCE_MARKER_SCHEMA.to_owned(),
+            directory_id,
+            session_id,
+            manifest_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), PeerSyncError> {
+        if self.schema != ACTIVE_SOURCE_MARKER_SCHEMA
+            || !is_canonical_uuid(&self.directory_id)
+            || !is_canonical_uuid(&self.session_id)
+            || super::protocol::validate_hash(&self.manifest_id).is_err()
+        {
+            return Err(PeerSyncError::Validation(
+                "invalid prepared clone source marker".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct SourceRuntime {
     session_id: String,
     manifest_id: String,
     session_root: PathBuf,
+    marker_path: PathBuf,
+    marker: ActiveSourceMarker,
     host: Option<LanCloneHost>,
     control: LanCloneHostControl,
     tunnel: Option<Box<dyn SourceTunnel>>,
@@ -392,7 +432,6 @@ impl Drop for SourceRuntime {
         if let Some(host) = self.host.as_mut() {
             let _ = host.stop();
         }
-        let _ = remove_directory_if_exists(&self.session_root);
     }
 }
 
@@ -412,6 +451,7 @@ struct TargetRuntime {
 #[derive(Default)]
 struct PeerCloneRuntime {
     source_preparing: bool,
+    source_recovery_error: Option<String>,
     source: Option<SourceRuntime>,
     target_claiming: bool,
     target: Option<TargetRuntime>,
@@ -439,6 +479,70 @@ impl PeerCloneCommandState {
             runtime: Arc::new(Mutex::new(PeerCloneRuntime::default())),
             tunnel_launcher,
         }
+    }
+
+    pub(crate) fn initialize(peer_root: &Path) -> Self {
+        let state = Self::default();
+        let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
+        let recovered = (|| {
+            let Some(marker) = read_active_source_marker(&marker_path)? else {
+                return Ok(None);
+            };
+            let session_root = peer_root.join("source-sessions").join(&marker.directory_id);
+            let prepared = super::PreparedCloneSession::reopen_lossless(
+                &session_root,
+                &marker.session_id,
+                &marker.manifest_id,
+            )?;
+            Ok(Some((marker, session_root, prepared)))
+        })();
+        let Some((marker, session_root, prepared)) = (match recovered {
+            Ok(recovered) => recovered,
+            Err(PeerSyncError::Validation(_)) => {
+                if let Err(cleanup_error) = remove_file_if_exists(&marker_path) {
+                    state
+                        .runtime
+                        .lock()
+                        .expect("new peer clone runtime")
+                        .source_recovery_error = Some(cleanup_error.to_string());
+                }
+                return state;
+            }
+            Err(error) => {
+                state
+                    .runtime
+                    .lock()
+                    .expect("new peer clone runtime")
+                    .source_recovery_error = Some(error.to_string());
+                return state;
+            }
+        }) else {
+            return state;
+        };
+        let session_id = prepared.manifest().session_id.clone();
+        let manifest_id = prepared.manifest_id().to_owned();
+        let host = LanCloneHost::prepare(prepared);
+        let control = host.control();
+        state.runtime.lock().expect("new peer clone runtime").source = Some(SourceRuntime {
+            session_id,
+            manifest_id,
+            session_root,
+            marker_path,
+            marker,
+            host: Some(host),
+            control,
+            tunnel: None,
+            failed_tunnel: None,
+            tunnel_metadata: None,
+            phase: PeerCloneSourcePhase::Prepared,
+            stop_in_progress: false,
+            terminal_cleanup_pending: false,
+            #[cfg(test)]
+            stop_pause: None,
+            #[cfg(test)]
+            fail_cleanup_once: false,
+        });
+        state
     }
 
     fn lock_runtime(&self) -> Result<MutexGuard<'_, PeerCloneRuntime>, PeerSyncError> {
@@ -481,6 +585,9 @@ impl PeerCloneCommandState {
     ) -> Result<PeerCloneSourceStatus, PeerSyncError> {
         {
             let mut runtime = self.lock_runtime()?;
+            if let Some(error) = &runtime.source_recovery_error {
+                return Err(PeerSyncError::Storage(error.clone()));
+            }
             if runtime.source_preparing
                 || runtime
                     .source
@@ -529,6 +636,19 @@ impl PeerCloneCommandState {
         };
         let session_id = prepared.manifest().session_id.clone();
         let manifest_id = prepared.manifest_id().to_owned();
+        let marker = ActiveSourceMarker::new(operation_id, session_id.clone(), manifest_id.clone());
+        let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
+        if let Err(error) = write_active_source_marker(&marker_path, &marker) {
+            let cleanup = remove_directory_if_exists(&session_root);
+            let mut runtime = self.lock_runtime()?;
+            runtime.source_preparing = false;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(PeerSyncError::Storage(format!(
+                    "{error}; peer clone source session cleanup failed: {cleanup}"
+                ))),
+            };
+        }
         let host = LanCloneHost::prepare(prepared);
         let control = host.control();
         let mut runtime = self.lock_runtime()?;
@@ -537,6 +657,8 @@ impl PeerCloneCommandState {
             session_id,
             manifest_id,
             session_root,
+            marker_path,
+            marker,
             host: Some(host),
             control,
             tunnel: None,
@@ -704,7 +826,11 @@ impl PeerCloneCommandState {
         if let Ok(mut runtime) = self.lock_runtime() {
             if let Ok(source) = require_source_mut(&mut runtime, session_id) {
                 if stopped {
-                    source.phase = match remove_directory_if_exists(&source.session_root) {
+                    source.phase = match cleanup_source_artifacts(
+                        &source.session_root,
+                        &source.marker_path,
+                        &source.marker,
+                    ) {
                         Ok(()) => PeerCloneSourcePhase::Stopped,
                         Err(_) => PeerCloneSourcePhase::Stopping,
                     };
@@ -771,7 +897,16 @@ impl PeerCloneCommandState {
     }
 
     pub fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
-        let (mut host, mut tunnel, mut failed_tunnel, session_root, stop_pause, fail_cleanup) = {
+        let (
+            mut host,
+            mut tunnel,
+            mut failed_tunnel,
+            session_root,
+            marker_path,
+            marker,
+            stop_pause,
+            fail_cleanup,
+        ) = {
             let mut runtime = self.lock_runtime()?;
             let source = require_source_mut(&mut runtime, session_id)?;
             if source.phase == PeerCloneSourcePhase::Stopped {
@@ -798,6 +933,8 @@ impl PeerCloneCommandState {
                 tunnel,
                 failed_tunnel,
                 source.session_root.clone(),
+                source.marker_path.clone(),
+                source.marker.clone(),
                 #[cfg(test)]
                 source.stop_pause.take(),
                 #[cfg(not(test))]
@@ -844,7 +981,7 @@ impl PeerCloneCommandState {
                 "injected peer clone source cleanup failure".to_owned(),
             ))
         } else {
-            remove_directory_if_exists(&session_root)
+            cleanup_source_artifacts(&session_root, &marker_path, &marker)
         };
         let mut runtime = self.lock_runtime()?;
         let source = require_source_mut(&mut runtime, session_id)?;
@@ -900,22 +1037,50 @@ impl PeerCloneCommandState {
         manifest_id: &str,
         claim: &str,
     ) -> Result<(), PeerSyncError> {
+        self.reap_finished_target_worker()?;
         let request = PeerCloneTargetRequest {
             endpoint: endpoint.to_owned(),
             session_id: session_id.to_owned(),
             manifest_id: manifest_id.to_owned(),
         };
         let paths = target_paths(peer_root, &request)?;
-        {
+        let rotate_credential = {
             let mut runtime = self.lock_runtime()?;
             if let Some(target) = &runtime.target {
-                return if target.request == request && target.job_root == paths.job_root {
-                    Ok(())
-                } else {
-                    Err(PeerSyncError::Protocol(
+                if !same_target_identity(&target.request, &request)
+                    || target.job_root != paths.job_root
+                {
+                    return Err(PeerSyncError::Protocol(
                         "another peer clone target job is already owned".to_owned(),
-                    ))
-                };
+                    ));
+                }
+                if matches!(
+                    target.status.phase,
+                    PeerCloneTargetPhase::AwaitingActivation
+                        | PeerCloneTargetPhase::Activating
+                        | PeerCloneTargetPhase::Completed
+                ) {
+                    return Err(PeerSyncError::Protocol(
+                        "peer clone target cannot rotate credentials during activation".to_owned(),
+                    ));
+                }
+                if !matches!(
+                    target.status.phase,
+                    PeerCloneTargetPhase::Failed | PeerCloneTargetPhase::Cancelled
+                ) {
+                    return if target.request == request {
+                        Ok(())
+                    } else {
+                        Err(PeerSyncError::Protocol(
+                            "peer clone target is not ready to repair its pairing".to_owned(),
+                        ))
+                    };
+                }
+                if target.worker.is_some() || target.client.is_none() {
+                    return Err(PeerSyncError::Protocol(
+                        "peer clone target worker is still active".to_owned(),
+                    ));
+                }
             }
             if runtime.target_claiming {
                 return Err(PeerSyncError::Protocol(
@@ -923,21 +1088,32 @@ impl PeerCloneCommandState {
                 ));
             }
             runtime.target_claiming = true;
-        }
+            runtime.target.is_some()
+        };
 
         let claimed = (|| {
-            let lan = match fs::symlink_metadata(&paths.credential) {
-                Ok(_) => LanCloneClient::open_persisted(&paths.credential)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    LanCloneClient::claim_and_persist(
-                        &paths.credential,
-                        endpoint,
-                        session_id,
-                        manifest_id,
-                        claim,
-                    )?
+            let lan = if rotate_credential {
+                LanCloneClient::claim_and_persist(
+                    &paths.credential,
+                    endpoint,
+                    session_id,
+                    manifest_id,
+                    claim,
+                )?
+            } else {
+                match fs::symlink_metadata(&paths.credential) {
+                    Ok(_) => LanCloneClient::open_persisted(&paths.credential)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        LanCloneClient::claim_and_persist(
+                            &paths.credential,
+                            endpoint,
+                            session_id,
+                            manifest_id,
+                            claim,
+                        )?
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             };
             if !lan.matches_target(endpoint, session_id, manifest_id)? {
                 return Err(PeerSyncError::Protocol(
@@ -950,6 +1126,28 @@ impl PeerCloneCommandState {
         let mut runtime = self.lock_runtime()?;
         runtime.target_claiming = false;
         let client = claimed?;
+        if rotate_credential {
+            let target = runtime.target.as_mut().ok_or_else(|| {
+                PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+            })?;
+            if !same_target_identity(&target.request, &request)
+                || target.job_root != paths.job_root
+                || !matches!(
+                    target.status.phase,
+                    PeerCloneTargetPhase::Failed | PeerCloneTargetPhase::Cancelled
+                )
+                || target.worker.is_some()
+            {
+                return Err(PeerSyncError::Protocol(
+                    "peer clone target changed while repairing its pairing".to_owned(),
+                ));
+            }
+            target.request = request;
+            target.client = Some(client);
+            target.cancellation = None;
+            target.status = PeerCloneTargetStatus::idle();
+            return Ok(());
+        }
         runtime.target = Some(TargetRuntime {
             request,
             job_root: paths.job_root,
@@ -1410,6 +1608,10 @@ struct TargetPaths {
     transfer: PathBuf,
 }
 
+fn same_target_identity(left: &PeerCloneTargetRequest, right: &PeerCloneTargetRequest) -> bool {
+    left.session_id == right.session_id && left.manifest_id == right.manifest_id
+}
+
 fn target_paths(
     peer_root: &Path,
     request: &PeerCloneTargetRequest,
@@ -1506,6 +1708,9 @@ fn join_target_worker(worker: Option<JoinHandle<()>>) -> Result<(), PeerSyncErro
 }
 
 fn source_status(runtime: &mut PeerCloneRuntime) -> Result<PeerCloneSourceStatus, PeerSyncError> {
+    if let Some(error) = &runtime.source_recovery_error {
+        return Err(PeerSyncError::Storage(error.clone()));
+    }
     let Some(source) = runtime.source.as_mut() else {
         return Ok(PeerCloneSourceStatus::idle());
     };
@@ -1616,6 +1821,150 @@ fn remove_directory_if_exists(path: &Path) -> Result<(), PeerSyncError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_active_source_marker(path: &Path) -> Result<Option<ActiveSourceMarker>, PeerSyncError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_ACTIVE_SOURCE_MARKER_BYTES
+    {
+        return Err(PeerSyncError::Validation(
+            "invalid prepared clone source marker file".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(MAX_ACTIVE_SOURCE_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ACTIVE_SOURCE_MARKER_BYTES {
+        return Err(PeerSyncError::Validation(
+            "prepared clone source marker exceeds its bound".to_owned(),
+        ));
+    }
+    let marker: ActiveSourceMarker = serde_json::from_slice(&bytes)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    marker.validate()?;
+    Ok(Some(marker))
+}
+
+fn write_active_source_marker(
+    path: &Path,
+    marker: &ActiveSourceMarker,
+) -> Result<(), PeerSyncError> {
+    marker.validate()?;
+    let bytes =
+        serde_json::to_vec(marker).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    if bytes.len() as u64 > MAX_ACTIVE_SOURCE_MARKER_BYTES {
+        return Err(PeerSyncError::Storage(
+            "prepared clone source marker exceeds its bound".to_owned(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        PeerSyncError::Storage("prepared clone source marker has no parent".to_owned())
+    })?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".active-source-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        replace_file_atomic(&temporary, path)?;
+        sync_parent_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn cleanup_source_artifacts(
+    session_root: &Path,
+    marker_path: &Path,
+    marker: &ActiveSourceMarker,
+) -> Result<(), PeerSyncError> {
+    remove_directory_if_exists(session_root)?;
+    match read_active_source_marker(marker_path)? {
+        None => Ok(()),
+        Some(actual) if actual == *marker => remove_file_if_exists(marker_path),
+        Some(_) => Err(PeerSyncError::Validation(
+            "prepared clone source marker belongs to another session".to_owned(),
+        )),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), PeerSyncError> {
+    match fs::remove_file(path) {
+        Ok(()) => path
+            .parent()
+            .map(sync_parent_directory)
+            .transpose()
+            .map(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), PeerSyncError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), PeerSyncError> {
+    Ok(())
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|parsed| parsed.to_string() == value)
+        .unwrap_or(false)
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
@@ -2195,6 +2544,12 @@ mod tests {
             .unwrap();
         fixture.launcher_state.lock().unwrap().stop_failures = 1;
         let session_root = fixture.source.source_session_root_for_test().unwrap();
+        let marker_path = session_root
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("active-source.json");
 
         let error = fixture.source.stop_source(&fixture.session_id).unwrap_err();
         assert_eq!(
@@ -2206,6 +2561,7 @@ mod tests {
             PeerCloneSourcePhase::Stopping
         );
         assert!(session_root.exists());
+        assert!(marker_path.exists());
 
         fixture.source.stop_source(&fixture.session_id).unwrap();
         assert_eq!(
@@ -2213,6 +2569,7 @@ mod tests {
             PeerCloneSourcePhase::Stopped
         );
         assert!(!session_root.exists());
+        assert!(!marker_path.exists());
     }
 
     #[test]
@@ -2223,6 +2580,12 @@ mod tests {
             .start_tunnel(&fixture.session_id, PeerCloneTunnelStart::Quick)
             .unwrap();
         let session_root = fixture.source.source_session_root_for_test().unwrap();
+        let marker_path = session_root
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("active-source.json");
         let stop_pause = Arc::new(Barrier::new(2));
         fixture.launcher_state.lock().unwrap().stop_pause = Some(Arc::clone(&stop_pause));
 
@@ -2247,6 +2610,7 @@ mod tests {
         shutdown.join().unwrap();
         assert_eq!(fixture.launcher_state.lock().unwrap().stop_calls, 1);
         assert!(session_root.exists());
+        assert!(marker_path.exists());
     }
 
     #[test]
@@ -2257,6 +2621,12 @@ mod tests {
             .start_tunnel(&fixture.session_id, PeerCloneTunnelStart::Quick)
             .unwrap();
         let session_root = fixture.source.source_session_root_for_test().unwrap();
+        let marker_path = session_root
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("active-source.json");
         let cleanup_pause = Arc::new(Barrier::new(2));
         fixture
             .source
@@ -2281,6 +2651,7 @@ mod tests {
             PeerCloneSourcePhase::Stopped
         );
         assert!(!session_root.exists());
+        assert!(!marker_path.exists());
     }
 
     #[test]
@@ -2571,12 +2942,13 @@ mod tests {
         let source_cas = PayloadCas::new(source_root.path()).unwrap();
         let mut source_store = PersistentStore::open(source_root.path()).unwrap();
         seed_product_store(&mut source_store, "Source", 9 * 1024 * 1024);
+        let source_peer_root = source_root.path().join("peer-sync");
         let source = PeerCloneCommandState::default();
         let prepared = source
             .prepare_source(
                 &mut source_store,
                 &source_cas,
-                &source_root.path().join("peer-sync"),
+                &source_peer_root,
                 &NeverCancelled,
             )
             .unwrap();
@@ -2639,21 +3011,155 @@ mod tests {
             .join("ledger.jsonl");
         assert!(credential.is_file());
         let persisted_chunk = first_persisted_chunk_event(&ledger);
-        drop(target);
-
-        let resumed = PeerCloneCommandState::default();
-        resumed
-            .resume_target_download(&peer_root, request.clone())
+        source.shutdown_for_exit();
+        drop(source);
+        let reopened = PeerCloneCommandState::initialize(&source_peer_root);
+        let restarted = reopened
+            .start_source(&request.session_id, Ipv4Addr::new(192, 168, 1, 4))
             .unwrap();
-        wait_for_target_phase(&resumed, PeerCloneTargetPhase::AwaitingActivation);
+        let restarted_pairing = parse_product_pairing(restarted.pairing_uri.as_deref().unwrap());
+        let restarted_request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                reopened.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: restarted_pairing.session_id,
+            manifest_id: restarted_pairing.manifest_id,
+        };
+        let different_session = PeerCloneTargetRequest {
+            session_id: "223e4567-e89b-42d3-a456-426614174000".to_owned(),
+            ..restarted_request.clone()
+        };
+        let different_manifest = PeerCloneTargetRequest {
+            manifest_id: "0".repeat(64),
+            ..restarted_request.clone()
+        };
+        assert!(target
+            .claim_target(
+                &peer_root,
+                &different_session.endpoint,
+                &different_session.session_id,
+                &different_session.manifest_id,
+                &restarted_pairing.claim,
+            )
+            .is_err());
+        assert!(target
+            .claim_target(
+                &peer_root,
+                &different_manifest.endpoint,
+                &different_manifest.session_id,
+                &different_manifest.manifest_id,
+                &restarted_pairing.claim,
+            )
+            .is_err());
+        target
+            .claim_target(
+                &peer_root,
+                &restarted_request.endpoint,
+                &restarted_request.session_id,
+                &restarted_request.manifest_id,
+                &restarted_pairing.claim,
+            )
+            .unwrap();
+        target
+            .start_target_download(&peer_root, restarted_request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
         assert_eq!(
             persisted_chunk_event_count(&ledger, &persisted_chunk),
             1,
-            "resume must not redownload an already verified chunk"
+            "credential rotation must not redownload an already verified chunk"
         );
 
-        assert_eq!(source.source_status().unwrap().devices.len(), 1);
-        source.stop_source(&request.session_id).unwrap();
+        assert_eq!(reopened.source_status().unwrap().devices.len(), 1);
+        reopened.stop_source(&restarted_request.session_id).unwrap();
+    }
+
+    #[test]
+    fn product_target_repair_rejects_activation_and_completed_phases_before_claim() {
+        for phase in [
+            PeerCloneTargetPhase::AwaitingActivation,
+            PeerCloneTargetPhase::Activating,
+            PeerCloneTargetPhase::Completed,
+        ] {
+            let source_root = tempfile::tempdir().unwrap();
+            let target_root = tempfile::tempdir().unwrap();
+            let verifier_root = tempfile::tempdir().unwrap();
+            let source_cas = PayloadCas::new(source_root.path()).unwrap();
+            let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+            seed_product_store(&mut source_store, "Source", 0);
+            let source_peer_root = source_root.path().join("peer-sync");
+            let source = PeerCloneCommandState::default();
+            let prepared = source
+                .prepare_source(
+                    &mut source_store,
+                    &source_cas,
+                    &source_peer_root,
+                    &NeverCancelled,
+                )
+                .unwrap();
+            let running = source
+                .start_source(
+                    prepared.session_id.as_deref().unwrap(),
+                    Ipv4Addr::new(192, 168, 1, 4),
+                )
+                .unwrap();
+            let pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+            let target_peer_root = target_root.path().join("peer-sync");
+            let target = PeerCloneCommandState::default();
+            target
+                .claim_target(
+                    &target_peer_root,
+                    &format!(
+                        "http://127.0.0.1:{}",
+                        source.source_bind_address().unwrap().unwrap().port()
+                    ),
+                    &pairing.session_id,
+                    &pairing.manifest_id,
+                    &pairing.claim,
+                )
+                .unwrap();
+            target
+                .lock_runtime()
+                .unwrap()
+                .target
+                .as_mut()
+                .unwrap()
+                .status
+                .phase = phase;
+
+            source.shutdown_for_exit();
+            drop(source);
+            let reopened = PeerCloneCommandState::initialize(&source_peer_root);
+            let restarted = reopened
+                .start_source(&pairing.session_id, Ipv4Addr::new(192, 168, 1, 4))
+                .unwrap();
+            let repaired = parse_product_pairing(restarted.pairing_uri.as_deref().unwrap());
+            let repaired_endpoint = format!(
+                "http://127.0.0.1:{}",
+                reopened.source_bind_address().unwrap().unwrap().port()
+            );
+
+            assert!(target
+                .claim_target(
+                    &target_peer_root,
+                    &repaired_endpoint,
+                    &repaired.session_id,
+                    &repaired.manifest_id,
+                    &repaired.claim,
+                )
+                .is_err());
+            PeerCloneCommandState::default()
+                .claim_target(
+                    &verifier_root.path().join("peer-sync"),
+                    &repaired_endpoint,
+                    &repaired.session_id,
+                    &repaired.manifest_id,
+                    &repaired.claim,
+                )
+                .unwrap();
+            reopened.stop_source(&repaired.session_id).unwrap();
+        }
     }
 
     #[test]
@@ -2739,25 +3245,225 @@ mod tests {
     }
 
     #[test]
-    fn product_owned_source_runtime_cleans_up_on_drop() {
+    fn product_source_runtime_reopens_prepared_package_after_process_loss() {
         let source_root = tempfile::tempdir().unwrap();
         let source_cas = PayloadCas::new(source_root.path()).unwrap();
         let mut source_store = PersistentStore::open(source_root.path()).unwrap();
         seed_product_store(&mut source_store, "Source", 0);
+        let peer_root = source_root.path().join("peer-sync");
         let source = PeerCloneCommandState::default();
-        source
-            .prepare_source(
-                &mut source_store,
-                &source_cas,
-                &source_root.path().join("peer-sync"),
-                &NeverCancelled,
-            )
+        let prepared = source
+            .prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled)
             .unwrap();
         let session_root = source.source_session_root_for_test().unwrap();
+        let marker_path = peer_root.join("active-source.json");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(
+            marker,
+            json!({
+                "schema": "risunest.peer-clone-active-source/v1",
+                "directoryId": session_root.file_name().unwrap().to_str().unwrap(),
+                "sessionId": prepared.session_id.as_deref().unwrap(),
+                "manifestId": prepared.manifest_id.as_deref().unwrap(),
+            })
+        );
+
+        let first_running = source
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let first_pairing = parse_product_pairing(first_running.pairing_uri.as_deref().unwrap());
+        let first_endpoint = format!(
+            "http://127.0.0.1:{}",
+            source.source_bind_address().unwrap().unwrap().port()
+        );
+        let credential_root = source_root.path().join("first-credential");
+        let credential_path = credential_root.join("credential.json");
+        LanCloneClient::claim_and_persist(
+            &credential_path,
+            &first_endpoint,
+            &first_pairing.session_id,
+            &first_pairing.manifest_id,
+            &first_pairing.claim,
+        )
+        .unwrap();
+        let first_credential: serde_json::Value =
+            serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
+
+        source.shutdown_for_exit();
 
         drop(source);
 
+        assert!(session_root.exists());
+        assert!(marker_path.is_file());
+        let reopened = PeerCloneCommandState::initialize(&peer_root);
+        let recovered = reopened.source_status().unwrap();
+        assert_eq!(recovered.phase, PeerCloneSourcePhase::Prepared);
+        assert_eq!(recovered.session_id, prepared.session_id);
+        assert_eq!(recovered.manifest_id, prepared.manifest_id);
+        assert!(reopened.source_bind_address().unwrap().is_none());
+
+        let second_running = reopened
+            .start_source(
+                recovered.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let second_pairing = parse_product_pairing(second_running.pairing_uri.as_deref().unwrap());
+        let second_endpoint = format!(
+            "http://127.0.0.1:{}",
+            reopened.source_bind_address().unwrap().unwrap().port()
+        );
+        let second_credential_path = source_root.path().join("second-credential.json");
+        LanCloneClient::claim_and_persist(
+            &second_credential_path,
+            &second_endpoint,
+            &second_pairing.session_id,
+            &second_pairing.manifest_id,
+            &second_pairing.claim,
+        )
+        .unwrap();
+        let second_credential: serde_json::Value =
+            serde_json::from_slice(&fs::read(&second_credential_path).unwrap()).unwrap();
+        assert_eq!(second_pairing.session_id, first_pairing.session_id);
+        assert_eq!(second_pairing.manifest_id, first_pairing.manifest_id);
+        assert_ne!(second_pairing.claim, first_pairing.claim);
+        assert_ne!(second_credential["bearer"], first_credential["bearer"]);
+        assert_ne!(second_credential["deviceId"], first_credential["deviceId"]);
+        let stale = reqwest::blocking::Client::new()
+            .get(format!(
+                "{second_endpoint}/v1/sessions/{}/manifest",
+                second_pairing.session_id
+            ))
+            .bearer_auth(first_credential["bearer"].as_str().unwrap())
+            .send()
+            .unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        reopened.stop_source(&second_pairing.session_id).unwrap();
         assert!(!session_root.exists());
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn product_source_recovery_fails_closed_for_corrupt_marker_manifest_and_cas() {
+        for corruption in [
+            "marker-json",
+            "manifest-identity",
+            "noncanonical-manifest",
+            "missing-object",
+            "wrong-object-size",
+        ] {
+            let source_root = tempfile::tempdir().unwrap();
+            let source_cas = PayloadCas::new(source_root.path()).unwrap();
+            let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+            seed_product_store(&mut source_store, "Source", 0);
+            let peer_root = source_root.path().join("peer-sync");
+            let source = PeerCloneCommandState::default();
+            source
+                .prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled)
+                .unwrap();
+            let marker_path = peer_root.join("active-source.json");
+            let session_root = source.source_session_root_for_test().unwrap();
+            let manifest_path = session_root.join("manifest.json");
+            let manifest: super::super::CloneManifest =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            let session_cas = PayloadCas::new(&session_root).unwrap();
+            let object_path = session_cas
+                .object_path(&manifest.database.object)
+                .unwrap()
+                .unwrap();
+
+            match corruption {
+                "marker-json" => fs::write(&marker_path, b"{").unwrap(),
+                "manifest-identity" => {
+                    let mut marker: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+                    marker["manifestId"] = serde_json::Value::String("0".repeat(64));
+                    fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+                }
+                "noncanonical-manifest" => {
+                    let mut bytes = fs::read(&manifest_path).unwrap();
+                    bytes.push(b'\n');
+                    fs::write(&manifest_path, bytes).unwrap();
+                }
+                "missing-object" => fs::remove_file(object_path).unwrap(),
+                "wrong-object-size" => File::options()
+                    .write(true)
+                    .open(object_path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+
+            let recovered = PeerCloneCommandState::initialize(&peer_root);
+            assert_eq!(
+                recovered.source_status().unwrap().phase,
+                PeerCloneSourcePhase::Idle,
+                "{corruption}"
+            );
+            assert!(!marker_path.exists(), "{corruption}");
+            assert!(
+                recovered.source_bind_address().unwrap().is_none(),
+                "{corruption}"
+            );
+            assert!(session_root.exists(), "{corruption}");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-sync");
+        let orphan = peer_root
+            .join("source-sessions")
+            .join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&orphan).unwrap();
+        let idle = PeerCloneCommandState::initialize(&peer_root);
+        assert_eq!(
+            idle.source_status().unwrap().phase,
+            PeerCloneSourcePhase::Idle
+        );
+        assert!(
+            orphan.exists(),
+            "markerless legacy sessions are not auto-adopted"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn product_source_recovery_io_failure_preserves_marker_and_blocks_source_commands() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(root.path()).unwrap();
+        let mut source_store = PersistentStore::open(root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let peer_root = root.path().join("peer-sync");
+        let source = PeerCloneCommandState::default();
+        source
+            .prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled)
+            .unwrap();
+        let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
+        let marker_lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&marker_path)
+            .unwrap();
+
+        let recovered = PeerCloneCommandState::initialize(&peer_root);
+        assert!(matches!(
+            recovered.source_status(),
+            Err(PeerSyncError::Storage(_))
+        ));
+        assert!(matches!(
+            recovered.prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled,),
+            Err(PeerSyncError::Storage(_))
+        ));
+        assert!(marker_path.is_file());
+
+        drop(marker_lock);
     }
 
     struct TunnelSourceFixture {

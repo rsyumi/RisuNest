@@ -325,6 +325,13 @@ function sameTargetRequest(
         && left.manifestId === right.manifestId
 }
 
+function sameTargetIdentity(
+    left: { sessionId: string; manifestId: string },
+    right: { sessionId: string; manifestId: string },
+): boolean {
+    return left.sessionId === right.sessionId && left.manifestId === right.manifestId
+}
+
 export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     const nativeInvoke = options.invoke ?? invoke
     let state = initialPeerCloneState
@@ -451,6 +458,21 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             }
             const pairing = parsePeerCloneUri(pairingUri)
             if (ownedTarget) {
+                if (
+                    (state.target.phase === 'failed' || state.target.phase === 'cancelled')
+                    && sameTargetIdentity(ownedTarget, pairing)
+                ) {
+                    warning = ''
+                    targetIdentityEpoch += 1
+                    ownedTarget = {
+                        endpoint: pairing.endpoint,
+                        sessionId: pairing.sessionId,
+                        manifestId: pairing.manifestId,
+                    }
+                    claimOwned = false
+                    state = reducePeerCloneState(state, { type: 'target-joined', pairing })
+                    return state
+                }
                 if (!sameTargetRequest(ownedTarget, pairing)) {
                     throw new Error('Another peer clone target job is already owned')
                 }
