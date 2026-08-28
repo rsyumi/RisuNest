@@ -5194,6 +5194,7 @@ mod tests {
                 1,
                 PeerBidirectionalBackupSide::Remote,
                 &source_identity,
+                None,
                 &NeverCancelled,
             )
             .unwrap();
