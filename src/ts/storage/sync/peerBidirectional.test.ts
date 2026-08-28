@@ -92,6 +92,14 @@ describe('peer bidirectional facade', () => {
         }
     })
 
+    it.each([
+        ['127.23.4.5', 'http://127.23.4.5:32146'],
+        ['%5B%3A%3A1%5D', 'http://[::1]:32146'],
+    ])('accepts the supported LAN loopback endpoint %s', (encodedHost, endpoint) => {
+        const loopbackPairing = pairingUri.replace('192.168.1.20', encodedHost)
+        expect(parsePeerBidirectionalUri(loopbackPairing).endpoint).toBe(endpoint)
+    })
+
     it.each(['web', 'android'] as const)('does not create a fallback authority on %s', async (platform) => {
         const facade = createPeerBidirectionalFacade({ platform })
         await expect(facade.capabilities()).rejects.toThrow(`Peer sync is unsupported on ${platform}`)

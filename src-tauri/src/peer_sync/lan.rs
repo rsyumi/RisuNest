@@ -1861,7 +1861,7 @@ pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError
     Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))
 }
 
-fn validate_private_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
+pub(crate) fn validate_private_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
     let endpoint = validate_lan_endpoint(value)?;
     if endpoint.starts_with("http://") {
         Ok(endpoint)

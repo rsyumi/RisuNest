@@ -1,11 +1,12 @@
 use super::{
     execute_logical_delta_pull,
     lan::{
-        LanBidirectionalBackupReceipt, LanBidirectionalControl, LanBidirectionalGeneration,
-        LanBidirectionalLogicalClient, LanBidirectionalLogicalCredential,
-        LanBidirectionalRegistrationRequest, LanBidirectionalRemoteApplyReceipt,
-        LanBidirectionalRemoteApplyRequest, LanBidirectionalSession, LanCloneHostControl,
-        LanLogicalDeltaClient, PreparedBidirectionalLogicalLanSession,
+        validate_private_lan_endpoint, LanBidirectionalBackupReceipt, LanBidirectionalControl,
+        LanBidirectionalGeneration, LanBidirectionalLogicalClient,
+        LanBidirectionalLogicalCredential, LanBidirectionalRegistrationRequest,
+        LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
+        LanBidirectionalSession, LanCloneHostControl, LanLogicalDeltaClient,
+        PreparedBidirectionalLogicalLanSession,
     },
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
     logical_delta_transfer::{
@@ -285,6 +286,16 @@ impl PeerBidirectionalDurableOperation {
             return Err(PeerSyncError::Storage(
                 "bidirectional operation record is invalid".to_owned(),
             ));
+        }
+        if let Self::TargetPrepared { context, .. }
+        | Self::AwaitingConflict { context, .. }
+        | Self::LocalCommitted { context, .. } = self
+        {
+            validate_private_lan_endpoint(&context.credential.endpoint).map_err(|_| {
+                PeerSyncError::Storage(
+                    "bidirectional operation has an invalid private LAN endpoint".to_owned(),
+                )
+            })?;
         }
         match self {
             Self::SourcePrepared {
@@ -9166,6 +9177,61 @@ mod tests {
     }
 
     #[test]
+    fn context_bearing_durable_operations_reject_public_https_credentials() {
+        let operation_id = "123e4567-e89b-42d3-a456-426614174004";
+        let mut retained_context = context(operation_id);
+        retained_context.credential.endpoint = "https://sync.example.com".to_owned();
+        retained_context.credential.manifest_id = retained_context
+            .expected_remote_generation
+            .manifest_hash
+            .clone();
+        let operations = [
+            PeerBidirectionalDurableOperation::TargetPrepared {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: retained_context.clone(),
+                local_generation: generation("local-l", "2", 'c'),
+                conflict_policy: TargetPreparedConflictPolicy::Reject,
+                changed: true,
+                remote_backup_required: false,
+                transferred_objects: 2,
+                transferred_bytes: 19,
+                backups: vec![],
+            },
+            PeerBidirectionalDurableOperation::AwaitingConflict {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: retained_context.clone(),
+                conflicts: vec![PeerBidirectionalConflict {
+                    key: "r1:root".to_owned(),
+                    conflict_type: "sameRecord".to_owned(),
+                }],
+                local_generation: generation("local-l", "2", 'c'),
+                local_manifest_hash: "a".repeat(64),
+                remote_manifest_hash: "b".repeat(64),
+                backups: vec![],
+            },
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: retained_context,
+                committed_revision: 8,
+                shared_generation: generation("local-a", "3", 'e'),
+                changed: true,
+                remote_backup_required: false,
+                remote_apply_receipt: None,
+                transferred_objects: 2,
+                transferred_bytes: 19,
+                backups: vec![],
+            },
+        ];
+
+        for operation in operations {
+            assert!(matches!(
+                operation.validate(),
+                Err(PeerSyncError::Storage(message)) if message.contains("private LAN endpoint")
+            ));
+        }
+    }
+
+    #[test]
     fn durable_operations_project_the_exact_frontend_contract() {
         let operation_id = "123e4567-e89b-42d3-a456-426614174004";
         let target_prepared = PeerBidirectionalDurableOperation::TargetPrepared {
@@ -10888,6 +10954,47 @@ mod tests {
             Err(error) if error.kind() == io::ErrorKind::NotFound
         ));
         assert_eq!(source.reads, 1);
+    }
+
+    #[test]
+    fn target_postactivation_status_rejects_retained_public_https_without_mutation() {
+        let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
+        let mut source = fixture_source(&remote);
+        TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
+        assert!(begin_bidirectional_local_merge(
+            &mut store,
+            &cas,
+            directory.path(),
+            credential,
+            1,
+            &remote.manifest_bytes,
+            &mut source,
+        )
+        .is_err());
+
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        let mut prepared = journal.load().unwrap().unwrap();
+        let job_id = match &mut prepared {
+            PeerBidirectionalDurableOperation::TargetPrepared { context, .. } => {
+                context.credential.endpoint = "https://sync.example.com".to_owned();
+                context.durable_job_id.clone()
+            }
+            other => panic!("expected target-prepared activation crash, got {other:?}"),
+        };
+        let retained_bytes = serde_json::to_vec(&prepared).unwrap();
+        let operation_path = journal.root.join(OPERATION_FILE);
+        fs::write(&operation_path, &retained_bytes).unwrap();
+        let revision_before = store.revision().unwrap();
+        let root_before = store.read_root(None).unwrap();
+
+        assert!(matches!(
+            PeerBidirectionalCommandState::default().status(directory.path(), &mut store),
+            Err(PeerSyncError::Storage(message)) if message.contains("private LAN endpoint")
+        ));
+        assert_eq!(store.revision().unwrap(), revision_before);
+        assert_eq!(store.read_root(None).unwrap(), root_before);
+        assert_eq!(fs::read(operation_path).unwrap(), retained_bytes);
+        assert!(DurableCasJob::open(directory.path(), &job_id).is_ok());
     }
 
     #[test]

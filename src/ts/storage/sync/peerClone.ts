@@ -214,13 +214,18 @@ function isAllowedLanHost(hostname: string): boolean {
         || (ipv4[0] === 169 && ipv4[1] === 254)
 }
 
+function isLoopbackHost(hostname: string): boolean {
+    const ipv4 = parseIpv4(hostname)
+    return ipv4?.[0] === 127 || hostname === '[::1]'
+}
+
 function isAllowedPublicHttpsHost(hostname: string): boolean {
     if (parseIpv4(hostname) || /^\d+(?:\.\d+){3}$/.test(hostname)) return false
     return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(hostname)
         && hostname.toLowerCase() !== 'localhost'
 }
 
-export function parsePeerCloneEndpoint(value: string): string {
+function parsePeerEndpoint(value: string): URL {
     if (value.length === 0 || value.length > maximumEndpointLength) {
         return invalidPairingUri()
     }
@@ -237,6 +242,12 @@ export function parsePeerCloneEndpoint(value: string): string {
         || endpoint.pathname !== '/'
     ) return invalidPairingUri()
 
+    return endpoint
+}
+
+export function parsePeerCloneEndpoint(value: string): string {
+    const endpoint = parsePeerEndpoint(value)
+
     const lan = endpoint.protocol === 'http:'
         && hasExplicitValidPort(value)
         && isAllowedLanHost(endpoint.hostname)
@@ -249,9 +260,12 @@ export function parsePeerCloneEndpoint(value: string): string {
 }
 
 export function parsePeerLanEndpoint(value: string): string {
-    const endpoint = parsePeerCloneEndpoint(value)
-    if (!endpoint.startsWith('http://')) return invalidPairingUri()
-    return endpoint
+    const endpoint = parsePeerEndpoint(value)
+    if (endpoint.protocol !== 'http:'
+        || !hasExplicitValidPort(value)
+        || (!isAllowedLanHost(endpoint.hostname) && !isLoopbackHost(endpoint.hostname))
+    ) return invalidPairingUri()
+    return endpoint.toString()
 }
 
 export function parsePeerCloneUri(value: string): PeerClonePairing {

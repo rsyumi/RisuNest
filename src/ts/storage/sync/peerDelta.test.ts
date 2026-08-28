@@ -26,6 +26,14 @@ describe('peer logical delta product facade', () => {
         expect(() => parsePeerDeltaUri(`${pairing}&extra=1`)).toThrow()
     })
 
+    test.each([
+        ['127.23.4.5', 'http://127.23.4.5:32145/'],
+        ['%5B%3A%3A1%5D', 'http://[::1]:32145/'],
+    ])('accepts the supported LAN loopback endpoint %s', (encodedHost, endpoint) => {
+        const loopbackPairing = pairing.replace('192.168.1.20', encodedHost)
+        expect(parsePeerDeltaUri(loopbackPairing).endpoint).toBe(endpoint)
+    })
+
     test.each(['web', 'android'] as const)('does not expose native delta on %s', async (platform) => {
         const facade = createPeerDeltaFacade({ platform })
         await expect(facade.capabilities()).rejects.toThrow(`unsupported on ${platform}`)
