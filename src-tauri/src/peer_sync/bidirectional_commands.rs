@@ -4166,6 +4166,38 @@ mod tests {
         ids
     }
 
+    fn assert_no_logical_delta_staging_orphans(repository_root: &Path) {
+        let connection =
+            rusqlite::Connection::open(repository_root.join("persistent").join("persistent.db"))
+                .unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let staging_generations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM root WHERE generation LIKE 'staging-logical-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let staging_leases: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot_leases WHERE lease LIKE 'logical-delta-pin-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let staging_root = repository_root.join("peer-bidirectional").join("staging");
+        let staging_directories = if staging_root.exists() {
+            fs::read_dir(staging_root).unwrap().count()
+        } else {
+            0
+        };
+        assert_eq!(staging_generations, 0, "orphaned PDS staging generation");
+        assert_eq!(staging_leases, 0, "orphaned logical delta snapshot lease");
+        assert_eq!(staging_directories, 0, "orphaned logical delta directory");
+    }
+
     #[test]
     fn local_committed_operation_survives_reopen_and_atomic_completion() {
         let directory = tempfile::tempdir().unwrap();
@@ -7884,6 +7916,7 @@ mod tests {
         }));
         assert!(crashed.is_err());
         drop(control);
+        assert_no_logical_delta_staging_orphans(directory.path());
         let crashed_prepared = PeerBidirectionalOperationJournal::new(directory.path())
             .load()
             .unwrap()
@@ -7959,6 +7992,7 @@ mod tests {
                 .unwrap(),
             Some(crashed_prepared)
         );
+        assert_no_logical_delta_staging_orphans(directory.path());
         let retained_roots = collect_durable_cas_job_roots(directory.path());
         assert!(retained_roots.object_hashes.contains(&retained_object_hash));
         assert!(retained_roots

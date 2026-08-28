@@ -107,6 +107,7 @@ pub(crate) enum PersistentLogicalDeltaStage {
     },
     Changed {
         expected_base: PeerBase,
+        expected_local_revision: i64,
         staging_id: String,
         logical_generation_id: String,
         merged_generation_sequence: String,
@@ -114,6 +115,7 @@ pub(crate) enum PersistentLogicalDeltaStage {
         staging_directory: PathBuf,
         staged_objects: BTreeMap<String, PathBuf>,
         database_staged: bool,
+        initialized: bool,
     },
 }
 
@@ -1560,6 +1562,84 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         }
         Ok(())
     }
+
+    fn initialize_changed_stage(
+        &mut self,
+        stage: &mut PersistentLogicalDeltaStage,
+    ) -> Result<(), PeerSyncError> {
+        let (
+            expected_base,
+            expected_local_revision,
+            staging_id,
+            pin_lease_id,
+            staging_directory,
+            initialized,
+        ) = match stage {
+            PersistentLogicalDeltaStage::Changed {
+                expected_base,
+                expected_local_revision,
+                staging_id,
+                pin_lease_id,
+                staging_directory,
+                initialized,
+                ..
+            } => (
+                expected_base.clone(),
+                *expected_local_revision,
+                staging_id.clone(),
+                pin_lease_id.clone(),
+                staging_directory.clone(),
+                initialized,
+            ),
+            _ => return Ok(()),
+        };
+        if *initialized {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.staging_root)?;
+        if let Err(error) = fs::create_dir(&staging_directory) {
+            let _ = fs::remove_dir(&self.staging_root);
+            return Err(PeerSyncError::Storage(error.to_string()));
+        }
+        let result = (|| {
+            let transaction = self
+                .store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let active = active_generation(&transaction).map_err(storage_error)?;
+            let revision = current_revision(&transaction).map_err(storage_error)?;
+            if revision != expected_local_revision {
+                return Err(PeerSyncError::ActivationConflict {
+                    expected: Some(expected_local_revision.to_string()),
+                    actual: Some(revision.to_string()),
+                });
+            }
+            let transaction_base = common_base(&transaction, &self.peer_id, &self.library_id)?;
+            if transaction_base.as_ref() != Some(&expected_base) {
+                return Err(PeerSyncError::ActivationConflict {
+                    expected: Some(expected_base.manifest_hash.clone()),
+                    actual: transaction_base.map(|base| base.manifest_hash),
+                });
+            }
+            clone_generation(&transaction, &active, &staging_id)?;
+            transaction
+                .execute(
+                    "INSERT INTO snapshot_leases (
+                        lease, generation, revision, created_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![pin_lease_id, active, revision, unix_millis()?],
+                )
+                .map_err(sql_error)?;
+            transaction.commit().map_err(sql_error)
+        })();
+        if let Err(error) = result {
+            let _ = remove_staging_directory(&self.staging_root, &staging_directory);
+            return Err(error);
+        }
+        *initialized = true;
+        Ok(())
+    }
 }
 
 impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
@@ -1619,50 +1699,10 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         let staging_id = format!("staging-logical-{}", uuid::Uuid::new_v4());
         let logical_generation_id = format!("local-{}", uuid::Uuid::new_v4());
         let pin_lease_id = format!("logical-delta-pin-{}", uuid::Uuid::new_v4());
-        fs::create_dir_all(&self.staging_root)?;
         let staging_directory = self.staging_root.join(&staging_id);
-        if let Err(error) = fs::create_dir(&staging_directory) {
-            let _ = fs::remove_dir(&self.staging_root);
-            return Err(PeerSyncError::Storage(error.to_string()));
-        }
-        let result = (|| {
-            let transaction = self
-                .store
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let active = active_generation(&transaction).map_err(storage_error)?;
-            let revision = current_revision(&transaction).map_err(storage_error)?;
-            if revision != plan.expected_local_revision {
-                return Err(PeerSyncError::ActivationConflict {
-                    expected: Some(plan.expected_local_revision.to_string()),
-                    actual: Some(revision.to_string()),
-                });
-            }
-            let transaction_base = common_base(&transaction, &self.peer_id, &self.library_id)?;
-            if transaction_base.as_ref() != Some(&actual_base) {
-                return Err(PeerSyncError::ActivationConflict {
-                    expected: Some(actual_base.manifest_hash.clone()),
-                    actual: transaction_base.map(|base| base.manifest_hash),
-                });
-            }
-            clone_generation(&transaction, &active, &staging_id)?;
-            transaction
-                .execute(
-                    "INSERT INTO snapshot_leases (
-                        lease, generation, revision, created_at
-                     ) VALUES (?1, ?2, ?3, ?4)",
-                    params![pin_lease_id, active, revision, unix_millis()?],
-                )
-                .map_err(sql_error)?;
-            transaction.commit().map_err(sql_error)
-        })();
-        if let Err(error) = result {
-            let _ = remove_staging_directory(&self.staging_root, &staging_directory);
-            return Err(error);
-        }
         Ok(PersistentLogicalDeltaStage::Changed {
             expected_base: actual_base,
+            expected_local_revision: plan.expected_local_revision,
             staging_id,
             logical_generation_id,
             merged_generation_sequence,
@@ -1670,6 +1710,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             staging_directory,
             staged_objects: BTreeMap::new(),
             database_staged: false,
+            initialized: false,
         })
     }
 
@@ -1683,6 +1724,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         object: &LogicalDeltaObject,
         reader: &mut dyn Read,
     ) -> Result<(), PeerSyncError> {
+        self.initialize_changed_stage(stage)?;
         let (staging_directory, staged_objects, database_staged) = match stage {
             PersistentLogicalDeltaStage::AlreadyActive { .. } => return Ok(()),
             PersistentLogicalDeltaStage::NoOp { .. } => {
@@ -1748,6 +1790,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             )?;
             self.validate_policy_three_way_plan(plan, &base_manifest, &local_manifest)?;
         }
+        self.initialize_changed_stage(stage)?;
         match stage {
             PersistentLogicalDeltaStage::AlreadyActive { .. } => Ok(()),
             PersistentLogicalDeltaStage::NoOp {
@@ -2164,11 +2207,15 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             logical_generation_id,
             pin_lease_id,
             staging_directory,
+            initialized,
             ..
         } = stage
         else {
             return Ok(());
         };
+        if !initialized {
+            return Ok(());
+        }
         let transaction = self
             .store
             .connection
@@ -4238,6 +4285,7 @@ mod tests {
                 manifest_hash: "0".repeat(64),
                 generation_sequence: "0".to_owned(),
             },
+            expected_local_revision: 0,
             staging_id: "staging-logical-bounded-reader".to_owned(),
             logical_generation_id: "local-bounded-reader".to_owned(),
             merged_generation_sequence: "2".to_owned(),
@@ -4245,6 +4293,7 @@ mod tests {
             staging_directory,
             staged_objects: BTreeMap::new(),
             database_staged: false,
+            initialized: true,
         };
         let mut bytes = record.bytes.clone();
         bytes.push(0xff);

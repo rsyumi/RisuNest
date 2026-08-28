@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_activation_evidence_is_persisted_after_staging_and_before_activation() {
+    fn pre_activation_evidence_is_persisted_before_payload_and_database_staging() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let payload = b"remote-payload".to_vec();
