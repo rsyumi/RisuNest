@@ -618,6 +618,39 @@ fn bidirectional_backup_path(
         .join(format!("{operation_id}-{side_name}.risulossless"))
 }
 
+fn verify_source_prepared_backup(
+    app_root: &Path,
+    evidence: &SourcePreparedEvidence,
+) -> Result<(), PeerSyncError> {
+    let Some(backup) = &evidence.backup else {
+        return Ok(());
+    };
+    let expected_path = bidirectional_backup_path(
+        app_root,
+        &evidence.operation_id,
+        PeerBidirectionalBackupSide::Remote,
+    );
+    if Path::new(&backup.path) != expected_path.as_path() {
+        return Err(PeerSyncError::Storage(
+            "source-prepared backup path differs from its operation".to_owned(),
+        ));
+    }
+    let verified = verify_bidirectional_backup_receipt(
+        &expected_path,
+        &evidence.operation_id,
+        evidence.expected_source_revision,
+        PeerBidirectionalBackupSide::Remote,
+        &evidence.expected_source_generation,
+        Some(&backup.package_id),
+    )?;
+    if verified.path != backup.path {
+        return Err(PeerSyncError::Storage(
+            "source-prepared backup path differs from its receipt".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_bidirectional_backup_receipt(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -2603,6 +2636,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
                 completed_revision,
                 durable_job_id,
             ) => {
+                verify_source_prepared_backup(&self.app_root, &evidence)?;
                 release_retained_source_job(
                     &self.app_root,
                     &durable_job_id,
@@ -2913,8 +2947,22 @@ impl PeerBidirectionalCommandState {
         };
         let journal = PeerBidirectionalOperationJournal::new(app_root);
         let mut retained = journal.load()?;
-        if let Some(operation @ PeerBidirectionalDurableOperation::SourcePrepared { .. }) =
-            retained.as_ref()
+        let promotion_guard = if matches!(
+            retained.as_ref(),
+            Some(PeerBidirectionalDurableOperation::SourcePrepared { .. })
+        ) {
+            match self.begin_target() {
+                Ok(guard) => Some(guard),
+                Err(PeerSyncError::Protocol(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        if let (
+            Some(_guard),
+            Some(operation @ PeerBidirectionalDurableOperation::SourcePrepared { .. }),
+        ) = (promotion_guard.as_ref(), retained.as_ref())
         {
             let evidence = SourcePreparedEvidence::from_operation(operation).ok_or_else(|| {
                 PeerSyncError::Storage("source-prepared operation is invalid".to_owned())
@@ -2934,6 +2982,7 @@ impl PeerBidirectionalCommandState {
                     } => durable_job_id,
                     _ => unreachable!(),
                 };
+                verify_source_prepared_backup(app_root, &evidence)?;
                 release_retained_source_job(
                     app_root,
                     durable_job_id,
@@ -2994,6 +3043,7 @@ impl PeerBidirectionalCommandState {
                         receipt,
                         completed_revision,
                     } => {
+                        verify_source_prepared_backup(app_root, &evidence)?;
                         release_retained_source_job(
                             app_root,
                             &durable_job_id,
@@ -3984,17 +4034,18 @@ impl PeerBidirectionalOperationJournal {
                 "bidirectional operation directory has no repository root".to_owned(),
             )
         })?;
-        let mut job =
-            DurableCasJob::open(repository_root, &context.durable_job_id).map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    PeerSyncError::Validation(
-                        "awaiting-conflict operation has no abandonable CAS job".to_owned(),
-                    )
-                } else {
-                    error.into()
-                }
-            })?;
-        if job.kind() != CasJobKind::LogicalDeltaTarget || job.is_sealed() || job.is_released() {
+        let mut job = match DurableCasJob::open(repository_root, &context.durable_job_id) {
+            Ok(job) => job,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return match fs::remove_file(self.root.join(OPERATION_FILE)) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if job.kind() != CasJobKind::LogicalDeltaTarget || job.is_sealed() {
             return Err(PeerSyncError::Validation(
                 "awaiting-conflict operation CAS job cannot be abandoned".to_owned(),
             ));
@@ -8627,6 +8678,23 @@ mod tests {
         assert!(collect_durable_cas_job_roots(directory.path())
             .object_hashes
             .contains(&retained_object_hash));
+        let retained_backup_path = PathBuf::from(&evidence.backup.as_ref().unwrap().path);
+        let retained_backup_bytes = fs::read(&retained_backup_path).unwrap();
+        fs::write(&retained_backup_path, b"corrupt retained source backup").unwrap();
+        assert!(recovery_control
+            .remote_apply(session.clone(), request.clone())
+            .is_err());
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::SourcePrepared { .. })
+        ));
+        let retained_job = DurableCasJob::open(directory.path(), &committed_job_id).unwrap();
+        assert!(retained_job.is_sealed());
+        assert!(!retained_job.is_released());
+        drop(retained_job);
+        fs::write(&retained_backup_path, retained_backup_bytes).unwrap();
         PeerBidirectionalCommandState::default()
             .acknowledge(
                 directory.path(),
@@ -9199,6 +9267,172 @@ mod tests {
     }
 
     #[test]
+    fn status_does_not_promote_source_postcommit_with_a_missing_physical_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174156";
+        let durable_job_id = "123e4567-e89b-42d3-a456-426614174157";
+        let (mut store, _cas, mut evidence, _receipt) = retain_source_postcommit_fixture(
+            directory.path(),
+            operation_id,
+            "123e4567-e89b-42d3-a456-426614174158",
+            "123e4567-e89b-42d3-a456-426614174159",
+            durable_job_id,
+        );
+        evidence.backup = Some(LanBidirectionalBackupReceipt {
+            package_id: "f".repeat(64),
+            path: bidirectional_backup_path(
+                directory.path(),
+                operation_id,
+                PeerBidirectionalBackupSide::Remote,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        });
+        let retained = evidence.durable_operation(durable_job_id.to_owned());
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&retained).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .status(directory.path(), &mut store)
+            .is_err());
+        assert_eq!(journal.load().unwrap(), Some(retained));
+        let job = DurableCasJob::open(directory.path(), durable_job_id).unwrap();
+        assert!(job.is_sealed());
+        assert!(!job.is_released());
+    }
+
+    #[test]
+    fn acknowledge_does_not_promote_source_postcommit_with_a_corrupt_physical_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174160";
+        let durable_job_id = "123e4567-e89b-42d3-a456-426614174161";
+        let (mut store, _cas, mut evidence, _receipt) = retain_source_postcommit_fixture(
+            directory.path(),
+            operation_id,
+            "123e4567-e89b-42d3-a456-426614174162",
+            "123e4567-e89b-42d3-a456-426614174163",
+            durable_job_id,
+        );
+        let backup_path = bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        );
+        fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+        fs::write(&backup_path, b"corrupt physical backup").unwrap();
+        evidence.backup = Some(LanBidirectionalBackupReceipt {
+            package_id: "f".repeat(64),
+            path: backup_path.to_string_lossy().into_owned(),
+        });
+        let retained = evidence.durable_operation(durable_job_id.to_owned());
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&retained).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
+        assert_eq!(journal.load().unwrap(), Some(retained));
+        let job = DurableCasJob::open(directory.path(), durable_job_id).unwrap();
+        assert!(job.is_sealed());
+        assert!(!job.is_released());
+    }
+
+    #[test]
+    fn status_projects_source_prepared_while_source_runtime_is_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174164";
+        let durable_job_id = "123e4567-e89b-42d3-a456-426614174165";
+        let (mut store, _cas, evidence, _receipt) = retain_source_postcommit_fixture(
+            directory.path(),
+            operation_id,
+            "123e4567-e89b-42d3-a456-426614174166",
+            "123e4567-e89b-42d3-a456-426614174167",
+            durable_job_id,
+        );
+        let active = store
+            .seal_or_initialize_active_logical_generation(
+                &PayloadCas::new(directory.path()).unwrap(),
+            )
+            .unwrap();
+        let source = LogicalDeltaSourceSession::open(
+            directory.path(),
+            directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &active.manifest.generation,
+        )
+        .unwrap();
+        let session_id = "123e4567-e89b-42d3-a456-426614174168";
+        let prepared = super::super::lan::PreparedLogicalLanSession::new(
+            session_id,
+            "123e4567-e89b-42d3-a456-426614174169",
+            active.manifest_hash.clone(),
+            active.manifest_bytes,
+            source.objects().to_vec(),
+            Box::new(source),
+        )
+        .unwrap();
+        let state = PeerBidirectionalCommandState::default();
+        state
+            .install_source(
+                LanCloneHost::prepare_logical(prepared),
+                session_id,
+                &active.manifest_hash,
+            )
+            .unwrap();
+
+        let status = state.status(directory.path(), &mut store).unwrap();
+
+        assert!(matches!(
+            status.operation,
+            Some(PeerBidirectionalStatusOperation::SourcePrepared { ref operation_id })
+                if operation_id == &evidence.operation_id
+        ));
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::SourcePrepared { .. })
+        ));
+        let job = DurableCasJob::open(directory.path(), durable_job_id).unwrap();
+        assert!(job.is_sealed());
+        assert!(!job.is_released());
+    }
+
+    #[test]
+    fn status_projects_source_prepared_while_target_guard_is_active_then_promotes_once_idle() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174170";
+        let durable_job_id = "123e4567-e89b-42d3-a456-426614174171";
+        let (mut store, _cas, _evidence, _receipt) = retain_source_postcommit_fixture(
+            directory.path(),
+            operation_id,
+            "123e4567-e89b-42d3-a456-426614174172",
+            "123e4567-e89b-42d3-a456-426614174173",
+            durable_job_id,
+        );
+        let state = PeerBidirectionalCommandState::default();
+        let active_target = state.begin_target().unwrap();
+
+        let active_status = state.status(directory.path(), &mut store).unwrap();
+        assert!(matches!(
+            active_status.operation,
+            Some(PeerBidirectionalStatusOperation::SourcePrepared { .. })
+        ));
+        assert!(DurableCasJob::open(directory.path(), durable_job_id).is_ok());
+        drop(active_target);
+
+        let idle_status = state.status(directory.path(), &mut store).unwrap();
+        assert!(matches!(
+            idle_status.operation,
+            Some(PeerBidirectionalStatusOperation::Completed { .. })
+        ));
+        assert!(matches!(
+            DurableCasJob::open(directory.path(), durable_job_id),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
     fn fresh_pairing_rebind_changes_only_awaiting_conflict_credential() {
         let directory = tempfile::tempdir().unwrap();
         let operation_id = "123e4567-e89b-42d3-a456-426614174136";
@@ -9374,28 +9608,63 @@ mod tests {
     }
 
     #[test]
-    fn acknowledge_retains_awaiting_conflict_with_missing_wrong_kind_or_sealed_job() {
-        for case in ["missing", "wrong-kind", "sealed"] {
+    fn acknowledge_retries_awaiting_conflict_cleanup_with_missing_or_released_job() {
+        for case in ["missing", "released"] {
             let directory = tempfile::tempdir().unwrap();
             let operation_id = "123e4567-e89b-42d3-a456-426614174145";
             let durable_job_id = "123e4567-e89b-42d3-a456-426614174146";
             let retained = awaiting_conflict_operation(operation_id, durable_job_id);
             let mut store = PersistentStore::open(directory.path()).unwrap();
-            if case != "missing" {
+            if case == "released" {
                 let mut job = DurableCasJob::begin(
                     directory.path(),
                     durable_job_id,
-                    if case == "wrong-kind" {
-                        CasJobKind::PeerClone
-                    } else {
-                        CasJobKind::LogicalDeltaTarget
-                    },
+                    CasJobKind::LogicalDeltaTarget,
                     0,
                 )
                 .unwrap();
-                if case == "sealed" {
-                    job.seal(&mut store, 0).unwrap();
-                }
+                job.leave_release_record_for_cleanup_retry(CasReleaseOutcome::Aborted)
+                    .unwrap();
+            }
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .store(&retained)
+                .unwrap();
+
+            PeerBidirectionalCommandState::default()
+                .acknowledge(directory.path(), &mut store, operation_id)
+                .unwrap();
+            assert!(PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                DurableCasJob::open(directory.path(), durable_job_id),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ));
+        }
+    }
+
+    #[test]
+    fn acknowledge_retains_awaiting_conflict_with_wrong_kind_or_sealed_job() {
+        for case in ["wrong-kind", "sealed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let operation_id = "123e4567-e89b-42d3-a456-426614174145";
+            let durable_job_id = "123e4567-e89b-42d3-a456-426614174146";
+            let retained = awaiting_conflict_operation(operation_id, durable_job_id);
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let mut job = DurableCasJob::begin(
+                directory.path(),
+                durable_job_id,
+                if case == "wrong-kind" {
+                    CasJobKind::PeerClone
+                } else {
+                    CasJobKind::LogicalDeltaTarget
+                },
+                0,
+            )
+            .unwrap();
+            if case == "sealed" {
+                job.seal(&mut store, 0).unwrap();
             }
             PeerBidirectionalOperationJournal::new(directory.path())
                 .store(&retained)
