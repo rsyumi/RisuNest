@@ -81,6 +81,10 @@ describe('peer bidirectional facade', () => {
             pairingUri.replace('peer-sync', 'peer-delta'),
             pairingUri.replace('/v1', '/v2'),
             pairingUri.replace('192.168.1.20', 'example.com'),
+            pairingUri.replace(
+                'http%3A%2F%2F192.168.1.20%3A32146',
+                'https%3A%2F%2Fsync.example.com',
+            ),
             pairingUri.replace(`#claim=${'b'.repeat(64)}`, ''),
             `${pairingUri}&extra=true`,
         ]) {

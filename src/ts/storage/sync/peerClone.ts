@@ -248,6 +248,12 @@ export function parsePeerCloneEndpoint(value: string): string {
     return endpoint.toString()
 }
 
+export function parsePeerLanEndpoint(value: string): string {
+    const endpoint = parsePeerCloneEndpoint(value)
+    if (!endpoint.startsWith('http://')) return invalidPairingUri()
+    return endpoint
+}
+
 export function parsePeerCloneUri(value: string): PeerClonePairing {
     if (value.length === 0 || value.length > maximumPairingUriLength) return invalidPairingUri()
     let uri: URL

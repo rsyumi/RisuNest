@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import {
-    parsePeerCloneEndpoint,
+    parsePeerLanEndpoint,
     type PeerClonePlatform,
 } from './peerClone'
 
@@ -107,7 +107,7 @@ export function parsePeerDeltaUri(value: string): PeerDeltaPairing {
         || !sha256Pattern.test(manifestId)
         || !/^claim=[0-9a-f]{64}$/.test(fragment)) return invalidPairingUri()
     return {
-        endpoint: parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!),
+        endpoint: parsePeerLanEndpoint(uri.searchParams.get('endpoint')!),
         sessionId,
         manifestId,
         claim: fragment.slice('claim='.length),

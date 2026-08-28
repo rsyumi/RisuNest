@@ -1730,7 +1730,7 @@ pub(crate) struct LanBidirectionalRemoteApplyRequest {
 impl LanBidirectionalRemoteApplyRequest {
     fn is_valid(&self) -> bool {
         is_canonical_uuid(&self.operation_id)
-            && validate_lan_endpoint(&self.source_endpoint).is_ok()
+            && validate_private_lan_endpoint(&self.source_endpoint).is_ok()
             && is_canonical_uuid(&self.source_session_id)
             && is_lower_hex_256(&self.source_manifest_id)
             && is_lower_hex_256(&self.source_claim)
@@ -1861,6 +1861,17 @@ pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError
     Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))
 }
 
+fn validate_private_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
+    let endpoint = validate_lan_endpoint(value)?;
+    if endpoint.starts_with("http://") {
+        Ok(endpoint)
+    } else {
+        Err(PeerSyncError::Protocol(
+            "invalid private LAN endpoint".to_owned(),
+        ))
+    }
+}
+
 fn has_explicit_authority_port(value: &str) -> bool {
     let Some((_, remainder)) = value.split_once("://") else {
         return false;
@@ -1932,6 +1943,42 @@ mod endpoint_tests {
         ] {
             assert!(validate_lan_endpoint(endpoint).is_err(), "{endpoint}");
         }
+    }
+
+    #[test]
+    fn logical_credentials_reject_public_https_while_clone_keeps_it() {
+        let endpoint = "https://sync.example.com";
+        assert!(validate_lan_endpoint(endpoint).is_ok());
+
+        let credential = LanBidirectionalLogicalCredential {
+            endpoint: endpoint.to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            manifest_id: "a".repeat(64),
+            device_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            source_device_id: "00000000-0000-4000-8000-000000000003".to_owned(),
+            bearer: "b".repeat(64),
+        };
+        assert!(credential.validate().is_err());
+    }
+
+    #[test]
+    fn bidirectional_remote_apply_rejects_public_https_source() {
+        let request = LanBidirectionalRemoteApplyRequest {
+            operation_id: "00000000-0000-4000-8000-000000000004".to_owned(),
+            source_endpoint: "https://sync.example.com".to_owned(),
+            source_session_id: "00000000-0000-4000-8000-000000000005".to_owned(),
+            source_manifest_id: "c".repeat(64),
+            source_claim: "d".repeat(64),
+            expected_source_revision: 1,
+            expected_source_generation: LanBidirectionalGeneration {
+                generation_id: "generation-1".to_owned(),
+                manifest_hash: "e".repeat(64),
+                generation_sequence: "1".to_owned(),
+            },
+            expected_common_base_manifest_hash: "f".repeat(64),
+            backup_losing_side: false,
+        };
+        assert!(!request.is_valid());
     }
 }
 
@@ -3355,7 +3402,7 @@ impl LanLogicalDeltaClient {
                 "invalid logical delta pairing data".to_owned(),
             ));
         }
-        let endpoint = validate_lan_endpoint(endpoint)?;
+        let endpoint = validate_private_lan_endpoint(endpoint)?;
         let session_url = format!("{endpoint}/v1/sessions/{session_id}");
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(
@@ -3556,7 +3603,7 @@ impl LanBidirectionalLogicalCredential {
                 "invalid bidirectional logical credential".to_owned(),
             ));
         }
-        validate_lan_endpoint(&self.endpoint)
+        validate_private_lan_endpoint(&self.endpoint)
     }
 }
 
@@ -3591,7 +3638,7 @@ impl LanBidirectionalLogicalClient {
         )?;
         Ok(Self {
             remote_apply_client: build_bidirectional_remote_apply_client()?,
-            endpoint: validate_lan_endpoint(endpoint)?,
+            endpoint: validate_private_lan_endpoint(endpoint)?,
             session_id: session_id.to_owned(),
             inner,
         })

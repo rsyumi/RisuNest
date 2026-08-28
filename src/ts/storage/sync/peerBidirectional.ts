@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import {
-    parsePeerCloneEndpoint,
+    parsePeerLanEndpoint,
     type PeerClonePlatform,
 } from './peerClone'
 
@@ -179,7 +179,7 @@ export function parsePeerBidirectionalUri(value: string): PeerBidirectionalPairi
     ) return invalidPairingUri()
     let endpoint: string
     try {
-        endpoint = parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!)
+        endpoint = parsePeerLanEndpoint(uri.searchParams.get('endpoint')!)
     } catch {
         return invalidPairingUri()
     }

@@ -19,6 +19,10 @@ describe('peer logical delta product facade', () => {
         })
         expect(() => parsePeerDeltaUri(pairing.replace('peer-delta', 'peer-clone'))).toThrow()
         expect(() => parsePeerDeltaUri(pairing.replace('192.168.1.20', '8.8.8.8'))).toThrow()
+        expect(() => parsePeerDeltaUri(pairing.replace(
+            'http%3A%2F%2F192.168.1.20%3A32145%2F',
+            'https%3A%2F%2Fsync.example.com',
+        ))).toThrow()
         expect(() => parsePeerDeltaUri(`${pairing}&extra=1`)).toThrow()
     })
 
