@@ -405,6 +405,8 @@ struct TargetRuntime {
     status: PeerCloneTargetStatus,
     #[cfg(test)]
     fail_finalize_cleanup_once: bool,
+    #[cfg(test)]
+    fail_release_cleanup_once: bool,
 }
 
 #[derive(Default)]
@@ -932,6 +934,8 @@ impl PeerCloneCommandState {
             status: PeerCloneTargetStatus::idle(),
             #[cfg(test)]
             fail_finalize_cleanup_once: false,
+            #[cfg(test)]
+            fail_release_cleanup_once: false,
         });
         Ok(())
     }
@@ -980,6 +984,16 @@ impl PeerCloneCommandState {
             PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
         })?;
         target.fail_finalize_cleanup_once = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_target_release_cleanup_once_for_test(&self) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let target = runtime.target.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+        })?;
+        target.fail_release_cleanup_once = true;
         Ok(())
     }
 
@@ -1054,6 +1068,8 @@ impl PeerCloneCommandState {
                 status: PeerCloneTargetStatus::idle(),
                 #[cfg(test)]
                 fail_finalize_cleanup_once: false,
+                #[cfg(test)]
+                fail_release_cleanup_once: false,
             });
         }
         self.start_target_worker(peer_root, request, true)
@@ -1212,7 +1228,7 @@ impl PeerCloneCommandState {
     pub fn release_target(&self, request: &PeerCloneTargetRequest) -> Result<(), PeerSyncError> {
         self.reap_finished_target_worker()?;
         let mut runtime = self.lock_runtime()?;
-        let Some(target) = runtime.target.as_ref() else {
+        let Some(target) = runtime.target.as_mut() else {
             return Ok(());
         };
         if &target.request != request {
@@ -1230,6 +1246,13 @@ impl PeerCloneCommandState {
                 "peer clone target worker is still active".to_owned(),
             ));
         }
+        #[cfg(test)]
+        if std::mem::take(&mut target.fail_release_cleanup_once) {
+            return Err(PeerSyncError::Storage(
+                "injected peer clone target release cleanup failure".to_owned(),
+            ));
+        }
+        remove_directory_if_exists(&target.job_root)?;
         runtime.target = None;
         Ok(())
     }
@@ -1865,6 +1888,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::{
+        io::Cursor,
         net::Ipv4Addr,
         sync::{Arc, Barrier},
         thread,
@@ -2206,6 +2230,9 @@ mod tests {
         let target_root = tempfile::tempdir().unwrap();
         let source_cas = PayloadCas::new(source_root.path()).unwrap();
         let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        let authoritative = target_cas
+            .prepare_reader(&mut Cursor::new(b"authoritative-target-object"))
+            .unwrap();
         let mut source_store = PersistentStore::open(source_root.path()).unwrap();
         let mut target_store = PersistentStore::open(target_root.path()).unwrap();
         seed_product_store(&mut source_store, "Source", 0);
@@ -2315,7 +2342,37 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Source"
         );
+        let target_job_root = target_root
+            .path()
+            .join("peer-sync")
+            .join("targets")
+            .join(&request.session_id);
+        assert!(target_job_root.join("credential.json").is_file());
+        assert!(target_job_root.join("transfer/manifest.json").is_file());
+        assert!(target_job_root.join("transfer/ledger.jsonl").is_file());
+        assert!(target_job_root.join("transfer/assets-v2/objects").is_dir());
+        target.fail_target_release_cleanup_once_for_test().unwrap();
+        assert_eq!(
+            target.release_target(&request).unwrap_err(),
+            PeerSyncError::Storage("injected peer clone target release cleanup failure".to_owned())
+        );
+        assert_eq!(
+            target.target_status(&request).unwrap().phase,
+            PeerCloneTargetPhase::Completed
+        );
+        assert!(target_job_root.exists());
+        assert!(target_cas
+            .open_object(&authoritative.content_hash)
+            .unwrap()
+            .is_some());
+        assert_eq!(target_store.revision().unwrap(), finalized.revision);
         target.release_target(&request).unwrap();
+        assert!(!target_job_root.exists());
+        assert!(target_cas
+            .open_object(&authoritative.content_hash)
+            .unwrap()
+            .is_some());
+        assert_eq!(target_store.revision().unwrap(), finalized.revision);
         target.release_target(&request).unwrap();
         assert!(target.target_status(&request).is_err());
     }
