@@ -125,6 +125,8 @@ pub(crate) enum PeerBidirectionalDurableOperation {
     },
     Completed {
         schema: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_apply_receipt: Option<LanBidirectionalRemoteApplyReceipt>,
         result: PeerBidirectionalCompletedResult,
     },
 }
@@ -1451,6 +1453,7 @@ fn complete_bidirectional_local_after_remote_apply(
     };
     journal.store(&PeerBidirectionalDurableOperation::Completed {
         schema: OPERATION_SCHEMA.to_owned(),
+        remote_apply_receipt: None,
         result: result.clone(),
     })?;
     Ok(result)
@@ -1672,13 +1675,17 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
                     "another bidirectional operation is retained".to_owned(),
                 ));
             }
-            if !matches!(
-                retained,
-                PeerBidirectionalDurableOperation::Completed { .. }
-            ) {
-                return Err(PeerSyncError::Validation(
-                    "bidirectional source operation is not completed".to_owned(),
-                ));
+            match retained {
+                PeerBidirectionalDurableOperation::Completed {
+                    remote_apply_receipt: Some(receipt),
+                    ..
+                } => return Ok(receipt),
+                PeerBidirectionalDurableOperation::Completed { .. } => {}
+                _ => {
+                    return Err(PeerSyncError::Validation(
+                        "bidirectional source operation is not completed".to_owned(),
+                    ));
+                }
             }
         }
         let mut client = LanLogicalDeltaClient::claim(
@@ -1765,6 +1772,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
         }
         journal.store(&PeerBidirectionalDurableOperation::Completed {
             schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: Some(receipt.clone()),
             result,
         })?;
         Ok(receipt)
@@ -3102,6 +3110,7 @@ mod tests {
 
         let completed = PeerBidirectionalDurableOperation::Completed {
             schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: None,
             result: PeerBidirectionalCompletedResult {
                 kind: "updated".to_owned(),
                 operation_id: operation_id.to_owned(),
@@ -3844,6 +3853,7 @@ mod tests {
                 .unwrap(),
             Some(PeerBidirectionalDurableOperation::Completed {
                 schema: OPERATION_SCHEMA.to_owned(),
+                remote_apply_receipt: None,
                 result,
             })
         );
@@ -3893,6 +3903,7 @@ mod tests {
 
         let completed = PeerBidirectionalDurableOperation::Completed {
             schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: None,
             result: PeerBidirectionalCompletedResult {
                 kind: "updated".to_owned(),
                 operation_id: operation_id.to_owned(),
@@ -3970,6 +3981,7 @@ mod tests {
 
         let completed = PeerBidirectionalDurableOperation::Completed {
             schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: None,
             result: PeerBidirectionalCompletedResult {
                 kind: "updated".to_owned(),
                 operation_id: operation_id.to_owned(),
@@ -5176,6 +5188,7 @@ mod tests {
                 .unwrap(),
             PeerBidirectionalDurableOperation::Completed {
                 schema: OPERATION_SCHEMA.to_owned(),
+                remote_apply_receipt: None,
                 result: result.clone(),
             }
         );
@@ -5316,6 +5329,104 @@ mod tests {
     }
 
     #[test]
+    fn production_control_replays_the_exact_completed_receipt_without_a_second_source_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let target_device_id = "123e4567-e89b-42d3-a456-426614174092";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            target_device_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        let common = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    target_device_id,
+                    common.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let inspector = store.open_native_job_store().unwrap();
+        let source_session_id = "123e4567-e89b-42d3-a456-426614174093";
+        let source_device_id = "123e4567-e89b-42d3-a456-426614174094";
+        let control = ProductionLanBidirectionalControl::new(
+            directory.path().to_path_buf(),
+            store,
+            source_session_id,
+            source_device_id,
+        );
+        let remote = remote_disjoint_manifest(&base.manifest);
+        let temporary_session_id = "123e4567-e89b-42d3-a456-426614174095";
+        let prepared = super::super::lan::PreparedLogicalLanSession::new(
+            temporary_session_id,
+            target_device_id,
+            remote.manifest_hash.clone(),
+            remote.manifest_bytes.clone(),
+            remote
+                .manifest
+                .objects
+                .iter()
+                .map(|object| LogicalDeltaObject {
+                    hash: object.hash.clone(),
+                    size: object.size,
+                })
+                .collect(),
+            Box::new(fixture_source(&remote)),
+        )
+        .unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared);
+        let pairing = host.start().unwrap();
+        let request = LanBidirectionalRemoteApplyRequest {
+            operation_id: "123e4567-e89b-42d3-a456-426614174096".to_owned(),
+            source_endpoint: format!("http://127.0.0.1:{}", host.address().unwrap().port()),
+            source_session_id: pairing.session_id,
+            source_manifest_id: pairing.manifest_id,
+            source_claim: pairing.claim,
+            expected_source_revision: 0,
+            expected_source_generation: LanBidirectionalGeneration {
+                generation_id: common.generation_id,
+                manifest_hash: common.manifest_hash.clone(),
+                generation_sequence: common.generation_sequence,
+            },
+            expected_common_base_manifest_hash: common.manifest_hash,
+            backup_losing_side: false,
+        };
+        let session = LanBidirectionalSession {
+            session_id: source_session_id.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+        };
+
+        let first = control
+            .remote_apply(session.clone(), request.clone())
+            .unwrap();
+        assert!(first.transferred_objects > 0);
+        host.stop().unwrap();
+
+        let replayed = control.remote_apply(session, request).unwrap();
+        assert_eq!(replayed, first);
+        assert_eq!(inspector.revision().unwrap(), first.committed_revision);
+    }
+
+    #[test]
     fn command_state_excludes_source_preparation_and_target_work() {
         let state = PeerBidirectionalCommandState::default();
 
@@ -5369,6 +5480,7 @@ mod tests {
         PeerBidirectionalOperationJournal::new(directory.path())
             .store(&PeerBidirectionalDurableOperation::Completed {
                 schema: OPERATION_SCHEMA.to_owned(),
+                remote_apply_receipt: None,
                 result: PeerBidirectionalCompletedResult {
                     kind: "updated".to_owned(),
                     operation_id: operation_id.to_owned(),
@@ -5484,6 +5596,7 @@ mod tests {
         journal
             .store(&PeerBidirectionalDurableOperation::Completed {
                 schema: OPERATION_SCHEMA.to_owned(),
+                remote_apply_receipt: None,
                 result: PeerBidirectionalCompletedResult {
                     kind: "noChanges".to_owned(),
                     operation_id: operation_id.to_owned(),
