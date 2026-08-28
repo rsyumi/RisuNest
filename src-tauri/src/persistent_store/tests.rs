@@ -5696,14 +5696,14 @@ fn database_only_replace_preserves_active_v2_cold_payloads_across_reopen() {
 
     let staging = store.replace_begin().expect("begin database replacement");
     store
-        .replace_preserve_cold_payloads(&staging.staging_id, migrated.revision)
-        .expect("preserve active cold payloads");
-    store
         .replace_put_root(
             &staging.staging_id,
             &json!({ "username": "Restored database" }),
         )
         .expect("stage restored root");
+    store
+        .replace_preserve_repositories(&staging.staging_id, Some(migrated.revision))
+        .expect("preserve active repositories");
     let replaced = store
         .replace_commit(&staging.staging_id, Some(migrated.revision))
         .expect("activate restored database");

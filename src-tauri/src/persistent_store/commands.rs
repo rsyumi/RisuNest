@@ -554,17 +554,6 @@ pub(crate) fn pds_replace_put_cold_payload_authority(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_replace_preserve_cold_payloads(
-    state: State<'_, PersistentStoreState>,
-    staging_id: String,
-    expected_revision: i64,
-) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
-        store.replace_preserve_cold_payloads(&staging_id, expected_revision)
-    })
-}
-
-#[tauri::command(async)]
 pub(crate) fn pds_replace_preserve_repositories(
     state: State<'_, PersistentStoreState>,
     staging_id: String,

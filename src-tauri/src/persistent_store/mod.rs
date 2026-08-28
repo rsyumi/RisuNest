@@ -1516,14 +1516,6 @@ impl PersistentStore {
         commit::replace_put_cold_payload_authority(&mut self.connection, staging_id, authority)
     }
 
-    pub(crate) fn replace_preserve_cold_payloads(
-        &mut self,
-        staging_id: &str,
-        expected_revision: i64,
-    ) -> StoreResult<()> {
-        commit::replace_preserve_cold_payloads(&mut self.connection, staging_id, expected_revision)
-    }
-
     pub(crate) fn replace_preserve_repositories(
         &mut self,
         staging_id: &str,
