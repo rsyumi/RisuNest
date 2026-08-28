@@ -852,35 +852,79 @@ describe('peer bidirectional facade', () => {
         ])
     })
 
-    it('refreshes a recovered sync commit without claiming a lost response as success', async () => {
-        const events: string[] = []
-        const invoke = vi.fn(async (command: string) => {
-            events.push(`invoke:${command}`)
-            if (command === 'peer_bidirectional_sync') throw new Error('sync response lost')
-            if (command === 'peer_bidirectional_status') {
-                return {
-                    source: { phase: 'idle', devices: [] },
-                    operation: {
-                        phase: 'localCommitted',
-                        operationId: 'operation-unknown-owner',
-                        committedRevision: 8,
-                    },
+    it.each([
+        {
+            phase: 'localCommitted' as const,
+            operationId: 'operation-normalized-local',
+            committedRevision: 8,
+        },
+        {
+            phase: 'completed' as const,
+            result: {
+                kind: 'updated' as const,
+                operationId: 'operation-normalized-completed',
+                revision: 8,
+                remoteRevision: 9,
+                transferredObjects: 1,
+                transferredBytes: 12,
+                backups: [],
+            },
+        },
+    ])(
+        'refreshes a status-normalized $phase sync commit without claiming a lost response as success',
+        async (operation) => {
+            const events: string[] = []
+            const invoke = vi.fn(async (command: string) => {
+                events.push(`invoke:${command}`)
+                if (command === 'peer_bidirectional_sync') throw new Error('sync response lost')
+                if (command === 'peer_bidirectional_status') {
+                    return {
+                        source: { phase: 'idle', devices: [] },
+                        operation,
+                    }
                 }
-            }
-        })
-        const facade = createPeerBidirectionalFacade({
-            platform: 'desktop',
-            runtime: runtime(events),
-            invoke: invoke as unknown as PeerBidirectionalInvoke,
-        })
+            })
+            const facade = createPeerBidirectionalFacade({
+                platform: 'desktop',
+                runtime: runtime(events),
+                invoke: invoke as unknown as PeerBidirectionalInvoke,
+            })
 
-        await expect(facade.sync(pairingUri)).rejects.toThrow('sync response lost')
-        expect(events.slice(-3)).toEqual([
-            'invoke:peer_bidirectional_status',
-            'refresh:8',
-            'release',
-        ])
-    })
+            await expect(facade.sync(pairingUri)).rejects.toThrow('sync response lost')
+            expect(events.slice(-3)).toEqual([
+                'invoke:peer_bidirectional_status',
+                'refresh:8',
+                'release',
+            ])
+        },
+    )
+
+    it.each(['sourcePrepared', 'targetPrepared'] as const)(
+        'does not refresh a proven-precommit %s status after a failed mutation',
+        async (phase) => {
+            const events: string[] = []
+            const invoke = vi.fn(async (command: string) => {
+                events.push(`invoke:${command}`)
+                if (command === 'peer_bidirectional_sync') throw new Error('sync failed before commit')
+                if (command === 'peer_bidirectional_status') {
+                    return {
+                        source: { phase: 'idle', devices: [] },
+                        operation: { phase, operationId: `operation-${phase}` },
+                    }
+                }
+            })
+            const facade = createPeerBidirectionalFacade({
+                platform: 'desktop',
+                runtime: runtime(events),
+                invoke: invoke as unknown as PeerBidirectionalInvoke,
+            })
+
+            await expect(facade.sync(pairingUri)).rejects.toThrow('sync failed before commit')
+
+            expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
+            expect(events.at(-1)).toBe('release')
+        },
+    )
 
     it('does not suppress a failed resolve when the awaiting-conflict status is unchanged', async () => {
         const events: string[] = []

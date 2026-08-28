@@ -924,6 +924,35 @@ describe('peer bidirectional controller', () => {
         })
     })
 
+    it.each(['sourcePrepared', 'targetPrepared'] as const)(
+        'retains a proven-precommit %s phase after a failed mutation',
+        async (phase) => {
+            let statusCalls = 0
+            const controller = createPeerBidirectionalController({
+                facade: facade({
+                    status: async () => statusCalls++ === 0
+                        ? idleStatus()
+                        : ({
+                              source: { phase: 'idle', devices: [] },
+                              operation: { phase, operationId: `operation-${phase}` },
+                          } as PeerBidirectionalStatus),
+                    sync: async () => { throw new Error('sync failed before commit') },
+                }),
+            })
+            await controller.initialize()
+
+            await expect(controller.sync('pairing')).rejects.toThrow('sync failed before commit')
+
+            expect(controller.snapshot()).toMatchObject({
+                operationPhase: phase,
+                operationId: `operation-${phase}`,
+                operationResult: undefined,
+                operationRetained: true,
+                operationError: 'sync failed before commit',
+            })
+        },
+    )
+
     it('rejects target start while source is active and source start while target is retained', async () => {
         const sync = vi.fn(facade().sync)
         const sourceActive = createPeerBidirectionalController({
