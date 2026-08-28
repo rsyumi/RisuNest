@@ -29,9 +29,11 @@ function androidSafHandoffId(status: NativeFileJobStatus): string | null {
     if (!path) return null
     const pattern = status.kind === 'export-lossless-backup'
         ? /(?:^|[\\/])risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risulossless$/
-        : status.kind === 'export-character-charx'
-            ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.charx$/
-            : null
+        : status.kind === 'export-legacy-local-backup'
+            ? /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/
+            : status.kind === 'export-character-charx'
+                ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.charx$/
+                : null
     return pattern?.exec(path)?.[1] ?? null
 }
 
