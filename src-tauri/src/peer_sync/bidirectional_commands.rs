@@ -55,6 +55,7 @@ thread_local! {
     static SOURCE_COMPLETE_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_PREPARED_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_PREPARED_STORE_PANIC: Cell<bool> = const { Cell::new(false) };
+    static SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
 }
 
@@ -1460,27 +1461,13 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     } else {
         None
     };
-    let (durable_job_id, retained_job_to_release, durable_job) =
+    let (durable_job_id, stage_with_durable_job, durable_job) =
         if let Some(retained_job_id) = retained_source_job_id {
             match DurableCasJob::open(app_root, retained_job_id) {
-                Ok(job) if !job.is_sealed() => (retained_job_id.to_owned(), None, job),
-                Ok(_) => {
-                    let replacement_job_id = uuid::Uuid::new_v4().to_string();
-                    let replacement = DurableCasJob::begin(
-                        app_root,
-                        &replacement_job_id,
-                        CasJobKind::LogicalDeltaTarget,
-                        now_millis()?,
-                    )?;
-                    (
-                        replacement_job_id,
-                        Some(retained_job_id.to_owned()),
-                        replacement,
-                    )
-                }
+                Ok(job) => (retained_job_id.to_owned(), !job.is_sealed(), job),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => (
                     retained_job_id.to_owned(),
-                    None,
+                    true,
                     DurableCasJob::begin(
                         app_root,
                         retained_job_id,
@@ -1498,23 +1485,55 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
                 CasJobKind::LogicalDeltaTarget,
                 now_millis()?,
             )?;
-            (durable_job_id, None, job)
+            (durable_job_id, true, job)
         };
+    if durable_job.kind() != CasJobKind::LogicalDeltaTarget {
+        return Err(PeerSyncError::Storage(
+            "retained source job has an unexpected kind".to_owned(),
+        ));
+    }
+    if durable_job.is_sealed()
+        && !durable_job
+            .root_set()?
+            .object_hashes
+            .contains(&shared_manifest_hash)
+    {
+        return Err(PeerSyncError::Storage(
+            "retained source job does not own the shared manifest".to_owned(),
+        ));
+    }
     let job = RefCell::new(durable_job);
-    let mut target = match PersistentLogicalDeltaTarget::new_p5_remote_shared_ack_with_durable_job(
-        store,
-        cas,
-        peer_id,
-        PRODUCT_LOGICAL_LIBRARY_ID,
-        &local.manifest.generation,
-        shared_manifest_bytes,
-        &app_root.join("peer-bidirectional").join("staging"),
-        &job,
-        LogicalDeltaConflictPolicy::PreferRemote,
-    ) {
+    let staging_root = app_root.join("peer-bidirectional").join("staging");
+    let target = if stage_with_durable_job {
+        PersistentLogicalDeltaTarget::new_p5_remote_shared_ack_with_durable_job(
+            store,
+            cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &local.manifest.generation,
+            shared_manifest_bytes,
+            &staging_root,
+            &job,
+            LogicalDeltaConflictPolicy::PreferRemote,
+        )
+    } else {
+        PersistentLogicalDeltaTarget::new_p5_remote_shared_ack(
+            store,
+            cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &local.manifest.generation,
+            shared_manifest_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::PreferRemote,
+        )
+    };
+    let mut target = match target {
         Ok(target) => target,
         Err(error) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if retained_source.is_none() {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             return Err(error);
         }
     };
@@ -1522,14 +1541,18 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
         Ok(LogicalDeltaPlanResolution::Ready { plan, .. }) => plan,
         Ok(LogicalDeltaPlanResolution::Conflict { .. }) => {
             drop(target);
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if retained_source.is_none() {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             return Err(PeerSyncError::Protocol(
                 "bidirectional remote winner did not resolve its conflicts".to_owned(),
             ));
         }
         Err(error) => {
             drop(target);
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if retained_source.is_none() {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             return Err(error);
         }
     };
@@ -1612,22 +1635,27 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
                     "bidirectional source retry differs from retained evidence".to_owned(),
                 ));
             }
-            #[cfg(test)]
-            if SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.replace(false)) {
-                return Err(PeerSyncError::Storage(
-                    "simulated source-prepared journal failure".to_owned(),
-                ));
-            }
-            if let Some(retained_job_id) = retained_job_to_release.as_deref() {
-                release_retained_source_job(app_root, retained_job_id, CasReleaseOutcome::Aborted)?;
-            }
-            PeerBidirectionalOperationJournal::new(app_root)
-                .store(&evidence.durable_operation(durable_job_id.clone()))?;
-            #[cfg(test)]
-            if SOURCE_AFTER_PREPARED_STORE_PANIC.with(|enabled| enabled.replace(false)) {
-                panic!("simulated process loss after source-prepared journal store");
+            if retained_source.is_none() {
+                #[cfg(test)]
+                if SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.replace(false)) {
+                    return Err(PeerSyncError::Storage(
+                        "simulated source-prepared journal failure".to_owned(),
+                    ));
+                }
+                PeerBidirectionalOperationJournal::new(app_root)
+                    .store(&evidence.durable_operation(durable_job_id.clone()))?;
+                #[cfg(test)]
+                if SOURCE_AFTER_PREPARED_STORE_PANIC.with(|enabled| enabled.replace(false)) {
+                    panic!("simulated process loss after source-prepared journal store");
+                }
             }
             prepared_evidence.replace(Some(evidence));
+            #[cfg(test)]
+            if SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT.with(|enabled| enabled.replace(false)) {
+                return Err(PeerSyncError::Storage(
+                    "simulated source pre-activation failure".to_owned(),
+                ));
+            }
             Ok(())
         },
     );
@@ -1639,14 +1667,18 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
         Ok(LogicalDeltaActivation::Conflict {
             actual_revision, ..
         }) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if prepared_evidence.borrow().is_none() {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             return Err(PeerSyncError::ActivationConflict {
                 expected: Some(expected_revision.to_string()),
                 actual: Some(actual_revision.to_string()),
             });
         }
         Err(error) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if prepared_evidence.borrow().is_none() {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             return Err(error);
         }
     };
@@ -2854,8 +2886,8 @@ pub fn peer_bidirectional_capabilities() -> PeerBidirectionalCapabilities {
         atomic_activation_ready: true,
         authenticated_transport_ready: true,
         lossless_backup_ready: true,
-        durable_state_ready: true,
-        production_enabled: true,
+        durable_state_ready: false,
+        production_enabled: false,
     }
 }
 
@@ -7122,15 +7154,23 @@ mod tests {
             other => panic!("expected source-prepared crash journal, got {other:?}"),
         };
         let crashed_job = DurableCasJob::open(directory.path(), &crashed_job_id).unwrap();
-        assert!(crashed_job.is_sealed());
+        assert!(!crashed_job.is_sealed());
         assert!(crashed_job.pin_count() > 0);
         let crashed_roots = collect_durable_cas_job_roots(directory.path());
         assert!(!crashed_roots.object_hashes.is_empty());
         let retained_object_hash = crashed_roots.object_hashes.iter().next().unwrap().clone();
         let retained_object_size = cas.stat_object(&retained_object_hash).unwrap().unwrap();
-        assert!(!crashed_roots
+        assert!(crashed_roots
             .blockers
             .contains(&format!("job-pin-unsealed:{crashed_job_id}")));
+        assert_eq!(
+            crashed_roots
+                .blockers
+                .iter()
+                .filter(|blocker| blocker.starts_with("job-pin-unsealed:"))
+                .count(),
+            1
+        );
         retry_host.stop().unwrap();
         let handoff_source = LogicalDeltaSourceSession::open(
             remote_directory.path(),
@@ -7162,25 +7202,68 @@ mod tests {
             source_session_id,
             source_device_id,
         );
-        SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
+        SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT.with(|enabled| enabled.set(true));
         let handoff_error = recovery_control
             .remote_apply(session.clone(), request.clone())
             .unwrap_err();
         assert!(
-            matches!(&handoff_error, PeerSyncError::Storage(message) if message.contains("source-prepared")),
+            matches!(&handoff_error, PeerSyncError::Storage(message) if message.contains("pre-activation")),
             "{handoff_error:?}"
         );
         let retained_old_job = DurableCasJob::open(directory.path(), &crashed_job_id).unwrap();
-        assert!(retained_old_job.is_sealed());
+        assert!(!retained_old_job.is_sealed());
         assert_eq!(
             PeerBidirectionalOperationJournal::new(directory.path())
                 .load()
                 .unwrap(),
             Some(crashed_prepared)
         );
-        assert!(!collect_durable_cas_job_roots(directory.path())
+        let retained_roots = collect_durable_cas_job_roots(directory.path());
+        assert!(retained_roots
             .object_hashes
-            .is_empty());
+            .contains(&retained_object_hash));
+        assert!(retained_roots
+            .blockers
+            .contains(&format!("job-pin-unsealed:{crashed_job_id}")));
+        drop(retained_old_job);
+        let mut sealed_retry_job = DurableCasJob::open(directory.path(), &crashed_job_id).unwrap();
+        let mut sealed_retry_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &retry_remote.manifest.generation,
+        )
+        .unwrap();
+        for object in &retry_remote.manifest.objects {
+            match cas.stat_object(&object.hash).unwrap() {
+                Some(size) => sealed_retry_job
+                    .pin_existing(&cas, &object.hash, size, CasObjectRole::DirectObject)
+                    .unwrap(),
+                None => {
+                    let mut reader = sealed_retry_source
+                        .open_object(&LogicalDeltaObject {
+                            hash: object.hash.clone(),
+                            size: object.size,
+                        })
+                        .unwrap();
+                    let prepared = sealed_retry_job
+                        .prepare_reader(&cas, &mut reader, CasObjectRole::DirectObject)
+                        .unwrap();
+                    assert_eq!(prepared.content_hash, object.hash);
+                    assert_eq!(prepared.byte_size, object.size);
+                }
+            }
+        }
+        let mut seal_store = PersistentStore::open(directory.path()).unwrap();
+        sealed_retry_job.seal(&mut seal_store, 0).unwrap();
+        drop(seal_store);
+        let sealed_roots = sealed_retry_job.root_set().unwrap();
+        assert!(sealed_roots
+            .object_hashes
+            .contains(&retry_remote.manifest_hash));
+        assert!(!collect_durable_cas_job_roots(directory.path())
+            .blockers
+            .contains(&format!("job-pin-unsealed:{crashed_job_id}")));
         retry_host.stop().unwrap();
         let completion_source = LogicalDeltaSourceSession::open(
             remote_directory.path(),
@@ -7206,10 +7289,12 @@ mod tests {
         request.source_manifest_id = completion_pairing.manifest_id;
         request.source_claim = completion_pairing.claim;
 
+        SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         SOURCE_COMPLETE_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         let error = recovery_control
             .remote_apply(session.clone(), request.clone())
             .unwrap_err();
+        assert!(SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.replace(false)));
         assert!(
             matches!(&error, PeerSyncError::Storage(message) if message.contains("completion")),
             "{error:?}"
@@ -7225,6 +7310,7 @@ mod tests {
             }
             other => panic!("expected source-prepared completion journal, got {other:?}"),
         };
+        assert_eq!(committed_job_id, crashed_job_id);
         assert!(evidence.transferred_objects > 0);
         assert!(evidence.transferred_bytes > 0);
         assert!(evidence.backup.is_some());

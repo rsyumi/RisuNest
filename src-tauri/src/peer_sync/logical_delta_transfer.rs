@@ -196,12 +196,12 @@ where
     let mut stage = target.begin(plan)?;
     let result = (|| {
         if target.can_activate_without_transfer(&stage) {
-            target.prepare_activation(&mut stage)?;
             before_activation(&LogicalDeltaTransferSelection {
                 reused_from_local_manifest: Vec::new(),
                 reused_from_cas: Vec::new(),
                 missing_objects: Vec::new(),
             })?;
+            target.prepare_activation(&mut stage)?;
             return target.activate_database_and_base_if_current(
                 &mut stage,
                 plan.expected_local_revision,
@@ -216,6 +216,7 @@ where
             target_cas,
             remote_object_sizes,
         )?;
+        before_activation(&selection)?;
         for object in selection.missing_objects() {
             let mut source_reader = source.open_object(object)?;
             let mut verified_reader = VerifiedObjectReader::new(source_reader.as_mut());
@@ -224,7 +225,6 @@ where
         }
         target.stage_database_changes(&mut stage, plan)?;
         target.prepare_activation(&mut stage)?;
-        before_activation(&selection)?;
         target.activate_database_and_base_if_current(
             &mut stage,
             plan.expected_local_revision,
@@ -927,11 +927,12 @@ mod tests {
                 size: b"remote-payload".len() as u64,
             }])
         );
-        assert_eq!(source.content_gets, 1);
+        assert_eq!(source.content_gets, 0);
         assert_eq!(target.active_revision, 7);
         assert_eq!(target.active_base, "1".repeat(64));
         assert_eq!(target.aborts, 1);
-        assert!(target.events.iter().any(|event| event == "prepare"));
+        assert!(!target.events.iter().any(|event| event == "database"));
+        assert!(!target.events.iter().any(|event| event == "prepare"));
         assert_eq!(target.events.last().map(String::as_str), Some("abort"));
         assert!(!target.events.iter().any(|event| event == "activate"));
     }
