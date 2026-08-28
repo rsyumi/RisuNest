@@ -3757,7 +3757,7 @@ mod tests {
                 Some(owner_manifest),
             );
             let backup_path = directory.path().join("pre-replacement.lossless");
-            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let mut store = PersistentStore::open(&repository).unwrap();
             let cas = PayloadCas::new(&repository).unwrap();
             seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -3798,7 +3798,7 @@ mod tests {
             Some(owner_manifest.clone()),
         );
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -3861,7 +3861,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
         let output = directory.path().join("peer-source.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Source", b"source");
 
@@ -3920,7 +3920,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
         let output = directory.path().join("peer-source.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Source", b"source");
         let mut root = store.read_root(None).unwrap().value;
@@ -3964,7 +3964,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
         let output = directory.path().join("managed-source.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Source", b"source");
 
@@ -4387,7 +4387,7 @@ mod tests {
         fs::create_dir(&repository).unwrap();
         let incoming = production_package(directory.path(), "New", b"new");
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
         let activation_attempted = AtomicBool::new(false);
@@ -4430,7 +4430,7 @@ mod tests {
             json!({ "fixtureUnknown": { "preserved": true } }),
         );
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -4528,7 +4528,7 @@ mod tests {
             }),
         );
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -4577,7 +4577,7 @@ mod tests {
             }),
         );
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -4614,7 +4614,7 @@ mod tests {
         fs::create_dir(&repository).unwrap();
         let incoming = production_package(directory.path(), "New", b"new");
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -4937,7 +4937,7 @@ mod tests {
         let preparation = directory.path().join("source-preparation");
         let session_root = directory.path().join("source-session");
         fs::create_dir(&repository).unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Source", b"source");
 
@@ -4981,7 +4981,7 @@ mod tests {
             Some(owner_manifest),
         );
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         cas.prepare_bytes(b"ambient-only").unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
@@ -5011,7 +5011,7 @@ mod tests {
         fs::create_dir(&repository).unwrap();
         let incoming = production_package(directory.path(), "New", b"new");
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store_with_owner_history(&mut store, &cas, "Old", b"old", b"");
 
@@ -5073,8 +5073,7 @@ mod tests {
             fs::create_dir(&repository).unwrap();
             let incoming = production_package(directory.path(), "New", b"new");
             let backup_path = directory.path().join("pre-replacement.lossless");
-            let mut store =
-                crate::persistent_store::PersistentStore::open(directory.path()).unwrap();
+            let mut store = crate::persistent_store::PersistentStore::open(&repository).unwrap();
             let cas = PayloadCas::new(&repository).unwrap();
             seed_active_store(&mut store, &cas, "Old", b"old");
 
@@ -5089,8 +5088,7 @@ mod tests {
             );
 
             drop(store);
-            let reopened =
-                crate::persistent_store::PersistentStore::open(directory.path()).unwrap();
+            let reopened = crate::persistent_store::PersistentStore::open(&repository).unwrap();
             if fail_before_commit {
                 assert_eq!(
                     result.unwrap_err().code,
@@ -5780,8 +5778,8 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
         let incoming = production_package(directory.path(), "New", b"new");
-        let cas = PayloadCas::new(repository).unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
         let backup_path = directory.path().join("cancelled.lossless");
         let cancelled = Arc::new(AtomicBool::new(true));
@@ -5842,7 +5840,7 @@ mod tests {
             cancelled: cancelled.clone(),
         };
         let cas = PayloadCas::new(&repository).unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
         let backup_path = directory.path().join("mid-copy.lossless");
 
@@ -5880,7 +5878,7 @@ mod tests {
         fs::create_dir(&baseline_repository).unwrap();
         let baseline_incoming = production_package(baseline_directory.path(), "New", b"new");
         let baseline_cas = PayloadCas::new(&baseline_repository).unwrap();
-        let mut baseline_store = PersistentStore::open(baseline_directory.path()).unwrap();
+        let mut baseline_store = PersistentStore::open(&baseline_repository).unwrap();
         seed_active_store(&mut baseline_store, &baseline_cas, "Old", b"old");
         let baseline_probe = CheckCountingCancellation {
             calls: AtomicUsize::new(0),
@@ -5906,7 +5904,7 @@ mod tests {
         fs::create_dir(&repository).unwrap();
         let incoming = production_package(directory.path(), "New", b"new");
         let cas = PayloadCas::new(&repository).unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
         let backup_path = directory.path().join("boundary.lossless");
         let cancellation = CheckCountingCancellation {
@@ -5976,7 +5974,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut store = PersistentStore::open(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Old", b"old");
 
         let mut mismatched = production_package(directory.path(), "Mismatch", b"mismatch");
