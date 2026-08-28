@@ -117,17 +117,18 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
     const imgid = arg.id ?? v4()
     const source = sourceUrl || imgObj.currentSrc || imgObj.src
     if (!source) throw new Error('Inlay image source is unavailable')
-    const ready = isTauri ? null : imageReadiness(imgObj, sourceUrl)
     const response = await fetch(source)
     if (!response.ok) throw new Error(`Failed to read Inlay image source: ${response.status}`)
     const data = new Uint8Array(await response.arrayBuffer())
     validateNewInlayImage(data, response.headers.get('Content-Type') ?? '', arg.ext ?? '')
-    if (isTauri) {
+    const nativeFastPath = isTauri && isNativeInlayFormat(data)
+    if (nativeFastPath) {
         const blobStore = await resolveBlobStore()
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
         await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid })
         return imgid
     }
+    const ready = imageReadiness(imgObj, sourceUrl)
 
     let drawHeight = 0
     let drawWidth = 0
@@ -396,6 +397,17 @@ function isAnimatedWebP(data: Uint8Array): boolean {
     return false
 }
 
+function isNativeInlayFormat(data: Uint8Array): boolean {
+    const isPng = data.byteLength >= 8
+        && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47
+        && data[4] === 0x0d && data[5] === 0x0a && data[6] === 0x1a && data[7] === 0x0a
+    const isJpeg = data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff
+    const isWebP = data.byteLength >= 12
+        && new TextDecoder().decode(data.subarray(0, 4)) === 'RIFF'
+        && new TextDecoder().decode(data.subarray(8, 12)) === 'WEBP'
+    return isPng || isJpeg || isWebP
+}
+
 function isAnimatedPng(data: Uint8Array): boolean {
     const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
     if (data.byteLength < pngSignature.length
@@ -463,7 +475,7 @@ export async function setInlayAsset(id: string, img: InlayAsset){
     const { bytes, mime } = await inlayBytes(img)
     const blobStore = await resolveBlobStore()
     if (img.type === 'image') validateNewInlayImage(bytes, mime, img.ext)
-    if (isTauri && img.type === 'image') {
+    if (isTauri && img.type === 'image' && isNativeInlayFormat(bytes)) {
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
         await blobStore.putNewInlayImage(id, bytes, { name: img.name })
         return

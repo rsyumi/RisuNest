@@ -25,6 +25,11 @@ const nativeStore = {
         return metadata
     },
     async putNewInlayImage(key: string, data: Uint8Array, input: { name: string }) {
+        const png = data.length >= 8 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47
+        const jpeg = data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff
+        const webp = data.length >= 12 && new TextDecoder().decode(data.subarray(0, 4)) === 'RIFF'
+            && new TextDecoder().decode(data.subarray(8, 12)) === 'WEBP'
+        if (!png && !jpeg && !webp) throw new Error('unsupported new Inlay image format: Bmp')
         native.optimizedWrites.push({ key, data: data.slice(), name: input.name })
         const metadata: InlayBlobMetadata = {
             key, kind: 'inlay', size: 3, mime: 'image/webp', name: input.name,
@@ -197,7 +202,7 @@ describe('native inlay fresh-install boundary', () => {
     })
 
     test('new image writes use the native optimizer without an opaque BlobStore put', async () => {
-        const source = Uint8Array.of(1, 2, 3, 4)
+        const source = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
 
         await setInlayAsset('new-image', {
             data: new Blob([source], { type: 'image/png' }),
@@ -214,7 +219,7 @@ describe('native inlay fresh-install boundary', () => {
     })
 
     test('native file image posts send original source bytes directly to the optimizer', async () => {
-        const source = Uint8Array.of(9, 8, 7, 6)
+        const source = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
         const createObjectURL = vi.spyOn(URL, 'createObjectURL')
 
         await expect(postInlayAsset({ name: 'upload.png', data: source })).resolves.toBe('native-test-id')
@@ -226,7 +231,7 @@ describe('native inlay fresh-install boundary', () => {
     })
 
     test('native generated images fetch their source bytes without a canvas round trip', async () => {
-        const source = Uint8Array.of(5, 4, 3, 2)
+        const source = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
         const fetchSource = vi.fn(async () => new Response(source, {
             headers: { 'Content-Type': 'image/png' },
         }))
@@ -243,5 +248,48 @@ describe('native inlay fresh-install boundary', () => {
         expect(native.optimizedWrites).toEqual([{
             key: 'generated', data: source, name: 'generated.png',
         }])
+    })
+
+    test('browser-decodable BMP images fall back to a WebP BlobStore write', async () => {
+        const bmp = Uint8Array.of(0x42, 0x4d, 0, 0)
+        const fetchSource = vi.fn(async () => new Response(bmp, {
+            headers: { 'Content-Type': 'image/bmp' },
+        }))
+        const drawImage = vi.fn()
+        const toBlob = vi.fn((callback: BlobCallback) => callback(new Blob([Uint8Array.of(8, 5, 0)], { type: 'image/webp' })))
+        vi.stubGlobal('fetch', fetchSource)
+        vi.stubGlobal('Image', class {
+            complete = false
+            naturalHeight = 4
+            naturalWidth = 6
+            height = 4
+            width = 6
+            onerror: (() => void) | null = null
+            onload: (() => void) | null = null
+            set src(_value: string) { this.onload?.() }
+        })
+        vi.stubGlobal('document', {
+            createElement: vi.fn(() => ({
+                getContext: vi.fn(() => ({ drawImage })),
+                height: 0,
+                toBlob,
+                width: 0,
+            })),
+        })
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:native-bmp')
+        vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+        await setInlayAsset('bmp-image', {
+            data: new Blob([bmp], { type: 'image/bmp' }),
+            ext: 'bmp', name: 'source.bmp', type: 'image',
+        })
+
+        expect(native.optimizedWrites).toEqual([])
+        expect(native.opaqueWrites).toEqual(['bmp-image'])
+        expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 6, 4)
+        expect(toBlob).toHaveBeenCalledWith(expect.any(Function), 'image/webp', 0.85)
+        await expect(getInlayAssetMetadata('bmp-image')).resolves.toMatchObject({
+            mime: 'image/webp', ext: 'webp', width: 6, height: 4,
+        })
     })
 })
