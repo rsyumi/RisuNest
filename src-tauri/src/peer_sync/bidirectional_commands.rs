@@ -4088,6 +4088,21 @@ mod tests {
         }
     }
 
+    fn durable_job_journal_ids(repository_root: &Path) -> Vec<String> {
+        let directory = repository_root.join("assets-v2").join("job-pins");
+        let mut ids = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter_map(|name| {
+                name.strip_prefix("job-")
+                    .and_then(|name| name.strip_suffix(".journal"))
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     #[test]
     fn local_committed_operation_survives_reopen_and_atomic_completion() {
         let directory = tempfile::tempdir().unwrap();
@@ -4851,6 +4866,131 @@ mod tests {
                 ..
             }) if replayed == receipt && replayed.committed_revision == 0
         ));
+    }
+
+    fn assert_invalid_retained_sealed_source_job(
+        kind: CasJobKind,
+        pin_shared_manifest: bool,
+        expected_message: &str,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let target_device_id = "123e4567-e89b-42d3-a456-426614174039";
+        let source_device_id = "123e4567-e89b-42d3-a456-426614174040";
+        let operation_id = "123e4567-e89b-42d3-a456-426614174041";
+        let durable_job_id = "123e4567-e89b-42d3-a456-426614174042";
+        let previous = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            target_device_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    target_device_id,
+                    previous.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let shared_generation = LanBidirectionalGeneration {
+            generation_id: previous.generation_id.clone(),
+            manifest_hash: previous.manifest_hash.clone(),
+            generation_sequence: previous.generation_sequence.clone(),
+        };
+        let evidence = SourcePreparedEvidence {
+            operation_id: operation_id.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+            expected_source_revision: 0,
+            previous_shared: previous.clone(),
+            expected_source_generation: previous.clone(),
+            shared_generation: shared_generation.clone(),
+            incoming_revision: 0,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backup: None,
+        };
+        let mut job = DurableCasJob::begin(directory.path(), durable_job_id, kind, 0).unwrap();
+        if pin_shared_manifest {
+            let size = cas
+                .stat_object(&base.manifest_hash)
+                .unwrap()
+                .expect("sealed active manifest must exist in the CAS");
+            job.pin_existing(&cas, &base.manifest_hash, size, CasObjectRole::DirectObject)
+                .unwrap();
+        }
+        job.seal(&mut store, 0).unwrap();
+        PeerBidirectionalOperationJournal::new(directory.path())
+            .store(&evidence.durable_operation(durable_job_id.to_owned()))
+            .unwrap();
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            reads: 0,
+        };
+
+        let error = apply_bidirectional_remote_shared_inner(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            target_device_id,
+            0,
+            &previous.manifest_hash,
+            &previous,
+            shared_generation,
+            &base.manifest_bytes,
+            &mut source,
+            false,
+            Some(source_device_id),
+            Some(&evidence),
+            Some(durable_job_id),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, PeerSyncError::Storage(message) if message == expected_message),
+            "{error:?}"
+        );
+        assert_eq!(store.revision().unwrap(), 0);
+        assert!(DurableCasJob::open(directory.path(), durable_job_id)
+            .unwrap()
+            .is_sealed());
+    }
+
+    #[test]
+    fn retained_sealed_source_job_rejects_an_unexpected_kind() {
+        assert_invalid_retained_sealed_source_job(
+            CasJobKind::DirectAssetOrInlayWrite,
+            true,
+            "retained source job has an unexpected kind",
+        );
+    }
+
+    #[test]
+    fn retained_sealed_source_job_requires_the_shared_manifest_root() {
+        assert_invalid_retained_sealed_source_job(
+            CasJobKind::LogicalDeltaTarget,
+            false,
+            "retained source job does not own the shared manifest",
+        );
     }
 
     #[test]
@@ -7597,6 +7737,46 @@ mod tests {
         assert!(!collect_durable_cas_job_roots(directory.path())
             .blockers
             .contains(&format!("job-pin-unsealed:{crashed_job_id}")));
+        retry_host.stop().unwrap();
+        let observer_source = LogicalDeltaSourceSession::open(
+            remote_directory.path(),
+            remote_directory.path(),
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &retry_remote.manifest.generation,
+        )
+        .unwrap();
+        let observer_prepared = super::super::lan::PreparedLogicalLanSession::new(
+            &uuid::Uuid::new_v4().to_string(),
+            target_device_id,
+            retry_remote.manifest_hash.clone(),
+            retry_remote.manifest_bytes.clone(),
+            observer_source.objects().to_vec(),
+            Box::new(observer_source),
+        )
+        .unwrap();
+        retry_host = LanCloneHost::prepare_logical(observer_prepared);
+        let observer_pairing = retry_host.start().unwrap();
+        request.source_endpoint =
+            format!("http://127.0.0.1:{}", retry_host.address().unwrap().port());
+        request.source_session_id = observer_pairing.session_id;
+        request.source_manifest_id = observer_pairing.manifest_id;
+        request.source_claim = observer_pairing.claim;
+
+        SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT.with(|enabled| enabled.set(true));
+        let observer_error = recovery_control
+            .remote_apply(session.clone(), request.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&observer_error, PeerSyncError::Storage(message) if message.contains("pre-activation")),
+            "{observer_error:?}"
+        );
+        assert_eq!(
+            durable_job_journal_ids(directory.path()),
+            vec![crashed_job_id.clone()]
+        );
+        assert!(DurableCasJob::open(directory.path(), &crashed_job_id)
+            .unwrap()
+            .is_sealed());
         retry_host.stop().unwrap();
         let completion_source = LogicalDeltaSourceSession::open(
             remote_directory.path(),
