@@ -20,7 +20,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -323,6 +323,38 @@ pub(super) fn cleanup_abandoned_logical_staging(connection: &mut Connection) -> 
 }
 
 impl PersistentStore {
+    pub(crate) fn logical_generation_descends_from(
+        &self,
+        library_id: &str,
+        descendant_generation_id: &str,
+        ancestor_generation_id: &str,
+    ) -> StoreResult<bool> {
+        let mut current = descendant_generation_id.to_owned();
+        let mut visited = BTreeSet::new();
+        loop {
+            if current == ancestor_generation_id {
+                return Ok(true);
+            }
+            if !visited.insert(current.clone()) {
+                return validation("logical generation ancestry contains a cycle");
+            }
+            let parent = self
+                .connection
+                .query_row(
+                    "SELECT parent_generation_id FROM logical_sync_generations
+                     WHERE library_id = ?1 AND generation_id = ?2
+                       AND state = 'complete' AND completed_at IS NOT NULL",
+                    params![library_id, current],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            let Some(Some(parent)) = parent else {
+                return Ok(false);
+            };
+            current = parent;
+        }
+    }
+
     pub(crate) fn seal_or_initialize_active_logical_generation(
         &mut self,
         cas: &PayloadCas,

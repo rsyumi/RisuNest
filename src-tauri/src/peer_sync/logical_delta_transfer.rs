@@ -164,9 +164,39 @@ where
     S: LogicalDeltaObjectSource,
     T: LogicalDeltaStagedTarget,
 {
+    execute_logical_delta_pull_with_pre_activation(
+        plan,
+        local_manifest_object_hashes,
+        target_cas,
+        remote_object_sizes,
+        source,
+        target,
+        |_| Ok(()),
+    )
+}
+
+pub(crate) fn execute_logical_delta_pull_with_pre_activation<S, T, F>(
+    plan: &ReadyLogicalDeltaPlan,
+    local_manifest_object_hashes: &BTreeSet<String>,
+    target_cas: &PayloadCas,
+    remote_object_sizes: &BTreeMap<String, u64>,
+    source: &mut S,
+    target: &mut T,
+    before_activation: F,
+) -> Result<LogicalDeltaActivation, PeerSyncError>
+where
+    S: LogicalDeltaObjectSource,
+    T: LogicalDeltaStagedTarget,
+    F: FnOnce(&LogicalDeltaTransferSelection) -> Result<(), PeerSyncError>,
+{
     let mut stage = target.begin(plan)?;
     let result = (|| {
         if target.can_activate_without_transfer(&stage) {
+            before_activation(&LogicalDeltaTransferSelection {
+                reused_from_local_manifest: Vec::new(),
+                reused_from_cas: Vec::new(),
+                missing_objects: Vec::new(),
+            })?;
             return target.activate_database_and_base_if_current(
                 &mut stage,
                 plan.expected_local_revision,
@@ -188,6 +218,7 @@ where
             verified_reader.finish(object)?;
         }
         target.stage_database_changes(&mut stage, plan)?;
+        before_activation(&selection)?;
         target.activate_database_and_base_if_current(
             &mut stage,
             plan.expected_local_revision,
@@ -392,9 +423,10 @@ impl Read for VerifiedObjectReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_logical_delta_pull, select_missing_logical_delta_objects, LogicalDeltaActivation,
-        LogicalDeltaApplyOperation, LogicalDeltaObject, LogicalDeltaObjectSource,
-        LogicalDeltaStagedTarget, ReadyLogicalDeltaPlan,
+        execute_logical_delta_pull, execute_logical_delta_pull_with_pre_activation,
+        select_missing_logical_delta_objects, LogicalDeltaActivation, LogicalDeltaApplyOperation,
+        LogicalDeltaObject, LogicalDeltaObjectSource, LogicalDeltaStagedTarget,
+        ReadyLogicalDeltaPlan,
     };
     use crate::{asset_repository::PayloadCas, peer_sync::PeerSyncError};
     use sha2::{Digest, Sha256};
@@ -840,6 +872,55 @@ mod tests {
         assert_eq!(target.active_base, "2".repeat(64));
         assert_eq!(target.active_base_generation_sequence, "8");
         assert_eq!(target.aborts, 0);
+    }
+
+    #[test]
+    fn pre_activation_evidence_is_persisted_after_staging_and_before_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), payload)]),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+        let mut evidence = None;
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash.clone(), b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+            |selection| {
+                evidence = Some(selection.missing_objects().to_vec());
+                Err(PeerSyncError::Storage(
+                    "simulated durable evidence failure".to_owned(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PeerSyncError::Storage(message) if message.contains("evidence")));
+        assert_eq!(
+            evidence,
+            Some(vec![LogicalDeltaObject {
+                hash: payload_hash,
+                size: b"remote-payload".len() as u64,
+            }])
+        );
+        assert_eq!(source.content_gets, 1);
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.active_base, "1".repeat(64));
+        assert_eq!(target.aborts, 1);
+        assert_eq!(target.events.last().map(String::as_str), Some("abort"));
+        assert!(!target.events.iter().any(|event| event == "activate"));
     }
 
     #[test]
