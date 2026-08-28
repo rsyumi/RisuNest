@@ -580,6 +580,70 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
     roots
 }
 
+pub(crate) fn reclaim_abandoned_durable_cas_jobs(
+    repository_root: &Path,
+    job_id_prefix: &str,
+    expected_kind: CasJobKind,
+) -> io::Result<usize> {
+    if job_id_prefix.is_empty()
+        || job_id_prefix.len() >= 64
+        || !job_id_prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return invalid_data("CAS job owner prefix is invalid");
+    }
+    let Some((repository_root, directory)) = job_pin_directory(repository_root, false)? else {
+        return Ok(0);
+    };
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        paths.push(entry?.path());
+        if paths.len() > MAX_DURABLE_CAS_JOB_JOURNALS {
+            return invalid_data("CAS job journal limit exceeded");
+        }
+    }
+    paths.sort();
+
+    let mut candidates = Vec::new();
+    for path in paths {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(job_id) = file_name
+            .strip_prefix("job-")
+            .and_then(|name| name.strip_suffix(".journal"))
+        else {
+            continue;
+        };
+        if !job_id.starts_with(job_id_prefix) {
+            continue;
+        }
+        validate_job_id(job_id)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || is_link_like(&metadata) {
+            return invalid_data("owned CAS job journal is not a real file");
+        }
+        let state = File::open(&path)
+            .and_then(|mut file| read_job_state(&mut file, Some(job_id), false))?;
+        if state.kind != expected_kind {
+            return invalid_data("owned CAS job kind does not match its cleanup owner");
+        }
+        candidates.push((path, state));
+    }
+
+    let reclaimed = candidates.len();
+    for (journal_path, state) in candidates {
+        DurableCasJob {
+            repository_root: repository_root.clone(),
+            journal_path,
+            state,
+        }
+        .release(CasReleaseOutcome::Aborted)?;
+    }
+    Ok(reclaimed)
+}
+
 fn root_set_from_state(state: &JobState) -> AssetRootSet {
     let mut roots = AssetRootSet::default();
     for (hash, pin) in &state.pins {
@@ -883,8 +947,9 @@ fn sync_directory(_path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_durable_cas_job_roots, write_record, CasJobKind, CasObjectRole, CasReleaseOutcome,
-        DurableCasJob, JobJournalRecord, DURABLE_CAS_JOB_VERSION, MAX_DURABLE_CAS_JOB_PINS,
+        collect_durable_cas_job_roots, reclaim_abandoned_durable_cas_jobs, write_record,
+        CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob, JobJournalRecord,
+        DURABLE_CAS_JOB_VERSION, MAX_DURABLE_CAS_JOB_PINS,
     };
     use crate::asset_repository::owner_manifest_codec::{
         encode_owner_manifest, OwnerManifestEntry,
@@ -897,6 +962,134 @@ mod tests {
     #[test]
     fn durable_job_supports_normal_fifty_thousand_asset_packages() {
         assert!(MAX_DURABLE_CAS_JOB_PINS >= 50_000);
+    }
+
+    #[test]
+    fn abandoned_job_reclaim_releases_only_the_exact_owner_prefix() {
+        let directory = tempfile::tempdir().expect("create reclaim directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+
+        let mut sealed_owned = DurableCasJob::begin(
+            directory.path(),
+            "p4-delta-target-00000000-0000-4000-8000-000000000001",
+            CasJobKind::LogicalDeltaTarget,
+            1,
+        )
+        .expect("begin sealed owned job");
+        let owned = sealed_owned
+            .prepare_bytes(&cas, b"owned logical target", CasObjectRole::DirectObject)
+            .expect("prepare owned object");
+        sealed_owned.seal(&mut store, 2).expect("seal owned job");
+        let sealed_owned_path = sealed_owned.journal_path().to_path_buf();
+        drop(sealed_owned);
+
+        let unsealed_owned = DurableCasJob::begin(
+            directory.path(),
+            "p4-delta-target-00000000-0000-4000-8000-000000000002",
+            CasJobKind::LogicalDeltaTarget,
+            3,
+        )
+        .expect("begin unsealed owned job");
+        let unsealed_owned_path = unsealed_owned.journal_path().to_path_buf();
+        drop(unsealed_owned);
+
+        let canonical_job_id = "00000000-0000-4000-8000-000000000003";
+        let mut unrelated = DurableCasJob::begin(
+            directory.path(),
+            canonical_job_id,
+            CasJobKind::LogicalDeltaTarget,
+            4,
+        )
+        .expect("begin unrelated logical target job");
+        let unrelated_object = unrelated
+            .prepare_bytes(
+                &cas,
+                b"unrelated logical target",
+                CasObjectRole::DirectObject,
+            )
+            .expect("prepare unrelated object");
+        unrelated.seal(&mut store, 5).expect("seal unrelated job");
+        let unrelated_path = unrelated.journal_path().to_path_buf();
+        drop(unrelated);
+
+        assert_eq!(
+            reclaim_abandoned_durable_cas_jobs(
+                directory.path(),
+                "p4-delta-target-",
+                CasJobKind::LogicalDeltaTarget,
+            )
+            .expect("reclaim owned jobs"),
+            2
+        );
+
+        assert!(!sealed_owned_path.exists());
+        assert!(!unsealed_owned_path.exists());
+        assert!(unrelated_path.exists());
+        let roots = collect_durable_cas_job_roots(directory.path());
+        assert!(!roots.object_hashes.contains(&owned.content_hash));
+        assert!(roots.object_hashes.contains(&unrelated_object.content_hash));
+    }
+
+    #[test]
+    fn abandoned_job_reclaim_preserves_an_owned_wrong_kind() {
+        let directory = tempfile::tempdir().expect("create wrong-kind directory");
+        let job = DurableCasJob::begin(
+            directory.path(),
+            "p4-delta-target-00000000-0000-4000-8000-000000000004",
+            CasJobKind::PeerClone,
+            1,
+        )
+        .expect("begin wrong-kind job");
+        let path = job.journal_path().to_path_buf();
+        drop(job);
+
+        let error = reclaim_abandoned_durable_cas_jobs(
+            directory.path(),
+            "p4-delta-target-",
+            CasJobKind::LogicalDeltaTarget,
+        )
+        .expect_err("wrong-kind job must fail closed");
+
+        assert!(error.to_string().contains("kind"));
+        assert!(path.exists());
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("p4-delta-target-")));
+    }
+
+    #[test]
+    fn abandoned_job_reclaim_preserves_an_owned_corrupt_journal_byte_for_byte() {
+        let directory = tempfile::tempdir().expect("create corrupt reclaim directory");
+        let job = DurableCasJob::begin(
+            directory.path(),
+            "p4-delta-target-00000000-0000-4000-8000-000000000005",
+            CasJobKind::LogicalDeltaTarget,
+            1,
+        )
+        .expect("begin corrupt candidate");
+        let path = job.journal_path().to_path_buf();
+        drop(job);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open corrupt candidate")
+            .write_all(&[3, 0])
+            .expect("append incomplete frame");
+        let before = std::fs::read(&path).expect("read corrupt candidate");
+
+        assert!(reclaim_abandoned_durable_cas_jobs(
+            directory.path(),
+            "p4-delta-target-",
+            CasJobKind::LogicalDeltaTarget,
+        )
+        .is_err());
+
+        assert_eq!(
+            std::fs::read(&path).expect("reread corrupt candidate"),
+            before
+        );
     }
 
     #[test]

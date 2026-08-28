@@ -82,6 +82,7 @@ pub(crate) struct PersistentLogicalDeltaTarget<'a> {
     same_run_job_prepared_objects: BTreeSet<String>,
     conflict_policy: LogicalDeltaConflictPolicy,
     activation_mode: LogicalDeltaActivationMode,
+    durable_abort_succeeded: bool,
     #[cfg(test)]
     payload_reprepare_count: Cell<usize>,
 }
@@ -598,6 +599,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             same_run_job_prepared_objects: BTreeSet::new(),
             conflict_policy,
             activation_mode,
+            durable_abort_succeeded: false,
             #[cfg(test)]
             payload_reprepare_count: Cell::new(0),
         })
@@ -630,6 +632,10 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             job.borrow_mut().seal(self.store, unix_millis()?)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn durable_abort_succeeded(&self) -> bool {
+        self.durable_abort_succeeded
     }
 
     fn validate_plan_identity(&self, plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError> {
@@ -2307,6 +2313,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
     }
 
     fn abort(&mut self, stage: Self::Stage) -> Result<(), PeerSyncError> {
+        self.durable_abort_succeeded = false;
         let PersistentLogicalDeltaStage::Changed {
             staging_id,
             logical_generation_id,
@@ -2316,9 +2323,11 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             ..
         } = stage
         else {
+            self.durable_abort_succeeded = true;
             return Ok(());
         };
         if !initialized {
+            self.durable_abort_succeeded = true;
             return Ok(());
         }
         let transaction = self
@@ -2335,7 +2344,9 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         delete_logical_generation(&transaction, &self.library_id, &logical_generation_id)?;
         delete_generation(&transaction, &staging_id)?;
         transaction.commit().map_err(sql_error)?;
-        remove_staging_directory(&self.staging_root, &staging_directory)
+        remove_staging_directory(&self.staging_root, &staging_directory)?;
+        self.durable_abort_succeeded = true;
+        Ok(())
     }
 }
 
@@ -7780,6 +7791,7 @@ mod tests {
             }
         );
         target.abort(stage).unwrap();
+        assert!(target.durable_abort_succeeded());
         drop(target);
 
         assert_eq!(store.revision().unwrap(), 0);

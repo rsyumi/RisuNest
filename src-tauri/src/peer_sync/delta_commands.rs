@@ -7,7 +7,9 @@ use super::{
 };
 use crate::{
     asset_repository::{
-        job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
+        job_pins::{
+            reclaim_abandoned_durable_cas_jobs, CasJobKind, CasReleaseOutcome, DurableCasJob,
+        },
         PayloadCas,
     },
     persistent_store::{
@@ -30,6 +32,8 @@ use std::{
 use tauri::{AppHandle, Manager, State};
 
 const SOURCE_DEVICE_ID_FILE: &str = "source-device-id";
+const P4_DELTA_TARGET_JOB_PREFIX: &str = "p4-delta-target-";
+const P4_SOURCE_PIN_PREFIX: &str = "logical-session-p4-source-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -398,7 +402,7 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
         });
     }
 
-    let job_id = uuid::Uuid::new_v4().to_string();
+    let job_id = format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", uuid::Uuid::new_v4());
     let job = RefCell::new(DurableCasJob::begin(
         app_root,
         &job_id,
@@ -461,7 +465,26 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
         &mut target,
     );
     let (transferred_objects, transferred_bytes) = measured_source.totals();
+    let durable_abort_succeeded = target.durable_abort_succeeded();
     drop(target);
+    finish_pull(
+        &job,
+        &plan,
+        activation,
+        transferred_objects,
+        transferred_bytes,
+        durable_abort_succeeded,
+    )
+}
+
+fn finish_pull(
+    job: &RefCell<DurableCasJob>,
+    plan: &ReadyLogicalDeltaPlan,
+    activation: Result<LogicalDeltaActivation, PeerSyncError>,
+    transferred_objects: u64,
+    transferred_bytes: u64,
+    durable_abort_succeeded: bool,
+) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match activation {
         Ok(LogicalDeltaActivation::Activated { revision }) => {
             let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
@@ -499,7 +522,7 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
             ))
         }
         Err(error) => {
-            if !job.borrow().is_sealed() {
+            if !job.borrow().is_sealed() || durable_abort_succeeded {
                 let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
             }
             classify_plan_error(error)
@@ -532,9 +555,7 @@ fn finish_bootstrap(
             classify_plan_error(error)
         }
         Err(error) => {
-            if !job.borrow().is_sealed() {
-                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-            }
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
             Err(error)
         }
     }
@@ -607,14 +628,16 @@ pub async fn peer_delta_prepare(
         let prepared = (|| {
             let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
             let built = persistent_store::commands::with_store_mut(app.state(), |store| {
+                store.reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)?;
                 store.seal_or_initialize_active_logical_generation(&cas)
             })
             .map_err(|error| error.to_string())?;
-            let session = LogicalDeltaSourceSession::open(
+            let session = LogicalDeltaSourceSession::open_owned(
                 &app_root,
                 &app_root,
                 &built.manifest.library_id,
                 &built.manifest.generation,
+                P4_SOURCE_PIN_PREFIX,
             )
             .map_err(|error| error.to_string())?;
             let source_device_id = load_or_create_source_device_id(
@@ -692,6 +715,12 @@ pub async fn peer_delta_pull(
     let app_root = app_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = state.begin_pull().map_err(|error| error.to_string())?;
+        reclaim_abandoned_durable_cas_jobs(
+            &app_root,
+            P4_DELTA_TARGET_JOB_PREFIX,
+            CasJobKind::LogicalDeltaTarget,
+        )
+        .map_err(|error| error.to_string())?;
         let mut client = LanLogicalDeltaClient::claim(&endpoint, &session_id, &manifest_id, &claim)
             .map_err(|error| error.to_string())?;
         let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
@@ -1040,6 +1069,111 @@ mod tests {
             Default::default()
         );
         assert_eq!(store.revision().unwrap(), 0);
+    }
+
+    #[test]
+    fn sealed_target_error_releases_roots_after_a_successful_durable_abort() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "p4-delta-target-00000000-0000-4000-8000-000000000006",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .unwrap(),
+        );
+        job.borrow_mut()
+            .prepare_bytes(&cas, b"aborted target", CasObjectRole::DirectObject)
+            .unwrap();
+        job.borrow_mut().seal(&mut store, 0).unwrap();
+
+        let error = finish_pull(
+            &job,
+            &activation_conflict_plan(),
+            Err(PeerSyncError::Storage("activation failed".to_owned())),
+            0,
+            0,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("activation failed"));
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn sealed_target_error_preserves_roots_when_durable_abort_cleanup_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "p4-delta-target-00000000-0000-4000-8000-000000000007",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .unwrap(),
+        );
+        let prepared = job
+            .borrow_mut()
+            .prepare_bytes(&cas, b"retained target", CasObjectRole::DirectObject)
+            .unwrap();
+        job.borrow_mut().seal(&mut store, 0).unwrap();
+
+        assert!(finish_pull(
+            &job,
+            &activation_conflict_plan(),
+            Err(PeerSyncError::Storage(
+                "activation and abort failed".to_owned()
+            )),
+            0,
+            0,
+            false,
+        )
+        .is_err());
+
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .object_hashes
+            .contains(&prepared.content_hash));
+    }
+
+    #[test]
+    fn generic_bootstrap_error_releases_its_sealed_durable_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "p4-delta-target-00000000-0000-4000-8000-000000000008",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .unwrap(),
+        );
+        job.borrow_mut()
+            .prepare_bytes(&cas, b"bootstrap target", CasObjectRole::DirectObject)
+            .unwrap();
+        job.borrow_mut().seal(&mut store, 0).unwrap();
+
+        assert!(finish_bootstrap(
+            &job,
+            0,
+            Err(PeerSyncError::Storage("bootstrap failed".to_owned())),
+        )
+        .is_err());
+
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
     }
 
     fn activation_conflict_plan() -> ReadyLogicalDeltaPlan {

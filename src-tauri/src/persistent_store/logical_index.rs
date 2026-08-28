@@ -627,6 +627,16 @@ impl PersistentStore {
         library_id: &str,
         generation_id: &str,
     ) -> StoreResult<String> {
+        self.pin_logical_generation_with_prefix(library_id, generation_id, "logical-session-")
+    }
+
+    pub(crate) fn pin_logical_generation_with_prefix(
+        &mut self,
+        library_id: &str,
+        generation_id: &str,
+        session_id_prefix: &str,
+    ) -> StoreResult<String> {
+        validate_logical_session_pin_prefix(session_id_prefix)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -641,7 +651,7 @@ impl PersistentStore {
         if !complete {
             return validation("only a complete logical generation can be session-pinned");
         }
-        let session_id = format!("logical-session-{}", uuid::Uuid::new_v4());
+        let session_id = format!("{session_id_prefix}{}", uuid::Uuid::new_v4());
         transaction.execute(
             "INSERT INTO logical_generation_session_pins (
                 session_id, library_id, generation_id, created_at
@@ -650,6 +660,23 @@ impl PersistentStore {
         )?;
         transaction.commit()?;
         Ok(session_id)
+    }
+
+    pub(crate) fn reclaim_logical_generation_pins(
+        &mut self,
+        session_id_prefix: &str,
+    ) -> StoreResult<usize> {
+        validate_logical_session_pin_prefix(session_id_prefix)?;
+        if session_id_prefix == "logical-session-" {
+            return validation("logical generation pin cleanup requires an owner prefix");
+        }
+        self.connection
+            .execute(
+                "DELETE FROM logical_generation_session_pins
+                 WHERE substr(session_id, 1, length(?1)) = ?1",
+                [session_id_prefix],
+            )
+            .map_err(Into::into)
     }
 
     pub(crate) fn resume_logical_generation_pin(
@@ -3458,6 +3485,18 @@ fn missing_source(kind: &str) -> StoreError {
     }
 }
 
+fn validate_logical_session_pin_prefix(prefix: &str) -> StoreResult<()> {
+    if !prefix.starts_with("logical-session-")
+        || prefix.len() > 96
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return validation("logical generation session pin prefix is invalid");
+    }
+    Ok(())
+}
+
 fn validation<T>(message: impl Into<String>) -> StoreResult<T> {
     Err(StoreError::Validation {
         message: message.into(),
@@ -4802,6 +4841,89 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("session-pinned"));
         store.release_logical_generation_pin(&session).unwrap();
+        store
+            .prune_logical_generation("library", "generation-0")
+            .unwrap();
+    }
+
+    #[test]
+    fn owner_scoped_session_pin_reclaim_preserves_other_owners_and_legacy_pins() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let p4 = store
+            .pin_logical_generation_with_prefix(
+                "library",
+                "generation-0",
+                "logical-session-p4-source-",
+            )
+            .unwrap();
+        let p5 = store
+            .pin_logical_generation_with_prefix(
+                "library",
+                "generation-0",
+                "logical-session-p5-source-",
+            )
+            .unwrap();
+        let legacy = store
+            .pin_logical_generation("library", "generation-0")
+            .unwrap();
+
+        assert!(p4.starts_with("logical-session-p4-source-"));
+        assert!(p5.starts_with("logical-session-p5-source-"));
+        assert_eq!(
+            store
+                .reclaim_logical_generation_pins("logical-session-p4-source-")
+                .unwrap(),
+            1
+        );
+
+        let present = |session_id: &str| {
+            store
+                .connection
+                .query_row::<bool, _, _>(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM logical_generation_session_pins WHERE session_id = ?1
+                     )",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(!present(&p4));
+        assert!(present(&p5));
+        assert!(present(&legacy));
+    }
+
+    #[test]
+    fn owner_scoped_session_pin_reclaim_unblocks_generation_prune() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        store
+            .pin_logical_generation_with_prefix(
+                "library",
+                "generation-0",
+                "logical-session-p4-source-",
+            )
+            .unwrap();
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        assert!(store
+            .prune_logical_generation("library", "generation-0")
+            .unwrap_err()
+            .to_string()
+            .contains("session-pinned"));
+
+        assert_eq!(
+            store
+                .reclaim_logical_generation_pins("logical-session-p4-source-")
+                .unwrap(),
+            1
+        );
         store
             .prune_logical_generation("library", "generation-0")
             .unwrap();

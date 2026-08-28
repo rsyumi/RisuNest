@@ -288,6 +288,25 @@ fn durable_logical_session_can_resume_after_store_reopen_without_duplicate_pins(
 }
 
 #[test]
+fn owned_logical_source_uses_the_requested_session_prefix() {
+    let fixture = SourceFixture::create();
+    let mut source = LogicalDeltaSourceSession::open_owned(
+        fixture.directory.path(),
+        fixture.directory.path(),
+        "library",
+        "generation-0",
+        "logical-session-p4-source-",
+    )
+    .expect("open owned logical source");
+
+    assert!(source
+        .session_id()
+        .starts_with("logical-session-p4-source-"));
+    source.release().expect("release owned logical source");
+    assert_eq!(logical_source_pin_count(fixture.directory.path()), 0);
+}
+
+#[test]
 fn source_open_rejects_missing_or_incomplete_logical_generations_without_leaking_a_session() {
     let fixture = SourceFixture::create();
     let missing = match LogicalDeltaSourceSession::open(

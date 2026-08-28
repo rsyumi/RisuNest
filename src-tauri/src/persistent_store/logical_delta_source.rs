@@ -38,6 +38,21 @@ impl LogicalDeltaSourceSession {
         Self::from_pinned(store, cas, library_id, generation_id, session_id)
     }
 
+    pub(crate) fn open_owned(
+        app_data_dir: &Path,
+        repository_root: &Path,
+        library_id: &str,
+        generation_id: &str,
+        session_id_prefix: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let cas = PayloadCas::new(repository_root)?;
+        let mut store = PersistentStore::open(app_data_dir).map_err(map_store_error)?;
+        let session_id = store
+            .pin_logical_generation_with_prefix(library_id, generation_id, session_id_prefix)
+            .map_err(map_store_error)?;
+        Self::from_pinned(store, cas, library_id, generation_id, session_id)
+    }
+
     pub(crate) fn resume(
         app_data_dir: &Path,
         repository_root: &Path,

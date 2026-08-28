@@ -54,6 +54,7 @@ use std::os::windows::fs::MetadataExt;
 const OPERATION_SCHEMA: &str = "risunest.peer-bidirectional-operation/v1";
 const OPERATION_FILE: &str = "operation.json";
 const MAX_OPERATION_BYTES: u64 = 1_048_576;
+const P5_SOURCE_PIN_PREFIX: &str = "logical-session-p5-source-";
 
 #[cfg(test)]
 thread_local! {
@@ -4777,6 +4778,7 @@ pub async fn peer_bidirectional_prepare(
         }
         let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
         let (built, store) = persistent_store::commands::with_store_mut(app.state(), |store| {
+            store.reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)?;
             let actual = store.revision()?;
             if actual != expected_revision {
                 return Err(StoreError::RevisionConflict {
@@ -4789,11 +4791,12 @@ pub async fn peer_bidirectional_prepare(
             Ok((built, job_store))
         })
         .map_err(|error| error.to_string())?;
-        let source = LogicalDeltaSourceSession::open(
+        let source = LogicalDeltaSourceSession::open_owned(
             &root,
             &root,
             &built.manifest.library_id,
             &built.manifest.generation,
+            P5_SOURCE_PIN_PREFIX,
         )
         .map_err(|error| error.to_string())?;
         let (host, session_id, manifest_id) = prepare_product_source_host(
