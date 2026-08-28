@@ -538,6 +538,22 @@ impl PersistentStore {
         &mut self,
         cas: &PayloadCas,
     ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        self.seal_active_logical_generation_inner(cas, None)
+    }
+
+    pub(crate) fn seal_active_logical_generation_at_revision(
+        &mut self,
+        cas: &PayloadCas,
+        expected_revision: i64,
+    ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        self.seal_active_logical_generation_inner(cas, Some(expected_revision))
+    }
+
+    fn seal_active_logical_generation_inner(
+        &mut self,
+        cas: &PayloadCas,
+        expected_revision: Option<i64>,
+    ) -> StoreResult<BuiltIndexedLogicalManifest> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -562,6 +578,14 @@ impl PersistentStore {
             )?;
         let active = super::active_generation(&transaction)?;
         let revision = super::current_revision(&transaction)?;
+        if let Some(expected) = expected_revision {
+            if revision != expected {
+                return Err(StoreError::RevisionConflict {
+                    expected,
+                    actual: revision,
+                });
+            }
+        }
         if pds_generation != active || source_revision != revision {
             return validation("logical library head is not current with the active PDS revision");
         }
@@ -4577,6 +4601,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(building_count, 1);
+    }
+
+    #[test]
+    fn exact_revision_seal_rejects_a_racing_descendant_without_changing_it() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        store
+            .commit(&root_commit(0, json!({"preserved": "descendant"})))
+            .unwrap();
+
+        let error = store
+            .seal_active_logical_generation_at_revision(&cas, 0)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.read_root(None).unwrap().value,
+            json!({"preserved": "descendant"})
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT state FROM logical_sync_generations
+                     JOIN logical_library_head USING (library_id, generation_id)
+                     WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "building"
+        );
     }
 
     #[test]

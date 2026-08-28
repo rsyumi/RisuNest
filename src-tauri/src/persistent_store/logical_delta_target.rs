@@ -24,11 +24,13 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -77,8 +79,11 @@ pub(crate) struct PersistentLogicalDeltaTarget<'a> {
     remote_manifest_hash: String,
     staging_root: PathBuf,
     durable_job: Option<&'a RefCell<DurableCasJob>>,
+    same_run_job_prepared_objects: BTreeSet<String>,
     conflict_policy: LogicalDeltaConflictPolicy,
     activation_mode: LogicalDeltaActivationMode,
+    #[cfg(test)]
+    payload_reprepare_count: Cell<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -590,8 +595,11 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             remote_manifest_hash,
             staging_root: staging_root.to_path_buf(),
             durable_job,
+            same_run_job_prepared_objects: BTreeSet::new(),
             conflict_policy,
             activation_mode,
+            #[cfg(test)]
+            payload_reprepare_count: Cell::new(0),
         })
     }
 
@@ -735,6 +743,21 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         &self,
         expected_local_revision: i64,
     ) -> Result<LogicalDeltaPlanResolution, PeerSyncError> {
+        self.resolve_authoritative_plan_inner(expected_local_revision, true)
+    }
+
+    pub(crate) fn reconstruct_authoritative_plan(
+        &self,
+        expected_local_revision: i64,
+    ) -> Result<LogicalDeltaPlanResolution, PeerSyncError> {
+        self.resolve_authoritative_plan_inner(expected_local_revision, false)
+    }
+
+    fn resolve_authoritative_plan_inner(
+        &self,
+        expected_local_revision: i64,
+        require_active_local_generation: bool,
+    ) -> Result<LogicalDeltaPlanResolution, PeerSyncError> {
         if expected_local_revision < 0 {
             return validation("logical delta expected local revision must be nonnegative");
         }
@@ -744,8 +767,11 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             )
         })?;
         let base_manifest = self.load_common_base_manifest(&base)?;
-        let local_manifest =
-            self.load_local_manifest(&self.local_generation_id, expected_local_revision, true)?;
+        let local_manifest = self.load_local_manifest(
+            &self.local_generation_id,
+            expected_local_revision,
+            require_active_local_generation,
+        )?;
         validate_manifest_object_size_parity([
             &base_manifest,
             &local_manifest,
@@ -1214,7 +1240,18 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         hash: &str,
     ) -> Result<(), PeerSyncError> {
         let expected_size = self.object_size(hash)?;
+        if self.same_run_job_prepared_objects.contains(hash) {
+            if self.cas.stat_object(hash)? != Some(expected_size) {
+                return validation(
+                    "logical delta same-run CAS object differs from its verified preparation",
+                );
+            }
+            return Ok(());
+        }
         if let Some(path) = staged_objects.get(hash) {
+            #[cfg(test)]
+            self.payload_reprepare_count
+                .set(self.payload_reprepare_count.get() + 1);
             let mut file = fs::File::open(path)?;
             let prepared = self.prepare_reader(&mut file)?;
             if prepared.content_hash != hash || prepared.byte_size != expected_size {
@@ -1642,6 +1679,55 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
     }
 }
 
+struct ExactSizeReader<'a> {
+    inner: &'a mut dyn Read,
+    remaining: u64,
+    checked_trailing: bool,
+}
+
+impl<'a> ExactSizeReader<'a> {
+    fn new(inner: &'a mut dyn Read, expected_size: u64) -> Self {
+        Self {
+            inner,
+            remaining: expected_size,
+            checked_trailing: false,
+        }
+    }
+}
+
+impl Read for ExactSizeReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining > 0 {
+            let limit = usize::try_from(self.remaining)
+                .unwrap_or(usize::MAX)
+                .min(output.len());
+            let read = self.inner.read(&mut output[..limit])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "logical delta staged object is incomplete",
+                ));
+            }
+            self.remaining -= read as u64;
+            return Ok(read);
+        }
+        if !self.checked_trailing {
+            let mut trailing = [0_u8; 1];
+            if self.inner.read(&mut trailing)? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "logical delta staged object exceeds its declared size",
+                ));
+            }
+            self.checked_trailing = true;
+        }
+        Ok(0)
+    }
+}
+
 impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
     type Stage = PersistentLogicalDeltaStage;
 
@@ -1742,6 +1828,28 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         }
         if self.object_size(&object.hash)? != object.size {
             return validation("logical delta staged object size differs from its manifest");
+        }
+        if let Some(job) = self.durable_job {
+            let mut exact = ExactSizeReader::new(reader, object.size);
+            let prepared = self.cas.prepare_reader(&mut exact)?;
+            if prepared.content_hash != object.hash || prepared.byte_size != object.size {
+                return validation("logical delta streamed object differs from its manifest");
+            }
+            job.borrow_mut().pin_existing(
+                self.cas,
+                &object.hash,
+                object.size,
+                CasObjectRole::DirectObject,
+            )?;
+            let path = self.cas.object_path(&object.hash)?.ok_or_else(|| {
+                PeerSyncError::Storage(
+                    "logical delta streamed object is absent after CAS promotion".to_owned(),
+                )
+            })?;
+            staged_objects.insert(object.hash.clone(), path);
+            self.same_run_job_prepared_objects
+                .insert(object.hash.clone());
+            return Ok(());
         }
         let path = staging_directory.join(&object.hash);
         let mut file = OpenOptions::new()
@@ -4314,6 +4422,134 @@ mod tests {
     }
 
     #[test]
+    fn durable_stage_payload_publishes_only_complete_exact_objects() {
+        let (directory, mut store, cas) = open_fixture();
+        let remote = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "remote-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("remote-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "remote-plugin".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: json!({"remote":true}),
+                },
+                vec![],
+            )],
+        })
+        .expect("build durable reader manifest");
+        let record = &remote.record_objects[0].object;
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "logical-durable-reader",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .expect("begin durable reader job"),
+        );
+        let staging_root = directory.path().join("logical-delta-staging");
+        let mut target = PersistentLogicalDeltaTarget::new_with_durable_job(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "local-0",
+            &remote.manifest_bytes,
+            &staging_root,
+            &job,
+        )
+        .expect("open durable reader target");
+        let mut stage = PersistentLogicalDeltaStage::Changed {
+            expected_base: PeerBase {
+                generation_id: "remote-0".to_owned(),
+                manifest_hash: "0".repeat(64),
+                generation_sequence: "0".to_owned(),
+            },
+            expected_local_revision: 0,
+            staging_id: "staging-logical-durable-reader".to_owned(),
+            logical_generation_id: "local-durable-reader".to_owned(),
+            merged_generation_sequence: "2".to_owned(),
+            pin_lease_id: "logical-delta-pin-durable-reader".to_owned(),
+            staging_directory: staging_root.join("staging-logical-durable-reader"),
+            staged_objects: BTreeMap::new(),
+            database_staged: false,
+            initialized: true,
+        };
+
+        let mut partial = Cursor::new(record.bytes[..record.bytes.len() - 1].to_vec());
+        assert!(target
+            .stage_payload(
+                &mut stage,
+                &LogicalDeltaObject {
+                    hash: record.hash.clone(),
+                    size: record.size,
+                },
+                &mut partial,
+            )
+            .is_err());
+        assert_eq!(cas.stat_object(&record.hash).unwrap(), None);
+        assert_eq!(job.borrow().pin_count(), 1);
+
+        let mut wrong = record.bytes.clone();
+        wrong[0] ^= 0xff;
+        for _ in 0..3 {
+            assert!(target
+                .stage_payload(
+                    &mut stage,
+                    &LogicalDeltaObject {
+                        hash: record.hash.clone(),
+                        size: record.size,
+                    },
+                    &mut Cursor::new(wrong.clone()),
+                )
+                .is_err());
+            assert_eq!(job.borrow().pin_count(), 1);
+        }
+        assert_eq!(cas.stat_object(&record.hash).unwrap(), None);
+
+        assert!(target
+            .stage_payload(
+                &mut stage,
+                &LogicalDeltaObject {
+                    hash: record.hash.clone(),
+                    size: record.size + 1,
+                },
+                &mut Cursor::new(record.bytes.clone()),
+            )
+            .is_err());
+        assert_eq!(job.borrow().pin_count(), 1);
+
+        target
+            .stage_payload(
+                &mut stage,
+                &LogicalDeltaObject {
+                    hash: record.hash.clone(),
+                    size: record.size,
+                },
+                &mut Cursor::new(record.bytes.clone()),
+            )
+            .expect("promote complete exact object");
+        let PersistentLogicalDeltaStage::Changed { staged_objects, .. } = &stage else {
+            panic!("expected changed durable stage");
+        };
+        assert_eq!(
+            staged_objects.get(&record.hash),
+            cas.object_path(&record.hash).unwrap().as_ref()
+        );
+        assert_eq!(job.borrow().pin_count(), 2);
+        target
+            .promote_payload_object(staged_objects, &record.hash)
+            .expect("reuse same-run verified job preparation");
+        assert_eq!(target.payload_reprepare_count.get(), 0);
+        assert_eq!(job.borrow().pin_count(), 2);
+    }
+
+    #[test]
     fn merged_generation_sequence_advances_the_greater_parent_sequence() {
         assert_eq!(merged_generation_sequence("12", "13").unwrap(), "14");
         assert_eq!(merged_generation_sequence("99", "8").unwrap(), "100");
@@ -6699,7 +6935,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_pull_applies_every_record_family_and_keeps_structured_objects_temporary() {
+    fn changed_pull_applies_every_record_family_with_durable_cas_payloads() {
         let (directory, mut store, cas) = open_fixture();
         store
             .connection
@@ -7227,7 +7463,11 @@ mod tests {
         assert_eq!(cas.read_object(&asset_hash).unwrap().unwrap(), asset_bytes);
         assert_eq!(cas.read_object(&inlay_hash).unwrap().unwrap(), inlay_bytes);
         for record in &remote.record_objects {
-            assert_eq!(cas.stat_object(&record.object.hash).unwrap(), None);
+            assert_eq!(
+                cas.stat_object(&record.object.hash).unwrap(),
+                Some(record.object.size)
+            );
+            assert!(durable_roots.object_hashes.contains(&record.object.hash));
         }
         assert_eq!(
             store
