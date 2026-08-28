@@ -383,6 +383,11 @@ impl AndroidResumableCloneJob {
                 progress(transferred);
             });
         if let Some(error) = status_error.into_inner() {
+            if let Err(pause_error) = self.mark_paused() {
+                return Err(PeerSyncError::Storage(format!(
+                    "Android clone progress status persistence failed: {error}; failed to persist paused Android clone status: {pause_error}"
+                )));
+            }
             return Err(error);
         }
         match result {

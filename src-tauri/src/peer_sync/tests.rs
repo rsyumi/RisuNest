@@ -1066,6 +1066,108 @@ fn android_clone_job_resumes_from_a_verified_chunk_after_actual_process_kill() {
 }
 
 #[test]
+fn android_clone_progress_status_failure_pauses_and_resumes_without_redownloading_verified_chunks()
+{
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let jobs_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[(CLONE_CHUNK_SIZE * 2 + 97) as usize]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let job_root = jobs_root
+        .path()
+        .join("66666666-6666-4666-8666-666666666666");
+    let status_path = job_root.join("status.json");
+    let status_backup = job_root.join("status.backup.json");
+    let mut job = AndroidResumableCloneJob::claim(
+        &job_root,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let mut sabotaged = false;
+    let mut restored = false;
+
+    let result = job.download_with_progress(&TransferCancellation::new(), |bytes| {
+        if !sabotaged && bytes >= CLONE_CHUNK_SIZE + 64 * 1024 {
+            fs::rename(&status_path, &status_backup).unwrap();
+            fs::create_dir(&status_path).unwrap();
+            sabotaged = true;
+        } else if sabotaged && !restored && bytes >= CLONE_CHUNK_SIZE + 4 * 1024 * 1024 {
+            fs::remove_dir(&status_path).unwrap();
+            fs::rename(&status_backup, &status_path).unwrap();
+            restored = true;
+        }
+    });
+
+    assert!(sabotaged, "the status write failure was not injected");
+    assert!(
+        restored,
+        "the status record was not restored after the injected failure"
+    );
+    assert!(matches!(result, Err(PeerSyncError::Storage(_))));
+    assert_eq!(job.phase().unwrap(), AndroidCloneJobPhase::Paused);
+
+    let report = job.download(&TransferCancellation::new()).unwrap();
+    let total_bytes = host
+        .manifest()
+        .objects
+        .values()
+        .map(|object| object.size)
+        .sum::<u64>();
+    assert_eq!(
+        job.phase().unwrap(),
+        AndroidCloneJobPhase::VerifiedAwaitingActivation
+    );
+    assert!(report.transferred_bytes <= total_bytes - CLONE_CHUNK_SIZE);
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_progress_and_pause_status_failures_preserve_both_error_contexts() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let jobs_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[(CLONE_CHUNK_SIZE + 97) as usize]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let job_root = jobs_root
+        .path()
+        .join("55555555-5555-4555-8555-555555555555");
+    let status_path = job_root.join("status.json");
+    let status_backup = job_root.join("status.backup.json");
+    let mut job = AndroidResumableCloneJob::claim(
+        &job_root,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let mut sabotaged = false;
+
+    let result = job.download_with_progress(&TransferCancellation::new(), |_| {
+        if !sabotaged {
+            fs::rename(&status_path, &status_backup).unwrap();
+            fs::create_dir(&status_path).unwrap();
+            sabotaged = true;
+        }
+    });
+
+    assert!(sabotaged, "the status write failures were not injected");
+    let error = result.unwrap_err().to_string();
+    fs::remove_dir(&status_path).unwrap();
+    fs::rename(&status_backup, &status_path).unwrap();
+    assert!(error.contains("Android clone progress status persistence failed"));
+    assert!(error.contains("failed to persist paused Android clone status"));
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_clone_explicit_cancel_removes_only_the_owned_job_root() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
