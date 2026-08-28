@@ -458,10 +458,10 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             }
             const pairing = parsePeerCloneUri(pairingUri)
             if (ownedTarget) {
-                if (
-                    (state.target.phase === 'failed' || state.target.phase === 'cancelled')
-                    && sameTargetIdentity(ownedTarget, pairing)
-                ) {
+                const rotatable = state.target.phase === 'failed'
+                    || state.target.phase === 'cancelled'
+                    || (!claimOwned && (state.target.phase === 'joined' || state.target.phase === 'confirmed'))
+                if (rotatable && sameTargetIdentity(ownedTarget, pairing)) {
                     warning = ''
                     targetIdentityEpoch += 1
                     ownedTarget = {
