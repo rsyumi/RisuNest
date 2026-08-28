@@ -3699,9 +3699,10 @@ mod tests {
     #[test]
     fn staged_f0_verification_accepts_a_legacy_iteration_order_database_hash() {
         let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("repository")).unwrap();
         let cas = PayloadCas::new(directory.path().join("repository")).unwrap();
         let database: Value = serde_json::from_str(
-            r#"{"zeta":0,"characters":[],"botPresets":[],"alpha":{"zeta":false,"alpha":true}}"#,
+            r#"{"zeta":0,"characters":[],"botPresets":[{"name":"legacy-fixture-preset"}],"botPresetsId":0,"personas":[{"id":"legacy-fixture-persona"}],"selectedPersona":0,"alpha":{"zeta":false,"alpha":true}}"#,
         )
         .unwrap();
         let validation = validate_f0_v1(&database, &[], &[]).unwrap();
