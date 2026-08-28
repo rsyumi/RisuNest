@@ -82,6 +82,7 @@ export function createPeerBidirectionalController(options: {
     let initialization: Promise<void> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
     let sourcePolling = false
+    let sourceRefreshError = false
     let activeOperation: { key: string; promise: Promise<PeerBidirectionalSyncResult> } | undefined
     let refreshRetry: {
         key: string
@@ -115,18 +116,21 @@ export function createPeerBidirectionalController(options: {
         sourcePolling = true
         try {
             const status = await options.facade.status()
+            const clearSourceRefreshError = sourceRefreshError
+            sourceRefreshError = false
             update({
                 sourceStatus: status.source,
                 sourcePairingUri: status.source.phase === 'running'
                     ? status.source.pairingUri ?? snapshot.sourcePairingUri
                     : '',
                 sourceError: '',
-                operationError: '',
+                operationError: clearSourceRefreshError ? '' : snapshot.operationError,
                 ...operationSnapshot(status.operation),
             })
             if (status.source.phase !== 'running') stopSourcePolling()
         } catch (cause) {
             if (cause instanceof PeerBidirectionalRefreshError && cause.status) {
+                sourceRefreshError = true
                 update({
                     sourceStatus: cause.status.source,
                     sourcePairingUri: cause.status.source.pairingUri ?? snapshot.sourcePairingUri,

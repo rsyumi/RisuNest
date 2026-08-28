@@ -120,6 +120,41 @@ describe('peer bidirectional controller', () => {
         }
     })
 
+    it('does not clear an acknowledge error during an unrelated successful source poll', async () => {
+        vi.useFakeTimers()
+        try {
+            const completed: PeerBidirectionalSyncResult = {
+                kind: 'noChanges',
+                operationId: 'operation-acknowledge-error',
+                revision: 8,
+                remoteRevision: 8,
+                transferredObjects: 0,
+                transferredBytes: 0,
+                backups: [],
+            }
+            const controller = createPeerBidirectionalController({
+                sourcePollMilliseconds: 10,
+                facade: facade({
+                    status: async () => ({
+                        source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                        operation: { phase: 'completed', result: completed },
+                    }),
+                    acknowledge: async () => { throw new Error('acknowledge failed') },
+                }),
+            })
+
+            await controller.initialize()
+            await expect(controller.acknowledge()).rejects.toThrow('acknowledge failed')
+            await vi.advanceTimersByTimeAsync(10)
+            expect(controller.snapshot()).toMatchObject({
+                operationPhase: 'completed',
+                operationError: 'acknowledge failed',
+            })
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('adopts an awaiting-choice operation from durable native status after restart', async () => {
         const conflict: PeerBidirectionalSyncResult = {
             kind: 'conflict',
