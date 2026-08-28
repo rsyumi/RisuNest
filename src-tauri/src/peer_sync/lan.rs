@@ -2593,6 +2593,7 @@ mod timeout_tests {
     #[derive(Default)]
     struct BidirectionalControlFixture {
         registrations: Mutex<Vec<LanBidirectionalSession>>,
+        remote_apply_delay: Mutex<Option<Duration>>,
         remote_apply_error: Mutex<Option<PeerSyncError>>,
     }
 
@@ -2611,6 +2612,9 @@ mod timeout_tests {
             _session: LanBidirectionalSession,
             request: LanBidirectionalRemoteApplyRequest,
         ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+            if let Some(delay) = self.remote_apply_delay.lock().unwrap().take() {
+                thread::sleep(delay);
+            }
             if let Some(error) = self.remote_apply_error.lock().unwrap().take() {
                 return Err(error);
             }
@@ -2663,6 +2667,56 @@ mod timeout_tests {
             control,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn p5_remote_apply_waits_past_the_short_control_timeout_for_a_terminal_response() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        *control.remote_apply_delay.lock().unwrap() = Some(Duration::from_millis(5_100));
+        let session_id = "00000000-0000-4000-8000-000000000078";
+        let source_device_id = "00000000-0000-4000-8000-000000000079";
+        let target_device_id = "00000000-0000-4000-8000-000000000080";
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                session_id,
+                source_device_id,
+                Arc::clone(&control),
+            ));
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanBidirectionalLogicalClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+            target_device_id,
+        )
+        .unwrap();
+        let generation = LanBidirectionalGeneration {
+            generation_id: "generation-1".to_owned(),
+            manifest_hash: pairing.manifest_id.clone(),
+            generation_sequence: "1".to_owned(),
+        };
+
+        let started = Instant::now();
+        let receipt = client
+            .request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: "00000000-0000-4000-8000-000000000081".to_owned(),
+                source_endpoint: endpoint,
+                source_session_id: pairing.session_id,
+                source_manifest_id: pairing.manifest_id,
+                source_claim: pairing.claim,
+                expected_source_revision: 0,
+                expected_source_generation: generation.clone(),
+                expected_common_base_manifest_hash: generation.manifest_hash.clone(),
+                backup_losing_side: false,
+            })
+            .unwrap();
+
+        assert!(started.elapsed() > CONTROL_REQUEST_TIMEOUT);
+        assert_eq!(receipt.committed_generation, generation);
+        host.stop().unwrap();
     }
 
     #[test]
@@ -3165,6 +3219,16 @@ fn build_logical_http_client(
 }
 
 #[cfg(desktop)]
+fn build_bidirectional_remote_apply_client() -> Result<reqwest::blocking::Client, PeerSyncError> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(transport)
+}
+
+#[cfg(desktop)]
 impl LanLogicalDeltaClient {
     pub fn claim(
         endpoint: &str,
@@ -3429,6 +3493,7 @@ impl LanBidirectionalLogicalCredential {
 #[cfg(desktop)]
 pub(crate) struct LanBidirectionalLogicalClient {
     inner: LanLogicalDeltaClient,
+    remote_apply_client: reqwest::blocking::Client,
     endpoint: String,
     session_id: String,
 }
@@ -3455,6 +3520,7 @@ impl LanBidirectionalLogicalClient {
             },
         )?;
         Ok(Self {
+            remote_apply_client: build_bidirectional_remote_apply_client()?,
             endpoint: validate_lan_endpoint(endpoint)?,
             session_id: session_id.to_owned(),
             inner,
@@ -3476,6 +3542,7 @@ impl LanBidirectionalLogicalClient {
             object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
         };
         Ok(Self {
+            remote_apply_client: build_bidirectional_remote_apply_client()?,
             inner: LanLogicalDeltaClient {
                 control_client: build_logical_http_client(LogicalRequestKind::Control, timeouts)?,
                 object_client: build_logical_http_client(LogicalRequestKind::Object, timeouts)?,
@@ -3553,13 +3620,10 @@ impl LanBidirectionalLogicalClient {
             ));
         }
         let response = self
-            .inner
-            .authorized_control(
-                self.inner
-                    .control_client
-                    .post(format!("{}/remote-apply", self.inner.session_url))
-                    .json(&request),
-            )
+            .remote_apply_client
+            .post(format!("{}/remote-apply", self.inner.session_url))
+            .bearer_auth(&self.inner.bearer)
+            .json(&request)
             .send()
             .map_err(transport)?;
         if response.status() == reqwest::StatusCode::CONFLICT {
