@@ -87,6 +87,10 @@ pub(crate) struct PeerBidirectionalOperationContext {
     pub(crate) durable_job_id: String,
 }
 
+fn conservative_remote_backup_required() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "phase", rename_all = "camelCase")]
 pub(crate) enum PeerBidirectionalDurableOperation {
@@ -105,6 +109,7 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         committed_revision: i64,
         shared_generation: SyncGenerationIdentity,
         changed: bool,
+        #[serde(default = "conservative_remote_backup_required")]
         remote_backup_required: bool,
         transferred_objects: u64,
         transferred_bytes: u64,
@@ -1914,6 +1919,74 @@ mod tests {
         };
         journal.store(&completed).unwrap();
         assert_eq!(journal.load().unwrap(), Some(completed));
+    }
+
+    #[test]
+    fn legacy_local_committed_journal_requires_remote_backup_conservatively() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_root = directory.path().join("peer-bidirectional");
+        fs::create_dir_all(&operation_root).unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174004";
+        let legacy_operation = json!({
+            "phase": "localCommitted",
+            "schema": "risunest.peer-bidirectional-operation/v1",
+            "context": {
+                "operationId": operation_id,
+                "credential": {
+                    "endpoint": "http://192.168.1.2:32146",
+                    "sessionId": "123e4567-e89b-42d3-a456-426614174000",
+                    "manifestId": "b".repeat(64),
+                    "deviceId": "123e4567-e89b-42d3-a456-426614174001",
+                    "sourceDeviceId": "123e4567-e89b-42d3-a456-426614174002",
+                    "bearer": "c".repeat(64),
+                },
+                "libraryId": "risunest-product",
+                "expectedLocalRevision": 7,
+                "expectedRemoteRevision": 7,
+                "expectedRemoteGeneration": {
+                    "generationId": "remote-r",
+                    "manifestHash": "d".repeat(64),
+                    "generationSequence": "2",
+                },
+                "previousShared": {
+                    "generationId": "shared-c",
+                    "manifestHash": "a".repeat(64),
+                    "generationSequence": "1",
+                },
+                "previousLocal": {
+                    "generationId": "shared-c",
+                    "manifestHash": "a".repeat(64),
+                    "generationSequence": "1",
+                },
+                "durableJobId": "123e4567-e89b-42d3-a456-426614174003",
+            },
+            "committed_revision": 8,
+            "shared_generation": {
+                "generationId": "local-a",
+                "manifestHash": "e".repeat(64),
+                "generationSequence": "3",
+            },
+            "changed": true,
+            "transferred_objects": 2,
+            "transferred_bytes": 19,
+            "backups": [],
+        });
+        fs::write(
+            operation_root.join(OPERATION_FILE),
+            serde_json::to_vec(&legacy_operation).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap()
+                .unwrap(),
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                remote_backup_required: true,
+                ..
+            }
+        ));
     }
 
     #[test]
