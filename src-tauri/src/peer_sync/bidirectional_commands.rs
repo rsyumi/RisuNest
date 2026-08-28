@@ -57,6 +57,12 @@ thread_local! {
     static SOURCE_AFTER_PREPARED_STORE_PANIC: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
+    static BACKUP_FULL_VERIFICATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, not(windows)))]
+thread_local! {
+    static ATOMIC_PARENT_SYNC_FAILPOINT: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -564,6 +570,8 @@ fn verify_bidirectional_backup_receipt(
     expected_source: &SyncGenerationIdentity,
     expected_package_id: Option<&str>,
 ) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
+    #[cfg(test)]
+    BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(PeerSyncError::Storage(
@@ -668,6 +676,52 @@ fn bidirectional_backup_staging_paths(
     (staging, temporary)
 }
 
+#[derive(Debug)]
+struct VerifiedBidirectionalBackupReceipt {
+    receipt: PeerBidirectionalBackupReceipt,
+    published: bool,
+}
+
+impl VerifiedBidirectionalBackupReceipt {
+    fn receipt(&self) -> &PeerBidirectionalBackupReceipt {
+        &self.receipt
+    }
+
+    fn into_receipt(self) -> PeerBidirectionalBackupReceipt {
+        self.receipt
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedRemoteApplyReceipt {
+    receipt: LanBidirectionalRemoteApplyReceipt,
+    _backup: Option<VerifiedBidirectionalBackupReceipt>,
+}
+
+impl VerifiedRemoteApplyReceipt {
+    fn receipt(&self) -> &LanBidirectionalRemoteApplyReceipt {
+        &self.receipt
+    }
+
+    fn into_receipt(self) -> LanBidirectionalRemoteApplyReceipt {
+        self.receipt
+    }
+}
+
+fn published_backup_receipt(
+    verified: PeerBidirectionalBackupReceipt,
+    backup_path: &Path,
+) -> VerifiedBidirectionalBackupReceipt {
+    VerifiedBidirectionalBackupReceipt {
+        receipt: PeerBidirectionalBackupReceipt {
+            package_id: verified.package_id,
+            side: verified.side,
+            path: backup_path.to_string_lossy().into_owned(),
+        },
+        published: true,
+    }
+}
+
 fn ensure_bidirectional_backup_receipt(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -676,24 +730,38 @@ fn ensure_bidirectional_backup_receipt(
     expected_revision: i64,
     side: PeerBidirectionalBackupSide,
     expected_source: &SyncGenerationIdentity,
-) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
+    bound_package_id: Option<&str>,
+) -> Result<VerifiedBidirectionalBackupReceipt, PeerSyncError> {
     let backup_path = bidirectional_backup_path(app_root, operation_id, side.clone());
     let backup_root = backup_path.parent().ok_or_else(|| {
         PeerSyncError::Storage("bidirectional backup path has no parent".to_owned())
     })?;
     fs::create_dir_all(&backup_root)?;
     match fs::symlink_metadata(&backup_path) {
-        Ok(_) => {
-            return verify_bidirectional_backup_receipt(
-                &backup_path,
-                operation_id,
-                expected_revision,
-                side,
-                expected_source,
-                None,
-            );
+        Ok(_) => match verify_bidirectional_backup_receipt(
+            &backup_path,
+            operation_id,
+            expected_revision,
+            side.clone(),
+            expected_source,
+            bound_package_id,
+        ) {
+            Ok(receipt) => {
+                return Ok(VerifiedBidirectionalBackupReceipt {
+                    receipt,
+                    published: false,
+                });
+            }
+            Err(error) if bound_package_id.is_some() => return Err(error),
+            Err(_) => fs::remove_file(&backup_path)?,
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if bound_package_id.is_some() {
+                return Err(PeerSyncError::Storage(
+                    "bound bidirectional backup is missing".to_owned(),
+                ));
+            }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     let (backup_staging, temporary) =
@@ -710,14 +778,7 @@ fn ensure_bidirectional_backup_receipt(
         ) {
             Ok(receipt) => {
                 replace_file_atomic(&temporary, &backup_path)?;
-                return verify_bidirectional_backup_receipt(
-                    &backup_path,
-                    operation_id,
-                    expected_revision,
-                    side,
-                    expected_source,
-                    Some(&receipt.package_id),
-                );
+                return Ok(published_backup_receipt(receipt, &backup_path));
             }
             Err(_) => fs::remove_file(&temporary)?,
         },
@@ -737,29 +798,37 @@ fn ensure_bidirectional_backup_receipt(
         Ok(report) => {
             match fs::symlink_metadata(&backup_path) {
                 Ok(_) => {
-                    let receipt = verify_bidirectional_backup_receipt(
+                    match verify_bidirectional_backup_receipt(
                         &backup_path,
                         operation_id,
                         expected_revision,
                         side.clone(),
                         expected_source,
-                        None,
-                    )?;
-                    fs::remove_file(&temporary)?;
-                    return Ok(receipt);
+                        bound_package_id,
+                    ) {
+                        Ok(receipt) => {
+                            fs::remove_file(&temporary)?;
+                            return Ok(VerifiedBidirectionalBackupReceipt {
+                                receipt,
+                                published: false,
+                            });
+                        }
+                        Err(error) if bound_package_id.is_some() => return Err(error),
+                        Err(_) => fs::remove_file(&backup_path)?,
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
             replace_file_atomic(&temporary, &backup_path)?;
-            verify_bidirectional_backup_receipt(
-                &backup_path,
-                operation_id,
-                expected_revision,
-                side,
-                expected_source,
-                Some(&report.archive_sha256),
-            )
+            Ok(VerifiedBidirectionalBackupReceipt {
+                receipt: PeerBidirectionalBackupReceipt {
+                    package_id: report.archive_sha256,
+                    side,
+                    path: backup_path.to_string_lossy().into_owned(),
+                },
+                published: true,
+            })
         }
         Err(error) => Err(PeerSyncError::Storage(error.to_string())),
     }
@@ -1370,15 +1439,19 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
                 Some(&receipt.package_id),
             )?;
         } else {
-            backups.push(ensure_bidirectional_backup_receipt(
-                store,
-                cas,
-                app_root,
-                operation_id,
-                context.expected_local_revision,
-                PeerBidirectionalBackupSide::Local,
-                &local_generation,
-            )?);
+            backups.push(
+                ensure_bidirectional_backup_receipt(
+                    store,
+                    cas,
+                    app_root,
+                    operation_id,
+                    context.expected_local_revision,
+                    PeerBidirectionalBackupSide::Local,
+                    &local_generation,
+                    None,
+                )?
+                .into_receipt(),
+            );
             journal.store(&PeerBidirectionalDurableOperation::AwaitingConflict {
                 schema: OPERATION_SCHEMA.to_owned(),
                 context: context.clone(),
@@ -1495,6 +1568,7 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
         None,
         None,
     )
+    .map(VerifiedRemoteApplyReceipt::into_receipt)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1514,7 +1588,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     source_device_id: Option<&str>,
     retained_source: Option<&SourcePreparedEvidence>,
     retained_source_job_id: Option<&str>,
-) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+) -> Result<VerifiedRemoteApplyReceipt, PeerSyncError> {
     if uuid::Uuid::parse_str(operation_id)
         .map(|value| value.to_string() != operation_id)
         .unwrap_or(true)
@@ -1573,7 +1647,7 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
                         && state.local_identity == active_identity
                 })
             {
-                let backup = if backup_losing_side {
+                let verified_backup = if backup_losing_side {
                     let receipt = verify_bidirectional_backup_receipt(
                         &bidirectional_backup_path(
                             app_root,
@@ -1586,19 +1660,29 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
                         expected_losing_generation,
                         None,
                     )?;
-                    Some(LanBidirectionalBackupReceipt {
-                        package_id: receipt.package_id,
-                        path: receipt.path,
+                    Some(VerifiedBidirectionalBackupReceipt {
+                        receipt,
+                        published: false,
                     })
                 } else {
                     None
                 };
-                return Ok(LanBidirectionalRemoteApplyReceipt {
-                    committed_revision: actual_revision,
-                    committed_generation: expected_shared_generation,
-                    transferred_objects: 0,
-                    transferred_bytes: 0,
-                    backup,
+                let backup = verified_backup.as_ref().map(|verified| {
+                    let receipt = verified.receipt();
+                    LanBidirectionalBackupReceipt {
+                        package_id: receipt.package_id.clone(),
+                        path: receipt.path.clone(),
+                    }
+                });
+                return Ok(VerifiedRemoteApplyReceipt {
+                    receipt: LanBidirectionalRemoteApplyReceipt {
+                        committed_revision: actual_revision,
+                        committed_generation: expected_shared_generation,
+                        transferred_objects: 0,
+                        transferred_bytes: 0,
+                        backup,
+                    },
+                    _backup: verified_backup,
                 });
             }
         }
@@ -1630,8 +1714,11 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             received: local_identity.manifest_hash,
         });
     }
-    let backup = if backup_losing_side {
-        let receipt = ensure_bidirectional_backup_receipt(
+    let verified_backup = if backup_losing_side {
+        let bound_package_id = retained_source
+            .and_then(|evidence| evidence.backup.as_ref())
+            .map(|receipt| receipt.package_id.as_str());
+        let verified = ensure_bidirectional_backup_receipt(
             store,
             cas,
             app_root,
@@ -1639,14 +1726,20 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             expected_revision,
             PeerBidirectionalBackupSide::Remote,
             expected_losing_generation,
+            bound_package_id,
         )?;
-        Some(LanBidirectionalBackupReceipt {
-            package_id: receipt.package_id,
-            path: receipt.path,
-        })
+        debug_assert!(bound_package_id.is_none() || !verified.published);
+        Some(verified)
     } else {
         None
     };
+    let backup = verified_backup.as_ref().map(|verified| {
+        let receipt = verified.receipt();
+        LanBidirectionalBackupReceipt {
+            package_id: receipt.package_id.clone(),
+            path: receipt.path.clone(),
+        }
+    });
     let (durable_job_id, stage_with_durable_job, durable_job) =
         if let Some(retained_job_id) = retained_source_job_id {
             match DurableCasJob::open(app_root, retained_job_id) {
@@ -1890,9 +1983,6 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             "bidirectional remote acknowledgement differs from shared generation".to_owned(),
         ));
     }
-    if let Some(evidence) = prepared_evidence.borrow().as_ref() {
-        verify_source_evidence_backup(app_root, evidence)?;
-    }
     job.borrow_mut().release(CasReleaseOutcome::Committed)?;
     let measured_receipt = LanBidirectionalRemoteApplyReceipt {
         committed_revision,
@@ -1902,7 +1992,10 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
         backup,
     };
     let Some(evidence) = prepared_evidence.into_inner() else {
-        return Ok(measured_receipt);
+        return Ok(VerifiedRemoteApplyReceipt {
+            receipt: measured_receipt,
+            _backup: verified_backup,
+        });
     };
     let receipt = evidence.receipt_at(measured_receipt.committed_revision)?;
     if retained_source.is_none()
@@ -1913,7 +2006,10 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
             "bidirectional source activation differs from prepared evidence".to_owned(),
         ));
     }
-    Ok(receipt)
+    Ok(VerifiedRemoteApplyReceipt {
+        receipt,
+        _backup: verified_backup,
+    })
 }
 
 fn complete_bidirectional_local_after_remote_apply(
@@ -2820,7 +2916,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
                 "bidirectional production store mutex poisoned: {error}"
             ))
         })?;
-        let receipt = apply_bidirectional_remote_shared_inner(
+        let verified_receipt = apply_bidirectional_remote_shared_inner(
             &mut store,
             &cas,
             &self.app_root,
@@ -2846,20 +2942,20 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
                     "bidirectional source activation is missing prepared evidence".to_owned(),
                 )
             })?;
-        verify_source_evidence_backup(&self.app_root, &evidence)?;
         #[cfg(test)]
         if SOURCE_COMPLETE_STORE_FAILPOINT.with(|enabled| enabled.replace(false)) {
             return Err(PeerSyncError::Storage(
                 "simulated source completion journal failure".to_owned(),
             ));
         }
+        let receipt = verified_receipt.receipt();
         store_source_completed(
             &self.app_root,
             evidence,
-            &receipt,
+            receipt,
             receipt.committed_revision,
         )?;
-        Ok(receipt)
+        Ok(verified_receipt.into_receipt())
     }
 }
 
@@ -4217,6 +4313,16 @@ fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSync
 #[cfg(not(windows))]
 fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
     fs::rename(source, destination)?;
+    #[cfg(test)]
+    if ATOMIC_PARENT_SYNC_FAILPOINT.with(|enabled| enabled.replace(false)) {
+        return Err(PeerSyncError::Storage(
+            "simulated parent directory sync failure".to_owned(),
+        ));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        PeerSyncError::Storage("atomic destination has no parent directory".to_owned())
+    })?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -4600,6 +4706,7 @@ mod tests {
                 1,
                 PeerBidirectionalBackupSide::Local,
                 &source,
+                None,
             )
             .unwrap_err();
 
@@ -4638,6 +4745,7 @@ mod tests {
         let temporary = staging.join("backup.risulossless");
         fs::create_dir_all(&staging).unwrap();
         fs::write(&temporary, b"truncated backup").unwrap();
+        BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
 
         let receipt = ensure_bidirectional_backup_receipt(
             &mut store,
@@ -4647,10 +4755,13 @@ mod tests {
             1,
             PeerBidirectionalBackupSide::Local,
             &source,
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .into_receipt();
 
         assert!(!temporary.exists());
+        assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
         assert_eq!(
             verify_bidirectional_backup_receipt(
                 Path::new(&receipt.path),
@@ -4709,6 +4820,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let mut store = PersistentStore::open(directory.path()).unwrap();
+        BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
 
         let receipt = ensure_bidirectional_backup_receipt(
             &mut store,
@@ -4718,11 +4830,14 @@ mod tests {
             1,
             PeerBidirectionalBackupSide::Local,
             &source,
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .into_receipt();
 
         assert_eq!(receipt.package_id, prepared.archive_sha256);
         assert!(!temporary.exists());
+        assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
         assert_eq!(
             Path::new(&receipt.path),
             bidirectional_backup_path(
@@ -4731,6 +4846,74 @@ mod tests {
                 PeerBidirectionalBackupSide::Local,
             )
         );
+    }
+
+    #[test]
+    fn unbound_truncated_final_is_replaced_but_a_bound_final_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let source = SyncGenerationIdentity {
+            generation_id: active.manifest.generation,
+            manifest_hash: active.manifest_hash,
+            generation_sequence: active.manifest.generation_sequence,
+        };
+        let operation_id = "123e4567-e89b-42d3-a456-426614174096";
+        let final_path = bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Local,
+        );
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, b"truncated unbound final").unwrap();
+
+        let receipt = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Local,
+            &source,
+            None,
+        )
+        .unwrap()
+        .into_receipt();
+        let verified_bytes = fs::read(&final_path).unwrap();
+        assert_ne!(verified_bytes, b"truncated unbound final");
+
+        fs::write(&final_path, b"truncated bound final").unwrap();
+        let error = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Local,
+            &source,
+            Some(&receipt.package_id),
+        )
+        .unwrap_err();
+        assert!(matches!(error, PeerSyncError::Storage(_)));
+        assert_eq!(fs::read(&final_path).unwrap(), b"truncated bound final");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_parent_sync_failure_keeps_the_published_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.tmp");
+        let destination = directory.path().join("published.bin");
+        fs::write(&source, b"durable bytes").unwrap();
+        ATOMIC_PARENT_SYNC_FAILPOINT.with(|enabled| enabled.set(true));
+
+        assert!(replace_file_atomic(&source, &destination).is_err());
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), b"durable bytes");
     }
 
     fn remote_disjoint_manifest(
@@ -5633,7 +5816,8 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .unwrap()
+        .into_receipt();
 
         assert_eq!(receipt.committed_revision, 0);
         assert_eq!(receipt.transferred_objects, 0);
@@ -5861,7 +6045,8 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .unwrap()
+        .into_receipt();
         assert_eq!(receipt.committed_revision, 0);
         assert_eq!(source.reads, 0);
         store
@@ -7174,7 +7359,7 @@ mod tests {
         };
         let wrong_source_staging = wrong_source_directory.path().join("backup-staging");
         fs::create_dir_all(&wrong_source_staging).unwrap();
-        create_and_verify_peer_bidirectional_backup_v1_report(
+        let wrong_source_backup = create_and_verify_peer_bidirectional_backup_v1_report(
             &backup_path,
             &wrong_source_staging,
             &wrong_source_cas,
@@ -7188,6 +7373,19 @@ mod tests {
             &NeverCancelled,
         )
         .unwrap();
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        let mut retained_with_wrong_receipt = journal.load().unwrap().unwrap();
+        match &mut retained_with_wrong_receipt {
+            PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. } => {
+                backups.push(PeerBidirectionalBackupReceipt {
+                    package_id: wrong_source_backup.archive_sha256,
+                    side: PeerBidirectionalBackupSide::Local,
+                    path: backup_path.to_string_lossy().into_owned(),
+                });
+            }
+            other => panic!("unexpected retained operation: {other:?}"),
+        }
+        journal.store(&retained_with_wrong_receipt).unwrap();
         let wrong_source_bytes = fs::read(&backup_path).unwrap();
         let mut wrong_source = LogicalDeltaSourceSession::open(
             remote_directory.path(),
@@ -7216,7 +7414,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. }
-                if backups.is_empty()
+                if backups.len() == 1
         ));
 
         fs::remove_file(&backup_path).unwrap();
@@ -7248,7 +7446,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. }
-                if backups.is_empty()
+                if backups.len() == 1
         ));
 
         fs::remove_file(&backup_path).unwrap();
@@ -7273,11 +7471,10 @@ mod tests {
             side: PeerBidirectionalBackupSide::Local,
             path: backup_path.to_string_lossy().into_owned(),
         };
-        let journal = PeerBidirectionalOperationJournal::new(directory.path());
         let mut retained_with_receipt = journal.load().unwrap().unwrap();
         match &mut retained_with_receipt {
             PeerBidirectionalDurableOperation::AwaitingConflict { backups, .. } => {
-                backups.push(completed_receipt.clone());
+                *backups = vec![completed_receipt.clone()];
             }
             other => panic!("unexpected retained operation: {other:?}"),
         }
@@ -8869,6 +9066,7 @@ mod tests {
         request.source_manifest_id = completion_pairing.manifest_id;
         request.source_claim = completion_pairing.claim;
 
+        BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
         SOURCE_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         SOURCE_COMPLETE_STORE_FAILPOINT.with(|enabled| enabled.set(true));
         let error = recovery_control
@@ -8879,6 +9077,7 @@ mod tests {
             matches!(&error, PeerSyncError::Storage(message) if message.contains("completion")),
             "{error:?}"
         );
+        assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
         let prepared = PeerBidirectionalOperationJournal::new(directory.path())
             .load()
             .unwrap()
@@ -9216,12 +9415,14 @@ mod tests {
             Some(source_completed.clone())
         );
         fs::write(&completed_backup_path, &completed_backup_bytes).unwrap();
+        BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
         assert_eq!(
             completed_control
                 .remote_apply(session.clone(), request.clone())
                 .unwrap(),
             expected
         );
+        assert_eq!(BACKUP_FULL_VERIFICATION_COUNT.with(Cell::get), 1);
         fs::remove_file(&completed_backup_path).unwrap();
         assert!(matches!(
             completed_control.remote_apply(session.clone(), request.clone()),
