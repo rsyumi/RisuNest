@@ -616,7 +616,13 @@ pub(crate) fn reclaim_abandoned_durable_cas_jobs(
         else {
             continue;
         };
-        if !job_id.starts_with(job_id_prefix) {
+        let Some(owned_suffix) = job_id.strip_prefix(job_id_prefix) else {
+            continue;
+        };
+        if !uuid::Uuid::parse_str(owned_suffix)
+            .map(|parsed| parsed.to_string() == owned_suffix)
+            .unwrap_or(false)
+        {
             continue;
         }
         validate_job_id(job_id)?;
@@ -1029,6 +1035,31 @@ mod tests {
         let roots = collect_durable_cas_job_roots(directory.path());
         assert!(!roots.object_hashes.contains(&owned.content_hash));
         assert!(roots.object_hashes.contains(&unrelated_object.content_hash));
+    }
+
+    #[test]
+    fn abandoned_job_reclaim_preserves_a_prefixed_job_without_a_canonical_uuid() {
+        let directory = tempfile::tempdir().expect("create non-uuid reclaim directory");
+        let job = DurableCasJob::begin(
+            directory.path(),
+            "p4-delta-target-extra-00000000-0000-4000-8000-000000000009",
+            CasJobKind::LogicalDeltaTarget,
+            1,
+        )
+        .expect("begin prefixed non-uuid job");
+        let path = job.journal_path().to_path_buf();
+        drop(job);
+
+        assert_eq!(
+            reclaim_abandoned_durable_cas_jobs(
+                directory.path(),
+                "p4-delta-target-",
+                CasJobKind::LogicalDeltaTarget,
+            )
+            .expect("reclaim without owned candidates"),
+            0
+        );
+        assert!(path.exists());
     }
 
     #[test]
