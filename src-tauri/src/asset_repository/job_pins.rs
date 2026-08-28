@@ -387,6 +387,29 @@ impl DurableCasJob {
         self.state.kind
     }
 
+    #[cfg(test)]
+    pub(crate) fn leave_release_record_for_cleanup_retry(
+        &mut self,
+        outcome: CasReleaseOutcome,
+    ) -> io::Result<()> {
+        if self.state.released {
+            return Ok(());
+        }
+        if outcome == CasReleaseOutcome::Committed && !self.state.sealed {
+            return invalid_data("unsealed CAS job cannot be released as committed");
+        }
+        let record = JobJournalRecord::Release {
+            sequence: self.state.next_sequence,
+            job_id: self.state.job_id.clone(),
+            outcome,
+        };
+        let mut file = OpenOptions::new().append(true).open(&self.journal_path)?;
+        write_record(&mut file, &record, true)?;
+        self.state.released = true;
+        self.state.next_sequence += 1;
+        Ok(())
+    }
+
     fn ensure_preparable(&self) -> io::Result<()> {
         if self.state.sealed || self.state.released {
             return invalid_data("sealed or released CAS job cannot accept more objects");

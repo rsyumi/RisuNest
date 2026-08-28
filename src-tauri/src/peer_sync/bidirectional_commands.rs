@@ -1524,6 +1524,20 @@ fn apply_bidirectional_remote_shared_inner<S: LogicalDeltaObjectSource + ?Sized>
     let (durable_job_id, stage_with_durable_job, durable_job) =
         if let Some(retained_job_id) = retained_source_job_id {
             match DurableCasJob::open(app_root, retained_job_id) {
+                Ok(mut job) if job.is_released() => {
+                    job.release(CasReleaseOutcome::Aborted)?;
+                    drop(job);
+                    (
+                        retained_job_id.to_owned(),
+                        true,
+                        DurableCasJob::begin(
+                            app_root,
+                            retained_job_id,
+                            CasJobKind::LogicalDeltaTarget,
+                            now_millis()?,
+                        )?,
+                    )
+                }
                 Ok(job) => (retained_job_id.to_owned(), !job.is_sealed(), job),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => (
                     retained_job_id.to_owned(),
@@ -2137,6 +2151,28 @@ fn verified_source_acknowledgement(
     Ok((committed_revision, acknowledgement.local_identity))
 }
 
+fn completed_source_request_matches(
+    binding: &SourcePreparedEvidence,
+    session: &LanBidirectionalSession,
+    request: &LanBidirectionalRemoteApplyRequest,
+) -> bool {
+    binding.source_device_id == session.source_device_id
+        && binding.target_device_id == session.target_device_id
+        && binding.operation_id == request.operation_id
+        && binding.expected_source_revision == request.expected_source_revision
+        && binding.expected_source_generation
+            == (SyncGenerationIdentity {
+                generation_id: request.expected_source_generation.generation_id.clone(),
+                manifest_hash: request.expected_source_generation.manifest_hash.clone(),
+                generation_sequence: request
+                    .expected_source_generation
+                    .generation_sequence
+                    .clone(),
+            })
+        && binding.previous_shared.manifest_hash == request.expected_common_base_manifest_hash
+        && request.backup_losing_side == binding.backup.is_some()
+}
+
 fn reconcile_source_operation(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -2159,22 +2195,7 @@ fn reconcile_source_operation(
             result,
             ..
         } => {
-            if binding.source_device_id != session.source_device_id
-                || binding.target_device_id != session.target_device_id
-                || binding.operation_id != request.operation_id
-                || binding.expected_source_revision != request.expected_source_revision
-                || binding.expected_source_generation
-                    != (SyncGenerationIdentity {
-                        generation_id: request.expected_source_generation.generation_id.clone(),
-                        manifest_hash: request.expected_source_generation.manifest_hash.clone(),
-                        generation_sequence: request
-                            .expected_source_generation
-                            .generation_sequence
-                            .clone(),
-                    })
-                || binding.previous_shared.manifest_hash
-                    != request.expected_common_base_manifest_hash
-            {
+            if !completed_source_request_matches(&binding, session, request) {
                 return Err(PeerSyncError::Validation(
                     "bidirectional completed source retry differs from its binding".to_owned(),
                 ));
@@ -4418,6 +4439,71 @@ mod tests {
     }
 
     #[test]
+    fn source_completed_request_requires_the_original_backup_choice() {
+        let operation_id = "123e4567-e89b-42d3-a456-426614174116";
+        let source_device_id = "123e4567-e89b-42d3-a456-426614174117";
+        let target_device_id = "123e4567-e89b-42d3-a456-426614174118";
+        let expected_source_generation = generation("source-e", "3", 'b');
+        let mut binding = SourcePreparedEvidence {
+            operation_id: operation_id.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+            expected_source_revision: 7,
+            previous_shared: generation("shared-b", "2", 'a'),
+            expected_source_generation: expected_source_generation.clone(),
+            shared_generation: LanBidirectionalGeneration {
+                generation_id: "shared-a".to_owned(),
+                manifest_hash: "c".repeat(64),
+                generation_sequence: "4".to_owned(),
+            },
+            incoming_revision: 8,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backup: None,
+        };
+        let session = LanBidirectionalSession {
+            session_id: "123e4567-e89b-42d3-a456-426614174119".to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+        };
+        let mut request = LanBidirectionalRemoteApplyRequest {
+            operation_id: operation_id.to_owned(),
+            source_endpoint: "http://127.0.0.1:1".to_owned(),
+            source_session_id: "123e4567-e89b-42d3-a456-426614174120".to_owned(),
+            source_manifest_id: "manifest".to_owned(),
+            source_claim: "claim".to_owned(),
+            expected_source_revision: 7,
+            expected_source_generation: LanBidirectionalGeneration {
+                generation_id: expected_source_generation.generation_id,
+                manifest_hash: expected_source_generation.manifest_hash,
+                generation_sequence: expected_source_generation.generation_sequence,
+            },
+            expected_common_base_manifest_hash: binding.previous_shared.manifest_hash.clone(),
+            backup_losing_side: false,
+        };
+
+        assert!(completed_source_request_matches(
+            &binding, &session, &request
+        ));
+        request.backup_losing_side = true;
+        assert!(!completed_source_request_matches(
+            &binding, &session, &request
+        ));
+        binding.backup = Some(LanBidirectionalBackupReceipt {
+            package_id: "d".repeat(64),
+            path: "peer-bidirectional/backups/source.risulossless".to_owned(),
+        });
+        request.backup_losing_side = false;
+        assert!(!completed_source_request_matches(
+            &binding, &session, &request
+        ));
+        request.backup_losing_side = true;
+        assert!(completed_source_request_matches(
+            &binding, &session, &request
+        ));
+    }
+
+    #[test]
     fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
@@ -4969,6 +5055,14 @@ mod tests {
             .unwrap()
             .is_sealed());
         host.stop().unwrap();
+        let mut released = DurableCasJob::open(directory.path(), &retained_job_id).unwrap();
+        released
+            .leave_release_record_for_cleanup_retry(CasReleaseOutcome::Aborted)
+            .unwrap();
+        drop(released);
+        assert!(DurableCasJob::open(directory.path(), &retained_job_id)
+            .unwrap()
+            .is_released());
 
         let (mut host, pairing) = start_retry_host();
         request.source_endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
@@ -5003,6 +5097,12 @@ mod tests {
                 .unwrap(),
             receipt
         );
+        let mut mismatched_backup = request.clone();
+        mismatched_backup.backup_losing_side = true;
+        assert!(matches!(
+            control.remote_apply(session.clone(), mismatched_backup),
+            Err(PeerSyncError::Validation(_))
+        ));
 
         let journal = PeerBidirectionalOperationJournal::new(directory.path());
         let mut mismatched = journal.load().unwrap().unwrap();
