@@ -398,6 +398,13 @@
         })
     }
 
+    async function abandonBidirectional(): Promise<void> {
+        if (!await alertConfirm(language.peerBidirectional.abandonConfirm)) return
+        await withBidirectionalBusy(async () => {
+            await bidirectionalController.abandon()
+        })
+    }
+
     onMount(() => {
         const unsubscribeController = controller.subscribe(() => refreshState())
         const unsubscribeDeltaController = deltaController.subscribe(() => refreshDeltaState())
@@ -805,8 +812,18 @@
             <p class="mt-2 text-sm text-draculared">{language.peerBidirectional.stale}</p>
         {/if}
 
+        {#if ['localCommitted', 'sourceUnavailable'].includes(bidirectionalOperationPhase)}
+            <Button className="mt-2" styled="danger" disabled={bidirectionalBusy} onclick={abandonBidirectional}>
+                {language.peerBidirectional.abandon}
+            </Button>
+        {/if}
+
         {#if bidirectionalOperationPhase === 'completed'}
-            <Button className="mt-2" disabled={bidirectionalBusy} onclick={acknowledgeBidirectional}>
+            <Button
+                className="mt-2"
+                disabled={bidirectionalBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
+                onclick={acknowledgeBidirectional}
+            >
                 {language.peerBidirectional.acknowledge}
             </Button>
         {/if}

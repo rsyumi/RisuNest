@@ -245,6 +245,24 @@ export function createPeerBidirectionalController(options: {
         activeOperation = { key, promise }
         return promise
     }
+    const clearRetainedOperation = async (operationId: string): Promise<void> => {
+        try {
+            await options.facade.acknowledge(operationId)
+            operationErrorOwner += 1
+            sourceRefreshErrorOwner = undefined
+            update({
+                operationPhase: 'idle',
+                operationResult: undefined,
+                operationId: undefined,
+                operationError: '',
+            })
+        } catch (cause) {
+            operationErrorOwner += 1
+            sourceRefreshErrorOwner = undefined
+            update({ operationError: cause instanceof Error ? cause.message : String(cause) })
+            throw cause
+        }
+    }
 
     return {
         snapshot: (): PeerBidirectionalControllerSnapshot => snapshot,
@@ -353,23 +371,19 @@ export function createPeerBidirectionalController(options: {
             )
         },
         async acknowledge(): Promise<void> {
-            if (!snapshot.operationId || snapshot.operationPhase !== 'completed') return
-            try {
-                await options.facade.acknowledge(snapshot.operationId)
-                operationErrorOwner += 1
-                sourceRefreshErrorOwner = undefined
-                update({
-                    operationPhase: 'idle',
-                    operationResult: undefined,
-                    operationId: undefined,
-                    operationError: '',
-                })
-            } catch (cause) {
-                operationErrorOwner += 1
-                sourceRefreshErrorOwner = undefined
-                update({ operationError: cause instanceof Error ? cause.message : String(cause) })
-                throw cause
-            }
+            if (
+                !snapshot.operationId
+                || snapshot.operationPhase !== 'completed'
+                || ['prepared', 'running'].includes(snapshot.sourceStatus.phase)
+            ) return
+            await clearRetainedOperation(snapshot.operationId)
+        },
+        async abandon(): Promise<void> {
+            if (
+                !snapshot.operationId
+                || !['localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)
+            ) return
+            await clearRetainedOperation(snapshot.operationId)
         },
     }
 }

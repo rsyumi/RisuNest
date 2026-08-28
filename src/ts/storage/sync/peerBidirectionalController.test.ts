@@ -121,7 +121,7 @@ describe('peer bidirectional controller', () => {
         }
     })
 
-    it('does not clear a later acknowledge error when source refresh recovery succeeds', async () => {
+    it('preserves a later acknowledge error after stopping a source with a refresh error', async () => {
         vi.useFakeTimers()
         try {
             const completed: PeerBidirectionalSyncResult = {
@@ -137,6 +137,10 @@ describe('peer bidirectional controller', () => {
                 source: { phase: 'running', sessionId: 'session-source', devices: [] },
                 operation: { phase: 'completed', result: completed },
             }
+            const stoppedStatus: PeerBidirectionalStatus = {
+                source: { phase: 'stopped', sessionId: 'session-source', devices: [] },
+                operation: { phase: 'completed', result: completed },
+            }
             let statusCalls = 0
             const controller = createPeerBidirectionalController({
                 sourcePollMilliseconds: 10,
@@ -150,7 +154,7 @@ describe('peer bidirectional controller', () => {
                                 completedStatus,
                             )
                         }
-                        return completedStatus
+                        return statusCalls > 2 ? stoppedStatus : completedStatus
                     },
                     acknowledge: async () => { throw new Error('acknowledge failed') },
                 }),
@@ -159,6 +163,7 @@ describe('peer bidirectional controller', () => {
             await controller.initialize()
             await vi.advanceTimersByTimeAsync(10)
             expect(controller.snapshot().operationError).toBe('source refresh failed')
+            await controller.stop('session-source')
             await expect(controller.acknowledge()).rejects.toThrow('acknowledge failed')
             await vi.advanceTimersByTimeAsync(10)
             expect(controller.snapshot()).toMatchObject({
@@ -817,4 +822,89 @@ describe('peer bidirectional controller', () => {
         expect(acknowledge).toHaveBeenCalledWith('operation-1')
         expect(controller.snapshot()).toMatchObject({ operationPhase: 'idle', operationId: undefined })
     })
+
+    it.each(['prepared', 'running'] as const)(
+        'does not acknowledge a completed result while the source is %s',
+        async (sourcePhase) => {
+            const acknowledge = vi.fn(async () => undefined)
+            const controller = createPeerBidirectionalController({
+                facade: facade({
+                    acknowledge,
+                    status: async () => ({
+                        source: { phase: sourcePhase, sessionId: 'session-source', devices: [] },
+                        operation: {
+                            phase: 'completed',
+                            result: {
+                                kind: 'noChanges',
+                                operationId: 'operation-source-active',
+                                revision: 8,
+                                remoteRevision: 8,
+                                transferredObjects: 0,
+                                transferredBytes: 0,
+                                backups: [],
+                            },
+                        },
+                    }),
+                }),
+            })
+            await controller.initialize()
+
+            await controller.acknowledge()
+
+            expect(acknowledge).not.toHaveBeenCalled()
+            expect(controller.snapshot()).toMatchObject({
+                operationPhase: 'completed',
+                operationId: 'operation-source-active',
+                operationRetained: true,
+            })
+        },
+    )
+
+    it.each(['localCommitted', 'sourceUnavailable'] as const)(
+        'abandons a retained %s operation and permits a new sync',
+        async (retainedPhase) => {
+            const acknowledge = vi.fn(async () => undefined)
+            const sync = vi.fn(async () => ({
+                kind: 'noChanges' as const,
+                operationId: 'operation-next',
+                revision: 8,
+                remoteRevision: 8,
+                transferredObjects: 0,
+                transferredBytes: 0,
+                backups: [],
+            }))
+            const controller = createPeerBidirectionalController({
+                facade: facade({
+                    acknowledge,
+                    sync,
+                    status: async () => ({
+                        source: { phase: 'idle', devices: [] },
+                        operation: {
+                            phase: 'localCommitted',
+                            operationId: 'operation-abandon',
+                            committedRevision: 7,
+                        },
+                    }),
+                    resume: async () => ({
+                        kind: 'sourceUnavailable',
+                        operationId: 'operation-abandon',
+                        committedRevision: 7,
+                    }),
+                }),
+            })
+            await controller.initialize()
+            if (retainedPhase === 'sourceUnavailable') await controller.resume()
+
+            await controller.abandon()
+
+            expect(acknowledge).toHaveBeenCalledWith('operation-abandon')
+            expect(controller.snapshot()).toMatchObject({
+                operationPhase: 'idle',
+                operationId: undefined,
+                operationRetained: false,
+            })
+            await controller.sync('pairing-next')
+            expect(sync).toHaveBeenCalledWith('pairing-next')
+        },
+    )
 })

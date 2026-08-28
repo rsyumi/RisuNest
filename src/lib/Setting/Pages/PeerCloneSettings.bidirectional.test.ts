@@ -45,6 +45,22 @@ describe('peer bidirectional settings surface', () => {
         expect(languageKorean.peerBidirectional?.sourceUnavailable).toContain('다른 기기')
     })
 
+    it('separates stopped completion dismissal from explicit committed-operation abandonment', () => {
+        expect(peerCloneSettingsSource).toContain(
+            "disabled={bidirectionalBusy || ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}",
+        )
+        expect(peerCloneSettingsSource).toContain(
+            "['localCommitted', 'sourceUnavailable'].includes(bidirectionalOperationPhase)",
+        )
+        expect(peerCloneSettingsSource).toContain('await alertConfirm(language.peerBidirectional.abandonConfirm)')
+        expect(peerCloneSettingsSource).toContain('bidirectionalController.abandon()')
+        expect(peerCloneSettingsSource).toContain('language.peerBidirectional.abandon')
+        expect(languageEnglish.peerBidirectional.abandon).toContain('Abandon')
+        expect(languageEnglish.peerBidirectional.abandonConfirm).toContain('committed data')
+        expect(languageKorean.peerBidirectional?.abandon).toContain('포기')
+        expect(languageKorean.peerBidirectional?.abandonConfirm).toContain('반영된 데이터')
+    })
+
     it('localizes the losing backup side', () => {
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.backupLocal')
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.backupRemote')

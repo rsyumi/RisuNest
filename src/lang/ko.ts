@@ -1631,6 +1631,8 @@ export const languageKorean = {
         refreshPending: "두 기기 반영은 끝났지만 로컬 화면을 새로 고치지 못했습니다.",
         retryRefresh: "로컬 새로 고침 재시도",
         acknowledge: "완료된 동기화 닫기",
+        abandon: "대기 중인 동기화 포기",
+        abandonConfirm: "대기 중인 동기화를 포기할까요? 이 기기에 반영된 데이터는 유지되지만 다른 기기의 작업은 끝나지 않을 수 있습니다.",
         noChanges: "두 기기 모두 이미 최신 상태입니다.",
         updated: (objects: number, bytes: string) => `객체 ${objects}개(${bytes}바이트)를 동기화했습니다.`,
         stale: "동기화 시작 후 기기가 변경되었습니다. 추가 데이터는 교체되지 않았습니다. 현재 상태에서 다시 시작하세요.",

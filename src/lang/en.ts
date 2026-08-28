@@ -1851,6 +1851,8 @@ export const languageEnglish = {
         refreshPending: "Both devices are committed, but the local screen could not refresh.",
         retryRefresh: "Retry local refresh",
         acknowledge: "Dismiss completed sync",
+        abandon: "Abandon pending sync",
+        abandonConfirm: "Abandon this pending sync? This device's committed data is preserved, but the other device may remain unfinished.",
         noChanges: "Both devices are already up to date.",
         updated: (objects: number, bytes: string) => `Synchronized ${objects} objects (${bytes} bytes).`,
         stale: "A device changed after sync started. No further data was replaced. Start again from the current state.",
