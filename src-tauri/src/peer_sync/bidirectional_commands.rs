@@ -2049,7 +2049,9 @@ impl PeerBidirectionalCommandState {
                 .as_ref()
                 .is_some_and(|operation| operation.operation_id() == operation_id)
             {
-                return Ok(());
+                return Err(PeerSyncError::Protocol(
+                    "peer bidirectional source must be stopped before acknowledgement".to_owned(),
+                ));
             }
         }
         let Some(operation) = journal.load()? else {
@@ -6055,7 +6057,10 @@ mod tests {
             })
             .unwrap();
 
-        state.acknowledge(directory.path(), operation_id).unwrap();
+        assert!(matches!(
+            state.acknowledge(directory.path(), operation_id),
+            Err(PeerSyncError::Protocol(message)) if message.contains("source")
+        ));
         assert!(journal.load().unwrap().is_some());
         assert_eq!(
             state.status(directory.path()).unwrap().source.phase,
