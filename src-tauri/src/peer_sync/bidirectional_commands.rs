@@ -47,6 +47,11 @@ const OPERATION_SCHEMA: &str = "risunest.peer-bidirectional-operation/v1";
 const OPERATION_FILE: &str = "operation.json";
 const MAX_OPERATION_BYTES: u64 = 1_048_576;
 
+#[cfg(test)]
+thread_local! {
+    static COMPLETE_AFTER_ACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerBidirectionalConflict {
@@ -119,6 +124,8 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         changed: bool,
         #[serde(default = "conservative_remote_backup_required")]
         remote_backup_required: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_apply_receipt: Option<LanBidirectionalRemoteApplyReceipt>,
         transferred_objects: u64,
         transferred_bytes: u64,
         backups: Vec<PeerBidirectionalBackupReceipt>,
@@ -690,6 +697,7 @@ fn retain_bidirectional_local_activation(
             },
             changed,
             remote_backup_required,
+            remote_apply_receipt: None,
             transferred_objects: if changed { transferred_objects } else { 0 },
             transferred_bytes: if changed { transferred_bytes } else { 0 },
             backups,
@@ -1325,6 +1333,7 @@ fn complete_bidirectional_local_after_remote_apply(
         shared_generation,
         changed,
         remote_backup_required,
+        retained_remote_apply_receipt,
         local_transferred_objects,
         local_transferred_bytes,
         mut backups,
@@ -1335,6 +1344,7 @@ fn complete_bidirectional_local_after_remote_apply(
             shared_generation,
             changed,
             remote_backup_required,
+            remote_apply_receipt,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -1345,6 +1355,7 @@ fn complete_bidirectional_local_after_remote_apply(
             shared_generation,
             changed,
             remote_backup_required,
+            remote_apply_receipt,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -1402,6 +1413,26 @@ fn complete_bidirectional_local_after_remote_apply(
             actual: Some(active_identity.manifest_hash),
         });
     }
+    match retained_remote_apply_receipt {
+        Some(retained) if retained != remote => {
+            return Err(PeerSyncError::Validation(
+                "bidirectional remote receipt differs from retained completion".to_owned(),
+            ));
+        }
+        Some(_) => {}
+        None => journal.store(&PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context.clone(),
+            committed_revision,
+            shared_generation: shared_generation.clone(),
+            changed,
+            remote_backup_required,
+            remote_apply_receipt: Some(remote.clone()),
+            transferred_objects: local_transferred_objects,
+            transferred_bytes: local_transferred_bytes,
+            backups: backups.clone(),
+        })?,
+    }
     let acknowledgement = store
         .sync_device_ack_state(&context.library_id, &context.credential.source_device_id)
         .map_err(store_error)?;
@@ -1420,6 +1451,12 @@ fn complete_bidirectional_local_after_remote_apply(
                 &active_identity,
             )
             .map_err(store_error)?;
+    }
+    #[cfg(test)]
+    if COMPLETE_AFTER_ACK_FAILPOINT.with(|enabled| enabled.replace(false)) {
+        return Err(PeerSyncError::Storage(
+            "simulated crash after bidirectional acknowledgement".to_owned(),
+        ));
     }
     if let Some(backup) = remote.backup {
         backups.push(PeerBidirectionalBackupReceipt {
@@ -1479,18 +1516,26 @@ where
     let operation = journal.load()?.ok_or_else(|| {
         PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
     })?;
-    let (context, committed_revision, shared_generation, remote_backup_required) = match operation {
+    let (
+        context,
+        committed_revision,
+        shared_generation,
+        remote_backup_required,
+        remote_apply_receipt,
+    ) = match operation {
         PeerBidirectionalDurableOperation::LocalCommitted {
             context,
             committed_revision,
             shared_generation,
             remote_backup_required,
+            remote_apply_receipt,
             ..
         } if context.operation_id == operation_id => (
             context,
             committed_revision,
             shared_generation,
             remote_backup_required,
+            remote_apply_receipt,
         ),
         other if other.operation_id() != operation_id => {
             return Err(PeerSyncError::Validation(
@@ -1509,6 +1554,16 @@ where
             operation_id: operation_id.to_owned(),
             reason: PeerBidirectionalStaleReason::LocalRevision,
         });
+    }
+    if let Some(remote) = remote_apply_receipt {
+        return complete_bidirectional_local_after_remote_apply(
+            store,
+            cas,
+            app_root,
+            operation_id,
+            remote,
+        )
+        .map(ResumeLocalCommittedOutcome::Completed);
     }
     let common_base = store
         .sync_device_common_base_identity(&context.library_id, &context.credential.source_device_id)
@@ -3101,6 +3156,7 @@ mod tests {
             shared_generation: generation("local-a", "3", 'e'),
             changed: true,
             remote_backup_required: false,
+            remote_apply_receipt: None,
             transferred_objects: 2,
             transferred_bytes: 19,
             backups: vec![backup(PeerBidirectionalBackupSide::Local)],
@@ -3123,6 +3179,139 @@ mod tests {
         };
         journal.store(&completed).unwrap();
         assert_eq!(journal.load().unwrap(), Some(completed));
+    }
+
+    #[test]
+    fn ack_after_completed_journal_crash_reopens_without_a_second_remote_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer_id = "123e4567-e89b-42d3-a456-426614174097";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        let previous = SyncGenerationIdentity {
+            generation_id: base.manifest.generation,
+            manifest_hash: base.manifest_hash,
+            generation_sequence: base.manifest.generation_sequence,
+        };
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    previous.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"side": "shared"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: active.manifest.generation,
+            manifest_hash: active.manifest_hash,
+            generation_sequence: active.manifest.generation_sequence,
+        };
+        let operation_id = "123e4567-e89b-42d3-a456-426614174098";
+        let mut retained_context = context(operation_id);
+        retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        retained_context.credential.source_device_id = peer_id.to_owned();
+        retained_context.expected_remote_revision = 4;
+        retained_context.previous_shared = previous.clone();
+        retained_context.previous_local = previous;
+        PeerBidirectionalOperationJournal::new(directory.path())
+            .store(&PeerBidirectionalDurableOperation::LocalCommitted {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: retained_context,
+                committed_revision: 1,
+                shared_generation: shared.clone(),
+                changed: true,
+                remote_backup_required: false,
+                remote_apply_receipt: None,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups: vec![],
+            })
+            .unwrap();
+        let receipt = LanBidirectionalRemoteApplyReceipt {
+            committed_revision: 5,
+            committed_generation: LanBidirectionalGeneration {
+                generation_id: shared.generation_id.clone(),
+                manifest_hash: shared.manifest_hash.clone(),
+                generation_sequence: shared.generation_sequence.clone(),
+            },
+            transferred_objects: 3,
+            transferred_bytes: 27,
+            backup: None,
+        };
+        COMPLETE_AFTER_ACK_FAILPOINT.with(|enabled| enabled.set(true));
+
+        assert!(complete_bidirectional_local_after_remote_apply(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            receipt,
+        )
+        .is_err());
+        assert_eq!(
+            store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap()
+                .shared_identity,
+            shared
+        );
+        drop(store);
+        let mut reopened = PersistentStore::open(directory.path()).unwrap();
+
+        let resumed = resume_bidirectional_local_committed_with_remote(
+            &mut reopened,
+            &cas,
+            directory.path(),
+            operation_id,
+            |_context, _revision, _shared, _manifest, _backup_required| {
+                panic!("durable remote receipt must complete without a second network request")
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            resumed,
+            ResumeLocalCommittedOutcome::Completed(PeerBidirectionalCompletedResult {
+                revision: 1,
+                remote_revision: 5,
+                transferred_objects: 3,
+                transferred_bytes: 27,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3243,6 +3432,7 @@ mod tests {
             shared_generation: shared.clone(),
             changed: false,
             remote_backup_required: false,
+            remote_apply_receipt: None,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -3366,6 +3556,7 @@ mod tests {
             shared_generation: shared.clone(),
             changed: false,
             remote_backup_required: false,
+            remote_apply_receipt: None,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -3480,6 +3671,7 @@ mod tests {
             shared_generation: shared.clone(),
             changed: true,
             remote_backup_required: true,
+            remote_apply_receipt: None,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -3579,6 +3771,7 @@ mod tests {
                 shared_generation: shared.clone(),
                 changed: false,
                 remote_backup_required: false,
+                remote_apply_receipt: None,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -3624,6 +3817,7 @@ mod tests {
                 shared_generation: shared,
                 changed: false,
                 remote_backup_required: false,
+                remote_apply_receipt: None,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -3679,6 +3873,7 @@ mod tests {
                 },
                 changed: false,
                 remote_backup_required: false,
+                remote_apply_receipt: None,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -3889,6 +4084,7 @@ mod tests {
             shared_generation: generation("shared-a", "2", 'e'),
             changed: true,
             remote_backup_required: false,
+            remote_apply_receipt: None,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: backups.clone(),
@@ -3966,6 +4162,7 @@ mod tests {
             shared_generation: generation("local-a", "3", 'e'),
             changed: true,
             remote_backup_required: false,
+            remote_apply_receipt: None,
             transferred_objects: 2,
             transferred_bytes: 19,
             backups: vec![backup(PeerBidirectionalBackupSide::Local)],
