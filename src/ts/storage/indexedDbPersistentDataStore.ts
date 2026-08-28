@@ -120,15 +120,21 @@ interface ReplacementOwnerTuple {
     entries: unknown[]
 }
 
+// A malformed parent or non-array property yields no tuple, so the head is
+// dropped instead of failing the whole replacement. Staged-head validation
+// stays strict through ownArrayProperty above.
 function replacementOwnerTupleFromParent(
-    parent: object | undefined,
+    parent: object | null | undefined,
     property: string,
 ): ReplacementOwnerTuple | null {
-    if (!parent) return null
-    const entries = ownArrayProperty(parent, property)
-    return entries === undefined
-        ? { present: false, entries: [] }
-        : { present: true, entries }
+    if (!parent || typeof parent !== 'object') return null
+    if (!Object.prototype.hasOwnProperty.call(parent, property)) {
+        return { present: false, entries: [] }
+    }
+    const entries = (parent as Record<string, unknown>)[property]
+    return Array.isArray(entries)
+        ? { present: true, entries }
+        : null
 }
 
 function replacementOwnerTupleFromDatabase(

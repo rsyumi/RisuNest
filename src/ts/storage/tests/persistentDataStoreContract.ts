@@ -1023,6 +1023,96 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
+        it('drops owner heads for malformed replacement parents without failing the replacement', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [{
+                id: 'kept-module',
+                name: 'Kept module',
+                description: '',
+                assets: [['kept', 'assets/kept.bin', 'BIN']],
+            }]
+            database.personas = [{
+                name: 'Persona',
+                personaPrompt: '',
+                icon: '',
+                embeddedModule: {
+                    id: 'persona-module',
+                    name: 'Persona module',
+                    description: '',
+                    assets: [['persona', 'assets/persona.bin', 'BIN']],
+                },
+            }]
+            database.characters[0].additionalAssets = [['c', 'assets/c.bin', 'BIN']]
+            const alias: AssetAlias = {
+                key: 'assets/kept.bin',
+                objectHash: '71'.repeat(32),
+                kind: 'asset',
+                size: 4,
+                mime: 'application/octet-stream',
+                name: 'Kept',
+                ext: 'BIN',
+            }
+            const heads: AssetOwnerHead[] = [
+                {
+                    owner: { kind: 'root-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '72'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: { kind: 'persona-embedded-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '73'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: {
+                        kind: 'character-additional-assets',
+                        characterId: database.characters[0].chaId,
+                    },
+                    present: true,
+                    manifestHash: '74'.repeat(32),
+                    entryCount: 1,
+                },
+            ]
+            const authority = {
+                format: 'v2' as const,
+                migrationId: 'asset-malformed-parent',
+                compatibilityHash: '75'.repeat(32),
+            }
+            const imported = await store.replaceFromDatabase(database)
+            const activated = await store.activateAssetRepositoryMigration({
+                sourceRevision: imported.revision,
+                migrationId: authority.migrationId,
+                compatibilityHash: authority.compatibilityHash,
+                database,
+                assetAliases: [alias],
+                assetOwnerHeads: heads,
+            })
+            const replacement = structuredClone(database)
+            replacement.username = 'Malformed replacement parents'
+            replacement.modules = null as unknown as Database['modules']
+            replacement.personas[0].embeddedModule = null as unknown as
+                Database['personas'][number]['embeddedModule']
+            replacement.characters[0].additionalAssets = null as unknown as
+                Database['characters'][number]['additionalAssets']
+
+            const replaced = await store.replaceFromDatabase(replacement, activated.revision)
+
+            for (const head of heads) {
+                expect(await store.readAssetOwnerHead(head.owner)).toBeNull()
+            }
+            expect(await store.readAssetAlias({ kind: 'asset', key: alias.key })).toEqual({
+                revision: replaced.revision,
+                value: alias,
+            })
+            expect(await store.readAssetRepositoryAuthority()).toEqual({
+                revision: replaced.revision,
+                value: authority,
+            })
+        })
+
         it('copy-on-write isolates cold alias commits and deletes from a pinned revision', async () => {
             const { store } = await createHarness()
             const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

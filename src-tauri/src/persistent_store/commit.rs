@@ -1001,30 +1001,28 @@ fn replacement_owner_tuple(
             replacement_owner_tuple_from_parent(&serde_json::from_str(&detail)?, "additionalAssets")
         }
         AssetOwnerLocator::RootModuleAssets { index } => {
-            let Some(modules) = root.get("modules") else {
-                return Ok(None);
-            };
-            let modules = modules
-                .as_array()
-                .ok_or_else(|| validation("Replacement modules must be an array"))?;
-            let Some(module) = usize::try_from(*index)
-                .ok()
-                .and_then(|index| modules.get(index))
+            let Some(module) = root
+                .get("modules")
+                .and_then(Value::as_array)
+                .and_then(|modules| {
+                    usize::try_from(*index)
+                        .ok()
+                        .and_then(|index| modules.get(index))
+                })
             else {
                 return Ok(None);
             };
             replacement_owner_tuple_from_parent(module, "assets")
         }
         AssetOwnerLocator::PersonaEmbeddedModuleAssets { index } => {
-            let Some(personas) = root.get("personas") else {
-                return Ok(None);
-            };
-            let personas = personas
-                .as_array()
-                .ok_or_else(|| validation("Replacement personas must be an array"))?;
-            let Some(module) = usize::try_from(*index)
-                .ok()
-                .and_then(|index| personas.get(index))
+            let Some(module) = root
+                .get("personas")
+                .and_then(Value::as_array)
+                .and_then(|personas| {
+                    usize::try_from(*index)
+                        .ok()
+                        .and_then(|index| personas.get(index))
+                })
                 .and_then(Value::as_object)
                 .and_then(|persona| persona.get("embeddedModule"))
             else {
@@ -1035,23 +1033,21 @@ fn replacement_owner_tuple(
     }
 }
 
+// A malformed parent or non-array property yields no tuple, so the head is
+// dropped instead of failing the whole replacement. Staging accepts such
+// shapes, and extraction here exists only to compare retention candidates.
 fn replacement_owner_tuple_from_parent(
     parent: &Value,
     property: &str,
 ) -> StoreResult<Option<ReplacementOwnerTuple>> {
-    let parent = parent
-        .as_object()
-        .ok_or_else(|| validation("Replacement asset owner parent must be an object"))?;
+    let Some(parent) = parent.as_object() else {
+        return Ok(None);
+    };
     match parent.get(property) {
         None => Ok(Some(ReplacementOwnerTuple::Absent)),
-        Some(entries) => Ok(Some(ReplacementOwnerTuple::Present(
-            entries
-                .as_array()
-                .ok_or_else(|| {
-                    validation("Replacement asset owner property must be an array when present")
-                })?
-                .clone(),
-        ))),
+        Some(entries) => Ok(entries
+            .as_array()
+            .map(|entries| ReplacementOwnerTuple::Present(entries.clone()))),
     }
 }
 

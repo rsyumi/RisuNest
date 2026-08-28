@@ -5940,6 +5940,165 @@ fn database_only_replace_preserves_repositories_and_only_matching_owner_heads() 
 }
 
 #[test]
+fn database_only_replace_drops_heads_for_malformed_replacement_parents() {
+    let directory = tempfile::tempdir().expect("create malformed parent directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let mut database = fixture();
+    database["modules"] = json!([
+        {
+            "id": "kept-module",
+            "name": "Kept module",
+            "description": "",
+            "assets": [["kept", "assets/kept.bin", "BIN"]]
+        }
+    ]);
+    database["personas"] = json!([
+        {
+            "name": "Persona",
+            "personaPrompt": "",
+            "icon": "",
+            "embeddedModule": {
+                "id": "persona-module",
+                "name": "Persona module",
+                "description": "",
+                "assets": [["persona", "assets/persona.bin", "BIN"]]
+            }
+        }
+    ]);
+    database["characters"][0]["additionalAssets"] = json!([["c", "assets/c.bin", "BIN"]]);
+    let character_id = database["characters"][0]["chaId"]
+        .as_str()
+        .expect("fixture character id")
+        .to_owned();
+    let alias = AssetAlias {
+        key: "assets/kept.bin".to_owned(),
+        object_hash: Some("71".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 4,
+        mime: "application/octet-stream".to_owned(),
+        name: "Kept".to_owned(),
+        ext: "BIN".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let heads = vec![
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "72".repeat(32),
+            1,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 },
+            "73".repeat(32),
+            1,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::CharacterAdditionalAssets {
+                character_id: character_id.clone(),
+            },
+            "74".repeat(32),
+            1,
+        ),
+    ];
+    let asset_authority = AssetRepositoryAuthorityState::V2 {
+        migration_id: "asset-malformed-parent".to_owned(),
+        compatibility_hash: "75".repeat(32),
+    };
+    let initial = store.replace_begin().expect("begin v2 generation");
+    store
+        .replace_put_root(&initial.staging_id, &staged_root(&database))
+        .expect("stage v2 root");
+    store
+        .replace_put_presets(
+            &initial.staging_id,
+            database["botPresets"].as_array().expect("fixture presets"),
+        )
+        .expect("stage v2 presets");
+    store
+        .replace_add_characters(
+            &initial.staging_id,
+            database["characters"]
+                .as_array()
+                .expect("fixture characters"),
+        )
+        .expect("stage v2 characters");
+    store
+        .replace_put_asset_aliases(&initial.staging_id, std::slice::from_ref(&alias))
+        .expect("stage v2 aliases");
+    store
+        .replace_put_asset_owner_heads(&initial.staging_id, &heads)
+        .expect("stage v2 owner heads");
+    store
+        .replace_put_asset_repository_authority(&initial.staging_id, &asset_authority)
+        .expect("stage v2 asset authority");
+    let activated = store
+        .replace_commit(&initial.staging_id, Some(0))
+        .expect("activate v2 repository");
+
+    let mut replacement = database;
+    replacement["username"] = json!("Malformed replacement parents");
+    replacement["modules"] = json!(null);
+    replacement["personas"][0]["embeddedModule"] = json!(null);
+    replacement["characters"][0]["additionalAssets"] = json!(null);
+    let staging = store
+        .replace_begin()
+        .expect("begin database-only replacement");
+    store
+        .replace_put_root(&staging.staging_id, &staged_root(&replacement))
+        .expect("stage replacement root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            replacement["botPresets"]
+                .as_array()
+                .expect("replacement presets"),
+        )
+        .expect("stage replacement presets");
+    store
+        .replace_add_characters(
+            &staging.staging_id,
+            replacement["characters"]
+                .as_array()
+                .expect("replacement characters"),
+        )
+        .expect("stage replacement characters");
+    store
+        .replace_preserve_repositories(&staging.staging_id, Some(activated.revision))
+        .expect("preserve repositories despite malformed replacement parents");
+    let replaced = store
+        .replace_commit(&staging.staging_id, Some(activated.revision))
+        .expect("activate database-only replacement");
+
+    for head in &heads {
+        assert_eq!(
+            store
+                .read_asset_owner_head(&head.owner, None)
+                .expect("read dropped owner head"),
+            None
+        );
+    }
+    assert_eq!(
+        store
+            .read_asset_alias("asset", &alias.key, None)
+            .expect("read preserved asset alias")
+            .expect("preserved asset alias exists")
+            .value,
+        alias
+    );
+    assert_eq!(
+        store
+            .read_asset_repository_authority(None)
+            .expect("read preserved asset authority"),
+        super::Versioned {
+            revision: replaced.revision,
+            value: asset_authority,
+        }
+    );
+}
+
+#[test]
 fn missing_cold_authority_marker_fails_closed() {
     let directory = tempfile::tempdir().expect("create cold authority directory");
     let store = PersistentStore::open(directory.path()).expect("open persistent store");
