@@ -746,6 +746,11 @@ class SafFileBridgeTest {
     assertEquals("opened-file.risudat", safeSafDestinationName("///"))
     assertEquals("chat.zip", safeSafDestinationName("folder/chat.zip"))
     assertEquals("Leased.charx", safeSafDestinationName("Leased.charx"))
+    assertEquals(
+      "risunest-2026-08-29T00-00-00-000Z.risulossless",
+      safeSafDestinationName("risunest-2026-08-29T00-00-00-000Z.risulossless"),
+    )
+    assertEquals("risu-backup.bin", safeSafDestinationName("risu-backup.bin"))
   }
 
   @Test

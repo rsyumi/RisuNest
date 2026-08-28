@@ -662,6 +662,8 @@ internal fun safeSafDestinationName(name: String): String {
   val safe = safeSafDisplayName(name)
   return if (
     safe.endsWith(".risudat", ignoreCase = true)
+    || safe.endsWith(".risulossless", ignoreCase = true)
+    || safe.endsWith(".bin", ignoreCase = true)
     || safe.endsWith(".zip", ignoreCase = true)
     || safe.endsWith(".charx", ignoreCase = true)
   ) safe else "$safe.risudat"
