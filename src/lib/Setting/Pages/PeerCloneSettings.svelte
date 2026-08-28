@@ -693,11 +693,19 @@
         <h4 class="font-bold">{language.peerBidirectional.source}</h4>
         <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.sourceHelp}</p>
         <div class="mt-2 flex flex-wrap gap-2">
-            <Button disabled={!bidirectionalEnabled || bidirectionalBusy || bidirectionalOperationRetained} onclick={prepareBidirectionalSource}>
+            <Button
+                disabled={!bidirectionalEnabled
+                    || bidirectionalBusy
+                    || (bidirectionalOperationRetained && bidirectionalOperationPhase !== 'completed')}
+                onclick={prepareBidirectionalSource}
+            >
                 {language.peerBidirectional.prepare}
             </Button>
             <Button
-                disabled={!bidirectionalEnabled || bidirectionalBusy || bidirectionalOperationRetained || bidirectionalSourceStatus.phase !== 'prepared'}
+                disabled={!bidirectionalEnabled
+                    || bidirectionalBusy
+                    || (bidirectionalOperationRetained && bidirectionalOperationPhase !== 'completed')
+                    || bidirectionalSourceStatus.phase !== 'prepared'}
                 onclick={startBidirectionalSource}
             >{language.peerBidirectional.start}</Button>
             <Button

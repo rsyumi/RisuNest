@@ -5,7 +5,8 @@ import { mount, tick, unmount } from 'svelte'
 
 const controllerMocks = vi.hoisted(() => {
     const listeners = new Set<() => void>()
-    let operationPhase: 'idle' | 'localCommitted' | 'sourceUnavailable' = 'idle'
+    let operationPhase: 'idle' | 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'refreshPending' | 'completed' = 'idle'
+    let sourcePhase: 'stopped' | 'prepared' | 'running' = 'stopped'
     let revoked = false
     const snapshot = () => ({
         capabilities: {
@@ -18,7 +19,8 @@ const controllerMocks = vi.hoisted(() => {
             productionEnabled: true,
         },
         sourceStatus: {
-            phase: 'stopped' as const,
+            phase: sourcePhase,
+            sessionId: sourcePhase === 'stopped' ? undefined : 'session-rehost',
             devices: [{
                 deviceId: 'device-offline',
                 transferredBytes: 14,
@@ -28,7 +30,15 @@ const controllerMocks = vi.hoisted(() => {
         },
         sourcePairingUri: '',
         operationPhase,
-        operationResult: operationPhase === 'localCommitted'
+        operationResult: operationPhase === 'awaitingConflict'
+            ? {
+                  kind: 'conflict' as const,
+                  operationId: 'operation-retained',
+                  conflicts: [{ key: 'r1:root', type: 'sameRecord' as const }],
+                  localManifestHash: 'a'.repeat(64),
+                  remoteManifestHash: 'b'.repeat(64),
+              }
+            : operationPhase === 'localCommitted'
             ? {
                   kind: 'resumeRequired' as const,
                   operationId: 'operation-retained',
@@ -41,7 +51,17 @@ const controllerMocks = vi.hoisted(() => {
                       operationId: 'operation-retained',
                       committedRevision: 7,
                   }
-                : undefined,
+                : operationPhase === 'completed' || operationPhase === 'refreshPending'
+                    ? {
+                          kind: 'noChanges' as const,
+                          operationId: 'operation-retained',
+                          revision: 7,
+                          remoteRevision: 7,
+                          transferredObjects: 0,
+                          transferredBytes: 0,
+                          backups: [],
+                      }
+                    : undefined,
         operationRetained: operationPhase !== 'idle',
         sourceError: '',
         operationError: '',
@@ -54,6 +74,14 @@ const controllerMocks = vi.hoisted(() => {
             return () => listeners.delete(listener)
         },
         initialize: vi.fn(async () => undefined),
+        prepare: vi.fn(async () => {
+            sourcePhase = 'prepared'
+            for (const listener of listeners) listener()
+        }),
+        start: vi.fn(async () => {
+            sourcePhase = 'running'
+            for (const listener of listeners) listener()
+        }),
         sync: vi.fn(async () => undefined),
         revoke: vi.fn(async (_sessionId: string, deviceId: string) => {
             if (deviceId === 'device-offline') revoked = true
@@ -75,9 +103,10 @@ const controllerMocks = vi.hoisted(() => {
         delta,
         reset() {
             operationPhase = 'idle'
+            sourcePhase = 'stopped'
             revoked = false
         },
-        setOperationPhase(phase: 'localCommitted' | 'sourceUnavailable') {
+        setOperationPhase(phase: 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'refreshPending' | 'completed') {
             operationPhase = phase
         },
     }
@@ -173,6 +202,38 @@ describe('peer bidirectional offline revoke', () => {
             expect(sync?.disabled).toBe(false)
             sync?.click()
             await vi.waitFor(() => expect(controllerMocks.bidirectional.sync).toHaveBeenCalledWith(pairingUri))
+        },
+    )
+
+    it('prepares and starts a source while completion is retained', async () => {
+        controllerMocks.setOperationPhase('completed')
+        const target = document.createElement('div')
+        document.body.append(target)
+        mounted = mount(PeerCloneSettings, { target })
+        await tick()
+        const button = (label: string) => [...target.querySelectorAll<HTMLButtonElement>('button')]
+            .find((candidate) => candidate.textContent?.trim() === label)
+
+        expect(button('Prepare pairing')?.disabled).toBe(false)
+        button('Prepare pairing')?.click()
+        await vi.waitFor(() => expect(controllerMocks.bidirectional.prepare).toHaveBeenCalledTimes(1))
+        await vi.waitFor(() => expect(button('Start pairing')?.disabled).toBe(false))
+        button('Start pairing')?.click()
+        await vi.waitFor(() => expect(controllerMocks.bidirectional.start).toHaveBeenCalledWith('session-rehost'))
+    })
+
+    it.each(['awaitingConflict', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
+        'keeps source prepare disabled while %s is retained',
+        async (operationPhase) => {
+            controllerMocks.setOperationPhase(operationPhase)
+            const target = document.createElement('div')
+            document.body.append(target)
+            mounted = mount(PeerCloneSettings, { target })
+            await tick()
+            const prepare = [...target.querySelectorAll<HTMLButtonElement>('button')]
+                .find((button) => button.textContent?.trim() === 'Prepare pairing')
+
+            expect(prepare?.disabled).toBe(true)
         },
     )
 })

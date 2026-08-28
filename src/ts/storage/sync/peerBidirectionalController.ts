@@ -160,9 +160,11 @@ export function createPeerBidirectionalController(options: {
     }
     const runSource = async <T>(
         operation: () => Promise<T>,
-        allowRetained = false,
+        allowRetained: boolean | 'completed' = false,
     ): Promise<T> => {
-        if (snapshot.operationRetained && !allowRetained) {
+        const retainedAllowed = allowRetained === true
+            || (allowRetained === 'completed' && snapshot.operationPhase === 'completed')
+        if (snapshot.operationRetained && !retainedAllowed) {
             throw new Error('A retained peer sync operation must be resolved first')
         }
         try {
@@ -301,14 +303,14 @@ export function createPeerBidirectionalController(options: {
             sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: '' })
             return sourceStatus
-        }),
+        }, 'completed'),
         start: (sessionId: string) => runSource(async () => {
             const sourceStatus = await options.facade.start(sessionId)
             sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
             beginSourcePolling()
             return sourceStatus
-        }),
+        }, 'completed'),
         stop: (sessionId: string) => runSource(async () => {
             await options.facade.stop(sessionId)
             stopSourcePolling()

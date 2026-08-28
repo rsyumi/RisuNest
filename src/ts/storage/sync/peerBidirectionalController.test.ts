@@ -971,6 +971,144 @@ describe('peer bidirectional controller', () => {
         },
     )
 
+    it('prepares and starts a new source while a completed operation is retained', async () => {
+        const completed: PeerBidirectionalSyncResult = {
+            kind: 'noChanges',
+            operationId: 'operation-source-rehost',
+            revision: 7,
+            remoteRevision: 7,
+            transferredObjects: 0,
+            transferredBytes: 0,
+            backups: [],
+        }
+        const prepare = vi.fn(async () => ({
+            phase: 'prepared' as const,
+            sessionId: 'session-rehost',
+            devices: [],
+        }))
+        const start = vi.fn(async () => ({
+            phase: 'running' as const,
+            sessionId: 'session-rehost',
+            devices: [],
+        }))
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                prepare,
+                start,
+                status: async () => ({
+                    source: { phase: 'stopped', devices: [] },
+                    operation: { phase: 'completed', result: completed },
+                }),
+            }),
+        })
+        await controller.initialize()
+
+        await controller.prepare()
+        await controller.start('session-rehost')
+
+        expect(prepare).toHaveBeenCalledTimes(1)
+        expect(start).toHaveBeenCalledWith('session-rehost')
+        expect(controller.snapshot()).toMatchObject({
+            sourceStatus: { phase: 'running' },
+            operationPhase: 'completed',
+            operationResult: completed,
+            operationRetained: true,
+        })
+    })
+
+    it('retains completed operation state when native rejects source rehost', async () => {
+        const completed: PeerBidirectionalSyncResult = {
+            kind: 'noChanges',
+            operationId: 'operation-source-rehost-rejected',
+            revision: 7,
+            remoteRevision: 7,
+            transferredObjects: 0,
+            transferredBytes: 0,
+            backups: [],
+        }
+        const prepare = vi.fn(async () => { throw new Error('completed operation belongs to target') })
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                prepare,
+                status: async () => ({
+                    source: { phase: 'stopped', devices: [] },
+                    operation: { phase: 'completed', result: completed },
+                }),
+            }),
+        })
+        await controller.initialize()
+
+        await expect(controller.prepare()).rejects.toThrow('completed operation belongs to target')
+
+        expect(prepare).toHaveBeenCalledTimes(1)
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'completed',
+            operationResult: completed,
+            operationRetained: true,
+            sourceError: 'completed operation belongs to target',
+        })
+    })
+
+    it.each(['awaitingConflict', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
+        'keeps source prepare and start blocked while %s is retained',
+        async (retainedPhase) => {
+            const conflict: PeerBidirectionalSyncResult = {
+                kind: 'conflict',
+                operationId: 'operation-source-blocked',
+                conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
+                localManifestHash: 'a'.repeat(64),
+                remoteManifestHash: 'b'.repeat(64),
+            }
+            const completed: PeerBidirectionalSyncResult = {
+                kind: 'noChanges',
+                operationId: 'operation-source-blocked',
+                revision: 7,
+                remoteRevision: 7,
+                transferredObjects: 0,
+                transferredBytes: 0,
+                backups: [],
+            }
+            const prepare = vi.fn(facade().prepare)
+            const start = vi.fn(facade().start)
+            const controller = createPeerBidirectionalController({
+                facade: facade({
+                    prepare,
+                    start,
+                    status: async () => ({
+                        source: { phase: 'stopped', devices: [] },
+                        operation: retainedPhase === 'awaitingConflict'
+                            ? { phase: 'awaitingConflict', result: conflict }
+                            : retainedPhase === 'refreshPending'
+                                ? undefined
+                                : {
+                                      phase: 'localCommitted',
+                                      operationId: 'operation-source-blocked',
+                                      committedRevision: 7,
+                                  },
+                    }),
+                    resume: async () => ({
+                        kind: 'sourceUnavailable',
+                        operationId: 'operation-source-blocked',
+                        committedRevision: 7,
+                    }),
+                    sync: async () => {
+                        throw new PeerBidirectionalRefreshError(completed, new Error('refresh failed'))
+                    },
+                }),
+            })
+            await controller.initialize()
+            if (retainedPhase === 'sourceUnavailable') await controller.resume()
+            if (retainedPhase === 'refreshPending') {
+                await expect(controller.sync('pairing-refresh')).rejects.toThrow('refresh failed')
+            }
+
+            await expect(controller.prepare()).rejects.toThrow('retained peer sync operation')
+            await expect(controller.start('session-blocked')).rejects.toThrow('retained peer sync operation')
+            expect(prepare).not.toHaveBeenCalled()
+            expect(start).not.toHaveBeenCalled()
+        },
+    )
+
     it.each(['awaitingConflict', 'completed', 'refreshPending'] as const)(
         'continues to reject fresh pairing sync while %s is retained',
         async (retainedPhase) => {
