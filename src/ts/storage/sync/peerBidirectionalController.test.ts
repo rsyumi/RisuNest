@@ -65,6 +65,154 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
 }
 
 describe('peer bidirectional controller', () => {
+    it('projects a durable source-prepared operation after restart without a resume result', async () => {
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                status: async () => ({
+                    source: { phase: 'stopped', devices: [] },
+                    operation: {
+                        phase: 'sourcePrepared',
+                        operationId: 'operation-source-prepared',
+                    },
+                } as unknown as PeerBidirectionalStatus),
+            }),
+        })
+
+        await controller.initialize()
+
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'sourcePrepared',
+            operationId: 'operation-source-prepared',
+            operationResult: undefined,
+            operationRetained: true,
+        })
+    })
+
+    it('rehosts a source while a source-prepared operation is retained', async () => {
+        const prepare = vi.fn(facade().prepare)
+        const start = vi.fn(facade().start)
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                prepare,
+                start,
+                status: async () => ({
+                    source: { phase: 'stopped', devices: [] },
+                    operation: {
+                        phase: 'sourcePrepared',
+                        operationId: 'operation-source-prepared',
+                    },
+                } as unknown as PeerBidirectionalStatus),
+            }),
+        })
+        await controller.initialize()
+
+        await controller.prepare()
+        await controller.start('session-1')
+
+        expect(prepare).toHaveBeenCalledTimes(1)
+        expect(start).toHaveBeenCalledWith('session-1')
+        expect(controller.snapshot()).toMatchObject({
+            sourceStatus: { phase: 'running' },
+            operationPhase: 'sourcePrepared',
+            operationId: 'operation-source-prepared',
+            operationResult: undefined,
+            operationRetained: true,
+        })
+    })
+
+    it('keeps target sync blocked while a source-prepared operation is retained', async () => {
+        const sync = vi.fn(facade().sync)
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                sync,
+                status: async () => ({
+                    source: { phase: 'stopped', devices: [] },
+                    operation: {
+                        phase: 'sourcePrepared',
+                        operationId: 'operation-source-prepared',
+                    },
+                } as unknown as PeerBidirectionalStatus),
+            }),
+        })
+        await controller.initialize()
+
+        await expect(controller.sync('pairing-fresh')).rejects.toThrow('retained peer sync operation')
+        expect(sync).not.toHaveBeenCalled()
+    })
+
+    it('abandons a stopped source-prepared operation and preserves a completed receipt', async () => {
+        const completed: PeerBidirectionalCompletedResult = {
+            kind: 'noChanges',
+            operationId: 'operation-source-prepared',
+            revision: 9,
+            remoteRevision: 9,
+            transferredObjects: 0,
+            transferredBytes: 0,
+            backups: [{ packageId: 'backup-source-prepared', side: 'local', path: 'source.risulossless' }],
+        }
+        const acknowledge = vi.fn(async () => undefined)
+        let acknowledged = false
+        acknowledge.mockImplementation(async () => { acknowledged = true })
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                acknowledge,
+                status: async () => acknowledged
+                    ? {
+                          source: { phase: 'stopped', devices: [] },
+                          operation: { phase: 'completed', result: completed },
+                      }
+                    : ({
+                          source: { phase: 'stopped', devices: [] },
+                          operation: {
+                              phase: 'sourcePrepared',
+                              operationId: 'operation-source-prepared',
+                          },
+                      } as unknown as PeerBidirectionalStatus),
+            }),
+        })
+        await controller.initialize()
+
+        await controller.abandon()
+
+        expect(acknowledge).toHaveBeenCalledWith('operation-source-prepared')
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'completed',
+            operationId: 'operation-source-prepared',
+            operationResult: completed,
+            operationRetained: true,
+        })
+    })
+
+    it.each(['prepared', 'running'] as const)(
+        'does not abandon a source-prepared operation while the source is %s',
+        async (sourcePhase) => {
+            const acknowledge = vi.fn(async () => undefined)
+            const controller = createPeerBidirectionalController({
+                facade: facade({
+                    acknowledge,
+                    status: async () => ({
+                        source: { phase: sourcePhase, sessionId: 'session-source', devices: [] },
+                        operation: {
+                            phase: 'sourcePrepared',
+                            operationId: 'operation-source-prepared',
+                        },
+                    } as unknown as PeerBidirectionalStatus),
+                }),
+            })
+            await controller.initialize()
+
+            await controller.abandon()
+
+            expect(acknowledge).not.toHaveBeenCalled()
+            expect(controller.snapshot()).toMatchObject({
+                operationPhase: 'sourcePrepared',
+                operationId: 'operation-source-prepared',
+                operationResult: undefined,
+                operationRetained: true,
+            })
+        },
+    )
+
     it('projects source-side completion from polling and clears a retried refresh error', async () => {
         vi.useFakeTimers()
         try {

@@ -696,7 +696,8 @@
             <Button
                 disabled={!bidirectionalEnabled
                     || bidirectionalBusy
-                    || (bidirectionalOperationRetained && bidirectionalOperationPhase !== 'completed')}
+                    || (bidirectionalOperationRetained
+                        && !['completed', 'sourcePrepared'].includes(bidirectionalOperationPhase))}
                 onclick={prepareBidirectionalSource}
             >
                 {language.peerBidirectional.prepare}
@@ -704,7 +705,8 @@
             <Button
                 disabled={!bidirectionalEnabled
                     || bidirectionalBusy
-                    || (bidirectionalOperationRetained && bidirectionalOperationPhase !== 'completed')
+                    || (bidirectionalOperationRetained
+                        && !['completed', 'sourcePrepared'].includes(bidirectionalOperationPhase))
                     || bidirectionalSourceStatus.phase !== 'prepared'}
                 onclick={startBidirectionalSource}
             >{language.peerBidirectional.start}</Button>
@@ -821,7 +823,8 @@
             <p class="mt-2 text-sm text-draculared">{language.peerBidirectional.stale}</p>
         {/if}
 
-        {#if ['localCommitted', 'sourceUnavailable'].includes(bidirectionalOperationPhase)}
+        {#if ['localCommitted', 'sourceUnavailable', 'sourcePrepared'].includes(bidirectionalOperationPhase)
+            && ['idle', 'stopped'].includes(bidirectionalSourceStatus.phase)}
             <Button className="mt-2" styled="danger" disabled={bidirectionalBusy} onclick={abandonBidirectional}>
                 {language.peerBidirectional.abandon}
             </Button>

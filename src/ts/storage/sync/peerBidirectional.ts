@@ -97,6 +97,10 @@ export type PeerBidirectionalSyncResult =
 
 export type PeerBidirectionalDurableOperation =
     | {
+          phase: 'sourcePrepared'
+          operationId: string
+      }
+    | {
           phase: 'awaitingConflict'
           result: Extract<PeerBidirectionalSyncResult, { kind: 'conflict' }>
       }
@@ -251,7 +255,8 @@ export function createPeerBidirectionalFacade(options: {
     }
     const projectOperation = (
         operation: PeerBidirectionalDurableOperation,
-    ): PeerBidirectionalSyncResult => {
+    ): PeerBidirectionalSyncResult | undefined => {
+        if (operation.phase === 'sourcePrepared') return undefined
         if (operation.phase === 'awaitingConflict' || operation.phase === 'completed') {
             return operation.result
         }
@@ -268,7 +273,9 @@ export function createPeerBidirectionalFacade(options: {
         operation: PeerBidirectionalDurableOperation,
     ): boolean => {
         const operationId = typeof args.operationId === 'string' ? args.operationId : undefined
-        if (!operationId || operation.phase === 'awaitingConflict') return false
+        if (!operationId || operation.phase === 'awaitingConflict' || operation.phase === 'sourcePrepared') {
+            return false
+        }
         const recoveredOperationId = operation.phase === 'completed'
             ? operation.result.operationId
             : operation.operationId
@@ -342,17 +349,19 @@ export function createPeerBidirectionalFacade(options: {
                 if (status.operation) {
                     const recovered = projectOperation(status.operation)
                     const advances = recoveredOperationAdvances(command, args, status.operation)
-                    const revision = committedRevision(recovered)
-                    if (revision !== undefined) {
-                        await refreshTargetResult(
-                            key,
-                            recovered,
-                            revision,
-                            fence,
-                            advances ? undefined : { cause },
-                        )
+                    if (recovered) {
+                        const revision = committedRevision(recovered)
+                        if (revision !== undefined) {
+                            await refreshTargetResult(
+                                key,
+                                recovered,
+                                revision,
+                                fence,
+                                advances ? undefined : { cause },
+                            )
+                        }
+                        if (advances) return recovered
                     }
-                    if (advances) return recovered
                 }
                 throw cause
             }

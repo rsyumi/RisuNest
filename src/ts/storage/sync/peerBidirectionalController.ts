@@ -13,6 +13,7 @@ export type PeerBidirectionalOperationPhase =
     | 'idle'
     | 'running'
     | 'awaitingConflict'
+    | 'sourcePrepared'
     | 'localCommitted'
     | 'sourceUnavailable'
     | 'refreshPending'
@@ -41,6 +42,13 @@ function operationSnapshot(
             operationPhase: operation.phase,
             operationResult: operation.result,
             operationId: operation.result.operationId,
+        }
+    }
+    if (operation.phase === 'sourcePrepared') {
+        return {
+            operationPhase: operation.phase,
+            operationId: operation.operationId,
+            operationResult: undefined,
         }
     }
     return {
@@ -94,6 +102,7 @@ export function createPeerBidirectionalController(options: {
     const retainedPhase = (phase: PeerBidirectionalOperationPhase): boolean => [
         'running',
         'awaitingConflict',
+        'sourcePrepared',
         'localCommitted',
         'sourceUnavailable',
         'refreshPending',
@@ -160,10 +169,11 @@ export function createPeerBidirectionalController(options: {
     }
     const runSource = async <T>(
         operation: () => Promise<T>,
-        allowRetained: boolean | 'completed' = false,
+        allowRetained: boolean | 'rehost' = false,
     ): Promise<T> => {
         const retainedAllowed = allowRetained === true
-            || (allowRetained === 'completed' && snapshot.operationPhase === 'completed')
+            || (allowRetained === 'rehost'
+                && ['completed', 'sourcePrepared'].includes(snapshot.operationPhase))
         if (snapshot.operationRetained && !retainedAllowed) {
             throw new Error('A retained peer sync operation must be resolved first')
         }
@@ -247,17 +257,30 @@ export function createPeerBidirectionalController(options: {
         activeOperation = { key, promise }
         return promise
     }
-    const clearRetainedOperation = async (operationId: string): Promise<void> => {
+    const clearRetainedOperation = async (
+        operationId: string,
+        refreshStatus = false,
+    ): Promise<void> => {
         try {
             await options.facade.acknowledge(operationId)
+            const status = refreshStatus ? await options.facade.status() : undefined
             operationErrorOwner += 1
             sourceRefreshErrorOwner = undefined
-            update({
-                operationPhase: 'idle',
-                operationResult: undefined,
-                operationId: undefined,
-                operationError: '',
-            })
+            update(status
+                ? {
+                      sourceStatus: status.source,
+                      sourcePairingUri: status.source.phase === 'running'
+                          ? status.source.pairingUri ?? snapshot.sourcePairingUri
+                          : '',
+                      ...operationSnapshot(status.operation),
+                      operationError: '',
+                  }
+                : {
+                      operationPhase: 'idle',
+                      operationResult: undefined,
+                      operationId: undefined,
+                      operationError: '',
+                  })
         } catch (cause) {
             operationErrorOwner += 1
             sourceRefreshErrorOwner = undefined
@@ -303,14 +326,14 @@ export function createPeerBidirectionalController(options: {
             sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: '' })
             return sourceStatus
-        }, 'completed'),
+        }, 'rehost'),
         start: (sessionId: string) => runSource(async () => {
             const sourceStatus = await options.facade.start(sessionId)
             sourcePollEpoch += 1
             update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
             beginSourcePolling()
             return sourceStatus
-        }, 'completed'),
+        }, 'rehost'),
         stop: (sessionId: string) => runSource(async () => {
             await options.facade.stop(sessionId)
             stopSourcePolling()
@@ -386,9 +409,13 @@ export function createPeerBidirectionalController(options: {
         async abandon(): Promise<void> {
             if (
                 !snapshot.operationId
-                || !['localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)
+                || !['localCommitted', 'sourceUnavailable', 'sourcePrepared'].includes(snapshot.operationPhase)
+                || ['prepared', 'running'].includes(snapshot.sourceStatus.phase)
             ) return
-            await clearRetainedOperation(snapshot.operationId)
+            await clearRetainedOperation(
+                snapshot.operationId,
+                snapshot.operationPhase === 'sourcePrepared',
+            )
         },
     }
 }

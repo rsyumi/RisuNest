@@ -36,6 +36,23 @@ function runtime(log: string[]): PeerBidirectionalMutationRuntime {
 }
 
 describe('peer bidirectional facade', () => {
+    it('preserves a durable source-prepared operation in status', async () => {
+        const status = {
+            source: { phase: 'stopped' as const, devices: [] },
+            operation: { phase: 'sourcePrepared' as const, operationId: 'operation-source-prepared' },
+        }
+        const nativeInvoke = vi.fn(async (command: string) => {
+            if (command === 'peer_bidirectional_status') return status
+            throw new Error(`Unexpected command: ${command}`)
+        })
+        const peer = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: nativeInvoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(peer.status()).resolves.toEqual(status)
+    })
+
     it('parses only the dedicated strict desktop pairing form', () => {
         expect(parsePeerBidirectionalUri(pairingUri)).toEqual({
             endpoint: 'http://192.168.1.20:32146',

@@ -5,7 +5,7 @@ import { mount, tick, unmount } from 'svelte'
 
 const controllerMocks = vi.hoisted(() => {
     const listeners = new Set<() => void>()
-    let operationPhase: 'idle' | 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'refreshPending' | 'completed' = 'idle'
+    let operationPhase: 'idle' | 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'refreshPending' | 'completed' = 'idle'
     let sourcePhase: 'stopped' | 'prepared' | 'running' = 'stopped'
     let revoked = false
     const snapshot = () => ({
@@ -83,6 +83,7 @@ const controllerMocks = vi.hoisted(() => {
             for (const listener of listeners) listener()
         }),
         sync: vi.fn(async () => undefined),
+        abandon: vi.fn(async () => undefined),
         revoke: vi.fn(async (_sessionId: string, deviceId: string) => {
             if (deviceId === 'device-offline') revoked = true
             for (const listener of listeners) listener()
@@ -106,8 +107,11 @@ const controllerMocks = vi.hoisted(() => {
             sourcePhase = 'stopped'
             revoked = false
         },
-        setOperationPhase(phase: 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'refreshPending' | 'completed') {
+        setOperationPhase(phase: 'awaitingConflict' | 'localCommitted' | 'sourceUnavailable' | 'sourcePrepared' | 'refreshPending' | 'completed') {
             operationPhase = phase
+        },
+        setSourcePhase(phase: 'stopped' | 'prepared' | 'running') {
+            sourcePhase = phase
         },
     }
 })
@@ -205,22 +209,54 @@ describe('peer bidirectional offline revoke', () => {
         },
     )
 
-    it('prepares and starts a source while completion is retained', async () => {
-        controllerMocks.setOperationPhase('completed')
+    it.each(['completed', 'sourcePrepared'] as const)(
+        'prepares and starts a source while %s is retained',
+        async (operationPhase) => {
+            controllerMocks.setOperationPhase(operationPhase)
+            const target = document.createElement('div')
+            document.body.append(target)
+            mounted = mount(PeerCloneSettings, { target })
+            await tick()
+            const button = (label: string) => [...target.querySelectorAll<HTMLButtonElement>('button')]
+                .find((candidate) => candidate.textContent?.trim() === label)
+
+            expect(button('Prepare pairing')?.disabled).toBe(false)
+            button('Prepare pairing')?.click()
+            await vi.waitFor(() => expect(controllerMocks.bidirectional.prepare).toHaveBeenCalledTimes(1))
+            await vi.waitFor(() => expect(button('Start pairing')?.disabled).toBe(false))
+            button('Start pairing')?.click()
+            await vi.waitFor(() => expect(controllerMocks.bidirectional.start).toHaveBeenCalledWith('session-rehost'))
+        },
+    )
+
+    it('offers abandon for a stopped source-prepared operation', async () => {
+        controllerMocks.setOperationPhase('sourcePrepared')
         const target = document.createElement('div')
         document.body.append(target)
         mounted = mount(PeerCloneSettings, { target })
         await tick()
-        const button = (label: string) => [...target.querySelectorAll<HTMLButtonElement>('button')]
-            .find((candidate) => candidate.textContent?.trim() === label)
+        const abandon = [...target.querySelectorAll<HTMLButtonElement>('button')]
+            .find((button) => button.textContent?.trim() === 'Abandon pending sync')
 
-        expect(button('Prepare pairing')?.disabled).toBe(false)
-        button('Prepare pairing')?.click()
-        await vi.waitFor(() => expect(controllerMocks.bidirectional.prepare).toHaveBeenCalledTimes(1))
-        await vi.waitFor(() => expect(button('Start pairing')?.disabled).toBe(false))
-        button('Start pairing')?.click()
-        await vi.waitFor(() => expect(controllerMocks.bidirectional.start).toHaveBeenCalledWith('session-rehost'))
+        expect(abandon?.disabled).toBe(false)
+        abandon?.click()
+        await vi.waitFor(() => expect(controllerMocks.bidirectional.abandon).toHaveBeenCalledTimes(1))
     })
+
+    it.each(['prepared', 'running'] as const)(
+        'hides source-prepared abandon while the source is %s',
+        async (sourcePhase) => {
+            controllerMocks.setOperationPhase('sourcePrepared')
+            controllerMocks.setSourcePhase(sourcePhase)
+            const target = document.createElement('div')
+            document.body.append(target)
+            mounted = mount(PeerCloneSettings, { target })
+            await tick()
+
+            expect([...target.querySelectorAll<HTMLButtonElement>('button')]
+                .some((button) => button.textContent?.trim() === 'Abandon pending sync')).toBe(false)
+        },
+    )
 
     it.each(['awaitingConflict', 'localCommitted', 'sourceUnavailable', 'refreshPending'] as const)(
         'keeps source prepare disabled while %s is retained',
