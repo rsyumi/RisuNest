@@ -759,6 +759,7 @@ fn ensure_bidirectional_backup_receipt(
                     published: false,
                 });
             }
+            Err(PeerSyncError::Cancelled) => return Err(PeerSyncError::Cancelled),
             Err(error) if bound_package_id.is_some() => return Err(error),
             Err(_) => fs::remove_file(&backup_path)?,
         },
@@ -788,6 +789,7 @@ fn ensure_bidirectional_backup_receipt(
                 replace_file_atomic(&temporary, &backup_path)?;
                 return Ok(published_backup_receipt(receipt, &backup_path));
             }
+            Err(PeerSyncError::Cancelled) => return Err(PeerSyncError::Cancelled),
             Err(_) => fs::remove_file(&temporary)?,
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -824,6 +826,7 @@ fn ensure_bidirectional_backup_receipt(
                                 published: false,
                             });
                         }
+                        Err(PeerSyncError::Cancelled) => return Err(PeerSyncError::Cancelled),
                         Err(error) if bound_package_id.is_some() => return Err(error),
                         Err(_) => fs::remove_file(&backup_path)?,
                     }
@@ -5285,6 +5288,179 @@ mod tests {
             matches!(error, PeerSyncError::Storage(message) if message.contains("newly published backup"))
         );
         assert!(owned_directory.is_dir());
+    }
+
+    #[test]
+    fn cancelled_unbound_final_verification_preserves_the_existing_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let source = SyncGenerationIdentity {
+            generation_id: active.manifest.generation.clone(),
+            manifest_hash: active.manifest_hash.clone(),
+            generation_sequence: active.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174093";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &active.manifest.generation,
+            1,
+            &active.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    source.clone(),
+                    0,
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174094";
+        let backup = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Remote,
+            &source,
+            None,
+            &NeverCancelled,
+        )
+        .unwrap();
+        assert!(backup.published);
+        let backup_path = PathBuf::from(&backup.receipt.path);
+        let expected_bytes = fs::read(&backup_path).unwrap();
+        let expected_revision = store.revision().unwrap();
+        let expected_ack = store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let expected_common = store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+            .unwrap();
+        let expected_operation = PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap();
+        let expected_jobs = durable_job_journal_ids(directory.path());
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Remote,
+            &source,
+            None,
+            &AtomicCancellation::new(cancelled),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(fs::read(&backup_path).unwrap(), expected_bytes);
+        assert_eq!(store.revision().unwrap(), expected_revision);
+        assert_eq!(
+            store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_ack
+        );
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            expected_common
+        );
+        assert_eq!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            expected_operation
+        );
+        assert_eq!(durable_job_journal_ids(directory.path()), expected_jobs);
+    }
+
+    #[test]
+    fn cancelled_reusable_temp_verification_preserves_the_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_lossless_backup_fixture(&mut store, &cas);
+        let active = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let source = SyncGenerationIdentity {
+            generation_id: active.manifest.generation,
+            manifest_hash: active.manifest_hash,
+            generation_sequence: active.manifest.generation_sequence,
+        };
+        let operation_id = "123e4567-e89b-42d3-a456-426614174095";
+        let (staging, temporary) = bidirectional_backup_staging_paths(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        );
+        fs::create_dir_all(&staging).unwrap();
+        create_and_verify_peer_bidirectional_backup_v1_report(
+            &temporary,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &lossless_source_binding(operation_id, PeerBidirectionalBackupSide::Remote, &source),
+            &NeverCancelled,
+        )
+        .unwrap();
+        let expected_bytes = fs::read(&temporary).unwrap();
+        let expected_revision = store.revision().unwrap();
+        let expected_operation = PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap();
+        let expected_jobs = durable_job_journal_ids(directory.path());
+        let final_path = bidirectional_backup_path(
+            directory.path(),
+            operation_id,
+            PeerBidirectionalBackupSide::Remote,
+        );
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error = ensure_bidirectional_backup_receipt(
+            &mut store,
+            &cas,
+            directory.path(),
+            operation_id,
+            1,
+            PeerBidirectionalBackupSide::Remote,
+            &source,
+            None,
+            &AtomicCancellation::new(cancelled),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(fs::read(&temporary).unwrap(), expected_bytes);
+        assert!(!final_path.exists());
+        assert_eq!(store.revision().unwrap(), expected_revision);
+        assert_eq!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            expected_operation
+        );
+        assert_eq!(durable_job_journal_ids(directory.path()), expected_jobs);
     }
 
     fn remote_disjoint_manifest(
