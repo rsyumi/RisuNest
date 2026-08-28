@@ -1921,7 +1921,7 @@ pub(crate) fn create_and_verify_peer_bidirectional_backup_v1_report(
         expected_revision,
         None,
         None,
-        false,
+        true,
         Some(peer_source),
         cancellation,
     );

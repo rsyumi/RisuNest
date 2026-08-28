@@ -1751,6 +1751,77 @@ mod tests {
         store.replace_commit(&staging, Some(0)).unwrap();
     }
 
+    #[test]
+    fn conflict_backup_requires_v2_authority_before_replacement() {
+        let authorities = [
+            (r#"{"format":"legacy"}"#, r#"{"format":"legacy"}"#),
+            (
+                r#"{"format":"preparing","migrationId":"asset-preparing","sourceRevision":0}"#,
+                r#"{"format":"v2","migrationId":"cold-v2","compatibilityHash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#,
+            ),
+            (
+                r#"{"format":"v2","migrationId":"asset-v2","compatibilityHash":"abababababababababababababababababababababababababababababababab"}"#,
+                r#"{"format":"preparing","migrationId":"cold-preparing","sourceRevision":0}"#,
+            ),
+        ];
+
+        for (asset_authority, cold_authority) in authorities {
+            let directory = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            seed_lossless_backup_fixture(&mut store, &cas);
+            let active = store
+                .seal_or_initialize_active_logical_generation(&cas)
+                .unwrap();
+            let source = SyncGenerationIdentity {
+                generation_id: active.manifest.generation,
+                manifest_hash: active.manifest_hash,
+                generation_sequence: active.manifest.generation_sequence,
+            };
+            drop(store);
+            let connection = rusqlite::Connection::open(
+                directory.path().join("persistent").join("persistent.db"),
+            )
+            .unwrap();
+            connection
+                .execute(
+                    "UPDATE asset_repository_authority SET value = ?1 WHERE generation = 'revision-1'",
+                    [asset_authority],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE cold_payload_authority SET value = ?1 WHERE generation = 'revision-1'",
+                    [cold_authority],
+                )
+                .unwrap();
+            drop(connection);
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let operation_id = "123e4567-e89b-42d3-a456-426614174099";
+
+            let error = ensure_bidirectional_backup_receipt(
+                &mut store,
+                &cas,
+                directory.path(),
+                operation_id,
+                1,
+                PeerBidirectionalBackupSide::Local,
+                &source,
+            )
+            .unwrap_err();
+
+            assert!(matches!(error, PeerSyncError::Storage(_)));
+            assert_eq!(store.revision().unwrap(), 1);
+            assert_eq!(store.read_root(None).unwrap().value, lossless_root("Base"));
+            assert!(!bidirectional_backup_path(
+                directory.path(),
+                operation_id,
+                PeerBidirectionalBackupSide::Local,
+            )
+            .exists());
+        }
+    }
+
     fn remote_disjoint_manifest(
         base: &crate::peer_sync::logical_delta::LogicalManifest,
     ) -> crate::peer_sync::logical_delta::BuiltLogicalManifest {
