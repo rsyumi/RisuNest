@@ -10,8 +10,8 @@ use super::{
     StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
-use std::path::Path;
 use std::sync::Mutex;
+use std::{fs, path::Path};
 use tauri::{AppHandle, Manager, State};
 
 #[cfg(feature = "official-publication-upload-pilot")]
@@ -83,6 +83,64 @@ pub(crate) fn replace_commit_with_snapshot(
     })
 }
 
+fn should_remove_peer_staging_entry(
+    name: &str,
+    is_directory: bool,
+    is_symlink_or_reparse: bool,
+) -> bool {
+    if !is_directory || is_symlink_or_reparse {
+        return false;
+    }
+    let Some(uuid) = name.strip_prefix("staging-logical-") else {
+        return false;
+    };
+    uuid::Uuid::parse_str(uuid)
+        .map(|parsed| parsed.hyphenated().to_string() == uuid)
+        .unwrap_or(false)
+}
+
+fn peer_staging_entry_is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn sweep_peer_logical_staging_directories(app_root: &Path) {
+    for peer_root in ["peer-delta", "peer-bidirectional"] {
+        let staging_root = app_root.join(peer_root).join("staging");
+        let Ok(entries) = fs::read_dir(&staging_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if should_remove_peer_staging_entry(
+                name,
+                metadata.is_dir(),
+                peer_staging_entry_is_symlink_or_reparse(&metadata),
+            ) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
 #[tauri::command(async)]
 pub(crate) fn pds_open(
     app: AppHandle,
@@ -105,6 +163,7 @@ pub(crate) fn pds_open(
             message: format!("failed to resolve application data directory: {error}"),
         })?;
     let persistent_store = PersistentStore::open(&app_data_dir)?;
+    sweep_peer_logical_staging_directories(&app_data_dir);
     let revision = persistent_store.revision()?;
     *store = Some(persistent_store);
 
@@ -621,4 +680,176 @@ pub(crate) fn pds_remove_app_kv(
     key: String,
 ) -> Result<(), StoreError> {
     with_store(state, |store| store.remove_app_kv(&key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    const CANONICAL_STAGING_NAME: &str = "staging-logical-01234567-89ab-4cde-8123-456789abcdef";
+
+    fn create_staging_directory(app_root: &Path, peer_root: &str, name: &str) {
+        fs::create_dir_all(app_root.join(peer_root).join("staging").join(name))
+            .expect("create staging directory");
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("invoke junction creation");
+        assert!(
+            result.status.success(),
+            "create directory junction: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_canonical_owned_directories_from_both_roots() {
+        let directory = tempdir().expect("create temporary directory");
+        for peer_root in ["peer-delta", "peer-bidirectional"] {
+            create_staging_directory(directory.path(), peer_root, CANONICAL_STAGING_NAME);
+            create_staging_directory(directory.path(), peer_root, "staging-logical-not-a-uuid");
+            create_staging_directory(
+                directory.path(),
+                peer_root,
+                "staging-logical-BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+            );
+            create_staging_directory(directory.path(), peer_root, "unrelated");
+            fs::write(
+                directory
+                    .path()
+                    .join(peer_root)
+                    .join("staging")
+                    .join("staging-logical-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                b"preserve file",
+            )
+            .expect("create regular file");
+        }
+
+        sweep_peer_logical_staging_directories(directory.path());
+
+        for peer_root in ["peer-delta", "peer-bidirectional"] {
+            let root = directory.path().join(peer_root).join("staging");
+            assert!(!root.join(CANONICAL_STAGING_NAME).exists());
+            assert!(root.join("staging-logical-not-a-uuid").is_dir());
+            assert!(root
+                .join("staging-logical-BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB")
+                .is_dir());
+            assert!(root.join("unrelated").is_dir());
+            assert!(root
+                .join("staging-logical-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                .is_file());
+        }
+    }
+
+    #[test]
+    fn startup_sweep_classification_preserves_symlink_or_reparse_entries() {
+        assert!(should_remove_peer_staging_entry(
+            CANONICAL_STAGING_NAME,
+            true,
+            false
+        ));
+        assert!(!should_remove_peer_staging_entry(
+            CANONICAL_STAGING_NAME,
+            true,
+            true
+        ));
+        assert!(!should_remove_peer_staging_entry(
+            CANONICAL_STAGING_NAME,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn startup_sweep_preserves_directory_links_and_their_targets() {
+        let directory = tempdir().expect("create temporary directory");
+        let target = directory.path().join("link-target");
+        fs::create_dir(&target).expect("create link target");
+        fs::write(target.join("sentinel"), b"preserve target").expect("write link target");
+        let staging_root = directory.path().join("peer-delta").join("staging");
+        fs::create_dir_all(&staging_root).expect("create staging root");
+        let link = staging_root.join(CANONICAL_STAGING_NAME);
+        create_directory_link(&target, &link);
+
+        sweep_peer_logical_staging_directories(directory.path());
+
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert_eq!(
+            fs::read(target.join("sentinel")).expect("read preserved link target"),
+            b"preserve target"
+        );
+    }
+
+    #[test]
+    fn startup_sweep_is_idempotent_and_tolerates_missing_roots() {
+        let directory = tempdir().expect("create temporary directory");
+        create_staging_directory(
+            directory.path(),
+            "peer-bidirectional",
+            CANONICAL_STAGING_NAME,
+        );
+
+        sweep_peer_logical_staging_directories(directory.path());
+        sweep_peer_logical_staging_directories(directory.path());
+
+        assert!(!directory
+            .path()
+            .join("peer-bidirectional")
+            .join("staging")
+            .join(CANONICAL_STAGING_NAME)
+            .exists());
+        assert!(!directory.path().join("peer-delta").exists());
+    }
+
+    #[test]
+    fn startup_sweep_after_database_recovery_preserves_active_data_and_revision() {
+        let directory = tempdir().expect("create temporary directory");
+        {
+            let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+            let committed = store.replace_begin().expect("begin committed staging");
+            store
+                .replace_put_root(&committed.staging_id, &json!({ "username": "active" }))
+                .expect("stage active root");
+            store
+                .replace_commit(&committed.staging_id, Some(0))
+                .expect("commit active root");
+
+            let abandoned = store.replace_begin().expect("begin abandoned staging");
+            store
+                .replace_put_root(&abandoned.staging_id, &json!({ "username": "abandoned" }))
+                .expect("stage abandoned root");
+        }
+        create_staging_directory(directory.path(), "peer-delta", CANONICAL_STAGING_NAME);
+
+        let reopened = PersistentStore::open(directory.path()).expect("recover persistent store");
+        let revision_before_sweep = reopened.revision().expect("read revision before sweep");
+        let root_before_sweep = reopened.read_root(None).expect("read root before sweep");
+
+        sweep_peer_logical_staging_directories(directory.path());
+
+        assert_eq!(
+            reopened.revision().expect("read revision after sweep"),
+            revision_before_sweep
+        );
+        assert_eq!(
+            reopened.read_root(None).expect("read root after sweep"),
+            root_before_sweep
+        );
+        assert_eq!(revision_before_sweep, 1);
+        assert_eq!(root_before_sweep.value["username"], "active");
+    }
 }
