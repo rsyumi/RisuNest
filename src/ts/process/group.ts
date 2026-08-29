@@ -19,12 +19,11 @@ import { doingChat } from './generationState'
 import { appendCurrentConversationMessage } from '../conversationMutations'
 import type { ActiveConversationPin } from '../storage/activeConversationSession'
 import type { CompleteConversationLease } from '../storage/activeWorkingSet.svelte'
+import { v4 } from 'uuid'
 
 interface GroupGreetingMutation {
     chatId: string
-    index: number
-    data: string
-    saying: string
+    messageId: string
     pin: ActiveConversationPin | null
 }
 
@@ -69,22 +68,35 @@ function rollbackGroupGreeting(
     groupId: string,
     group: Extract<(typeof DBState.db.characters)[number], { type: 'group' }>,
     greeting: GroupGreetingMutation,
+    owningSession: ReturnType<typeof getActiveConversationSession>,
 ): void {
     const chat = group.chats.find((candidate) => candidate.id === greeting.chatId)
-        ?? group.chats[group.chatPage]
-    const message = chat?.message[greeting.index]
-    if (
-        !chat ||
-        message?.saying !== greeting.saying ||
-        message.data !== greeting.data
-    ) return
+    if (!chat) return
+    const messageIndex = chat.message.findIndex(
+        (message) => message.chatId === greeting.messageId,
+    )
+    if (messageIndex < 0) return
 
-    const session = getActiveConversationSession()
+    const currentSession = getActiveConversationSession()
+    const session = owningSession?.matchesConversation(groupId, chat)
+        ? owningSession
+        : currentSession
     if (session?.matchesConversation(groupId, chat)) {
-        session.delete(session.locate(greeting.index))
-    } else if (!session) {
-        chat.message.splice(greeting.index, 1)
+        session.delete(session.locate(messageIndex))
+    } else if (!currentSession) {
+        chat.message.splice(messageIndex, 1)
     }
+}
+
+function rollbackGroupMembership(
+    group: Extract<(typeof DBState.db.characters)[number], { type: 'group' }>,
+    memberId: string,
+): void {
+    const memberIndex = group.characters.indexOf(memberId)
+    if (memberIndex < 0) return
+    group.characters.splice(memberIndex, 1)
+    group.characterTalks.splice(memberIndex, 1)
+    group.characterActive.splice(memberIndex, 1)
 }
 
 export async function addGroupChar(): Promise<boolean> {
@@ -123,36 +135,35 @@ export async function addGroupChar(): Promise<boolean> {
                             target,
                         )
                     }
+                }
+                let greeting: GroupGreetingMutation | null = null
+                try {
                     if (!isSelectedGroup(groupId)) {
-                        completeLease?.release()
                         return false
                     }
                     selectedId = get(selectedCharID)
                     group = DBState.db.characters[selectedId]
                     if (group?.type !== 'group' || group.chaId !== groupId) {
-                        completeLease?.release()
                         return false
                     }
-                }
-                const selectedChat = group.chats[group.chatPage]
-                const activeSession = completeLease?.session ?? getActiveConversationSession()
-                if (
-                    activeSession &&
-                    !activeSession.matchesConversation(groupId, selectedChat)
-                ) {
-                    completeLease?.release()
-                    return false
-                }
-                let greeting: GroupGreetingMutation | null = null
-                try {
+                    if (group.characters.includes(res) || get(doingChat)) return false
+                    const selectedChat = group.chats[group.chatPage]
+                    const activeSession = completeLease?.session ?? getActiveConversationSession()
+                    if (
+                        activeSession &&
+                        !activeSession.matchesConversation(groupId, selectedChat)
+                    ) return false
+                    const mutatedGroup = group
                     group.characters.push(res)
                     group.characterTalks.push(1 / 6 * 4)
                     group.characterActive.push(true)
                     if(loadFirstMessage){
+                        const messageId = v4()
                         const message = {
                             role:'char',
                             data: member?.firstMessage ?? '',
                             saying: res,
+                            chatId: messageId,
                         } as const
                         const index = selectedChat.message.length
                         appendCurrentConversationMessage(
@@ -163,9 +174,7 @@ export async function addGroupChar(): Promise<boolean> {
                         )
                         greeting = {
                             chatId: selectedChat.id,
-                            index,
-                            data: message.data,
-                            saying: res,
+                            messageId,
                             pin: activeSession?.acquireRangePin(
                                 index,
                                 index + 1,
@@ -176,16 +185,12 @@ export async function addGroupChar(): Promise<boolean> {
                     markGroupDirty(group)
                     const activation = await activateSelectedGroup(groupId)
                     if (activation === 'activated') return true
-                    if (activation === 'superseded') return false
                     group = DBState.db.characters.find((character) => character.chaId === groupId)
                     if (!group || group.type !== 'group') return false
-                    const memberIndex = group.characters.indexOf(res)
-                    if (memberIndex >= 0) {
-                        group.characters.splice(memberIndex, 1)
-                        group.characterTalks.splice(memberIndex, 1)
-                        group.characterActive.splice(memberIndex, 1)
+                    if (group === mutatedGroup) rollbackGroupMembership(group, res)
+                    if (greeting) {
+                        rollbackGroupGreeting(groupId, group, greeting, activeSession)
                     }
-                    if (greeting) rollbackGroupGreeting(groupId, group, greeting)
                     markGroupDirty(group)
                     await settleGroupRollback(groupId)
                     return false

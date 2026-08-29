@@ -76,6 +76,14 @@ function makeGroup() {
     }
 }
 
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((resolvePromise) => {
+        resolve = resolvePromise
+    })
+    return { promise, resolve }
+}
+
 describe('group working-set residency', () => {
     beforeEach(() => {
         vi.clearAllMocks()
@@ -117,7 +125,12 @@ describe('group working-set residency', () => {
         expect(group.characterTalks).toEqual([0.5, 1 / 6 * 4])
         expect(group.characterActive).toEqual([true, true])
         expect(group.chats[0].message).toEqual([
-            { role: 'char', data: 'Hydrated B', saying: 'member-b' },
+            expect.objectContaining({
+                role: 'char',
+                data: 'Hydrated B',
+                saying: 'member-b',
+                chatId: expect.any(String),
+            }),
         ])
         expect(mocks.markPersistentDataDirty).toHaveBeenCalled()
     })
@@ -191,6 +204,115 @@ describe('group working-set residency', () => {
         await expect(adding).resolves.toBe(false)
         expect(releaseCount).toBe(1)
         expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('rechecks duplicate membership after awaited promotion before mutating', async () => {
+        const group = mocks.database.characters[0]
+        const session = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: group.chats[0].id,
+            conversation: group.chats[0],
+            storeRevision: 1,
+        })
+        mocks.activeSession = session
+        const target = { characterId: group.chaId, conversationId: group.chats[0].id }
+        mocks.selectedTarget = target
+        const promotion = deferred<any>()
+        mocks.acquireCompleteConversation.mockReturnValue(promotion.promise)
+        let releaseCount = 0
+
+        const adding = addGroupChar()
+        while (mocks.acquireCompleteConversation.mock.calls.length === 0) await Promise.resolve()
+        group.characters.push('member-b')
+        group.characterTalks.push(0.75)
+        group.characterActive.push(false)
+        promotion.resolve({
+            session,
+            target,
+            release() { releaseCount += 1 },
+        })
+
+        await expect(adding).resolves.toBe(false)
+        expect(group.characters).toEqual(['member-a', 'member-b'])
+        expect(group.characterTalks).toEqual([0.5, 0.75])
+        expect(group.characterActive).toEqual([true, false])
+        expect(group.chats[0].message).toEqual([])
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(releaseCount).toBe(1)
+    })
+
+    it('rolls back membership and its greeting when activation is superseded', async () => {
+        const group = mocks.database.characters[0]
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration += 2
+            return false
+        })
+
+        await expect(addGroupChar()).resolves.toBe(false)
+
+        expect(group.characters).toEqual(['member-a'])
+        expect(group.characterTalks).toEqual([0.5])
+        expect(group.characterActive).toEqual([true])
+        expect(group.chats[0].message).toEqual([])
+        expect(mocks.flushPendingData).toHaveBeenCalledWith('group-membership-rollback')
+    })
+
+    it('rolls back its ID-owned greeting after a concurrent identical message shifts its index', async () => {
+        const group = mocks.database.characters[0]
+        const identical = { role: 'char', data: 'Hydrated B', saying: 'member-b' }
+        group.chats[0].message.push(identical)
+        const session = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: group.chats[0].id,
+            conversation: group.chats[0],
+            storeRevision: 1,
+        })
+        mocks.activeSession = session
+        let shifted = false
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            if (!shifted) {
+                shifted = true
+                session.delete(session.locate(0))
+            }
+            return false
+        })
+
+        await expect(addGroupChar()).resolves.toBe(false)
+
+        expect(group.characters).toEqual(['member-a'])
+        expect(group.chats[0].message).toEqual([])
+    })
+
+    it('releases once when post-promotion owner validation throws', async () => {
+        const group = mocks.database.characters[0]
+        const session = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: group.chats[0].id,
+            conversation: group.chats[0],
+            storeRevision: 1,
+        })
+        const target = { characterId: group.chaId, conversationId: group.chats[0].id }
+        mocks.selectedTarget = target
+        const promotion = deferred<any>()
+        mocks.acquireCompleteConversation.mockReturnValue(promotion.promise)
+        const failure = new Error('chat validation failed')
+        let releaseCount = 0
+
+        const adding = addGroupChar()
+        while (mocks.acquireCompleteConversation.mock.calls.length === 0) await Promise.resolve()
+        Object.defineProperty(group, 'chats', {
+            configurable: true,
+            get() { throw failure },
+        })
+        promotion.resolve({
+            session,
+            target,
+            release() { releaseCount += 1 },
+        })
+
+        await expect(adding).rejects.toBe(failure)
+        expect(releaseCount).toBe(1)
     })
 
     it('aborts group membership and greeting mutation when the promoted lease is stale', async () => {

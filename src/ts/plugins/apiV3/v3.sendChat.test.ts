@@ -132,7 +132,7 @@ describe('Plugin v3 sendChat complete mutation gateway', () => {
 
     it('preserves direct no-session send behavior when no selected target exists', async () => {
         const chat = mocks.database.characters[0].chats[0]
-        mocks.processSendChat.mockResolvedValue(undefined)
+        mocks.processSendChat.mockResolvedValue(true)
 
         await expect(mocks.api.sendChat('hello')).resolves.toBe(true)
 
@@ -141,13 +141,85 @@ describe('Plugin v3 sendChat complete mutation gateway', () => {
         expect(mocks.processSendChat).toHaveBeenCalledOnce()
     })
 
+    it('rechecks busy state after promotion so concurrent calls cannot both append', async () => {
+        const chat = mocks.database.characters[0].chats[0]
+        const target = { characterId: 'character-a', conversationId: 'chat-a' }
+        mocks.selectedTarget = target
+        const firstPromotion = deferred<any>()
+        const secondPromotion = deferred<any>()
+        mocks.acquireCompleteConversation
+            .mockReturnValueOnce(firstPromotion.promise)
+            .mockReturnValueOnce(secondPromotion.promise)
+        const generation = deferred<boolean>()
+        mocks.processSendChat.mockImplementationOnce(() => {
+            mocks.doingChat = true
+            return generation.promise
+        })
+        let firstReleases = 0
+        let secondReleases = 0
+
+        const first = mocks.api.sendChat('first')
+        const second = mocks.api.sendChat('second')
+        while (mocks.acquireCompleteConversation.mock.calls.length < 2) await Promise.resolve()
+
+        firstPromotion.resolve({
+            session: mocks.session,
+            target,
+            release() { firstReleases += 1 },
+        })
+        while (mocks.processSendChat.mock.calls.length === 0) await Promise.resolve()
+        secondPromotion.resolve({
+            session: mocks.session,
+            target,
+            release() { secondReleases += 1 },
+        })
+
+        await expect(second).rejects.toThrow('A chat is already in progress')
+        expect(chat.message.map((message: any) => message.data)).toEqual(['before', 'first'])
+        expect(mocks.doingChat).toBe(true)
+        expect(secondReleases).toBe(1)
+
+        generation.resolve(true)
+        await expect(first).resolves.toBe(true)
+        expect(firstReleases).toBe(1)
+        expect(mocks.doingChat).toBe(false)
+    })
+
+    it('returns false and removes only its appended message when generation declines', async () => {
+        const chat = mocks.database.characters[0].chats[0]
+        mocks.processSendChat.mockResolvedValue(false)
+
+        await expect(mocks.api.sendChat('declined')).resolves.toBe(false)
+
+        expect(chat.message.map((message: any) => message.data)).toEqual(['before'])
+    })
+
+    it('removes only its appended message and releases once when generation throws', async () => {
+        const chat = mocks.database.characters[0].chats[0]
+        const target = { characterId: 'character-a', conversationId: 'chat-a' }
+        mocks.selectedTarget = target
+        const failure = new Error('generation failed')
+        mocks.processSendChat.mockRejectedValue(failure)
+        let releaseCount = 0
+        mocks.acquireCompleteConversation.mockResolvedValue({
+            session: mocks.session,
+            target,
+            release() { releaseCount += 1 },
+        })
+
+        await expect(mocks.api.sendChat('failed')).rejects.toBe(failure)
+
+        expect(chat.message.map((message: any) => message.data)).toEqual(['before'])
+        expect(releaseCount).toBe(1)
+    })
+
     it('promotes before append and holds one exact lease until delegated generation settles', async () => {
         const chat = mocks.database.characters[0].chats[0]
         const target = { characterId: 'character-a', conversationId: 'chat-a' }
         mocks.selectedTarget = target
         const promotion = deferred<any>()
         mocks.acquireCompleteConversation.mockReturnValue(promotion.promise)
-        const generation = deferred<void>()
+        const generation = deferred<boolean>()
         mocks.processSendChat.mockReturnValue(generation.promise)
         let releaseCount = 0
 
@@ -172,7 +244,7 @@ describe('Plugin v3 sendChat complete mutation gateway', () => {
         expect(chat.message.map((message: any) => message.data)).toEqual(['before', 'hello'])
         expect(mocks.session.pinCount('compatibility')).toBe(1)
 
-        generation.resolve()
+        generation.resolve(true)
         await expect(sending).resolves.toBe(true)
         expect(releaseCount).toBe(1)
         expect(mocks.session.pinCount('compatibility')).toBe(0)

@@ -1420,6 +1420,32 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
 
             let completeLease: CompleteConversationLease | null = null;
+            let generationStarted = false;
+            let appendedMessageId: string | null = null;
+            let appendedCharacter: (typeof DBState.db.characters)[number] | null = null;
+            let appendedChat: (typeof DBState.db.characters)[number]['chats'][number] | null = null;
+            const rollbackAppendedMessage = () => {
+                if(!appendedMessageId || !appendedCharacter || !appendedChat) return;
+                const currentCharacter = DBState.db.characters[get(selectedCharID)];
+                if(currentCharacter !== appendedCharacter){
+                    return;
+                }
+                const currentChat = currentCharacter.chats[currentCharacter.chatPage];
+                if(currentChat !== appendedChat){
+                    return;
+                }
+                const messageIndex = currentChat.message.findIndex(
+                    (candidate) => candidate.chatId === appendedMessageId,
+                );
+                if(messageIndex < 0) return;
+                const currentSession = getActiveConversationSession();
+                if(currentSession?.matchesConversation(currentCharacter.chaId, currentChat)){
+                    currentSession.delete(currentSession.locate(messageIndex));
+                }
+                else if(!currentSession){
+                    currentChat.message.splice(messageIndex, 1);
+                }
+            };
             try {
                 const target = captureSelectedConversationTarget();
                 if(target){
@@ -1439,20 +1465,37 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 if(completeLease && !activeSession.matchesConversation(char.chaId, chat)){
                     return false;
                 }
+                if(get(doingChat)){
+                    throw new Error("A chat is already in progress");
+                }
 
                 if(message){
+                    appendedMessageId = v4();
+                    appendedCharacter = char;
+                    appendedChat = chat;
                     appendCurrentConversationMessage(char, chat, activeSession, {
                         role: 'user',
                         data: message,
                         time: Date.now(),
+                        chatId: appendedMessageId,
                     });
                 }
 
-                await processSendChat(-1, {});
+                generationStarted = true;
+                const sent = await processSendChat(-1, {});
+                if(!sent){
+                    rollbackAppendedMessage();
+                    return false;
+                }
+            } catch(error) {
+                rollbackAppendedMessage();
+                throw error;
             } finally {
                 // Plugin API path does not pass through the UI unlock logic,
                 // so release doingChat here on both success and failure.
-                doingChat.set(false);
+                if(generationStarted){
+                    doingChat.set(false);
+                }
                 completeLease?.release();
             }
 
