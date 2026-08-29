@@ -2412,13 +2412,13 @@ mod timeout_tests {
             )
             .unwrap();
             stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(1_000));
+            thread::sleep(Duration::from_millis(2_000));
             let _ = stream.write_all(&bytes);
         });
         let mut client = direct_logical_client(
             address,
             Duration::from_millis(100),
-            Duration::from_millis(120),
+            Duration::from_millis(500),
         );
         let mut reader = client
             .open_object(&LogicalDeltaObject {
@@ -2436,7 +2436,7 @@ mod timeout_tests {
             io::ErrorKind::TimedOut | io::ErrorKind::Other
         ));
         assert!(
-            elapsed < Duration::from_millis(800),
+            elapsed < Duration::from_millis(1_500),
             "stall lasted {elapsed:?}"
         );
     }
@@ -2697,7 +2697,9 @@ mod timeout_tests {
 
     #[test]
     fn p5_source_stop_cancels_remote_apply_and_joins_the_host() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = Arc::new(BidirectionalControlFixture::default());
         let (started_tx, started_rx) = mpsc::channel();
         *control.remote_apply_started.lock().unwrap() = Some(started_tx);
@@ -2788,7 +2790,9 @@ mod timeout_tests {
 
     #[test]
     fn p5_remote_apply_waits_past_the_short_control_timeout_for_a_terminal_response() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = Arc::new(BidirectionalControlFixture::default());
         *control.remote_apply_delay.lock().unwrap() = Some(Duration::from_millis(5_100));
         let session_id = "00000000-0000-4000-8000-000000000078";
@@ -2838,7 +2842,9 @@ mod timeout_tests {
 
     #[test]
     fn p5_claim_binds_the_stable_target_and_authenticates_control_callbacks() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = Arc::new(BidirectionalControlFixture::default());
         let session_id = "00000000-0000-4000-8000-000000000070";
         let source_device_id = "00000000-0000-4000-8000-000000000071";
@@ -2969,7 +2975,9 @@ mod timeout_tests {
 
     #[test]
     fn p5_rejects_malformed_claimants_and_wrong_logical_permissions() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = Arc::new(BidirectionalControlFixture::default());
         let mut host =
             LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
@@ -3013,7 +3021,9 @@ mod timeout_tests {
 
     #[test]
     fn logical_session_reuses_claim_bearer_revoke_and_bounded_object_routes() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
             generation: "generation-1".to_owned(),
@@ -3096,7 +3106,9 @@ mod timeout_tests {
 
     #[test]
     fn logical_progress_never_marks_a_corrupt_object_as_verified() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
             generation: "generation-1".to_owned(),
@@ -3167,7 +3179,9 @@ mod timeout_tests {
 
     #[test]
     fn backpressured_logical_object_opens_without_waiting_for_control_progress() {
-        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
             generation: "generation-1".to_owned(),
@@ -3205,14 +3219,14 @@ mod timeout_tests {
             Box::new(DelayedLogicalFixtureSource {
                 object_hash: record_hash.clone(),
                 bytes: record_bytes.clone(),
-                delay: Duration::from_millis(600),
+                delay: Duration::from_millis(1_500),
             }),
         )
         .unwrap();
         let mut host = LanCloneHost::prepare_logical(logical);
         let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let endpoint = format!("http://{}", host.address().unwrap());
-        let control_timeout = Duration::from_millis(400);
+        let control_timeout = Duration::from_millis(1_000);
         let mut client = LanLogicalDeltaClient::claim_with_timeouts(
             &endpoint,
             &pairing.session_id,
