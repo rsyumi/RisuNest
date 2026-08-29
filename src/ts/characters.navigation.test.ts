@@ -921,6 +921,7 @@ describe('chat list operations', () => {
     it('does not install a duplicate after the selected character changes', async () => {
         const sourceCharacter = buildCharacter()
         const nextCharacter = createBlankChar()
+        const nextChatIds = nextCharacter.chats.map((chat: any) => chat.id)
         const read = deferred<any>()
         mocks.database.characters.push(sourceCharacter, nextCharacter)
         selectedCharID.set(0)
@@ -932,6 +933,7 @@ describe('chat list operations', () => {
 
         expect(await pending).toBe(false)
         expect(sourceCharacter.chats).toHaveLength(3)
+        expect(nextCharacter.chats.map((chat: any) => chat.id)).toEqual(nextChatIds)
         expect(mocks.changeChatTo).not.toHaveBeenCalled()
     })
 
