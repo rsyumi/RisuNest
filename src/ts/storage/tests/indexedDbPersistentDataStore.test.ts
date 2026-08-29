@@ -2167,6 +2167,96 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         )
     })
 
+    it('rewrites occurrence lookup generations during copy-on-write and cleans the source', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `revision-occurrence-copy-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const database = structuredClone(fixtureDatabase)
+        const longConversation = database.characters
+            .find((character) => character.chaId === 'char-a')!
+            .chats.find((conversation) => conversation.id === 'conv-long')!
+        longConversation.message[0].chatId = 'cow-duplicate'
+        longConversation.message[129].chatId = 'cow-duplicate'
+        const imported = await store.replaceFromDatabase(database)
+        const lease = await store.acquireRevision(imported.revision)
+
+        const root = (await store.readRoot()).value
+        const committed = await store.commit({
+            expectedRevision: imported.revision,
+            root: { ...root, username: 'Copied root only' },
+        })
+        const query = (reader: typeof store | typeof lease, occurrence: 'first' | 'last') => (
+            reader.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-long',
+                anchorMessageId: 'cow-duplicate',
+                anchorOccurrence: occurrence,
+                before: 0,
+                after: 0,
+            })
+        )
+
+        await expect(query(store, 'first')).resolves.toMatchObject({
+            revision: committed.revision,
+            value: { startIndex: 0 },
+        })
+        await expect(query(store, 'last')).resolves.toMatchObject({
+            revision: committed.revision,
+            value: { startIndex: 129 },
+        })
+        await expect(store.readConversationWindow({
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            anchorMessageId: 'cow-absent',
+            before: 0,
+            after: 0,
+        })).resolves.toBeNull()
+        await expect(query(lease, 'first')).resolves.toMatchObject({
+            revision: imported.revision,
+            value: { startIndex: 0 },
+        })
+        await expect(query(lease, 'last')).resolves.toMatchObject({
+            revision: imported.revision,
+            value: { startIndex: 129 },
+        })
+
+        const rawDatabase = await openDatabase(indexedDB, databaseName)
+        const beforeRelease = rawDatabase.transaction('messageOccurrences', 'readonly')
+        const occurrences = beforeRelease.objectStore('messageOccurrences')
+        const copiedRows = await requestResultForTest<Array<{
+            generation: string
+            lookupKeys: string[]
+        }>>(occurrences.index('byGeneration').getAll('revision-2'))
+        expect(copiedRows).not.toHaveLength(0)
+        expect(copiedRows.every((row) => row.lookupKeys.every(
+            (lookupKey) => JSON.parse(lookupKey)[0] === 'revision-2',
+        ))).toBe(true)
+        expect(await requestResultForTest(occurrences.index('byLookupKey').count(
+            JSON.stringify(['revision-1', 'char-a', 'conv-long', 'cow-duplicate']),
+        ))).toBe(2)
+        expect(await requestResultForTest(occurrences.index('byLookupKey').count(
+            JSON.stringify(['revision-2', 'char-a', 'conv-long', 'cow-duplicate']),
+        ))).toBe(2)
+        await completeTransaction(beforeRelease)
+
+        await lease.release()
+
+        const afterRelease = rawDatabase.transaction('messageOccurrences', 'readonly')
+        const releasedOccurrences = afterRelease.objectStore('messageOccurrences')
+        expect(await requestResultForTest(
+            releasedOccurrences.index('byGeneration').count('revision-1'),
+        )).toBe(0)
+        expect(await requestResultForTest(releasedOccurrences.index('byLookupKey').count(
+            JSON.stringify(['revision-1', 'char-a', 'conv-long', 'cow-duplicate']),
+        ))).toBe(0)
+        expect(await requestResultForTest(releasedOccurrences.index('byLookupKey').count(
+            JSON.stringify(['revision-2', 'char-a', 'conv-long', 'cow-duplicate']),
+        ))).toBe(2)
+        await completeTransaction(afterRelease)
+        rawDatabase.close()
+    })
+
     it('rejects every old lease view after another realm removes its durable lease', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `externally-expired-revision-${databaseSequence++}`

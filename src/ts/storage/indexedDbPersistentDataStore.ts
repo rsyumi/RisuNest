@@ -2087,11 +2087,19 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     return
                 }
                 const record = cursor.value as StoredRecord<unknown>
-                store.put({
+                const copiedRecord: StoredRecord<unknown> & Record<string, unknown> = {
                     ...record,
                     key: `${targetGeneration}${record.key.slice(sourceGeneration.length)}`,
                     generation: targetGeneration,
-                })
+                }
+                if (store.name === 'messageOccurrences') {
+                    copiedRecord.lookupKeys = this.retargetMessageOccurrenceLookupKeys(
+                        record as unknown as StoredMessageOccurrencePage,
+                        sourceGeneration,
+                        targetGeneration,
+                    )
+                }
+                store.put(copiedRecord)
                 cursor.continue()
             }
         })
@@ -3522,6 +3530,37 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         messageId: string,
     ): string {
         return JSON.stringify([generation, characterId, conversationId, messageId])
+    }
+
+    private retargetMessageOccurrenceLookupKeys(
+        record: StoredMessageOccurrencePage,
+        sourceGeneration: string,
+        targetGeneration: string,
+    ): string[] {
+        return record.lookupKeys.map((lookupKey) => {
+            let locator: unknown
+            try {
+                locator = JSON.parse(lookupKey)
+            } catch {
+                throw new TypeError('Persistent message occurrence lookup key is invalid')
+            }
+            if (
+                !Array.isArray(locator)
+                || locator.length !== 4
+                || locator[0] !== sourceGeneration
+                || locator[1] !== record.characterId
+                || locator[2] !== record.conversationId
+                || typeof locator[3] !== 'string'
+            ) {
+                throw new TypeError('Persistent message occurrence lookup key does not match its row')
+            }
+            return this.messageOccurrenceLookupKey(
+                targetGeneration,
+                record.characterId,
+                record.conversationId,
+                locator[3],
+            )
+        })
     }
 
     private pluginStorageKey(generation: string, key: string): string {
