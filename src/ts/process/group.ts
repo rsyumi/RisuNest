@@ -11,6 +11,7 @@ import {
     flushPendingData,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
+    hydrateCurrentGroupMemberDetail,
     markPersistentDataDirty,
     reconcilePersistentActiveCharacterIds,
 } from "../storage/persistentDataRuntime.svelte";
@@ -109,9 +110,11 @@ export async function addGroupChar(): Promise<boolean> {
                         activeSession &&
                         !activeSession.matchesConversation(groupId, selectedChat)
                     ) return false
+                    if (!hydrateCurrentGroupMemberDetail(groupId, member)) return false
                     group.characters.push(res)
                     group.characterTalks.push(1 / 6 * 4)
                     group.characterActive.push(true)
+                    reconcilePersistentActiveCharacterIds(DBState.db, groupId)
                     if(loadFirstMessage){
                         const messageId = v4()
                         const message = {

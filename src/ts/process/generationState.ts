@@ -1,16 +1,22 @@
-import { get, writable } from 'svelte/store'
+import { get, writable, type Writable } from 'svelte/store'
 
-export const doingChat = writable(false)
+let activeReservation: symbol | null = null
+const doingChatState = writable(false)
+export const doingChat: Writable<boolean> = {
+    subscribe: doingChatState.subscribe,
+    set(busy) {
+        if (!busy && activeReservation) return
+        doingChatState.set(busy)
+    },
+    update(updater) {
+        doingChat.set(updater(get(doingChatState)))
+    },
+}
 
 export interface GenerationReservation {
     isCurrent(): boolean
-    release(): void
+    release(options?: { preserveBusy?: boolean }): void
 }
-
-let activeReservation: symbol | null = null
-doingChat.subscribe((busy) => {
-    if (!busy) activeReservation = null
-})
 
 export function reserveGeneration(): GenerationReservation | null {
     if (activeReservation || get(doingChat)) return null
@@ -20,12 +26,12 @@ export function reserveGeneration(): GenerationReservation | null {
     let released = false
     return {
         isCurrent: () => !released && activeReservation === token,
-        release() {
+        release(options) {
             if (released) return
             released = true
             if (activeReservation !== token) return
             activeReservation = null
-            doingChat.set(false)
+            if (!options?.preserveBusy) doingChat.set(false)
         },
     }
 }

@@ -48,6 +48,7 @@ import { workingSetResidency } from './workingSetResidency'
 import {
     createCatalogPresetWorkingSet,
     hydrateWorkingSetCharacterDetail,
+    isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
 import { notifyPluginStorageAuthorityReplacement } from '../plugins/pluginStorageStore'
@@ -341,6 +342,24 @@ export const activateCharacter = (
     id: string,
     options?: CharacterActivationOptions,
 ): Promise<boolean> => getPersistentDataRuntime().activateCharacter(id, options)
+export function hydrateCurrentGroupMemberDetail(
+    groupId: string,
+    detail: CharacterDetail,
+): boolean {
+    const database = getDatabase()
+    const selectedIndex = get(selectedCharID)
+    const selectedGroup = database.characters[selectedIndex]
+    if (selectedGroup?.type !== 'group' || selectedGroup.chaId !== groupId) return false
+    const memberIndex = database.characters.findIndex(
+        (character) => character.chaId === detail.chaId,
+    )
+    if (memberIndex < 0 || detail.chaId === groupId) return false
+    const member = database.characters[memberIndex]
+    if (!isCatalogCharacterStub(member)) return true
+    const hydrated = hydrateWorkingSetCharacterDetail(database, memberIndex, detail)
+    workingSetResidency.markCharacterHydrated(hydrated.chaId)
+    return true
+}
 export const activateConversation = (id: string): Promise<boolean> =>
     getPersistentDataRuntime().activateConversation(id)
 export const getActiveConversationSession = (): ActiveConversationSession | null =>

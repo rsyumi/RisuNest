@@ -1,6 +1,7 @@
 import { DBState, selectedCharID } from 'src/ts/stores.svelte';
 import { get } from 'svelte/store';
-import { doingChat, sendChat } from '../index.svelte';
+import { sendChat } from '../index.svelte';
+import { reserveGeneration } from '../generationState';
 import { downloadFile } from 'src/ts/globalApi.svelte';
 import { isTauri } from "src/ts/platform"
 import { HypaProcesser } from '../memory/hypamemory';
@@ -25,10 +26,12 @@ type sendFileArg = {
 }
 
 async function sendPofile(arg:sendFileArg){
+    const reservation = reserveGeneration()
+    if (!reservation) return
     let completeLease: CompleteConversationLease | null = null
+    try {
     const target = captureSelectedConversationTarget()
     if (target) completeLease = await acquireCompleteConversation('po-multisend', target)
-    try {
     let result = ''
     let msgId = ''
     let note = ''
@@ -89,8 +92,7 @@ async function sendPofile(arg:sendFileArg){
                 data: text
             })
             if (!refreshMutationTarget()) return
-            doingChat.set(false)
-            await sendChat(-1);
+            await sendChat(-1, {}, reservation);
             if (!refreshMutationTarget()) return
             const res = currentConversation.message[currentConversation.message.length-1]
             const msgStr = res.data.split('\n').filter((a) => {
@@ -152,6 +154,7 @@ async function sendPofile(arg:sendFileArg){
     await downloadFile('translated.po', result)
     } finally {
         completeLease?.release()
+        reservation.release()
     }
 }
 

@@ -200,12 +200,12 @@ vi.mock('./generationState', () => ({
         let released = false
         return {
             isCurrent: () => !released && harness.generationReservation === token,
-            release: () => {
+            release: (options?: { preserveBusy?: boolean }) => {
                 if (released) return
                 released = true
                 if (harness.generationReservation !== token) return
                 harness.generationReservation = null
-                harness.doingChat.set(false)
+                if (!options?.preserveBusy) harness.doingChat.set(false)
             },
         }
     },

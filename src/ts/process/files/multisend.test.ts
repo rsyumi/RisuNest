@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { get } from 'svelte/store'
 
 import { ActiveConversationSession } from '../../storage/activeConversationSession'
 import type { Chat, Database } from '../../storage/database.svelte'
@@ -23,9 +24,9 @@ vi.mock('src/ts/stores.svelte', () => ({
     },
 }))
 vi.mock('../index.svelte', async () => {
-    const { writable } = await import('svelte/store')
+    const { doingChat } = await import('../generationState')
     return {
-        doingChat: writable(false),
+        doingChat,
         sendChat: mocks.sendChat,
     }
 })
@@ -49,6 +50,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
 }))
 
 import { postChatFile } from './multisend'
+import { doingChat, reserveGeneration } from '../generationState'
 
 function createDatabase(): Database {
     const conversation = {
@@ -77,6 +79,7 @@ describe('postChatFile PO append', () => {
         mocks.downloadFile.mockClear()
         mocks.selectedTarget = null
         mocks.acquireCompleteConversation.mockReset()
+        doingChat.set(false)
     })
 
     it('routes each PO user message through the matching session', async () => {
@@ -199,5 +202,27 @@ describe('postChatFile PO append', () => {
         expect(conversation.message.map((message) => message.data)).toEqual(['before'])
         expect(mocks.sendChat).not.toHaveBeenCalled()
         expect(releaseCount).toBe(1)
+    })
+
+    it('does not cancel a provider-waiting generation or append when PO overlaps it', async () => {
+        const conversation = mocks.dbState.db!.characters[0].chats[0]
+        const providerGeneration = reserveGeneration()
+        expect(providerGeneration).not.toBeNull()
+        doingChat.set(false)
+        const input = new TextEncoder().encode('msgid "overlap"\nmsgstr ""\n\n')
+
+        try {
+            await expect(postChatFile({ name: 'input.po', data: input })).resolves.toEqual([
+                { type: 'void' },
+            ])
+
+            expect(providerGeneration!.isCurrent()).toBe(true)
+            expect(get(doingChat)).toBe(true)
+            expect(conversation.message.map((message) => message.data)).toEqual(['before'])
+            expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
+            expect(mocks.sendChat).not.toHaveBeenCalled()
+        } finally {
+            providerGeneration?.release()
+        }
     })
 })

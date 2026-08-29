@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     flushPendingData: vi.fn(async () => undefined),
     reconcilePersistentActiveCharacterIds: vi.fn(),
     restoreColdPersistentCharacter: vi.fn(),
+    hydrateCurrentGroupMemberDetail: vi.fn(),
     selectedTarget: null as any,
     acquireCompleteConversation: vi.fn(),
 }))
@@ -56,6 +57,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => mocks.activeSession,
     markPersistentDataDirty: mocks.markPersistentDataDirty,
     reconcilePersistentActiveCharacterIds: mocks.reconcilePersistentActiveCharacterIds,
+    hydrateCurrentGroupMemberDetail: mocks.hydrateCurrentGroupMemberDetail,
 }))
 vi.mock('./coldCharacterRestore', () => ({
     restoreColdPersistentCharacter: mocks.restoreColdPersistentCharacter,
@@ -63,6 +65,7 @@ vi.mock('./coldCharacterRestore', () => ({
 
 import { addGroupChar, groupOrder, rmCharFromGroup } from './group'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
+import { createCatalogCharacterStub } from '../storage/workingSetCatalog'
 
 function makeGroup() {
     return {
@@ -105,6 +108,17 @@ describe('group working-set residency', () => {
             chaId: 'member-b',
             firstMessage: 'Hydrated B',
         })
+        mocks.hydrateCurrentGroupMemberDetail.mockImplementation((groupId, detail) => {
+            const group = mocks.database.characters[mocks.selectedId]
+            if (group?.chaId !== groupId || group.type !== 'group') return false
+            const index = mocks.database.characters.findIndex(
+                (character) => character.chaId === detail.chaId,
+            )
+            if (index < 0) return false
+            const chats = mocks.database.characters[index].chats
+            mocks.database.characters[index] = { ...detail, chats }
+            return true
+        })
         mocks.activateCharacter.mockImplementation(async (id) => {
             mocks.navigationGeneration++
             mocks.selectedCharacterId = id
@@ -133,6 +147,45 @@ describe('group working-set residency', () => {
             }),
         ])
         expect(mocks.markPersistentDataDirty).toHaveBeenCalled()
+    })
+
+    it('publishes restored scalable member detail before immediate group generation', async () => {
+        const detail = {
+            type: 'character',
+            chaId: 'member-b',
+            name: 'Beta',
+            personality: 'Persistent personality',
+            scenario: 'Persistent scenario',
+            firstMessage: 'Persistent greeting',
+        }
+        mocks.database.characters[2] = createCatalogCharacterStub({
+            id: 'member-b',
+            configuredIndex: 2,
+            conversationCount: 0,
+            name: 'Beta',
+            type: 'character',
+            recentAt: 0,
+            trashed: false,
+        })
+        mocks.restoreColdPersistentCharacter.mockResolvedValue(detail)
+        mocks.alertConfirm.mockResolvedValue(false)
+
+        await expect(addGroupChar()).resolves.toBe(true)
+
+        expect(mocks.hydrateCurrentGroupMemberDetail).toHaveBeenCalledWith(
+            'group-a',
+            detail,
+        )
+        const order = groupOrder([
+            { id: 'member-b', talkness: 1, index: 0 },
+        ], 'persistent')
+        const generatedMember = mocks.database.characters.find(
+            (character) => character.chaId === order[0].id,
+        )
+        expect(generatedMember).toMatchObject({
+            personality: 'Persistent personality',
+            scenario: 'Persistent scenario',
+        })
     })
 
     it('routes a first-message greeting through the active conversation session', async () => {

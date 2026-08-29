@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { get } from 'svelte/store'
 
 vi.mock('../parser/parser.svelte', () => ({
     assetRegex: /$^/,
@@ -21,8 +22,10 @@ import { getDatabase, setDatabaseLite } from './database.svelte'
 import {
     configurePersistentDataRuntime,
     createProductionStateAdapter,
+    hydrateCurrentGroupMemberDetail,
 } from './persistentDataRuntime.svelte'
 import {
+    createCatalogCharacterStub,
     isCatalogCharacterStub,
     projectCompleteScalableWorkingSet,
 } from './workingSetCatalog'
@@ -36,6 +39,88 @@ afterEach(() => {
 })
 
 describe('production persistent working-set publication', () => {
+    it('hydrates only the restored catalog member while preserving the selected group', () => {
+        const group = {
+            type: 'group',
+            chaId: 'group-a',
+            name: 'Group',
+            characters: ['member-a'],
+            characterTalks: [1],
+            characterActive: [true],
+            chats: [{ id: 'group-chat', message: [] }],
+            chatPage: 0,
+        }
+        const memberStub = createCatalogCharacterStub({
+            id: 'member-b',
+            configuredIndex: 1,
+            conversationCount: 0,
+            name: 'Beta',
+            type: 'character',
+            recentAt: 0,
+            trashed: false,
+        })
+        const database = {
+            botPresets: [],
+            plugins: [],
+            characters: [group, memberStub],
+        } as unknown as Database
+        setDatabaseLite(database)
+        selectedCharID.set(0)
+        const residentGroup = getDatabase().characters[0]
+        const residentMemberStub = getDatabase().characters[1]
+        const detail = {
+            type: 'character',
+            chaId: 'member-b',
+            name: 'Beta',
+            personality: 'Persistent personality',
+            scenario: 'Persistent scenario',
+        } as any
+
+        expect(hydrateCurrentGroupMemberDetail('group-a', detail)).toBe(true)
+
+        expect(getDatabase().characters[0]).toBe(residentGroup)
+        expect(getDatabase().characters[1]).toMatchObject({
+            personality: 'Persistent personality',
+            scenario: 'Persistent scenario',
+        })
+        expect(isCatalogCharacterStub(getDatabase().characters[1])).toBe(false)
+        expect(getDatabase().characters[1].chats).toBe(residentMemberStub.chats)
+        expect(getDatabase().characters[get(selectedCharID)]).toBe(residentGroup)
+    })
+
+    it('leaves an already complete maximum-compatibility member unchanged', () => {
+        const group = {
+            type: 'group',
+            chaId: 'group-a',
+            characters: [],
+            characterTalks: [],
+            characterActive: [],
+            chats: [],
+        }
+        const member = {
+            type: 'character',
+            chaId: 'member-b',
+            personality: 'Complete personality',
+            chats: [],
+        }
+        setDatabaseLite({
+            botPresets: [],
+            plugins: [{ enabled: true, version: '2.1' }],
+            characters: [group, member],
+        } as unknown as Database)
+        selectedCharID.set(0)
+        const residentMember = getDatabase().characters[1]
+
+        expect(hydrateCurrentGroupMemberDetail('group-a', {
+            type: 'character',
+            chaId: 'member-b',
+            personality: 'Replacement personality',
+        } as any)).toBe(true)
+
+        expect(getDatabase().characters[1]).toBe(residentMember)
+        expect(getDatabase().characters[1].personality).toBe('Complete personality')
+    })
+
     it('reports selected lifecycle policy, compatibility, operation and viewport budget', () => {
         setDatabaseLite({
             botPresets: [],

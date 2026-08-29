@@ -206,7 +206,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         throw error
     } finally {
         completeLease?.release()
-        if (!enteredGeneration || generationReturned) ownedReservation?.release()
+        ownedReservation?.release({
+            preserveBusy: enteredGeneration && !generationReturned,
+        })
     }
 }
 
