@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 
 const mocks = vi.hoisted(() => ({
+    unexpectedNativeRuntimeAccess: () => {
+        throw new Error('Unexpected native runtime access in this test')
+    },
     database: { characters: [] as any[] },
     nextId: 0,
     navigationGeneration: 0,
@@ -96,6 +99,8 @@ vi.mock('./pngChunk', () => ({ PngChunk: {} }))
 vi.mock('./process/coldstorage.svelte', () => ({ getColdStorageItem: mocks.getColdStorageItem }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     activateCharacter: mocks.activateCharacter,
+    acquireDestructiveReplacementFence: mocks.unexpectedNativeRuntimeAccess,
+    capturePersistentMutationToken: mocks.unexpectedNativeRuntimeAccess,
     commitCharacterAddition: mocks.commitCharacterAddition,
     deactivateActiveWorkingSet: mocks.deactivateActiveWorkingSet,
     getPersistentNavigationGeneration: mocks.getPersistentNavigationGeneration,

@@ -6,10 +6,16 @@ import { processMultiCommand } from './command'
 import { createConversationOperationContext } from './conversationOperationContext'
 
 const runtime = vi.hoisted(() => ({
+    unexpectedNativeRuntimeAccess: () => {
+        throw new Error('Unexpected native runtime access in this test')
+    },
     session: null as ActiveConversationSession | null,
 }))
 
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    acquireDestructiveReplacementFence: runtime.unexpectedNativeRuntimeAccess,
+    capturePersistentMutationToken: runtime.unexpectedNativeRuntimeAccess,
+    getPersistentDataRuntime: runtime.unexpectedNativeRuntimeAccess,
     peekActiveConversationSession: () => runtime.session,
 }))
 vi.mock('./modules', async (importOriginal) => ({

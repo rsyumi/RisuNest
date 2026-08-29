@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const testState = vi.hoisted(() => ({
+    unexpectedNativeRuntimeAccess: () => {
+        throw new Error('Unexpected native runtime access in this test')
+    },
     activeSession: null as unknown,
     runTrigger: vi.fn(),
     onTokenizeChat: null as null | (() => void | Promise<void>),
@@ -45,7 +48,10 @@ vi.mock('../parser/parser.svelte', () => ({
 }))
 
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    acquireDestructiveReplacementFence: testState.unexpectedNativeRuntimeAccess,
+    capturePersistentMutationToken: testState.unexpectedNativeRuntimeAccess,
     getActiveConversationSession: () => testState.activeSession,
+    getPersistentDataRuntime: testState.unexpectedNativeRuntimeAccess,
     peekActiveConversationSession: () => testState.activeSession,
 }))
 

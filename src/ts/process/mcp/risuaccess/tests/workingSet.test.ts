@@ -6,6 +6,9 @@ import { CharacterHandler } from '../characters'
 import { ChatHandler } from '../chats'
 
 const runtimeMocks = vi.hoisted(() => ({
+  unexpectedNativeRuntimeAccess: () => {
+    throw new Error('Unexpected native runtime access in this test')
+  },
   mutateCharacter: vi.fn(),
   readCharacter: vi.fn(),
   readConversationAt: vi.fn(),
@@ -31,6 +34,9 @@ vi.mock('src/ts/util', () => ({
   pickHashRand: () => 1,
 }))
 vi.mock(import('src/ts/storage/persistentDataRuntime.svelte'), () => ({
+  acquireDestructiveReplacementFence: runtimeMocks.unexpectedNativeRuntimeAccess,
+  capturePersistentMutationToken: runtimeMocks.unexpectedNativeRuntimeAccess,
+  getPersistentDataRuntime: runtimeMocks.unexpectedNativeRuntimeAccess,
   materializeMaximumCompatibilityWorkingSet: vi.fn(),
   mutatePersistentCharacterDetail: runtimeMocks.mutateCharacter,
   readPersistentCharacterDetail: runtimeMocks.readCharacter,
