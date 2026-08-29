@@ -53,6 +53,7 @@ use std::os::windows::fs::MetadataExt;
 
 const OPERATION_SCHEMA: &str = "risunest.peer-bidirectional-operation/v1";
 const OPERATION_FILE: &str = "operation.json";
+const ABANDON_CLAIM_FILE: &str = ".operation-abandon.claim";
 const MAX_OPERATION_BYTES: u64 = 1_048_576;
 const P5_SOURCE_PIN_PREFIX: &str = "logical-session-p5-source-";
 
@@ -76,6 +77,7 @@ thread_local! {
     static OPERATION_READ_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static ABANDON_BEFORE_CLAIM_REPLACEMENT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     static ABANDON_CLAIM_REMOVE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+    static ABANDON_AFTER_CLAIM_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
     static BACKUP_FULL_VERIFICATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
@@ -5324,6 +5326,7 @@ impl PeerBidirectionalOperationJournal {
                 "simulated bidirectional operation read failure".to_owned(),
             ));
         }
+        self.recover_abandon_claim()?;
         let path = self.root.join(OPERATION_FILE);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -5381,10 +5384,15 @@ impl PeerBidirectionalOperationJournal {
     ) -> Result<(), PeerSyncError> {
         Self::validate_abandon_identity(&snapshot.operation, operation_id)?;
         let operation_path = self.root.join(OPERATION_FILE);
-        let claim_path = self
-            .root
-            .join(format!(".operation-abandon-{}.claim", uuid::Uuid::new_v4()));
+        let claim_path = self.root.join(ABANDON_CLAIM_FILE);
         fs::rename(&operation_path, &claim_path)?;
+
+        #[cfg(test)]
+        if ABANDON_AFTER_CLAIM_FAILPOINT.with(|enabled| enabled.replace(false)) {
+            return Err(PeerSyncError::Storage(
+                "simulated crash after bidirectional operation claim".to_owned(),
+            ));
+        }
 
         let validation = (|| {
             let claimed = self.read_bounded_path(&claim_path)?;
@@ -5450,6 +5458,44 @@ impl PeerBidirectionalOperationJournal {
         fs::hard_link(claim_path, &operation_path)?;
         fs::remove_file(claim_path)?;
         Ok(())
+    }
+
+    fn recover_abandon_claim(&self) -> Result<(), PeerSyncError> {
+        let claim_path = self.root.join(ABANDON_CLAIM_FILE);
+        match fs::symlink_metadata(&claim_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let claimed = self.read_bounded_path(&claim_path)?;
+        let claimed_operation =
+            serde_json::from_slice::<PeerBidirectionalDurableOperation>(&claimed)
+                .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        let claimed_operation_id = claimed_operation.operation_id().to_owned();
+        Self::validate_abandon_identity(&claimed_operation, &claimed_operation_id)?;
+
+        let operation_path = self.root.join(OPERATION_FILE);
+        match fs::symlink_metadata(&operation_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.restore_claim(&claim_path)
+            }
+            Err(error) => Err(error.into()),
+            Ok(_) => {
+                let canonical = self.read_bounded_path(&operation_path)?;
+                let canonical_operation =
+                    serde_json::from_slice::<PeerBidirectionalDurableOperation>(&canonical)
+                        .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+                let canonical_operation_id = canonical_operation.operation_id().to_owned();
+                Self::validate_abandon_identity(&canonical_operation, &canonical_operation_id)?;
+                if canonical != claimed || canonical_operation_id != claimed_operation_id {
+                    return Err(PeerSyncError::Storage(
+                        "bidirectional operation and abandon claim differ".to_owned(),
+                    ));
+                }
+                fs::remove_file(claim_path)?;
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn store(
@@ -13167,9 +13213,15 @@ mod tests {
         let operation_id = "123e4567-e89b-42d3-a456-426614174247";
         let invalid = invalid_target_prepared_journal_bytes(operation_id);
         let operation_path = write_operation_journal(directory.path(), &invalid);
+        let mut valid_context = context(operation_id);
+        valid_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        valid_context.credential.manifest_id = valid_context
+            .expected_remote_generation
+            .manifest_hash
+            .clone();
         let valid = serde_json::to_vec(&PeerBidirectionalDurableOperation::TargetPrepared {
             schema: OPERATION_SCHEMA.to_owned(),
-            context: context(operation_id),
+            context: valid_context,
             local_generation: generation("local", "3", 'e'),
             conflict_policy: TargetPreparedConflictPolicy::Reject,
             changed: true,
@@ -13202,6 +13254,148 @@ mod tests {
             .acknowledge(directory.path(), &mut store, operation_id)
             .is_err());
         assert_eq!(fs::read(operation_path).unwrap(), bytes);
+    }
+
+    fn abandon_claim_paths(root: &Path) -> Vec<PathBuf> {
+        let journal_root = root.join("peer-bidirectional");
+        let Ok(entries) = fs::read_dir(journal_root) else {
+            return vec![];
+        };
+        entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name == ".operation-abandon.claim"
+                            || name.starts_with(".operation-abandon-") && name.ends_with(".claim")
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tolerant_abandon_crash_reopen_restores_a_valid_replacement_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174249";
+        let invalid = invalid_target_prepared_journal_bytes(operation_id);
+        write_operation_journal(directory.path(), &invalid);
+        let mut valid_context = context(operation_id);
+        valid_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        valid_context.credential.manifest_id = valid_context
+            .expected_remote_generation
+            .manifest_hash
+            .clone();
+        let valid_operation = PeerBidirectionalDurableOperation::TargetPrepared {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: valid_context,
+            local_generation: generation("local", "3", 'e'),
+            conflict_policy: TargetPreparedConflictPolicy::Reject,
+            changed: true,
+            remote_backup_required: false,
+            transferred_objects: 2,
+            transferred_bytes: 19,
+            backups: vec![],
+        };
+        let valid = serde_json::to_vec(&valid_operation).unwrap();
+        ABANDON_BEFORE_CLAIM_REPLACEMENT
+            .with(|replacement| replacement.replace(Some(valid.clone())));
+        ABANDON_AFTER_CLAIM_FAILPOINT.with(|enabled| enabled.set(true));
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
+        assert!(!directory
+            .path()
+            .join("peer-bidirectional")
+            .join(OPERATION_FILE)
+            .exists());
+        assert_eq!(abandon_claim_paths(directory.path()).len(), 1);
+
+        assert_eq!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(valid_operation)
+        );
+        assert!(abandon_claim_paths(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn tolerant_abandon_crash_reopen_restores_invalid_claim_for_explicit_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174250";
+        let invalid = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &invalid);
+        ABANDON_AFTER_CLAIM_FAILPOINT.with(|enabled| enabled.set(true));
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
+        assert!(!operation_path.exists());
+
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .is_err());
+        assert_eq!(fs::read(&operation_path).unwrap(), invalid);
+        assert!(abandon_claim_paths(directory.path()).is_empty());
+
+        PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .unwrap();
+        assert!(!operation_path.exists());
+    }
+
+    #[test]
+    fn tolerant_abandon_claim_recovery_never_overwrites_a_concurrent_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174251";
+        let canonical = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &canonical);
+        let claim = operation_path
+            .parent()
+            .unwrap()
+            .join(".operation-abandon.claim");
+        let claimed = invalid_target_prepared_journal_bytes("123e4567-e89b-42d3-a456-426614174252");
+        fs::write(&claim, &claimed).unwrap();
+
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .is_err());
+        assert_eq!(fs::read(operation_path).unwrap(), canonical);
+        assert_eq!(fs::read(claim).unwrap(), claimed);
+    }
+
+    #[test]
+    fn tolerant_abandon_claim_recovery_rejects_unbounded_or_linked_claims() {
+        let operation_id = "123e4567-e89b-42d3-a456-426614174253";
+        let target_bytes = invalid_target_prepared_journal_bytes(operation_id);
+        for linked in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let journal = PeerBidirectionalOperationJournal::new(directory.path());
+            fs::create_dir_all(&journal.root).unwrap();
+            let claim = journal.root.join(".operation-abandon.claim");
+            if linked {
+                let target = directory.path().join("outside-operation.json");
+                fs::write(&target, &target_bytes).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &claim).unwrap();
+                #[cfg(windows)]
+                if let Err(error) = std::os::windows::fs::symlink_file(&target, &claim) {
+                    if error.raw_os_error() == Some(1314) {
+                        continue;
+                    }
+                    panic!("failed to create linked claim fixture: {error}");
+                }
+            } else {
+                fs::write(&claim, vec![b' '; MAX_OPERATION_BYTES as usize + 1]).unwrap();
+            }
+
+            assert!(journal.load().is_err());
+            assert!(fs::symlink_metadata(claim).is_ok());
+        }
     }
 
     #[test]
