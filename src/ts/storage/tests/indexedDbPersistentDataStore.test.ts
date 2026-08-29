@@ -27,6 +27,13 @@ async function completeTransaction(transaction: IDBTransaction): Promise<void> {
     })
 }
 
+async function requestResultForTest<T>(request: IDBRequest<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+    })
+}
+
 async function readRawRecord(
     indexedDB: IDBFactory,
     databaseName: string,
@@ -69,6 +76,7 @@ async function countPersistentDataRecords(
         'characters',
         'conversations',
         'messagePages',
+        'messageOccurrences',
         'pluginStorage',
         'pluginStorageMetadata',
         'assetAliases',
@@ -472,6 +480,143 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })
     }
 
+    it('uses only the occurrence index for present and absent first/last anchor lookup', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `message-occurrence-io-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const database = structuredClone(fixtureDatabase)
+        const conversation = database.characters
+            .find((character) => character.chaId === 'char-a')!
+            .chats.find((chat) => chat.id === 'conv-long')!
+        conversation.message[1].chatId = 'far-duplicate'
+        conversation.message[128].chatId = 'far-duplicate'
+        await store.replaceFromDatabase(database)
+
+        const cursorCalls: Array<{ store: string; index: string }> = []
+        const pageRangeReads: string[] = []
+        const originalOpenCursor = IDBIndex.prototype.openCursor
+        const originalGetAll = IDBIndex.prototype.getAll
+        const cursorSpy = vi.spyOn(IDBIndex.prototype, 'openCursor').mockImplementation(function (
+            this: IDBIndex,
+            ...args: Parameters<IDBIndex['openCursor']>
+        ) {
+            cursorCalls.push({ store: this.objectStore.name, index: this.name })
+            return originalOpenCursor.apply(this, args)
+        })
+        const getAllSpy = vi.spyOn(IDBIndex.prototype, 'getAll').mockImplementation(function (
+            this: IDBIndex,
+            ...args: Parameters<IDBIndex['getAll']>
+        ) {
+            if (this.objectStore.name === 'messagePages') pageRangeReads.push(this.name)
+            return originalGetAll.apply(this, args)
+        })
+
+        try {
+            for (const [messageId, anchorOccurrence] of [
+                ['far-duplicate', 'first'],
+                ['far-duplicate', 'last'],
+                ['absent', 'first'],
+                ['absent', 'last'],
+            ] as const) {
+                await store.readConversationWindow({
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    anchorMessageId: messageId,
+                    anchorOccurrence,
+                    before: 0,
+                    after: 0,
+                })
+            }
+        } finally {
+            cursorSpy.mockRestore()
+            getAllSpy.mockRestore()
+        }
+
+        expect(cursorCalls).toEqual(Array.from({ length: 4 }, () => ({
+            store: 'messageOccurrences',
+            index: 'byConversationMessageIndex',
+        })))
+        expect(pageRangeReads).toEqual([])
+    })
+
+    it('backfills the occurrence index atomically when upgrading legacy message pages', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `message-occurrence-upgrade-${databaseSequence++}`
+        await createVersion1Database(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        await store.open()
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(13)
+        const transaction = database.transaction('messageOccurrences', 'readonly')
+        expect(transaction.objectStore('messageOccurrences').indexNames.contains(
+            'byConversationMessageIndex',
+        )).toBe(true)
+        expect(await requestResultForTest(
+            transaction.objectStore('messageOccurrences').count(),
+        )).toBeGreaterThan(0)
+        await completeTransaction(transaction)
+        database.close()
+
+        await expect(store.readConversationWindow({
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            anchorMessageId: 'msg-127',
+            anchorOccurrence: 'last',
+            before: 0,
+            after: 0,
+        })).resolves.toMatchObject({ value: { startIndex: 127, endIndex: 128 } })
+        await expect(store.readConversationWindow({
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            anchorMessageId: 'absent-after-upgrade',
+            anchorOccurrence: 'last',
+            before: 0,
+            after: 0,
+        })).resolves.toBeNull()
+    })
+
+    it('rolls back the schema upgrade when occurrence backfill cannot read legacy pages', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `message-occurrence-upgrade-rollback-${databaseSequence++}`
+        await createVersion1Database(indexedDB, databaseName)
+        const originalOpenCursor = IDBObjectStore.prototype.openCursor
+        const cursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor').mockImplementation(
+            function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['openCursor']>
+            ) {
+                if (this.name === 'messagePages') throw new Error('injected occurrence backfill failure')
+                return originalOpenCursor.apply(this, args)
+            },
+        )
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        try {
+            await expect(store.open()).rejects.toThrow()
+        } finally {
+            cursorSpy.mockRestore()
+        }
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(1)
+        expect(database.objectStoreNames.contains('messageOccurrences')).toBe(false)
+        database.close()
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        await expect(reopened.readConversationWindow({
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            anchorMessageId: 'msg-127',
+            anchorOccurrence: 'last',
+            before: 0,
+            after: 0,
+        })).resolves.toMatchObject({ value: { startIndex: 127 } })
+    })
+
     it('keeps ordinary owner invalidation bounded with a large head set', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `large-owner-head-save-${databaseSequence++}`
@@ -609,8 +754,8 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 this: IDBObjectStore,
                 ...args: Parameters<IDBObjectStore['openCursor']>
             ) {
-                if (this.name !== 'meta') {
-                    throw new Error('version 7 alias schema upgrade must not scan records')
+                if (this.name !== 'meta' && this.name !== 'messagePages') {
+                    throw new Error('version 7 upgrade must scan only message pages for occurrences')
                 }
                 return originalOpenCursor.apply(this, args)
             })
@@ -623,7 +768,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(12)
+        expect(database.version).toBe(13)
         const transaction = database.transaction(
             ['assetAliases', 'assetOwnerHeads', 'assetRepositoryAuthority'],
             'readonly',
@@ -659,8 +804,12 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 this: IDBObjectStore,
                 ...args: Parameters<IDBObjectStore['openCursor']>
             ) {
-                if (this.name !== 'meta' && this.name !== 'assetAliases') {
-                    throw new Error('version 8 upgrade must scan only aliases that need new keys')
+                if (
+                    this.name !== 'meta' &&
+                    this.name !== 'assetAliases' &&
+                    this.name !== 'messagePages'
+                ) {
+                    throw new Error('version 8 upgrade scanned an unrelated record family')
                 }
                 return originalOpenCursor.apply(this, args)
             })
@@ -673,7 +822,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(12)
+        expect(database.version).toBe(13)
         const transaction = database.transaction('assetOwnerHeads', 'readonly')
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)
@@ -695,7 +844,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(12)
+        expect(database.version).toBe(13)
         const transaction = database.transaction(
             ['coldAliases', 'coldPayloadAuthority'],
             'readonly',
@@ -1727,6 +1876,13 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 upper: ['revision-1', 'char-a'],
                 direction: undefined,
             },
+            {
+                store: 'messageOccurrences',
+                index: 'byGenerationCharacter',
+                lower: ['revision-1', 'char-a'],
+                upper: ['revision-1', 'char-a'],
+                direction: undefined,
+            },
         ])
         expect(objectStoreIo).toEqual([])
         expect((await store.readConversation('char-b', 'conv-beta'))?.value.message).toHaveLength(3)
@@ -1760,11 +1916,13 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.replaceFromDatabase(fixtureDatabase)
 
         let conversationPageCursors = 0
+        let occurrenceCursors = 0
         const originalOpenCursor = IDBIndex.prototype.openCursor
         const cursorSpy = vi
             .spyOn(IDBIndex.prototype, 'openCursor')
             .mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex['openCursor']>) {
                 if (this.name === 'byConversationPage') conversationPageCursors++
+                if (this.name === 'byConversationMessageIndex') occurrenceCursors++
                 return originalOpenCursor.apply(this, args)
             })
         try {
@@ -1779,7 +1937,8 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             cursorSpy.mockRestore()
         }
 
-        expect(conversationPageCursors).toBe(1)
+        expect(conversationPageCursors).toBe(0)
+        expect(occurrenceCursors).toBe(1)
     })
 
     it('removes the previous generation after each successful staged replacement', async () => {

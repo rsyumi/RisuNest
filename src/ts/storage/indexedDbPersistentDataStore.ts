@@ -48,7 +48,7 @@ import {
 import { parseAssetRepositoryAuthorityState } from './assetRepositoryAuthority'
 import { parseColdPayloadAuthorityState } from './coldPayloadAuthority'
 
-const DATABASE_VERSION = 12
+const DATABASE_VERSION = 13
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -59,6 +59,7 @@ const INDEXED_GENERATION_STORE_NAMES = [
     'characters',
     'conversations',
     'messagePages',
+    'messageOccurrences',
     'pluginStorage',
     'pluginStorageMetadata',
     'assetAliases',
@@ -165,6 +166,15 @@ function replacementOwnerTuplesEqual(
         && right !== null
         && left.present === right.present
         && isEqual(left.entries, right.entries)
+}
+
+interface StoredMessageOccurrence {
+    key: string
+    generation: string
+    characterId: string
+    conversationId: string
+    messageId: string
+    absoluteIndex: number
 }
 
 function commitCharacterParents(input: WorkingSetCommit): Map<string, CharacterDetail> {
@@ -407,6 +417,26 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )
             this.createIndex(transaction.objectStore('messagePages'), 'byGeneration', 'generation')
             this.createIndex(
+                transaction.objectStore('messageOccurrences'),
+                'byConversationMessageIndex',
+                ['generation', 'characterId', 'conversationId', 'messageId', 'absoluteIndex'],
+            )
+            this.createIndex(
+                transaction.objectStore('messageOccurrences'),
+                'byConversationIndex',
+                ['generation', 'characterId', 'conversationId', 'absoluteIndex'],
+            )
+            this.createIndex(
+                transaction.objectStore('messageOccurrences'),
+                'byGenerationCharacter',
+                ['generation', 'characterId'],
+            )
+            this.createIndex(
+                transaction.objectStore('messageOccurrences'),
+                'byGeneration',
+                'generation',
+            )
+            this.createIndex(
                 transaction.objectStore('pluginStorage'),
                 'byGenerationKey',
                 ['generation', 'storageKey'],
@@ -465,6 +495,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             if (event.oldVersion > 0 && event.oldVersion < 12) {
                 this.backfillColdPayloadAuthority(transaction)
+            }
+            if (event.oldVersion > 0 && event.oldVersion < 13) {
+                this.backfillMessageOccurrences(transaction)
             }
         }
         this.database = await requestResult(request)
@@ -552,7 +585,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     ): Promise<Versioned<ConversationWindow> | null> {
         validateConversationWindowQuery(input)
         const transaction = this.requireDatabase().transaction(
-            ['meta', 'conversations', 'messagePages'],
+            ['meta', 'conversations', 'messagePages', 'messageOccurrences'],
             'readonly',
         )
         const { revision, generation } = await this.readActive(transaction)
@@ -1250,7 +1283,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 assertActive()
                 validateConversationWindowQuery(input)
                 const transaction = this.requireDatabase().transaction(
-                    ['meta', 'conversations', 'messagePages'],
+                    ['meta', 'conversations', 'messagePages', 'messageOccurrences'],
                     'readonly',
                 )
                 await this.validateSnapshotLease(transaction, lease, generation, revision)
@@ -2597,6 +2630,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             transaction.objectStore('messagePages').index('byGenerationCharacter'),
             this.keyRangeFactory.only([generation, character.chaId]),
         )
+        await this.deleteIndexRange(
+            transaction.objectStore('messageOccurrences').index('byGenerationCharacter'),
+            this.keyRangeFactory.only([generation, character.chaId]),
+        )
 
         const { chats, ...detail } = character
         this.putCharacterRecords(
@@ -2725,6 +2762,30 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             pageIndex,
             value: messages,
         })
+        const occurrences = transaction.objectStore('messageOccurrences')
+        const pageStart = pageIndex * MESSAGE_PAGE_SIZE
+        for (let offset = 0; offset < messages.length; offset++) {
+            const absoluteIndex = pageStart + offset
+            const key = this.messageOccurrenceKey(
+                generation,
+                characterId,
+                conversationId,
+                absoluteIndex,
+            )
+            const messageId = messages[offset].chatId
+            if (messageId === undefined) {
+                occurrences.delete(key)
+                continue
+            }
+            occurrences.put({
+                key,
+                generation,
+                characterId,
+                conversationId,
+                messageId,
+                absoluteIndex,
+            } satisfies StoredMessageOccurrence)
+        }
     }
 
     private async refreshCharacterSummary(
@@ -2758,6 +2819,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )
         await this.deleteIndexRange(
             transaction.objectStore('messagePages').index('byGenerationCharacter'),
+            this.keyRangeFactory.only([generation, characterId]),
+        )
+        await this.deleteIndexRange(
+            transaction.objectStore('messageOccurrences').index('byGenerationCharacter'),
             this.keyRangeFactory.only([generation, characterId]),
         )
     }
@@ -2903,15 +2968,14 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         occurrence: 'first' | 'last',
     ): Promise<{ index: number; page: StoredMessagePage } | null> {
         if (totalMessages === 0) return Promise.resolve(null)
-        const lastPage = Math.floor((totalMessages - 1) / MESSAGE_PAGE_SIZE)
         const range = this.keyRangeFactory.bound(
-            [generation, characterId, conversationId, 0],
-            [generation, characterId, conversationId, lastPage],
+            [generation, characterId, conversationId, messageId, 0],
+            [generation, characterId, conversationId, messageId, MAX_INDEX_VALUE],
         )
         return new Promise((resolve, reject) => {
             const request = transaction
-                .objectStore('messagePages')
-                .index('byConversationPage')
+                .objectStore('messageOccurrences')
+                .index('byConversationMessageIndex')
                 .openCursor(range, occurrence === 'last' ? 'prev' : 'next')
             request.onerror = () => reject(request.error)
             request.onsuccess = () => {
@@ -2920,30 +2984,47 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     resolve(null)
                     return
                 }
-                const page = cursor.value as StoredMessagePage
-                const indexInPage = occurrence === 'last'
-                    ? page.value.findLastIndex((message) => message.chatId === messageId)
-                    : page.value.findIndex((message) => message.chatId === messageId)
-                if (indexInPage !== -1) {
-                    resolve({ index: page.pageIndex * MESSAGE_PAGE_SIZE + indexInPage, page })
+                const record = cursor.value as StoredMessageOccurrence
+                if (record.absoluteIndex >= totalMessages) {
+                    reject(new Error('Persistent message occurrence exceeds conversation bounds'))
                     return
                 }
-                cursor.continue()
+                const pageIndex = Math.floor(record.absoluteIndex / MESSAGE_PAGE_SIZE)
+                const pageRequest = transaction.objectStore('messagePages').get(
+                    this.messagePageKey(generation, characterId, conversationId, pageIndex),
+                )
+                pageRequest.onerror = () => reject(pageRequest.error)
+                pageRequest.onsuccess = () => {
+                    const page = pageRequest.result as StoredMessagePage | undefined
+                    const message = page?.value[record.absoluteIndex % MESSAGE_PAGE_SIZE]
+                    if (!page || message?.chatId !== messageId) {
+                        reject(new Error('Persistent message occurrence index is inconsistent'))
+                        return
+                    }
+                    resolve({ index: record.absoluteIndex, page })
+                }
             }
         })
     }
 
-    private deleteConversationPages(
+    private async deleteConversationPages(
         transaction: IDBTransaction,
         generation: string,
         characterId: string,
         conversationId: string,
         startPage: number,
     ): Promise<void> {
-        return this.deleteIndexRange(
+        await this.deleteIndexRange(
             transaction.objectStore('messagePages').index('byConversationPage'),
             this.keyRangeFactory.bound(
                 [generation, characterId, conversationId, startPage],
+                [generation, characterId, conversationId, MAX_INDEX_VALUE],
+            ),
+        )
+        await this.deleteIndexRange(
+            transaction.objectStore('messageOccurrences').index('byConversationIndex'),
+            this.keyRangeFactory.bound(
+                [generation, characterId, conversationId, startPage * MESSAGE_PAGE_SIZE],
                 [generation, characterId, conversationId, MAX_INDEX_VALUE],
             ),
         )
@@ -3167,6 +3248,37 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
+    private backfillMessageOccurrences(transaction: IDBTransaction): void {
+        const pages = transaction.objectStore('messagePages')
+        const occurrences = transaction.objectStore('messageOccurrences')
+        const request = pages.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) return
+            const page = cursor.value as StoredMessagePage
+            const pageStart = page.pageIndex * MESSAGE_PAGE_SIZE
+            for (let offset = 0; offset < page.value.length; offset++) {
+                const messageId = page.value[offset].chatId
+                if (messageId === undefined) continue
+                const absoluteIndex = pageStart + offset
+                occurrences.put({
+                    key: this.messageOccurrenceKey(
+                        page.generation,
+                        page.characterId,
+                        page.conversationId,
+                        absoluteIndex,
+                    ),
+                    generation: page.generation,
+                    characterId: page.characterId,
+                    conversationId: page.conversationId,
+                    messageId,
+                    absoluteIndex,
+                } satisfies StoredMessageOccurrence)
+            }
+            cursor.continue()
+        }
+    }
+
     private backfillAssetRepositoryAuthority(transaction: IDBTransaction): void {
         const authority = transaction.objectStore('assetRepositoryAuthority')
         const generations = new Set<string>()
@@ -3378,6 +3490,15 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         pageIndex: number,
     ): string {
         return `${generation}:message-page:${characterId}:${conversationId}:${pageIndex}`
+    }
+
+    private messageOccurrenceKey(
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        absoluteIndex: number,
+    ): string {
+        return `${generation}:message-occurrence:${characterId}:${conversationId}:${absoluteIndex}`
     }
 
     private pluginStorageKey(generation: string, key: string): string {

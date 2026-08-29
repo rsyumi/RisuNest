@@ -1833,6 +1833,133 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect(absent).toBeNull()
         })
 
+        it('keeps anchor occurrences truthful across message ID and range mutations', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const character = database.characters.find((entry) => entry.chaId === 'char-a')!
+            const conversation = character.chats.find((entry) => entry.id === 'conv-long')!
+            conversation.message = [
+                { role: 'user', data: 'first', chatId: 'duplicate' },
+                { role: 'char', data: 'middle', chatId: 'middle' },
+                { role: 'user', data: 'last', chatId: 'duplicate' },
+            ]
+            let revision = (await store.replaceFromDatabase(database)).revision
+            const anchor = (messageId: string, anchorOccurrence: 'first' | 'last') =>
+                store.readConversationWindow({
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    anchorMessageId: messageId,
+                    anchorOccurrence,
+                    before: 0,
+                    after: 0,
+                })
+
+            expect((await anchor('duplicate', 'first'))?.value.startIndex).toBe(0)
+            expect((await anchor('duplicate', 'last'))?.value.startIndex).toBe(2)
+
+            revision = (await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 3,
+                    deleteCount: 0,
+                    messages: [{ role: 'char', data: 'appended', chatId: 'duplicate' }],
+                }],
+            })).revision
+            expect((await anchor('duplicate', 'last'))?.value.startIndex).toBe(3)
+
+            revision = (await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 3,
+                    deleteCount: 1,
+                    messages: [{ role: 'char', data: 'edited ID', chatId: 'edited' }],
+                }],
+            })).revision
+            expect((await anchor('duplicate', 'last'))?.value.startIndex).toBe(2)
+            expect((await anchor('edited', 'first'))?.value.startIndex).toBe(3)
+
+            revision = (await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 0,
+                    deleteCount: 1,
+                    messages: [],
+                }],
+            })).revision
+            expect((await anchor('duplicate', 'first'))?.value.startIndex).toBe(1)
+            expect((await anchor('duplicate', 'last'))?.value.startIndex).toBe(1)
+            expect((await anchor('edited', 'first'))?.value.startIndex).toBe(2)
+
+            revision = (await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 1,
+                    deleteCount: 2,
+                    messages: [],
+                }],
+            })).revision
+            expect(await anchor('duplicate', 'last')).toBeNull()
+            expect(await anchor('edited', 'first')).toBeNull()
+
+            revision = (await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 0,
+                    deleteCount: 1,
+                    messages: [
+                        { role: 'user', data: 'replacement first', chatId: 'replacement' },
+                        { role: 'char', data: 'replacement last', chatId: 'replacement' },
+                    ],
+                }],
+            })).revision
+            expect((await anchor('replacement', 'first'))?.value.startIndex).toBe(0)
+            expect((await anchor('replacement', 'last'))?.value.startIndex).toBe(1)
+
+            revision = (await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'delete',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                }],
+            })).revision
+            await store.commit({
+                expectedRevision: revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 0,
+                    deleteCount: 0,
+                    messages: [{ role: 'user', data: 'recreated', chatId: 'recreated' }],
+                    conversation: {
+                        id: 'conv-long',
+                        name: 'Recreated',
+                        note: '',
+                        localLore: [],
+                    },
+                    configuredIndex: 0,
+                }],
+            })
+            expect(await anchor('replacement', 'last')).toBeNull()
+            expect((await anchor('recreated', 'first'))?.value.startIndex).toBe(0)
+        })
+
         it('reads absolute conversation ranges with zero-based exclusive-end semantics', async () => {
             const { store } = await createHarness()
             await store.replaceFromDatabase(fixtureDatabase)
