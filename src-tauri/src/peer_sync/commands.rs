@@ -474,6 +474,55 @@ impl Default for PeerCloneCommandState {
     }
 }
 
+fn recover_source(peer_root: &Path) -> Result<Option<SourceRuntime>, PeerSyncError> {
+    let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
+    let recovered = (|| {
+        let Some(marker) = read_active_source_marker(&marker_path)? else {
+            return Ok(None);
+        };
+        let session_root = peer_root.join("source-sessions").join(&marker.directory_id);
+        let prepared = super::PreparedCloneSession::reopen_lossless(
+            &session_root,
+            &marker.session_id,
+            &marker.manifest_id,
+        )?;
+        Ok(Some((marker, session_root, prepared)))
+    })();
+    let Some((marker, session_root, prepared)) = (match recovered {
+        Ok(recovered) => recovered,
+        Err(PeerSyncError::Validation(_)) => {
+            remove_file_if_exists(&marker_path)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }) else {
+        return Ok(None);
+    };
+    let session_id = prepared.manifest().session_id.clone();
+    let manifest_id = prepared.manifest_id().to_owned();
+    let host = LanCloneHost::prepare(prepared);
+    let control = host.control();
+    Ok(Some(SourceRuntime {
+        session_id,
+        manifest_id,
+        session_root,
+        marker_path,
+        marker,
+        host: Some(host),
+        control,
+        tunnel: None,
+        failed_tunnel: None,
+        tunnel_metadata: None,
+        phase: PeerCloneSourcePhase::Prepared,
+        stop_in_progress: false,
+        terminal_cleanup_pending: false,
+        #[cfg(test)]
+        stop_pause: None,
+        #[cfg(test)]
+        fail_cleanup_once: false,
+    }))
+}
+
 impl PeerCloneCommandState {
     #[cfg(test)]
     fn with_tunnel_launcher(tunnel_launcher: Arc<dyn SourceTunnelLauncher>) -> Self {
@@ -485,31 +534,8 @@ impl PeerCloneCommandState {
 
     pub(crate) fn initialize(peer_root: &Path) -> Self {
         let state = Self::default();
-        let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
-        let recovered = (|| {
-            let Some(marker) = read_active_source_marker(&marker_path)? else {
-                return Ok(None);
-            };
-            let session_root = peer_root.join("source-sessions").join(&marker.directory_id);
-            let prepared = super::PreparedCloneSession::reopen_lossless(
-                &session_root,
-                &marker.session_id,
-                &marker.manifest_id,
-            )?;
-            Ok(Some((marker, session_root, prepared)))
-        })();
-        let Some((marker, session_root, prepared)) = (match recovered {
-            Ok(recovered) => recovered,
-            Err(PeerSyncError::Validation(_)) => {
-                if let Err(cleanup_error) = remove_file_if_exists(&marker_path) {
-                    state
-                        .runtime
-                        .lock()
-                        .expect("new peer clone runtime")
-                        .source_recovery_error = Some(cleanup_error.to_string());
-                }
-                return state;
-            }
+        let source = match recover_source(peer_root) {
+            Ok(source) => source,
             Err(error) => {
                 state
                     .runtime
@@ -518,32 +544,11 @@ impl PeerCloneCommandState {
                     .source_recovery_error = Some(error.to_string());
                 return state;
             }
-        }) else {
+        };
+        let Some(source) = source else {
             return state;
         };
-        let session_id = prepared.manifest().session_id.clone();
-        let manifest_id = prepared.manifest_id().to_owned();
-        let host = LanCloneHost::prepare(prepared);
-        let control = host.control();
-        state.runtime.lock().expect("new peer clone runtime").source = Some(SourceRuntime {
-            session_id,
-            manifest_id,
-            session_root,
-            marker_path,
-            marker,
-            host: Some(host),
-            control,
-            tunnel: None,
-            failed_tunnel: None,
-            tunnel_metadata: None,
-            phase: PeerCloneSourcePhase::Prepared,
-            stop_in_progress: false,
-            terminal_cleanup_pending: false,
-            #[cfg(test)]
-            stop_pause: None,
-            #[cfg(test)]
-            fail_cleanup_once: false,
-        });
+        state.runtime.lock().expect("new peer clone runtime").source = Some(source);
         state
     }
 
@@ -585,11 +590,8 @@ impl PeerCloneCommandState {
         peer_root: &Path,
         cancellation: &dyn crate::local_backup::CancellationProbe,
     ) -> Result<PeerCloneSourceStatus, PeerSyncError> {
-        {
+        let retry_recovery = {
             let mut runtime = self.lock_runtime()?;
-            if let Some(error) = &runtime.source_recovery_error {
-                return Err(PeerSyncError::Storage(error.clone()));
-            }
             if runtime.source_preparing
                 || runtime
                     .source
@@ -601,6 +603,28 @@ impl PeerCloneCommandState {
                 ));
             }
             runtime.source_preparing = true;
+            runtime.source_recovery_error.is_some()
+        };
+
+        if retry_recovery {
+            match recover_source(peer_root) {
+                Ok(Some(source)) => {
+                    let mut runtime = self.lock_runtime()?;
+                    runtime.source_preparing = false;
+                    runtime.source_recovery_error = None;
+                    runtime.source = Some(source);
+                    return source_status(&mut runtime);
+                }
+                Ok(None) => {
+                    self.lock_runtime()?.source_recovery_error = None;
+                }
+                Err(error) => {
+                    let mut runtime = self.lock_runtime()?;
+                    runtime.source_preparing = false;
+                    runtime.source_recovery_error = Some(error.to_string());
+                    return Err(error);
+                }
+            }
         }
 
         let operation_id = uuid::Uuid::new_v4().to_string();
@@ -3581,7 +3605,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn product_source_recovery_io_failure_preserves_marker_and_blocks_source_commands() {
+    fn product_source_prepare_retries_retained_recovery_after_io_failure() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -3590,7 +3614,7 @@ mod tests {
         seed_product_store(&mut source_store, "Source", 0);
         let peer_root = root.path().join("peer-sync");
         let source = PeerCloneCommandState::default();
-        source
+        let prepared = source
             .prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled)
             .unwrap();
         let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
@@ -3612,6 +3636,13 @@ mod tests {
         assert!(marker_path.is_file());
 
         drop(marker_lock);
+
+        let retried = recovered
+            .prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled)
+            .unwrap();
+        assert_eq!(retried.phase, PeerCloneSourcePhase::Prepared);
+        assert_eq!(retried.session_id, prepared.session_id);
+        assert_eq!(retried.manifest_id, prepared.manifest_id);
     }
 
     struct TunnelSourceFixture {
