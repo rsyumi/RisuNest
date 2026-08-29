@@ -1023,6 +1023,45 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
+        it('preserves an owner head when nested object key insertion order changes', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [{
+                id: 'semantic-module',
+                name: 'Semantic module',
+                description: '',
+                assets: [[{
+                    metadata: { first: 1, second: 2 },
+                }]] as unknown as [string, string, string][],
+            }]
+            const imported = await store.replaceFromDatabase(database)
+            const head: AssetOwnerHead = {
+                owner: { kind: 'root-module-assets', index: 0 },
+                present: true,
+                manifestHash: '69'.repeat(32),
+                entryCount: 1,
+            }
+            const activated = await store.activateAssetRepositoryMigration({
+                sourceRevision: imported.revision,
+                migrationId: 'asset-semantic-owner-tuple',
+                compatibilityHash: '6a'.repeat(32),
+                database,
+                assetAliases: [],
+                assetOwnerHeads: [head],
+            })
+            const replacement = structuredClone(database)
+            replacement.modules[0].assets = [[{
+                metadata: { second: 2, first: 1 },
+            }]] as unknown as [string, string, string][]
+
+            const replaced = await store.replaceFromDatabase(replacement, activated.revision)
+
+            expect(await store.readAssetOwnerHead(head.owner)).toEqual({
+                revision: replaced.revision,
+                value: head,
+            })
+        })
+
         it('drops owner heads for malformed replacement parents without failing the replacement', async () => {
             const { store } = await createHarness()
             const database = structuredClone(fixtureDatabase)

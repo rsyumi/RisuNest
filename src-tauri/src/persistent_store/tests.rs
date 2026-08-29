@@ -5940,6 +5940,82 @@ fn database_only_replace_preserves_repositories_and_only_matching_owner_heads() 
 }
 
 #[test]
+fn database_only_replace_preserves_owner_head_across_nested_object_key_order() {
+    let (_directory, mut store, mut database) = open_fixture();
+    let source_assets: Value = serde_json::from_str(r#"[[{"metadata":{"first":1,"second":2}}]]"#)
+        .expect("parse source assets");
+    database["modules"] = json!([{
+        "id": "semantic-module",
+        "name": "Semantic module",
+        "description": "",
+        "assets": source_assets
+    }]);
+    let head = AssetOwnerHead::present(
+        AssetOwnerLocator::RootModuleAssets { index: 0 },
+        "69".repeat(32),
+        1,
+    );
+    let activated = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(root(&database)),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![head.clone()]),
+        })
+        .expect("activate semantic owner tuple");
+
+    let replacement_assets: Value =
+        serde_json::from_str(r#"[[{"metadata":{"second":2,"first":1}}]]"#)
+            .expect("parse replacement assets");
+    database["modules"][0]["assets"] = replacement_assets;
+    let staging = store
+        .replace_begin()
+        .expect("begin semantic database replacement");
+    store
+        .replace_put_root(&staging.staging_id, &staged_root(&database))
+        .expect("stage semantic replacement root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"]
+                .as_array()
+                .expect("replacement presets"),
+        )
+        .expect("stage semantic replacement presets");
+    store
+        .replace_add_characters(
+            &staging.staging_id,
+            database["characters"]
+                .as_array()
+                .expect("replacement characters"),
+        )
+        .expect("stage semantic replacement characters");
+    store
+        .replace_preserve_repositories(&staging.staging_id, Some(activated.revision))
+        .expect("preserve semantically equal owner tuple");
+    let replaced = store
+        .replace_commit(&staging.staging_id, Some(activated.revision))
+        .expect("activate semantic database replacement");
+
+    assert_eq!(
+        store
+            .read_asset_owner_head(&head.owner, None)
+            .expect("read retained semantic owner head"),
+        Some(super::Versioned {
+            revision: replaced.revision,
+            value: head,
+        })
+    );
+}
+
+#[test]
 fn database_only_replace_drops_heads_for_malformed_replacement_parents() {
     let directory = tempfile::tempdir().expect("create malformed parent directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");

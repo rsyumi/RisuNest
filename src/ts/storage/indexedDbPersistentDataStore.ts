@@ -1,3 +1,4 @@
+import isEqual from 'lodash/isEqual'
 import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     AssetAlias,
@@ -163,7 +164,7 @@ function replacementOwnerTuplesEqual(
     return left !== null
         && right !== null
         && left.present === right.present
-        && JSON.stringify(left.entries) === JSON.stringify(right.entries)
+        && isEqual(left.entries, right.entries)
 }
 
 function commitCharacterParents(input: WorkingSetCommit): Map<string, CharacterDetail> {
