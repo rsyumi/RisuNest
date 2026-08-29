@@ -4312,8 +4312,10 @@ impl PeerBidirectionalCommandState {
             }
         }
         let _guard = self.begin_target()?;
-        let Some(operation) = journal.load()? else {
-            return Ok(());
+        let operation = match journal.load() {
+            Ok(Some(operation)) => operation,
+            Ok(None) => return Ok(()),
+            Err(_) => return journal.abandon_invalid_record(operation_id),
         };
         if operation.operation_id() != operation_id {
             return Err(PeerSyncError::Validation(
@@ -5270,6 +5272,16 @@ impl PeerBidirectionalOperationJournal {
     }
 
     pub(crate) fn load(&self) -> Result<Option<PeerBidirectionalDurableOperation>, PeerSyncError> {
+        let Some(bytes) = self.read_bounded()? else {
+            return Ok(None);
+        };
+        let operation = serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        operation.validate()?;
+        Ok(Some(operation))
+    }
+
+    fn read_bounded(&self) -> Result<Option<Vec<u8>>, PeerSyncError> {
         let path = self.root.join(OPERATION_FILE);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -5293,10 +5305,37 @@ impl PeerBidirectionalOperationJournal {
                 "bidirectional operation record exceeds its bound".to_owned(),
             ));
         }
+        Ok(Some(bytes))
+    }
+
+    fn abandon_invalid_record(&self, operation_id: &str) -> Result<(), PeerSyncError> {
+        let Some(bytes) = self.read_bounded()? else {
+            return Ok(());
+        };
         let operation = serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes)
             .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
-        operation.validate()?;
-        Ok(Some(operation))
+        let schema = match &operation {
+            PeerBidirectionalDurableOperation::SourcePrepared { schema, .. }
+            | PeerBidirectionalDurableOperation::TargetPrepared { schema, .. }
+            | PeerBidirectionalDurableOperation::AwaitingConflict { schema, .. }
+            | PeerBidirectionalDurableOperation::LocalCommitted { schema, .. }
+            | PeerBidirectionalDurableOperation::Completed { schema, .. } => schema,
+        };
+        if schema != OPERATION_SCHEMA || !is_canonical_uuid(operation.operation_id()) {
+            return Err(PeerSyncError::Storage(
+                "bidirectional operation record is invalid".to_owned(),
+            ));
+        }
+        if operation.operation_id() != operation_id {
+            return Err(PeerSyncError::Validation(
+                "another bidirectional operation is retained".to_owned(),
+            ));
+        }
+        match fs::remove_file(self.root.join(OPERATION_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(crate) fn store(
@@ -12863,6 +12902,134 @@ mod tests {
                 "operationId": operation_id,
             })
         );
+    }
+
+    fn invalid_target_prepared_journal_bytes(operation_id: &str) -> Vec<u8> {
+        let operation = PeerBidirectionalDurableOperation::TargetPrepared {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            local_generation: generation("local", "3", 'e'),
+            conflict_policy: TargetPreparedConflictPolicy::Reject,
+            changed: true,
+            remote_backup_required: false,
+            transferred_objects: 2,
+            transferred_bytes: 19,
+            backups: vec![],
+        };
+        let mut value = serde_json::to_value(operation).unwrap();
+        value["context"]["durableJobId"] = json!("../../untrusted-job");
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn write_operation_journal(root: &Path, bytes: &[u8]) -> PathBuf {
+        let journal = PeerBidirectionalOperationJournal::new(root);
+        fs::create_dir_all(&journal.root).unwrap();
+        let path = journal.root.join(OPERATION_FILE);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn acknowledge_abandons_only_a_semantically_invalid_retained_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174240";
+        let bytes = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &bytes);
+        let sibling = operation_path.parent().unwrap().join("keep.marker");
+        fs::write(&sibling, b"unrelated retained state").unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let state = PeerBidirectionalCommandState::default();
+
+        assert!(state.status(directory.path(), &mut store).is_err());
+        assert_eq!(fs::read(&operation_path).unwrap(), bytes);
+
+        state
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .unwrap();
+
+        assert!(!operation_path.exists());
+        assert_eq!(fs::read(sibling).unwrap(), b"unrelated retained state");
+    }
+
+    #[test]
+    fn invalid_retained_journal_abandon_requires_the_exact_operation_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174241";
+        let bytes = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &bytes);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(
+                directory.path(),
+                &mut store,
+                "123e4567-e89b-42d3-a456-426614174242",
+            )
+            .is_err());
+        assert_eq!(fs::read(operation_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_retained_journal_abandon_rejects_malformed_and_oversized_records() {
+        let operation_id = "123e4567-e89b-42d3-a456-426614174243";
+        for bytes in [b"{".to_vec(), vec![b' '; MAX_OPERATION_BYTES as usize + 1]] {
+            let directory = tempfile::tempdir().unwrap();
+            let operation_path = write_operation_journal(directory.path(), &bytes);
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+
+            assert!(PeerBidirectionalCommandState::default()
+                .acknowledge(directory.path(), &mut store, operation_id)
+                .is_err());
+            assert_eq!(fs::read(operation_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn invalid_retained_journal_abandon_rejects_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174244";
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        fs::create_dir_all(&journal.root).unwrap();
+        let target = directory.path().join("outside-operation.json");
+        let bytes = invalid_target_prepared_journal_bytes(operation_id);
+        fs::write(&target, &bytes).unwrap();
+        let operation_path = journal.root.join(OPERATION_FILE);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &operation_path).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &operation_path) {
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create linked journal fixture: {error}");
+        }
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
+        assert!(fs::symlink_metadata(operation_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(target).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_retained_journal_abandon_rejects_an_active_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174245";
+        let bytes = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &bytes);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let state = PeerBidirectionalCommandState::default();
+        let _active_target = state.begin_target().unwrap();
+
+        assert!(matches!(
+            state.acknowledge(directory.path(), &mut store, operation_id),
+            Err(PeerSyncError::Protocol(message)) if message.contains("target operation is active")
+        ));
+        assert_eq!(fs::read(operation_path).unwrap(), bytes);
     }
 
     #[test]
