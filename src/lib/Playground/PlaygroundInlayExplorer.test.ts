@@ -177,6 +177,50 @@ describe('PlaygroundInlayExplorer native previews', () => {
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-id'))
         expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledTimes(2)
     })
+
+    test('keeps 108 native thumbnail previews detached outside each synthetic scroll page', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const assets = Array.from({ length: 108 }, (_, index) => ({
+            key: `photo-${index}`,
+            kind: 'inlay' as const,
+            size: 4096,
+            mime: 'image/webp',
+            name: `photo-${index}.webp`,
+            ext: 'webp',
+            inlayType: 'image' as const,
+            width: 800,
+            height: 600,
+        }))
+        inlayMocks.listInlayAssetMetadata.mockResolvedValue(assets)
+        inlayMocks.getInlayAssetRenderUrl.mockImplementation(async (id) => `http://risuasset.localhost/${id}`)
+        const createObjectURL = vi.spyOn(URL, 'createObjectURL')
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(PlaygroundInlayExplorer, { target })
+
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-inlay-preview-id]')).toHaveLength(36))
+        const previewObserver = TestIntersectionObserver.instances.find((observer) =>
+            [...observer.observed].some((element) => element.matches('[data-inlay-preview-id]')),
+        )!
+
+        for (const pageStart of [0, 36, 72]) {
+            const cards = [...target.querySelectorAll<HTMLElement>('[data-inlay-preview-id]')].slice(pageStart, pageStart + 36)
+            for (const card of cards) previewObserver.setVisible(card, true)
+            await vi.waitFor(() => expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledTimes(pageStart + 36))
+
+            if (pageStart === 72) continue
+            for (const card of cards) previewObserver.setVisible(card, false)
+            await tick()
+            expect(cards.every((card) => card.querySelector('img')?.getAttribute('src') === null)).toBe(true)
+
+            const sentinel = target.querySelector('.h-12')!
+            const loadMoreObserver = TestIntersectionObserver.instances.find((observer) => observer.observed.has(sentinel))!
+            loadMoreObserver.setVisible(sentinel, true)
+            await vi.waitFor(() => expect(target.querySelectorAll('[data-inlay-preview-id]')).toHaveLength(pageStart + 72))
+        }
+
+        expect(createObjectURL).not.toHaveBeenCalled()
+    })
 })
 
 describe('PlaygroundInlayExplorer browser preview ownership', () => {
@@ -343,6 +387,65 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         observer.setVisible(card, true)
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:photo-second'))
         expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
+    })
+
+    test('keeps browser thumbnail object URLs to one synthetic scroll page and revokes detached URLs once', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const assets = Array.from({ length: 108 }, (_, index) => ({
+            ...metadata,
+            key: `photo-${index}`,
+            name: `photo-${index}.webp`,
+        }))
+        const liveUrls = new Set<string>()
+        const createdUrls: string[] = []
+        let maxLiveUrls = 0
+        inlayMocks.listInlayAssetMetadata.mockResolvedValue(assets)
+        inlayMocks.getInlayAssetBlob.mockImplementation(async (id) => ({ ...asset, name: `${id}.webp` }))
+        vi.mocked(URL.createObjectURL).mockImplementation(() => {
+            const url = `blob:photo-${createdUrls.length}`
+            createdUrls.push(url)
+            liveUrls.add(url)
+            maxLiveUrls = Math.max(maxLiveUrls, liveUrls.size)
+            return url
+        })
+        vi.mocked(URL.revokeObjectURL).mockImplementation((url) => {
+            liveUrls.delete(url)
+        })
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(PlaygroundInlayExplorer, { target })
+
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-inlay-preview-id]')).toHaveLength(36))
+        const previewObserver = TestIntersectionObserver.instances.find((observer) =>
+            [...observer.observed].some((element) => element.matches('[data-inlay-preview-id]')),
+        )!
+
+        for (const pageStart of [0, 36, 72]) {
+            const cards = [...target.querySelectorAll<HTMLElement>('[data-inlay-preview-id]')].slice(pageStart, pageStart + 36)
+            for (const card of cards) previewObserver.setVisible(card, true)
+            await vi.waitFor(() => expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(pageStart + 36))
+            await vi.waitFor(() => expect(cards.every((card) => card.querySelector('img')?.hasAttribute('src'))).toBe(true))
+            expect(liveUrls.size).toBeLessThanOrEqual(36)
+
+            if (pageStart === 72) continue
+            for (const card of cards) previewObserver.setVisible(card, false)
+            await vi.waitFor(() => expect(cards.every((card) => card.querySelector('img')?.getAttribute('src') === null)).toBe(true))
+            expect(liveUrls).toHaveLength(0)
+
+            const sentinel = target.querySelector('.h-12')!
+            const loadMoreObserver = TestIntersectionObserver.instances.find((observer) => observer.observed.has(sentinel))!
+            loadMoreObserver.setVisible(sentinel, true)
+            await vi.waitFor(() => expect(target.querySelectorAll('[data-inlay-preview-id]')).toHaveLength(pageStart + 72))
+        }
+
+        expect(maxLiveUrls).toBeLessThanOrEqual(36)
+        await unmount(mounted)
+        mounted = undefined
+        expect(liveUrls).toHaveLength(0)
+        expect(URL.revokeObjectURL).toHaveBeenCalledTimes(createdUrls.length)
+        for (const url of createdUrls) {
+            expect(URL.revokeObjectURL).toHaveBeenCalledWith(url)
+        }
     })
 
     test.each([
