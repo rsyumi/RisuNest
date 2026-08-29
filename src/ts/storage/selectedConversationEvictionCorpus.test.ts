@@ -1,12 +1,23 @@
+// @vitest-environment node
+
+import './selectedConversationEvictionNodeDom'
 import 'fake-indexeddb/auto'
+import { IDBKeyRange, indexedDB } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
+import { writable } from 'svelte/store'
 import {
+    captureChatMessageTarget,
     queryChatMessageTargetAt,
     queryChatMessageTargetById,
     queryChatMessageTargetsByIds,
     renameCapturedBookmark,
 } from '../chatMessageUi'
-import type { Chat, Database, Message } from './database.svelte'
+import { createCapturedConversationBranch } from '../chatBranchUi'
+import { openChatScreenshotSourceLease } from '../chatScreenshotSourceLease'
+import { createConversationOperationContext } from '../process/conversationOperationContext'
+import { executeRegexPlanSync, getRegexExecutionPlan } from '../process/regexExecutionPlan'
+import type { ChatScreenshotRenderContext } from '../chatScreenshotRange'
+import type { Chat, Database, Message, character } from './database.svelte'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { RevisionConflictError, type WorkingSetCommit } from './persistentDataStore'
 import {
@@ -22,7 +33,7 @@ function makeMessage(index: number): Message {
     return {
         role: index % 2 === 0 ? 'user' : 'char',
         data: `turn-${index.toString().padStart(5, '0')}`,
-        chatId: `message-${index}`,
+        chatId: index === 100 || index === 9_000 ? 'duplicate-anchor' : `message-${index}`,
         name: index % 97 === 0 ? `speaker-${index}` : undefined,
         saying: index % 131 === 0 ? `aside-${index}` : undefined,
     }
@@ -43,17 +54,83 @@ function makeDatabase(conversation: Chat): Database {
     return {
         username: 'Eviction corpus',
         botPresets: [],
+        botPresetsId: 0,
         pluginCustomStorage: {},
+        statics: { messages: 0 },
+        aiModel: 'test-model',
+        maxContext: 8_192,
+        maxResponse: 128,
+        promptTemplate: [{ type: 'chat', rangeStart: 0, rangeEnd: 'end' }],
+        promptSettings: { trimStartNewChat: true, sendName: false },
+        customPromptTemplateToggle: '', globalChatVariables: {}, mainPrompt: '',
+        additionalPrompt: '', globalNote: '', jailbreak: '', jailbreakToggle: false,
+        chainOfThought: false, personaPrompt: false, promptPreprocess: false,
+        descriptionPrefix: '', formatingOrder: [], bias: [], outputImageModal: false,
+        rememberToolUsage: false, streamingDisplayOptimizationMode: 'off',
+        autoContinueMinTokens: 0, autoContinueChat: false, notification: false,
+        ttsAutoSpeech: false, supaModelType: 'none', hanuraiEnable: false,
+        hypav2: false, hypaV3: false,
         characters: [{
             type: 'character',
             chaId: 'char-a',
             name: 'Synthetic owner',
             firstMessage: 'Greeting',
             alternateGreetings: [],
+            desc: '', personality: '', scenario: '', bias: [], additionalAssets: [],
+            emotionImages: [], reloadKeys: 0, viewScreen: 'none', inlayViewScreen: false,
+            supaMemory: false, utilityBot: false,
             chatPage: 0,
             chats: [conversation],
         }],
     } as unknown as Database
+}
+
+function screenshotRenderContext(owner: character): ChatScreenshotRenderContext {
+    const projected = structuredClone(owner)
+    projected.chats[projected.chatPage ?? 0].message = []
+    return {
+        character: null,
+        characterName: owner.name,
+        characterImageSource: '',
+        characterLargePortrait: false,
+        userName: 'User',
+        userImageSource: '',
+        userLargePortrait: false,
+        moduleAssets: [],
+        presetRegex: [],
+        moduleRegexScripts: [],
+        assetStyle: '',
+        parserContext: {
+            database: { characters: [projected] } as Database,
+            character: projected,
+            userName: 'User',
+            personaPrompt: '',
+            modules: [],
+            moduleLorebooks: [],
+            selectedCharID: 0,
+            chatVariables: {},
+            globalChatVariables: {},
+            currentTime: 1,
+        },
+        settings: {
+            autoTranslate: false,
+            autoTranslateCachedOnly: false,
+            translatorType: 'google',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            newImageHandlingBeta: false,
+            assetWidth: -1,
+            hideAllImages: false,
+            iconSize: 100,
+            zoomSize: 100,
+            lineHeight: 1.25,
+            dynamicAssets: false,
+            dynamicAssetsEditDisplay: false,
+            legacyMediaFindings: false,
+            assetMaxDifference: 0.5,
+        },
+    }
 }
 
 async function waitForWindowed(runtime: ReturnType<typeof createPersistentDataRuntime>) {
@@ -76,13 +153,17 @@ describe('selected conversation eviction correctness corpus', () => {
         )
         await store.open()
         const initial = await store.replaceFromDatabase(workingCopy)
+        const selectedConversation = () => {
+            const owner = workingCopy.characters[0]
+            return owner.chats[owner.chatPage ?? 0]
+        }
         const state: PersistentDataRuntimeStateAdapter = {
             captureRoot: () => capturePersistentRoot(workingCopy),
             captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
             captureCharacter: (id) =>
                 workingCopy.characters.find((candidate) => candidate.chaId === id) ?? null,
             getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
-            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
+            getSelectedConversationId: () => selectedConversation()?.id,
             replaceDatabase: (next) => {
                 workingCopy = next
             },
@@ -91,7 +172,7 @@ describe('selected conversation eviction correctness corpus', () => {
             },
             publishConversation: (_characterId, conversation, nextCharacter) => {
                 if (nextCharacter) workingCopy.characters[0] = nextCharacter
-                else workingCopy.characters[0].chats[0] = conversation
+                else workingCopy.characters[0].chats[workingCopy.characters[0].chatPage ?? 0] = conversation
             },
             canUseWindowedSelectedConversation: () => true,
             isMaximumCompatibilityMode: () => false,
@@ -110,7 +191,7 @@ describe('selected conversation eviction correctness corpus', () => {
         const context = {
             captureCurrent: () => ({
                 character: workingCopy.characters[0],
-                conversation: workingCopy.characters[0].chats[0],
+                conversation: selectedConversation(),
             }),
             getCurrentSession: () => runtime.getActiveConversationSession(),
             captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
@@ -123,7 +204,7 @@ describe('selected conversation eviction correctness corpus', () => {
 
         const assertWindowed = async () => {
             await waitForWindowed(runtime)
-            expect(() => workingCopy.characters[0].chats[0].message).toThrow('metadata-only')
+            expect(() => selectedConversation().message).toThrow('metadata-only')
             expect(runtime.captureSelectedConversationAuthority()).toMatchObject({
                 characterId: 'char-a',
                 conversationId: 'chat-a',
@@ -177,9 +258,59 @@ describe('selected conversation eviction correctness corpus', () => {
         )
         await mutateComplete(
             'delete',
-            (session) => session.delete(session.locate(session.totalMessages - 3)),
-            () => { oracle.message.splice(oracle.message.length - 3, 1) },
+            (session) => session.delete(session.locate(17)),
+            () => { oracle.message.splice(17, 1) },
         )
+
+        const shifted = await queryChatMessageTargetById(context, 'message-18')
+        expect(shifted).toMatchObject({ absoluteIndex: 17, message: oracle.message[17] })
+        const firstDuplicate = await queryChatMessageTargetById(context, 'duplicate-anchor', 'first')
+        const lastDuplicate = await queryChatMessageTargetById(context, 'duplicate-anchor', 'last')
+        expect(firstDuplicate).toMatchObject({ absoluteIndex: 99, message: oracle.message[99] })
+        expect(lastDuplicate).toMatchObject({ absoluteIndex: 8_999, message: oracle.message[8_999] })
+        await assertWindowed()
+
+        const branchEnd = 257
+        const branchLease = await runtime.acquireCompleteConversation('branch-gateway')
+        const branchTarget = captureChatMessageTarget({
+            ...context,
+            absoluteIndex: branchEnd,
+        })
+        expect(branchTarget?.kind).toBe('session')
+        const branchIds = ['branch-a', 'branch-marker'][Symbol.iterator]()
+        await expect(createCapturedConversationBranch({
+            target: branchTarget!,
+            context,
+            runtime,
+            createFolderOnBranch: false,
+            createId: () => branchIds.next().value!,
+            createBranchName: () => 'Corpus branch',
+            navigateToBranch: async (id) => {
+                await runtime.activateConversation(id)
+                return true
+            },
+            pageSize: 128,
+        })).resolves.toBe(true)
+        branchLease.release()
+        expectedRevision += 1
+        await vi.waitFor(() => expect(runtime.getSelectedConversationMode()).toBe('windowed'))
+        const persistedBranch = await store.readConversation('char-a', 'branch-a')
+        expect(persistedBranch?.value.message).toEqual([
+            ...oracle.message.slice(0, branchEnd + 1),
+            expect.objectContaining({ chatId: 'branch-marker', isComment: true }),
+        ])
+        await runtime.activateConversation('chat-a')
+        await assertWindowed()
+
+        const exportedBeforeTruncate = await runtime
+            .materializePersistentDatabaseSnapshotWithRevision('corpus-export-before-truncate')
+        expect(exportedBeforeTruncate.revision).toBe(expectedRevision)
+        expect(exportedBeforeTruncate.database.characters[0].chats.find((chat) => chat.id === 'chat-a'))
+            .toEqual(oracle)
+        expect(exportedBeforeTruncate.database.characters[0].chats.find((chat) => chat.id === 'branch-a'))
+            .toEqual(persistedBranch!.value)
+        await assertWindowed()
+
         await mutateComplete(
             'truncate',
             (session) => session.truncate(session.locate(session.totalMessages - 2)),
@@ -201,7 +332,7 @@ describe('selected conversation eviction correctness corpus', () => {
             }),
         )
 
-        const bookmarkTarget = await queryChatMessageTargetById(context, 'message-9000')
+        const bookmarkTarget = await queryChatMessageTargetById(context, 'message-9001')
         expect(bookmarkTarget?.kind).toBe('persistent')
         const bookmarkLease = await runtime.acquireCompleteConversation(
             'bookmark',
@@ -212,15 +343,15 @@ describe('selected conversation eviction correctness corpus', () => {
             name: 'Far bookmark',
         })
         bookmarkLease.release()
-        oracle.bookmarks = ['message-9000']
-        oracle.bookmarkNames = { 'message-9000': 'Far bookmark' }
+        oracle.bookmarks = ['message-9001']
+        oracle.bookmarkNames = { 'message-9001': 'Far bookmark' }
         await runtime.flushPendingData('bookmark-persisted')
         expectedRevision += 1
         await assertWindowed()
-        const renameTarget = await queryChatMessageTargetById(context, 'message-9000')
+        const renameTarget = await queryChatMessageTargetById(context, 'message-9001')
         await expect(renameCapturedBookmark(renameTarget!, context, async () => 'Renamed bookmark'))
             .resolves.toBe(true)
-        oracle.bookmarkNames['message-9000'] = 'Renamed bookmark'
+        oracle.bookmarkNames['message-9001'] = 'Renamed bookmark'
         await runtime.flushPendingData('bookmark-rename-persisted')
         expectedRevision += 1
         await assertWindowed()
@@ -231,81 +362,459 @@ describe('selected conversation eviction correctness corpus', () => {
             () => { oracle.message.push({ role: 'user', data: 'retry retained', chatId: 'op-retry' }) },
             new Error('synthetic save failure'),
         )
-        await mutateComplete(
-            'revision-conflict',
-            (session) => session.append({ role: 'user', data: 'conflict retained', chatId: 'op-conflict' }),
-            () => { oracle.message.push({ role: 'user', data: 'conflict retained', chatId: 'op-conflict' }) },
-            new RevisionConflictError(expectedRevision, expectedRevision + 1),
-        )
-
-        for (const [consumer, id] of [
-            ['Trigger', 'op-trigger'],
-            ['Lua', 'op-lua'],
-            ['CBS', 'op-cbs'],
-            ['regex', 'op-regex'],
-            ['generation', 'op-generation'],
-        ] as const) {
-            await mutateComplete(
-                consumer,
-                (session) => session.append({
-                    role: consumer === 'generation' ? 'char' : 'user',
-                    data: `${consumer} compatibility output`,
-                    chatId: id,
-                    ...(consumer === 'generation'
-                        ? { generationInfo: { model: 'synthetic-generator' } }
-                        : { saying: `${consumer} visited complete history` }),
-                }),
-                () => { oracle.message.push({
-                    role: consumer === 'generation' ? 'char' : 'user',
-                    data: `${consumer} compatibility output`,
-                    chatId: id,
-                    ...(consumer === 'generation'
-                        ? { generationInfo: { model: 'synthetic-generator' } }
-                        : { saying: `${consumer} visited complete history` }),
-                }) },
-            )
-        }
-
-        const screenshot = await queryChatMessageTargetAt(context, 9_500)
-        expect(screenshot).toMatchObject({
-            kind: 'persistent',
-            absoluteIndex: 9_500,
-            message: oracle.message[9_500],
+        const staleLease = await runtime.acquireCompleteConversation('revision-conflict-stale')
+        staleLease.session.append({
+            role: 'user',
+            data: 'stale conflict attempt',
+            chatId: 'op-conflict',
         })
+        staleLease.release()
+        const competingRoot = await store.readRoot()
+        const competingCommit = await store.commit({
+            expectedRevision,
+            root: { ...competingRoot.value, username: 'Competing writer' },
+        })
+        expectedRevision = competingCommit.revision
+        await expect(runtime.flushPendingData('revision-conflict-stale'))
+            .rejects.toBeInstanceOf(RevisionConflictError)
+        expect(runtime.getSelectedConversationMode()).toBe('complete')
+        await runtime.refreshActiveWorkingSetFromStore(competingCommit.revision)
+        await waitForWindowed(runtime)
+        const retryLease = await runtime.acquireCompleteConversation('revision-conflict-retry')
+        retryLease.session.append({
+            role: 'user',
+            data: 'conflict retained',
+            chatId: 'op-conflict',
+        })
+        retryLease.release()
+        oracle.message.push({ role: 'user', data: 'conflict retained', chatId: 'op-conflict' })
+        await runtime.flushPendingData('revision-conflict-retry')
+        expectedRevision += 1
+        await assertWindowed()
+
+        const regexLease = await runtime.acquireCompleteConversation('regex-operation-context')
+        const regexOperation = createConversationOperationContext(
+            regexLease.session,
+            selectedConversation(),
+        )
+        expect(regexOperation.mode).toBe('compatibility')
+        expect(regexOperation.chat.message).toEqual(oracle.message)
+        const regexPlan = getRegexExecutionPlan([{
+            comment: 'corpus regex',
+            in: '^conflict retained$',
+            out: 'regex compatibility output',
+            type: 'editoutput',
+            flag: 'g',
+            ableFlag: true,
+        }], 'editoutput')
+        const regexIndex = regexOperation.chat.message.length - 1
+        regexOperation.chat.message[regexIndex] = {
+            ...regexOperation.chat.message[regexIndex],
+            data: executeRegexPlanSync(
+                regexPlan,
+                regexOperation.chat.message[regexIndex].data,
+                (value) => value,
+            ).data,
+            saying: 'regex visited complete history',
+        }
+        expect(regexOperation.commit(regexLease.session)).toEqual(expect.arrayContaining([
+            expect.objectContaining({ type: 'replace-range' }),
+        ]))
+        regexLease.release()
+        oracle.message[regexIndex] = {
+            ...oracle.message[regexIndex],
+            data: 'regex compatibility output',
+            saying: 'regex visited complete history',
+        }
+        await runtime.flushPendingData('regex-operation-context')
+        expectedRevision += 1
+        await assertWindowed()
+
+        const luaLease = await runtime.acquireCompleteConversation('lua-operation-context')
+        const luaOperation = createConversationOperationContext(
+            luaLease.session,
+            selectedConversation(),
+        )
+        expect(luaOperation.mode).toBe('compatibility')
+        vi.doMock('../parser/parser.svelte', () => ({
+            hasher: vi.fn(),
+            risuChatParser: (value: string) => value,
+        }))
+        vi.doMock('../alert', () => ({
+            alertConfirm: vi.fn(),
+            alertError: vi.fn(),
+            alertInput: vi.fn(),
+            alertNormal: vi.fn(),
+            alertSelect: vi.fn(),
+        }))
+        vi.doMock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
+        vi.doMock('../platform', () => ({
+            isTauriMobile: true,
+            isNodeServer: false,
+            isTauri: false,
+            isMobile: false,
+        }))
+        vi.doMock('../tokenizer', () => ({ tokenize: vi.fn() }))
+        vi.doMock('../util', () => ({
+            asBuffer: vi.fn(),
+            getPersonaPrompt: vi.fn(),
+            getUserIcon: vi.fn(),
+            getUserName: vi.fn(() => 'User'),
+        }))
+        vi.doMock('./database.svelte', () => ({
+            getCurrentCharacter: () => workingCopy.characters[0],
+            getCurrentChat: () => selectedConversation(),
+            getDatabase: () => workingCopy,
+            setDatabase: vi.fn(),
+        }))
+        vi.doMock('../stores.svelte', () => ({
+            DBState: { db: workingCopy },
+            ReloadChatPointer: { update: vi.fn() },
+            ReloadGUIPointer: { update: vi.fn() },
+            selectedCharID: { subscribe: (run: (value: number) => void) => (run(0), () => undefined) },
+        }))
+        vi.doMock('../process/modules', () => ({
+            getModuleLorebooks: () => [],
+            getModuleTriggers: () => [],
+        }))
+        vi.doMock('../process/files/inlays', () => ({
+            getInlayAsset: vi.fn(),
+            writeInlayImage: vi.fn(),
+        }))
+        vi.doMock('../process/lorebook.svelte', () => ({
+            loadLoreBookV3PromptFromCompatibilitySnapshot: vi.fn(),
+        }))
+        vi.doMock('../process/memory/hypamemory', () => ({ HypaProcesser: vi.fn() }))
+        vi.doMock('../process/request/request', () => ({ requestChatData: vi.fn() }))
+        vi.doMock('../process/stableDiff', () => ({ generateAIImage: vi.fn() }))
+        const { readFile } = await import('node:fs/promises')
+        const { resolve } = await import('node:path')
+        const jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
+        const originalFetch = globalThis.fetch
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLuaSource, { status: 200 })))
+        const nodeDomGlobals = {
+            window: globalThis.window,
+            document: globalThis.document,
+            navigator: globalThis.navigator,
+            location: globalThis.location,
+        }
+        for (const key of Object.keys(nodeDomGlobals)) {
+            Reflect.deleteProperty(globalThis, key)
+        }
+        const { runScripted } = await import('../process/scriptings')
+        const luaResult = await runScripted(`
+            listenEdit('editInput', function(id, value, meta)
+                addChat(id, 'user', 'Lua compatibility output')
+                return false
+            end)
+        `, {
+            char: workingCopy.characters[0],
+            mode: 'editInput',
+            operationContext: luaOperation,
+        })
+        expect(luaResult.stopSending).toBe(true)
+        const luaMessage = luaOperation.chat.message.at(-1)!
+        luaMessage.chatId = 'op-lua'
+        luaMessage.saying = 'Lua visited complete history'
+        luaOperation.commit(luaLease.session)
+        luaLease.release()
+        oracle.message.push(structuredClone(luaMessage))
+        await runtime.flushPendingData('lua-operation-context')
+        expectedRevision += 1
+        await assertWindowed()
+        for (const [key, value] of Object.entries(nodeDomGlobals)) {
+            Object.defineProperty(globalThis, key, { configurable: true, value })
+        }
+        vi.stubGlobal('fetch', originalFetch)
+        for (const moduleId of [
+            '../parser/parser.svelte',
+            '../alert',
+            '../globalApi.svelte',
+            '../platform',
+            '../tokenizer',
+            '../util',
+            './database.svelte',
+            '../stores.svelte',
+            '../process/modules',
+            '../process/files/inlays',
+            '../process/lorebook.svelte',
+            '../process/memory/hypamemory',
+            '../process/request/request',
+            '../process/stableDiff',
+        ]) vi.doUnmock(moduleId)
+        vi.resetModules()
+
+        const generationDBState = {
+            get db() { return workingCopy },
+            set db(value: Database) { workingCopy = value },
+        }
+        vi.doMock('../stores.svelte', () => ({
+            DBState: generationDBState,
+            selectedCharID: writable(0),
+            ReloadGUIPointer: { update: vi.fn() },
+        }))
+        vi.doMock('./persistentDataRuntime.svelte', () => ({
+            acquireDestructiveReplacementFence: vi.fn(),
+            acknowledgeGenerationCompletion: () => runtime.acknowledgeGenerationCompletion(),
+            capturePersistentMutationToken: vi.fn(),
+            captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
+            acquireCompleteConversation: (reason: string, target: never) =>
+                runtime.acquireCompleteConversation(reason, target),
+            getActiveConversationSession: () => runtime.getActiveConversationSession(),
+            getPersistentDataRuntime: () => runtime,
+            invalidateActiveConversationSession: () => runtime.invalidateActiveConversationSession(),
+        }))
+        vi.doMock('../process/request/request', () => ({
+            requestChatData: vi.fn(async () => ({
+                type: 'streaming',
+                result: new ReadableStream({
+                    start(controller) {
+                        controller.enqueue({ response: 'Generation compatibility output' })
+                        controller.close()
+                    },
+                }),
+            })),
+        }))
+        vi.doMock('../tokenizer', () => ({
+            ChatTokenizer: class {
+                async tokenizeChat() { return 1 }
+                async tokenizeChats(chats: unknown[]) { return chats.length }
+            },
+            tokenize: vi.fn(async () => 1), tokenizeNum: vi.fn(async () => []),
+        }))
+        vi.doMock('../../lang', () => ({ language: { errors: {}, otherUserRequesting: '' } }))
+        vi.doMock('../alert', () => ({ alertError: vi.fn(), alertToast: vi.fn() }))
+        vi.doMock('../parser/chatML', () => ({ parseChatML: (value: string) => value }))
+        vi.doMock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
+        vi.doMock('../util', () => ({
+            checkNullish: (value: unknown) => value == null,
+            findCharacterbyId: () => workingCopy.characters[0],
+            getAuthorNoteDefaultText: () => '', getPersonaPrompt: () => '', getUserName: () => 'User',
+            isLastCharPunctuation: () => true, trimUntilPunctuation: (value: string) => value,
+            parseToggleSyntax: () => [], prebuiltAssetCommand: '',
+        }))
+        vi.doMock('../process/scripts', () => ({
+            createPromptScriptOperationScope: () => ({
+                assertOwnerCurrent: vi.fn(), adoptMessageId: vi.fn(),
+                parse: (_char: unknown, value: string) => value,
+                finish: vi.fn(), finishAfterError: vi.fn(), release: vi.fn(),
+            }),
+            processScript: vi.fn(async (_char: unknown, value: string) => value),
+            processScriptFull: vi.fn(async (_char: unknown, value: string) => ({ data: value, emoChanged: false })),
+            risuChatParser: (value: string) => value, resetScriptCache: vi.fn(),
+        }))
+        vi.doMock('../process/triggers', () => ({
+            runTrigger: vi.fn(async (_char: unknown, mode: string, arg: { chat: Chat }) =>
+                mode === 'start' ? null : { chat: arg.chat }),
+        }))
+        vi.doMock('../process/modules', () => ({
+            getModuleAssets: () => [], getModuleToggles: () => '', moduleUpdate: vi.fn(),
+        }))
+        for (const [id, exports] of [
+            ['../process/lorebook.svelte', { loadLoreBookV3Prompt: vi.fn(async () => ({ actives: [] })) }],
+            ['../process/templates/templates', { prebuiltNAIpresets: [], prebuiltPresets: { OAI: { mainPrompt: '', jailbreak: '' } } }],
+            ['../process/exampleMessages', { exampleMessage: () => [] }],
+            ['../process/tts', { sayTTS: vi.fn() }],
+            ['../process/memory/supaMemory', { supaMemory: vi.fn() }],
+            ['../process/group', { groupOrder: (value: unknown) => value }],
+            ['../process/memory/hypamemory', { HypaProcesser: class {} }],
+            ['../process/embedding/addinfo', { additionalInformations: vi.fn(async () => '') }],
+            ['../process/files/inlays', { getInlayAsset: vi.fn(async () => null) }],
+            ['../process/models/modelString', { getGenerationModelString: () => 'test-model' }],
+            ['../process/inlayScreen', { runInlayScreen: (_char: unknown, data: string) => ({ text: data }) }],
+            ['../process/prereroll', { addRerolls: vi.fn() }],
+            ['../process/transformers', { runImageEmbedding: vi.fn() }],
+            ['../process/memory/hanuraiMemory', { hanuraiMemory: vi.fn() }],
+            ['../process/memory/hypav2', { hypaMemoryV2: vi.fn() }],
+            ['../process/memory/hypav3', { hypaMemoryV3: vi.fn() }],
+            ['../process/scriptings', { runLuaEditTrigger: vi.fn(async (_c: unknown, _m: string, value: unknown) => value) }],
+            ['../globalApi.svelte', { readImage: vi.fn() }],
+            ['../plugins/plugins.svelte', { pluginV2: { chatOutput: new Set() } }],
+            ['../process/presetChain', { activatePresetChainForRequest: vi.fn() }],
+        ] as const) vi.doMock(id, () => exports)
+        vi.doMock('../model/modellist', () => ({ getModelInfo: () => ({ flags: [] }), LLMFlags: {} }))
+        vi.doMock('../sync/multiuser', () => ({
+            connectionOpen: false, peerRevertChat: vi.fn(), peerSafeCheck: vi.fn(async () => true),
+            peerSync: vi.fn(),
+        }))
+        const generationBefore = oracle.message.length
+        const { sendChat } = await import('../process/index.svelte')
+        const generationLog = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        await expect(sendChat()).resolves.toBe(true)
+        generationLog.mockRestore()
+        expectedRevision += 1
+        const generatedConversation = await store.readConversation('char-a', 'chat-a')
+        const generatedMessage = generatedConversation!.value.message[generationBefore]
+        expect(generatedMessage.data).toBe('Generation compatibility output')
+        oracle.message.push(structuredClone(generatedMessage))
+        oracle.isStreaming = generatedConversation!.value.isStreaming
+        oracle.lastMemory = generatedConversation!.value.lastMemory
+        await assertWindowed()
+        vi.resetModules()
+
+        const cbsLease = await runtime.acquireCompleteConversation('cbs-operation-context')
+        const cbsOperation = createConversationOperationContext(
+            cbsLease.session,
+            selectedConversation(),
+        )
+        const cbsCallbacks = new Map<string, import('../cbs').RegisterCallback>()
+        vi.doMock('../stores.svelte', () => ({ CurrentTriggerIdStore: writable(null) }))
+        const { defaultCBSRegisterArg, registerCBS } = await import('../cbs')
+        registerCBS({
+            ...defaultCBSRegisterArg,
+            getDatabase: () => cbsOperation.createDatabaseView(workingCopy),
+            getSelectedCharID: () => 0,
+            registerFunction: ({ name, alias, callback }) => {
+                if (callback === 'doc_only') return
+                for (const key of [name, ...alias]) cbsCallbacks.set(key, callback)
+            },
+        })
+        const cbsDatabase = cbsOperation.createDatabaseView(workingCopy)
+        expect(cbsCallbacks.get('previouscharchat')!('', {
+            chatID: -1,
+            db: cbsDatabase,
+            chara: cbsDatabase.characters[0],
+            selectedCharacterId: 'char-a',
+            rmVar: false,
+            cbsConditions: {},
+        } as never, [], null)).toBe('Generation compatibility output')
+        cbsOperation.release()
+        cbsLease.release()
+        await assertWindowed()
+        vi.doUnmock('../stores.svelte')
+        vi.resetModules()
+
+        const triggerLease = await runtime.acquireCompleteConversation('trigger-operation-context')
+        const triggerOperation = createConversationOperationContext(
+            triggerLease.session,
+            selectedConversation(),
+        )
+        expect(triggerOperation.mode).toBe('compatibility')
+        vi.doUnmock('../process/triggers')
+        vi.doUnmock('../util')
+        const triggerStoreState = { DBState: { db: workingCopy } }
+        vi.doMock('../stores.svelte', () => ({
+            ...triggerStoreState,
+            CurrentTriggerIdStore: writable(null),
+            selectedCharID: writable(0),
+        }))
+        vi.doMock('./database.svelte', () => ({ getDatabase: () => workingCopy }))
+        vi.doMock('./persistentDataRuntime.svelte', () => ({
+            acquireDestructiveReplacementFence: vi.fn(),
+            capturePersistentMutationToken: vi.fn(),
+            getPersistentDataRuntime: vi.fn(),
+            peekActiveConversationSession: () => triggerLease.session,
+        }))
+        vi.doMock('../process/modules', () => ({ getModuleTriggers: () => [] }))
+        vi.doMock('../tokenizer', () => ({ tokenize: vi.fn(async () => 0) }))
+        vi.doMock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
+        vi.doMock('../process/command', () => ({ processMultiCommand: vi.fn() }))
+        vi.doMock('../process/request/request', () => ({ requestChatData: vi.fn() }))
+        vi.doMock('../process/stableDiff', () => ({ generateAIImage: vi.fn() }))
+        vi.doMock('../process/files/inlays', () => ({ writeInlayImage: vi.fn() }))
+        const triggerCharacter = workingCopy.characters[0] as character
+        triggerCharacter.triggerscript = [{
+            comment: 'corpus trigger',
+            type: 'manual',
+            conditions: [],
+            effect: [{ type: 'impersonate', role: 'user', value: 'Trigger compatibility output' }],
+        }] as never
+        triggerCharacter.customscript = []
+        triggerCharacter.defaultVariables = ''
+        const { runTrigger } = await import('../process/triggers')
+        const triggerResult = await runTrigger(triggerCharacter, 'manual', {
+            chat: triggerOperation.chat,
+            manualName: 'corpus trigger',
+            conversationOperation: triggerOperation,
+        })
+        expect(triggerResult?.chat).toBe(triggerOperation.chat)
+        const triggerMessage = triggerOperation.chat.message.at(-1)!
+        triggerMessage.chatId = 'op-trigger'
+        triggerMessage.saying = 'Trigger visited complete history'
+        triggerOperation.commit(triggerLease.session)
+        triggerLease.release()
+        oracle.message = JSON.parse(JSON.stringify(oracle.message)) as Message[]
+        oracle.message.push(structuredClone(triggerMessage))
+        await runtime.flushPendingData('trigger-operation-context')
+        expectedRevision += 1
+        await assertWindowed()
+        delete triggerCharacter.triggerscript
+        delete triggerCharacter.customscript
+        delete triggerCharacter.defaultVariables
+        for (const moduleId of [
+            '../stores.svelte',
+            './database.svelte',
+            './persistentDataRuntime.svelte',
+            '../process/modules',
+            '../tokenizer',
+            '../parser/parser.svelte',
+            '../process/command',
+            '../process/request/request',
+            '../process/stableDiff',
+            '../process/files/inlays',
+        ]) vi.doUnmock(moduleId)
+        vi.resetModules()
+
+        const screenshot = await openChatScreenshotSourceLease({
+            characterId: 'char-a',
+            chatId: 'chat-a',
+            renderContext: screenshotRenderContext(workingCopy.characters[0] as character),
+        }, runtime)
+        const screenshotJob = await screenshot.createJob(9_501, 9_502)
+        expect(screenshotJob.messages).toEqual(oracle.message.slice(9_500, 9_502))
+        await screenshot.close()
         await assertWindowed()
 
         const search = await queryChatMessageTargetsByIds(context, [
             // Keep a mix of near, far, and generated IDs.
             'message-3',
-            'message-9000',
-            'op-generation',
+            'message-9001',
+            'op-trigger',
         ])
         expect(search.map((target) => target.message)).toEqual([
             oracle.message.find((message) => message.chatId === 'message-3'),
-            oracle.message.find((message) => message.chatId === 'message-9000'),
-            oracle.message.find((message) => message.chatId === 'op-generation'),
+            oracle.message.find((message) => message.chatId === 'message-9001'),
+            oracle.message.find((message) => message.chatId === 'op-trigger'),
         ])
         await assertWindowed()
 
-        const hypa = await queryChatMessageTargetById(context, 'message-8888')
-        expect(hypa?.message).toEqual(oracle.message.find((message) => message.chatId === 'message-8888'))
-        await assertWindowed()
-
-        const branchEnd = 257
-        const branchLease = await runtime.acquireCompleteConversation('branch')
-        const branchSource = branchLease.session.readBranchSource(
-            branchLease.session.locate(branchEnd),
+        const hypaLease = await runtime.acquireCompleteConversation('hypa-anchored-query')
+        vi.doMock('../stores.svelte', () => ({
+            DBState: { db: workingCopy },
+            selectedCharID: writable(0),
+        }))
+        vi.doMock('./persistentDataRuntime.svelte', () => ({
+            acquireDestructiveReplacementFence: vi.fn(),
+            acquireCompleteConversation: (
+                reason: string,
+                target: ReturnType<typeof runtime.captureSelectedConversationTarget>,
+            ) => runtime.acquireCompleteConversation(reason, target),
+            captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
+            capturePersistentMutationToken: vi.fn(),
+            getPersistentDataRuntime: () => runtime,
+            peekActiveConversationSession: () => runtime.getActiveConversationSession(),
+        }))
+        vi.doMock('../process/scripts', () => ({
+            processScriptFull: vi.fn(),
+            risuChatParser: (value: string) => value,
+        }))
+        vi.doMock('../alert', () => ({ alertConfirm: vi.fn() }))
+        vi.doMock('../../lang', () => ({ language: { hypaV3Modal: { unclassified: '' } } }))
+        const { captureCurrentHypaMessageById } = await import(
+            '../../lib/Others/HypaV3Modal/utils'
         )
-        expect(branchSource).toMatchObject({
-            characterId: 'char-a',
-            conversationId: 'chat-a',
-            startIndex: 0,
-            endIndex: branchEnd + 1,
-            totalMessages: oracle.message.length,
-            messages: oracle.message.slice(0, branchEnd + 1),
-        })
-        branchLease.release()
+        const hypa = await captureCurrentHypaMessageById('message-8888')
+        expect(hypa?.message).toEqual(oracle.message.find((message) => message.chatId === 'message-8888'))
+        hypaLease.release()
         await assertWindowed()
+        for (const moduleId of [
+            '../stores.svelte',
+            './persistentDataRuntime.svelte',
+            '../process/scripts',
+            '../alert',
+            '../../lang',
+        ]) vi.doUnmock(moduleId)
+        vi.resetModules()
 
         const exported = await runtime.materializePersistentDatabaseSnapshotWithRevision('export')
         expect(exported.revision).toBe(expectedRevision)
@@ -313,24 +822,60 @@ describe('selected conversation eviction correctness corpus', () => {
         expect(exportedOwner).toEqual(oracle)
         await assertWindowed()
 
-        await mutateComplete(
-            'plugin-v2.1-compatibility',
-            (session) => {
-                expect(session.materializeCompatibilityArray()).toEqual(oracle.message)
-                session.append({
-                    role: 'user',
-                    data: 'plugin compatibility append',
-                    chatId: 'op-plugin-v2.1',
-                    saying: 'live proxy compatibility',
-                })
-            },
-            () => { oracle.message.push({
-                role: 'user',
-                data: 'plugin compatibility append',
-                chatId: 'op-plugin-v2.1',
-                saying: 'live proxy compatibility',
-            }) },
-        )
+        for (const moduleId of [
+            '../plugins/plugins.svelte',
+            '../globalApi.svelte',
+            '../alert',
+            '../util',
+            '../../lang',
+            '../stores.svelte',
+        ]) vi.doUnmock(moduleId)
+        vi.resetModules()
+        vi.doMock('./persistentDataRuntime.svelte', () => ({
+            acquireDestructiveReplacementFence: vi.fn(),
+            capturePersistentMutationToken: vi.fn(),
+            getPersistentDataRuntime: () => runtime,
+            getPersistentNavigationGeneration: () => runtime.getNavigationGeneration(),
+            materializeMaximumCompatibilityWorkingSet: () =>
+                runtime.materializeMaximumCompatibilityWorkingSet(),
+            mutatePersistentPluginStorage: (
+                reason: string,
+                mutations: never,
+            ) => runtime.mutatePersistentPluginStorage(reason, mutations),
+            releaseInactiveWorkingSet: (
+                canRelease?: () => boolean | Promise<boolean>,
+                isCurrent?: () => boolean,
+            ) => runtime.releaseInactiveWorkingSet(canRelease, isCurrent),
+            replacePersistentDatabase: (
+                database: Database,
+                reason: string,
+                options: never,
+            ) => runtime.replacePersistentDatabase(database, reason, options),
+        }))
+        const pluginStores = await import('../stores.svelte')
+        pluginStores.DBState.db = workingCopy
+        pluginStores.selectedCharID.set(0)
+        const { getV2PluginAPIs, pluginCompatibility } = await import('../plugins/plugins.svelte')
+        await pluginCompatibility.transition('maximum-compatibility')
+        pluginStores.DBState.db = workingCopy
+        const livePluginDatabase = getV2PluginAPIs().getDatabase() as Database
+        expect(livePluginDatabase).not.toBe(workingCopy)
+        const livePluginConversation = livePluginDatabase.characters[0].chats
+            .find((chat: Chat) => chat.id === 'chat-a')!
+        expect(livePluginConversation.message).toEqual(oracle.message)
+        const pluginMessage = {
+            role: 'user',
+            data: 'plugin compatibility append',
+            chatId: 'op-plugin-v2.1',
+            saying: 'live proxy compatibility',
+        } as Message
+        livePluginConversation.message.push(pluginMessage)
+        oracle.message.push(pluginMessage)
+        await pluginCompatibility.transition('scalable-v3')
+        expectedRevision += 1
+        await runtime.initializeActiveWorkingSet(workingCopy)
+        await assertWindowed()
+        vi.doUnmock('./persistentDataRuntime.svelte')
 
         const finalPersisted = await store.readConversation('char-a', 'chat-a')
         expect(finalPersisted).not.toBeNull()
