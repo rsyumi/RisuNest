@@ -192,6 +192,8 @@ vi.mock('./presetChain', () => ({
 vi.mock('./generationState', () => ({ doingChat: harness.doingChat }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     acknowledgeGenerationCompletion: harness.acknowledge,
+    captureSelectedConversationTarget: () => null,
+    acquireCompleteConversation: vi.fn(),
     getActiveConversationSession: () => null,
     invalidateActiveConversationSession: vi.fn(),
 }))

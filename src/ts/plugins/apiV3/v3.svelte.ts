@@ -36,12 +36,15 @@ import {
 } from "src/ts/process/ttsHooks";
 import {
     flushPendingData,
+    acquireCompleteConversation,
+    captureSelectedConversationTarget,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
     invalidateActiveConversationSession,
     materializePersistentDatabaseSnapshotWithRevision,
     replacePersistentDatabase,
 } from "src/ts/storage/persistentDataRuntime.svelte";
+import type { CompleteConversationLease } from "src/ts/storage/activeWorkingSet.svelte";
 import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
 import {
     assertPluginFullObjectCompatibility,
@@ -1416,31 +1419,41 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 throw new Error("Sending chat with plugin-based model is currently blocked");
             }
 
-            const charId = get(selectedCharID);
-            const char = DBState.db.characters[charId];
-            if(!char){
-                throw new Error("No character selected");
-            }
-
-            const chat = char.chats[char.chatPage];
-            if(!chat){
-                throw new Error("No active chat found");
-            }
-
-            if(message){
-                appendCurrentConversationMessage(char, chat, getActiveConversationSession(), {
-                    role: 'user',
-                    data: message,
-                    time: Date.now(),
-                });
-            }
-
+            let completeLease: CompleteConversationLease | null = null;
             try {
+                const target = captureSelectedConversationTarget();
+                if(target){
+                    completeLease = await acquireCompleteConversation('plugin-v3-send-chat', target);
+                }
+                const charId = get(selectedCharID);
+                const char = DBState.db.characters[charId];
+                if(!char){
+                    throw new Error("No character selected");
+                }
+
+                const chat = char.chats[char.chatPage];
+                if(!chat){
+                    throw new Error("No active chat found");
+                }
+                const activeSession = completeLease?.session ?? getActiveConversationSession();
+                if(completeLease && !activeSession.matchesConversation(char.chaId, chat)){
+                    return false;
+                }
+
+                if(message){
+                    appendCurrentConversationMessage(char, chat, activeSession, {
+                        role: 'user',
+                        data: message,
+                        time: Date.now(),
+                    });
+                }
+
                 await processSendChat(-1, {});
             } finally {
                 // Plugin API path does not pass through the UI unlock logic,
                 // so release doingChat here on both success and failure.
                 doingChat.set(false);
+                completeLease?.release();
             }
 
             return true;

@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
     session: null as ActiveConversationSession | null,
     sendChat: vi.fn(async () => undefined),
     downloadFile: vi.fn(async () => undefined),
+    selectedTarget: null as any,
+    acquireCompleteConversation: vi.fn(),
 }))
 
 vi.mock('src/ts/stores.svelte', () => ({
@@ -41,6 +43,8 @@ vi.mock('src/ts/util', () => ({
 }))
 vi.mock('./inlays', () => ({ postInlayAsset: vi.fn() }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
+    captureSelectedConversationTarget: () => mocks.selectedTarget,
+    acquireCompleteConversation: mocks.acquireCompleteConversation,
     getActiveConversationSession: () => mocks.session,
 }))
 
@@ -71,6 +75,8 @@ describe('postChatFile PO append', () => {
         mocks.session = null
         mocks.sendChat.mockClear()
         mocks.downloadFile.mockClear()
+        mocks.selectedTarget = null
+        mocks.acquireCompleteConversation.mockReset()
     })
 
     it('routes each PO user message through the matching session', async () => {
@@ -116,5 +122,82 @@ describe('postChatFile PO append', () => {
             'second',
         ])
         expect(mocks.sendChat).toHaveBeenCalledTimes(2)
+    })
+
+    it('promotes before the first PO append and holds the exact lease across generation', async () => {
+        const character = mocks.dbState.db!.characters[0]
+        const conversation = character.chats[0]
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        mocks.session = session
+        const target = { characterId: character.chaId, conversationId: conversation.id }
+        mocks.selectedTarget = target
+        let resolvePromotion!: (lease: any) => void
+        const promotion = new Promise<any>((resolve) => { resolvePromotion = resolve })
+        mocks.acquireCompleteConversation.mockReturnValue(promotion)
+        let resolveGeneration!: () => void
+        mocks.sendChat.mockImplementationOnce(() => new Promise<void>((resolve) => {
+            resolveGeneration = resolve
+        }))
+        let releaseCount = 0
+        const input = new TextEncoder().encode('msgid "hello"\nmsgstr ""\n\n')
+
+        const posting = postChatFile({ name: 'input.po', data: input })
+        await Promise.resolve()
+
+        expect(conversation.message.map((message) => message.data)).toEqual(['before'])
+        expect(mocks.sendChat).not.toHaveBeenCalled()
+
+        const pin = session.acquirePin('compatibility')
+        resolvePromotion({
+            session,
+            target,
+            release() {
+                releaseCount += 1
+                pin.release()
+            },
+        })
+        while (mocks.sendChat.mock.calls.length === 0) await Promise.resolve()
+
+        expect(conversation.message.map((message) => message.data)).toEqual(['before', 'hello'])
+        expect(session.pinCount('compatibility')).toBe(1)
+
+        resolveGeneration()
+        await expect(posting).resolves.toEqual([{ type: 'void' }])
+        expect(releaseCount).toBe(1)
+        expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('aborts a PO append when the promoted lease does not own the selected conversation', async () => {
+        const character = mocks.dbState.db!.characters[0]
+        const conversation = character.chats[0]
+        const otherConversation = { ...conversation, id: 'chat-b', message: [] } as Chat
+        const otherSession = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: otherConversation.id,
+            conversation: otherConversation,
+            storeRevision: 1,
+        })
+        const target = { characterId: character.chaId, conversationId: conversation.id }
+        mocks.selectedTarget = target
+        let releaseCount = 0
+        mocks.acquireCompleteConversation.mockResolvedValue({
+            session: otherSession,
+            target,
+            release() { releaseCount += 1 },
+        })
+        const input = new TextEncoder().encode('msgid "hello"\nmsgstr ""\n\n')
+
+        await expect(postChatFile({ name: 'input.po', data: input })).resolves.toEqual([
+            { type: 'void' },
+        ])
+
+        expect(conversation.message.map((message) => message.data)).toEqual(['before'])
+        expect(mocks.sendChat).not.toHaveBeenCalled()
+        expect(releaseCount).toBe(1)
     })
 })

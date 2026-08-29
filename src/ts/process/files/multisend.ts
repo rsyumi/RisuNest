@@ -6,7 +6,12 @@ import { isTauri } from "src/ts/platform"
 import { HypaProcesser } from '../memory/hypamemory';
 import { BufferToText as BufferToText, selectMultipleFile } from 'src/ts/util';
 import { postInlayAsset } from './inlays';
-import { getActiveConversationSession } from 'src/ts/storage/persistentDataRuntime.svelte';
+import {
+    acquireCompleteConversation,
+    captureSelectedConversationTarget,
+    getActiveConversationSession,
+} from 'src/ts/storage/persistentDataRuntime.svelte';
+import type { CompleteConversationLease } from 'src/ts/storage/activeWorkingSet.svelte';
 import {
     appendConversationMessage,
     captureConversationMutationTarget,
@@ -20,7 +25,10 @@ type sendFileArg = {
 }
 
 async function sendPofile(arg:sendFileArg){
-
+    let completeLease: CompleteConversationLease | null = null
+    const target = captureSelectedConversationTarget()
+    if (target) completeLease = await acquireCompleteConversation('po-multisend', target)
+    try {
     let result = ''
     let msgId = ''
     let note = ''
@@ -29,10 +37,14 @@ async function sendPofile(arg:sendFileArg){
     const selectedCharacterIndex = get(selectedCharID)
     const currentCharacter = DBState.db.characters[selectedCharacterIndex]
     const currentConversation = currentCharacter.chats[currentCharacter.chatPage]
+    if (
+        completeLease &&
+        !completeLease.session.matchesConversation(currentCharacter.chaId, currentConversation)
+    ) return
     let mutationTarget = captureConversationMutationTarget(
         currentCharacter,
         currentConversation,
-        getActiveConversationSession(),
+        completeLease?.session ?? getActiveConversationSession(),
     )
     const mutationTargetIsCurrent = () => {
         const character = DBState.db.characters[get(selectedCharID)]
@@ -138,6 +150,9 @@ async function sendPofile(arg:sendFileArg){
 
     }
     await downloadFile('translated.po', result)
+    } finally {
+        completeLease?.release()
+    }
 }
 
 async function sendPDFFile(arg:sendFileArg) {

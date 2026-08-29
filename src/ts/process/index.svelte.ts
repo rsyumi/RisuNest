@@ -40,6 +40,8 @@ import {
 } from './streamingDisplayStream'
 import {
     acknowledgeGenerationCompletion,
+    acquireCompleteConversation,
+    captureSelectedConversationTarget,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
@@ -67,6 +69,10 @@ import {
 } from './promptHistory'
 import { runCurrentChatParserPass } from './currentChatParserPass'
 import { applyGenerationErrorResponse } from './generationErrorResponse'
+import {
+    SelectedConversationPromotionStaleError,
+    type CompleteConversationLease,
+} from '../storage/activeWorkingSet.svelte'
 
 export { doingChat } from './generationState'
 
@@ -163,11 +169,21 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     preview?:boolean
     previewPrompt?:boolean
 } = {}):Promise<boolean> {
+    let completeLease: CompleteConversationLease | null = null
     const lifecycle: GenerationCompletionLifecycle = {
         responseApplied: false,
         acknowledgementAttempted: false,
     }
     try {
+        const target = captureSelectedConversationTarget()
+        if (target) {
+            try {
+                completeLease = await acquireCompleteConversation('generation', target)
+            } catch (error) {
+                if (error instanceof SelectedConversationPromotionStaleError) return false
+                throw error
+            }
+        }
         return await sendChatInternal(chatProcessIndex, arg, lifecycle)
     }
     catch(error) {
@@ -176,6 +192,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             await acknowledgeGenerationCompletion()
         }
         throw error
+    } finally {
+        completeLease?.release()
     }
 }
 

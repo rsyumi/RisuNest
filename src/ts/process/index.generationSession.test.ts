@@ -13,6 +13,11 @@ const mocks = vi.hoisted(() => ({
     tokenizeResult: null as Promise<number> | null,
     inlay: null as null | ((data: string) => { text: string, promise?: Promise<string> }),
     listeners: new Set<(event: any) => Promise<void> | void>(),
+    selectedTarget: null as any,
+    acquireCompleteConversation: vi.fn(),
+    activeCompleteLeases: 0,
+    completeLeaseReleases: 0,
+    lastCharPunctuation: true,
 }))
 
 vi.mock('../tokenizer', () => ({
@@ -60,7 +65,7 @@ vi.mock('../util', () => ({
     getAuthorNoteDefaultText: () => '',
     getPersonaPrompt: () => '',
     getUserName: () => 'User',
-    isLastCharPunctuation: () => true,
+    isLastCharPunctuation: () => mocks.lastCharPunctuation,
     trimUntilPunctuation: (value: string) => value,
     parseToggleSyntax: () => [],
     prebuiltAssetCommand: '',
@@ -73,7 +78,9 @@ vi.mock('./request/request', () => ({
         }
         mocks.modelRequestCount += 1
         mocks.modelRequests.push(request)
-        return mocks.modelResponse
+        return typeof mocks.modelResponse === 'function'
+            ? mocks.modelResponse()
+            : mocks.modelResponse
     }),
 }))
 vi.mock('./stableDiff', () => ({ stableDiff: vi.fn() }))
@@ -159,6 +166,8 @@ vi.mock('./presetChain', () => ({
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     acknowledgeGenerationCompletion: vi.fn(async () => undefined),
+    captureSelectedConversationTarget: () => mocks.selectedTarget,
+    acquireCompleteConversation: mocks.acquireCompleteConversation,
     getActiveConversationSession: () => mocks.session,
     invalidateActiveConversationSession: () => {
         mocks.events.push('invalidate-session')
@@ -169,6 +178,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
 
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
+import { SelectedConversationPromotionStaleError } from '../storage/activeWorkingSet.svelte'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, sendChat } from './index.svelte'
 
@@ -316,6 +326,133 @@ describe('sendChat generation session integration', () => {
         mocks.tokenizeResult = null
         mocks.inlay = null
         mocks.listeners.clear()
+        mocks.selectedTarget = null
+        mocks.activeCompleteLeases = 0
+        mocks.completeLeaseReleases = 0
+        mocks.lastCharPunctuation = true
+        mocks.acquireCompleteConversation.mockReset()
+        mocks.acquireCompleteConversation.mockImplementation(async (_reason, target) => {
+            const session = mocks.session
+            const pin = session.acquirePin('compatibility')
+            mocks.activeCompleteLeases += 1
+            let released = false
+            return {
+                session,
+                target,
+                release() {
+                    if (released) return
+                    released = true
+                    mocks.completeLeaseReleases += 1
+                    mocks.activeCompleteLeases -= 1
+                    pin.release()
+                },
+            }
+        })
+    })
+
+    it('promotes before generation reads history and holds one lease across awaited streaming work', async () => {
+        const { session } = installDatabase()
+        const target = { characterId: 'character-a', conversationId: 'chat-a' }
+        const promotion = deferred<any>()
+        const response = deferred<any>()
+        mocks.selectedTarget = target
+        mocks.acquireCompleteConversation.mockImplementationOnce(() => promotion.promise)
+        mocks.modelResponse = response.promise
+
+        const sending = sendChat()
+        await Promise.resolve()
+
+        expect(mocks.presetActivationCount).toBe(0)
+        expect(DBState.db.statics.messages).toBe(0)
+
+        const pin = session.acquirePin('compatibility')
+        mocks.activeCompleteLeases = 1
+        promotion.resolve({
+            session,
+            target,
+            release() {
+                mocks.completeLeaseReleases += 1
+                mocks.activeCompleteLeases -= 1
+                pin.release()
+            },
+        })
+        while (mocks.modelRequestCount === 0) await Promise.resolve()
+
+        expect(mocks.activeCompleteLeases).toBe(1)
+        expect(session.pinCount('compatibility')).toBe(1)
+
+        response.resolve(streamingResponse('answer'))
+        await expect(sending).resolves.toBe(true)
+        expect(mocks.activeCompleteLeases).toBe(0)
+        expect(mocks.completeLeaseReleases).toBe(1)
+        expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('holds the outer lease while auto-continue recursively owns and releases its exact lease', async () => {
+        const { session } = installDatabase()
+        mocks.selectedTarget = { characterId: 'character-a', conversationId: 'chat-a' }
+        DBState.db.autoContinueChat = true
+        mocks.modelResponse = () => streamingResponse('answer')
+        mocks.outputTrigger = () => null
+        mocks.lastCharPunctuation = false
+        mocks.listeners.add(() => {
+            if (mocks.modelRequestCount === 2) mocks.lastCharPunctuation = true
+        })
+        let maximumLeases = 0
+        mocks.acquireCompleteConversation.mockImplementation(async (_reason, target) => {
+            const pin = session.acquirePin('compatibility')
+            mocks.activeCompleteLeases += 1
+            maximumLeases = Math.max(maximumLeases, mocks.activeCompleteLeases)
+            let released = false
+            return {
+                session,
+                target,
+                release() {
+                    if (released) return
+                    released = true
+                    mocks.completeLeaseReleases += 1
+                    mocks.activeCompleteLeases -= 1
+                    pin.release()
+                },
+            }
+        })
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        expect(mocks.modelRequestCount).toBe(2)
+        expect(maximumLeases).toBe(2)
+        expect(mocks.completeLeaseReleases).toBe(2)
+        expect(mocks.activeCompleteLeases).toBe(0)
+        expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('releases the complete generation lease exactly once when awaited provider work throws', async () => {
+        const { session } = installDatabase()
+        const failure = new Error('provider failed')
+        mocks.selectedTarget = { characterId: 'character-a', conversationId: 'chat-a' }
+        mocks.modelResponse = Promise.reject(failure)
+
+        await expect(sendChat()).rejects.toBe(failure)
+
+        expect(mocks.completeLeaseReleases).toBe(1)
+        expect(mocks.activeCompleteLeases).toBe(0)
+        expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('returns false without reading or mutating history when complete promotion is stale', async () => {
+        const { chat, currentCharacter } = installDatabase()
+        currentCharacter.lastInteraction = 123
+        mocks.selectedTarget = { characterId: 'character-a', conversationId: 'chat-a' }
+        mocks.acquireCompleteConversation.mockRejectedValueOnce(
+            new SelectedConversationPromotionStaleError(),
+        )
+
+        await expect(sendChat()).resolves.toBe(false)
+
+        expect(chat.message).toEqual([expect.objectContaining({ data: 'hello' })])
+        expect(DBState.db.statics.messages).toBe(0)
+        expect(currentCharacter.lastInteraction).toBe(123)
+        expect(mocks.presetActivationCount).toBe(0)
     })
 
     it('records generation-start message ID assignment through the active session', async () => {

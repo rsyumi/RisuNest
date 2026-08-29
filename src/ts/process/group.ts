@@ -6,6 +6,8 @@ import { get } from "svelte/store";
 import { DBState, selectedCharID } from "../stores.svelte";
 import {
     activateCharacter,
+    acquireCompleteConversation,
+    captureSelectedConversationTarget,
     flushPendingData,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
@@ -16,6 +18,7 @@ import { restoreColdPersistentCharacter } from './coldCharacterRestore'
 import { doingChat } from './generationState'
 import { appendCurrentConversationMessage } from '../conversationMutations'
 import type { ActiveConversationPin } from '../storage/activeConversationSession'
+import type { CompleteConversationLease } from '../storage/activeWorkingSet.svelte'
 
 interface GroupGreetingMutation {
     chatId: string
@@ -111,42 +114,65 @@ export async function addGroupChar(): Promise<boolean> {
                 group = DBState.db.characters[selectedId]
                 if (group?.type !== 'group' || group.chaId !== groupId) return false
                 if (group.characters.includes(res)) return false
+                let completeLease: CompleteConversationLease | null = null
+                if (loadFirstMessage) {
+                    const target = captureSelectedConversationTarget()
+                    if (target) {
+                        completeLease = await acquireCompleteConversation(
+                            'group-greeting',
+                            target,
+                        )
+                    }
+                    if (!isSelectedGroup(groupId)) {
+                        completeLease?.release()
+                        return false
+                    }
+                    selectedId = get(selectedCharID)
+                    group = DBState.db.characters[selectedId]
+                    if (group?.type !== 'group' || group.chaId !== groupId) {
+                        completeLease?.release()
+                        return false
+                    }
+                }
                 const selectedChat = group.chats[group.chatPage]
-                const activeSession = getActiveConversationSession()
+                const activeSession = completeLease?.session ?? getActiveConversationSession()
                 if (
                     activeSession &&
                     !activeSession.matchesConversation(groupId, selectedChat)
-                ) return false
-                group.characters.push(res)
-                group.characterTalks.push(1 / 6 * 4)
-                group.characterActive.push(true)
-                let greeting: GroupGreetingMutation | null = null
-                if(loadFirstMessage){
-                    const message = {
-                        role:'char',
-                        data: member?.firstMessage ?? '',
-                        saying: res,
-                    } as const
-                    const index = selectedChat.message.length
-                    appendCurrentConversationMessage(
-                        group,
-                        selectedChat,
-                        activeSession,
-                        message,
-                    )
-                    greeting = {
-                        chatId: selectedChat.id,
-                        index,
-                        data: message.data,
-                        saying: res,
-                        pin: activeSession?.acquireRangePin(
-                            index,
-                            index + 1,
-                            'transaction',
-                        ) ?? null,
-                    }
+                ) {
+                    completeLease?.release()
+                    return false
                 }
+                let greeting: GroupGreetingMutation | null = null
                 try {
+                    group.characters.push(res)
+                    group.characterTalks.push(1 / 6 * 4)
+                    group.characterActive.push(true)
+                    if(loadFirstMessage){
+                        const message = {
+                            role:'char',
+                            data: member?.firstMessage ?? '',
+                            saying: res,
+                        } as const
+                        const index = selectedChat.message.length
+                        appendCurrentConversationMessage(
+                            group,
+                            selectedChat,
+                            activeSession,
+                            message,
+                        )
+                        greeting = {
+                            chatId: selectedChat.id,
+                            index,
+                            data: message.data,
+                            saying: res,
+                            pin: activeSession?.acquireRangePin(
+                                index,
+                                index + 1,
+                                'transaction',
+                            ) ?? null,
+                        }
+                    }
                     markGroupDirty(group)
                     const activation = await activateSelectedGroup(groupId)
                     if (activation === 'activated') return true
@@ -165,6 +191,7 @@ export async function addGroupChar(): Promise<boolean> {
                     return false
                 } finally {
                     greeting?.pin?.release()
+                    completeLease?.release()
                 }
             }
         }

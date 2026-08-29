@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
     flushPendingData: vi.fn(async () => undefined),
     reconcilePersistentActiveCharacterIds: vi.fn(),
     restoreColdPersistentCharacter: vi.fn(),
+    selectedTarget: null as any,
+    acquireCompleteConversation: vi.fn(),
 }))
 
 vi.mock('lodash/shuffle', () => ({ default: <T>(value: T[]) => value }))
@@ -46,6 +48,8 @@ vi.mock('../stores.svelte', () => ({
     selectedCharID: {},
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    captureSelectedConversationTarget: () => mocks.selectedTarget,
+    acquireCompleteConversation: mocks.acquireCompleteConversation,
     activateCharacter: mocks.activateCharacter,
     flushPendingData: mocks.flushPendingData,
     getPersistentNavigationGeneration: () => mocks.navigationGeneration,
@@ -98,6 +102,10 @@ describe('group working-set residency', () => {
             mocks.selectedCharacterId = id
             return true
         })
+        mocks.selectedTarget = null
+        mocks.acquireCompleteConversation.mockReset()
+        mocks.flushPendingData.mockReset()
+        mocks.flushPendingData.mockResolvedValue(undefined)
     })
 
     it('hydrates a newly added member before using its first message', async () => {
@@ -130,6 +138,84 @@ describe('group working-set residency', () => {
         expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
             commands: ['append'],
         }))
+    })
+
+    it('promotes before a group greeting and holds one exact lease through rollback settlement', async () => {
+        const group = mocks.database.characters[0]
+        const session = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: group.chats[0].id,
+            conversation: group.chats[0],
+            storeRevision: 1,
+        })
+        mocks.activeSession = session
+        const target = { characterId: group.chaId, conversationId: group.chats[0].id }
+        mocks.selectedTarget = target
+        let resolvePromotion!: (lease: any) => void
+        mocks.acquireCompleteConversation.mockReturnValue(new Promise((resolve) => {
+            resolvePromotion = resolve
+        }))
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            return false
+        })
+        let resolveFlush!: () => void
+        mocks.flushPendingData.mockImplementationOnce(() => new Promise<void>((resolve) => {
+            resolveFlush = resolve
+        }))
+        let releaseCount = 0
+
+        const adding = addGroupChar()
+        for (let index = 0; index < 20; index++) await Promise.resolve()
+
+        expect(mocks.acquireCompleteConversation).toHaveBeenCalledOnce()
+        expect(group.characters).toEqual(['member-a'])
+        expect(group.chats[0].message).toEqual([])
+
+        const pin = session.acquirePin('compatibility')
+        resolvePromotion({
+            session,
+            target,
+            release() {
+                releaseCount += 1
+                pin.release()
+            },
+        })
+        while (mocks.flushPendingData.mock.calls.length === 0) await Promise.resolve()
+
+        expect(group.characters).toEqual(['member-a'])
+        expect(group.chats[0].message).toEqual([])
+        expect(session.pinCount('compatibility')).toBe(1)
+
+        resolveFlush()
+        await expect(adding).resolves.toBe(false)
+        expect(releaseCount).toBe(1)
+        expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('aborts group membership and greeting mutation when the promoted lease is stale', async () => {
+        const group = mocks.database.characters[0]
+        const otherChat = { id: 'chat-b', message: [] }
+        const otherSession = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: otherChat.id,
+            conversation: otherChat as any,
+            storeRevision: 1,
+        })
+        mocks.selectedTarget = { characterId: group.chaId, conversationId: group.chats[0].id }
+        let releaseCount = 0
+        mocks.acquireCompleteConversation.mockResolvedValue({
+            session: otherSession,
+            target: mocks.selectedTarget,
+            release() { releaseCount += 1 },
+        })
+
+        await expect(addGroupChar()).resolves.toBe(false)
+
+        expect(group.characters).toEqual(['member-a'])
+        expect(group.chats[0].message).toEqual([])
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(releaseCount).toBe(1)
     })
 
     it('rolls a failed first-message greeting back through the current session', async () => {
