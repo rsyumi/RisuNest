@@ -202,25 +202,32 @@ describe('selected conversation eviction correctness corpus', () => {
             ) => runtime.acquireCompleteConversation(reason, target),
         }
 
-        const assertWindowed = async (stage = 'unnamed stage') => {
+        const assertSelectedWindowed = async (
+            stage: string,
+            conversationId: string,
+            expectedConversation: Chat,
+        ) => {
             await waitForWindowed(runtime)
             expect(() => selectedConversation().message).toThrow('metadata-only')
             expect(Object.keys(selectedConversation()), `${stage}: metadata shell keys`)
                 .not.toContain('message')
+            const { message: _expectedMessages, ...expectedMetadata } = expectedConversation
+            expect({ ...selectedConversation() }, `${stage}: metadata shell`).toEqual(expectedMetadata)
             expect(runtime.captureSelectedConversationAuthority()).toMatchObject({
                 characterId: 'char-a',
-                conversationId: 'chat-a',
+                conversationId,
                 storeRevision: expectedRevision,
-                totalMessages: oracle.message.length,
+                totalMessages: expectedConversation.message.length,
             })
-            const persisted = await store.readConversation('char-a', 'chat-a')
+            const persisted = await store.readConversation('char-a', conversationId)
             expect(persisted, `${stage}: authoritative conversation`).not.toBeNull()
             expect(persisted!.revision, `${stage}: authoritative revision`).toBe(expectedRevision)
-            expect(persisted!.value, `${stage}: authoritative conversation value`).toEqual(oracle)
+            expect(persisted!.value, `${stage}: authoritative conversation value`)
+                .toEqual(expectedConversation)
             expect(
                 persisted!.value.message.map((message) => message.chatId),
                 `${stage}: authoritative message IDs`,
-            ).toEqual(oracle.message.map((message) => message.chatId))
+            ).toEqual(expectedConversation.message.map((message) => message.chatId))
             const viewport = runtime.getActiveConversationViewportSource()!.snapshot()
             let residentRows = 0
             for (let index = 0; index < viewport.totalMessages; index++) {
@@ -229,6 +236,8 @@ describe('selected conversation eviction correctness corpus', () => {
             expect(residentRows, `${stage}: resident viewport rows`)
                 .toBeLessThanOrEqual(VIEWPORT_ROW_BUDGET)
         }
+        const assertWindowed = (stage = 'unnamed stage') =>
+            assertSelectedWindowed(stage, 'chat-a', oracle)
 
         const mutateComplete = async (
             reason: string,
@@ -310,12 +319,26 @@ describe('selected conversation eviction correctness corpus', () => {
         })).resolves.toBe(true)
         branchLease.release()
         expectedRevision += 1
-        await vi.waitFor(() => expect(runtime.getSelectedConversationMode()).toBe('windowed'))
+        const branchMarker: Message = {
+            role: 'char',
+            data: `{{specialcomment::branchedfrom::${oracle.id}::${oracle.name}::${oracle.message[branchEnd].chatId}::}}`,
+            isComment: true,
+            disabled: true,
+            chatId: 'branch-marker',
+        }
+        const { message: _sourceMessages, ...sourceMetadata } = structuredClone(oracle)
+        const branchOracle: Chat = {
+            ...sourceMetadata,
+            id: 'branch-a',
+            name: 'Corpus branch',
+            message: [
+                ...structuredClone(oracle.message.slice(0, branchEnd + 1)),
+                branchMarker,
+            ],
+        }
+        await assertSelectedWindowed('persistent branch immediate', 'branch-a', branchOracle)
         const persistedBranch = await store.readConversation('char-a', 'branch-a')
-        expect(persistedBranch?.value.message).toEqual([
-            ...oracle.message.slice(0, branchEnd + 1),
-            expect.objectContaining({ chatId: 'branch-marker', isComment: true }),
-        ])
+        expect(persistedBranch?.value).toEqual(branchOracle)
         await runtime.activateConversation('chat-a')
         await assertWindowed('persistent branch gateway')
 

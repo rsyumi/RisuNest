@@ -2,6 +2,14 @@
 
 Status: Implemented and validated, pending review approval.
 
+## Review fix round 3
+
+The branch stage now runs the full selected-conversation invariant while `branch-a` is still active and demoted. Its oracle is independently derived from the shifted source metadata, exact inclusive prefix, and deterministic production branch marker. Before any navigation back to `chat-a`, the corpus compares the complete authoritative branch `Chat`, messages, ordered IDs, and metadata; checks the branch record and selected authority at the current revision; verifies the exact branch metadata shell and null complete session; and enforces at most 64 resident viewport rows. Only then does it activate `chat-a` and run the source oracle invariant.
+
+The RED placed the source-only helper at the immediate branch point. It failed with expected `chat-a` and 10,000 messages versus actual `branch-a` and 259 messages. The helper was then generalized to accept a selected conversation ID and oracle, while retaining the source wrapper for every later stage.
+
+This round changes only the corpus test and this report. No product file changed.
+
 ## Review fix round 2
 
 The stage invariant now runs after every completed mutating operation and after the bounded read-only stages. It waits for the metadata shell, proves the complete session is absent, reads the authoritative conversation from IndexedDB, compares the full `Chat` value and ordered message IDs with the oracle, checks the exact record and selected-authority revision, and counts viewport residents to enforce the 64-row budget. Intermediate corruption can no longer be hidden by a later repair or by the final-only comparison.
@@ -44,7 +52,7 @@ Review-round final corpus command:
 
 `$env:VITE_DISABLE_REALM='true'; pnpm vitest run src/ts/storage/selectedConversationEvictionCorpus.test.ts --reporter=verbose`
 
-Round 2 result: 1 file passed, 1 test passed, 11.78 seconds total.
+Round 3 result: 1 file passed, 1 test passed, 11.70 seconds total.
 
 ## Validation evidence
 
@@ -64,13 +72,13 @@ Production build:
 
 `$env:VITE_DISABLE_REALM='true'; pnpm build`
 
-Round 2 result: passed in 14.99 seconds. Existing CSS `::highlight`, externalized Node module, dynamic import, and chunk-size warnings remain.
+Round 3 result: passed in 15.16 seconds. Existing CSS `::highlight`, externalized Node module, dynamic import, and chunk-size warnings remain.
 
 Full TypeScript suite:
 
 `$env:VITE_DISABLE_REALM='true'; pnpm test`
 
-Round 2 result: 255 files passed, 2 skipped. 3,315 tests passed, 6 skipped. Duration 54.33 seconds.
+Round 3 result: 255 files passed, 2 skipped. 3,315 tests passed, 6 skipped. Duration 54.90 seconds.
 
 Formatting command:
 
@@ -91,6 +99,8 @@ Ruling: Failed save and revision conflict attempts preserve the intended mutatio
 Ruling: Screenshot uses the screenshot source lease. Search uses anchored exact-ID queries. Hypa starts and ends windowed, uses its production anchored adapter and a pinned IndexedDB revision, and never acquires a complete conversation lease.
 
 Ruling: Branch uses the persistent UI gateway after the shifted interior delete, then verifies the exact persisted prefix and branch marker before returning to the source.
+
+Ruling: Branch approval evidence is captured while the branch remains selected. The exact branch metadata shell, authoritative record, revision, IDs, null session, and resident budget are checked before source activation can conceal branch-specific damage.
 
 Ruling: Export materializes the authoritative persistent snapshot at the exact modeled revision and compares its selected conversation with the complete-owner oracle.
 
