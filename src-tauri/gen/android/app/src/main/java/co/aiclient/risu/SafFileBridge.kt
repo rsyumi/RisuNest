@@ -420,6 +420,7 @@ internal class SafDestinationException(
 
 internal suspend fun copySafDestinationOnIo(
   source: File,
+  openSource: () -> InputStream = { source.inputStream() },
   openDestination: () -> OutputStream,
   deletePartial: () -> Boolean,
   createdDocument: Boolean,
@@ -431,7 +432,7 @@ internal suspend fun copySafDestinationOnIo(
   val baseWarnings = listOf("android-saf-provider-not-atomic")
   var copiedBytes = 0L
   try {
-    source.inputStream().use { input ->
+    openSource().use { input ->
       openDestination().use { output ->
         val buffer = ByteArray(bufferBytes)
         while (true) {

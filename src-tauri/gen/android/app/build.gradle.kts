@@ -97,3 +97,29 @@ dependencies {
 }
 
 apply(from = "tauri.build.gradle.kts")
+
+afterEvaluate {
+    val universalDebugUnitTest = tasks.named(
+        "testUniversalDebugUnitTest",
+        org.gradle.api.tasks.testing.Test::class.java,
+    )
+    universalDebugUnitTest.configure {
+        filter {
+            excludeTestsMatching("co.aiclient.risu.SafFileBridgeLowMemoryTest")
+        }
+    }
+    tasks.register(
+        "testLowMemorySafCopy",
+        org.gradle.api.tasks.testing.Test::class.java,
+    ) {
+        group = "verification"
+        description = "Runs the SAF stream copy test with a 32 MiB JVM heap."
+        testClassesDirs = universalDebugUnitTest.get().testClassesDirs
+        classpath = universalDebugUnitTest.get().classpath
+        minHeapSize = "16m"
+        maxHeapSize = "32m"
+        filter {
+            includeTestsMatching("co.aiclient.risu.SafFileBridgeLowMemoryTest")
+        }
+    }
+}
