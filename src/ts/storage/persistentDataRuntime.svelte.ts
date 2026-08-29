@@ -328,8 +328,11 @@ export const markPersistentDataDirty = (estimatedBytes: number): void =>
     getPersistentDataRuntime().markPersistentDataDirty(estimatedBytes)
 export const flushPendingData = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingData(reason)
-export const acknowledgeGenerationCompletion = (): Promise<void> =>
-    getPersistentDataRuntime().acknowledgeGenerationCompletion()
+export const acknowledgeGenerationCompletion = async (): Promise<void> => {
+    const runtime = getPersistentDataRuntime()
+    await runtime.acknowledgeGenerationCompletion()
+    runtime.tryDemoteSelectedConversation()
+}
 export const commitCharacterAddition = (
     request: CharacterAdditionRequest,
     reason: string,

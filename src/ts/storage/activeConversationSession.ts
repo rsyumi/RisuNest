@@ -163,6 +163,7 @@ export interface ActiveConversationSessionOptions {
     maxResidentBytes?: number
     measureMessage?(message: Message): number
     onMutation?(event: ActiveConversationMutationEvent): void
+    onPinReleased?(): void
 }
 
 export class ActiveConversationCompatibilitySnapshot {
@@ -1065,6 +1066,7 @@ export class ActiveConversationSession {
 
     private conversation: Chat
     private readonly onMutation?: (event: ActiveConversationMutationEvent) => void
+    private readonly onPinReleased?: () => void
     private readonly residency: SegmentedConversationResidency
     private readonly residentReadsEnabled: boolean
     private readonly pins = new Map<ActiveConversationPinReason, number>()
@@ -1080,6 +1082,7 @@ export class ActiveConversationSession {
     private active = true
     private compatibilityFallback = false
     private compatibilityBaselineMessageCount: number | null = null
+    private pinReleaseNotificationPending = false
 
     constructor(options: ActiveConversationSessionOptions) {
         if (!options.conversation) {
@@ -1090,6 +1093,7 @@ export class ActiveConversationSession {
         this.conversation = options.conversation
         this.currentStoreRevision = options.storeRevision
         this.onMutation = options.onMutation
+        this.onPinReleased = options.onPinReleased
         this.residentReadsEnabled = options.maxResidentBytes !== undefined
         this.residency = new SegmentedConversationResidency({
             revision: options.storeRevision,
@@ -1845,6 +1849,7 @@ export class ActiveConversationSession {
                 const count = this.pins.get(reason) ?? 0
                 if (count <= 1) this.pins.delete(reason)
                 else this.pins.set(reason, count - 1)
+                this.schedulePinReleaseNotification()
             },
         }
     }
@@ -1913,12 +1918,14 @@ export class ActiveConversationSession {
                 } finally {
                     released = true
                     attempt.release()
+                    this.schedulePinReleaseNotification()
                 }
             },
             release: () => {
                 if (released) return
                 released = true
                 attempt.release()
+                this.schedulePinReleaseNotification()
             },
         }
     }
@@ -2038,6 +2045,15 @@ export class ActiveConversationSession {
 
     private assertActive(): void {
         if (!this.active) throw new ConversationSessionInactiveError()
+    }
+
+    private schedulePinReleaseNotification(): void {
+        if (!this.onPinReleased || this.pinReleaseNotificationPending) return
+        this.pinReleaseNotificationPending = true
+        queueMicrotask(() => {
+            this.pinReleaseNotificationPending = false
+            if (this.active) this.onPinReleased?.()
+        })
     }
 
     private notifyMutation(

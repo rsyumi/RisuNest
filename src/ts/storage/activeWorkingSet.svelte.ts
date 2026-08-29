@@ -163,6 +163,8 @@ export class ActiveWorkingSet {
     private activeSession: ActiveConversationSession | null = null
     private selectedConversationState: SelectedConversationState | null = null
     private promotionFlight: Promise<CompleteSelectedConversationState> | null = null
+    private demotionScheduled = false
+    private demotionRetryScheduled = false
     private readonly viewportSourceListeners = new Set<
         ActiveConversationViewportSourceListener
     >()
@@ -282,7 +284,7 @@ export class ActiveWorkingSet {
             state.session.version !== state.session.persistedVersion ||
             state.session.storeRevision !== this.dependencies.coordinator.revision ||
             state.session.isTransactionActive ||
-            state.session.activePinReasons.length > 0 ||
+            state.session.activePinReasons.some((reason) => reason !== 'viewport') ||
             state.conversation.isStreaming === true
         ) return false
 
@@ -455,11 +457,16 @@ export class ActiveWorkingSet {
             session.conversationId !== event.conversationId ||
             !session.ownsSessionToken(event.sessionToken)
         ) return false
-        return session.acknowledgePersisted(
+        const acknowledged = session.acknowledgePersisted(
             event.sessionToken,
             event.sessionVersion,
             event.revision,
         )
+        if (acknowledged) {
+            this.scheduleSelectedConversationDemotion()
+            this.scheduleSelectedConversationDemotionRetry()
+        }
+        return acknowledged
     }
 
     reconcileActiveCharacterIds(
@@ -809,6 +816,7 @@ export class ActiveWorkingSet {
         this.activeSession = complete.session
         this.selectedConversationState = complete
         this.notifyActiveConversationViewportSource()
+        this.scheduleSelectedConversationDemotion()
     }
 
     private clearActiveConversationSession(notify = true): boolean {
@@ -925,6 +933,7 @@ export class ActiveWorkingSet {
             onMutation: this.dependencies.coordinator.recordActiveConversationMutation === undefined
                 ? undefined
                 : (event) => this.dependencies.coordinator.recordActiveConversationMutation!(event),
+            onPinReleased: () => this.scheduleSelectedConversationDemotion(),
         })
         let complete!: CompleteSelectedConversationState
         const viewportSource = new SynchronousSessionConversationViewportSource({
@@ -962,6 +971,24 @@ export class ActiveWorkingSet {
                 console.error('Active conversation viewport source subscriber failed', error)
             }
         }
+    }
+
+    private scheduleSelectedConversationDemotion(): void {
+        if (this.demotionScheduled) return
+        this.demotionScheduled = true
+        queueMicrotask(() => {
+            this.demotionScheduled = false
+            this.tryDemoteSelectedConversation()
+        })
+    }
+
+    private scheduleSelectedConversationDemotionRetry(): void {
+        if (this.demotionRetryScheduled) return
+        this.demotionRetryScheduled = true
+        setTimeout(() => {
+            this.demotionRetryScheduled = false
+            this.scheduleSelectedConversationDemotion()
+        }, 0)
     }
 
     private requireCurrentWindowedState(

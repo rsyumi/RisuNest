@@ -183,7 +183,79 @@ function deferred<T>() {
     return { promise, resolve, reject }
 }
 
+async function flushScheduledDemotion(): Promise<void> {
+    await Promise.resolve()
+    await Promise.resolve()
+}
+
 describe('selected conversation lifecycle', () => {
+    it('automatically demotes a 10k complete owner after activation', async () => {
+        const harness = makeHarness()
+
+        await flushScheduledDemotion()
+
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
+        expect(harness.workingSet.activeConversationSession).toBeNull()
+        expect(() => harness.getResident().chats[0].message).toThrow('metadata-only')
+        expect(harness.workingSet.activeConversationViewportSource?.snapshot()).toMatchObject({
+            totalMessages: 10_000,
+            storeRevision: 7,
+        })
+        expect(harness.coordinator.adoptWindowedSelectedConversation).toHaveBeenCalledOnce()
+    })
+
+    it('automatically demotes after persistence acknowledgement releases ownership', async () => {
+        const harness = makeHarness(10_000)
+        const session = harness.workingSet.activeConversationSession!
+        session.append({ role: 'user', data: 'persisted', chatId: 'persisted' })
+        const attempt = session.beginPersistence(session.version)
+        harness.setCoordinatorRevision(8)
+
+        attempt.acknowledge(8)
+        await flushScheduledDemotion()
+
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
+        expect(harness.workingSet.captureSelectedConversationAuthority()).toMatchObject({
+            persistedSessionVersion: 1,
+            sessionVersion: 1,
+            storeRevision: 8,
+            totalMessages: 10_001,
+        })
+        expect(() => harness.getResident().chats[0].message).toThrow('metadata-only')
+    })
+
+    it('coalesces final blocker releases into one automatic demotion attempt', async () => {
+        const harness = makeHarness(10_000)
+        const session = harness.workingSet.activeConversationSession!
+        const editor = session.acquirePin('editor')
+        const prompt = session.acquirePin('prompt')
+        await flushScheduledDemotion()
+        expect(harness.workingSet.selectedConversationMode).toBe('complete')
+
+        editor.release()
+        prompt.release()
+        await flushScheduledDemotion()
+
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
+        expect(harness.coordinator.adoptWindowedSelectedConversation).toHaveBeenCalledOnce()
+    })
+
+    it('hands a viewport-only owner to the persistent source without exposing messages', async () => {
+        const harness = makeHarness(10_000)
+        const completeSource = harness.workingSet.activeConversationViewportSource!
+        const viewport = completeSource.acquireRangePin(9_936, 10_000, 'viewport')
+
+        await flushScheduledDemotion()
+
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
+        expect(completeSource.snapshot().totalMessages).toBe(0)
+        expect(harness.workingSet.activeConversationViewportSource).toBeInstanceOf(
+            PersistentConversationViewportSource,
+        )
+        expect(() => harness.getResident().chats[0].message).toThrow('metadata-only')
+        expect(() => viewport.release()).not.toThrow()
+    })
+
     it('demotes a 10k complete owner to a throwing metadata shell and persistent source', () => {
         const harness = makeHarness()
         const completeSession = harness.workingSet.activeConversationSession!
@@ -441,7 +513,6 @@ describe('selected conversation lifecycle', () => {
     })
 
     it.each([
-        'viewport',
         'editor',
         'playing-media',
         'dirty',
@@ -450,15 +521,17 @@ describe('selected conversation lifecycle', () => {
         'transaction',
         'prompt',
         'compatibility',
-    ] as const)('keeps complete ownership while a %s pin is active', (reason) => {
+    ] as const)('keeps complete ownership until the final %s pin releases', async (reason) => {
         const harness = makeHarness(3)
         const session = harness.workingSet.activeConversationSession!
         const pin = session.acquirePin(reason)
 
-        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(false)
+        await flushScheduledDemotion()
+        expect(harness.workingSet.selectedConversationMode).toBe('complete')
         expect(session.isActive).toBe(true)
         pin.release()
-        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
+        await flushScheduledDemotion()
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
     })
 
     it('rolls back publication when windowed baseline adoption is rejected', () => {
@@ -630,15 +703,13 @@ describe('selected conversation lifecycle', () => {
             state,
             prepareDatabase: async (candidate) => candidate,
         })
-        await runtime.initializeActiveWorkingSet(workingCopy)
-
-        expect(runtime.getSelectedConversationMode()).toBe('complete')
         const runtimeSourceChanges = vi.fn()
         const unsubscribeSource = runtime.subscribeActiveConversationViewportSource(
             runtimeSourceChanges,
         )
-        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
-        expect(runtimeSourceChanges).toHaveBeenCalledOnce()
+        await runtime.initializeActiveWorkingSet(workingCopy)
+
+        expect(runtimeSourceChanges).toHaveBeenCalledTimes(2)
         expect(runtime.getSelectedConversationMode()).toBe('windowed')
         expect(runtime.getActiveConversationViewportSource()).toBeInstanceOf(
             PersistentConversationViewportSource,
@@ -666,16 +737,30 @@ describe('selected conversation lifecycle', () => {
             storeRevision: revision.revision + 2,
             totalMessages: 10_000,
         })
-        expect(runtimeSourceChanges).toHaveBeenCalledTimes(3)
+        expect(runtimeSourceChanges).toHaveBeenCalledTimes(4)
 
         const target = runtime.captureSelectedConversationTarget()!
         const lease = await runtime.acquireCompleteConversation('runtime-test', target)
         expect(lease.target).toEqual(runtime.captureSelectedConversationTarget())
         expect(runtime.getSelectedConversationMode()).toBe('complete')
         expect(workingCopy.characters[0].chats[0].message).toHaveLength(10_000)
-        expect(runtimeSourceChanges).toHaveBeenCalledTimes(4)
-        unsubscribeSource()
+        expect(runtimeSourceChanges).toHaveBeenCalledTimes(5)
+        lease.session.append({ role: 'user', data: 'persisted tail', chatId: 'tail' })
         lease.release()
+        await runtime.flushPendingData('selected-conversation-acknowledgement')
+        await vi.waitFor(() => {
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        })
+
+        expect(runtime.captureSelectedConversationAuthority()).toMatchObject({
+            persistedSessionVersion: 1,
+            sessionVersion: 1,
+            totalMessages: 10_001,
+        })
+        expect((await store.readConversation('char-a', 'chat-a')).value.message).toHaveLength(
+            10_001,
+        )
+        unsubscribeSource()
     })
 
     it('advances complete ownership after an ordinary root commit and remains demotable', async () => {
@@ -726,7 +811,7 @@ describe('selected conversation lifecycle', () => {
         expect(runtime.captureSelectedConversationTarget()).toMatchObject({
             storeRevision: initial.revision + 1,
         })
-        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
     })
 
     it('keeps a windowed selected conversation authoritative across a root module append', async () => {
@@ -773,7 +858,7 @@ describe('selected conversation lifecycle', () => {
             prepareDatabase: async (candidate) => candidate,
         })
         await runtime.initializeActiveWorkingSet(workingCopy)
-        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
 
         await runtime.appendPersistentRootModule('windowed-module-append', {
             module: {
@@ -870,7 +955,7 @@ describe('selected conversation lifecycle', () => {
         expect((await store.readConversation('char-a', 'chat-a')).value.message).toHaveLength(3)
     })
 
-    it('promotes before navigating from a windowed conversation to another conversation', async () => {
+    it('promotes for conversation navigation then automatically demotes the destination', async () => {
         const chatA = makeChat(3)
         const chatB = { ...makeChat(2), id: 'chat-b', name: 'Second' }
         const selected = makeCharacter(chatA)
@@ -915,20 +1000,21 @@ describe('selected conversation lifecycle', () => {
             prepareDatabase: async (candidate) => candidate,
         })
         await runtime.initializeActiveWorkingSet(workingCopy)
-        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
         const previousSource = runtime.getActiveConversationViewportSource()!
 
         await expect(runtime.activateConversation('chat-b')).resolves.toBe(true)
 
         expect(previousSource.snapshot().totalMessages).toBe(0)
-        expect(runtime.getSelectedConversationMode()).toBe('complete')
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        expect(() => workingCopy.characters[0].chats[1].message).toThrow('metadata-only')
         expect(runtime.captureSelectedConversationTarget()).toMatchObject({
             characterId: 'char-a',
             conversationId: 'chat-b',
         })
     })
 
-    it('promotes before navigating from a windowed conversation to another character', async () => {
+    it('promotes for character navigation then automatically demotes the destination', async () => {
         const characterA = makeCharacter(makeChat(3))
         const characterB = {
             ...makeCharacter({ ...makeChat(2), id: 'chat-b' }),
@@ -988,13 +1074,15 @@ describe('selected conversation lifecycle', () => {
             prepareDatabase: async (candidate) => candidate,
         })
         await runtime.initializeActiveWorkingSet(workingCopy)
-        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
         const previousSource = runtime.getActiveConversationViewportSource()!
 
         await expect(runtime.activateCharacter('char-b')).resolves.toBe(true)
 
         expect(previousSource.snapshot().totalMessages).toBe(0)
-        expect(runtime.getSelectedConversationMode()).toBe('complete')
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        const selected = workingCopy.characters.find((entry) => entry.chaId === 'char-b')!
+        expect(() => selected.chats[selected.chatPage ?? 0].message).toThrow('metadata-only')
         expect(runtime.captureSelectedConversationTarget()).toMatchObject({
             characterId: 'char-b',
             conversationId: 'chat-b',
@@ -1049,7 +1137,7 @@ describe('selected conversation lifecycle', () => {
             prepareDatabase: async (candidate) => candidate,
         })
         await runtime.initializeActiveWorkingSet(workingCopy)
-        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
 
         await runtime.materializeMaximumCompatibilityWorkingSet()
 
