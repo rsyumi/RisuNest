@@ -71,15 +71,6 @@ export async function addGroupChar(): Promise<boolean> {
             else{
                 const loadFirstMessage = await alertConfirm(language.askLoadFirstMsg)
                 const groupId = group.chaId
-                const navigationGeneration = getPersistentNavigationGeneration()
-                const member = await restoreColdPersistentCharacter(res, {
-                    errorMessage: language.errors.coldStorageRestoreFailed,
-                    isCurrent: () => (
-                        getPersistentNavigationGeneration() === navigationGeneration &&
-                        isSelectedGroup(groupId)
-                    ),
-                })
-                if (!member || !isSelectedGroup(groupId)) return false
                 if (get(doingChat)) return false
                 selectedId = get(selectedCharID)
                 group = DBState.db.characters[selectedId]
@@ -110,6 +101,31 @@ export async function addGroupChar(): Promise<boolean> {
                         activeSession &&
                         !activeSession.matchesConversation(groupId, selectedChat)
                     ) return false
+                    const restoreGeneration = getPersistentNavigationGeneration()
+                    const member = await restoreColdPersistentCharacter(res, {
+                        errorMessage: language.errors.coldStorageRestoreFailed,
+                        isCurrent: () => (
+                            getPersistentNavigationGeneration() === restoreGeneration &&
+                            isSelectedGroup(groupId)
+                        ),
+                    })
+                    if (
+                        !member ||
+                        getPersistentNavigationGeneration() !== restoreGeneration ||
+                        !isSelectedGroup(groupId) ||
+                        get(doingChat)
+                    ) return false
+                    selectedId = get(selectedCharID)
+                    group = DBState.db.characters[selectedId]
+                    if (group?.type !== 'group' || group.chaId !== groupId) return false
+                    if (group.characters.includes(res)) return false
+                    const restoredSelectedChat = group.chats[group.chatPage]
+                    const restoredActiveSession = completeLease?.session
+                        ?? getActiveConversationSession()
+                    if (
+                        restoredActiveSession &&
+                        !restoredActiveSession.matchesConversation(groupId, restoredSelectedChat)
+                    ) return false
                     if (!hydrateCurrentGroupMemberDetail(groupId, member)) return false
                     group.characters.push(res)
                     group.characterTalks.push(1 / 6 * 4)
@@ -125,8 +141,8 @@ export async function addGroupChar(): Promise<boolean> {
                         } as const
                         appendCurrentConversationMessage(
                             group,
-                            selectedChat,
-                            activeSession,
+                            restoredSelectedChat,
+                            restoredActiveSession,
                             message,
                         )
                     }

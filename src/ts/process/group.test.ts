@@ -188,6 +188,53 @@ describe('group working-set residency', () => {
         })
     })
 
+    it('publishes the current member revision when activation races a newer detail', async () => {
+        let persistentDetail = {
+            type: 'character',
+            chaId: 'member-b',
+            name: 'Beta',
+            personality: 'Revision R personality',
+            scenario: 'Revision R prompt',
+        }
+        mocks.database.characters[2] = createCatalogCharacterStub({
+            id: 'member-b',
+            configuredIndex: 2,
+            conversationCount: 0,
+            name: 'Beta',
+            type: 'character',
+            recentAt: 0,
+            trashed: false,
+        })
+        mocks.restoreColdPersistentCharacter.mockImplementation(async () => ({
+            ...persistentDetail,
+        }))
+        mocks.alertConfirm.mockResolvedValue(false)
+        let activationAttempt = 0
+        mocks.activateCharacter.mockImplementation(async () => {
+            activationAttempt++
+            if (activationAttempt === 1) {
+                persistentDetail = {
+                    ...persistentDetail,
+                    personality: 'Revision R+1 personality',
+                    scenario: 'Revision R+1 prompt',
+                }
+            }
+            mocks.navigationGeneration++
+            return activationAttempt === 2
+        })
+
+        await expect(addGroupChar()).resolves.toBe(true)
+
+        expect(mocks.database.characters[2]).toMatchObject({
+            personality: 'Revision R+1 personality',
+            scenario: 'Revision R+1 prompt',
+        })
+        expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
+        expect(mocks.restoreColdPersistentCharacter.mock.invocationCallOrder[0]).toBeGreaterThan(
+            mocks.activateCharacter.mock.invocationCallOrder[1],
+        )
+    })
+
     it('routes a first-message greeting through the active conversation session', async () => {
         const group = mocks.database.characters[0]
         const onMutation = vi.fn()
@@ -483,7 +530,7 @@ describe('group working-set residency', () => {
 
         expect(mocks.database.characters[0].characters).toEqual(['member-a'])
         expect(mocks.database.characters[0].chats[0].message).toEqual([])
-        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(mocks.activateCharacter).toHaveBeenCalledOnce()
         expect(mocks.markPersistentDataDirty).not.toHaveBeenCalled()
     })
 
@@ -496,10 +543,7 @@ describe('group working-set residency', () => {
         await expect(addGroupChar()).resolves.toBe(false)
 
         const group = mocks.database.characters[0]
-        expect(mocks.restoreColdPersistentCharacter).toHaveBeenCalledWith(
-            'member-b',
-            expect.objectContaining({ errorMessage: undefined }),
-        )
+        expect(mocks.restoreColdPersistentCharacter).not.toHaveBeenCalled()
         expect(group.characters).toEqual(['member-a'])
         expect(group.chats[0].message).toEqual([])
         expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
