@@ -26,7 +26,7 @@ import { loadLoreBookV3PromptFromCompatibilitySnapshot } from './lorebook.svelte
 import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
-import { createLuaFactory } from './luaRuntime';
+import { createLuaFactory, runLuaSource } from './luaRuntime';
 import { withObjectUrl } from '../objectUrl';
 import {
     createConversationOperationContext,
@@ -182,7 +182,10 @@ export async function runScripted(code:string, arg:{
             if(ScriptingEngineState.type === 'lua'){
                 console.log('Creating new Lua engine for mode:', mode)
                 ScriptingEngineState.engine?.global.close()
-                ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true})
+                ScriptingEngineState.engine = await luaFactory.createEngine({
+                    injectObjects: true,
+                    functionTimeout: 2_000,
+                })
                 const luaEngine = ScriptingEngineState.engine
                 declareAPI = (name:string, func:Function) => {
                     luaEngine.global.set(name, func)
@@ -1209,7 +1212,7 @@ export async function runScripted(code:string, arg:{
 
             console.log('Running Lua code:', code)
             if(ScriptingEngineState.type === 'lua'){
-                await ScriptingEngineState.engine?.doString(luaCodeWrapper(code))
+                await runLuaSource(ScriptingEngineState.engine, luaCodeWrapper(code))
             }
             if(ScriptingEngineState.type === 'py'){
                 await ScriptingEngineState.pyodide?.init(code)
@@ -1569,7 +1572,7 @@ function async(callback)
 
             checkresult = function()
                 if safe and result == Promise.resolve(result) then
-                    result:finally(step)
+                    result:finally(step):catch(reject)
                 else
                     step()
                 end

@@ -1,5 +1,6 @@
 // @vitest-environment node
 
+import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { beforeAll, expect, test, vi } from 'vitest'
@@ -18,6 +19,7 @@ import type { LuaEngine } from 'wasmoon'
 
 const scriptingSelectionState = vi.hoisted(() => ({ index: 0 }))
 const createdLuaEngines = vi.hoisted(() => [] as LuaEngine[])
+const createdLuaEngineOptions = vi.hoisted(() => [] as unknown[])
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -79,6 +81,7 @@ vi.mock('./luaRuntime', async (importOriginal) => {
       const factory = await actual.createLuaFactory()
       const createEngine = factory.createEngine.bind(factory)
       factory.createEngine = async (options) => {
+        createdLuaEngineOptions.push(options)
         const engine = await createEngine(options)
         createdLuaEngines.push(engine)
         return engine
@@ -1403,3 +1406,97 @@ test('records the synthetic LLM Promise await result in a supported listener mod
     noMultiGen: true,
   }, 'model')
 })
+
+test('creates production Lua engines with the handler deadline', async () => {
+  await runScripted('', {
+    char: { chaId: 'bounded-handler-options' } as never,
+    chat: { message: [] } as never,
+    mode: 'bounded-handler-options',
+  })
+
+  expect(createdLuaEngineOptions.at(-1)).toEqual({
+    injectObjects: true,
+    functionTimeout: 2_000,
+  })
+})
+
+test('settles a resumed coroutine rejection without leaving an unhandled rejection', async () => {
+  if (process.env.RISUNEST_A4_COROUTINE_CHILD !== 'true') {
+    const child = spawn(process.execPath, [
+      resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+      'run',
+      'src/ts/process/scriptings.test.ts',
+      '--pool=threads',
+      '--maxWorkers=1',
+      '--no-file-parallelism',
+      '-t',
+      'settles a resumed coroutine rejection without leaving an unhandled rejection',
+    ], {
+      env: {
+        ...process.env,
+        RISUNEST_A4_COROUTINE_CHILD: 'true',
+        VITE_DISABLE_REALM: 'true',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stderr = ''
+    let stdout = ''
+    child.stderr.setEncoding('utf8')
+    child.stdout.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+    })
+    const childResult = await new Promise<{ code: number | null; timedOut: boolean }>(
+      (resolveChild) => {
+        let timedOut = false
+        const timeout = setTimeout(() => {
+          timedOut = true
+          child.kill()
+        }, 8_000)
+        child.once('exit', (code) => {
+          clearTimeout(timeout)
+          resolveChild({ code, timedOut })
+        })
+      },
+    )
+
+    expect(childResult, `${stdout}\n${stderr}`).toEqual({ code: 0, timedOut: false })
+    return
+  }
+
+  const unhandledRejections: unknown[] = []
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason)
+  }
+  process.on('unhandledRejection', onUnhandledRejection)
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockResolvedValueOnce({
+    type: 'success',
+    result: 'resume into loop',
+  } as never)
+
+  try {
+    const scriptingPromise = runScripted(`
+      coroutine_rejection_boundary = async(function(id)
+        LLM(id, {{ role = 'user', content = 'reject' }})
+        while true do end
+      end)
+    `, {
+      char: { chaId: 'coroutine-rejection-boundary' } as never,
+      chat: { message: [] } as never,
+      lowLevelAccess: true,
+      mode: 'coroutine_rejection_boundary',
+    })
+    const settled = await scriptingPromise.then(() => true, () => true)
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate))
+
+    expect(settled).toBe(true)
+    expect(unhandledRejections).toEqual([])
+  } finally {
+    process.off('unhandledRejection', onUnhandledRejection)
+    vi.mocked(requestChatData).mockReset()
+  }
+}, 12_000)

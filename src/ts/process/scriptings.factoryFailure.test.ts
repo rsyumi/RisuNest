@@ -43,6 +43,7 @@ vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
 vi.mock('./luaRuntime', () => ({
     createLuaFactory: () => runtimeState.createLuaFactory(),
+    runLuaSource: vi.fn(async (engine, source) => engine.doString(source)),
 }))
 
 let runScripted: typeof import('./scriptings').runScripted
