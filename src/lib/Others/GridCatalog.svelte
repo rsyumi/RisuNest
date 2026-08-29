@@ -51,6 +51,9 @@
         }
         return charas
     }
+
+    let activeCharacters = $derived(formatChars(search, DBState.db))
+    let trashedCharacters = $derived(formatChars(search, DBState.db, true))
 </script>
 
 <div class="h-full w-full flex justify-center">
@@ -83,14 +86,14 @@
                 </Button>
                 <div class="grow"></div>
                 <span class="text-textcolor2 text-sm">
-                    {formatChars(search, DBState.db).length} {language.character}
+                    {activeCharacters.length} {language.character}
                 </span>
             </div>
         </div>
         {#if selected === 0}
             <div class="w-full flex justify-center">
                 <div class="flex flex-wrap gap-2 w-full justify-center">
-                    {#each formatChars(search, DBState.db) as char}
+                    {#each activeCharacters as char (char.chaId)}
                         <div class="flex items-center text-textcolor">
                             {#if char.image}
                                 <BarIcon onClick={() => {changeChar(char.index)}} additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
@@ -108,7 +111,7 @@
                 </div>
             </div>
         {:else if selected === 1}
-            {#each formatChars(search, DBState.db) as char}
+            {#each activeCharacters as char (char.chaId)}
                 <div class="flex p-2 border border-darkborderc rounded-md mb-2">
                     <BarIcon onClick={() => {changeChar(char.index)}} additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
                     <div class="flex-1 flex flex-col ml-2">
@@ -131,7 +134,7 @@
             {/each}
         {:else if selected === 2}
             <span class="text-textcolor2 text-sm mb-2">{language.trashDesc}</span>
-            {#each formatChars(search, DBState.db, true) as char}
+            {#each trashedCharacters as char (char.chaId)}
                 <div class="flex p-2 border border-darkborderc rounded-md mb-2">
                     <BarIcon onClick={() => {changeChar(char.index)}} additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
                     <div class="flex-1 flex flex-col ml-2">

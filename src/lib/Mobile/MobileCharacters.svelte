@@ -1,5 +1,4 @@
 <script lang="ts">
-    import { type character, type groupChat } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import BarIcon from "../SideBars/BarIcon.svelte";
     import { addCharacter, changeChar, getCharImage } from "src/ts/characters";
@@ -51,44 +50,60 @@
         return agoFormatter.format(-year, 'year');
     }
 
-    function sortChar(char: (character|groupChat)[]) {
-        return char.map((c, i) => ({ c, i })).filter(({ c }) => {
-            return !hideTrash || !c.trashTime;
-        }).map(({ c, i }) => {
-            return {
-                name: c.name || "Unnamed",
-                image: c.image,
-                chats: getCatalogConversationCount(c),
-                i: i,
-                interaction: c.lastInteraction || 0,
-                agoText: makeAgoText(c.lastInteraction || 0),
-            }
-        }).sort((a, b) => {
-            if (a.interaction === b.interaction) {
-                return a.name.localeCompare(b.name);
-            }
-            return b.interaction - a.interaction;
-        });
-    }
+    let visibleCharacters = $derived.by(() => {
+        const rows: Array<{
+            chaId: string
+            name: string
+            image: string
+            chats: number
+            index: number
+            interaction: number
+            agoText: string
+        }> = []
+        for (let index = 0; index < DBState.db.characters.length; index += 1) {
+            const character = DBState.db.characters[index]
+            if (hideTrash && character.trashTime) continue
+            const name = character.name || 'Unnamed'
+            if (!normalizeSearch(name).includes(normalizedSearch)) continue
+            const interaction = character.lastInteraction || 0
+            rows.push({
+                chaId: character.chaId,
+                name,
+                image: character.image,
+                chats: getCatalogConversationCount(character),
+                index,
+                interaction,
+                agoText: makeAgoText(interaction),
+            })
+        }
+        return rows.sort((left, right) =>
+            left.interaction === right.interaction
+                ? left.name.localeCompare(right.name)
+                : right.interaction - left.interaction,
+        )
+    })
 </script>
 <div class="flex flex-col items-center w-full overflow-y-auto h-full">
-    {#each sortChar(DBState.db.characters) as char, i}
-        {#if normalizeSearch(char.name).includes(normalizedSearch)}
-            <button class="flex p-2 border-t-darkborderc gap-2 w-full" class:border-t={i !== 0} onclick={async () => {
-                if(await changeChar(char.i)) endGrid()
-            }}>
-                <BarIcon additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
-                <div class="flex flex-1 w-full flex-col justify-start items-start text-start">
-                    <span>{char.name}</span>
-                    <div class="text-sm text-textcolor2 flex items-center w-full flex-wrap">
-                        <span class="mr-1">{char.chats}</span>
-                        <MessageSquareIcon size={14} />
-                        <span class="mr-1 ml-1">|</span>
-                        <span>{char.agoText}</span>
-                    </div>
+    {#each visibleCharacters as char, index (char.chaId)}
+        <button
+            data-character-id={char.chaId}
+            class="flex p-2 border-t-darkborderc gap-2 w-full"
+            class:border-t={index !== 0}
+            onclick={async () => {
+                if(await changeChar(char.index)) endGrid()
+            }}
+        >
+            <BarIcon additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
+            <div class="flex flex-1 w-full flex-col justify-start items-start text-start">
+                <span>{char.name}</span>
+                <div class="text-sm text-textcolor2 flex items-center w-full flex-wrap">
+                    <span class="mr-1">{char.chats}</span>
+                    <MessageSquareIcon size={14} />
+                    <span class="mr-1 ml-1">|</span>
+                    <span>{char.agoText}</span>
                 </div>
-            </button>
-        {/if}
+            </div>
+        </button>
     {/each}
 </div>
 
