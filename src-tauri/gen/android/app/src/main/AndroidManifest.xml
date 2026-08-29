@@ -53,6 +53,7 @@
                 <data android:pathPattern=".*\\.risup" />
                 <data android:pathPattern=".*\\.charx" />
             </intent-filter>
+            
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 
