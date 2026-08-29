@@ -1103,10 +1103,15 @@ export async function addNewChat(character: character | groupChat): Promise<bool
 }
 
 export async function duplicateChat(characterId: string, chatId: string): Promise<boolean> {
-    if (!(await changeChatTo(chatId))) return false
-    const character = getDatabase().characters.find((candidate) => candidate.chaId === characterId)
-    const source = character?.chats.find((conversation) => conversation.id === chatId)
-    if (!character || !source) return false
+    const selectedBeforeRead = getDatabase().characters[get(selectedCharID)]?.chaId
+    if (selectedBeforeRead !== characterId) return false
+    const source = await readPersistentConversation(characterId, chatId, 'duplicate-chat')
+    if (!source) return false
+    const database = getDatabase()
+    const selectedAfterRead = database.characters[get(selectedCharID)]
+    if (selectedAfterRead?.chaId !== characterId) return false
+    const character = database.characters.find((candidate) => candidate.chaId === characterId)
+    if (!character?.chats.some((conversation) => conversation.id === chatId)) return false
     const duplicate = safeStructuredClone(source)
     duplicate.name = createChatCopyName(duplicate.name, 'Copy')
     duplicate.id = v4()

@@ -800,7 +800,10 @@ describe('chat list operations', () => {
     beforeEach(() => {
         mocks.database.characters = []
         mocks.nextId = 0
+        selectedCharID.set(-1)
         vi.clearAllMocks()
+        mocks.readPersistentConversation.mockReset()
+        mocks.changeChatTo.mockReset()
         mocks.changeChatTo.mockResolvedValue(true)
     })
 
@@ -888,31 +891,75 @@ describe('chat list operations', () => {
         expect(character.chats[0]).not.toHaveProperty('fmIndex')
     })
 
-    it('hydrates a nonselected chat before duplicating its body', async () => {
+    it('reads a chat authoritatively and navigates only to its duplicate', async () => {
         const character = buildCharacter()
-        character.chats[0].message = []
+        const authoritative = {
+            ...character.chats[0],
+            message: [{ role: 'user', data: 'authoritative body' }],
+        }
         mocks.database.characters.push(character)
-        mocks.changeChatTo.mockImplementation(async (id: string) => {
-            if (id === 'chat-a') {
-                character.chats[0] = {
-                    ...character.chats[0],
-                    message: [{ role: 'user', data: 'authoritative body' }],
-                }
-                character.chatPage = 0
-            }
-            return true
-        })
+        selectedCharID.set(0)
+        mocks.readPersistentConversation.mockResolvedValue(authoritative)
 
         const duplicated = await duplicateChat(character.chaId, 'chat-a')
 
         expect(duplicated).toBe(true)
-        expect(mocks.changeChatTo).toHaveBeenNthCalledWith(1, 'chat-a')
+        expect(mocks.readPersistentConversation).toHaveBeenCalledWith(
+            character.chaId,
+            'chat-a',
+            'duplicate-chat',
+        )
         expect(character.chats[0]).toMatchObject({
             id: expect.stringMatching(/^generated-/),
             name: 'Chat A (Copy)',
             message: [{ role: 'user', data: 'authoritative body' }],
         })
-        expect(mocks.changeChatTo).toHaveBeenNthCalledWith(2, character.chats[0].id)
+        expect(mocks.changeChatTo).toHaveBeenCalledTimes(1)
+        expect(mocks.changeChatTo).toHaveBeenCalledWith(character.chats[0].id)
+    })
+
+    it('does not install a duplicate after the selected character changes', async () => {
+        const sourceCharacter = buildCharacter()
+        const nextCharacter = createBlankChar()
+        const read = deferred<any>()
+        mocks.database.characters.push(sourceCharacter, nextCharacter)
+        selectedCharID.set(0)
+        mocks.readPersistentConversation.mockReturnValue(read.promise)
+
+        const pending = duplicateChat(sourceCharacter.chaId, 'chat-a')
+        selectedCharID.set(1)
+        read.resolve(structuredClone(sourceCharacter.chats[0]))
+
+        expect(await pending).toBe(false)
+        expect(sourceCharacter.chats).toHaveLength(3)
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
+    })
+
+    it('does not duplicate a missing authoritative chat', async () => {
+        const character = buildCharacter()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.readPersistentConversation.mockResolvedValue(null)
+
+        expect(await duplicateChat(character.chaId, 'chat-a')).toBe(false)
+        expect(character.chats).toHaveLength(3)
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
+    })
+
+    it('does not restore a source chat deleted while the read was pending', async () => {
+        const character = buildCharacter()
+        const read = deferred<any>()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.readPersistentConversation.mockReturnValue(read.promise)
+
+        const pending = duplicateChat(character.chaId, 'chat-a')
+        character.chats.splice(0, 1)
+        read.resolve({ message: [], note: '', name: 'Chat A', localLore: [], id: 'chat-a' })
+
+        expect(await pending).toBe(false)
+        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-b', 'chat-c'])
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
     })
 
     it('reads a nonselected chat authoritatively before export', async () => {
