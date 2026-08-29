@@ -103,9 +103,11 @@ afterEvaluate {
         "testUniversalDebugUnitTest",
         org.gradle.api.tasks.testing.Test::class.java,
     )
-    universalDebugUnitTest.configure {
-        filter {
-            excludeTestsMatching("co.aiclient.risu.SafFileBridgeLowMemoryTest")
+    tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {
+        if (name.endsWith("UnitTest")) {
+            filter {
+                excludeTestsMatching("co.aiclient.risu.SafFileBridgeLowMemoryTest")
+            }
         }
     }
     tasks.register(

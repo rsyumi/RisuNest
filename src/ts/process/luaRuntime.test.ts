@@ -186,6 +186,33 @@ it.each([
     ])
 })
 
+it('sets the default source deadline to exactly 2,000 ms from now', async () => {
+    const setThreadTimeout = vi.fn()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    const thread = {
+        loadString: vi.fn(),
+        setTimeout: setThreadTimeout,
+        run: vi.fn().mockResolvedValue([]),
+        close: vi.fn(),
+    }
+    const engine = {
+        global: {
+            newThread: () => thread,
+            getTop: () => 3,
+            remove: vi.fn(),
+        },
+    }
+    const { runLuaSource } = await import('./luaRuntime')
+
+    try {
+        await runLuaSource(engine as never, 'return 1')
+        expect(setThreadTimeout).toHaveBeenCalledOnce()
+        expect(setThreadTimeout).toHaveBeenCalledWith(12_000)
+    } finally {
+        now.mockRestore()
+    }
+})
+
 it('interrupts a Lua handler invoked from JavaScript through functionTimeout', async () => {
     const child = await runIsolatedWasmoon(`
         const factory = new LuaFactory()
