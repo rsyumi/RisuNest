@@ -83,12 +83,15 @@ function capture(target: ReturnType<typeof fixture>, absoluteIndex: number) {
 }
 
 describe('chat message UI targets', () => {
-    it('queries far stable message IDs through one pinned windowed revision', async () => {
-        const complete = fixture(Array.from({ length: 10_000 }, (_, index) => ({
+    it('uses the last far duplicate for bookmark display and navigation', async () => {
+        const completeMessages = Array.from({ length: 10_000 }, (_, index) => ({
             role: index % 2 === 0 ? 'user' : 'char',
             data: `message-${index}`,
             chatId: `id-${index}`,
-        } as Message)))
+        } as Message))
+        completeMessages[10].chatId = 'duplicate'
+        completeMessages[9000].chatId = 'duplicate'
+        const complete = fixture(completeMessages)
         const shell = createMetadataOnlySelectedConversation(complete.conversation)
         complete.character.chats[0] = shell
         const selection = {
@@ -98,26 +101,27 @@ describe('chat message UI targets', () => {
             storeRevision: 7,
         } as any
         const release = vi.fn()
-        const readConversationWindow = vi.fn(async ({ anchorMessageId, startIndex }: any) => {
-            let absoluteIndex = anchorMessageId === undefined
-                ? startIndex
-                : Number(anchorMessageId.slice(3))
+        const readConversationWindow = vi.fn(async ({ anchorMessageId, startIndex, limit }: any) => {
+            limit ??= 1
+            let absoluteIndex = startIndex
+            if (anchorMessageId !== undefined) {
+                absoluteIndex = completeMessages.findIndex((message) => message.chatId === anchorMessageId)
+            } else if (startIndex === undefined) {
+                absoluteIndex = Math.max(0, completeMessages.length - limit)
+            }
             if (startIndex === 8888) absoluteIndex = 8887
+            const messages = completeMessages.slice(absoluteIndex, absoluteIndex + limit)
             return {
                 revision: 7,
                 value: {
                     characterId: complete.character.chaId,
                     conversationId: shell.id,
                     startIndex: absoluteIndex,
-                    endIndex: absoluteIndex + 1,
+                    endIndex: absoluteIndex + messages.length,
                     totalMessages: 10_000,
-                    messages: [{
-                        role: absoluteIndex % 2 === 0 ? 'user' : 'char',
-                        data: `message-${absoluteIndex}`,
-                        chatId: anchorMessageId,
-                    }],
+                    messages,
                     hasMoreBefore: absoluteIndex > 0,
-                    hasMoreAfter: absoluteIndex < 9_999,
+                    hasMoreAfter: absoluteIndex + messages.length < 10_000,
                 },
             }
         })
@@ -148,12 +152,22 @@ describe('chat message UI targets', () => {
         const indexed = await queryChatMessageTargetAt(context as any, 7777)
         expect(indexed).toMatchObject({
             absoluteIndex: 7777,
-            message: { chatId: undefined, data: 'message-7777' },
+            message: { chatId: 'id-7777', data: 'message-7777' },
         })
         expect(readConversationWindow).toHaveBeenCalledTimes(3)
         expect(release).toHaveBeenCalledTimes(2)
         await expect(queryChatMessageTargetAt(context as any, 8888)).resolves.toBeNull()
         expect(release).toHaveBeenCalledTimes(3)
+
+        const duplicate = await queryChatMessageTargetById(
+            context as any,
+            'duplicate',
+            'last',
+        )
+        expect(duplicate).toMatchObject({
+            absoluteIndex: 9000,
+            message: { chatId: 'duplicate', data: 'message-9000' },
+        })
     })
 
     it('rejects every anchored result when selection changes during a multi-ID query', async () => {
@@ -242,6 +256,59 @@ describe('chat message UI targets', () => {
             'mismatched revision',
         )
         expect(release).toHaveBeenCalledOnce()
+    })
+
+    it('rejects ID and index results when selection changes during revision release', async () => {
+        const complete = fixture([{ role: 'user', data: 'message', chatId: 'message-id' }])
+        const shell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = shell
+        const initialSelection = {
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            navigationGeneration: 1,
+            storeRevision: 4,
+        } as any
+        const laterSelection = { ...initialSelection, navigationGeneration: 2 } as any
+        const window = {
+            revision: 4,
+            value: {
+                characterId: complete.character.chaId,
+                conversationId: shell.id,
+                startIndex: 0,
+                endIndex: 1,
+                totalMessages: 1,
+                messages: [{ role: 'user', data: 'message', chatId: 'message-id' }],
+                hasMoreBefore: false,
+                hasMoreAfter: false,
+            },
+        }
+
+        for (const query of [
+            (context: any) => queryChatMessageTargetById(context, 'message-id'),
+            (context: any) => queryChatMessageTargetAt(context, 0),
+        ]) {
+            let selection = initialSelection
+            const releasing = deferred<void>()
+            const release = vi.fn(() => releasing.promise)
+            const context = {
+                captureCurrent: () => ({ character: complete.character, conversation: shell }),
+                getCurrentSession: () => null,
+                captureSelectedConversationTarget: () => selection,
+                acquirePersistentRevision: vi.fn(async () => ({
+                    revision: 4,
+                    readConversationWindow: async () => window,
+                    release,
+                })),
+                acquireCompleteConversation: vi.fn(),
+            }
+
+            const pending = query(context)
+            await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+            selection = laterSelection
+            releasing.resolve()
+
+            await expect(pending).resolves.toBeNull()
+        }
     })
 
     it('routes role and both disabled-state toggles through session edits', () => {

@@ -38,4 +38,47 @@ describe('DevTool complete conversation lease', () => {
         lifetime.destroy()
         expect(release).toHaveBeenCalledOnce()
     })
+
+    test('releases the old lease and holds the replacement when selection changes', async () => {
+        const firstRelease = vi.fn()
+        const secondRelease = vi.fn()
+        const second = deferred<any>()
+        const acquire = vi.fn()
+            .mockResolvedValueOnce({ release: firstRelease })
+            .mockReturnValueOnce(second.promise)
+        const lifetime = new DevToolConversationLease()
+
+        await expect(lifetime.acquire({ conversationId: 'chat-a' } as any, acquire))
+            .resolves.toBe(true)
+        const replacing = lifetime.acquire({ conversationId: 'chat-b' } as any, acquire)
+
+        expect(firstRelease).toHaveBeenCalledOnce()
+        second.resolve({ release: secondRelease })
+        await expect(replacing).resolves.toBe(true)
+        lifetime.destroy()
+        expect(secondRelease).toHaveBeenCalledOnce()
+    })
+
+    test('discards a late stale acquisition without detaching the current replacement', async () => {
+        const first = deferred<any>()
+        const second = deferred<any>()
+        const firstRelease = vi.fn()
+        const secondRelease = vi.fn()
+        const acquire = vi.fn()
+            .mockReturnValueOnce(first.promise)
+            .mockReturnValueOnce(second.promise)
+        const lifetime = new DevToolConversationLease()
+
+        const older = lifetime.acquire({ conversationId: 'chat-a' } as any, acquire)
+        const newer = lifetime.acquire({ conversationId: 'chat-b' } as any, acquire)
+        second.resolve({ release: secondRelease })
+        await expect(newer).resolves.toBe(true)
+        first.resolve({ release: firstRelease })
+
+        await expect(older).resolves.toBe(false)
+        expect(firstRelease).toHaveBeenCalledOnce()
+        expect(secondRelease).not.toHaveBeenCalled()
+        lifetime.destroy()
+        expect(secondRelease).toHaveBeenCalledOnce()
+    })
 })

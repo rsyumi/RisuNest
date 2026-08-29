@@ -5,6 +5,7 @@ import type {
 
 export class DevToolConversationLease {
     private destroyed = false
+    private generation = 0
     private lease: CompleteConversationLease | null = null
 
     async acquire(
@@ -14,6 +15,10 @@ export class DevToolConversationLease {
             target: SelectedConversationTarget,
         ) => Promise<CompleteConversationLease>,
     ): Promise<boolean> {
+        const generation = ++this.generation
+        this.lease?.release()
+        this.lease = null
+        if (this.destroyed) return false
         if (!target) return !this.destroyed
         let lease: CompleteConversationLease
         try {
@@ -21,7 +26,7 @@ export class DevToolConversationLease {
         } catch {
             return false
         }
-        if (this.destroyed) {
+        if (this.destroyed || generation !== this.generation) {
             lease.release()
             return false
         }
@@ -32,6 +37,7 @@ export class DevToolConversationLease {
     destroy(): void {
         if (this.destroyed) return
         this.destroyed = true
+        this.generation++
         this.lease?.release()
         this.lease = null
     }

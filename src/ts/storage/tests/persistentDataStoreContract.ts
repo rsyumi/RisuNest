@@ -1795,6 +1795,37 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
+        it('exposes far duplicate IDs through bounded absolute ranges while anchors remain first-match', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const character = database.characters.find((entry) => entry.chaId === 'char-a')!
+            const conversation = character.chats.find((entry) => entry.id === 'conv-long')!
+            conversation.message[1].chatId = 'far-duplicate'
+            conversation.message[128].chatId = 'far-duplicate'
+            await store.replaceFromDatabase(database)
+
+            const anchored = await store.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-long',
+                anchorMessageId: 'far-duplicate',
+                before: 0,
+                after: 0,
+            })
+            const boundedTail = await store.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-long',
+                startIndex: 127,
+                limit: 3,
+            })
+
+            expect(anchored?.value).toMatchObject({ startIndex: 1, endIndex: 2 })
+            expect(boundedTail?.value.messages.map((message) => message.chatId)).toEqual([
+                'msg-127',
+                'far-duplicate',
+                'msg-129',
+            ])
+        })
+
         it('reads absolute conversation ranges with zero-based exclusive-end semantics', async () => {
             const { store } = await createHarness()
             await store.replaceFromDatabase(fixtureDatabase)

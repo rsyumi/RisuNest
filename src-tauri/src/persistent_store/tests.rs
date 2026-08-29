@@ -3256,6 +3256,75 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
 }
 
 #[test]
+fn conversation_windows_expose_far_duplicate_ids_through_bounded_ranges() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut first = message("first duplicate");
+    first["chatId"] = json!("far-duplicate");
+    let mut last = message("last duplicate");
+    last["chatId"] = json!("far-duplicate");
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+            start: 1,
+            delete_count: 1,
+            messages: vec![first],
+            conversation: None,
+            configured_index: None,
+        },
+    );
+    commit(
+        &mut store,
+        revision,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+            start: 128,
+            delete_count: 1,
+            messages: vec![last],
+            conversation: None,
+            configured_index: None,
+        },
+    );
+
+    let anchored = store
+        .read_conversation_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-long".to_owned(),
+                start_index: None,
+                limit: None,
+                anchor_message_id: Some("far-duplicate".to_owned()),
+                before: Some(0),
+                after: Some(0),
+            },
+            None,
+        )
+        .expect("read duplicate anchor")
+        .expect("conversation exists");
+    let bounded_tail = store
+        .read_conversation_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-long".to_owned(),
+                start_index: Some(127),
+                limit: Some(3),
+                anchor_message_id: None,
+                before: None,
+                after: None,
+            },
+            None,
+        )
+        .expect("read bounded duplicate tail")
+        .expect("conversation exists");
+
+    assert_eq!((anchored.value.start_index, anchored.value.end_index), (1, 2));
+    assert_eq!(bounded_tail.value.messages[1]["chatId"], "far-duplicate");
+}
+
+#[test]
 fn conversation_windows_support_strict_absolute_ranges() {
     let (_directory, store, _) = open_fixture();
     let range = |start_index, limit| ConversationWindowQuery {

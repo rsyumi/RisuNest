@@ -20,6 +20,7 @@
         acquireCompleteConversation,
         captureSelectedConversationTarget,
         getActiveConversationSession,
+        subscribeActiveConversationViewportSource,
     } from "src/ts/storage/persistentDataRuntime.svelte";
     import { DevToolConversationLease } from "./devToolLease";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
@@ -116,17 +117,26 @@
     let autopilot = $state([])
     let devToolReady = $state(false)
     const panelLease = new DevToolConversationLease()
+    let panelRefreshGeneration = 0
 
-    onMount(() => {
+    function refreshPanelLease(): void {
+        const generation = ++panelRefreshGeneration
+        devToolReady = false
         void panelLease.acquire(
             captureSelectedConversationTarget(),
             acquireCompleteConversation,
         ).then((ready) => {
-            devToolReady = ready
+            if (generation === panelRefreshGeneration) devToolReady = ready
         })
+    }
+
+    onMount(() => {
+        refreshPanelLease()
+        return subscribeActiveConversationViewportSource(refreshPanelLease)
     })
 
     onDestroy(() => {
+        panelRefreshGeneration++
         panelLease.destroy()
     })
 

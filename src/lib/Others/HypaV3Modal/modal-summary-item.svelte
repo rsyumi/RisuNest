@@ -41,6 +41,7 @@
     processRegexScript,
     getCategoryName,
   } from "./utils";
+  import { resolveHypaOrphanState } from "./hypaOrphanState";
 
   interface Props {
     summaryIndex: number;
@@ -164,7 +165,7 @@
     summary.chatMemos;
     const generation = ++orphanQueryGeneration;
     orphan = true;
-    void isOrphan().then((value) => {
+    void resolveHypaOrphanState(isOrphan()).then((value) => {
       if (generation === orphanQueryGeneration) orphan = value;
     });
   });

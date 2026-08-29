@@ -13,6 +13,7 @@ import { isSameSelectedConversationTarget } from './storage/activeWorkingSet.sve
 import type {
     ConversationWindow,
 } from './storage/persistentDataStore'
+import { CONVERSATION_RANGE_MAX_LIMIT } from './storage/persistentDataStore'
 import { isMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 
 export interface CurrentChatMessageTarget {
@@ -234,34 +235,43 @@ export async function queryChatMessageTargetsByIds(
     const selection = captureMatchingPersistentSelection(context, current)
     if (!selection) return []
     const lease = await context.acquirePersistentRevision(selection.storeRevision)
+    let results: CapturedChatMessageTarget[] = []
     let operationFailed = false
     try {
         if (lease.revision !== selection.storeRevision) {
             throw new Error('Persistent message query acquired a mismatched revision')
         }
-        const results: CapturedChatMessageTarget[] = []
-        for (const messageId of messageIds) {
-            const window = await lease.readConversationWindow({
-                characterId: selection.characterId,
-                conversationId: selection.conversationId,
-                anchorMessageId: messageId,
-                before: 0,
-                after: 0,
-            })
-            const recaptured = context.captureSelectedConversationTarget()
-            if (!recaptured || !isSameSelectedConversationTarget(recaptured, selection)) {
-                return []
-            }
-            const target = capturePersistentWindowTarget(
+        if (occurrence === 'last') {
+            results = await readLastPersistentTargets(
                 context,
                 current,
                 selection,
-                window,
-                messageId,
+                lease,
+                messageIds,
             )
-            if (target) results.push(target)
+        } else {
+            for (const messageId of messageIds) {
+                const window = await lease.readConversationWindow({
+                    characterId: selection.characterId,
+                    conversationId: selection.conversationId,
+                    anchorMessageId: messageId,
+                    before: 0,
+                    after: 0,
+                })
+                if (!isPersistentQueryCurrent(context, current, selection)) {
+                    results = []
+                    break
+                }
+                const target = capturePersistentWindowTarget(
+                    context,
+                    current,
+                    selection,
+                    window,
+                    messageId,
+                )
+                if (target) results.push(target)
+            }
         }
-        return results
     } catch (error) {
         operationFailed = true
         throw error
@@ -272,6 +282,7 @@ export async function queryChatMessageTargetsByIds(
             if (!operationFailed) throw error
         }
     }
+    return isPersistentQueryCurrent(context, current, selection) ? results : []
 }
 
 export function resolveChatMessageTarget(
@@ -562,6 +573,7 @@ async function readPersistentTarget(
     query: { startIndex: number; limit: number },
 ): Promise<CapturedChatMessageTarget | null> {
     const lease = await context.acquirePersistentRevision(selection.storeRevision)
+    let target: CapturedChatMessageTarget | null = null
     let operationFailed = false
     try {
         if (lease.revision !== selection.storeRevision) {
@@ -572,7 +584,7 @@ async function readPersistentTarget(
             conversationId: selection.conversationId,
             ...query,
         })
-        return capturePersistentWindowTarget(
+        target = capturePersistentWindowTarget(
             context,
             current,
             selection,
@@ -590,6 +602,94 @@ async function readPersistentTarget(
             if (!operationFailed) throw error
         }
     }
+    return isPersistentQueryCurrent(context, current, selection) ? target : null
+}
+
+async function readLastPersistentTargets(
+    context: AnchoredChatMessageUiContext,
+    current: CurrentChatMessageTarget,
+    selection: SelectedConversationTarget,
+    lease: AnchoredPersistentRevisionLease,
+    messageIds: readonly string[],
+): Promise<CapturedChatMessageTarget[]> {
+    const requested = new Set(messageIds)
+    const found = new Map<string, CapturedPersistentChatMessageTarget>()
+    const tail = await lease.readConversationWindow({
+        characterId: selection.characterId,
+        conversationId: selection.conversationId,
+        limit: 1,
+    })
+    if (!isPersistentQueryCurrent(context, current, selection)) return []
+    if (!tail) return []
+    validatePersistentWindowEvidence(selection, tail)
+    let endIndex = tail.value.totalMessages
+    while (endIndex > 0 && found.size < requested.size) {
+        const startIndex = Math.max(0, endIndex - CONVERSATION_RANGE_MAX_LIMIT)
+        const result = await lease.readConversationWindow({
+            characterId: selection.characterId,
+            conversationId: selection.conversationId,
+            startIndex,
+            limit: endIndex - startIndex,
+        })
+        if (!isPersistentQueryCurrent(context, current, selection)) return []
+        if (!result) return []
+        validatePersistentWindowEvidence(selection, result)
+        const window = result.value
+        if (
+            window.startIndex !== startIndex ||
+            window.endIndex !== endIndex ||
+            window.totalMessages !== tail.value.totalMessages ||
+            window.messages.length !== endIndex - startIndex
+        ) return []
+        for (let offset = window.messages.length - 1; offset >= 0; offset--) {
+            const message = window.messages[offset]
+            const messageId = message.chatId
+            if (messageId === undefined || !requested.has(messageId) || found.has(messageId)) continue
+            found.set(messageId, {
+                kind: 'persistent',
+                absoluteIndex: startIndex + offset,
+                ...current,
+                message,
+                session: null,
+                locator: null,
+                selection,
+            })
+        }
+        endIndex = startIndex
+    }
+    return messageIds.flatMap((messageId) => {
+        const target = found.get(messageId)
+        return target ? [target] : []
+    })
+}
+
+function validatePersistentWindowEvidence(
+    selection: SelectedConversationTarget,
+    result: { revision: number; value: ConversationWindow },
+): void {
+    if (result.revision !== selection.storeRevision) {
+        throw new Error('Persistent message query returned mismatched revision evidence')
+    }
+    if (
+        result.value.characterId !== selection.characterId ||
+        result.value.conversationId !== selection.conversationId
+    ) {
+        throw new Error('Persistent message query returned mismatched conversation evidence')
+    }
+}
+
+function isPersistentQueryCurrent(
+    context: AnchoredChatMessageUiContext,
+    current: CurrentChatMessageTarget,
+    selection: SelectedConversationTarget,
+): boolean {
+    const recaptured = context.captureSelectedConversationTarget()
+    const latest = context.captureCurrent()
+    return recaptured !== null &&
+        isSameSelectedConversationTarget(recaptured, selection) &&
+        latest?.character === current.character &&
+        latest.conversation === current.conversation &&
+        isMetadataOnlySelectedConversation(latest.conversation)
 }
 
 function capturePersistentWindowTarget(
