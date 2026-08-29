@@ -73,6 +73,9 @@ thread_local! {
     static TARGET_AFTER_ACTIVATION_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static TARGET_JOB_RELEASE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static TARGET_CONFLICT_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+    static OPERATION_READ_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+    static ABANDON_BEFORE_CLAIM_REPLACEMENT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static ABANDON_CLAIM_REMOVE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
     static BACKUP_FULL_VERIFICATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
@@ -4312,10 +4315,18 @@ impl PeerBidirectionalCommandState {
             }
         }
         let _guard = self.begin_target()?;
-        let operation = match journal.load() {
-            Ok(Some(operation)) => operation,
-            Ok(None) => return Ok(()),
-            Err(_) => return journal.abandon_invalid_record(operation_id),
+        let operation = match journal.load_for_acknowledge()? {
+            AcknowledgeOperationLoad::Valid(operation) => operation,
+            AcknowledgeOperationLoad::Absent => return Ok(()),
+            AcknowledgeOperationLoad::SemanticallyInvalid(snapshot) => {
+                #[cfg(test)]
+                if let Some(bytes) = ABANDON_BEFORE_CLAIM_REPLACEMENT
+                    .with(|replacement| replacement.borrow_mut().take())
+                {
+                    fs::write(journal.root.join(OPERATION_FILE), bytes)?;
+                }
+                return journal.abandon_invalid_record(operation_id, snapshot);
+            }
         };
         if operation.operation_id() != operation_id {
             return Err(PeerSyncError::Validation(
@@ -5264,6 +5275,17 @@ pub(crate) struct PeerBidirectionalOperationJournal {
     root: PathBuf,
 }
 
+enum AcknowledgeOperationLoad {
+    Absent,
+    Valid(PeerBidirectionalDurableOperation),
+    SemanticallyInvalid(InvalidOperationSnapshot),
+}
+
+struct InvalidOperationSnapshot {
+    bytes: Vec<u8>,
+    operation: PeerBidirectionalDurableOperation,
+}
+
 impl PeerBidirectionalOperationJournal {
     pub(crate) fn new(app_root: &Path) -> Self {
         Self {
@@ -5281,7 +5303,27 @@ impl PeerBidirectionalOperationJournal {
         Ok(Some(operation))
     }
 
+    fn load_for_acknowledge(&self) -> Result<AcknowledgeOperationLoad, PeerSyncError> {
+        let Some(bytes) = self.read_bounded()? else {
+            return Ok(AcknowledgeOperationLoad::Absent);
+        };
+        let operation = serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        match operation.validate() {
+            Ok(()) => Ok(AcknowledgeOperationLoad::Valid(operation)),
+            Err(_) => Ok(AcknowledgeOperationLoad::SemanticallyInvalid(
+                InvalidOperationSnapshot { bytes, operation },
+            )),
+        }
+    }
+
     fn read_bounded(&self) -> Result<Option<Vec<u8>>, PeerSyncError> {
+        #[cfg(test)]
+        if OPERATION_READ_FAILPOINT.with(|enabled| enabled.replace(false)) {
+            return Err(PeerSyncError::Storage(
+                "simulated bidirectional operation read failure".to_owned(),
+            ));
+        }
         let path = self.root.join(OPERATION_FILE);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -5308,12 +5350,10 @@ impl PeerBidirectionalOperationJournal {
         Ok(Some(bytes))
     }
 
-    fn abandon_invalid_record(&self, operation_id: &str) -> Result<(), PeerSyncError> {
-        let Some(bytes) = self.read_bounded()? else {
-            return Ok(());
-        };
-        let operation = serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes)
-            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    fn validate_abandon_identity(
+        operation: &PeerBidirectionalDurableOperation,
+        operation_id: &str,
+    ) -> Result<(), PeerSyncError> {
         let schema = match &operation {
             PeerBidirectionalDurableOperation::SourcePrepared { schema, .. }
             | PeerBidirectionalDurableOperation::TargetPrepared { schema, .. }
@@ -5331,11 +5371,85 @@ impl PeerBidirectionalOperationJournal {
                 "another bidirectional operation is retained".to_owned(),
             ));
         }
-        match fs::remove_file(self.root.join(OPERATION_FILE)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        Ok(())
+    }
+
+    fn abandon_invalid_record(
+        &self,
+        operation_id: &str,
+        snapshot: InvalidOperationSnapshot,
+    ) -> Result<(), PeerSyncError> {
+        Self::validate_abandon_identity(&snapshot.operation, operation_id)?;
+        let operation_path = self.root.join(OPERATION_FILE);
+        let claim_path = self
+            .root
+            .join(format!(".operation-abandon-{}.claim", uuid::Uuid::new_v4()));
+        fs::rename(&operation_path, &claim_path)?;
+
+        let validation = (|| {
+            let claimed = self.read_bounded_path(&claim_path)?;
+            if claimed != snapshot.bytes {
+                return Err(PeerSyncError::Storage(
+                    "bidirectional operation changed before abandon".to_owned(),
+                ));
+            }
+            let operation = serde_json::from_slice::<PeerBidirectionalDurableOperation>(&claimed)
+                .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+            if operation.validate().is_ok() {
+                return Err(PeerSyncError::Storage(
+                    "valid bidirectional operation cannot use tolerant abandon".to_owned(),
+                ));
+            }
+            Self::validate_abandon_identity(&operation, operation_id)
+        })();
+        if let Err(error) = validation {
+            self.restore_claim(&claim_path)?;
+            return Err(error);
         }
+
+        #[cfg(test)]
+        if ABANDON_CLAIM_REMOVE_FAILPOINT.with(|enabled| enabled.replace(false)) {
+            let error = PeerSyncError::Storage(
+                "simulated bidirectional operation claim removal failure".to_owned(),
+            );
+            self.restore_claim(&claim_path)?;
+            return Err(error);
+        }
+        if let Err(error) = fs::remove_file(&claim_path) {
+            let original = PeerSyncError::from(error);
+            self.restore_claim(&claim_path)?;
+            return Err(original);
+        }
+        Ok(())
+    }
+
+    fn read_bounded_path(&self, path: &Path) -> Result<Vec<u8>, PeerSyncError> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_OPERATION_BYTES
+        {
+            return Err(PeerSyncError::Storage(
+                "bidirectional operation record is invalid".to_owned(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        File::open(path)?
+            .take(MAX_OPERATION_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_OPERATION_BYTES {
+            return Err(PeerSyncError::Storage(
+                "bidirectional operation record exceeds its bound".to_owned(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn restore_claim(&self, claim_path: &Path) -> Result<(), PeerSyncError> {
+        let operation_path = self.root.join(OPERATION_FILE);
+        fs::hard_link(claim_path, &operation_path)?;
+        fs::remove_file(claim_path)?;
+        Ok(())
     }
 
     pub(crate) fn store(
@@ -13029,6 +13143,64 @@ mod tests {
             state.acknowledge(directory.path(), &mut store, operation_id),
             Err(PeerSyncError::Protocol(message)) if message.contains("target operation is active")
         ));
+        assert_eq!(fs::read(operation_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn tolerant_abandon_review_propagates_a_transient_strict_load_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174246";
+        let bytes = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &bytes);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        OPERATION_READ_FAILPOINT.with(|enabled| enabled.set(true));
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
+        assert_eq!(fs::read(operation_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn tolerant_abandon_review_rejects_a_valid_replacement_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174247";
+        let invalid = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &invalid);
+        let valid = serde_json::to_vec(&PeerBidirectionalDurableOperation::TargetPrepared {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            local_generation: generation("local", "3", 'e'),
+            conflict_policy: TargetPreparedConflictPolicy::Reject,
+            changed: true,
+            remote_backup_required: false,
+            transferred_objects: 2,
+            transferred_bytes: 19,
+            backups: vec![],
+        })
+        .unwrap();
+        ABANDON_BEFORE_CLAIM_REPLACEMENT
+            .with(|replacement| replacement.replace(Some(valid.clone())));
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
+        assert_eq!(fs::read(operation_path).unwrap(), valid);
+    }
+
+    #[test]
+    fn tolerant_abandon_review_restores_after_claim_cleanup_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174248";
+        let bytes = invalid_target_prepared_journal_bytes(operation_id);
+        let operation_path = write_operation_journal(directory.path(), &bytes);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        ABANDON_CLAIM_REMOVE_FAILPOINT.with(|enabled| enabled.set(true));
+
+        assert!(PeerBidirectionalCommandState::default()
+            .acknowledge(directory.path(), &mut store, operation_id)
+            .is_err());
         assert_eq!(fs::read(operation_path).unwrap(), bytes);
     }
 
