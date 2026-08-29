@@ -447,6 +447,93 @@ async function createVersion11ColdlessDatabase(
     database.close()
 }
 
+async function createVersion13OccurrenceDatabase(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    const openRequest = indexedDB.open(databaseName, 13)
+    openRequest.onupgradeneeded = () => {
+        for (const storeName of [
+            'meta',
+            'root',
+            'presets',
+            'catalog',
+            'characters',
+            'conversations',
+            'messagePages',
+            'messageOccurrences',
+            'pluginStorage',
+            'pluginStorageMetadata',
+            'assetAliases',
+            'assetOwnerHeads',
+            'assetRepositoryAuthority',
+            'coldAliases',
+            'coldPayloadAuthority',
+        ]) {
+            openRequest.result.createObjectStore(storeName, { keyPath: 'key' })
+        }
+        const occurrences = openRequest.transaction!.objectStore('messageOccurrences')
+        occurrences.createIndex(
+            'byConversationMessageIndex',
+            ['generation', 'characterId', 'conversationId', 'messageId', 'absoluteIndex'],
+        )
+        occurrences.createIndex(
+            'byConversationIndex',
+            ['generation', 'characterId', 'conversationId', 'absoluteIndex'],
+        )
+    }
+    const database = await requestResultForTest(openRequest)
+    const generation = 'revision-1'
+    const transaction = database.transaction(
+        ['meta', 'root', 'conversations', 'messagePages', 'messageOccurrences'],
+        'readwrite',
+    )
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 13 })
+    transaction.objectStore('meta').put({ key: 'activeGeneration', value: generation })
+    transaction.objectStore('meta').put({ key: 'currentRevision', value: 1 })
+    transaction.objectStore('root').put({ key: generation, generation, value: {} })
+    transaction.objectStore('conversations').put({
+        key: `${generation}:conversation:char-a:conv-long`,
+        generation,
+        value: {
+            summary: {
+                id: 'conv-long',
+                characterId: 'char-a',
+                name: 'Legacy occurrence chat',
+                configuredIndex: 0,
+                recentAt: 0,
+                messageCount: 3,
+            },
+            detail: { id: 'conv-long', name: 'Legacy occurrence chat', note: '', localLore: [] },
+        },
+    })
+    const messages = [
+        { role: 'user', data: 'first', chatId: 'duplicate' },
+        { role: 'char', data: 'middle', chatId: 'middle' },
+        { role: 'user', data: 'last', chatId: 'duplicate' },
+    ]
+    transaction.objectStore('messagePages').put({
+        key: `${generation}:message-page:char-a:conv-long:0`,
+        generation,
+        characterId: 'char-a',
+        conversationId: 'conv-long',
+        pageIndex: 0,
+        value: messages,
+    })
+    for (let absoluteIndex = 0; absoluteIndex < messages.length; absoluteIndex++) {
+        transaction.objectStore('messageOccurrences').put({
+            key: `${generation}:message-occurrence:char-a:conv-long:${absoluteIndex}`,
+            generation,
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            messageId: messages[absoluteIndex].chatId,
+            absoluteIndex,
+        })
+    }
+    await completeTransaction(transaction)
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -535,7 +622,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
 
         expect(cursorCalls).toEqual(Array.from({ length: 4 }, () => ({
             store: 'messageOccurrences',
-            index: 'byConversationMessageIndex',
+            index: 'byLookupKey',
         })))
         expect(pageRangeReads).toEqual([])
     })
@@ -549,10 +636,10 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(13)
+        expect(database.version).toBe(14)
         const transaction = database.transaction('messageOccurrences', 'readonly')
         expect(transaction.objectStore('messageOccurrences').indexNames.contains(
-            'byConversationMessageIndex',
+            'byLookupKey',
         )).toBe(true)
         expect(await requestResultForTest(
             transaction.objectStore('messageOccurrences').count(),
@@ -615,6 +702,36 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             before: 0,
             after: 0,
         })).resolves.toMatchObject({ value: { startIndex: 127 } })
+    })
+
+    it('compacts version 13 per-message occurrences into indexed page rows', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `message-occurrence-v13-upgrade-${databaseSequence++}`
+        await createVersion13OccurrenceDatabase(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        await store.open()
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(14)
+        const transaction = database.transaction('messageOccurrences', 'readonly')
+        const occurrences = transaction.objectStore('messageOccurrences')
+        expect(occurrences.indexNames.contains('byConversationMessageIndex')).toBe(false)
+        expect(occurrences.indexNames.contains('byLookupKey')).toBe(true)
+        expect(await requestResultForTest(occurrences.count())).toBe(1)
+        await completeTransaction(transaction)
+        database.close()
+
+        const query = (anchorOccurrence: 'first' | 'last') => store.readConversationWindow({
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            anchorMessageId: 'duplicate',
+            anchorOccurrence,
+            before: 0,
+            after: 0,
+        })
+        await expect(query('first')).resolves.toMatchObject({ value: { startIndex: 0 } })
+        await expect(query('last')).resolves.toMatchObject({ value: { startIndex: 2 } })
     })
 
     it('keeps ordinary owner invalidation bounded with a large head set', async () => {
@@ -768,7 +885,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(13)
+        expect(database.version).toBe(14)
         const transaction = database.transaction(
             ['assetAliases', 'assetOwnerHeads', 'assetRepositoryAuthority'],
             'readonly',
@@ -822,7 +939,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(13)
+        expect(database.version).toBe(14)
         const transaction = database.transaction('assetOwnerHeads', 'readonly')
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)
@@ -844,7 +961,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(13)
+        expect(database.version).toBe(14)
         const transaction = database.transaction(
             ['coldAliases', 'coldPayloadAuthority'],
             'readonly',
@@ -1922,7 +2039,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             .spyOn(IDBIndex.prototype, 'openCursor')
             .mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex['openCursor']>) {
                 if (this.name === 'byConversationPage') conversationPageCursors++
-                if (this.name === 'byConversationMessageIndex') occurrenceCursors++
+                if (this.name === 'byLookupKey') occurrenceCursors++
                 return originalOpenCursor.apply(this, args)
             })
         try {

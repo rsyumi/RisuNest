@@ -48,7 +48,7 @@ import {
 import { parseAssetRepositoryAuthorityState } from './assetRepositoryAuthority'
 import { parseColdPayloadAuthorityState } from './coldPayloadAuthority'
 
-const DATABASE_VERSION = 13
+const DATABASE_VERSION = 14
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -168,13 +168,13 @@ function replacementOwnerTuplesEqual(
         && isEqual(left.entries, right.entries)
 }
 
-interface StoredMessageOccurrence {
+interface StoredMessageOccurrencePage {
     key: string
     generation: string
     characterId: string
     conversationId: string
-    messageId: string
-    absoluteIndex: number
+    pageIndex: number
+    lookupKeys: string[]
 }
 
 function commitCharacterParents(input: WorkingSetCommit): Map<string, CharacterDetail> {
@@ -416,23 +416,32 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 ['generation', 'characterId'],
             )
             this.createIndex(transaction.objectStore('messagePages'), 'byGeneration', 'generation')
+            const messageOccurrences = transaction.objectStore('messageOccurrences')
+            if (event.oldVersion === 13) {
+                for (const oldIndex of ['byConversationMessageIndex', 'byConversationIndex']) {
+                    if (messageOccurrences.indexNames.contains(oldIndex)) {
+                        messageOccurrences.deleteIndex(oldIndex)
+                    }
+                }
+            }
             this.createIndex(
-                transaction.objectStore('messageOccurrences'),
-                'byConversationMessageIndex',
-                ['generation', 'characterId', 'conversationId', 'messageId', 'absoluteIndex'],
+                messageOccurrences,
+                'byLookupKey',
+                'lookupKeys',
+                { multiEntry: true },
             )
             this.createIndex(
-                transaction.objectStore('messageOccurrences'),
-                'byConversationIndex',
-                ['generation', 'characterId', 'conversationId', 'absoluteIndex'],
+                messageOccurrences,
+                'byConversationPage',
+                ['generation', 'characterId', 'conversationId', 'pageIndex'],
             )
             this.createIndex(
-                transaction.objectStore('messageOccurrences'),
+                messageOccurrences,
                 'byGenerationCharacter',
                 ['generation', 'characterId'],
             )
             this.createIndex(
-                transaction.objectStore('messageOccurrences'),
+                messageOccurrences,
                 'byGeneration',
                 'generation',
             )
@@ -496,7 +505,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (event.oldVersion > 0 && event.oldVersion < 12) {
                 this.backfillColdPayloadAuthority(transaction)
             }
-            if (event.oldVersion > 0 && event.oldVersion < 13) {
+            if (event.oldVersion > 0 && event.oldVersion < 14) {
                 this.backfillMessageOccurrences(transaction)
             }
         }
@@ -2762,30 +2771,14 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             pageIndex,
             value: messages,
         })
-        const occurrences = transaction.objectStore('messageOccurrences')
-        const pageStart = pageIndex * MESSAGE_PAGE_SIZE
-        for (let offset = 0; offset < messages.length; offset++) {
-            const absoluteIndex = pageStart + offset
-            const key = this.messageOccurrenceKey(
-                generation,
-                characterId,
-                conversationId,
-                absoluteIndex,
-            )
-            const messageId = messages[offset].chatId
-            if (messageId === undefined) {
-                occurrences.delete(key)
-                continue
-            }
-            occurrences.put({
-                key,
-                generation,
-                characterId,
-                conversationId,
-                messageId,
-                absoluteIndex,
-            } satisfies StoredMessageOccurrence)
-        }
+        this.putMessageOccurrencePage(
+            transaction,
+            generation,
+            characterId,
+            conversationId,
+            pageIndex,
+            messages,
+        )
     }
 
     private async refreshCharacterSummary(
@@ -2968,15 +2961,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         occurrence: 'first' | 'last',
     ): Promise<{ index: number; page: StoredMessagePage } | null> {
         if (totalMessages === 0) return Promise.resolve(null)
-        const range = this.keyRangeFactory.bound(
-            [generation, characterId, conversationId, messageId, 0],
-            [generation, characterId, conversationId, messageId, MAX_INDEX_VALUE],
+        const lookupKey = this.messageOccurrenceLookupKey(
+            generation,
+            characterId,
+            conversationId,
+            messageId,
         )
         return new Promise((resolve, reject) => {
             const request = transaction
                 .objectStore('messageOccurrences')
-                .index('byConversationMessageIndex')
-                .openCursor(range, occurrence === 'last' ? 'prev' : 'next')
+                .index('byLookupKey')
+                .openCursor(lookupKey, occurrence === 'last' ? 'prev' : 'next')
             request.onerror = () => reject(request.error)
             request.onsuccess = () => {
                 const cursor = request.result
@@ -2984,24 +2979,31 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     resolve(null)
                     return
                 }
-                const record = cursor.value as StoredMessageOccurrence
-                if (record.absoluteIndex >= totalMessages) {
-                    reject(new Error('Persistent message occurrence exceeds conversation bounds'))
+                const record = cursor.value as StoredMessageOccurrencePage
+                const pageStart = record.pageIndex * MESSAGE_PAGE_SIZE
+                if (pageStart >= totalMessages) {
+                    reject(new Error('Persistent message occurrence page exceeds conversation bounds'))
                     return
                 }
-                const pageIndex = Math.floor(record.absoluteIndex / MESSAGE_PAGE_SIZE)
                 const pageRequest = transaction.objectStore('messagePages').get(
-                    this.messagePageKey(generation, characterId, conversationId, pageIndex),
+                    this.messagePageKey(
+                        generation,
+                        characterId,
+                        conversationId,
+                        record.pageIndex,
+                    ),
                 )
                 pageRequest.onerror = () => reject(pageRequest.error)
                 pageRequest.onsuccess = () => {
                     const page = pageRequest.result as StoredMessagePage | undefined
-                    const message = page?.value[record.absoluteIndex % MESSAGE_PAGE_SIZE]
-                    if (!page || message?.chatId !== messageId) {
+                    const indexInPage = occurrence === 'last'
+                        ? page?.value.findLastIndex((message) => message.chatId === messageId) ?? -1
+                        : page?.value.findIndex((message) => message.chatId === messageId) ?? -1
+                    if (!page || indexInPage < 0) {
                         reject(new Error('Persistent message occurrence index is inconsistent'))
                         return
                     }
-                    resolve({ index: record.absoluteIndex, page })
+                    resolve({ index: pageStart + indexInPage, page })
                 }
             }
         })
@@ -3022,9 +3024,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             ),
         )
         await this.deleteIndexRange(
-            transaction.objectStore('messageOccurrences').index('byConversationIndex'),
+            transaction.objectStore('messageOccurrences').index('byConversationPage'),
             this.keyRangeFactory.bound(
-                [generation, characterId, conversationId, startPage * MESSAGE_PAGE_SIZE],
+                [generation, characterId, conversationId, startPage],
                 [generation, characterId, conversationId, MAX_INDEX_VALUE],
             ),
         )
@@ -3217,8 +3219,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.database
     }
 
-    private createIndex(store: IDBObjectStore, name: string, keyPath: string | string[]): void {
-        if (!store.indexNames.contains(name)) store.createIndex(name, keyPath)
+    private createIndex(
+        store: IDBObjectStore,
+        name: string,
+        keyPath: string | string[],
+        options?: IDBIndexParameters,
+    ): void {
+        if (!store.indexNames.contains(name)) store.createIndex(name, keyPath, options)
     }
 
     private migrateAssetAliasKeys(transaction: IDBTransaction): void {
@@ -3250,31 +3257,20 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     private backfillMessageOccurrences(transaction: IDBTransaction): void {
         const pages = transaction.objectStore('messagePages')
-        const occurrences = transaction.objectStore('messageOccurrences')
+        transaction.objectStore('messageOccurrences').clear()
         const request = pages.openCursor()
         request.onsuccess = () => {
             const cursor = request.result
             if (!cursor) return
             const page = cursor.value as StoredMessagePage
-            const pageStart = page.pageIndex * MESSAGE_PAGE_SIZE
-            for (let offset = 0; offset < page.value.length; offset++) {
-                const messageId = page.value[offset].chatId
-                if (messageId === undefined) continue
-                const absoluteIndex = pageStart + offset
-                occurrences.put({
-                    key: this.messageOccurrenceKey(
-                        page.generation,
-                        page.characterId,
-                        page.conversationId,
-                        absoluteIndex,
-                    ),
-                    generation: page.generation,
-                    characterId: page.characterId,
-                    conversationId: page.conversationId,
-                    messageId,
-                    absoluteIndex,
-                } satisfies StoredMessageOccurrence)
-            }
+            this.putMessageOccurrencePage(
+                transaction,
+                page.generation,
+                page.characterId,
+                page.conversationId,
+                page.pageIndex,
+                page.value,
+            )
             cursor.continue()
         }
     }
@@ -3492,13 +3488,40 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return `${generation}:message-page:${characterId}:${conversationId}:${pageIndex}`
     }
 
-    private messageOccurrenceKey(
+    private putMessageOccurrencePage(
+        transaction: IDBTransaction,
         generation: string,
         characterId: string,
         conversationId: string,
-        absoluteIndex: number,
+        pageIndex: number,
+        messages: readonly Message[],
+    ): void {
+        const messageIds = new Set<string>()
+        for (const message of messages) {
+            if (message.chatId !== undefined) messageIds.add(message.chatId)
+        }
+        transaction.objectStore('messageOccurrences').put({
+            key: `${generation}:message-occurrence-page:${characterId}:${conversationId}:${String(pageIndex).padStart(16, '0')}`,
+            generation,
+            characterId,
+            conversationId,
+            pageIndex,
+            lookupKeys: [...messageIds].map((messageId) => this.messageOccurrenceLookupKey(
+                generation,
+                characterId,
+                conversationId,
+                messageId,
+            )),
+        } satisfies StoredMessageOccurrencePage)
+    }
+
+    private messageOccurrenceLookupKey(
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        messageId: string,
     ): string {
-        return `${generation}:message-occurrence:${characterId}:${conversationId}:${absoluteIndex}`
+        return JSON.stringify([generation, characterId, conversationId, messageId])
     }
 
     private pluginStorageKey(generation: string, key: string): string {

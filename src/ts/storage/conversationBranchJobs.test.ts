@@ -1,4 +1,4 @@
-import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, Message } from './database.svelte'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
@@ -253,15 +253,29 @@ describe('pinned conversation branch jobs', () => {
             chatId: 'marker',
         } as Message
 
-        const result = await copyPinnedConversationBranch(store, {
-            characterId: 'char-a',
-            sourceConversationId: 'source-chat',
-            sourceRevision: imported.revision,
-            inclusiveEndIndex: messages.length - 1,
-            branch,
-            branchMarker: marker,
-            pageSize: 128,
+        let occurrencePuts = 0
+        const originalPut = IDBObjectStore.prototype.put
+        const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+            this: IDBObjectStore,
+            ...args: Parameters<IDBObjectStore['put']>
+        ) {
+            if (this.name === 'messageOccurrences') occurrencePuts++
+            return originalPut.apply(this, args)
         })
+        let result
+        try {
+            result = await copyPinnedConversationBranch(store, {
+                characterId: 'char-a',
+                sourceConversationId: 'source-chat',
+                sourceRevision: imported.revision,
+                inclusiveEndIndex: messages.length - 1,
+                branch,
+                branchMarker: marker,
+                pageSize: 128,
+            })
+        } finally {
+            putSpy.mockRestore()
+        }
 
         expect(result).toMatchObject({
             sourceStartIndex: 0,
@@ -273,6 +287,9 @@ describe('pinned conversation branch jobs', () => {
         expect(readPages!.mock.calls.every(([query]) => query.limit <= 128)).toBe(true)
         expect(readPages!.mock.calls[0][0]).toMatchObject({ startIndex: 0, limit: 128 })
         expect(readPages!.mock.calls[1][0]).toMatchObject({ startIndex: 128, limit: 128 })
+        expect(occurrencePuts).toBe(
+            Math.ceil(messages.length / 128) + Math.ceil((messages.length + 1) / 128),
+        )
 
         const expected = structuredClone(database)
         expected.characters[0].chats.unshift({
