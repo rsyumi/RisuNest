@@ -140,6 +140,52 @@ it('interrupts top-level infinite source and cleans up before running later sour
     expect(child.stdout).toContain('bounded-source-ok')
 })
 
+it.each([
+    { label: 'a successful run', runFailure: undefined },
+    { label: 'a rejected run', runFailure: new Error('source execution failed') },
+])('closes the child thread before removing it after $label', async ({ runFailure }) => {
+    const calls: string[] = []
+    const thread = {
+        loadString: () => calls.push('load'),
+        setTimeout: () => calls.push('setTimeout'),
+        run: async () => {
+            calls.push('run')
+            if (runFailure) throw runFailure
+        },
+        close: () => calls.push('close'),
+    }
+    const engine = {
+        global: {
+            newThread: () => {
+                calls.push('newThread')
+                return thread
+            },
+            getTop: () => {
+                calls.push('getTop')
+                return 7
+            },
+            remove: (index: number) => calls.push(`remove:${index}`),
+        },
+    }
+    const { runLuaSource } = await import('./luaRuntime')
+
+    const pendingRun = runLuaSource(engine as never, 'return 1', 25)
+    if (runFailure) {
+        await expect(pendingRun).rejects.toBe(runFailure)
+    } else {
+        await expect(pendingRun).resolves.toBeUndefined()
+    }
+    expect(calls).toEqual([
+        'newThread',
+        'getTop',
+        'load',
+        'setTimeout',
+        'run',
+        'close',
+        'remove:7',
+    ])
+})
+
 it('interrupts a Lua handler invoked from JavaScript through functionTimeout', async () => {
     const child = await runIsolatedWasmoon(`
         const factory = new LuaFactory()
