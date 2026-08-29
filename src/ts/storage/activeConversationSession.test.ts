@@ -1105,7 +1105,7 @@ describe('ActiveConversationSession', () => {
         const pins = reasons.map((reason) => session.acquirePin(reason))
         const secondDirty = session.acquirePin('dirty')
 
-        expect(session.evictionEnabled).toBe(false)
+        expect('evictionEnabled' in session).toBe(false)
         expect(session.activePinReasons).toEqual(reasons)
         expect(session.pinCount('dirty')).toBe(2)
         pins[0].release()
@@ -1251,7 +1251,7 @@ describe('ActiveConversationSession', () => {
         expect(session.acknowledgePersisted(event.sessionToken, 1, 8)).toBe(true)
         expect(session.persistedVersion).toBe(1)
         expect(session.materializeCompatibilityArray()).toBe(conversation.message)
-        expect(session.evictionEnabled).toBe(false)
+        expect('evictionEnabled' in session).toBe(false)
     })
 
     it('emits a complete ordered fallback event for a multi-command transaction', () => {
@@ -1338,7 +1338,7 @@ describe('ActiveConversationSession', () => {
         expect(session.residentIntervals).toHaveLength(1)
         expect(session.residentIntervals[0].endIndex -
             session.residentIntervals[0].startIndex).toBe(2)
-        expect(session.evictionEnabled).toBe(false)
+        expect('evictionEnabled' in session).toBe(false)
         expect(session.materializeCompatibilityArray()).toBe(conversation.message)
     })
 

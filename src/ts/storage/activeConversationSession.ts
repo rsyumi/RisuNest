@@ -1062,7 +1062,6 @@ export class ActiveConversationTransaction {
 export class ActiveConversationSession {
     readonly characterId: string
     readonly conversationId: string
-    readonly evictionEnabled = false
 
     private conversation: Chat
     private readonly onMutation?: (event: ActiveConversationMutationEvent) => void
