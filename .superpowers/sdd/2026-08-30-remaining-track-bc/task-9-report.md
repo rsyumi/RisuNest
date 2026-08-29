@@ -2,6 +2,16 @@
 
 Status: Implemented and validated, pending review approval.
 
+## Review fix round 2
+
+The stage invariant now runs after every completed mutating operation and after the bounded read-only stages. It waits for the metadata shell, proves the complete session is absent, reads the authoritative conversation from IndexedDB, compares the full `Chat` value and ordered message IDs with the oracle, checks the exact record and selected-authority revision, and counts viewport residents to enforce the 64-row budget. Intermediate corruption can no longer be hidden by a later repair or by the final-only comparison.
+
+The revision-conflict RED expected one persisted message with ID `op-conflict`, content `stale conflict attempt`, and stable evidence metadata, but found zero because the old test retried a substitute message. The stale attempt and retry now append structured clones of one intended `Message`. After the competing root commit, conflict, runtime refresh, and retry, IndexedDB contains exactly one value equal to that intended message.
+
+Hypa now invokes `captureCurrentHypaMessageById` while the runtime is windowed and `getActiveConversationSession()` is null. The test presents the adapter with its production metadata-shell brand after dynamic module isolation, spies on the real local store, and proves `acquireRevision(expectedRevision)` served a persistent anchored result. No complete lease is acquired, and the full stage invariant confirms the runtime remains demoted and within budget afterward.
+
+This round changes only the corpus test and this report. No product file changed.
+
 ## Review fix round 1
 
 The corpus now invokes each named production gateway instead of appending checklist labels. Trigger runs `runTrigger` with a 10,000-message compatibility `ConversationOperationContext`; Lua runs `runScripted` through the same authority; CBS calls the registered production history callback against the operation database; regex executes the production regex plan and reconciles its exact operation batch. Public `sendChat` uses a controlled streaming provider while promotion, mutation evidence, acknowledgement, persistence, and demotion remain owned by the real local runtime.
@@ -34,7 +44,7 @@ Review-round final corpus command:
 
 `$env:VITE_DISABLE_REALM='true'; pnpm vitest run src/ts/storage/selectedConversationEvictionCorpus.test.ts --reporter=verbose`
 
-Result: 1 file passed, 1 test passed, 11.20 seconds total on the recorded run.
+Round 2 result: 1 file passed, 1 test passed, 11.78 seconds total.
 
 ## Validation evidence
 
@@ -54,13 +64,13 @@ Production build:
 
 `$env:VITE_DISABLE_REALM='true'; pnpm build`
 
-Result: passed in 17.75 seconds. Existing CSS `::highlight`, externalized Node module, dynamic import, and chunk-size warnings remain.
+Round 2 result: passed in 14.99 seconds. Existing CSS `::highlight`, externalized Node module, dynamic import, and chunk-size warnings remain.
 
 Full TypeScript suite:
 
 `$env:VITE_DISABLE_REALM='true'; pnpm test`
 
-Review-round result after the Task 8 occurrence-index fix: 255 files passed, 2 skipped. 3,315 tests passed, 6 skipped. Duration 54.85 seconds.
+Round 2 result: 255 files passed, 2 skipped. 3,315 tests passed, 6 skipped. Duration 54.33 seconds.
 
 Formatting command:
 
@@ -74,11 +84,11 @@ Ruling: The IndexedDB persistent store remains authoritative. The oracle is comp
 
 Ruling: Every named complete-array consumer acquires the existing exact complete lease. Every bounded consumer remains windowed and reads from a pinned persistent revision.
 
-Ruling: Demotion is asserted after each operation. A metadata-only shell is published, the active complete session is absent, and the selected authority carries the exact current revision and message count.
+Ruling: Demotion is asserted after each operation. A metadata-only shell is published, the active complete session is absent, the selected authority carries the exact current revision and message count, the authoritative IndexedDB conversation equals the oracle, and viewport residents remain at or below 64.
 
-Ruling: Failed save and revision conflict attempts preserve the complete dirty owner, retry the same mutation, and increment the oracle revision only after a successful commit.
+Ruling: Failed save and revision conflict attempts preserve the intended mutation. The conflict retry uses the same exact ID, content, role, and evidence metadata as the stale attempt, persists it once, and increments the oracle revision only after the successful commit.
 
-Ruling: Screenshot uses the screenshot source lease. Search uses anchored exact-ID queries. Hypa uses its production anchored adapter and releases its read lease before redemotion.
+Ruling: Screenshot uses the screenshot source lease. Search uses anchored exact-ID queries. Hypa starts and ends windowed, uses its production anchored adapter and a pinned IndexedDB revision, and never acquires a complete conversation lease.
 
 Ruling: Branch uses the persistent UI gateway after the shifted interior delete, then verifies the exact persisted prefix and branch marker before returning to the source.
 

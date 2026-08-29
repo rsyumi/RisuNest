@@ -202,15 +202,32 @@ describe('selected conversation eviction correctness corpus', () => {
             ) => runtime.acquireCompleteConversation(reason, target),
         }
 
-        const assertWindowed = async () => {
+        const assertWindowed = async (stage = 'unnamed stage') => {
             await waitForWindowed(runtime)
             expect(() => selectedConversation().message).toThrow('metadata-only')
+            expect(Object.keys(selectedConversation()), `${stage}: metadata shell keys`)
+                .not.toContain('message')
             expect(runtime.captureSelectedConversationAuthority()).toMatchObject({
                 characterId: 'char-a',
                 conversationId: 'chat-a',
                 storeRevision: expectedRevision,
                 totalMessages: oracle.message.length,
             })
+            const persisted = await store.readConversation('char-a', 'chat-a')
+            expect(persisted, `${stage}: authoritative conversation`).not.toBeNull()
+            expect(persisted!.revision, `${stage}: authoritative revision`).toBe(expectedRevision)
+            expect(persisted!.value, `${stage}: authoritative conversation value`).toEqual(oracle)
+            expect(
+                persisted!.value.message.map((message) => message.chatId),
+                `${stage}: authoritative message IDs`,
+            ).toEqual(oracle.message.map((message) => message.chatId))
+            const viewport = runtime.getActiveConversationViewportSource()!.snapshot()
+            let residentRows = 0
+            for (let index = 0; index < viewport.totalMessages; index++) {
+                if (viewport.rowAt(index) !== undefined) residentRows += 1
+            }
+            expect(residentRows, `${stage}: resident viewport rows`)
+                .toBeLessThanOrEqual(VIEWPORT_ROW_BUDGET)
         }
 
         const mutateComplete = async (
@@ -239,7 +256,7 @@ describe('selected conversation eviction correctness corpus', () => {
             await runtime.flushPendingData(`${reason}-persisted`)
             expectedRevision += 1
             commitSpy?.mockRestore()
-            await assertWindowed()
+            await assertWindowed(reason)
         }
 
         await mutateComplete(
@@ -268,7 +285,7 @@ describe('selected conversation eviction correctness corpus', () => {
         const lastDuplicate = await queryChatMessageTargetById(context, 'duplicate-anchor', 'last')
         expect(firstDuplicate).toMatchObject({ absoluteIndex: 99, message: oracle.message[99] })
         expect(lastDuplicate).toMatchObject({ absoluteIndex: 8_999, message: oracle.message[8_999] })
-        await assertWindowed()
+        await assertWindowed('shifted anchored queries')
 
         const branchEnd = 257
         const branchLease = await runtime.acquireCompleteConversation('branch-gateway')
@@ -300,7 +317,7 @@ describe('selected conversation eviction correctness corpus', () => {
             expect.objectContaining({ chatId: 'branch-marker', isComment: true }),
         ])
         await runtime.activateConversation('chat-a')
-        await assertWindowed()
+        await assertWindowed('persistent branch gateway')
 
         const exportedBeforeTruncate = await runtime
             .materializePersistentDatabaseSnapshotWithRevision('corpus-export-before-truncate')
@@ -309,7 +326,7 @@ describe('selected conversation eviction correctness corpus', () => {
             .toEqual(oracle)
         expect(exportedBeforeTruncate.database.characters[0].chats.find((chat) => chat.id === 'branch-a'))
             .toEqual(persistedBranch!.value)
-        await assertWindowed()
+        await assertWindowed('pre-truncate export')
 
         await mutateComplete(
             'truncate',
@@ -347,14 +364,14 @@ describe('selected conversation eviction correctness corpus', () => {
         oracle.bookmarkNames = { 'message-9001': 'Far bookmark' }
         await runtime.flushPendingData('bookmark-persisted')
         expectedRevision += 1
-        await assertWindowed()
+        await assertWindowed('bookmark')
         const renameTarget = await queryChatMessageTargetById(context, 'message-9001')
         await expect(renameCapturedBookmark(renameTarget!, context, async () => 'Renamed bookmark'))
             .resolves.toBe(true)
         oracle.bookmarkNames['message-9001'] = 'Renamed bookmark'
         await runtime.flushPendingData('bookmark-rename-persisted')
         expectedRevision += 1
-        await assertWindowed()
+        await assertWindowed('bookmark rename')
 
         await mutateComplete(
             'failed-save-retry',
@@ -362,12 +379,14 @@ describe('selected conversation eviction correctness corpus', () => {
             () => { oracle.message.push({ role: 'user', data: 'retry retained', chatId: 'op-retry' }) },
             new Error('synthetic save failure'),
         )
-        const staleLease = await runtime.acquireCompleteConversation('revision-conflict-stale')
-        staleLease.session.append({
+        const conflictMessage: Message = {
             role: 'user',
             data: 'stale conflict attempt',
             chatId: 'op-conflict',
-        })
+            saying: 'stable conflict evidence',
+        }
+        const staleLease = await runtime.acquireCompleteConversation('revision-conflict-stale')
+        staleLease.session.append(structuredClone(conflictMessage))
         staleLease.release()
         const competingRoot = await store.readRoot()
         const competingCommit = await store.commit({
@@ -381,16 +400,16 @@ describe('selected conversation eviction correctness corpus', () => {
         await runtime.refreshActiveWorkingSetFromStore(competingCommit.revision)
         await waitForWindowed(runtime)
         const retryLease = await runtime.acquireCompleteConversation('revision-conflict-retry')
-        retryLease.session.append({
-            role: 'user',
-            data: 'conflict retained',
-            chatId: 'op-conflict',
-        })
+        retryLease.session.append(structuredClone(conflictMessage))
         retryLease.release()
-        oracle.message.push({ role: 'user', data: 'conflict retained', chatId: 'op-conflict' })
+        oracle.message.push(structuredClone(conflictMessage))
         await runtime.flushPendingData('revision-conflict-retry')
         expectedRevision += 1
-        await assertWindowed()
+        const conflictPersisted = await store.readConversation('char-a', 'chat-a')
+        expect(conflictPersisted!.value.message.filter((message) =>
+            message.chatId === conflictMessage.chatId
+        )).toEqual([conflictMessage])
+        await assertWindowed('revision conflict exact retry')
 
         const regexLease = await runtime.acquireCompleteConversation('regex-operation-context')
         const regexOperation = createConversationOperationContext(
@@ -401,7 +420,7 @@ describe('selected conversation eviction correctness corpus', () => {
         expect(regexOperation.chat.message).toEqual(oracle.message)
         const regexPlan = getRegexExecutionPlan([{
             comment: 'corpus regex',
-            in: '^conflict retained$',
+            in: '^stale conflict attempt$',
             out: 'regex compatibility output',
             type: 'editoutput',
             flag: 'g',
@@ -428,7 +447,7 @@ describe('selected conversation eviction correctness corpus', () => {
         }
         await runtime.flushPendingData('regex-operation-context')
         expectedRevision += 1
-        await assertWindowed()
+        await assertWindowed('regex operation context')
 
         const luaLease = await runtime.acquireCompleteConversation('lua-operation-context')
         const luaOperation = createConversationOperationContext(
@@ -521,7 +540,7 @@ describe('selected conversation eviction correctness corpus', () => {
         oracle.message.push(structuredClone(luaMessage))
         await runtime.flushPendingData('lua-operation-context')
         expectedRevision += 1
-        await assertWindowed()
+        await assertWindowed('Lua operation context')
         for (const [key, value] of Object.entries(nodeDomGlobals)) {
             Object.defineProperty(globalThis, key, { configurable: true, value })
         }
@@ -649,7 +668,7 @@ describe('selected conversation eviction correctness corpus', () => {
         oracle.message.push(structuredClone(generatedMessage))
         oracle.isStreaming = generatedConversation!.value.isStreaming
         oracle.lastMemory = generatedConversation!.value.lastMemory
-        await assertWindowed()
+        await assertWindowed('public generation gateway')
         vi.resetModules()
 
         const cbsLease = await runtime.acquireCompleteConversation('cbs-operation-context')
@@ -680,7 +699,7 @@ describe('selected conversation eviction correctness corpus', () => {
         } as never, [], null)).toBe('Generation compatibility output')
         cbsOperation.release()
         cbsLease.release()
-        await assertWindowed()
+        await assertWindowed('CBS operation context')
         vi.doUnmock('../stores.svelte')
         vi.resetModules()
 
@@ -737,7 +756,7 @@ describe('selected conversation eviction correctness corpus', () => {
         oracle.message.push(structuredClone(triggerMessage))
         await runtime.flushPendingData('trigger-operation-context')
         expectedRevision += 1
-        await assertWindowed()
+        await assertWindowed('Trigger operation context')
         delete triggerCharacter.triggerscript
         delete triggerCharacter.customscript
         delete triggerCharacter.defaultVariables
@@ -763,7 +782,7 @@ describe('selected conversation eviction correctness corpus', () => {
         const screenshotJob = await screenshot.createJob(9_501, 9_502)
         expect(screenshotJob.messages).toEqual(oracle.message.slice(9_500, 9_502))
         await screenshot.close()
-        await assertWindowed()
+        await assertWindowed('screenshot source lease')
 
         const search = await queryChatMessageTargetsByIds(context, [
             // Keep a mix of near, far, and generated IDs.
@@ -776,9 +795,10 @@ describe('selected conversation eviction correctness corpus', () => {
             oracle.message.find((message) => message.chatId === 'message-9001'),
             oracle.message.find((message) => message.chatId === 'op-trigger'),
         ])
-        await assertWindowed()
+        await assertWindowed('anchored search')
 
-        const hypaLease = await runtime.acquireCompleteConversation('hypa-anchored-query')
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        expect(runtime.getActiveConversationSession()).toBeNull()
         vi.doMock('../stores.svelte', () => ({
             DBState: { db: workingCopy },
             selectedCharID: writable(0),
@@ -803,10 +823,27 @@ describe('selected conversation eviction correctness corpus', () => {
         const { captureCurrentHypaMessageById } = await import(
             '../../lib/Others/HypaV3Modal/utils'
         )
+        const { createMetadataOnlySelectedConversation } = await import(
+            './selectedConversationLifecycle'
+        )
+        const hypaOwner = workingCopy.characters[0]
+        const hypaChatIndex = hypaOwner.chatPage ?? 0
+        const runtimeMetadataShell = hypaOwner.chats[hypaChatIndex]
+        hypaOwner.chats[hypaChatIndex] = createMetadataOnlySelectedConversation(
+            runtimeMetadataShell,
+        )
+        const hypaRevisionSpy = vi.spyOn(store, 'acquireRevision')
+        const hypaCompleteSpy = vi.spyOn(runtime, 'acquireCompleteConversation')
         const hypa = await captureCurrentHypaMessageById('message-8888')
+        hypaOwner.chats[hypaChatIndex] = runtimeMetadataShell
+        expect(hypa?.kind).toBe('persistent')
         expect(hypa?.message).toEqual(oracle.message.find((message) => message.chatId === 'message-8888'))
-        hypaLease.release()
-        await assertWindowed()
+        expect(hypaRevisionSpy).toHaveBeenCalledWith(expectedRevision)
+        expect(hypaCompleteSpy).not.toHaveBeenCalled()
+        hypaRevisionSpy.mockRestore()
+        hypaCompleteSpy.mockRestore()
+        expect(runtime.getActiveConversationSession()).toBeNull()
+        await assertWindowed('Hypa pinned anchor lookup')
         for (const moduleId of [
             '../stores.svelte',
             './persistentDataRuntime.svelte',
@@ -820,7 +857,7 @@ describe('selected conversation eviction correctness corpus', () => {
         expect(exported.revision).toBe(expectedRevision)
         const exportedOwner = exported.database.characters[0].chats.find((chat) => chat.id === 'chat-a')!
         expect(exportedOwner).toEqual(oracle)
-        await assertWindowed()
+        await assertWindowed('authoritative export')
 
         for (const moduleId of [
             '../plugins/plugins.svelte',
@@ -874,7 +911,7 @@ describe('selected conversation eviction correctness corpus', () => {
         await pluginCompatibility.transition('scalable-v3')
         expectedRevision += 1
         await runtime.initializeActiveWorkingSet(workingCopy)
-        await assertWindowed()
+        await assertWindowed('Plugin API v2.1 live Proxy')
         vi.doUnmock('./persistentDataRuntime.svelte')
 
         const finalPersisted = await store.readConversation('char-a', 'chat-a')
