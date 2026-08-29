@@ -1795,7 +1795,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
-        it('exposes far duplicate IDs through bounded absolute ranges while anchors remain first-match', async () => {
+        it('resolves first, last, and absent far duplicate anchors directly', async () => {
             const { store } = await createHarness()
             const database = structuredClone(fixtureDatabase)
             const character = database.characters.find((entry) => entry.chaId === 'char-a')!
@@ -1804,26 +1804,33 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             conversation.message[128].chatId = 'far-duplicate'
             await store.replaceFromDatabase(database)
 
-            const anchored = await store.readConversationWindow({
+            const first = await store.readConversationWindow({
                 characterId: 'char-a',
                 conversationId: 'conv-long',
                 anchorMessageId: 'far-duplicate',
                 before: 0,
                 after: 0,
             })
-            const boundedTail = await store.readConversationWindow({
+            const last = await store.readConversationWindow({
                 characterId: 'char-a',
                 conversationId: 'conv-long',
-                startIndex: 127,
-                limit: 3,
+                anchorMessageId: 'far-duplicate',
+                anchorOccurrence: 'last',
+                before: 0,
+                after: 0,
+            })
+            const absent = await store.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-long',
+                anchorMessageId: 'absent',
+                anchorOccurrence: 'last',
+                before: 0,
+                after: 0,
             })
 
-            expect(anchored?.value).toMatchObject({ startIndex: 1, endIndex: 2 })
-            expect(boundedTail?.value.messages.map((message) => message.chatId)).toEqual([
-                'msg-127',
-                'far-duplicate',
-                'msg-129',
-            ])
+            expect(first?.value).toMatchObject({ startIndex: 1, endIndex: 2 })
+            expect(last?.value).toMatchObject({ startIndex: 128, endIndex: 129 })
+            expect(absent).toBeNull()
         })
 
         it('reads absolute conversation ranges with zero-based exclusive-end semantics', async () => {

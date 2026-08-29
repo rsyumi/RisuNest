@@ -36,6 +36,7 @@ describe('SqlitePersistentDataStore', () => {
             characterId: 'char-a',
             conversationId: 'conv-long',
             anchorMessageId: 'msg-050',
+            anchorOccurrence: 'last' as const,
             before: 4,
             after: 5,
         }

@@ -1,5 +1,5 @@
 use super::{
-    active_generation, compare_plugin_storage_keys, current_revision, AssetAlias,
+    active_generation, compare_plugin_storage_keys, current_revision, AnchorOccurrence, AssetAlias,
     AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
     ColdPayloadAuthorityState, ConversationPage, ConversationQuery, ConversationSummary,
@@ -727,6 +727,11 @@ pub(super) fn read_conversation_window(
     query: &ConversationWindowQuery,
     target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<ConversationWindow>>> {
+    if query.anchor_occurrence.is_some() && query.anchor_message_id.is_none() {
+        return Err(StoreError::Validation {
+            message: "conversation anchor occurrence requires anchorMessageId".to_owned(),
+        });
+    }
     let absolute_range = match query.start_index {
         None => None,
         Some(start_index) => {
@@ -748,7 +753,10 @@ pub(super) fn read_conversation_window(
                     ),
                 });
             }
-            if query.anchor_message_id.is_some() || query.before.is_some() || query.after.is_some()
+            if query.anchor_message_id.is_some()
+                || query.anchor_occurrence.is_some()
+                || query.before.is_some()
+                || query.after.is_some()
             {
                 return Err(StoreError::Validation {
                     message: "conversation absolute range cannot include anchor options".to_owned(),
@@ -775,13 +783,26 @@ pub(super) fn read_conversation_window(
         }
         None => match query.anchor_message_id.as_deref() {
             Some(anchor_id) => {
-                let anchor: Option<i64> = connection.query_row(
-                "SELECT message_index FROM messages
-                 WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3 AND message_id = ?4
-                 ORDER BY message_index ASC LIMIT 1",
-                params![target.generation, query.character_id, query.conversation_id, anchor_id],
-                |row| row.get(0),
-            ).optional()?;
+                let anchor: Option<i64> = match query
+                    .anchor_occurrence
+                    .as_ref()
+                    .unwrap_or(&AnchorOccurrence::First)
+                {
+                    AnchorOccurrence::First => connection.query_row(
+                        "SELECT message_index FROM messages
+                         WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3 AND message_id = ?4
+                         ORDER BY message_index ASC LIMIT 1",
+                        params![target.generation, query.character_id, query.conversation_id, anchor_id],
+                        |row| row.get(0),
+                    ).optional()?,
+                    AnchorOccurrence::Last => connection.query_row(
+                        "SELECT message_index FROM messages
+                         WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3 AND message_id = ?4
+                         ORDER BY message_index DESC LIMIT 1",
+                        params![target.generation, query.character_id, query.conversation_id, anchor_id],
+                        |row| row.get(0),
+                    ).optional()?,
+                };
                 let Some(anchor) = anchor else {
                     return Ok(None);
                 };

@@ -363,6 +363,7 @@ export interface ConversationWindowQuery {
     startIndex?: number
     limit?: number
     anchorMessageId?: string
+    anchorOccurrence?: 'first' | 'last'
     before?: number
     after?: number
 }
@@ -370,6 +371,16 @@ export interface ConversationWindowQuery {
 export const CONVERSATION_RANGE_MAX_LIMIT = 4_096
 
 export function validateConversationWindowQuery(input: ConversationWindowQuery): void {
+    if (
+        input.anchorOccurrence !== undefined &&
+        input.anchorOccurrence !== 'first' &&
+        input.anchorOccurrence !== 'last'
+    ) {
+        throw new RangeError('Conversation anchor occurrence must be first or last')
+    }
+    if (input.anchorOccurrence !== undefined && input.anchorMessageId === undefined) {
+        throw new RangeError('Conversation anchor occurrence requires anchorMessageId')
+    }
     if (input.startIndex === undefined) return
     if (!Number.isSafeInteger(input.startIndex) || input.startIndex < 0) {
         throw new RangeError('Conversation range startIndex must be a nonnegative safe integer')
@@ -384,6 +395,7 @@ export function validateConversationWindowQuery(input: ConversationWindowQuery):
     }
     if (
         input.anchorMessageId !== undefined ||
+        input.anchorOccurrence !== undefined ||
         input.before !== undefined ||
         input.after !== undefined
     ) {

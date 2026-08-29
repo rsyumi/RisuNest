@@ -101,11 +101,19 @@ describe('chat message UI targets', () => {
             storeRevision: 7,
         } as any
         const release = vi.fn()
-        const readConversationWindow = vi.fn(async ({ anchorMessageId, startIndex, limit }: any) => {
+        const readConversationWindow = vi.fn(async ({
+            anchorMessageId,
+            anchorOccurrence,
+            startIndex,
+            limit,
+        }: any) => {
             limit ??= 1
             let absoluteIndex = startIndex
             if (anchorMessageId !== undefined) {
-                absoluteIndex = completeMessages.findIndex((message) => message.chatId === anchorMessageId)
+                absoluteIndex = anchorOccurrence === 'last'
+                    ? completeMessages.findLastIndex((message) => message.chatId === anchorMessageId)
+                    : completeMessages.findIndex((message) => message.chatId === anchorMessageId)
+                if (absoluteIndex === -1) return null
             } else if (startIndex === undefined) {
                 absoluteIndex = Math.max(0, completeMessages.length - limit)
             }
@@ -159,15 +167,33 @@ describe('chat message UI targets', () => {
         await expect(queryChatMessageTargetAt(context as any, 8888)).resolves.toBeNull()
         expect(release).toHaveBeenCalledTimes(3)
 
-        const duplicate = await queryChatMessageTargetById(
+        readConversationWindow.mockClear()
+        const duplicates = await queryChatMessageTargetsByIds(
             context as any,
-            'duplicate',
+            ['duplicate', 'duplicate'],
             'last',
         )
-        expect(duplicate).toMatchObject({
+        expect(duplicates).toHaveLength(2)
+        expect(duplicates[0]).toMatchObject({
             absoluteIndex: 9000,
             message: { chatId: 'duplicate', data: 'message-9000' },
         })
+        expect(duplicates[1]).toBe(duplicates[0])
+        expect(readConversationWindow).toHaveBeenCalledOnce()
+        expect(readConversationWindow).toHaveBeenCalledWith({
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            anchorMessageId: 'duplicate',
+            anchorOccurrence: 'last',
+            before: 0,
+            after: 0,
+        })
+
+        readConversationWindow.mockClear()
+        await expect(queryChatMessageTargetById(context as any, 'absent', 'last'))
+            .resolves.toBeNull()
+        expect(readConversationWindow).toHaveBeenCalledOnce()
+        expect(readConversationWindow.mock.calls[0][0]).not.toHaveProperty('startIndex')
     })
 
     it('rejects every anchored result when selection changes during a multi-ID query', async () => {

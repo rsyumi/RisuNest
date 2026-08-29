@@ -1,5 +1,5 @@
 use super::{
-    AssetAlias, AssetAliasListQuery, AssetOwnerHead, AssetOwnerLocator,
+    AnchorOccurrence, AssetAlias, AssetAliasListQuery, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ColdAlias,
     ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationMutation, ConversationPage,
     ConversationQuery, ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder,
@@ -3227,6 +3227,7 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
         start_index: None,
         limit: Some(4),
         anchor_message_id: anchor.map(str::to_owned),
+        anchor_occurrence: None,
         before,
         after,
     };
@@ -3256,7 +3257,7 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
 }
 
 #[test]
-fn conversation_windows_expose_far_duplicate_ids_through_bounded_ranges() {
+fn conversation_windows_resolve_last_and_absent_far_duplicate_anchors() {
     let (_directory, mut store, _) = open_fixture();
     let mut first = message("first duplicate");
     first["chatId"] = json!("far-duplicate");
@@ -3289,7 +3290,7 @@ fn conversation_windows_expose_far_duplicate_ids_through_bounded_ranges() {
         },
     );
 
-    let anchored = store
+    let first = store
         .read_conversation_window(
             &ConversationWindowQuery {
                 character_id: "char-a".to_owned(),
@@ -3297,6 +3298,23 @@ fn conversation_windows_expose_far_duplicate_ids_through_bounded_ranges() {
                 start_index: None,
                 limit: None,
                 anchor_message_id: Some("far-duplicate".to_owned()),
+                anchor_occurrence: None,
+                before: Some(0),
+                after: Some(0),
+            },
+            None,
+        )
+        .expect("read first duplicate anchor")
+        .expect("conversation exists");
+    let last = store
+        .read_conversation_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-long".to_owned(),
+                start_index: None,
+                limit: None,
+                anchor_message_id: Some("far-duplicate".to_owned()),
+                anchor_occurrence: Some(AnchorOccurrence::Last),
                 before: Some(0),
                 after: Some(0),
             },
@@ -3304,24 +3322,25 @@ fn conversation_windows_expose_far_duplicate_ids_through_bounded_ranges() {
         )
         .expect("read duplicate anchor")
         .expect("conversation exists");
-    let bounded_tail = store
+    let absent = store
         .read_conversation_window(
             &ConversationWindowQuery {
                 character_id: "char-a".to_owned(),
                 conversation_id: "conv-long".to_owned(),
-                start_index: Some(127),
-                limit: Some(3),
-                anchor_message_id: None,
-                before: None,
-                after: None,
+                start_index: None,
+                limit: None,
+                anchor_message_id: Some("absent".to_owned()),
+                anchor_occurrence: Some(AnchorOccurrence::Last),
+                before: Some(0),
+                after: Some(0),
             },
             None,
         )
-        .expect("read bounded duplicate tail")
-        .expect("conversation exists");
+        .expect("read absent duplicate anchor");
 
-    assert_eq!((anchored.value.start_index, anchored.value.end_index), (1, 2));
-    assert_eq!(bounded_tail.value.messages[1]["chatId"], "far-duplicate");
+    assert_eq!((first.value.start_index, first.value.end_index), (1, 2));
+    assert_eq!((last.value.start_index, last.value.end_index), (128, 129));
+    assert!(absent.is_none());
 }
 
 #[test]
@@ -3333,6 +3352,7 @@ fn conversation_windows_support_strict_absolute_ranges() {
         start_index,
         limit,
         anchor_message_id: None,
+        anchor_occurrence: None,
         before: None,
         after: None,
     };
@@ -4020,6 +4040,7 @@ fn leased_family_canonical(store: &PersistentStore, lease: &str) -> Vec<u8> {
                 start_index: None,
                 limit: None,
                 anchor_message_id: None,
+                anchor_occurrence: None,
                 before: None,
                 after: None,
             },
@@ -4997,6 +5018,7 @@ fn replace_range_clamps_out_of_bounds_indices() {
                 start_index: None,
                 limit: None,
                 anchor_message_id: None,
+                anchor_occurrence: None,
                 before: None,
                 after: None,
             },
@@ -5035,6 +5057,7 @@ fn revision_leases_isolate_conversation_reads() {
                     start_index: Some(1),
                     limit: Some(2),
                     anchor_message_id: None,
+                    anchor_occurrence: None,
                     before: None,
                     after: None,
                 },
@@ -5076,6 +5099,7 @@ fn revision_leases_isolate_conversation_reads() {
                 start_index: None,
                 limit: None,
                 anchor_message_id: None,
+                anchor_occurrence: None,
                 before: None,
                 after: None,
             },

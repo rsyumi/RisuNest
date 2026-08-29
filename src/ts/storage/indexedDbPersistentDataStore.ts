@@ -1992,6 +1992,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 input.conversationId,
                 input.anchorMessageId,
                 totalMessages,
+                input.anchorOccurrence ?? 'first',
             )
             if (!anchor) {
                 await transactionDone(transaction)
@@ -2899,6 +2900,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         conversationId: string,
         messageId: string,
         totalMessages: number,
+        occurrence: 'first' | 'last',
     ): Promise<{ index: number; page: StoredMessagePage } | null> {
         if (totalMessages === 0) return Promise.resolve(null)
         const lastPage = Math.floor((totalMessages - 1) / MESSAGE_PAGE_SIZE)
@@ -2910,7 +2912,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const request = transaction
                 .objectStore('messagePages')
                 .index('byConversationPage')
-                .openCursor(range)
+                .openCursor(range, occurrence === 'last' ? 'prev' : 'next')
             request.onerror = () => reject(request.error)
             request.onsuccess = () => {
                 const cursor = request.result
@@ -2919,7 +2921,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     return
                 }
                 const page = cursor.value as StoredMessagePage
-                const indexInPage = page.value.findIndex((message) => message.chatId === messageId)
+                const indexInPage = occurrence === 'last'
+                    ? page.value.findLastIndex((message) => message.chatId === messageId)
+                    : page.value.findIndex((message) => message.chatId === messageId)
                 if (indexInPage !== -1) {
                     resolve({ index: page.pageIndex * MESSAGE_PAGE_SIZE + indexInPage, page })
                     return

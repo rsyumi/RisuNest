@@ -1,8 +1,8 @@
 export async function resolveHypaOrphanState(
-    query: Promise<boolean>,
+    query: () => Promise<boolean>,
 ): Promise<boolean> {
     try {
-        return await query
+        return await query()
     } catch {
         return true
     }

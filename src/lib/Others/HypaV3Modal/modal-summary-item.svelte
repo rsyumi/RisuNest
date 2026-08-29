@@ -165,14 +165,14 @@
     summary.chatMemos;
     const generation = ++orphanQueryGeneration;
     orphan = true;
-    void resolveHypaOrphanState(isOrphan()).then((value) => {
+    void resolveHypaOrphanState(isOrphan).then((value) => {
       if (generation === orphanQueryGeneration) orphan = value;
     });
   });
 
   async function toggleReroll(): Promise<void> {
     if (isRerolling) return;
-    if (await isOrphan()) return;
+    if (await resolveHypaOrphanState(isOrphan)) return;
 
     isRerolling = true;
     rerolled = "Loading...";

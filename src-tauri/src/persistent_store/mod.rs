@@ -735,6 +735,13 @@ pub(crate) struct ConversationPage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) enum AnchorOccurrence {
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ConversationWindowQuery {
     pub(crate) character_id: String,
     pub(crate) conversation_id: String,
@@ -744,6 +751,8 @@ pub(crate) struct ConversationWindowQuery {
     pub(crate) limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) anchor_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) anchor_occurrence: Option<AnchorOccurrence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) before: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
