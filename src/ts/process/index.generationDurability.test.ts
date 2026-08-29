@@ -68,6 +68,7 @@ const harness = vi.hoisted(() => {
         selectedCharID,
         CharEmotion,
         doingChat,
+        generationReservation: null as symbol | null,
         requests,
         characters,
         acknowledge,
@@ -189,7 +190,26 @@ vi.mock('./presetChain', () => ({
         setBusy(true)
     }),
 }))
-vi.mock('./generationState', () => ({ doingChat: harness.doingChat }))
+vi.mock('./generationState', () => ({
+    doingChat: harness.doingChat,
+    reserveGeneration: () => {
+        if (harness.generationReservation || harness.doingChat.value()) return null
+        const token = Symbol('generation-reservation')
+        harness.generationReservation = token
+        harness.doingChat.set(true)
+        let released = false
+        return {
+            isCurrent: () => !released && harness.generationReservation === token,
+            release: () => {
+                if (released) return
+                released = true
+                if (harness.generationReservation !== token) return
+                harness.generationReservation = null
+                harness.doingChat.set(false)
+            },
+        }
+    },
+}))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     acknowledgeGenerationCompletion: harness.acknowledge,
     captureSelectedConversationTarget: () => null,
@@ -322,6 +342,7 @@ beforeEach(() => {
     harness.DBState.db = makeDatabase(character)
     harness.selectedCharID.set(0)
     harness.CharEmotion.set({})
+    harness.generationReservation = null
     harness.doingChat.set(false)
     harness.events.length = 0
     harness.tokenize.mockResolvedValue(8)

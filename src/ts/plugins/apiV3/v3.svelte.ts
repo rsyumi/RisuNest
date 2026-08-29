@@ -19,6 +19,7 @@ import { hasher } from "src/ts/parser/parser.svelte";
 import localforage from "localforage";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
+import { reserveGeneration } from "src/ts/process/generationState";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
@@ -1420,7 +1421,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
 
             let completeLease: CompleteConversationLease | null = null;
-            let generationStarted = false;
+            const reservation = reserveGeneration();
+            if(!reservation){
+                throw new Error("A chat is already in progress");
+            }
             let appendedMessageId: string | null = null;
             let appendedCharacter: (typeof DBState.db.characters)[number] | null = null;
             let appendedChat: (typeof DBState.db.characters)[number]['chats'][number] | null = null;
@@ -1465,10 +1469,6 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 if(completeLease && !activeSession.matchesConversation(char.chaId, chat)){
                     return false;
                 }
-                if(get(doingChat)){
-                    throw new Error("A chat is already in progress");
-                }
-
                 if(message){
                     appendedMessageId = v4();
                     appendedCharacter = char;
@@ -1481,8 +1481,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                     });
                 }
 
-                generationStarted = true;
-                const sent = await processSendChat(-1, {});
+                const sent = await processSendChat(-1, {}, reservation);
                 if(!sent){
                     rollbackAppendedMessage();
                     return false;
@@ -1493,9 +1492,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             } finally {
                 // Plugin API path does not pass through the UI unlock logic,
                 // so release doingChat here on both success and failure.
-                if(generationStarted){
-                    doingChat.set(false);
-                }
+                reservation.release();
                 completeLease?.release();
             }
 

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { get } from 'svelte/store'
 
 const mocks = vi.hoisted(() => ({
     session: null as any,
@@ -385,6 +386,31 @@ describe('sendChat generation session integration', () => {
         await expect(sending).resolves.toBe(true)
         expect(mocks.activeCompleteLeases).toBe(0)
         expect(mocks.completeLeaseReleases).toBe(1)
+        expect(session.pinCount('compatibility')).toBe(0)
+    })
+
+    it('reserves generation before async promotion so a concurrent public call cannot acquire', async () => {
+        const { session } = installDatabase()
+        const target = { characterId: 'character-a', conversationId: 'chat-a' }
+        const promotion = deferred<any>()
+        const secondReachedPromotion = new Error('second call reached promotion')
+        mocks.selectedTarget = target
+        mocks.acquireCompleteConversation
+            .mockReturnValueOnce(promotion.promise)
+            .mockRejectedValueOnce(secondReachedPromotion)
+
+        const first = sendChat()
+        while (mocks.acquireCompleteConversation.mock.calls.length === 0) await Promise.resolve()
+        const secondOutcome = await sendChat().catch((error) => error)
+
+        expect(get(doingChat)).toBe(true)
+
+        const pin = session.acquirePin('compatibility')
+        promotion.resolve({ session, target, release: () => pin.release() })
+        await expect(first).resolves.toBe(true)
+
+        expect(secondOutcome).toBe(false)
+        expect(mocks.acquireCompleteConversation).toHaveBeenCalledTimes(1)
         expect(session.pinCount('compatibility')).toBe(0)
     })
 

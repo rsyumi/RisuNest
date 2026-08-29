@@ -153,7 +153,7 @@ describe('group working-set residency', () => {
         }))
     })
 
-    it('promotes before a group greeting and holds one exact lease through rollback settlement', async () => {
+    it('activates before promotion and holds one exact lease through synchronous greeting commit', async () => {
         const group = mocks.database.characters[0]
         const session = new ActiveConversationSession({
             characterId: group.chaId,
@@ -170,12 +170,8 @@ describe('group working-set residency', () => {
         }))
         mocks.activateCharacter.mockImplementation(async () => {
             mocks.navigationGeneration++
-            return false
+            return true
         })
-        let resolveFlush!: () => void
-        mocks.flushPendingData.mockImplementationOnce(() => new Promise<void>((resolve) => {
-            resolveFlush = resolve
-        }))
         let releaseCount = 0
 
         const adding = addGroupChar()
@@ -194,14 +190,11 @@ describe('group working-set residency', () => {
                 pin.release()
             },
         })
-        while (mocks.flushPendingData.mock.calls.length === 0) await Promise.resolve()
-
-        expect(group.characters).toEqual(['member-a'])
-        expect(group.chats[0].message).toEqual([])
-        expect(session.pinCount('compatibility')).toBe(1)
-
-        resolveFlush()
-        await expect(adding).resolves.toBe(false)
+        await expect(adding).resolves.toBe(true)
+        expect(group.characters).toEqual(['member-a', 'member-b'])
+        expect(group.chats[0].message).toEqual([
+            expect.objectContaining({ data: 'Hydrated B', chatId: expect.any(String) }),
+        ])
         expect(releaseCount).toBe(1)
         expect(session.pinCount('compatibility')).toBe(0)
     })
@@ -237,11 +230,11 @@ describe('group working-set residency', () => {
         expect(group.characterTalks).toEqual([0.5, 0.75])
         expect(group.characterActive).toEqual([true, false])
         expect(group.chats[0].message).toEqual([])
-        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(mocks.activateCharacter).toHaveBeenCalledOnce()
         expect(releaseCount).toBe(1)
     })
 
-    it('rolls back membership and its greeting when activation is superseded', async () => {
+    it('does not mutate membership or greeting when activation is superseded', async () => {
         const group = mocks.database.characters[0]
         mocks.activateCharacter.mockImplementation(async () => {
             mocks.navigationGeneration += 2
@@ -254,10 +247,65 @@ describe('group working-set residency', () => {
         expect(group.characterTalks).toEqual([0.5])
         expect(group.characterActive).toEqual([true])
         expect(group.chats[0].message).toEqual([])
-        expect(mocks.flushPendingData).toHaveBeenCalledWith('group-membership-rollback')
+        expect(mocks.markPersistentDataDirty).not.toHaveBeenCalled()
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
     })
 
-    it('rolls back its ID-owned greeting after a concurrent identical message shifts its index', async () => {
+    it('activates first and commits membership plus greeting to the replacement current owner', async () => {
+        const oldGroup = mocks.database.characters[0]
+        let replacement: ReturnType<typeof makeGroup> | null = null
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            replacement = makeGroup()
+            mocks.database.characters[0] = replacement
+            mocks.activeSession = new ActiveConversationSession({
+                characterId: replacement.chaId,
+                conversationId: replacement.chats[0].id,
+                conversation: replacement.chats[0] as any,
+                storeRevision: 1,
+            })
+            return true
+        })
+
+        await expect(addGroupChar()).resolves.toBe(true)
+
+        expect(oldGroup.characters).toEqual(['member-a'])
+        expect(oldGroup.chats[0].message).toEqual([])
+        expect(replacement!.characters).toEqual(['member-a', 'member-b'])
+        expect(replacement!.chats[0].message).toEqual([
+            expect.objectContaining({
+                role: 'char',
+                data: 'Hydrated B',
+                saying: 'member-b',
+                chatId: expect.any(String),
+            }),
+        ])
+        expect(mocks.markPersistentDataDirty).toHaveBeenCalledOnce()
+    })
+
+    it('leaves both the old owner and a superseding catalog object clean before returning', async () => {
+        const oldGroup = mocks.database.characters[0]
+        const catalogReplacement = {
+            ...makeGroup(),
+            name: 'Concurrent catalog replacement',
+        }
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration += 2
+            mocks.database.characters[0] = catalogReplacement
+            return false
+        })
+
+        await expect(addGroupChar()).resolves.toBe(false)
+
+        expect(oldGroup.characters).toEqual(['member-a'])
+        expect(oldGroup.chats[0].message).toEqual([])
+        expect(catalogReplacement.characters).toEqual(['member-a'])
+        expect(catalogReplacement.chats[0].message).toEqual([])
+        expect(mocks.markPersistentDataDirty).not.toHaveBeenCalled()
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
+    })
+
+    it('does not touch an existing identical greeting when activation fails', async () => {
         const group = mocks.database.characters[0]
         const identical = { role: 'char', data: 'Hydrated B', saying: 'member-b' }
         group.chats[0].message.push(identical)
@@ -268,20 +316,16 @@ describe('group working-set residency', () => {
             storeRevision: 1,
         })
         mocks.activeSession = session
-        let shifted = false
         mocks.activateCharacter.mockImplementation(async () => {
             mocks.navigationGeneration++
-            if (!shifted) {
-                shifted = true
-                session.delete(session.locate(0))
-            }
             return false
         })
 
         await expect(addGroupChar()).resolves.toBe(false)
 
         expect(group.characters).toEqual(['member-a'])
-        expect(group.chats[0].message).toEqual([])
+        expect(group.chats[0].message).toEqual([identical])
+        expect(session.version).toBe(0)
     })
 
     it('releases once when post-promotion owner validation throws', async () => {
@@ -336,11 +380,11 @@ describe('group working-set residency', () => {
 
         expect(group.characters).toEqual(['member-a'])
         expect(group.chats[0].message).toEqual([])
-        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(mocks.activateCharacter).toHaveBeenCalledOnce()
         expect(releaseCount).toBe(1)
     })
 
-    it('rolls a failed first-message greeting back through the current session', async () => {
+    it('does not append a first-message greeting when activation fails', async () => {
         const group = mocks.database.characters[0]
         const onMutation = vi.fn()
         mocks.activeSession = new ActiveConversationSession({
@@ -358,12 +402,7 @@ describe('group working-set residency', () => {
         await expect(addGroupChar()).resolves.toBe(false)
 
         expect(group.chats[0].message).toEqual([])
-        expect(onMutation).toHaveBeenNthCalledWith(1, expect.objectContaining({
-            commands: ['append'],
-        }))
-        expect(onMutation).toHaveBeenNthCalledWith(2, expect.objectContaining({
-            commands: ['delete'],
-        }))
+        expect(onMutation).not.toHaveBeenCalled()
     })
 
     it('orders group generation from detail-only members without conversation histories', () => {
@@ -411,8 +450,8 @@ describe('group working-set residency', () => {
         expect(group.characters).toEqual(['member-a'])
         expect(group.chats[0].message).toEqual([])
         expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
-        expect(mocks.flushPendingData).toHaveBeenCalledWith('group-membership-rollback')
-        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalled()
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
+        expect(mocks.reconcilePersistentActiveCharacterIds).not.toHaveBeenCalled()
     })
 
     it('rolls back membership when busy generation blocks activation before navigation claim', async () => {
@@ -424,8 +463,8 @@ describe('group working-set residency', () => {
         expect(group.characters).toEqual(['member-a'])
         expect(group.chats[0].message).toEqual([])
         expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
-        expect(mocks.flushPendingData).toHaveBeenCalledWith('group-membership-rollback')
-        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalled()
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
+        expect(mocks.reconcilePersistentActiveCharacterIds).not.toHaveBeenCalled()
     })
 
     it('rolls back membership when same-group activation rejects', async () => {
@@ -437,7 +476,7 @@ describe('group working-set residency', () => {
         expect(group.characters).toEqual(['member-a'])
         expect(group.chats[0].message).toEqual([])
         expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
-        expect(mocks.flushPendingData).toHaveBeenCalledWith('group-membership-rollback')
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
     })
 
     it('removes only the newly appended first message when rollback sees duplicate content', async () => {

@@ -34,7 +34,11 @@ import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { activatePresetChainForRequest } from "./presetChain";
-import { doingChat } from './generationState'
+import {
+    doingChat,
+    reserveGeneration,
+    type GenerationReservation,
+} from './generationState'
 import {
     consumeStreamingDisplayStream,
 } from './streamingDisplayStream'
@@ -168,12 +172,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
-} = {}):Promise<boolean> {
+} = {}, inheritedReservation?: GenerationReservation):Promise<boolean> {
+    const ownedReservation = inheritedReservation ? null : reserveGeneration()
+    const reservation = inheritedReservation ?? ownedReservation
+    if (!reservation?.isCurrent()) return false
     let completeLease: CompleteConversationLease | null = null
     const lifecycle: GenerationCompletionLifecycle = {
         responseApplied: false,
         acknowledgementAttempted: false,
     }
+    let enteredGeneration = false
+    let generationReturned = false
     try {
         const target = captureSelectedConversationTarget()
         if (target) {
@@ -184,7 +193,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 throw error
             }
         }
-        return await sendChatInternal(chatProcessIndex, arg, lifecycle)
+        enteredGeneration = true
+        const result = await sendChatInternal(chatProcessIndex, arg, lifecycle, reservation)
+        generationReturned = true
+        return result
     }
     catch(error) {
         if(lifecycle.responseApplied && !lifecycle.acknowledgementAttempted){
@@ -194,6 +206,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         throw error
     } finally {
         completeLease?.release()
+        if (!enteredGeneration || generationReturned) ownedReservation?.release()
     }
 }
 
@@ -204,7 +217,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
-}, lifecycle: GenerationCompletionLifecycle):Promise<boolean> {
+}, lifecycle: GenerationCompletionLifecycle, reservation: GenerationReservation):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
@@ -321,13 +334,6 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         }
     }
 
-    let isDoing = get(doingChat)
-
-    if(isDoing){
-        if(chatProcessIndex === -1){
-            return false
-        }
-    }
     const generationSetupSession = getActiveConversationSession()
     if (hasMismatchedActiveConversationSession()) return false
 
@@ -344,7 +350,6 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         const peerSafe = await peerSafeCheck()
         if(!peerSafe){
             peerRevertChat()
-            doingChat.set(false)
             throwError(language.otherUserRequesting)
             return false
         }
@@ -436,7 +441,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                 const r = await sendChat(order[i].index, {
                     chatAdditonalTokens: caculatedChatTokens,
                     signal: abortSignal
-                })
+                }, reservation)
                 if(!r){
                     return false
                 }
@@ -1016,7 +1021,6 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         setCurrentChat(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            doingChat.set(false)
             return false
         }
     }
@@ -2254,14 +2258,13 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
 
     if(needsAutoContinue){
         await acknowledgeCompletedGeneration()
-        doingChat.set(false)
         releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
             usedContinueTokens: resultTokens
-        })
+        }, reservation)
     }
 
     const igp = risuChatParser(DBState.db.igpPrompt ?? "")
@@ -2311,11 +2314,10 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         }
 
         await acknowledgeCompletedGeneration()
-        doingChat.set(false)
         releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
             signal: abortSignal
-        })
+        }, reservation)
     }
 
     if(req.special){

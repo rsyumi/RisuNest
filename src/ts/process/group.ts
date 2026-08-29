@@ -17,15 +17,8 @@ import {
 import { restoreColdPersistentCharacter } from './coldCharacterRestore'
 import { doingChat } from './generationState'
 import { appendCurrentConversationMessage } from '../conversationMutations'
-import type { ActiveConversationPin } from '../storage/activeConversationSession'
 import type { CompleteConversationLease } from '../storage/activeWorkingSet.svelte'
 import { v4 } from 'uuid'
-
-interface GroupGreetingMutation {
-    chatId: string
-    messageId: string
-    pin: ActiveConversationPin | null
-}
 
 function markGroupDirty(group: unknown) {
     markPersistentDataDirty(new TextEncoder().encode(JSON.stringify(group)).byteLength)
@@ -64,41 +57,6 @@ async function settleGroupRollback(groupId: string): Promise<void> {
     reconcilePersistentActiveCharacterIds(DBState.db, groupId)
 }
 
-function rollbackGroupGreeting(
-    groupId: string,
-    group: Extract<(typeof DBState.db.characters)[number], { type: 'group' }>,
-    greeting: GroupGreetingMutation,
-    owningSession: ReturnType<typeof getActiveConversationSession>,
-): void {
-    const chat = group.chats.find((candidate) => candidate.id === greeting.chatId)
-    if (!chat) return
-    const messageIndex = chat.message.findIndex(
-        (message) => message.chatId === greeting.messageId,
-    )
-    if (messageIndex < 0) return
-
-    const currentSession = getActiveConversationSession()
-    const session = owningSession?.matchesConversation(groupId, chat)
-        ? owningSession
-        : currentSession
-    if (session?.matchesConversation(groupId, chat)) {
-        session.delete(session.locate(messageIndex))
-    } else if (!currentSession) {
-        chat.message.splice(messageIndex, 1)
-    }
-}
-
-function rollbackGroupMembership(
-    group: Extract<(typeof DBState.db.characters)[number], { type: 'group' }>,
-    memberId: string,
-): void {
-    const memberIndex = group.characters.indexOf(memberId)
-    if (memberIndex < 0) return
-    group.characters.splice(memberIndex, 1)
-    group.characterTalks.splice(memberIndex, 1)
-    group.characterActive.splice(memberIndex, 1)
-}
-
 export async function addGroupChar(): Promise<boolean> {
     let selectedId = get(selectedCharID)
     let group = DBState.db.characters[selectedId]
@@ -126,6 +84,9 @@ export async function addGroupChar(): Promise<boolean> {
                 group = DBState.db.characters[selectedId]
                 if (group?.type !== 'group' || group.chaId !== groupId) return false
                 if (group.characters.includes(res)) return false
+                const activation = await activateSelectedGroup(groupId)
+                if (activation !== 'activated') return false
+                if (!isSelectedGroup(groupId) || get(doingChat)) return false
                 let completeLease: CompleteConversationLease | null = null
                 if (loadFirstMessage) {
                     const target = captureSelectedConversationTarget()
@@ -136,16 +97,11 @@ export async function addGroupChar(): Promise<boolean> {
                         )
                     }
                 }
-                let greeting: GroupGreetingMutation | null = null
                 try {
-                    if (!isSelectedGroup(groupId)) {
-                        return false
-                    }
+                    if (!isSelectedGroup(groupId)) return false
                     selectedId = get(selectedCharID)
                     group = DBState.db.characters[selectedId]
-                    if (group?.type !== 'group' || group.chaId !== groupId) {
-                        return false
-                    }
+                    if (group?.type !== 'group' || group.chaId !== groupId) return false
                     if (group.characters.includes(res) || get(doingChat)) return false
                     const selectedChat = group.chats[group.chatPage]
                     const activeSession = completeLease?.session ?? getActiveConversationSession()
@@ -153,7 +109,6 @@ export async function addGroupChar(): Promise<boolean> {
                         activeSession &&
                         !activeSession.matchesConversation(groupId, selectedChat)
                     ) return false
-                    const mutatedGroup = group
                     group.characters.push(res)
                     group.characterTalks.push(1 / 6 * 4)
                     group.characterActive.push(true)
@@ -165,37 +120,16 @@ export async function addGroupChar(): Promise<boolean> {
                             saying: res,
                             chatId: messageId,
                         } as const
-                        const index = selectedChat.message.length
                         appendCurrentConversationMessage(
                             group,
                             selectedChat,
                             activeSession,
                             message,
                         )
-                        greeting = {
-                            chatId: selectedChat.id,
-                            messageId,
-                            pin: activeSession?.acquireRangePin(
-                                index,
-                                index + 1,
-                                'transaction',
-                            ) ?? null,
-                        }
                     }
                     markGroupDirty(group)
-                    const activation = await activateSelectedGroup(groupId)
-                    if (activation === 'activated') return true
-                    group = DBState.db.characters.find((character) => character.chaId === groupId)
-                    if (!group || group.type !== 'group') return false
-                    if (group === mutatedGroup) rollbackGroupMembership(group, res)
-                    if (greeting) {
-                        rollbackGroupGreeting(groupId, group, greeting, activeSession)
-                    }
-                    markGroupDirty(group)
-                    await settleGroupRollback(groupId)
-                    return false
+                    return true
                 } finally {
-                    greeting?.pin?.release()
                     completeLease?.release()
                 }
             }

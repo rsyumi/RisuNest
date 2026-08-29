@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { get } from 'svelte/store'
 
 import { ActiveConversationSession } from '../../storage/activeConversationSession'
+import { doingChat as generationDoingChat } from '../../process/generationState'
 
 const mocks = vi.hoisted(() => ({
     api: null as any,
@@ -112,6 +114,7 @@ function deferred<T>() {
 describe('Plugin v3 sendChat complete mutation gateway', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
+        generationDoingChat.set(false)
         mocks.api = null
         mocks.selectedId = 0
         mocks.doingChat = false
@@ -141,48 +144,36 @@ describe('Plugin v3 sendChat complete mutation gateway', () => {
         expect(mocks.processSendChat).toHaveBeenCalledOnce()
     })
 
-    it('rechecks busy state after promotion so concurrent calls cannot both append', async () => {
+    it('shares the public reservation before async promotion so concurrent calls cannot both append', async () => {
         const chat = mocks.database.characters[0].chats[0]
         const target = { characterId: 'character-a', conversationId: 'chat-a' }
         mocks.selectedTarget = target
         const firstPromotion = deferred<any>()
-        const secondPromotion = deferred<any>()
+        const secondReachedPromotion = new Error('second call reached promotion')
         mocks.acquireCompleteConversation
             .mockReturnValueOnce(firstPromotion.promise)
-            .mockReturnValueOnce(secondPromotion.promise)
-        const generation = deferred<boolean>()
-        mocks.processSendChat.mockImplementationOnce(() => {
-            mocks.doingChat = true
-            return generation.promise
-        })
+            .mockRejectedValueOnce(secondReachedPromotion)
+        mocks.processSendChat.mockResolvedValue(true)
         let firstReleases = 0
-        let secondReleases = 0
 
         const first = mocks.api.sendChat('first')
-        const second = mocks.api.sendChat('second')
-        while (mocks.acquireCompleteConversation.mock.calls.length < 2) await Promise.resolve()
+        while (mocks.acquireCompleteConversation.mock.calls.length === 0) await Promise.resolve()
+        const secondOutcome = await mocks.api.sendChat('second').catch((error: unknown) => error)
+
+        expect(get(generationDoingChat)).toBe(true)
 
         firstPromotion.resolve({
             session: mocks.session,
             target,
             release() { firstReleases += 1 },
         })
-        while (mocks.processSendChat.mock.calls.length === 0) await Promise.resolve()
-        secondPromotion.resolve({
-            session: mocks.session,
-            target,
-            release() { secondReleases += 1 },
-        })
-
-        await expect(second).rejects.toThrow('A chat is already in progress')
-        expect(chat.message.map((message: any) => message.data)).toEqual(['before', 'first'])
-        expect(mocks.doingChat).toBe(true)
-        expect(secondReleases).toBe(1)
-
-        generation.resolve(true)
         await expect(first).resolves.toBe(true)
+
+        expect(secondOutcome).toBeInstanceOf(Error)
+        expect((secondOutcome as Error).message).toBe('A chat is already in progress')
+        expect(mocks.acquireCompleteConversation).toHaveBeenCalledTimes(1)
+        expect(chat.message.map((message: any) => message.data)).toEqual(['before', 'first'])
         expect(firstReleases).toBe(1)
-        expect(mocks.doingChat).toBe(false)
     })
 
     it('returns false and removes only its appended message when generation declines', async () => {
