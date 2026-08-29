@@ -76,6 +76,7 @@ export interface SaveCoordinatorDependencies {
         event: ActiveConversationMutationEvent,
     ): ConversationMutationPersistenceHandle | null | undefined
     onConversationMutationPersisted?(event: PersistedConversationMutationEvent): void
+    onPersistenceIdle?(): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
 }
@@ -865,6 +866,7 @@ export class SaveCoordinator {
         blockedPrePublicationDirty: boolean
     } | null = null
     private selectedConversationTransitionActive = false
+    private persistenceWasBusy = false
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -938,6 +940,7 @@ export class SaveCoordinator {
         this.reservedCharacterAddition = null
         this.pendingResidentCompensations = []
         this.pendingConversationMutations = []
+        this.persistenceWasBusy = false
         this.lastBackgroundErrorMessage = null
         if (this.destructiveReplacementFence?.state === 'held') {
             this.destructiveReplacementFence.acceptsPostPublicationDirty = true
@@ -1091,6 +1094,7 @@ export class SaveCoordinator {
             fence.queuedPostPublicationDirty = true
         }
         this.dirtyGeneration++
+        this.persistenceWasBusy = true
         const bytes = Number.isFinite(estimatedBytes) && estimatedBytes > 0 ? estimatedBytes : 0
         const previousBytes = this.pendingByteCount
         this.pendingByteCount = Math.max(previousBytes, bytes)
@@ -2286,6 +2290,7 @@ export class SaveCoordinator {
 
     private enqueue<T>(operation: () => Promise<T>): Promise<T> {
         this.queuedOperationCount += 1
+        this.persistenceWasBusy = true
         this.notifyOperationStateChange()
         const run = async (): Promise<T> => {
             try {
@@ -2311,6 +2316,7 @@ export class SaveCoordinator {
         const waiters = [...this.operationStateWaiters]
         this.operationStateWaiters.clear()
         for (const resolve of waiters) resolve()
+        this.reportPersistenceIdleIfNeeded()
     }
 
     private async flushIterations(_reason: string, publishOfficial: boolean): Promise<void> {
@@ -3651,6 +3657,13 @@ export class SaveCoordinator {
         if (active === this.lastReportedFlushPromise) return
         this.lastReportedFlushPromise = active
         this.dependencies.onFlushPromise?.(active)
+        this.reportPersistenceIdleIfNeeded()
+    }
+
+    private reportPersistenceIdleIfNeeded(): void {
+        if (!this.persistenceWasBusy || this.hasPendingPersistenceWork) return
+        this.persistenceWasBusy = false
+        this.dependencies.onPersistenceIdle?.()
     }
 
     private async publishPendingRevision(): Promise<void> {

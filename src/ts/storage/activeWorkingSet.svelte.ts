@@ -85,6 +85,7 @@ export interface ActiveWorkingSetDependencies {
     canUseWindowedSelectedConversation?(): boolean
     isMaximumCompatibilityMode?(): boolean
     isConversationOperationActive?(): boolean
+    subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
     conversationViewportRowBudget?: number
 }
 
@@ -164,12 +165,15 @@ export class ActiveWorkingSet {
     private selectedConversationState: SelectedConversationState | null = null
     private promotionFlight: Promise<CompleteSelectedConversationState> | null = null
     private demotionScheduled = false
-    private demotionRetryScheduled = false
     private readonly viewportSourceListeners = new Set<
         ActiveConversationViewportSourceListener
     >()
 
-    constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
+    constructor(private readonly dependencies: ActiveWorkingSetDependencies) {
+        dependencies.subscribeConversationOperationActive?.((active) => {
+            if (!active) this.scheduleSelectedConversationDemotion()
+        })
+    }
 
     get navigationGenerationToken(): number {
         return this.navigationGeneration
@@ -462,10 +466,7 @@ export class ActiveWorkingSet {
             event.sessionVersion,
             event.revision,
         )
-        if (acknowledged) {
-            this.scheduleSelectedConversationDemotion()
-            this.scheduleSelectedConversationDemotionRetry()
-        }
+        if (acknowledged) this.scheduleSelectedConversationDemotion()
         return acknowledged
     }
 
@@ -973,22 +974,13 @@ export class ActiveWorkingSet {
         }
     }
 
-    private scheduleSelectedConversationDemotion(): void {
+    scheduleSelectedConversationDemotion(): void {
         if (this.demotionScheduled) return
         this.demotionScheduled = true
         queueMicrotask(() => {
             this.demotionScheduled = false
             this.tryDemoteSelectedConversation()
         })
-    }
-
-    private scheduleSelectedConversationDemotionRetry(): void {
-        if (this.demotionRetryScheduled) return
-        this.demotionRetryScheduled = true
-        setTimeout(() => {
-            this.demotionRetryScheduled = false
-            this.scheduleSelectedConversationDemotion()
-        }, 0)
     }
 
     private requireCurrentWindowedState(

@@ -50,6 +50,7 @@ function makeHarness(messageCount = 10_000) {
     let allowWindowed = true
     let maximumCompatibility = false
     let operationActive = false
+    let operationActiveListener: ((active: boolean) => void) | null = null
     let pendingPersistence = false
     let transitionActive = false
     const storeRevision = 7
@@ -121,7 +122,7 @@ function makeHarness(messageCount = 10_000) {
         if (nextCharacter) resident = nextCharacter
         else resident.chats[resident.chatPage ?? 0] = conversation
     })
-    const workingSet = new ActiveWorkingSet({
+    const dependencies = {
         store,
         coordinator,
         getSelectedCharacterId: () => selectedCharacterId,
@@ -138,8 +139,16 @@ function makeHarness(messageCount = 10_000) {
         canUseWindowedSelectedConversation: () => allowWindowed,
         isMaximumCompatibilityMode: () => maximumCompatibility,
         isConversationOperationActive: () => operationActive,
+        subscribeConversationOperationActive: (listener: (active: boolean) => void) => {
+            operationActiveListener = listener
+            listener(operationActive)
+            return () => {
+                if (operationActiveListener === listener) operationActiveListener = null
+            }
+        },
         conversationViewportRowBudget: 64,
-    })
+    }
+    const workingSet = new ActiveWorkingSet(dependencies)
     workingSet.installCommittedWorkingSet(
         { username: 'Fixture', characters: [resident] } as unknown as Database,
         storeRevision,
@@ -160,6 +169,7 @@ function makeHarness(messageCount = 10_000) {
         },
         setOperationActive: (value: boolean) => {
             operationActive = value
+            operationActiveListener?.(value)
         },
         setPendingPersistence: (value: boolean) => {
             pendingPersistence = value
@@ -202,6 +212,19 @@ describe('selected conversation lifecycle', () => {
             storeRevision: 7,
         })
         expect(harness.coordinator.adoptWindowedSelectedConversation).toHaveBeenCalledOnce()
+    })
+
+    it('demotes after the final generation blocker transitions to idle', async () => {
+        const harness = makeHarness(10_000)
+        harness.setOperationActive(true)
+        await flushScheduledDemotion()
+        expect(harness.workingSet.selectedConversationMode).toBe('complete')
+
+        harness.setOperationActive(false)
+        await flushScheduledDemotion()
+
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
+        expect(() => harness.getResident().chats[0].message).toThrow('metadata-only')
     })
 
     it('automatically demotes after persistence acknowledgement releases ownership', async () => {
@@ -677,6 +700,12 @@ describe('selected conversation lifecycle', () => {
         )
         await store.open()
         const revision = await store.replaceFromDatabase(database)
+        const heldPublication = deferred<void>()
+        let holdPublication = false
+        let currentTime = 0
+        const publish = vi.fn(async () => {
+            if (holdPublication) await heldPublication.promise
+        })
         const state: PersistentDataRuntimeStateAdapter = {
             captureRoot: () => capturePersistentRoot(workingCopy),
             captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
@@ -702,6 +731,13 @@ describe('selected conversation lifecycle', () => {
             store,
             state,
             prepareDatabase: async (candidate) => candidate,
+            officialPublisher: {
+                pin: vi.fn(async () => ({
+                    publish,
+                    dispose: vi.fn(async () => undefined),
+                })),
+            },
+            now: () => currentTime,
         })
         const runtimeSourceChanges = vi.fn()
         const unsubscribeSource = runtime.subscribeActiveConversationViewportSource(
@@ -747,7 +783,17 @@ describe('selected conversation lifecycle', () => {
         expect(runtimeSourceChanges).toHaveBeenCalledTimes(5)
         lease.session.append({ role: 'user', data: 'persisted tail', chatId: 'tail' })
         lease.release()
-        await runtime.flushPendingData('selected-conversation-acknowledgement')
+        holdPublication = true
+        currentTime = 3_000
+        const previousPublishCount = publish.mock.calls.length
+        const flush = runtime.flushPendingData('selected-conversation-acknowledgement')
+        await vi.waitFor(() => {
+            expect(publish.mock.calls.length).toBeGreaterThan(previousPublishCount)
+        })
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+        expect(runtime.getSelectedConversationMode()).toBe('complete')
+        heldPublication.resolve()
+        await flush
         await vi.waitFor(() => {
             expect(runtime.getSelectedConversationMode()).toBe('windowed')
         })

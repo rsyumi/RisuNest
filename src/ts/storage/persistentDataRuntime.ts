@@ -242,6 +242,7 @@ export interface PersistentDataRuntimeStateAdapter {
     canUseWindowedSelectedConversation?(): boolean
     isMaximumCompatibilityMode?(): boolean
     isConversationOperationActive?(): boolean
+    subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
     conversationViewportRowBudget?: number
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
@@ -516,6 +517,7 @@ export function createPersistentDataRuntime(
         onConversationMutationPersisted: (event) => {
             workingSet.acknowledgeConversationMutationPersisted(event)
         },
+        onPersistenceIdle: () => workingSet.scheduleSelectedConversationDemotion(),
         onFlushPromise: dependencies.onFlushPromise,
         onBackgroundError: dependencies.onBackgroundError,
     })
@@ -546,6 +548,8 @@ export function createPersistentDataRuntime(
             dependencies.state.canUseWindowedSelectedConversation,
         isMaximumCompatibilityMode: dependencies.state.isMaximumCompatibilityMode,
         isConversationOperationActive: dependencies.state.isConversationOperationActive,
+        subscribeConversationOperationActive:
+            dependencies.state.subscribeConversationOperationActive,
         conversationViewportRowBudget: dependencies.state.conversationViewportRowBudget,
     })
     const activateCharacter = (

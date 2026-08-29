@@ -255,6 +255,9 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         isConversationOperationActive() {
             return get(doingChat)
         },
+        subscribeConversationOperationActive(listener) {
+            return doingChat.subscribe(listener)
+        },
         conversationViewportRowBudget: getRuntimePerformanceBudgets().chatMountedMessageBudget,
         canActivateWorkingSet() {
             return !get(doingChat)
@@ -328,11 +331,8 @@ export const markPersistentDataDirty = (estimatedBytes: number): void =>
     getPersistentDataRuntime().markPersistentDataDirty(estimatedBytes)
 export const flushPendingData = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingData(reason)
-export const acknowledgeGenerationCompletion = async (): Promise<void> => {
-    const runtime = getPersistentDataRuntime()
-    await runtime.acknowledgeGenerationCompletion()
-    runtime.tryDemoteSelectedConversation()
-}
+export const acknowledgeGenerationCompletion = (): Promise<void> =>
+    getPersistentDataRuntime().acknowledgeGenerationCompletion()
 export const commitCharacterAddition = (
     request: CharacterAdditionRequest,
     reason: string,

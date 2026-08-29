@@ -45,6 +45,10 @@ describe('production persistent working-set publication', () => {
         workingSetResidency.setEvictionAllowed(true)
         doingChat.set(false)
         const adapter = createProductionStateAdapter()
+        const operationTransitions: boolean[] = []
+        const unsubscribeOperation = adapter.subscribeConversationOperationActive?.(
+            (active) => operationTransitions.push(active),
+        )
 
         expect(adapter.canUseWindowedSelectedConversation?.()).toBe(true)
         expect(adapter.isMaximumCompatibilityMode?.()).toBe(false)
@@ -64,6 +68,9 @@ describe('production persistent working-set publication', () => {
         expect(adapter.canUseWindowedSelectedConversation?.()).toBe(false)
         expect(adapter.isMaximumCompatibilityMode?.()).toBe(true)
         expect(adapter.isConversationOperationActive?.()).toBe(true)
+        doingChat.set(false)
+        expect(operationTransitions).toEqual([false, true, false])
+        unsubscribeOperation?.()
     })
 
     it('clears old residency before the synchronous projector records the replacement', () => {
