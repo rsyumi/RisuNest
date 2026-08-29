@@ -2284,6 +2284,8 @@ mod timeout_tests {
 
     const TEST_SESSION_ID: &str = "00000000-0000-4000-8000-000000000000";
     const TEST_BEARER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const TEST_P5_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+    const TEST_P5_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
     fn read_request_head(stream: &mut TcpStream) -> String {
         let mut request = Vec::new();
@@ -2342,11 +2344,52 @@ mod timeout_tests {
         }
     }
 
+    fn direct_bidirectional_client(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        device_id: &str,
+    ) -> Result<LanBidirectionalLogicalClient, PeerSyncError> {
+        let inner = LanLogicalDeltaClient::claim_with_timeouts_and_device(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            Some(device_id),
+            "logical-bidirectional",
+            LogicalClientTimeouts {
+                control_request: TEST_P5_CONTROL_TIMEOUT,
+                object_idle: TEST_P5_OBJECT_IDLE_TIMEOUT,
+            },
+        )?;
+        Ok(LanBidirectionalLogicalClient {
+            remote_apply_client: build_bidirectional_remote_apply_client()?,
+            endpoint: validate_private_lan_endpoint(endpoint)?,
+            session_id: session_id.to_owned(),
+            inner,
+        })
+    }
+
     fn finish_response(stream: &mut TcpStream) {
         let _ = stream.shutdown(Shutdown::Write);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let mut drain = [0_u8; 64];
         while stream.read(&mut drain).is_ok_and(|read| read != 0) {}
+    }
+
+    fn is_reqwest_timeout(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout)
+    }
+
+    #[test]
+    fn socket_abort_is_not_a_logical_object_idle_timeout() {
+        let socket_abort = io::Error::other(io::Error::from_raw_os_error(10053));
+
+        assert!(!is_reqwest_timeout(&socket_abort));
     }
 
     #[test]
@@ -2374,7 +2417,9 @@ mod timeout_tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            configure_connection(&stream).unwrap();
+            assert!(read_request(&mut stream, &AtomicBool::new(false)).is_ok());
             thread::sleep(Duration::from_millis(800));
         });
         let started = Instant::now();
@@ -2431,10 +2476,10 @@ mod timeout_tests {
         let elapsed = started.elapsed();
         server.join().unwrap();
 
-        assert!(matches!(
-            error.kind(),
-            io::ErrorKind::TimedOut | io::ErrorKind::Other
-        ));
+        assert!(
+            is_reqwest_timeout(&error),
+            "unexpected read error: {error:?}"
+        );
         assert!(
             elapsed < Duration::from_millis(1_500),
             "stall lasted {elapsed:?}"
@@ -2468,7 +2513,7 @@ mod timeout_tests {
         });
         let control_timeout = Duration::from_millis(100);
         let mut client =
-            direct_logical_client(address, control_timeout, Duration::from_millis(200));
+            direct_logical_client(address, control_timeout, Duration::from_millis(1_000));
         let mut reader = client
             .open_object(&LogicalDeltaObject {
                 hash: object_hash,
@@ -2794,7 +2839,7 @@ mod timeout_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = Arc::new(BidirectionalControlFixture::default());
-        *control.remote_apply_delay.lock().unwrap() = Some(Duration::from_millis(5_100));
+        *control.remote_apply_delay.lock().unwrap() = Some(Duration::from_millis(1_500));
         let session_id = "00000000-0000-4000-8000-000000000078";
         let source_device_id = "00000000-0000-4000-8000-000000000079";
         let target_device_id = "00000000-0000-4000-8000-000000000080";
@@ -2806,7 +2851,7 @@ mod timeout_tests {
             ));
         let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let endpoint = format!("http://{}", host.address().unwrap());
-        let client = LanBidirectionalLogicalClient::claim(
+        let client = direct_bidirectional_client(
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
@@ -2835,7 +2880,7 @@ mod timeout_tests {
             })
             .unwrap();
 
-        assert!(started.elapsed() > CONTROL_REQUEST_TIMEOUT);
+        assert!(started.elapsed() > TEST_P5_CONTROL_TIMEOUT);
         assert_eq!(receipt.committed_generation, generation);
         host.stop().unwrap();
     }
