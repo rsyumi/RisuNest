@@ -133,6 +133,7 @@ import {
     removeChar,
     removeChat,
 } from './characters'
+import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
 import { doingChat } from './process/index.svelte'
 import { createConversationSummaryStub } from './storage/conversationResidency'
@@ -889,6 +890,25 @@ describe('chat list operations', () => {
         characterFormatUpdate(character)
 
         expect(character.chats[0]).not.toHaveProperty('fmIndex')
+    })
+
+    it('normalizes character and chat metadata without reading a metadata-only message array', () => {
+        const character = buildCharacter()
+        character.type = undefined as any
+        character.customscript = undefined as any
+        const shell = createMetadataOnlySelectedConversation(character.chats[0])
+        delete shell.fmIndex
+        delete shell.localLore
+        character.chats[0] = shell
+        character.chatPage = 0
+
+        const formatted = characterFormatUpdate(character)
+
+        expect(formatted.type).toBe('character')
+        expect(formatted.customscript).toEqual([])
+        expect(formatted.chats[0]).toBe(shell)
+        expect(formatted.chats[0].fmIndex).toBe(-1)
+        expect(formatted.chats[0].localLore).toEqual([])
     })
 
     it('reads a chat authoritatively and navigates only to its duplicate', async () => {

@@ -86,6 +86,8 @@
   let rerolled = $state<string | null>(null);
   let isTranslatingRerolled = $state(false);
   let rerolledTranslation = $state<string | null>(null);
+  let orphan = $state(true);
+  let orphanQueryGeneration = 0;
 
   $effect.pre(() => {
     summaryItemStateMap.set(summary, summaryItemState);
@@ -145,7 +147,7 @@
     summary.isImportant = !summary.isImportant;
   }
 
-  function isOrphan(): boolean {
+  async function isOrphan(): Promise<boolean> {
     const messageIds: string[] = [];
     for (const chatMemo of summary.chatMemos) {
       if (chatMemo == null) {
@@ -155,12 +157,21 @@
         messageIds.push(chatMemo);
       }
     }
-    return captureCurrentHypaMessagesByIds(messageIds).length !== messageIds.length;
+    return (await captureCurrentHypaMessagesByIds(messageIds)).length !== messageIds.length;
   }
+
+  $effect(() => {
+    summary.chatMemos;
+    const generation = ++orphanQueryGeneration;
+    orphan = true;
+    void isOrphan().then((value) => {
+      if (generation === orphanQueryGeneration) orphan = value;
+    });
+  });
 
   async function toggleReroll(): Promise<void> {
     if (isRerolling) return;
-    if (isOrphan()) return;
+    if (await isOrphan()) return;
 
     isRerolling = true;
     rerolled = "Loading...";
@@ -203,7 +214,7 @@
       if (!firstMessage) return null;
       msg = { role: "char", data: firstMessage };
     } else {
-      const target = captureCurrentHypaMessageById(chatMemo);
+      const target = await captureCurrentHypaMessageById(chatMemo);
       if (!target) return null;
       msgIndex = target.absoluteIndex;
       msg = target.message;
@@ -461,7 +472,7 @@
       <button
         class="p-2 transition-colors text-zinc-400 hover:text-zinc-200"
         tabindex="-1"
-        disabled={isOrphan()}
+        disabled={orphan}
         onclick={async () => await toggleReroll()}
       >
         <RefreshCw class="w-4 h-4" />

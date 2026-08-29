@@ -5,12 +5,17 @@ import { alertConfirm } from "src/ts/alert";
 import { DBState, selectedCharID } from "src/ts/stores.svelte";
 import { language } from "src/lang";
 import {
-  captureChatMessageTarget,
-  captureChatMessageTargetById,
-  captureChatMessageTargetsByIds,
+  queryChatMessageTargetAt,
+  queryChatMessageTargetById,
+  queryChatMessageTargetsByIds,
   type CapturedChatMessageTarget,
 } from "src/ts/chatMessageUi";
-import { peekActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
+import {
+  acquireCompleteConversation,
+  captureSelectedConversationTarget,
+  getPersistentDataRuntime,
+  peekActiveConversationSession,
+} from "src/ts/storage/persistentDataRuntime.svelte";
 
 export async function alertConfirmTwice(
   firstMessage: string,
@@ -109,21 +114,22 @@ const currentHypaMessageContext = {
     return character && conversation ? { character, conversation } : null;
   },
   getCurrentSession: peekActiveConversationSession,
+  captureSelectedConversationTarget,
+  acquirePersistentRevision: (revision: number) =>
+    getPersistentDataRuntime().store.acquireRevision(revision),
+  acquireCompleteConversation,
 };
 
 export function captureCurrentHypaMessageAt(
   absoluteIndex: number
-): CapturedChatMessageTarget | null {
-  return captureChatMessageTarget({
-    ...currentHypaMessageContext,
-    absoluteIndex,
-  });
+): Promise<CapturedChatMessageTarget | null> {
+  return queryChatMessageTargetAt(currentHypaMessageContext, absoluteIndex);
 }
 
 export function captureCurrentHypaMessageById(
   messageId: string
-): CapturedChatMessageTarget | null {
-  return captureChatMessageTargetById(
+): Promise<CapturedChatMessageTarget | null> {
+  return queryChatMessageTargetById(
     currentHypaMessageContext,
     messageId,
     "first"
@@ -132,8 +138,8 @@ export function captureCurrentHypaMessageById(
 
 export function captureCurrentHypaMessagesByIds(
   messageIds: readonly string[]
-): CapturedChatMessageTarget[] {
-  return captureChatMessageTargetsByIds(
+): Promise<CapturedChatMessageTarget[]> {
+  return queryChatMessageTargetsByIds(
     currentHypaMessageContext,
     messageIds,
     "first"

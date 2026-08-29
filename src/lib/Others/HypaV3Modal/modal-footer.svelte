@@ -27,10 +27,10 @@
       const lastMessageId = lastSummary.chatMemos.at(-1);
       const lastMessage = lastMessageId == null
         ? null
-        : captureCurrentHypaMessageById(lastMessageId);
+        : await captureCurrentHypaMessageById(lastMessageId);
 
       if (lastMessage) {
-        const nextTarget = captureCurrentHypaMessageAt(lastMessage.absoluteIndex + 1);
+        const nextTarget = await captureCurrentHypaMessageAt(lastMessage.absoluteIndex + 1);
         const next = nextTarget?.message ?? null;
 
         return next && shouldProcess
@@ -44,7 +44,7 @@
     const firstMessage = getFirstMessage();
 
     if (!firstMessage) {
-      const next = captureCurrentHypaMessageAt(0)?.message ?? null;
+      const next = (await captureCurrentHypaMessageAt(0))?.message ?? null;
 
       return next && shouldProcess ? await processRegexScript(next, 0) : next;
     }

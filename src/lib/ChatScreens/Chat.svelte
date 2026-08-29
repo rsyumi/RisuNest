@@ -732,7 +732,7 @@
                     <button class="text-blue-500 hover:underline"
                         onclick={async () => {
                             console.log(parts)
-                            if(await changeChatTo(parts[2] ?? '')) foldChatToMessage(parts[4])
+                            if(await changeChatTo(parts[2] ?? '')) await foldChatToMessage(parts[4])
                         }}
                     >
                         <GitBranch size={20} class="inline-block mr-1" />

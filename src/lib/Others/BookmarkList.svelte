@@ -7,9 +7,14 @@
     import { createSimpleCharacter, bookmarkListOpen, DBState, selectedCharID, ScrollToMessageStore } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import { alertInput } from "src/ts/alert";
-    import { getActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
     import {
-        captureChatMessageTargetsByIds,
+        acquireCompleteConversation,
+        captureSelectedConversationTarget,
+        getActiveConversationSession,
+        getPersistentDataRuntime,
+    } from "src/ts/storage/persistentDataRuntime.svelte";
+    import {
+        queryChatMessageTargetsByIds,
         removeCapturedBookmark,
         renameCapturedBookmark,
         type CapturedChatMessageTarget,
@@ -28,23 +33,33 @@
     const chatMessageContext = {
         captureCurrent: captureCurrentChat,
         getCurrentSession: getActiveConversationSession,
+        captureSelectedConversationTarget,
+        acquirePersistentRevision: (revision: number) =>
+            getPersistentDataRuntime().store.acquireRevision(revision),
+        acquireCompleteConversation,
     };
 
-    const bookmarkedMessages = $derived.by(() => {
-        if (!chara) return [];
-
-        const chat = chara.chats[chara.chatPage];
-        const bookmarkIds = chat.bookmarks ?? [];
-        const targets = captureChatMessageTargetsByIds(
+    let bookmarkedMessages = $state<any[]>([]);
+    let bookmarkQueryGeneration = 0;
+    $effect(() => {
+        const currentCharacter = chara;
+        const chat = currentCharacter?.chats[currentCharacter.chatPage];
+        const bookmarkIds = [...(chat?.bookmarks ?? [])];
+        const generation = ++bookmarkQueryGeneration;
+        if (!currentCharacter || !chat || bookmarkIds.length === 0) {
+            bookmarkedMessages = [];
+            return;
+        }
+        void queryChatMessageTargetsByIds(
             chatMessageContext,
             bookmarkIds,
             'last',
-        );
-
-        const messages = targets.map(target => {
+        ).then((targets) => {
+            if (generation !== bookmarkQueryGeneration) return;
+            bookmarkedMessages = targets.map(target => {
                 const message = target.message;
                 let speaker = null;
-                if (chara.type === 'group' && message.saying) {
+                if (currentCharacter.type === 'group' && message.saying) {
                     speaker = findCharacterbyId(message.saying);
                 }
                 
@@ -56,8 +71,9 @@
                     target,
                 };
             });
-
-        return messages;
+        }).catch(() => {
+            if (generation === bookmarkQueryGeneration) bookmarkedMessages = [];
+        });
     });
 
     let expandedBookmarks = $state(new Set<string>());
@@ -106,8 +122,8 @@
         );
     }
 
-    function removeBookmark(target: CapturedChatMessageTarget) {
-        removeCapturedBookmark(target, chatMessageContext);
+    async function removeBookmark(target: CapturedChatMessageTarget) {
+        await removeCapturedBookmark(target, chatMessageContext);
     }
 
     function goToChat(target: CapturedChatMessageTarget) {
@@ -172,7 +188,7 @@
                                 <button class="text-textcolor2 hover:text-green-500" onclick={(e) => { e.stopPropagation(); if (msg.target) editName(msg.target); }}>
                                     <PencilIcon size={16} />
                                 </button>
-                                <button class="text-textcolor2 hover:text-red-500" onclick={(e) => { e.stopPropagation(); if (msg.target) removeBookmark(msg.target); }}>
+                                <button class="text-textcolor2 hover:text-red-500" onclick={(e) => { e.stopPropagation(); if (msg.target) void removeBookmark(msg.target); }}>
                                     <TrashIcon size={16} />
                                 </button>
                             </div>

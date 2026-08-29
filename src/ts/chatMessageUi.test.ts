@@ -9,6 +9,10 @@ import {
     editCapturedChatMessage,
     LatestChatScrollRequestGuard,
     navigateCapturedChatMessage,
+    queryChatMessageTargetAt,
+    queryChatMessageTargetById,
+    queryChatMessageTargetsByIds,
+    removeCapturedBookmark,
     renameCapturedBookmark,
     resolveRetainedChatMessageTarget,
     resolveChatMessageTarget,
@@ -17,6 +21,7 @@ import {
     toggleCapturedMessageDisabled,
     toggleCapturedMessageRole,
 } from './chatMessageUi'
+import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -78,6 +83,167 @@ function capture(target: ReturnType<typeof fixture>, absoluteIndex: number) {
 }
 
 describe('chat message UI targets', () => {
+    it('queries far stable message IDs through one pinned windowed revision', async () => {
+        const complete = fixture(Array.from({ length: 10_000 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `message-${index}`,
+            chatId: `id-${index}`,
+        } as Message)))
+        const shell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = shell
+        const selection = {
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            navigationGeneration: 3,
+            storeRevision: 7,
+        } as any
+        const release = vi.fn()
+        const readConversationWindow = vi.fn(async ({ anchorMessageId, startIndex }: any) => {
+            let absoluteIndex = anchorMessageId === undefined
+                ? startIndex
+                : Number(anchorMessageId.slice(3))
+            if (startIndex === 8888) absoluteIndex = 8887
+            return {
+                revision: 7,
+                value: {
+                    characterId: complete.character.chaId,
+                    conversationId: shell.id,
+                    startIndex: absoluteIndex,
+                    endIndex: absoluteIndex + 1,
+                    totalMessages: 10_000,
+                    messages: [{
+                        role: absoluteIndex % 2 === 0 ? 'user' : 'char',
+                        data: `message-${absoluteIndex}`,
+                        chatId: anchorMessageId,
+                    }],
+                    hasMoreBefore: absoluteIndex > 0,
+                    hasMoreAfter: absoluteIndex < 9_999,
+                },
+            }
+        })
+        const context = {
+            captureCurrent: () => ({ character: complete.character, conversation: shell }),
+            getCurrentSession: () => null,
+            captureSelectedConversationTarget: () => selection,
+            acquirePersistentRevision: vi.fn(async () => ({
+                revision: 7,
+                readConversationWindow,
+                release,
+            })),
+            acquireCompleteConversation: vi.fn(),
+        }
+
+        const targets = await queryChatMessageTargetsByIds(
+            context as any,
+            ['id-9123', 'id-42'],
+            'first',
+        )
+
+        expect(targets.map((target) => [target.absoluteIndex, target.message.chatId])).toEqual([
+            [9123, 'id-9123'],
+            [42, 'id-42'],
+        ])
+        expect(context.acquirePersistentRevision).toHaveBeenCalledWith(7)
+        expect(readConversationWindow).toHaveBeenCalledTimes(2)
+        const indexed = await queryChatMessageTargetAt(context as any, 7777)
+        expect(indexed).toMatchObject({
+            absoluteIndex: 7777,
+            message: { chatId: undefined, data: 'message-7777' },
+        })
+        expect(readConversationWindow).toHaveBeenCalledTimes(3)
+        expect(release).toHaveBeenCalledTimes(2)
+        await expect(queryChatMessageTargetAt(context as any, 8888)).resolves.toBeNull()
+        expect(release).toHaveBeenCalledTimes(3)
+    })
+
+    it('rejects every anchored result when selection changes during a multi-ID query', async () => {
+        const complete = fixture([
+            { role: 'user', data: 'first', chatId: 'first-id' },
+            { role: 'char', data: 'second', chatId: 'second-id' },
+        ])
+        const shell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = shell
+        const initialSelection = {
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            navigationGeneration: 1,
+            storeRevision: 4,
+        } as any
+        const laterSelection = { ...initialSelection, navigationGeneration: 2 } as any
+        let selection = initialSelection
+        const secondRead = deferred<any>()
+        const release = vi.fn()
+        const windowFor = (absoluteIndex: number, message: Message) => ({
+            revision: 4,
+            value: {
+                characterId: complete.character.chaId,
+                conversationId: shell.id,
+                startIndex: absoluteIndex,
+                endIndex: absoluteIndex + 1,
+                totalMessages: 2,
+                messages: [message],
+                hasMoreBefore: absoluteIndex > 0,
+                hasMoreAfter: absoluteIndex < 1,
+            },
+        })
+        const readConversationWindow = vi.fn(({ anchorMessageId }: any) =>
+            anchorMessageId === 'first-id'
+                ? Promise.resolve(windowFor(0, complete.conversation.message[0]))
+                : secondRead.promise,
+        )
+        const context = {
+            captureCurrent: () => ({ character: complete.character, conversation: shell }),
+            getCurrentSession: () => null,
+            captureSelectedConversationTarget: () => selection,
+            acquirePersistentRevision: vi.fn(async () => ({
+                revision: 4,
+                readConversationWindow,
+                release,
+            })),
+            acquireCompleteConversation: vi.fn(),
+        }
+
+        const pending = queryChatMessageTargetsByIds(
+            context as any,
+            ['first-id', 'second-id'],
+        )
+        await vi.waitFor(() => expect(readConversationWindow).toHaveBeenCalledTimes(2))
+        selection = laterSelection
+        secondRead.resolve(windowFor(1, complete.conversation.message[1]))
+
+        await expect(pending).resolves.toEqual([])
+        expect(release).toHaveBeenCalledOnce()
+    })
+
+    it('rejects mismatched pinned revision evidence and always disposes the lease', async () => {
+        const complete = fixture([{ role: 'user', data: 'far', chatId: 'far-id' }])
+        const shell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = shell
+        const selection = {
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            navigationGeneration: 1,
+            storeRevision: 4,
+        } as any
+        const release = vi.fn()
+        const context = {
+            captureCurrent: () => ({ character: complete.character, conversation: shell }),
+            getCurrentSession: () => null,
+            captureSelectedConversationTarget: () => selection,
+            acquirePersistentRevision: vi.fn(async () => ({
+                revision: 4,
+                readConversationWindow: async () => ({ revision: 5, value: {} }),
+                release,
+            })),
+            acquireCompleteConversation: vi.fn(),
+        }
+
+        await expect(queryChatMessageTargetById(context as any, 'far-id')).rejects.toThrow(
+            'mismatched revision',
+        )
+        expect(release).toHaveBeenCalledOnce()
+    })
+
     it('routes role and both disabled-state toggles through session edits', () => {
         const target = fixture([{ role: 'char', data: 'message', disabled: false }])
 
@@ -308,6 +474,83 @@ describe('chat message UI targets', () => {
 
         await expect(renaming).resolves.toBe(false)
         expect(target.conversation.bookmarkNames).toEqual({ 'before-id': 'Before' })
+    })
+
+    it('holds short complete leases for persistent bookmark rename and removal', async () => {
+        const complete = fixture([{ role: 'user', data: 'far', chatId: 'far-id' }])
+        complete.conversation.bookmarks = ['far-id']
+        complete.conversation.bookmarkNames = { 'far-id': 'Before' }
+        const shell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = shell
+        const initialSelection = {
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            navigationGeneration: 1,
+            storeRevision: 4,
+        } as any
+        const completeSelection = { ...initialSelection, storeRevision: 4 } as any
+        let currentConversation: Chat = shell
+        let currentSession: ActiveConversationSession | null = null
+        let selection = initialSelection
+        const persistentRelease = vi.fn()
+        const renameRelease = vi.fn()
+        const removeRelease = vi.fn()
+        const acquireCompleteConversation = vi.fn(async (reason: string) => {
+            currentConversation = complete.conversation
+            complete.character.chats[0] = complete.conversation
+            currentSession = complete.session
+            selection = completeSelection
+            return {
+                reason,
+                session: complete.session,
+                target: completeSelection,
+                release: reason === 'rename-bookmark' ? renameRelease : removeRelease,
+            }
+        })
+        const context = {
+            captureCurrent: () => ({
+                character: complete.character,
+                conversation: currentConversation,
+            }),
+            getCurrentSession: () => currentSession,
+            captureSelectedConversationTarget: () => selection,
+            acquirePersistentRevision: vi.fn(async () => ({
+                revision: 4,
+                readConversationWindow: async () => ({
+                    revision: 4,
+                    value: {
+                        characterId: complete.character.chaId,
+                        conversationId: shell.id,
+                        startIndex: 0,
+                        endIndex: 1,
+                        totalMessages: 1,
+                        messages: [{ role: 'user', data: 'far', chatId: 'far-id' }],
+                        hasMoreBefore: false,
+                        hasMoreAfter: false,
+                    },
+                }),
+                release: persistentRelease,
+            })),
+            acquireCompleteConversation,
+        }
+        const target = await queryChatMessageTargetById(context as any, 'far-id')
+        expect(target).not.toBeNull()
+
+        await expect(renameCapturedBookmark(target!, context, async () => 'After')).resolves.toBe(true)
+        expect(complete.conversation.bookmarkNames).toEqual({ 'far-id': 'After' })
+        expect(renameRelease).toHaveBeenCalledOnce()
+
+        const updatedShell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = updatedShell
+        currentConversation = updatedShell
+        currentSession = null
+        selection = initialSelection
+        const removalTarget = await queryChatMessageTargetById(context as any, 'far-id')
+
+        await expect(removeCapturedBookmark(removalTarget!, context)).resolves.toBe(true)
+        expect(complete.conversation.bookmarks).toEqual([])
+        expect(removeRelease).toHaveBeenCalledOnce()
+        expect(persistentRelease).toHaveBeenCalledTimes(2)
     })
 
     it('rejects stale scroll, fold, and bookmark targets without changing canonical output', () => {

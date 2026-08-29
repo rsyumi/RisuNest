@@ -31,6 +31,7 @@ import { removeCharacterIdFromOrder } from './storage/characterOrderMutation'
 import { restoreColdPersistentCharacter } from './process/coldCharacterRestore'
 import { safeStructuredClone } from './polyfill'
 import { isConversationSummaryStub } from './storage/conversationResidency'
+import { isMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 import { open } from '@tauri-apps/plugin-dialog'
 import { readFile } from '@tauri-apps/plugin-fs'
 import { isTauriDesktop } from './platform'
@@ -601,7 +602,10 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     if(!cha.chats[cha.chatPage]){
         cha.chatPage = 0
     }
-    if(!cha.chats[cha.chatPage].message){
+    if(
+        !isMetadataOnlySelectedConversation(cha.chats[cha.chatPage]) &&
+        !cha.chats[cha.chatPage].message
+    ){
         cha.chats[cha.chatPage].message = []
     }
     if(!cha.type){

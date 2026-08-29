@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onDestroy, onMount } from "svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import NumberInput from "../UI/GUI/NumberInput.svelte";
@@ -15,7 +16,12 @@
     import { selectSingleFile } from "src/ts/util";
     import { doingChat, previewFormated, previewBody, sendChat } from "src/ts/process/index.svelte";
     import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
-    import { getActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
+    import {
+        acquireCompleteConversation,
+        captureSelectedConversationTarget,
+        getActiveConversationSession,
+    } from "src/ts/storage/persistentDataRuntime.svelte";
+    import { DevToolConversationLease } from "./devToolLease";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
@@ -108,8 +114,25 @@
     }
     
     let autopilot = $state([])
+    let devToolReady = $state(false)
+    const panelLease = new DevToolConversationLease()
+
+    onMount(() => {
+        void panelLease.acquire(
+            captureSelectedConversationTarget(),
+            acquireCompleteConversation,
+        ).then((ready) => {
+            devToolReady = ready
+        })
+    })
+
+    onDestroy(() => {
+        panelLease.destroy()
+    })
+
 </script>
 
+{#if devToolReady}
 <Accordion styled name={"Variables"}>
     <div class="rounded-md border border-darkborderc grid grid-cols-2 gap-2 p-2">
         {#if DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate &&  Object.keys(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate).length > 0}
@@ -321,3 +344,4 @@
 <Button className="mt-2" onclick={() => {
     alertMd(getRequestLog())
 }}>Request Log</Button>
+{/if}

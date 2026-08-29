@@ -60,8 +60,8 @@ import {
 } from "./storage/persistentDataRuntime.svelte";
 import * as persistentDataRuntime from "./storage/persistentDataRuntime.svelte";
 import {
-    captureChatMessageTarget,
-    captureChatMessageTargetById,
+    queryChatMessageTargetAt,
+    queryChatMessageTargetById,
     resolveRetainedChatMessageTarget,
     type CapturedChatMessageTarget,
 } from "./chatMessageUi";
@@ -1931,6 +1931,13 @@ const foldTargetContext = {
         return character && conversation ? { character, conversation } : null
     },
     getCurrentSession: () => persistentDataRuntime.getActiveConversationSession(),
+    captureSelectedConversationTarget: () =>
+        persistentDataRuntime.captureSelectedConversationTarget(),
+    acquirePersistentRevision: (revision: number) =>
+        persistentDataRuntime.getPersistentDataRuntime().store.acquireRevision(revision),
+    acquireCompleteConversation: (reason: string, target?: Parameters<
+        typeof persistentDataRuntime.acquireCompleteConversation
+    >[1]) => persistentDataRuntime.acquireCompleteConversation(reason, target),
 }
 
 export const chatFoldedState = $state<{
@@ -1960,17 +1967,16 @@ $effect.root(() => {
     })
 })
 
-export function foldChatToMessage(targetMessageIdOrIndex: string | number) {
-    chatFoldedState.data = typeof targetMessageIdOrIndex === 'number'
-        ? captureChatMessageTarget({
-            ...foldTargetContext,
-            absoluteIndex: targetMessageIdOrIndex,
-        })
-        : captureChatMessageTargetById(
-            foldTargetContext,
-            targetMessageIdOrIndex,
-            'first',
-        )
+let foldQueryGeneration = 0
+
+export async function foldChatToMessage(targetMessageIdOrIndex: string | number) {
+    const generation = ++foldQueryGeneration
+    const target = typeof targetMessageIdOrIndex === 'number'
+        ? await queryChatMessageTargetAt(foldTargetContext, targetMessageIdOrIndex)
+        : await queryChatMessageTargetById(foldTargetContext, targetMessageIdOrIndex, 'first')
+    if (generation !== foldQueryGeneration) return false
+    chatFoldedState.data = target
+    return target !== null
 }
 
 export async function changeChatTo(IdOrIndex: string | number): Promise<boolean> {
