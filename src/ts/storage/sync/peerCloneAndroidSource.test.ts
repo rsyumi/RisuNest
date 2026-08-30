@@ -11,9 +11,13 @@ const prepared = {
 }
 
 describe('Android P1 source facade', () => {
-    it.each(['false', 'throw', 'timeout'] as const)(
-        'abandons the exact native reservation after %s start failure',
-        async (failure) => {
+    it.each([
+        ['false', false],
+        ['throw', true],
+        ['timeout', true],
+    ] as const)(
+        'abandons the exact native reservation after %s start failure only with definitive start failure or accepted Stop',
+        async (failure, expectsStop) => {
             const foreground = { lane: 'p1-source' as const, operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
             let owner: typeof foreground | undefined
             const bridge = {
@@ -43,13 +47,70 @@ describe('Android P1 source facade', () => {
             })
 
             await expect(facade.start(prepared.sessionId)).rejects.toThrow()
-            expect(bridge.stopSource).toHaveBeenCalledWith(
-                foreground.lane,
-                foreground.operationId,
-                foreground.generation,
-            )
+            if (expectsStop) {
+                expect(bridge.stopSource).toHaveBeenCalledWith(
+                    foreground.lane,
+                    foreground.operationId,
+                    foreground.generation,
+                )
+            } else {
+                expect(bridge.stopSource).not.toHaveBeenCalled()
+            }
             expect(invoke).toHaveBeenCalledWith('peer_sync_foreground_source_abandon', { foreground })
             expect(owner).toBeUndefined()
+        },
+    )
+
+    it.each(['false', 'throw'] as const)(
+        'retains uncertain native ownership when exact Stop returns %s and recovers before a fresh reserve',
+        async (stopFailure) => {
+            const foreground = { lane: 'p1-source' as const, operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
+            let owner: typeof foreground | undefined
+            let stopAttempt = 0
+            let startThrows = true
+            const bridge = {
+                startSource: vi.fn(() => {
+                    if (startThrows) throw new Error('uncertain START')
+                    return true
+                }),
+                stopSource: vi.fn(() => {
+                    stopAttempt += 1
+                    if (stopAttempt === 1) {
+                        if (stopFailure === 'throw') throw new Error('uncertain Stop')
+                        return false
+                    }
+                    return true
+                }),
+            }
+            const invoke = vi.fn(async (command: string) => {
+                if (command === 'peer_sync_foreground_source_status') return owner ?? null
+                if (command.endsWith('_reserve')) {
+                    if (owner) throw new Error('owner retained')
+                    owner = foreground
+                    return foreground
+                }
+                if (command === 'peer_sync_foreground_source_abandon') {
+                    owner = undefined
+                    return true
+                }
+                return { ...prepared, phase: 'running' }
+            })
+            const facade = createAndroidPeerCloneSourceFacade({
+                invoke: invoke as PeerCloneInvoke,
+                bridge,
+                flushPendingData: vi.fn(async () => undefined),
+            })
+
+            await expect(facade.start(prepared.sessionId)).rejects.toThrow()
+            expect(owner).toEqual(foreground)
+            expect(invoke).not.toHaveBeenCalledWith('peer_sync_foreground_source_abandon', { foreground })
+
+            startThrows = false
+            await facade.start(prepared.sessionId)
+
+            expect(stopAttempt).toBe(2)
+            expect(owner).toEqual(foreground)
+            expect(invoke).toHaveBeenCalledWith('peer_sync_foreground_source_abandon', { foreground })
         },
     )
 
@@ -59,6 +120,7 @@ describe('Android P1 source facade', () => {
         const cleanup = new Error('abandon response lost')
         const facade = createAndroidPeerCloneSourceFacade({
             invoke: vi.fn(async (command) => {
+                if (command === 'peer_sync_foreground_source_status') return null
                 if (command.endsWith('_reserve')) return foreground
                 if (command === 'peer_sync_foreground_source_abandon') throw cleanup
                 throw primary
@@ -91,6 +153,7 @@ describe('Android P1 source facade', () => {
 
         expect(facade.foregroundIdentity()).toEqual(foreground)
         expect(calls.map(([command]) => command)).toEqual([
+            'peer_sync_foreground_source_status',
             'peer_clone_android_source_reserve',
             'peer_clone_android_source_start',
         ])

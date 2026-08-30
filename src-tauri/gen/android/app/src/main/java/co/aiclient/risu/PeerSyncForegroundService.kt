@@ -59,6 +59,11 @@ internal fun isExactAttachedPeerSyncStop(
   requested: PeerSyncForegroundIdentity,
 ): Boolean = attached == requested
 
+internal fun peerSyncForegroundIdentityAfterStop(
+  attached: PeerSyncForegroundIdentity?,
+  requested: PeerSyncForegroundIdentity,
+): PeerSyncForegroundIdentity? = attached.takeUnless { isExactAttachedPeerSyncStop(it, requested) }
+
 internal fun canStartPeerSyncForeground(
   attached: PeerSyncForegroundIdentity?,
   requested: PeerSyncForegroundIdentity,
@@ -96,7 +101,10 @@ class PeerSyncForegroundService : Service() {
     if (intent.action == PEER_SYNC_FOREGROUND_STOP_ACTION) {
       PeerSyncForegroundNativeBridge.cancel(identity.lane, identity.operationId, identity.generation)
       val exactAttachedStop = isExactAttachedPeerSyncStop(attached, identity)
-      if (exactAttachedStop) stopForeground(STOP_FOREGROUND_REMOVE)
+      if (exactAttachedStop) {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        attached = peerSyncForegroundIdentityAfterStop(attached, identity)
+      }
       if (attached == null || exactAttachedStop) stopSelfResult(startId)
       return PEER_SYNC_FOREGROUND_START_MODE
     }

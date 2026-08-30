@@ -591,6 +591,8 @@ pub fn run() {
             #[cfg(target_os = "android")]
             peer_sync::android_foreground::peer_sync_foreground_source_abandon,
             #[cfg(target_os = "android")]
+            peer_sync::android_foreground::peer_sync_foreground_source_status,
+            #[cfg(target_os = "android")]
             peer_sync::android_source_commands::peer_clone_android_source_prepare,
             #[cfg(target_os = "android")]
             peer_sync::android_source_commands::peer_clone_android_source_start,

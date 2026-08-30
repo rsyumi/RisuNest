@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::android_foreground::test_registry_guard;
 #[cfg(any(target_os = "android", test))]
 use super::android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane};
 use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
@@ -2077,6 +2079,7 @@ mod tests {
 
     #[test]
     fn android_full_source_release_drops_lifecycle_gate_before_real_registry_callback() {
+        let _registry_guard = test_registry_guard();
         let root = tempfile::tempdir().unwrap();
         let (session, manifest_bytes) = prepared_delta_source(root.path());
         let state = PeerDeltaCommandState::default();
@@ -2137,6 +2140,7 @@ mod tests {
 
     #[test]
     fn android_target_foreground_release_is_native_owned_and_generation_exact() {
+        let _registry_guard = test_registry_guard();
         let state = PeerDeltaCommandState::default();
         let foreground = state.reserve_target_foreground().unwrap();
         assert!(registry().attach_exact(&foreground));
@@ -2180,6 +2184,7 @@ mod tests {
 
     #[test]
     fn committed_target_stays_running_during_terminal_publication_pause() {
+        let _registry_guard = test_registry_guard();
         let state = PeerDeltaCommandState::default();
         let foreground = state.reserve_target_foreground().unwrap();
         assert!(registry().attach_exact(&foreground));
@@ -2222,6 +2227,7 @@ mod tests {
 
     #[test]
     fn target_precommit_failure_is_terminal_and_releases_without_a_result() {
+        let _registry_guard = test_registry_guard();
         let state = PeerDeltaCommandState::default();
         let foreground = state.reserve_target_foreground().unwrap();
         assert!(registry().attach_exact(&foreground));

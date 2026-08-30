@@ -179,15 +179,35 @@ export function createPeerDeltaFacade(options: {
     }
     const bridge = options.bridge ?? (typeof window === 'undefined' ? undefined : window.RisuPeerCloneBridge)
     const abandonSourceReservation = async (foreground: PeerDeltaForegroundIdentity): Promise<void> => {
-        let stopError: unknown
-        try {
-            bridge?.stopSource(foreground.lane, foreground.operationId, foreground.generation)
-        } catch (error) {
-            stopError = error
-        }
         const abandoned = await nativeInvoke<boolean>('peer_sync_foreground_source_abandon', { foreground })
         if (!abandoned) throw new Error('Android peer delta source foreground identity is stale')
-        if (stopError) throw stopError
+    }
+    const stopAndAbandonSourceReservation = async (
+        foreground: PeerDeltaForegroundIdentity,
+    ): Promise<void> => {
+        if (!bridge?.stopSource(foreground.lane, foreground.operationId, foreground.generation)) {
+            throw new Error('Android peer delta source foreground service could not stop')
+        }
+        await abandonSourceReservation(foreground)
+    }
+    const recoverSourceReservation = async (): Promise<void> => {
+        const pending = await nativeInvoke<PeerDeltaForegroundIdentity | null>(
+            'peer_sync_foreground_source_status',
+            { lane: 'p4-source' },
+        )
+        if (pending?.lane === 'p4-source') await stopAndAbandonSourceReservation(pending)
+    }
+    const failAfterCleanup = async (
+        error: unknown,
+        cleanup: () => Promise<void>,
+        message: string,
+    ): Promise<never> => {
+        try {
+            await cleanup()
+        } catch (cleanupError) {
+            throw new AggregateError([error, cleanupError], message)
+        }
+        throw error
     }
     const releaseAndroidTargetForeground = async (
         foreground: PeerDeltaForegroundIdentity,
@@ -198,37 +218,45 @@ export function createPeerDeltaFacade(options: {
         const released = await nativeInvoke<boolean>('peer_delta_target_foreground_release', { foreground })
         if (!released) throw new Error('Android peer delta foreground identity is stale')
     }
-    const recoverTargetForeground = async (): Promise<void> => {
-        if (options.platform !== 'android') return
+    const sameForegroundIdentity = (
+        left: PeerDeltaForegroundIdentity,
+        right: PeerDeltaForegroundIdentity,
+    ): boolean => left.lane === right.lane
+        && left.operationId === right.operationId
+        && left.generation === right.generation
+    const settleTargetForeground = async (
+        expected?: PeerDeltaForegroundIdentity,
+    ): Promise<PeerDeltaTargetForegroundStatus | null> => {
         let pending = await nativeInvoke<PeerDeltaTargetForegroundStatus | null>(
             'peer_delta_target_foreground_status',
         )
-        if (!pending) return
-        if (pending.phase === 'running') {
-            const cancelled = await nativeInvoke<boolean>('peer_delta_target_foreground_cancel', {
-                foreground: pending.foreground,
-            })
-            if (!cancelled) throw new Error('Android peer delta foreground identity is stale')
-            const expected = pending.foreground
-            for (let attempt = 0; attempt < 500 && pending?.phase === 'running'; attempt += 1) {
-                await new Promise<void>((resolve) => setTimeout(resolve, 10))
-                pending = await nativeInvoke<PeerDeltaTargetForegroundStatus | null>(
-                    'peer_delta_target_foreground_status',
-                )
-                if (
-                    pending &&
-                    (pending.foreground.lane !== expected.lane ||
-                        pending.foreground.operationId !== expected.operationId ||
-                        pending.foreground.generation !== expected.generation)
-                ) {
-                    throw new Error('Android peer delta foreground identity is stale')
-                }
-            }
-            if (!pending) return
-            if (pending.phase === 'running') {
-                throw new Error('Android peer delta foreground cancellation timed out')
+        if (pending && expected && !sameForegroundIdentity(pending.foreground, expected)) {
+            throw new Error('Android peer delta foreground identity is stale')
+        }
+        if (!pending || pending.phase !== 'running') return pending
+        const cancelled = await nativeInvoke<boolean>('peer_delta_target_foreground_cancel', {
+            foreground: pending.foreground,
+        })
+        if (!cancelled) throw new Error('Android peer delta foreground identity is stale')
+        const exact = pending.foreground
+        for (let attempt = 0; attempt < 500 && pending?.phase === 'running'; attempt += 1) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 10))
+            pending = await nativeInvoke<PeerDeltaTargetForegroundStatus | null>(
+                'peer_delta_target_foreground_status',
+            )
+            if (pending && !sameForegroundIdentity(pending.foreground, exact)) {
+                throw new Error('Android peer delta foreground identity is stale')
             }
         }
+        if (pending?.phase === 'running') {
+            throw new Error('Android peer delta foreground cancellation timed out')
+        }
+        return pending
+    }
+    const recoverTargetForeground = async (): Promise<void> => {
+        if (options.platform !== 'android') return
+        const pending = await settleTargetForeground()
+        if (!pending) return
         const runtime = options.runtime
         if (pending.result?.kind === 'updated' || pending.result?.kind === 'noChanges') {
             if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
@@ -257,22 +285,33 @@ export function createPeerDeltaFacade(options: {
             requireNative()
             if (options.platform === 'desktop') return nativeInvoke('peer_delta_start', { sessionId })
             if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
+            await recoverSourceReservation()
             const foreground = await nativeInvoke<PeerDeltaForegroundIdentity>('peer_delta_source_reserve')
+            let started: boolean
             try {
-                if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
-                    throw new Error('Android peer delta foreground service could not start')
-                }
+                started = bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)
+            } catch (error) {
+                return failAfterCleanup(
+                    error,
+                    () => stopAndAbandonSourceReservation(foreground),
+                    'Android peer delta foreground start and cleanup both failed',
+                )
+            }
+            if (!started) {
+                return failAfterCleanup(
+                    new Error('Android peer delta foreground service could not start'),
+                    () => abandonSourceReservation(foreground),
+                    'Android peer delta foreground start and cleanup both failed',
+                )
+            }
+            try {
                 return await nativeInvoke('peer_delta_start', { sessionId, foreground })
             } catch (error) {
-                try {
-                    await abandonSourceReservation(foreground)
-                } catch (cleanupError) {
-                    throw new AggregateError(
-                        [error, cleanupError],
-                        'Android peer delta foreground start and cleanup both failed',
-                    )
-                }
-                throw error
+                return failAfterCleanup(
+                    error,
+                    () => stopAndAbandonSourceReservation(foreground),
+                    'Android peer delta foreground start and cleanup both failed',
+                )
             }
         },
         async startQuickTunnel(sessionId: string): Promise<PeerDeltaSourceStatus> {
@@ -344,7 +383,10 @@ export function createPeerDeltaFacade(options: {
                     if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
                     foreground = await nativeInvoke<PeerDeltaForegroundIdentity>('peer_delta_target_reserve')
                     if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
-                        await nativeInvoke<boolean>('peer_delta_target_foreground_release', { foreground })
+                        const released = await nativeInvoke<boolean>('peer_delta_target_foreground_release', {
+                            foreground,
+                        })
+                        if (released) foreground = undefined
                         throw new Error('Android peer delta foreground service could not start')
                     }
                 }
@@ -362,6 +404,29 @@ export function createPeerDeltaFacade(options: {
                 fenceReleased = true
                 if (foreground) await releaseAndroidTargetForeground(foreground)
                 return result
+            } catch (error) {
+                if (!foreground) throw error
+                try {
+                    const pending = await settleTargetForeground(foreground)
+                    if (!fenceReleased) {
+                        if (pending?.result?.kind === 'updated' || pending?.result?.kind === 'noChanges') {
+                            await fence.refreshCommittedWorkingSet(pending.result.revision)
+                        }
+                        fence.release()
+                        fenceReleased = true
+                    }
+                    await releaseAndroidTargetForeground(foreground)
+                } catch (cleanupError) {
+                    if (!fenceReleased) {
+                        fence.release()
+                        fenceReleased = true
+                    }
+                    throw new AggregateError(
+                        [error, cleanupError],
+                        'Android peer delta pull and foreground cleanup both failed',
+                    )
+                }
+                throw error
             } finally {
                 if (!fenceReleased && pendingRefresh?.fence !== fence) fence.release()
             }

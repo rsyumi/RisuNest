@@ -51,17 +51,37 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
     const bridge = options.bridge ?? nativeBridge()
     let foreground: AndroidPeerCloneForegroundIdentity | undefined
     const abandonReservation = async (identity: AndroidPeerCloneForegroundIdentity): Promise<void> => {
-        let stopError: unknown
-        try {
-            bridge.stopSource(identity.lane, identity.operationId, identity.generation)
-        } catch (error) {
-            stopError = error
-        }
         const abandoned = await nativeInvoke<boolean>('peer_sync_foreground_source_abandon', {
             foreground: identity,
         })
         if (!abandoned) throw new Error('Android peer clone foreground identity is stale')
-        if (stopError) throw stopError
+    }
+    const stopAndAbandonReservation = async (identity: AndroidPeerCloneForegroundIdentity): Promise<void> => {
+        if (!bridge.stopSource(identity.lane, identity.operationId, identity.generation)) {
+            throw new Error('Android peer clone foreground service could not stop')
+        }
+        await abandonReservation(identity)
+    }
+    const recoverReservation = async (): Promise<void> => {
+        const pending = await nativeInvoke<AndroidPeerCloneForegroundIdentity | null>(
+            'peer_sync_foreground_source_status',
+            { lane: 'p1-source' },
+        )
+        if (pending?.lane === 'p1-source') await stopAndAbandonReservation(pending)
+    }
+    const failAfterCleanup = async (
+        error: unknown,
+        cleanup: () => Promise<void>,
+    ): Promise<never> => {
+        try {
+            await cleanup()
+        } catch (cleanupError) {
+            throw new AggregateError(
+                [error, cleanupError],
+                'Android peer clone foreground start and cleanup both failed',
+            )
+        }
+        throw error
     }
 
     return {
@@ -77,13 +97,23 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
             return nativeInvoke('peer_clone_android_source_status')
         },
         async start(sessionId: string): Promise<PeerCloneSourceStatus> {
+            await recoverReservation()
             const identity = await nativeInvoke<AndroidPeerCloneForegroundIdentity>(
                 'peer_clone_android_source_reserve',
             )
+            let started: boolean
             try {
-                if (!bridge.startSource(identity.lane, identity.operationId, identity.generation)) {
-                    throw new Error('Android peer clone foreground service could not start')
-                }
+                started = bridge.startSource(identity.lane, identity.operationId, identity.generation)
+            } catch (error) {
+                return failAfterCleanup(error, () => stopAndAbandonReservation(identity))
+            }
+            if (!started) {
+                return failAfterCleanup(
+                    new Error('Android peer clone foreground service could not start'),
+                    () => abandonReservation(identity),
+                )
+            }
+            try {
                 const status = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_android_source_start', {
                     sessionId,
                     foreground: identity,
@@ -91,15 +121,7 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
                 foreground = identity
                 return status
             } catch (error) {
-                try {
-                    await abandonReservation(identity)
-                } catch (cleanupError) {
-                    throw new AggregateError(
-                        [error, cleanupError],
-                        'Android peer clone foreground start and cleanup both failed',
-                    )
-                }
-                throw error
+                return failAfterCleanup(error, () => stopAndAbandonReservation(identity))
             }
         },
         async stop(sessionId: string): Promise<void> {

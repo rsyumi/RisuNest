@@ -189,6 +189,24 @@ impl AndroidForegroundRegistry {
         true
     }
 
+    pub(crate) fn source_status(
+        &self,
+        lane: AndroidForegroundLane,
+    ) -> Option<AndroidForegroundKey> {
+        if !matches!(
+            lane,
+            AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+        ) {
+            return None;
+        }
+        self.entry
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|entry| entry.key.lane == lane)
+            .map(|entry| entry.key.clone())
+    }
+
     pub(crate) fn retain_target_exact(&self, key: &AndroidForegroundKey) -> bool {
         let Ok(mut entry) = self.entry.lock() else {
             return false;
@@ -252,6 +270,15 @@ pub(crate) fn registry() -> &'static AndroidForegroundRegistry {
     REGISTRY.get_or_init(AndroidForegroundRegistry::default)
 }
 
+#[cfg(test)]
+pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_REGISTRY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[tauri::command]
 #[cfg(target_os = "android")]
 pub(crate) fn peer_sync_foreground_source_abandon(
@@ -264,6 +291,20 @@ pub(crate) fn peer_sync_foreground_source_abandon(
         return Err("Android foreground identity is not a source lane".to_owned());
     }
     Ok(registry().abandon_source_exact(&foreground))
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub(crate) fn peer_sync_foreground_source_status(
+    lane: AndroidForegroundLane,
+) -> Result<Option<AndroidForegroundKey>, String> {
+    if !matches!(
+        lane,
+        AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+    ) {
+        return Err("Android foreground lane is not a source lane".to_owned());
+    }
+    Ok(registry().source_status(lane))
 }
 
 #[cfg(test)]
@@ -365,6 +406,29 @@ mod tests {
             assert!(!registry.abandon_source_exact(&source));
             assert!(registry.detach_if_generation(&target));
         }
+    }
+
+    #[test]
+    fn source_status_returns_only_the_requested_source_lane() {
+        let registry = AndroidForegroundRegistry::default();
+        let source = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert_eq!(
+            registry.source_status(AndroidForegroundLane::P1Source),
+            Some(source.clone())
+        );
+        assert_eq!(
+            registry.source_status(AndroidForegroundLane::P4Source),
+            None
+        );
+        assert_eq!(
+            registry.source_status(AndroidForegroundLane::P4Target),
+            None
+        );
+        assert!(registry.abandon_source_exact(&source));
+        assert_eq!(
+            registry.source_status(AndroidForegroundLane::P1Source),
+            None
+        );
     }
 
     #[test]

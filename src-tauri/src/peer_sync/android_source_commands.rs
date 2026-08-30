@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::android_foreground::test_registry_guard;
 use super::{
     android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane},
     prepare_lossless_clone_session, LanCloneHost, PeerSyncError,
@@ -482,6 +484,7 @@ mod tests {
 
     #[test]
     fn notification_stop_pauses_real_source_and_full_release_cleans_up() {
+        let _registry_guard = test_registry_guard();
         let fixture_root = tempfile::tempdir().unwrap();
         let database = fixture_root.path().join("database.risusave");
         fs::write(&database, b"synthetic-android-source").unwrap();

@@ -2,6 +2,7 @@ package co.aiclient.risu
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -66,5 +67,23 @@ class PeerSyncForegroundServiceTest {
     assertEquals(null, rejectedPeerSyncForegroundStart(p1, p1))
     assertEquals(p1, peerSyncForegroundIdentityForDestruction(p1))
     assertEquals(null, peerSyncForegroundIdentityForDestruction(null))
+  }
+
+  @Test
+  fun `accepted exact Stop clears Kotlin identity before native cross lane reserve`() {
+    val p1 = PeerSyncForegroundIdentity("p1-source", operationId, 7L)
+    val p4 = PeerSyncForegroundIdentity("p4-source", "22222222-2222-4222-8222-222222222222", 8L)
+    var nativeOwner: PeerSyncForegroundIdentity? = p1
+    var attached: PeerSyncForegroundIdentity? = p1
+    assertEquals(p1, nativeOwner)
+
+    attached = peerSyncForegroundIdentityAfterStop(attached, p1)
+    nativeOwner = null
+    assertEquals(null, attached)
+    assertNull(nativeOwner)
+
+    nativeOwner = p4
+    assertTrue(canStartPeerSyncForeground(attached, nativeOwner))
+    assertEquals(p4, nativeOwner)
   }
 }
