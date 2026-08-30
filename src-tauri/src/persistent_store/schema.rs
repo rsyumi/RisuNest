@@ -2,7 +2,25 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 14;
+pub(super) const SCHEMA_VERSION: u32 = 15;
+
+const ASSET_OBJECT_DELETION_TABLE_SQL: &str = r#"
+CREATE TABLE asset_object_deletions (
+    object_hash TEXT PRIMARY KEY CHECK (
+        length(object_hash) = 64
+        AND object_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+    physical_key TEXT NOT NULL UNIQUE CHECK (length(physical_key) = 83),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'unlinked')),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+)
+"#;
+
+const ASSET_OBJECT_DELETION_INDEX_SQL: &str = r#"
+CREATE INDEX asset_object_deletions_state
+    ON asset_object_deletions (state, created_at_ms, object_hash)
+"#;
 
 const SYNC_DEVICE_TABLE_SQL: &str = r#"
 CREATE TABLE logical_sync_devices (
@@ -122,14 +140,20 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
         11 => {
             migrate_v11_to_v12(connection)?;
             migrate_v12_to_v13(connection)?;
-            return migrate_v13_to_v14(connection);
+            migrate_v13_to_v14(connection)?;
+            return migrate_v14_to_v15(connection);
         }
         12 => {
             migrate_v12_to_v13(connection)?;
-            return migrate_v13_to_v14(connection);
+            migrate_v13_to_v14(connection)?;
+            return migrate_v14_to_v15(connection);
         }
-        13 => return migrate_v13_to_v14(connection),
-        SCHEMA_VERSION => return validate_v14_schema(connection),
+        13 => {
+            migrate_v13_to_v14(connection)?;
+            return migrate_v14_to_v15(connection);
+        }
+        14 => return migrate_v14_to_v15(connection),
+        SCHEMA_VERSION => return validate_v15_schema(connection),
         _ => {
             return Err(StoreError::Store {
                 message: format!("unsupported persistent schema version {version}"),
@@ -139,7 +163,8 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     migrate_v10_to_v11(connection)?;
     migrate_v11_to_v12(connection)?;
     migrate_v12_to_v13(connection)?;
-    migrate_v13_to_v14(connection)
+    migrate_v13_to_v14(connection)?;
+    migrate_v14_to_v15(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -465,6 +490,17 @@ fn migrate_v13_to_v14(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_v14_schema(&transaction)?;
+    transaction.execute_batch(ASSET_OBJECT_DELETION_TABLE_SQL)?;
+    transaction.execute_batch(ASSET_OBJECT_DELETION_INDEX_SQL)?;
+    validate_v15_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn validate_v13_schema(connection: &Connection) -> StoreResult<()> {
     let table_sql: Option<String> = connection
         .query_row(
@@ -530,6 +566,41 @@ fn validate_v14_schema(connection: &Connection) -> StoreResult<()> {
     {
         return Err(StoreError::Validation {
             message: "sync device acknowledgement proof index definition is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_v15_schema(connection: &Connection) -> StoreResult<()> {
+    validate_v14_schema(connection)?;
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'asset_object_deletions'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(ASSET_OBJECT_DELETION_TABLE_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "asset object deletion tombstone table definition is invalid".to_owned(),
+        });
+    }
+    let index_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'asset_object_deletions_state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(ASSET_OBJECT_DELETION_INDEX_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "asset object deletion tombstone index definition is invalid".to_owned(),
         });
     }
     Ok(())

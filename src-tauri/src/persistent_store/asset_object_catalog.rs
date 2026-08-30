@@ -1,7 +1,7 @@
 use super::{StoreError, StoreResult};
 use crate::asset_repository::migration_gc::AssetGcCandidate;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const ASSET_OBJECT_CATALOG_MAX_PAGE: i64 = 4_096;
@@ -55,12 +55,45 @@ impl<'a> AssetObjectCatalog<'a> {
                 i64::try_from(object.byte_size).map_err(|_| StoreError::Validation {
                     message: "asset object size exceeds the SQLite integer limit".to_owned(),
                 })?;
-            transaction.execute(
-                "INSERT INTO asset_objects (object_hash, byte_size, created_at_ms)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(object_hash) DO NOTHING",
-                params![object.object_hash, byte_size, created_at_ms],
-            )?;
+            let tombstone: Option<(i64, String)> = transaction
+                .query_row(
+                    "SELECT byte_size, physical_key FROM asset_object_deletions
+                     WHERE object_hash = ?1",
+                    [&object.object_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((deleted_size, physical_key)) = tombstone {
+                let expected_key = format!(
+                    "assets-v2/objects/{}/{}",
+                    &object.object_hash[..2],
+                    &object.object_hash[2..]
+                );
+                if deleted_size != byte_size || physical_key != expected_key {
+                    return validation(
+                        "asset object deletion tombstone conflicts with the recreated object",
+                    );
+                }
+                transaction.execute(
+                    "INSERT INTO asset_objects (object_hash, byte_size, created_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(object_hash) DO UPDATE SET
+                        byte_size = excluded.byte_size,
+                        created_at_ms = excluded.created_at_ms",
+                    params![object.object_hash, byte_size, created_at_ms],
+                )?;
+                transaction.execute(
+                    "DELETE FROM asset_object_deletions WHERE object_hash = ?1",
+                    [&object.object_hash],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT INTO asset_objects (object_hash, byte_size, created_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(object_hash) DO NOTHING",
+                    params![object.object_hash, byte_size, created_at_ms],
+                )?;
+            }
             let stored_size: i64 = transaction.query_row(
                 "SELECT byte_size FROM asset_objects WHERE object_hash = ?1",
                 [&object.object_hash],

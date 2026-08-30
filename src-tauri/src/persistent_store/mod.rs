@@ -35,7 +35,7 @@ pub(crate) use sync_device_registry::{
     VerifiedSyncDeviceRegistration,
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "native-official-publication")]
@@ -1144,6 +1144,7 @@ impl PersistentStore {
         let database_path = persistent_dir.join("persistent.db");
         let mut connection = Connection::open(&database_path)?;
         schema::initialize(&mut connection)?;
+        recover_asset_object_deletions(&mut connection, app_data_dir)?;
 
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -1918,11 +1919,7 @@ impl PersistentStore {
         now_ms: i64,
         minimum_grace_ms: i64,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
-        use crate::asset_repository::job_pins::collect_durable_cas_job_roots;
-        use crate::asset_repository::migration_gc::{
-            collect_staged_migration_roots, dry_run_mark_and_sweep,
-            read_snapshot_asset_root_sidecar, AssetGcDryRunPage,
-        };
+        use crate::asset_repository::migration_gc::{dry_run_mark_and_sweep, AssetGcDryRunPage};
 
         let persistent_dir = self
             .snapshots_dir
@@ -1934,21 +1931,7 @@ impl PersistentStore {
             message: "persistent directory has no repository root".to_owned(),
         })?;
         let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
-        let mut roots = vec![snapshot::collect_asset_roots(&self.connection, &cas)?];
-        for reader in self.revision_leases.values() {
-            roots.push(snapshot::collect_asset_roots(&reader.connection, &cas)?);
-        }
-        roots.extend(self.active_readers.detached_asset_roots()?);
-        for snapshot in snapshot::list(&self.snapshots_dir)? {
-            roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
-        }
-        roots.extend(collect_staged_migration_roots(repository_root)?);
-        roots.push(collect_durable_cas_job_roots(repository_root));
-        #[cfg(not(unix))]
-        roots.push(crate::asset_repository::migration_gc::AssetRootSet {
-            blockers: ["cas-directory-sync-unverified".to_owned()].into(),
-            ..Default::default()
-        });
+        let roots = self.collect_asset_gc_roots(&cas, false)?;
         let candidates = self.query_asset_object_catalog(limit, cursor)?;
         let report =
             dry_run_mark_and_sweep(&cas, candidates.items, roots, now_ms, minimum_grace_ms)
@@ -1957,6 +1940,180 @@ impl PersistentStore {
             report,
             next_cursor: candidates.next_cursor,
         })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn asset_gc_delete_page(
+        &mut self,
+        limit: i64,
+        cursor: Option<&str>,
+        now_ms: i64,
+        minimum_grace_ms: i64,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        self.asset_gc_delete_page_with_hook(limit, cursor, now_ms, minimum_grace_ms, |_| Ok(()))
+    }
+
+    pub(crate) fn asset_gc_delete_page_with_hook(
+        &mut self,
+        limit: i64,
+        cursor: Option<&str>,
+        now_ms: i64,
+        minimum_grace_ms: i64,
+        mut hook: impl FnMut(
+            crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
+        ) -> StoreResult<()>,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        use crate::asset_repository::migration_gc::{
+            dry_run_mark_and_sweep, AssetGcDeleteHookPoint, AssetGcDryRunPage,
+        };
+
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let initial_candidates = self.query_asset_object_catalog(limit, cursor)?;
+        let initial_report = dry_run_mark_and_sweep(
+            &cas,
+            initial_candidates.items.clone(),
+            self.collect_asset_gc_roots(&cas, false)?,
+            now_ms,
+            minimum_grace_ms,
+        )?;
+        if !initial_report.blockers.is_empty() || initial_report.potential_delete_hashes.is_empty()
+        {
+            return Ok(AssetGcDryRunPage {
+                report: initial_report,
+                next_cursor: initial_candidates.next_cursor,
+            });
+        }
+        hook(AssetGcDeleteHookPoint::AfterInitialScan)?;
+
+        let _repository_guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+        let final_candidates = self.query_asset_object_catalog(limit, cursor)?;
+        if final_candidates != initial_candidates {
+            return Err(StoreError::Validation {
+                message: "asset object catalog page changed before final GC recheck".to_owned(),
+            });
+        }
+        let mut report = dry_run_mark_and_sweep(
+            &cas,
+            final_candidates.items.clone(),
+            self.collect_asset_gc_roots(&cas, true)?,
+            now_ms,
+            minimum_grace_ms,
+        )?;
+        if !report.blockers.is_empty() || report.potential_delete_hashes.is_empty() {
+            return Ok(AssetGcDryRunPage {
+                report,
+                next_cursor: final_candidates.next_cursor,
+            });
+        }
+
+        for object_hash in report.potential_delete_hashes.clone() {
+            let candidate = final_candidates
+                .items
+                .iter()
+                .find(|candidate| candidate.object_hash == object_hash)
+                .ok_or_else(|| StoreError::Validation {
+                    message: "final GC candidate is absent from its exact catalog page".to_owned(),
+                })?;
+            let physical_key = crate::asset_repository::object_physical_key(&object_hash);
+            let byte_size =
+                i64::try_from(candidate.byte_size).map_err(|_| StoreError::Validation {
+                    message: "asset GC candidate size exceeds the SQLite integer limit".to_owned(),
+                })?;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "INSERT INTO asset_object_deletions (
+                    object_hash, byte_size, physical_key, state, created_at_ms
+                 ) VALUES (?1, ?2, ?3, 'pending', ?4)",
+                params![object_hash, byte_size, physical_key, now_ms],
+            )?;
+            transaction.commit()?;
+            hook(AssetGcDeleteHookPoint::AfterTombstone)?;
+
+            let unlink = cas.unlink_exact_object(
+                &candidate.object_hash,
+                candidate.byte_size,
+                &physical_key,
+            )?;
+            hook(AssetGcDeleteHookPoint::AfterUnlink)?;
+            let directory_entries_synced = match unlink {
+                crate::asset_repository::ExactObjectUnlink::Missing => {
+                    return Err(StoreError::Validation {
+                        message: "exact GC object disappeared before unlink".to_owned(),
+                    });
+                }
+                crate::asset_repository::ExactObjectUnlink::Removed {
+                    directory_entries_synced,
+                } => directory_entries_synced,
+            };
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if transaction.execute(
+                "DELETE FROM asset_objects
+                 WHERE object_hash = ?1 AND byte_size = ?2",
+                params![object_hash, byte_size],
+            )? != 1
+            {
+                return Err(StoreError::Validation {
+                    message: "exact GC catalog row changed before deletion completion".to_owned(),
+                });
+            }
+            transaction.execute(
+                "UPDATE asset_object_deletions SET state = 'unlinked'
+                 WHERE object_hash = ?1 AND state = 'pending'",
+                [&object_hash],
+            )?;
+            if directory_entries_synced {
+                transaction.execute(
+                    "DELETE FROM asset_object_deletions WHERE object_hash = ?1",
+                    [&object_hash],
+                )?;
+            }
+            transaction.commit()?;
+            report.deleted_bytes = report
+                .deleted_bytes
+                .checked_add(candidate.byte_size)
+                .ok_or_else(|| StoreError::Validation {
+                    message: "asset GC deleted byte count overflow".to_owned(),
+                })?;
+            report.deleted_hashes.push(object_hash);
+        }
+        report.deletion_enabled = true;
+        Ok(AssetGcDryRunPage {
+            report,
+            next_cursor: final_candidates.next_cursor,
+        })
+    }
+
+    fn collect_asset_gc_roots(
+        &self,
+        cas: &crate::asset_repository::PayloadCas,
+        repository_guard_held: bool,
+    ) -> StoreResult<Vec<crate::asset_repository::migration_gc::AssetRootSet>> {
+        use crate::asset_repository::job_pins::{
+            collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
+        };
+        use crate::asset_repository::migration_gc::{
+            collect_staged_migration_roots, read_snapshot_asset_root_sidecar,
+        };
+
+        let mut roots = vec![snapshot::collect_asset_roots(&self.connection, cas)?];
+        for reader in self.revision_leases.values() {
+            roots.push(snapshot::collect_asset_roots(&reader.connection, cas)?);
+        }
+        roots.extend(self.active_readers.detached_asset_roots()?);
+        for snapshot in snapshot::list(&self.snapshots_dir)? {
+            roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
+        }
+        roots.extend(collect_staged_migration_roots(&self.repository_root)?);
+        roots.push(if repository_guard_held {
+            collect_durable_cas_job_roots_already_guarded(&self.repository_root)
+        } else {
+            collect_durable_cas_job_roots(&self.repository_root)
+        });
+        Ok(roots)
     }
 
     pub(crate) fn get_app_kv(&self, key: &str) -> StoreResult<Option<Value>> {
@@ -2031,6 +2188,128 @@ impl PersistentStore {
                 .unwrap_or(0),
         }
     }
+}
+
+fn recover_asset_object_deletions(
+    connection: &mut Connection,
+    repository_root: &Path,
+) -> StoreResult<()> {
+    use asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE;
+
+    let tombstones = {
+        let mut statement = connection.prepare(
+            "SELECT object_hash, byte_size, physical_key, state
+             FROM asset_object_deletions
+             ORDER BY state ASC, created_at_ms ASC, object_hash ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([ASSET_OBJECT_CATALOG_MAX_PAGE], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+
+    let _repository_guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+    let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
+    for (object_hash, byte_size, physical_key, state) in tombstones {
+        let byte_size = u64::try_from(byte_size).map_err(|_| StoreError::Validation {
+            message: "asset deletion tombstone size is invalid".to_owned(),
+        })?;
+        if physical_key != crate::asset_repository::object_physical_key(&object_hash) {
+            return Err(StoreError::Validation {
+                message: "asset deletion tombstone physical key is not canonical".to_owned(),
+            });
+        }
+        let catalog_size: Option<i64> = connection
+            .query_row(
+                "SELECT byte_size FROM asset_objects WHERE object_hash = ?1",
+                [&object_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match state.as_str() {
+            "pending" => {
+                if catalog_size != Some(byte_size as i64) {
+                    return Err(StoreError::Validation {
+                        message: "pending asset deletion has no exact catalog row".to_owned(),
+                    });
+                }
+                match cas.stat_object(&object_hash)? {
+                    Some(actual_size) if actual_size == byte_size => {
+                        connection.execute(
+                            "DELETE FROM asset_object_deletions
+                             WHERE object_hash = ?1 AND state = 'pending'",
+                            [&object_hash],
+                        )?;
+                    }
+                    Some(_) => {
+                        return Err(StoreError::Validation {
+                            message: "pending asset deletion size is ambiguous".to_owned(),
+                        });
+                    }
+                    None => {
+                        let transaction =
+                            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        if transaction.execute(
+                            "DELETE FROM asset_objects
+                             WHERE object_hash = ?1 AND byte_size = ?2",
+                            params![object_hash, byte_size as i64],
+                        )? != 1
+                        {
+                            return Err(StoreError::Validation {
+                                message: "pending asset deletion catalog row changed".to_owned(),
+                            });
+                        }
+                        transaction.execute(
+                            "UPDATE asset_object_deletions SET state = 'unlinked'
+                             WHERE object_hash = ?1 AND state = 'pending'",
+                            [&object_hash],
+                        )?;
+                        transaction.commit()?;
+                    }
+                }
+            }
+            "unlinked" => {
+                if catalog_size.is_some() {
+                    return Err(StoreError::Validation {
+                        message: "completed asset deletion unexpectedly has a catalog row"
+                            .to_owned(),
+                    });
+                }
+                match cas.stat_object(&object_hash)? {
+                    None => {
+                        connection.execute(
+                            "DELETE FROM asset_object_deletions
+                             WHERE object_hash = ?1 AND state = 'unlinked'",
+                            [&object_hash],
+                        )?;
+                    }
+                    Some(actual_size) if actual_size == byte_size => {}
+                    Some(_) => {
+                        return Err(StoreError::Validation {
+                            message: "unlinked asset deletion size is ambiguous".to_owned(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(StoreError::Validation {
+                    message: "asset deletion tombstone state is invalid".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

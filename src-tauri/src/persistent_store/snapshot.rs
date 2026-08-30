@@ -581,6 +581,7 @@ pub(super) fn collect_asset_roots(
     let plugin_rows: i64 =
         connection.query_row("SELECT COUNT(*) FROM plugin_storage", [], |row| row.get(0))?;
     if plugin_rows > 0 {
+        roots.blockers.insert("plugin-storage-opaque".to_owned());
         roots.retain_all_objects = true;
     }
     let cross_generation_cold_aliases =
@@ -647,6 +648,7 @@ fn collect_asset_roots_for_generation(
         |row| row.get(0),
     )?;
     if plugin_rows > 0 {
+        roots.blockers.insert("plugin-storage-opaque".to_owned());
         roots.retain_all_objects = true;
     }
     resolve_nested_cold_roots(cas, cold_aliases, &mut roots)?;

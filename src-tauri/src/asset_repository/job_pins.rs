@@ -496,6 +496,19 @@ impl DurableCasJob {
 }
 
 pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRootSet {
+    collect_durable_cas_job_roots_inner(repository_root, false)
+}
+
+pub(crate) fn collect_durable_cas_job_roots_already_guarded(
+    repository_root: &Path,
+) -> AssetRootSet {
+    collect_durable_cas_job_roots_inner(repository_root, true)
+}
+
+fn collect_durable_cas_job_roots_inner(
+    repository_root: &Path,
+    repository_guard_held: bool,
+) -> AssetRootSet {
     let mut roots = AssetRootSet::default();
     let directory = match job_pin_directory(repository_root, false) {
         Ok(Some((_, directory))) => directory,
@@ -578,49 +591,60 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
         }
     }
     if !released_journals.is_empty() {
-        match super::coordinator::lock_repository_mutation() {
-            Ok(_repository_guard) => {
-                let mut removed = false;
-                for (job_id, path) in released_journals {
-                    let state = File::open(&path)
-                        .and_then(|mut file| read_job_state(&mut file, Some(&job_id)));
-                    match state {
-                        Ok(state) if !state.released => {
-                            let job_roots = root_set_from_state(&state);
-                            roots.manifest_hashes.extend(job_roots.manifest_hashes);
-                            roots.object_hashes.extend(job_roots.object_hashes);
-                            if !state.sealed {
-                                roots.blockers.insert(format!("job-pin-unsealed:{job_id}"));
-                            }
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                        Err(_) => {
-                            roots.blockers.insert(format!("job-pin-corrupt:{job_id}"));
-                            continue;
-                        }
-                    }
-                    match fs::remove_file(&path) {
-                        Ok(()) => removed = true,
-                        Err(error) if error.kind() == ErrorKind::NotFound => {}
-                        Err(_) => {
-                            roots
-                                .blockers
-                                .insert(format!("job-pin-release-cleanup:{job_id}"));
-                        }
-                    }
+        if repository_guard_held {
+            cleanup_released_journal_roots(&directory, released_journals, &mut roots);
+        } else {
+            match super::coordinator::lock_repository_mutation() {
+                Ok(_repository_guard) => {
+                    cleanup_released_journal_roots(&directory, released_journals, &mut roots)
                 }
-                if removed && sync_directory(&directory).is_err() {
+                Err(_) => {
                     roots.blockers.insert("job-pin-release-cleanup".to_owned());
                 }
-            }
-            Err(_) => {
-                roots.blockers.insert("job-pin-release-cleanup".to_owned());
             }
         }
     }
     roots
+}
+
+fn cleanup_released_journal_roots(
+    directory: &Path,
+    released_journals: Vec<(String, PathBuf)>,
+    roots: &mut AssetRootSet,
+) {
+    let mut removed = false;
+    for (job_id, path) in released_journals {
+        let state = File::open(&path).and_then(|mut file| read_job_state(&mut file, Some(&job_id)));
+        match state {
+            Ok(state) if !state.released => {
+                let job_roots = root_set_from_state(&state);
+                roots.manifest_hashes.extend(job_roots.manifest_hashes);
+                roots.object_hashes.extend(job_roots.object_hashes);
+                if !state.sealed {
+                    roots.blockers.insert(format!("job-pin-unsealed:{job_id}"));
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                roots.blockers.insert(format!("job-pin-corrupt:{job_id}"));
+                continue;
+            }
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => {
+                roots
+                    .blockers
+                    .insert(format!("job-pin-release-cleanup:{job_id}"));
+            }
+        }
+    }
+    if removed && sync_directory(directory).is_err() {
+        roots.blockers.insert("job-pin-release-cleanup".to_owned());
+    }
 }
 
 pub(crate) fn reclaim_abandoned_durable_cas_jobs(

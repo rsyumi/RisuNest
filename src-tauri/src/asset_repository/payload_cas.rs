@@ -25,6 +25,12 @@ pub struct PayloadCas {
     repository_root: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactObjectUnlink {
+    Missing,
+    Removed { directory_entries_synced: bool },
+}
+
 struct StagingFile {
     path: PathBuf,
     parent: PathBuf,
@@ -215,6 +221,43 @@ impl PayloadCas {
 
     pub fn object_path(&self, content_hash: &str) -> io::Result<Option<PathBuf>> {
         self.existing_object_path(content_hash)
+    }
+
+    pub(crate) fn unlink_exact_object(
+        &self,
+        content_hash: &str,
+        expected_byte_size: u64,
+        expected_physical_key: &str,
+    ) -> io::Result<ExactObjectUnlink> {
+        validate_content_hash(content_hash)?;
+        let physical_key = object_physical_key(content_hash);
+        if expected_physical_key != physical_key {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "deletion tombstone physical key is not the exact canonical object key",
+            ));
+        }
+        let Some(path) = self.existing_object_path(content_hash)? else {
+            return Ok(ExactObjectUnlink::Missing);
+        };
+        let metadata = fs::symlink_metadata(&path)?;
+        self.validate_owned_file(&path, &metadata)?;
+        if metadata.len() != expected_byte_size {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "deletion tombstone size does not match the exact canonical object",
+            ));
+        }
+        fs::remove_file(&path)?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "canonical object path has no containing directory",
+            )
+        })?;
+        Ok(ExactObjectUnlink::Removed {
+            directory_entries_synced: sync_directory(parent)?,
+        })
     }
 
     fn ensure_repository_root(&self) -> io::Result<()> {
@@ -433,7 +476,7 @@ fn validate_content_hash(content_hash: &str) -> io::Result<()> {
     ))
 }
 
-fn object_physical_key(content_hash: &str) -> String {
+pub(crate) fn object_physical_key(content_hash: &str) -> String {
     format!(
         "assets-v2/objects/{}/{}",
         &content_hash[..2],
@@ -461,7 +504,7 @@ fn sync_directory(_path: &Path) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_staging_file, PayloadCas};
+    use super::{create_staging_file, ExactObjectUnlink, PayloadCas};
     use sha2::Digest;
     use std::io::Cursor;
 
@@ -558,5 +601,106 @@ mod tests {
             .is_err());
         assert_eq!(cas.read_object(&expected_hash).unwrap().unwrap(), expected);
         assert_eq!(cas.stat_object(&wrong_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn exact_object_unlink_rejects_path_and_size_mismatch_without_touching_bytes() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let prepared = cas.prepare_bytes(b"exact deletion candidate").unwrap();
+
+        let wrong_path = cas
+            .unlink_exact_object(
+                &prepared.content_hash,
+                prepared.byte_size,
+                "assets-v2/objects/00/not-the-canonical-object",
+            )
+            .expect_err("mismatched physical key must fail closed");
+        assert_eq!(wrong_path.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            cas.read_object(&prepared.content_hash).unwrap(),
+            Some(b"exact deletion candidate".to_vec())
+        );
+
+        let wrong_size = cas
+            .unlink_exact_object(
+                &prepared.content_hash,
+                prepared.byte_size + 1,
+                &prepared.physical_key,
+            )
+            .expect_err("mismatched byte size must fail closed");
+        assert_eq!(wrong_size.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            cas.stat_object(&prepared.content_hash).unwrap(),
+            Some(prepared.byte_size)
+        );
+    }
+
+    #[test]
+    fn exact_object_unlink_removes_only_the_canonical_regular_file() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let prepared = cas.prepare_bytes(b"unlink me exactly").unwrap();
+
+        let outcome = cas
+            .unlink_exact_object(
+                &prepared.content_hash,
+                prepared.byte_size,
+                &prepared.physical_key,
+            )
+            .expect("unlink exact object");
+
+        assert!(matches!(
+            outcome,
+            ExactObjectUnlink::Removed {
+                directory_entries_synced: _
+            }
+        ));
+        assert_eq!(cas.stat_object(&prepared.content_hash).unwrap(), None);
+        assert_eq!(
+            cas.unlink_exact_object(
+                &prepared.content_hash,
+                prepared.byte_size,
+                &prepared.physical_key,
+            )
+            .unwrap(),
+            ExactObjectUnlink::Missing
+        );
+    }
+
+    #[test]
+    fn exact_object_unlink_rejects_a_symlink_or_reparse_object() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::tempdir().expect("temporary outside directory");
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let prepared = cas.prepare_bytes(b"linked deletion candidate").unwrap();
+        let object_path = directory.path().join(&prepared.physical_key);
+        let target = outside.path().join("target.bin");
+        std::fs::write(&target, b"outside bytes").unwrap();
+        std::fs::remove_file(&object_path).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &object_path).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &object_path) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create reparse fixture: {error}");
+        }
+
+        let error = cas
+            .unlink_exact_object(
+                &prepared.content_hash,
+                prepared.byte_size,
+                &prepared.physical_key,
+            )
+            .expect_err("linked object must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
+        assert!(std::fs::symlink_metadata(object_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

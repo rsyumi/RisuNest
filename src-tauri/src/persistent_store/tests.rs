@@ -5229,7 +5229,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        14
+        15
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -6653,16 +6653,16 @@ fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
 }
 
 #[test]
-fn fresh_schema_v14_contains_dual_authority_and_empty_p4_logical_tables() {
-    let directory = tempfile::tempdir().expect("create fresh v14 directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v14 store");
+fn fresh_schema_v15_contains_dual_authority_and_empty_p4_logical_tables() {
+    let directory = tempfile::tempdir().expect("create fresh v15 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v15 store");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        14
+        15
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -6709,6 +6709,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             PRAGMA user_version = 10;
             "#,
@@ -6724,7 +6725,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated cold schema version"),
-        14
+        15
     );
     assert_cold_v11_authority_schema(&connection, 2);
     for generation in ["revision-0", "snapshot-v10-cold"] {
@@ -6797,6 +6798,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             PRAGMA user_version = 8;
             "#,
@@ -6818,7 +6820,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        14
+        15
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -6951,6 +6953,7 @@ fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 8;
@@ -7058,6 +7061,7 @@ fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 9;
@@ -7132,7 +7136,7 @@ fn schema_v10_logical_rows_survive_snapshot_restore_and_reopen() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read restored schema version"),
-        14
+        15
     );
     assert_logical_schema_fixture(&restored.connection);
     drop(restored);
@@ -7159,6 +7163,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
@@ -7188,7 +7193,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -7210,6 +7215,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
@@ -7228,7 +7234,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -7338,6 +7344,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
@@ -7357,7 +7364,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -7433,6 +7440,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
@@ -7463,7 +7471,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -7553,7 +7561,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let snapshot_rows: i64 = store
         .connection
@@ -7694,7 +7702,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        14
+        15
     );
     assert_eq!(
         store
@@ -7722,7 +7730,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        14
+        15
     );
     assert_eq!(
         store
@@ -7763,7 +7771,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 }
 
 #[test]
@@ -7788,7 +7796,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 }
 
 #[test]
@@ -7926,7 +7934,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 }
 
 #[test]
@@ -8068,7 +8076,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 }
 
 #[test]
@@ -8214,7 +8222,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 14);
+    assert_eq!(integer_pragma("user_version"), 15);
 }
 
 #[test]
@@ -8356,7 +8364,11 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
     assert_eq!(sidecar.roots.cold_keys, ["cold-chat".to_owned()].into());
     assert_eq!(
         sidecar.roots.blockers,
-        ["cold-payload-unscanned".to_owned()].into()
+        [
+            "cold-payload-unscanned".to_owned(),
+            "plugin-storage-opaque".to_owned()
+        ]
+        .into()
     );
     assert!(sidecar.roots.retain_all_objects);
     assert!(
@@ -8518,7 +8530,7 @@ fn asset_gc_dry_run_retains_every_catalog_object_for_opaque_plugin_storage() {
     assert!(first_page.next_cursor.is_some());
     assert!(second_page.next_cursor.is_none());
     for report in [first_page.report, second_page.report] {
-        assert!(!report
+        assert!(report
             .blockers
             .contains(&"plugin-storage-opaque".to_owned()));
         assert!(!report.deletion_enabled);
@@ -9449,7 +9461,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 15;")
+                .execute_batch("PRAGMA user_version = 16;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
@@ -9482,7 +9494,7 @@ fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read current version"),
-        14
+        15
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -9523,6 +9535,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              PRAGMA user_version = 11;",
         )
@@ -9541,7 +9554,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated version"),
-        14
+        15
     );
     assert_eq!(
         migrated
@@ -9569,6 +9582,7 @@ fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              CREATE TABLE asset_objects (collision_marker TEXT NOT NULL);
              PRAGMA user_version = 11;",
@@ -9591,6 +9605,80 @@ fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
             .map(|column| column.0)
             .collect::<Vec<_>>(),
         ["collision_marker"]
+    );
+}
+
+#[test]
+fn schema_v15_adds_exact_durable_asset_deletion_tombstones() {
+    let directory = tempfile::tempdir().expect("create v15 schema directory");
+    let store = PersistentStore::open(directory.path()).expect("open current store");
+
+    assert_eq!(
+        table_columns(&store.connection, "asset_object_deletions")
+            .into_iter()
+            .map(|column| column.0)
+            .collect::<Vec<_>>(),
+        [
+            "object_hash",
+            "byte_size",
+            "physical_key",
+            "state",
+            "created_at_ms"
+        ]
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_object_deletions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count fresh deletion tombstones"),
+        0
+    );
+    assert!(super::GENERATION_TABLES
+        .iter()
+        .all(|(table, _)| *table != "asset_object_deletions"));
+}
+
+#[test]
+fn schema_v15_migrates_v14_without_scanning_cas_objects() {
+    let directory = tempfile::tempdir().expect("create v14 migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            "DROP TABLE asset_object_deletions;
+             PRAGMA user_version = 14;",
+        )
+        .expect("create v14 fixture");
+    drop(store);
+    let sentinel = directory
+        .path()
+        .join("assets-v2/objects/aa/untracked-v14-object");
+    fs::create_dir_all(sentinel.parent().expect("read sentinel parent"))
+        .expect("create sentinel shard");
+    fs::write(&sentinel, b"not a deletion tombstone").expect("write sentinel object");
+
+    let migrated = PersistentStore::open(directory.path()).expect("migrate v14 store");
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read migrated version"),
+        15
+    );
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_object_deletions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count empty migrated tombstones"),
+        0
+    );
+    assert_eq!(
+        fs::read(sentinel).expect("read untracked sentinel"),
+        b"not a deletion tombstone"
     );
 }
 
@@ -9673,6 +9761,68 @@ fn asset_object_catalog_is_idempotent_conflict_safe_and_stably_paged() {
 }
 
 #[test]
+fn asset_object_catalog_revives_a_recreated_deleted_hash_transactionally() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    let directory = tempfile::tempdir().expect("create catalog revival directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let registration = AssetObjectRegistration {
+        object_hash: "44".repeat(32),
+        byte_size: 44,
+    };
+    store
+        .asset_object_catalog()
+        .register(&[registration.clone()], 5)
+        .expect("register original object");
+    let physical_key = format!(
+        "assets-v2/objects/{}/{}",
+        &registration.object_hash[..2],
+        &registration.object_hash[2..]
+    );
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_object_deletions (
+                object_hash, byte_size, physical_key, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, 'unlinked', 6)",
+            rusqlite::params![
+                registration.object_hash,
+                registration.byte_size as i64,
+                physical_key
+            ],
+        )
+        .expect("seed completed deletion tombstone");
+
+    store
+        .asset_object_catalog()
+        .register(&[registration.clone()], 99)
+        .expect("revive recreated object");
+
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT byte_size, created_at_ms FROM asset_objects WHERE object_hash = ?1",
+                [&registration.object_hash],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        (44, 99)
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_object_deletions WHERE object_hash = ?1",
+                [&registration.object_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn snapshot_restore_without_newer_catalog_rows_leaves_objects_untracked() {
     use super::asset_object_catalog::AssetObjectRegistration;
 
@@ -9751,6 +9901,568 @@ fn asset_gc_catalog_retains_future_rows_and_aborts_on_size_mismatch() {
         )
         .expect("corrupt catalog size fixture");
     assert!(store.asset_gc_dry_run(16, None, 300, 10).is_err());
+}
+
+fn register_gc_candidate(
+    store: &mut PersistentStore,
+    prepared: &crate::asset_repository::PreparedPayload,
+) {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    store
+        .asset_object_catalog()
+        .register(
+            &[AssetObjectRegistration {
+                object_hash: prepared.content_hash.clone(),
+                byte_size: prepared.byte_size,
+            }],
+            0,
+        )
+        .expect("register GC candidate");
+}
+
+#[test]
+fn asset_gc_delete_page_recollects_a_late_root_under_writer_exclusion() {
+    use crate::asset_repository::migration_gc::AssetGcDeleteHookPoint;
+
+    let directory = tempfile::tempdir().expect("create late-root directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"late rooted object").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+    let database_path = directory.path().join("persistent/persistent.db");
+    let generation = super::active_generation(&store.connection).unwrap();
+    let mut injected = false;
+
+    let page = store
+        .asset_gc_delete_page_with_hook(16, None, 100, 10, |point| {
+            if point == AssetGcDeleteHookPoint::AfterInitialScan && !injected {
+                let connection = Connection::open(&database_path).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO asset_aliases (
+                            generation, logical_key, object_hash, kind, size, mime, name, ext,
+                            inlay_type, width, height, metadata
+                         ) VALUES (?1, 'assets/late.bin', ?2, 'asset', ?3,
+                            'application/octet-stream', 'late', 'bin', NULL, NULL, NULL, '{}')",
+                        rusqlite::params![
+                            generation,
+                            prepared.content_hash,
+                            prepared.byte_size as i64
+                        ],
+                    )
+                    .unwrap();
+                injected = true;
+            }
+            Ok(())
+        })
+        .expect("late root must conservatively retain the object");
+
+    assert!(injected);
+    assert!(page.report.marked_hashes.contains(&prepared.content_hash));
+    assert!(page.report.deleted_hashes.is_empty());
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+}
+
+#[test]
+fn asset_gc_delete_page_recollects_a_late_durable_pin_under_writer_exclusion() {
+    use crate::asset_repository::{
+        job_pins::{CasJobKind, CasObjectRole, DurableCasJob},
+        migration_gc::AssetGcDeleteHookPoint,
+    };
+
+    let directory = tempfile::tempdir().expect("create late-pin directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"late pinned object").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+    let mut late_job = None;
+
+    let page = store
+        .asset_gc_delete_page_with_hook(16, None, 100, 10, |point| {
+            if point == AssetGcDeleteHookPoint::AfterInitialScan && late_job.is_none() {
+                let mut job = DurableCasJob::begin(
+                    directory.path(),
+                    "late-gc-pin",
+                    CasJobKind::DirectAssetOrInlayWrite,
+                    1,
+                )
+                .unwrap();
+                job.pin_existing(
+                    &cas,
+                    &prepared.content_hash,
+                    prepared.byte_size,
+                    CasObjectRole::DirectObject,
+                )
+                .unwrap();
+                late_job = Some(job);
+            }
+            Ok(())
+        })
+        .expect("late pin must conservatively retain the object");
+
+    assert!(late_job.is_some());
+    assert!(page.report.marked_hashes.contains(&prepared.content_hash));
+    assert!(page
+        .report
+        .blockers
+        .contains(&"job-pin-unsealed:late-gc-pin".to_owned()));
+    assert!(page.report.deleted_hashes.is_empty());
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+}
+
+#[test]
+fn asset_gc_delete_page_refuses_unsealed_jobs_and_unready_migrations() {
+    use crate::asset_repository::{
+        job_pins::{CasJobKind, DurableCasJob},
+        migration_gc::StagedAssetMigration,
+    };
+
+    let directory = tempfile::tempdir().expect("create blocker directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"blocked deletion candidate").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+    let _job = DurableCasJob::begin(
+        directory.path(),
+        "gc-blocker-job",
+        CasJobKind::DirectAssetOrInlayWrite,
+        1,
+    )
+    .unwrap();
+    let _migration =
+        StagedAssetMigration::begin(directory.path(), "gc-blocker-migration", 0).unwrap();
+    let generation = super::active_generation(&store.connection).expect("read generation");
+    store
+        .connection
+        .execute(
+            "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+             VALUES (?1, 'gc-blocker-plugin', 2, 0, '{}')",
+            [generation],
+        )
+        .unwrap();
+
+    let page = store
+        .asset_gc_delete_page(16, None, 100, 10)
+        .expect("documented blockers retain data");
+
+    assert!(page
+        .report
+        .blockers
+        .contains(&"job-pin-unsealed:gc-blocker-job".to_owned()));
+    assert!(page
+        .report
+        .blockers
+        .contains(&"staged-migration-unready:gc-blocker-migration".to_owned()));
+    assert!(page
+        .report
+        .blockers
+        .contains(&"plugin-storage-opaque".to_owned()));
+    assert!(!page.report.deletion_enabled);
+    assert!(page.report.deleted_hashes.is_empty());
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+}
+
+#[test]
+fn asset_gc_pending_tombstone_recovery_cancels_a_crash_before_unlink() {
+    use crate::asset_repository::migration_gc::AssetGcDeleteHookPoint;
+
+    let directory = tempfile::tempdir().expect("create pre-unlink crash directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"survive pre-unlink crash").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+
+    let error = store
+        .asset_gc_delete_page_with_hook(16, None, 100, 10, |point| {
+            if point == AssetGcDeleteHookPoint::AfterTombstone {
+                return Err(StoreError::Store {
+                    message: "injected crash before unlink".to_owned(),
+                });
+            }
+            Ok(())
+        })
+        .expect_err("injected pre-unlink crash");
+    assert!(error.to_string().contains("injected crash"));
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT state FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "pending"
+    );
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("recover pending deletion");
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_objects WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn asset_gc_pending_tombstone_recovery_finishes_a_crash_after_unlink_idempotently() {
+    use crate::asset_repository::migration_gc::AssetGcDeleteHookPoint;
+
+    let directory = tempfile::tempdir().expect("create post-unlink crash directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"finish post-unlink crash").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+
+    store
+        .asset_gc_delete_page_with_hook(16, None, 100, 10, |point| {
+            if point == AssetGcDeleteHookPoint::AfterUnlink {
+                return Err(StoreError::Store {
+                    message: "injected crash after unlink".to_owned(),
+                });
+            }
+            Ok(())
+        })
+        .expect_err("injected post-unlink crash");
+    assert_eq!(cas.stat_object(&prepared.content_hash).unwrap(), None);
+    drop(store);
+
+    let first = PersistentStore::open(directory.path()).expect("finish missing pending object");
+    assert_eq!(
+        first
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_objects WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        first
+            .connection
+            .query_row(
+                "SELECT state FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "unlinked"
+    );
+    drop(first);
+    let second = PersistentStore::open(directory.path()).expect("confirm absent unlinked object");
+    assert_eq!(
+        second
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(second);
+    PersistentStore::open(directory.path()).expect("recovery remains idempotent");
+}
+
+#[test]
+fn asset_gc_startup_recovery_processes_only_one_bounded_tombstone_page() {
+    use super::asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE;
+
+    let directory = tempfile::tempdir().expect("create bounded recovery directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let transaction = store.connection.transaction().unwrap();
+    for index in 0..=ASSET_OBJECT_CATALOG_MAX_PAGE {
+        let object_hash = format!("{index:064x}");
+        let physical_key = crate::asset_repository::object_physical_key(&object_hash);
+        transaction
+            .execute(
+                "INSERT INTO asset_object_deletions (
+                    object_hash, byte_size, physical_key, state, created_at_ms
+                 ) VALUES (?1, 0, ?2, 'unlinked', ?3)",
+                rusqlite::params![object_hash, physical_key, index],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(store);
+
+    let first = PersistentStore::open(directory.path()).expect("recover one bounded page");
+    assert_eq!(
+        first
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_object_deletions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    drop(first);
+
+    let second = PersistentStore::open(directory.path()).expect("recover the remaining page");
+    assert_eq!(
+        second
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_object_deletions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn asset_gc_delete_page_is_bounded_and_never_enumerates_untracked_cas_entries() {
+    let directory = tempfile::tempdir().expect("create bounded deletion directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let first = cas.prepare_bytes(b"bounded candidate one").unwrap();
+    let second = cas.prepare_bytes(b"bounded candidate two").unwrap();
+    register_gc_candidate(&mut store, &first);
+    register_gc_candidate(&mut store, &second);
+    let sentinel = directory
+        .path()
+        .join("assets-v2/objects/aa/not-a-catalog-object");
+    fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    fs::write(&sentinel, b"untracked sentinel").unwrap();
+
+    let first_page = store.asset_gc_delete_page(1, None, 100, 10).unwrap();
+
+    assert!(first_page.report.deletion_enabled);
+    assert_eq!(first_page.report.deleted_hashes.len(), 1);
+    assert_eq!(
+        first_page.report.deleted_bytes,
+        if first_page.report.deleted_hashes[0] == first.content_hash {
+            first.byte_size
+        } else {
+            second.byte_size
+        }
+    );
+    assert!(first_page.next_cursor.is_some());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"untracked sentinel");
+    assert_eq!(
+        store
+            .query_asset_object_catalog(16, None)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+
+    let second_page = store
+        .asset_gc_delete_page(1, first_page.next_cursor.as_deref(), 100, 10)
+        .unwrap();
+    assert!(second_page.report.deletion_enabled);
+    assert_eq!(second_page.report.deleted_hashes.len(), 1);
+    assert!(store
+        .query_asset_object_catalog(16, None)
+        .unwrap()
+        .items
+        .is_empty());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"untracked sentinel");
+}
+
+#[test]
+fn asset_gc_recovery_rejects_a_noncanonical_tombstone_path_without_data_loss() {
+    let directory = tempfile::tempdir().expect("create tombstone mismatch directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"retain path mismatch").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+    let wrong_hash = "55".repeat(32);
+    let wrong_key = format!(
+        "assets-v2/objects/{}/{}",
+        &wrong_hash[..2],
+        &wrong_hash[2..]
+    );
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_object_deletions (
+                object_hash, byte_size, physical_key, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, 'pending', 1)",
+            rusqlite::params![prepared.content_hash, prepared.byte_size as i64, wrong_key],
+        )
+        .unwrap();
+    drop(store);
+
+    let error = match PersistentStore::open(directory.path()) {
+        Ok(_) => panic!("noncanonical recovery target must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("physical key"));
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+    let connection = Connection::open(directory.path().join("persistent/persistent.db")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_objects WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn asset_gc_recovery_retains_a_reappeared_unlinked_object_until_catalog_revival() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    let directory = tempfile::tempdir().expect("create reappeared object directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"reappeared exact object").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+    store
+        .connection
+        .execute(
+            "DELETE FROM asset_objects WHERE object_hash = ?1",
+            [&prepared.content_hash],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_object_deletions (
+                object_hash, byte_size, physical_key, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, 'unlinked', 1)",
+            rusqlite::params![
+                prepared.content_hash,
+                prepared.byte_size as i64,
+                prepared.physical_key
+            ],
+        )
+        .unwrap();
+    drop(store);
+
+    let mut reopened = PersistentStore::open(directory.path())
+        .expect("retain ambiguous reappeared object during recovery");
+    assert_eq!(
+        cas.stat_object(&prepared.content_hash).unwrap(),
+        Some(prepared.byte_size)
+    );
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT state FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "unlinked"
+    );
+    reopened
+        .asset_object_catalog()
+        .register(
+            &[AssetObjectRegistration {
+                object_hash: prepared.content_hash.clone(),
+                byte_size: prepared.byte_size,
+            }],
+            200,
+        )
+        .expect("revive the recreated object");
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT created_at_ms FROM asset_objects WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        200
+    );
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn asset_gc_delete_page_fails_closed_for_missing_or_corrupt_manifest_roots() {
+    use crate::asset_repository::owner_manifest_codec::encode_owner_manifest;
+
+    for corrupt in [false, true] {
+        let directory = tempfile::tempdir().expect("create manifest blocker directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+        let candidate = cas.prepare_bytes(b"manifest-blocked candidate").unwrap();
+        register_gc_candidate(&mut store, &candidate);
+        let manifest_hash = if corrupt {
+            let manifest = cas
+                .prepare_bytes(&encode_owner_manifest(&[]).unwrap())
+                .unwrap();
+            fs::write(directory.path().join(&manifest.physical_key), b"corrupt").unwrap();
+            manifest.content_hash
+        } else {
+            "66".repeat(32)
+        };
+        let generation = super::active_generation(&store.connection).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES (?1, 'root-module-assets', '0', 1, ?2, 0)",
+                rusqlite::params![generation, manifest_hash],
+            )
+            .unwrap();
+
+        assert!(store.asset_gc_delete_page(16, None, 100, 10).is_err());
+        assert_eq!(
+            cas.stat_object(&candidate.content_hash).unwrap(),
+            Some(candidate.byte_size)
+        );
+    }
 }
 
 #[test]

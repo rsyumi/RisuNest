@@ -36,7 +36,7 @@ fn seed_complete_generation(
 }
 
 #[test]
-fn schema_v14_creates_shared_ack_local_proof_registry() {
+fn current_schema_creates_shared_ack_local_proof_registry() {
     let directory = tempfile::tempdir().expect("create schema fixture");
     let store = PersistentStore::open(directory.path()).expect("open fresh store");
 
@@ -45,7 +45,7 @@ fn schema_v14_creates_shared_ack_local_proof_registry() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        14
+        15
     );
     assert_eq!(
         store
@@ -420,6 +420,7 @@ fn schema_v13_migration_backfills_active_and_revoked_proofs_only() {
         .execute_batch(
             "DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 13;",
         )
         .expect("downgrade proof schema to v13");
@@ -431,7 +432,7 @@ fn schema_v13_migration_backfills_active_and_revoked_proofs_only() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        14
+        15
     );
     let proofs = migrated
         .connection
@@ -493,6 +494,7 @@ fn schema_v13_migration_preserves_p4_common_base_without_device_or_proof() {
         .execute_batch(
             "DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 13;",
         )
         .expect("downgrade P4-only fixture to v13");
@@ -546,6 +548,7 @@ fn v13_snapshot_restore_migrates_shared_ack_proofs_before_activation() {
         .execute_batch(
             "DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 13;",
         )
         .expect("downgrade proof snapshot to v13");
@@ -1142,6 +1145,7 @@ fn schema_v12_common_bases_migrate_to_revoked_exact_audit_rows() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 12;",
         )
         .expect("downgrade fixture to v12");
@@ -1184,6 +1188,7 @@ fn invalid_v12_common_base_rolls_back_the_entire_v13_migration() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 12;",
         )
         .expect("downgrade invalid fixture to v12");
@@ -1241,6 +1246,7 @@ fn invalid_v12_common_base_hash_sequence_and_timestamp_each_roll_back_v13() {
                  DROP TABLE logical_sync_device_ack_proofs;
                  DROP INDEX logical_sync_devices_status;
                  DROP TABLE logical_sync_devices;
+                 DROP TABLE asset_object_deletions;
                  PRAGMA user_version = 12;"
             ))
             .expect("corrupt v12 common base");
@@ -1328,6 +1334,7 @@ fn v12_snapshot_restore_migrates_common_base_to_revoked_device() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 12;",
         )
         .expect("convert snapshot candidate to v12");

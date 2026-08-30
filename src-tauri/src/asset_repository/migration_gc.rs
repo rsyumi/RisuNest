@@ -658,8 +658,17 @@ pub struct AssetGcDryRunReport {
     pub grace_retained_hashes: Vec<String>,
     pub potential_delete_hashes: Vec<String>,
     pub potential_delete_bytes: u64,
+    pub deleted_hashes: Vec<String>,
+    pub deleted_bytes: u64,
     pub blockers: Vec<String>,
     pub deletion_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AssetGcDeleteHookPoint {
+    AfterInitialScan,
+    AfterTombstone,
+    AfterUnlink,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -761,6 +770,8 @@ pub fn dry_run_mark_and_sweep(
         grace_retained_hashes,
         potential_delete_hashes,
         potential_delete_bytes,
+        deleted_hashes: Vec::new(),
+        deleted_bytes: 0,
         blockers: blockers.into_iter().collect(),
         deletion_enabled: false,
     })
