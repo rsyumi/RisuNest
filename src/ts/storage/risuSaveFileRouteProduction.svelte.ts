@@ -5,6 +5,7 @@ import { isTauriAndroid, isTauriDesktop } from '../platform'
 import {
     acknowledgeAndroidSafExport,
     copyNativeExportToAndroidSaf,
+    markAndroidSafExportPublicationReady,
 } from './androidSafBridge'
 import {
     loadPlugins,
@@ -62,6 +63,7 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
     },
     withFlushedExport: withFlushedRisuSaveExport,
     copyAndroidExport: copyNativeExportToAndroidSaf,
+    markAndroidExportReady: markAndroidSafExportPublicationReady,
     acknowledgeAndroidExport: acknowledgeAndroidSafExport,
     reloadPlugins: loadPlugins,
     reloadPluginsAfterNativeRestore: loadPluginsAfterAuthoritativeRestore,

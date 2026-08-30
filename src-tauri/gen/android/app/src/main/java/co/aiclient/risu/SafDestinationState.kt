@@ -4,7 +4,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
-private const val DESTINATION_STATE_VERSION = 2
+private const val DESTINATION_STATE_VERSION = 3
 private const val MAX_DESTINATION_STATE_BYTES = 8_192L
 private const val MAX_DESTINATION_URI_CHARS = 2_048
 internal const val DESTINATION_PICKER_STALE_MILLIS = 60 * 60 * 1_000L
@@ -154,6 +154,7 @@ internal data class SafDestinationRecord(
   val warningCodes: List<String>,
   val updatedAtMillis: Long,
   val sourceKind: SafDestinationSourceKind = SafDestinationSourceKind.RISU_SAVE,
+  val publicationPrerequisitesComplete: Boolean = false,
 ) {
   fun isTerminal() = phase in setOf(
     SafDestinationPhase.SUCCEEDED,
@@ -184,6 +185,11 @@ internal class SafDestinationStateStore(
     } else {
       stringField(json, "sourceKind")?.let(SafDestinationSourceKind::fromWireName) ?: return null
     }
+    val publicationPrerequisitesComplete = if (version < 3L) {
+      false
+    } else {
+      booleanField(json, "publicationPrerequisitesComplete") ?: return null
+    }
     val record = SafDestinationRecord(
       requestId = requestId,
       exportId = exportId,
@@ -194,6 +200,7 @@ internal class SafDestinationStateStore(
       warningCodes = warningCodes,
       updatedAtMillis = updatedAtMillis,
       sourceKind = sourceKind,
+      publicationPrerequisitesComplete = publicationPrerequisitesComplete,
     )
     return record.takeIf(::isValidRecord)
   }
@@ -215,6 +222,7 @@ internal class SafDestinationStateStore(
       "\"bytes\":${record.bytes ?: "null"}," +
       "\"code\":${record.code?.let { "\"$it\"" } ?: "null"}," +
       "\"warningCodes\":[$warnings]," +
+      "\"publicationPrerequisitesComplete\":${record.publicationPrerequisitesComplete}," +
       "\"updatedAtMillis\":${record.updatedAtMillis}" +
       "}"
     try {
@@ -245,6 +253,22 @@ internal class SafDestinationStateStore(
       !stateFile.exists()
     }
   }
+}
+
+internal fun completedSafPublicationPrerequisites(
+  record: SafDestinationRecord,
+  requestId: String,
+  nowMillis: Long,
+): SafDestinationRecord? {
+  if (
+    record.requestId != requestId ||
+    record.sourceKind != SafDestinationSourceKind.RISU_SAVE ||
+    !record.isTerminal()
+  ) return null
+  return record.copy(
+    publicationPrerequisitesComplete = true,
+    updatedAtMillis = nowMillis,
+  )
 }
 
 internal fun interruptedSafDestinationWarnings(deletePartial: () -> Boolean): List<String> {
@@ -290,6 +314,9 @@ private fun nullableStringField(json: String, name: String): NullableString? {
 
 private fun numberField(json: String, name: String): Long? =
   Regex("\\\"$name\\\":([0-9]+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+
+private fun booleanField(json: String, name: String): Boolean? =
+  Regex("\\\"$name\\\":(true|false)").find(json)?.groupValues?.get(1)?.toBooleanStrictOrNull()
 
 private fun nullableLongField(json: String, name: String): NullableLong? {
   val match = Regex("\\\"$name\\\":(null|[0-9]+)").find(json) ?: return null

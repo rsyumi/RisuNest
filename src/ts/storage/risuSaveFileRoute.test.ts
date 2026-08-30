@@ -74,6 +74,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         copyAndroidExport: vi.fn(async () => {
             throw new Error('Unexpected Android SAF copy')
         }),
+        markAndroidExportReady: vi.fn(() => true),
         acknowledgeAndroidExport: vi.fn(() => true),
         reloadPlugins: vi.fn(async () => undefined),
         reloadPluginsAfterNativeRestore: vi.fn(async () => undefined),
@@ -86,11 +87,13 @@ describe('RisuSave picker route', () => {
         input: {
             withFlushedExport: (...args: any[]) => Promise<unknown>
             copyAndroidExport: (...args: any[]) => Promise<unknown>
+            markAndroidExportReady?: (requestId: string) => boolean
             acknowledgeAndroidExport?: (requestId: string) => boolean
         },
     ): void {
         deps.platform = () => 'native-android' as never
         Object.assign(deps, {
+            markAndroidExportReady: vi.fn(() => true),
             acknowledgeAndroidExport: vi.fn(() => true),
             ...input,
         })
@@ -151,9 +154,14 @@ describe('RisuSave picker route', () => {
             events.push('saf-acknowledge')
             return true
         })
+        const markAndroidExportReady = vi.fn(() => {
+            events.push('saf-prerequisites-persisted')
+            return true
+        })
         installAndroidExport(deps, {
             withFlushedExport,
             copyAndroidExport,
+            markAndroidExportReady,
             acknowledgeAndroidExport,
         })
 
@@ -180,13 +188,16 @@ describe('RisuSave picker route', () => {
             'saf-terminal',
             'native-file-cleanup',
             'lease-release',
+            'saf-prerequisites-persisted',
             'saf-acknowledge',
         ])
+        expect(markAndroidExportReady).toHaveBeenCalledExactlyOnceWith('saf-request-1')
         expect(acknowledgeAndroidExport).toHaveBeenCalledExactlyOnceWith('saf-request-1')
     })
 
     it('leaves the SAF terminal replayable when managed source cleanup fails', async () => {
         const deps = dependencies('native-desktop')
+        const markAndroidExportReady = vi.fn(() => true)
         const acknowledgeAndroidExport = vi.fn(() => true)
         installAndroidExport(deps, {
             withFlushedExport: async (_runtime, _reason, callback) => await callback({
@@ -203,17 +214,31 @@ describe('RisuSave picker route', () => {
                 bytes: 10,
                 warningCodes: [],
             }),
+            markAndroidExportReady,
             acknowledgeAndroidExport,
         })
 
         await expect(exportRisuSaveFromPicker({}, deps)).rejects.toThrow(
             'managed source cleanup failed',
         )
+        expect(markAndroidExportReady).not.toHaveBeenCalled()
         expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
+
+        const replayAck = vi.fn(() => true)
+        expect(risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify({
+            requestId: '77777777-7777-4777-8777-777777777777',
+            exportId: '88888888-8888-4888-8888-888888888888',
+            sourceKind: 'risuSave',
+            state: 'succeeded',
+            publicationPrerequisitesComplete: false,
+            warningCodes: [],
+        }), replayAck)).toBeNull()
+        expect(replayAck).not.toHaveBeenCalled()
     })
 
     it('leaves the SAF terminal replayable when pinned revision release fails', async () => {
         const deps = dependencies('native-desktop')
+        const markAndroidExportReady = vi.fn(() => true)
         const acknowledgeAndroidExport = vi.fn(() => true)
         installAndroidExport(deps, {
             withFlushedExport: async (_runtime, _reason, callback) => {
@@ -231,17 +256,31 @@ describe('RisuSave picker route', () => {
                 bytes: 10,
                 warningCodes: [],
             }),
+            markAndroidExportReady,
             acknowledgeAndroidExport,
         })
 
         await expect(exportRisuSaveFromPicker({}, deps)).rejects.toThrow(
             'revision release failed',
         )
+        expect(markAndroidExportReady).not.toHaveBeenCalled()
         expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
+
+        const replayAck = vi.fn(() => true)
+        expect(risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify({
+            requestId: '99999999-9999-4999-8999-999999999999',
+            exportId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            sourceKind: 'risuSave',
+            state: 'succeeded',
+            publicationPrerequisitesComplete: false,
+            warningCodes: [],
+        }), replayAck)).toBeNull()
+        expect(replayAck).not.toHaveBeenCalled()
     })
 
     it('propagates acknowledgement failure while retaining a renderer recovery retry', async () => {
         const deps = dependencies('native-desktop')
+        const markAndroidExportReady = vi.fn(() => true)
         const acknowledgeAndroidExport = vi.fn(() => false)
         installAndroidExport(deps, {
             withFlushedExport: async (_runtime, _reason, callback) => await callback({
@@ -256,6 +295,7 @@ describe('RisuSave picker route', () => {
                 bytes: 10,
                 warningCodes: [],
             }),
+            markAndroidExportReady,
             acknowledgeAndroidExport,
         })
 
@@ -263,6 +303,9 @@ describe('RisuSave picker route', () => {
             code: 'acknowledgement-failed',
             requestId: '11111111-1111-4111-8111-111111111111',
         })
+        expect(markAndroidExportReady).toHaveBeenCalledExactlyOnceWith(
+            '11111111-1111-4111-8111-111111111111',
+        )
 
         const recover = (risuSaveFileRoute as unknown as {
             recoverAndroidRisuSavePublication(
@@ -277,6 +320,7 @@ describe('RisuSave picker route', () => {
             exportId: '22222222-2222-4222-8222-222222222222',
             sourceKind: 'risuSave',
             state: 'succeeded',
+            publicationPrerequisitesComplete: true,
             bytes: 10,
             warningCodes: [],
         }), retry)).toMatchObject({ state: 'succeeded' })
@@ -304,6 +348,7 @@ describe('RisuSave picker route', () => {
             exportId: '66666666-6666-4666-8666-666666666666',
             sourceKind: 'risuSave',
             state: 'cancelled',
+            publicationPrerequisitesComplete: true,
             warningCodes: ['partial-destination-may-remain'],
         }
         const acknowledge = vi.fn(() => true)
@@ -323,6 +368,72 @@ describe('RisuSave picker route', () => {
         expect(onError).not.toHaveBeenCalled()
         dispose()
         expect(disposeListener).toHaveBeenCalledOnce()
+    })
+
+    it('fails closed across WebView recreation until durable prerequisite proof exists', async () => {
+        const terminal = {
+            requestId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+            exportId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+            sourceKind: 'risuSave' as const,
+            state: 'succeeded' as const,
+            publicationPrerequisitesComplete: false,
+            warningCodes: [],
+        }
+        const acknowledge = vi.fn(() => true)
+        const onTerminal = vi.fn()
+        const dependencies = {
+            getStatus: () => JSON.stringify(terminal),
+            acknowledge,
+            listen: vi.fn(() => vi.fn()),
+            isActive: () => false,
+        }
+
+        const disposeBeforeProof = risuSaveFileRoute.listenRecoveredAndroidRisuSavePublications(
+            onTerminal,
+            vi.fn(),
+            dependencies,
+        )
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(acknowledge).not.toHaveBeenCalled()
+        expect(onTerminal).not.toHaveBeenCalled()
+        disposeBeforeProof()
+
+        terminal.publicationPrerequisitesComplete = true
+        const disposeAfterProof = risuSaveFileRoute.listenRecoveredAndroidRisuSavePublications(
+            onTerminal,
+            vi.fn(),
+            dependencies,
+        )
+        await vi.waitFor(() => expect(onTerminal).toHaveBeenCalledOnce())
+        expect(acknowledge).toHaveBeenCalledExactlyOnceWith(terminal.requestId)
+        disposeAfterProof()
+    })
+
+    it('does not acknowledge when durable prerequisite proof cannot be persisted', async () => {
+        const deps = dependencies('native-desktop')
+        const acknowledgeAndroidExport = vi.fn(() => true)
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                withNativeFile: async (_options: unknown, nativeCallback: Function) =>
+                    await nativeCallback({
+                        path: '/app/persistent/exports/source.risudat',
+                        bytes: 10,
+                    }),
+            }),
+            copyAndroidExport: async () => ({
+                requestId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+                bytes: 10,
+                warningCodes: [],
+            }),
+            markAndroidExportReady: () => false,
+            acknowledgeAndroidExport,
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            code: 'prerequisite-proof-failed',
+            requestId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        })
+        expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
     })
 
     it('fails closed when Android SAF reports a different byte count', async () => {
@@ -438,6 +549,10 @@ describe('RisuSave picker route', () => {
                 events.push('saf-cancelled-terminal')
                 throw cancellation
             },
+            markAndroidExportReady: (requestId) => {
+                events.push(`saf-prerequisites-persisted:${requestId}`)
+                return true
+            },
             acknowledgeAndroidExport: (requestId) => {
                 events.push(`saf-acknowledge:${requestId}`)
                 return true
@@ -455,6 +570,7 @@ describe('RisuSave picker route', () => {
             'saf-cancelled-terminal',
             'native-file-cleanup',
             'lease-release',
+            'saf-prerequisites-persisted:33333333-3333-4333-8333-333333333333',
             'saf-acknowledge:33333333-3333-4333-8333-333333333333',
         ])
     })

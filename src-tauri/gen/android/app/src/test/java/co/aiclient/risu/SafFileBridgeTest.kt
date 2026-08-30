@@ -386,6 +386,44 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `publication prerequisite proof survives activity and WebView reconstruction`() {
+    val root = temporaryDirectory()
+    val stateFile = root.resolve("android-saf-destination.json")
+    val first = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    val terminal = SafDestinationRecord(
+      requestId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      exportId = "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      phase = SafDestinationPhase.SUCCEEDED,
+      destinationUri = "content://provider/document/42",
+      bytes = 42,
+      code = null,
+      warningCodes = emptyList(),
+      updatedAtMillis = 2_000,
+    )
+    first.save(terminal)
+
+    val beforeProof = SafDestinationStateStore(stateFile, testAtomicPublisher).load()
+    assertEquals(false, beforeProof?.publicationPrerequisitesComplete)
+    assertNull(completedSafPublicationPrerequisites(
+      terminal,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      nowMillis = 2_001,
+    ))
+
+    val completed = completedSafPublicationPrerequisites(
+      beforeProof!!,
+      terminal.requestId,
+      nowMillis = 2_002,
+    )!!
+    first.save(completed)
+    val afterRecreation = SafDestinationStateStore(stateFile, testAtomicPublisher).load()
+
+    assertEquals(true, afterRecreation?.publicationPrerequisitesComplete)
+    assertEquals(2_002L, afterRecreation?.updatedAtMillis)
+    assertTrue(stateFile.readText().contains("\"publicationPrerequisitesComplete\":true"))
+  }
+
+  @Test
   fun `destination state rejects malformed and oversized persistence`() {
     val root = temporaryDirectory()
     val stateFile = root.resolve("android-saf-destination.json")

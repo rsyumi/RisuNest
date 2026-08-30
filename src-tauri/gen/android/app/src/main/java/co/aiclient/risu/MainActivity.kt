@@ -863,6 +863,23 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     fun getExportSourceId(): String? = loadSafDestinationState()?.exportId
 
     @JavascriptInterface
+    fun markExportPublicationReady(requestId: String): Boolean {
+      if (!isCanonicalUuidV4(requestId)) return false
+      return synchronized(safDestinationStateLock) {
+        runCatching {
+          val record = safDestinationStateStore.load() ?: return@runCatching false
+          val completed = completedSafPublicationPrerequisites(
+            record,
+            requestId,
+            System.currentTimeMillis(),
+          ) ?: return@runCatching false
+          safDestinationStateStore.save(completed)
+          true
+        }.getOrDefault(false)
+      }
+    }
+
+    @JavascriptInterface
     fun acknowledgeExport(requestId: String): Boolean {
       if (!isCanonicalUuidV4(requestId)) return false
       val record = loadSafDestinationState()
@@ -1500,6 +1517,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       code = record.code,
       message = message,
       warningCodes = record.warningCodes,
+      publicationPrerequisitesComplete = record.publicationPrerequisitesComplete,
     )
 
   private fun destinationMessage(record: SafDestinationRecord): String? = when (record.code) {

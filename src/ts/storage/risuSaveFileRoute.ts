@@ -60,6 +60,7 @@ export interface RisuSaveFileRouteDependencies {
     copyAndroidExport(
         request: AndroidSafDestinationRequest,
     ): Promise<AndroidSafDestinationResult>
+    markAndroidExportReady(requestId: string): boolean
     acknowledgeAndroidExport(requestId: string): boolean
     reloadPlugins(): void | Promise<void>
     reloadPluginsAfterNativeRestore(): void | Promise<void>
@@ -194,6 +195,14 @@ async function exportThroughAndroidSaf(
             )
         },
     )
+    if (!dependencies.markAndroidExportReady(terminal.requestId)) {
+        throw new AndroidSafDestinationError(
+            terminal.requestId,
+            'prerequisite-proof-failed',
+            'error' in terminal ? warningCodesFrom(terminal.error) : terminal.result.warningCodes,
+            'Android SAF publication prerequisites could not be persisted',
+        )
+    }
     if (!dependencies.acknowledgeAndroidExport(terminal.requestId)) {
         throw new AndroidSafDestinationError(
             terminal.requestId,
@@ -228,6 +237,7 @@ function recoveredAndroidRisuSaveTerminal(
         || !UUID_V4.test(event.exportId)
         || event.sourceKind !== 'risuSave'
         || !['succeeded', 'failed', 'cancelled'].includes(event.state ?? '')
+        || event.publicationPrerequisitesComplete !== true
         || !Array.isArray(event.warningCodes)
         || event.warningCodes.some((warning) => typeof warning !== 'string')
     ) return null

@@ -821,6 +821,7 @@ internal fun androidSafDestinationScript(
   code: String? = null,
   message: String? = null,
   warningCodes: List<String>,
+  publicationPrerequisitesComplete: Boolean = false,
 ): String {
   val detail = androidSafDestinationJson(
     requestId,
@@ -831,6 +832,7 @@ internal fun androidSafDestinationScript(
     code,
     message,
     warningCodes,
+    publicationPrerequisitesComplete,
   )
   return "window.tauriAndroidSafDestinationResult=$detail;" +
     "window.dispatchEvent(new CustomEvent('risu-android-saf-destination',{detail:$detail}));"
@@ -845,6 +847,7 @@ internal fun androidSafDestinationJson(
   code: String? = null,
   message: String? = null,
   warningCodes: List<String>,
+  publicationPrerequisitesComplete: Boolean = false,
 ): String {
   val warnings = warningCodes.joinToString(",") { jsonString(it) }
   return "{" +
@@ -855,7 +858,8 @@ internal fun androidSafDestinationJson(
     "\"bytes\":${bytes ?: "null"}," +
     "\"code\":${code?.let(::jsonString) ?: "null"}," +
     "\"message\":${message?.let(::jsonString) ?: "null"}," +
-    "\"warningCodes\":[$warnings]" +
+    "\"warningCodes\":[$warnings]," +
+    "\"publicationPrerequisitesComplete\":$publicationPrerequisitesComplete" +
     "}"
 }
 

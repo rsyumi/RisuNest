@@ -119,6 +119,7 @@ export interface AndroidSafDestinationEvent {
     code?: string | null
     message?: string | null
     warningCodes: string[]
+    publicationPrerequisitesComplete?: boolean
 }
 
 export interface AndroidSafJavascriptBridge {
@@ -135,6 +136,7 @@ export interface AndroidSafJavascriptBridge {
     getActiveSourceRequestIds?(): string
     getExportStatus?(): string | null
     getExportSourceId?(): string | null
+    markExportPublicationReady?(requestId: string): boolean
     acknowledgeExport?(requestId: string): boolean
 }
 
@@ -451,6 +453,13 @@ export function acknowledgeAndroidSafExport(
     bridge: AndroidSafJavascriptBridge = productionBridge(),
 ): boolean {
     return bridge.acknowledgeExport?.(requestId) === true
+}
+
+export function markAndroidSafExportPublicationReady(
+    requestId: string,
+    bridge: AndroidSafJavascriptBridge = productionBridge(),
+): boolean {
+    return bridge.markExportPublicationReady?.(requestId) === true
 }
 
 export function getAndroidSafExportStatus(
