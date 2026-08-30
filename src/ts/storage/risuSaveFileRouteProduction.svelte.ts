@@ -3,6 +3,7 @@ import { open, save } from '@tauri-apps/plugin-dialog'
 import { downloadFile } from '../globalApi.svelte'
 import { isTauriAndroid, isTauriDesktop } from '../platform'
 import {
+    acknowledgeAndroidSafExport,
     copyNativeExportToAndroidSaf,
 } from './androidSafBridge'
 import {
@@ -61,6 +62,7 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
     },
     withFlushedExport: withFlushedRisuSaveExport,
     copyAndroidExport: copyNativeExportToAndroidSaf,
+    acknowledgeAndroidExport: acknowledgeAndroidSafExport,
     reloadPlugins: loadPlugins,
     reloadPluginsAfterNativeRestore: loadPluginsAfterAuthoritativeRestore,
 }

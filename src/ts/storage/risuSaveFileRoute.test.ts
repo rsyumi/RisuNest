@@ -8,6 +8,7 @@ import {
     exportRisuSaveFromPicker,
     type RisuSaveFileRouteDependencies,
 } from './risuSaveFileRoute'
+import * as risuSaveFileRoute from './risuSaveFileRoute'
 
 function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDependencies {
     return {
@@ -73,6 +74,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         copyAndroidExport: vi.fn(async () => {
             throw new Error('Unexpected Android SAF copy')
         }),
+        acknowledgeAndroidExport: vi.fn(() => true),
         reloadPlugins: vi.fn(async () => undefined),
         reloadPluginsAfterNativeRestore: vi.fn(async () => undefined),
     }
@@ -84,10 +86,14 @@ describe('RisuSave picker route', () => {
         input: {
             withFlushedExport: (...args: any[]) => Promise<unknown>
             copyAndroidExport: (...args: any[]) => Promise<unknown>
+            acknowledgeAndroidExport?: (requestId: string) => boolean
         },
     ): void {
         deps.platform = () => 'native-android' as never
-        Object.assign(deps, input)
+        Object.assign(deps, {
+            acknowledgeAndroidExport: vi.fn(() => true),
+            ...input,
+        })
     }
 
     it('keeps the managed native file alive through the Android SAF terminal without exposing payload bytes', async () => {
@@ -100,6 +106,7 @@ describe('RisuSave picker route', () => {
             expect(request).toEqual(expect.objectContaining({
                 sourcePath: '/app/persistent/exports/risusave-a.risudat',
                 suggestedName: expect.stringMatching(/^risunest-.*\.risudat$/),
+                deferAcknowledgement: true,
             }))
             expect(JSON.stringify(request)).not.toContain('Uint8Array')
             await terminal
@@ -140,7 +147,15 @@ describe('RisuSave picker route', () => {
                 events.push('lease-release')
             }
         })
-        installAndroidExport(deps, { withFlushedExport, copyAndroidExport })
+        const acknowledgeAndroidExport = vi.fn(() => {
+            events.push('saf-acknowledge')
+            return true
+        })
+        installAndroidExport(deps, {
+            withFlushedExport,
+            copyAndroidExport,
+            acknowledgeAndroidExport,
+        })
 
         const pending = exportRisuSaveFromPicker({ omitAccount: true }, deps)
         await vi.waitFor(() => expect(events).toEqual([
@@ -165,7 +180,149 @@ describe('RisuSave picker route', () => {
             'saf-terminal',
             'native-file-cleanup',
             'lease-release',
+            'saf-acknowledge',
         ])
+        expect(acknowledgeAndroidExport).toHaveBeenCalledExactlyOnceWith('saf-request-1')
+    })
+
+    it('leaves the SAF terminal replayable when managed source cleanup fails', async () => {
+        const deps = dependencies('native-desktop')
+        const acknowledgeAndroidExport = vi.fn(() => true)
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                withNativeFile: async (_options: unknown, nativeCallback: Function) => {
+                    await nativeCallback({
+                        path: '/app/persistent/exports/source.risudat',
+                        bytes: 10,
+                    })
+                    throw new Error('managed source cleanup failed')
+                },
+            }),
+            copyAndroidExport: async () => ({
+                requestId: 'saf-request-cleanup',
+                bytes: 10,
+                warningCodes: [],
+            }),
+            acknowledgeAndroidExport,
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toThrow(
+            'managed source cleanup failed',
+        )
+        expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
+    })
+
+    it('leaves the SAF terminal replayable when pinned revision release fails', async () => {
+        const deps = dependencies('native-desktop')
+        const acknowledgeAndroidExport = vi.fn(() => true)
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => {
+                await callback({
+                    withNativeFile: async (_options: unknown, nativeCallback: Function) =>
+                        await nativeCallback({
+                            path: '/app/persistent/exports/source.risudat',
+                            bytes: 10,
+                        }),
+                })
+                throw new Error('revision release failed')
+            },
+            copyAndroidExport: async () => ({
+                requestId: 'saf-request-release',
+                bytes: 10,
+                warningCodes: [],
+            }),
+            acknowledgeAndroidExport,
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toThrow(
+            'revision release failed',
+        )
+        expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
+    })
+
+    it('propagates acknowledgement failure while retaining a renderer recovery retry', async () => {
+        const deps = dependencies('native-desktop')
+        const acknowledgeAndroidExport = vi.fn(() => false)
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                withNativeFile: async (_options: unknown, nativeCallback: Function) =>
+                    await nativeCallback({
+                        path: '/app/persistent/exports/source.risudat',
+                        bytes: 10,
+                    }),
+            }),
+            copyAndroidExport: async () => ({
+                requestId: '11111111-1111-4111-8111-111111111111',
+                bytes: 10,
+                warningCodes: [],
+            }),
+            acknowledgeAndroidExport,
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            code: 'acknowledgement-failed',
+            requestId: '11111111-1111-4111-8111-111111111111',
+        })
+
+        const recover = (risuSaveFileRoute as unknown as {
+            recoverAndroidRisuSavePublication(
+                encoded: string | null,
+                acknowledge: (requestId: string) => boolean,
+            ): unknown
+        }).recoverAndroidRisuSavePublication
+        expect(recover).toBeTypeOf('function')
+        const retry = vi.fn(() => true)
+        expect(recover(JSON.stringify({
+            requestId: '11111111-1111-4111-8111-111111111111',
+            exportId: '22222222-2222-4222-8222-222222222222',
+            sourceKind: 'risuSave',
+            state: 'succeeded',
+            bytes: 10,
+            warningCodes: [],
+        }), retry)).toMatchObject({ state: 'succeeded' })
+        expect(retry).toHaveBeenCalledExactlyOnceWith(
+            '11111111-1111-4111-8111-111111111111',
+        )
+    })
+
+    it('consumes a replayable RisuSave terminal when a renderer starts again', async () => {
+        const listenRecovered = (risuSaveFileRoute as unknown as {
+            listenRecoveredAndroidRisuSavePublications(
+                onTerminal: (terminal: unknown) => void,
+                onError: (error: unknown) => void,
+                dependencies: {
+                    getStatus(): string | null
+                    acknowledge(requestId: string): boolean
+                    listen(listener: (event: unknown) => void): () => void
+                    isActive(requestId: string): boolean
+                },
+            ): () => void
+        }).listenRecoveredAndroidRisuSavePublications
+        expect(listenRecovered).toBeTypeOf('function')
+        const terminal = {
+            requestId: '55555555-5555-4555-8555-555555555555',
+            exportId: '66666666-6666-4666-8666-666666666666',
+            sourceKind: 'risuSave',
+            state: 'cancelled',
+            warningCodes: ['partial-destination-may-remain'],
+        }
+        const acknowledge = vi.fn(() => true)
+        const onTerminal = vi.fn()
+        const onError = vi.fn()
+        const disposeListener = vi.fn()
+
+        const dispose = listenRecovered(onTerminal, onError, {
+            getStatus: () => JSON.stringify(terminal),
+            acknowledge,
+            listen: vi.fn(() => disposeListener),
+            isActive: () => false,
+        })
+
+        await vi.waitFor(() => expect(onTerminal).toHaveBeenCalledExactlyOnceWith(terminal))
+        expect(acknowledge).toHaveBeenCalledExactlyOnceWith(terminal.requestId)
+        expect(onError).not.toHaveBeenCalled()
+        dispose()
+        expect(disposeListener).toHaveBeenCalledOnce()
     })
 
     it('fails closed when Android SAF reports a different byte count', async () => {
@@ -190,6 +347,29 @@ describe('RisuSave picker route', () => {
             ],
         })
         expect(deps.collectWebExport).not.toHaveBeenCalled()
+    })
+
+    it('reserves the mandatory partial-destination warning within the 16-code bound', async () => {
+        const deps = dependencies('native-desktop')
+        const optionalWarnings = Array.from({ length: 16 }, (_, index) => `optional-${index}`)
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                withNativeFile: async (_options: unknown, nativeCallback: Function) =>
+                    await nativeCallback({
+                        path: '/app/persistent/exports/source.risudat',
+                        bytes: 10,
+                    }),
+            }),
+            copyAndroidExport: async () => ({
+                requestId: '44444444-4444-4444-8444-444444444444',
+                bytes: 9,
+                warningCodes: optionalWarnings,
+            }),
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            warningCodes: [...optionalWarnings.slice(0, 15), 'partial-destination-may-remain'],
+        })
     })
 
     it('deduplicates Android SAF warning codes', async () => {
@@ -226,8 +406,9 @@ describe('RisuSave picker route', () => {
         const cancellation = Object.assign(
             new DOMException('copy cancelled', 'AbortError'),
             {
+                requestId: '33333333-3333-4333-8333-333333333333',
                 warningCodes: [
-                    'partial-destination-may-remain',
+                    ...Array.from({ length: 16 }, (_, index) => `optional-${index}`),
                     'partial-destination-may-remain',
                 ],
             },
@@ -257,17 +438,47 @@ describe('RisuSave picker route', () => {
                 events.push('saf-cancelled-terminal')
                 throw cancellation
             },
+            acknowledgeAndroidExport: (requestId) => {
+                events.push(`saf-acknowledge:${requestId}`)
+                return true
+            },
         })
 
         await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
             name: 'AbortError',
-            warningCodes: ['partial-destination-may-remain'],
+            warningCodes: [
+                ...Array.from({ length: 15 }, (_, index) => `optional-${index}`),
+                'partial-destination-may-remain',
+            ],
         })
         expect(events).toEqual([
             'saf-cancelled-terminal',
             'native-file-cleanup',
             'lease-release',
+            'saf-acknowledge:33333333-3333-4333-8333-333333333333',
         ])
+    })
+
+    it('alerts the mandatory partial warning for an AbortError exactly once', () => {
+        const alertPartialDestinationWarning = (risuSaveFileRoute as unknown as {
+            alertPartialDestinationWarning(
+                error: unknown,
+                warning: string,
+                alert: (message: string) => void,
+            ): boolean
+        }).alertPartialDestinationWarning
+        expect(alertPartialDestinationWarning).toBeTypeOf('function')
+        const alert = vi.fn()
+        const error = Object.assign(new DOMException('cancelled', 'AbortError'), {
+            warningCodes: [
+                ...Array.from({ length: 16 }, (_, index) => `optional-${index}`),
+                'partial-destination-may-remain',
+            ],
+        })
+
+        expect(alertPartialDestinationWarning(error, 'A partial file may remain.', alert))
+            .toBe(true)
+        expect(alert).toHaveBeenCalledExactlyOnceWith('A partial file may remain.')
     })
 
     it('fails closed when the pinned Android revision has no managed native file', async () => {

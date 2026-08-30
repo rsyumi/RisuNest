@@ -1,6 +1,7 @@
 import type { Database } from './database.svelte'
 import {
     AndroidSafDestinationError,
+    type AndroidSafDestinationEvent,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
@@ -59,12 +60,55 @@ export interface RisuSaveFileRouteDependencies {
     copyAndroidExport(
         request: AndroidSafDestinationRequest,
     ): Promise<AndroidSafDestinationResult>
+    acknowledgeAndroidExport(requestId: string): boolean
     reloadPlugins(): void | Promise<void>
     reloadPluginsAfterNativeRestore(): void | Promise<void>
 }
 
-function deduplicateWarningCodes(codes: string[]): string[] {
-    return [...new Set(codes)].slice(0, 16)
+function deduplicateWarningCodes(codes: string[], requiredCode?: string): string[] {
+    const unique = [...new Set(codes)]
+    if (!requiredCode || !unique.includes(requiredCode)) return unique.slice(0, 16)
+    return [
+        ...unique.filter((code) => code !== requiredCode).slice(0, 15),
+        requiredCode,
+    ]
+}
+
+function warningCodesFrom(error: unknown): string[] {
+    if (
+        !error
+        || typeof error !== 'object'
+        || !('warningCodes' in error)
+        || !Array.isArray(error.warningCodes)
+    ) return []
+    const codes = error.warningCodes.filter((code): code is string => typeof code === 'string')
+    return deduplicateWarningCodes(
+        codes,
+        codes.includes('partial-destination-may-remain')
+            ? 'partial-destination-may-remain'
+            : undefined,
+    )
+}
+
+function requestIdFrom(error: unknown): string | null {
+    if (!error || typeof error !== 'object' || !('requestId' in error)) return null
+    return typeof error.requestId === 'string' && error.requestId.length > 0
+        ? error.requestId
+        : null
+}
+
+export function hasPartialDestinationWarning(error: unknown): boolean {
+    return warningCodesFrom(error).includes('partial-destination-may-remain')
+}
+
+export function alertPartialDestinationWarning(
+    error: unknown,
+    warning: string,
+    alert: (message: string) => void,
+): boolean {
+    if (!hasPartialDestinationWarning(error)) return false
+    alert(warning)
+    return true
 }
 
 async function exportThroughAndroidSaf(
@@ -73,7 +117,7 @@ async function exportThroughAndroidSaf(
     options: RisuSaveFileRouteOptions,
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
-    return dependencies.withFlushedExport(
+    const terminal = await dependencies.withFlushedExport(
         runtime,
         'risu-save-file-export',
         async (pinned) => {
@@ -86,12 +130,12 @@ async function exportThroughAndroidSaf(
             return pinned.withNativeFile(
                 { omitAccount: options.omitAccount ?? false },
                 async (file) => {
-                    let published: AndroidSafDestinationResult
                     try {
-                        published = await dependencies.copyAndroidExport({
+                        const published = await dependencies.copyAndroidExport({
                             sourcePath: file.path,
                             suggestedName: name,
                             signal: options.signal,
+                            deferAcknowledgement: true,
                             onProgress: (progress) => options.onStatus?.({
                                 jobId: progress.requestId,
                                 kind: 'export-block-risu-save',
@@ -107,42 +151,146 @@ async function exportThroughAndroidSaf(
                                 },
                             }),
                         })
-                    }
-                    catch (error) {
-                        if (
-                            error
-                            && typeof error === 'object'
-                            && 'warningCodes' in error
-                            && Array.isArray(error.warningCodes)
-                        ) {
-                            error.warningCodes = deduplicateWarningCodes(
-                                error.warningCodes.filter((code): code is string =>
-                                    typeof code === 'string'),
+                        if (!published.requestId) {
+                            throw new NativeFileJobError(
+                                'invalid-result',
+                                'Android SAF terminal receipt omitted its request ID',
                             )
                         }
-                        throw error
+                        const warningCodes = deduplicateWarningCodes(published.warningCodes)
+                        if (published.bytes !== file.bytes) {
+                            return {
+                                requestId: published.requestId,
+                                error: new AndroidSafDestinationError(
+                                    published.requestId,
+                                    'byte-count-mismatch',
+                                    deduplicateWarningCodes([
+                                        ...warningCodes,
+                                        'partial-destination-may-remain',
+                                    ], 'partial-destination-may-remain'),
+                                    `Android SAF copied ${published.bytes} of ${file.bytes} RisuSave bytes`,
+                                ),
+                            }
+                        }
+                        return {
+                            requestId: published.requestId,
+                            result: {
+                                mode: 'native' as const,
+                                warningCodes,
+                                bytes: file.bytes,
+                            },
+                        }
                     }
-                    const warningCodes = deduplicateWarningCodes(published.warningCodes)
-                    if (published.bytes !== file.bytes) {
-                        throw new AndroidSafDestinationError(
-                            published.requestId ?? '',
-                            'byte-count-mismatch',
-                            deduplicateWarningCodes([
-                                ...warningCodes,
-                                'partial-destination-may-remain',
-                            ]),
-                            `Android SAF copied ${published.bytes} of ${file.bytes} RisuSave bytes`,
-                        )
-                    }
-                    return {
-                        mode: 'native',
-                        warningCodes,
-                        bytes: file.bytes,
+                    catch (error) {
+                        const requestId = requestIdFrom(error)
+                        if (!requestId) throw error
+                        const warningCodes = warningCodesFrom(error)
+                        if (error && typeof error === 'object' && 'warningCodes' in error) {
+                            error.warningCodes = warningCodes
+                        }
+                        return { requestId, error }
                     }
                 },
             )
         },
     )
+    if (!dependencies.acknowledgeAndroidExport(terminal.requestId)) {
+        throw new AndroidSafDestinationError(
+            terminal.requestId,
+            'acknowledgement-failed',
+            'error' in terminal ? warningCodesFrom(terminal.error) : terminal.result.warningCodes,
+            'Android SAF terminal receipt could not be acknowledged',
+        )
+    }
+    if ('error' in terminal) throw terminal.error
+    return terminal.result
+}
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function recoveredAndroidRisuSaveTerminal(
+    encoded: string | null,
+): AndroidSafDestinationEvent | null {
+    if (!encoded || encoded.length > 8_192) return null
+    let value: unknown
+    try {
+        value = JSON.parse(encoded)
+    }
+    catch {
+        return null
+    }
+    if (!value || typeof value !== 'object') return null
+    const event = value as Partial<AndroidSafDestinationEvent>
+    if (
+        typeof event.requestId !== 'string'
+        || !UUID_V4.test(event.requestId)
+        || typeof event.exportId !== 'string'
+        || !UUID_V4.test(event.exportId)
+        || event.sourceKind !== 'risuSave'
+        || !['succeeded', 'failed', 'cancelled'].includes(event.state ?? '')
+        || !Array.isArray(event.warningCodes)
+        || event.warningCodes.some((warning) => typeof warning !== 'string')
+    ) return null
+    return event as AndroidSafDestinationEvent
+}
+
+export function recoverAndroidRisuSavePublication(
+    encoded: string | null,
+    acknowledge: (requestId: string) => boolean,
+): AndroidSafDestinationEvent | null {
+    const terminal = recoveredAndroidRisuSaveTerminal(encoded)
+    if (!terminal) return null
+    if (!acknowledge(terminal.requestId)) {
+        throw new AndroidSafDestinationError(
+            terminal.requestId,
+            'acknowledgement-failed',
+            warningCodesFrom(terminal),
+            'Recovered Android RisuSave terminal receipt could not be acknowledged',
+        )
+    }
+    return terminal
+}
+
+export interface AndroidRisuSaveRecoveryDependencies {
+    getStatus(): string | null
+    acknowledge(requestId: string): boolean
+    listen(listener: (event: AndroidSafDestinationEvent) => void): () => void
+    isActive(requestId: string): boolean
+}
+
+export function listenRecoveredAndroidRisuSavePublications(
+    onTerminal: (terminal: AndroidSafDestinationEvent) => void,
+    onError: (error: unknown) => void,
+    dependencies: AndroidRisuSaveRecoveryDependencies,
+): () => void {
+    let disposed = false
+    let queue = Promise.resolve()
+    const handledRequestIds = new Set<string>()
+    const enqueue = (encoded: string, requestId?: string) => {
+        queue = queue.then(() => {
+            if (disposed || (requestId && handledRequestIds.has(requestId))) return
+            const terminal = recoverAndroidRisuSavePublication(
+                encoded,
+                dependencies.acknowledge,
+            )
+            if (!terminal || handledRequestIds.has(terminal.requestId)) return
+            handledRequestIds.add(terminal.requestId)
+            onTerminal(terminal)
+        }).catch(onError)
+    }
+    const disposeListener = dependencies.listen((event) => {
+        if (event.sourceKind !== 'risuSave' || dependencies.isActive(event.requestId)) return
+        enqueue(JSON.stringify(event), event.requestId)
+    })
+    const encoded = dependencies.getStatus()
+    const terminal = recoveredAndroidRisuSaveTerminal(encoded)
+    if (encoded && terminal && !dependencies.isActive(terminal.requestId)) {
+        enqueue(encoded, terminal.requestId)
+    }
+    return () => {
+        disposed = true
+        disposeListener()
+    }
 }
 
 export interface RisuSaveFileRouteOptions extends NativeFileRestoreJobOptions {

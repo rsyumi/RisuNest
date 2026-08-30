@@ -4,8 +4,12 @@ import { alertConfirm, alertError, alertNormal } from '../alert'
 import { isTauriAndroid } from '../platform'
 import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
 import {
+    acknowledgeAndroidSafExport,
     discardAndroidSafSource,
+    getAndroidSafExportStatus,
+    isAndroidSafDestinationRequestActive,
     isAndroidSafFileJobsEnabled,
+    listenAndroidSafDestinationEvents,
     listenAndroidSpoolBatches,
     type AndroidSpoolBatch,
     type AndroidSpoolFailure,
@@ -21,6 +25,7 @@ import {
     runNativeLosslessBackupRestore,
 } from './nativeFileJobs'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
+import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 
 let disposeSpoolListener: (() => void) | undefined
 
@@ -146,6 +151,21 @@ function showDestinationRequired(source: AndroidSpoolReady): void {
 
 export function registerAndroidRisuSaveRoute(): void {
     if (!isTauriAndroid || !isAndroidSafFileJobsEnabled() || disposeSpoolListener) return
+
+    listenRecoveredAndroidRisuSavePublications(
+        (terminal) => {
+            if (terminal.warningCodes.includes('partial-destination-may-remain')) {
+                alertError(language.screenshotPartialDestinationMayRemain)
+            }
+        },
+        (error) => alertError(error instanceof Error ? error.message : String(error)),
+        {
+            getStatus: getAndroidSafExportStatus,
+            acknowledge: acknowledgeAndroidSafExport,
+            listen: listenAndroidSafDestinationEvents,
+            isActive: isAndroidSafDestinationRequestActive,
+        },
+    )
 
     const route = createAndroidRisuSaveSpoolRoute({
         confirmRestore: async () =>

@@ -37,6 +37,10 @@
         nativeFileOperation,
     } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
     import {
+        alertPartialDestinationWarning,
+        hasPartialDestinationWarning,
+    } from "src/ts/storage/risuSaveFileRoute";
+    import {
         exportLocalBackupFromSystemPicker,
         restoreLocalBackupFromSystemPicker,
     } from "src/ts/storage/losslessBackupFileRouteProduction.svelte";
@@ -75,18 +79,13 @@
     }
 
     function showRisuSaveError(error: unknown): void {
-        const partialDestinationMayRemain = !!(
-            error
-            && typeof error === 'object'
-            && 'warningCodes' in error
-            && Array.isArray((error as { warningCodes?: unknown }).warningCodes)
-            && (error as { warningCodes: unknown[] }).warningCodes
-                .includes('partial-destination-may-remain')
-        )
+        const partialDestinationMayRemain = hasPartialDestinationWarning(error)
         if(error instanceof DOMException && error.name === 'AbortError') {
-            if(partialDestinationMayRemain) {
-                alertError(language.screenshotPartialDestinationMayRemain)
-            }
+            alertPartialDestinationWarning(
+                error,
+                language.screenshotPartialDestinationMayRemain,
+                alertError,
+            )
             return
         }
         if(error instanceof NativeFileJobActivationCommittedError) {
