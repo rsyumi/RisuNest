@@ -368,7 +368,7 @@
     <div class="mt-3 rounded-md border border-darkborderc p-3">
         <h4 class="font-bold">{language.peerDelta.source}</h4>
         <div class="mt-2 flex flex-wrap gap-2">
-            <Button disabled={!deltaEnabled || busy || deltaSourceStatus.phase !== 'idle'} onclick={prepareDelta}>{language.peerDelta.prepare}</Button>
+            <Button disabled={!deltaEnabled || busy || !['idle', 'stopped'].includes(deltaSourceStatus.phase)} onclick={prepareDelta}>{language.peerDelta.prepare}</Button>
             <Button disabled={!deltaEnabled || busy || deltaSourceStatus.phase !== 'prepared'} onclick={startDelta}>{language.peerDelta.start}</Button>
             <Button styled="danger" disabled={busy || !deltaSourceStatus.sessionId} onclick={stopDelta}>{language.peerDelta.stop}</Button>
         </div>

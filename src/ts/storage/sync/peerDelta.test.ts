@@ -103,6 +103,7 @@ describe('peer logical delta product facade', () => {
         }
         const invoke = vi.fn(async <T>(command: string): Promise<T> => {
             events.push(command)
+            if (command === 'peer_delta_target_foreground_status') return null as T
             if (command.endsWith('_reserve')) return foreground as T
             return { kind: 'updated', revision: 5, transferredObjects: 1, transferredBytes: 8 } as T
         }) as PeerDeltaInvoke
@@ -111,11 +112,94 @@ describe('peer logical delta product facade', () => {
         await facade.pull(pairing)
 
         expect(events).toEqual([
-            'flush', 'capture', 'fence', 'peer_delta_target_reserve', 'service-start',
-            'peer_delta_pull', 'refresh:5', 'release', 'service-stop',
+            'peer_delta_target_foreground_status', 'flush', 'capture', 'fence',
+            'peer_delta_target_reserve', 'service-start', 'peer_delta_pull',
+            'refresh:5', 'release', 'service-stop', 'peer_delta_target_foreground_release',
         ])
         expect('startQuickTunnel' in facade).toBe(false)
         expect('startNamedTunnel' in facade).toBe(false)
+    })
+
+    test('keeps exact Android target cleanup retryable when Kotlin Stop returns false', async () => {
+        const foreground = { lane: 'p4-target', operationId: '22222222-2222-4222-8222-222222222222', generation: 4 } as const
+        let nativeOwner: typeof foreground | undefined
+        const bridge = {
+            startSource: vi.fn(() => true),
+            stopSource: vi.fn().mockReturnValueOnce(false).mockReturnValue(true),
+        }
+        const runtime: PeerDeltaMutationRuntime = {
+            flushPendingData: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 4, mutationGeneration: 2 })),
+            acquirePersistentMutationFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: vi.fn(async () => undefined),
+                release: vi.fn(),
+            })),
+        }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_target_foreground_status') {
+                return (nativeOwner ? { foreground: nativeOwner, result: { kind: 'updated', revision: 5, transferredObjects: 1, transferredBytes: 8 } } : null) as T
+            }
+            if (command === 'peer_delta_target_reserve') {
+                if (nativeOwner) throw new Error('Android foreground service is already reserved')
+                nativeOwner = foreground
+                return foreground as T
+            }
+            if (command === 'peer_delta_target_foreground_release') {
+                nativeOwner = undefined
+                return true as T
+            }
+            return { kind: 'updated', revision: 5, transferredObjects: 1, transferredBytes: 8 } as T
+        }) as PeerDeltaInvoke
+        const first = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+
+        await expect(first.pull(pairing)).rejects.toThrow('could not stop')
+        expect(nativeOwner).toEqual(foreground)
+
+        const reconstructed = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+        await reconstructed.recoverTargetForeground()
+        expect(nativeOwner).toBeUndefined()
+        expect(bridge.stopSource).toHaveBeenCalledTimes(2)
+    })
+
+    test('recovers an exact Android target after a lost native release response before fresh reserve', async () => {
+        const old = { lane: 'p4-target', operationId: '22222222-2222-4222-8222-222222222222', generation: 4 } as const
+        const fresh = { lane: 'p4-target', operationId: '33333333-3333-4333-8333-333333333333', generation: 5 } as const
+        let nativeOwner: typeof old | typeof fresh | undefined = old
+        let loseReleaseResponse = true
+        const bridge = { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) }
+        const runtime: PeerDeltaMutationRuntime = {
+            flushPendingData: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 5, mutationGeneration: 3 })),
+            acquirePersistentMutationFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: vi.fn(async () => undefined),
+                release: vi.fn(),
+            })),
+        }
+        const invoke = vi.fn(async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+            if (command === 'peer_delta_target_foreground_status') return (nativeOwner ? { foreground: nativeOwner } : null) as T
+            if (command === 'peer_delta_target_foreground_release') {
+                if ((args?.foreground as typeof old).generation !== nativeOwner?.generation) return false as T
+                nativeOwner = undefined
+                if (loseReleaseResponse) {
+                    loseReleaseResponse = false
+                    throw new Error('invoke response lost')
+                }
+                return true as T
+            }
+            if (command === 'peer_delta_target_reserve') {
+                if (nativeOwner) throw new Error('owner retained')
+                nativeOwner = fresh
+                return fresh as T
+            }
+            return { kind: 'noChanges', revision: 5, transferredObjects: 0, transferredBytes: 0 } as T
+        }) as PeerDeltaInvoke
+        const first = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+        await expect(first.recoverTargetForeground()).rejects.toThrow('invoke response lost')
+
+        const reconstructed = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+        await reconstructed.recoverTargetForeground()
+        await expect(reconstructed.pull(pairing)).resolves.toMatchObject({ kind: 'noChanges' })
+        expect(nativeOwner).toBeUndefined()
     })
 
     test('flushes and fences the exact revision while native Rust applies and renderer refreshes', async () => {

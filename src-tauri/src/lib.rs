@@ -603,6 +603,10 @@ pub fn run() {
             #[cfg(target_os = "android")]
             peer_sync::delta_commands::peer_delta_target_reserve,
             #[cfg(target_os = "android")]
+            peer_sync::delta_commands::peer_delta_target_foreground_status,
+            #[cfg(target_os = "android")]
+            peer_sync::delta_commands::peer_delta_target_foreground_release,
+            #[cfg(target_os = "android")]
             peer_sync::delta_commands::peer_delta_source_reserve,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_prepare,

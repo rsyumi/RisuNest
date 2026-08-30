@@ -120,10 +120,10 @@ export function createPeerDeltaController(options: {
         initialize(): Promise<void> {
             if (initialized) return initialization ?? Promise.resolve()
             initialized = true
-            initialization = Promise.all([
+            initialization = options.facade.recoverTargetForeground().then(() => Promise.all([
                 options.facade.capabilities(),
                 options.facade.status(),
-            ]).then(([capabilities, sourceStatus]) => {
+            ])).then(([capabilities, sourceStatus]) => {
                 sourceError = ''
                 update({
                     capabilities,

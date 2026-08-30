@@ -59,6 +59,20 @@ internal fun isExactAttachedPeerSyncStop(
   requested: PeerSyncForegroundIdentity,
 ): Boolean = attached == requested
 
+internal fun canStartPeerSyncForeground(
+  attached: PeerSyncForegroundIdentity?,
+  requested: PeerSyncForegroundIdentity,
+): Boolean = attached == null || attached == requested
+
+internal fun rejectedPeerSyncForegroundStart(
+  attached: PeerSyncForegroundIdentity?,
+  requested: PeerSyncForegroundIdentity,
+): PeerSyncForegroundIdentity? = requested.takeUnless { canStartPeerSyncForeground(attached, it) }
+
+internal fun peerSyncForegroundIdentityForDestruction(
+  attached: PeerSyncForegroundIdentity?,
+): PeerSyncForegroundIdentity? = attached
+
 internal object PeerSyncForegroundNativeBridge {
   init {
     System.loadLibrary("risuai_lib")
@@ -90,6 +104,12 @@ class PeerSyncForegroundService : Service() {
       stopSelfResult(startId)
       return PEER_SYNC_FOREGROUND_START_MODE
     }
+    rejectedPeerSyncForegroundStart(attached, identity)?.let { rejected ->
+      PeerSyncForegroundNativeBridge.cancel(rejected.lane, rejected.operationId, rejected.generation)
+      PeerSyncForegroundNativeBridge.detach(rejected.lane, rejected.operationId, rejected.generation)
+      return PEER_SYNC_FOREGROUND_START_MODE
+    }
+    if (attached == identity) return PEER_SYNC_FOREGROUND_START_MODE
 
     createNotificationChannel()
     startForeground(PEER_SYNC_FOREGROUND_NOTIFICATION_ID, notification(identity))
@@ -103,7 +123,7 @@ class PeerSyncForegroundService : Service() {
   }
 
   override fun onDestroy() {
-    attached?.let { identity ->
+    peerSyncForegroundIdentityForDestruction(attached)?.let { identity ->
       PeerSyncForegroundNativeBridge.cancel(identity.lane, identity.operationId, identity.generation)
       PeerSyncForegroundNativeBridge.detach(identity.lane, identity.operationId, identity.generation)
     }

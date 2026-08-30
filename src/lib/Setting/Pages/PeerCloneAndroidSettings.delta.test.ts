@@ -11,5 +11,6 @@ describe('Android P4 settings', () => {
         expect(source).toContain('!deltaCapabilities.tunnelReady')
         expect(source).not.toContain('deltaController.startQuickTunnel')
         expect(source).not.toContain('deltaController.startNamedTunnel')
+        expect(source).toContain("!['idle', 'stopped'].includes(deltaSourceStatus.phase)")
     })
 })

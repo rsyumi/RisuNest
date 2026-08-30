@@ -1,4 +1,4 @@
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 use super::android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane};
 use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
 #[cfg(desktop)]
@@ -64,12 +64,6 @@ pub fn peer_delta_capabilities() -> PeerDeltaCapabilities {
         production_enabled: true,
         tunnel_ready: cfg!(desktop),
     }
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-pub fn peer_delta_target_reserve() -> Result<AndroidForegroundKey, String> {
-    registry().reserve(AndroidForegroundLane::P4Target)
 }
 
 #[cfg(target_os = "android")]
@@ -336,7 +330,7 @@ struct DeltaSourceRuntime {
     tunnel_metadata: Option<PeerDeltaTunnelMetadata>,
     pairing_uri: Option<String>,
     stop_in_progress: bool,
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     foreground: Option<AndroidForegroundKey>,
 }
 
@@ -346,6 +340,16 @@ struct PeerDeltaRuntime {
     source: Option<DeltaSourceRuntime>,
     stopped: bool,
     pull_in_progress: bool,
+    #[cfg(any(target_os = "android", test))]
+    target_foreground: Option<AndroidTargetForegroundStatus>,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AndroidTargetForegroundStatus {
+    foreground: AndroidForegroundKey,
+    result: Option<PeerDeltaPullResult>,
 }
 
 #[derive(Clone)]
@@ -387,6 +391,70 @@ impl PeerDeltaCommandState {
         self.runtime.lock().map_err(|error| {
             PeerSyncError::Storage(format!("peer delta command state mutex poisoned: {error}"))
         })
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn reserve_target_foreground(&self) -> Result<AndroidForegroundKey, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        if runtime.target_foreground.is_some() {
+            return Err(PeerSyncError::Protocol(
+                "Android peer delta target foreground cleanup is pending".to_owned(),
+            ));
+        }
+        let foreground = registry()
+            .reserve(AndroidForegroundLane::P4Target)
+            .map_err(PeerSyncError::Protocol)?;
+        runtime.target_foreground = Some(AndroidTargetForegroundStatus {
+            foreground: foreground.clone(),
+            result: None,
+        });
+        Ok(foreground)
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn record_target_result_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+        result: PeerDeltaPullResult,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock()?;
+        let target = runtime.target_foreground.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("Android peer delta target foreground is absent".to_owned())
+        })?;
+        if target.foreground != *foreground {
+            return Err(PeerSyncError::Protocol(
+                "Android peer delta target foreground identity is stale".to_owned(),
+            ));
+        }
+        target.result = Some(result);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn target_foreground_status(
+        &self,
+    ) -> Result<Option<AndroidTargetForegroundStatus>, PeerSyncError> {
+        Ok(self.lock()?.target_foreground.clone())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn release_target_foreground_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+    ) -> Result<bool, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        let Some(target) = runtime.target_foreground.as_ref() else {
+            return Ok(false);
+        };
+        if target.foreground != *foreground {
+            return Ok(false);
+        }
+        let _ = registry().cancel_exact(foreground);
+        let _ = registry().detach_if_generation(foreground);
+        runtime.target_foreground = None;
+        Ok(true)
     }
 
     fn install_source(
@@ -435,7 +503,7 @@ impl PeerDeltaCommandState {
             tunnel_metadata: None,
             pairing_uri: None,
             stop_in_progress: false,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", test))]
             foreground: None,
         });
         source_status(&runtime)
@@ -695,7 +763,7 @@ impl PeerDeltaCommandState {
         self.status_inner()
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     fn attach_source_foreground(
         &self,
         session_id: &str,
@@ -706,7 +774,7 @@ impl PeerDeltaCommandState {
         Ok(())
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     fn pause_source_exact(&self, key: &AndroidForegroundKey) {
         let Ok(_operation) = self.lifecycle_operation.lock() else {
             return;
@@ -734,30 +802,40 @@ impl PeerDeltaCommandState {
         source.phase = PeerDeltaSourcePhase::Prepared;
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     fn release_source_android(
         &self,
         session_id: &str,
     ) -> Result<Option<AndroidForegroundKey>, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        let mut runtime = self.lock()?;
-        let source = runtime
-            .source
-            .as_ref()
-            .filter(|source| source.session_id == session_id)
-            .ok_or_else(|| {
-                PeerSyncError::Validation("peer delta source session is absent".to_owned())
-            })?;
-        let foreground = source.foreground.clone();
-        let mut source = runtime.source.take().expect("checked source");
-        runtime.stopped = true;
-        drop(runtime);
+        let operation = self.lock_lifecycle_operation()?;
+        let (foreground, mut source) = {
+            let mut runtime = self.lock()?;
+            let source = runtime
+                .source
+                .as_ref()
+                .filter(|source| source.session_id == session_id)
+                .ok_or_else(|| {
+                    PeerSyncError::Validation("peer delta source session is absent".to_owned())
+                })?;
+            let foreground = source.foreground.clone();
+            let source = runtime.source.take().expect("checked source");
+            runtime.stopped = true;
+            (foreground, source)
+        };
+        if let Some(host) = source.host.as_mut() {
+            if let Err(error) = host.stop() {
+                let mut runtime = self.lock()?;
+                runtime.stopped = false;
+                runtime.source = Some(source);
+                return Err(error);
+            }
+        }
+        source.foreground = None;
+        drop(source);
+        drop(operation);
         if let Some(key) = foreground.as_ref() {
             let _ = registry().cancel_exact(key);
             let _ = registry().detach_if_generation(key);
-        }
-        if let Some(host) = source.host.as_mut() {
-            host.stop()?;
         }
         Ok(foreground)
     }
@@ -1348,6 +1426,37 @@ pub fn peer_delta_source_reserve() -> Result<AndroidForegroundKey, String> {
     registry().reserve(AndroidForegroundLane::P4Source)
 }
 
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub fn peer_delta_target_reserve(
+    state: State<'_, PeerDeltaCommandState>,
+) -> Result<AndroidForegroundKey, String> {
+    state
+        .reserve_target_foreground()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub fn peer_delta_target_foreground_status(
+    state: State<'_, PeerDeltaCommandState>,
+) -> Result<Option<AndroidTargetForegroundStatus>, String> {
+    state
+        .target_foreground_status()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub fn peer_delta_target_foreground_release(
+    state: State<'_, PeerDeltaCommandState>,
+    foreground: AndroidForegroundKey,
+) -> Result<bool, String> {
+    state
+        .release_target_foreground_exact(&foreground)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(desktop)]
 #[tauri::command]
 pub fn peer_delta_start(
@@ -1563,7 +1672,8 @@ pub async fn peer_delta_pull(
     foreground: AndroidForegroundKey,
 ) -> Result<PeerDeltaPullResult, String> {
     let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target)?;
-    peer_delta_pull_with_cancellation(
+    let state_owner = state.inner().clone();
+    let result = peer_delta_pull_with_cancellation(
         app,
         state,
         endpoint,
@@ -1573,7 +1683,11 @@ pub async fn peer_delta_pull(
         expected_revision,
         cancellation,
     )
-    .await
+    .await?;
+    state_owner
+        .record_target_result_exact(&foreground, result.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1873,6 +1987,103 @@ mod tests {
         )
         .unwrap();
         (session, built.manifest_bytes)
+    }
+
+    #[test]
+    fn android_full_source_release_drops_lifecycle_gate_before_real_registry_callback() {
+        let root = tempfile::tempdir().unwrap();
+        let (session, manifest_bytes) = prepared_delta_source(root.path());
+        let state = PeerDeltaCommandState::default();
+        let status = state
+            .install_source(
+                session,
+                "00000000-0000-4000-8000-000000000001",
+                manifest_bytes,
+            )
+            .unwrap();
+        let session_id = status.session_id.unwrap();
+        let foreground = registry().reserve(AndroidForegroundLane::P4Source).unwrap();
+        assert!(registry().attach_exact(&foreground));
+        state
+            .attach_source_foreground(&session_id, foreground.clone())
+            .unwrap();
+        let callback_state = state.clone();
+        let callback_key = foreground.clone();
+        assert!(
+            registry().set_source_stop_callback_exact(&foreground, move || {
+                callback_state.pause_source_exact(&callback_key);
+            })
+        );
+        let release_state = state.clone();
+        let (released_tx, released_rx) = mpsc::channel();
+
+        let release = thread::spawn(move || {
+            let result = release_state.release_source_android(&session_id);
+            released_tx.send(result).unwrap();
+        });
+
+        assert_eq!(
+            released_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("full release deadlocked in foreground callback")
+                .unwrap(),
+            Some(foreground.clone()),
+        );
+        release.join().unwrap();
+        assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
+        assert!(registry().acquire_exact(&foreground).is_none());
+        let next = registry().reserve(AndroidForegroundLane::P4Target).unwrap();
+        assert!(registry().detach_if_generation(&next));
+
+        let (fresh_session, fresh_manifest) = prepared_delta_source(root.path());
+        let prepared = state
+            .install_source(
+                fresh_session,
+                "00000000-0000-4000-8000-000000000001",
+                fresh_manifest,
+            )
+            .unwrap();
+        assert_eq!(prepared.phase, PeerDeltaSourcePhase::Prepared);
+        state
+            .release_source_android(prepared.session_id.as_deref().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn android_target_foreground_release_is_native_owned_and_generation_exact() {
+        let state = PeerDeltaCommandState::default();
+        let foreground = state.reserve_target_foreground().unwrap();
+        assert_eq!(
+            state
+                .target_foreground_status()
+                .unwrap()
+                .unwrap()
+                .foreground,
+            foreground,
+        );
+        state
+            .record_target_result_exact(
+                &foreground,
+                PeerDeltaPullResult::NoChanges {
+                    revision: 7,
+                    transferred_objects: 0,
+                    transferred_bytes: 0,
+                },
+            )
+            .unwrap();
+        let mut stale = foreground.clone();
+        stale.generation -= 1;
+
+        assert!(!state.release_target_foreground_exact(&stale).unwrap());
+        assert!(registry().acquire_exact(&foreground).is_none());
+        assert!(registry().attach_exact(&foreground));
+        assert!(state.release_target_foreground_exact(&foreground).unwrap());
+        assert!(state.target_foreground_status().unwrap().is_none());
+
+        let fresh = state.reserve_target_foreground().unwrap();
+        assert!(fresh.generation > foreground.generation);
+        assert!(!registry().detach_if_generation(&foreground));
+        assert!(state.release_target_foreground_exact(&fresh).unwrap());
     }
 
     struct FixtureSource {

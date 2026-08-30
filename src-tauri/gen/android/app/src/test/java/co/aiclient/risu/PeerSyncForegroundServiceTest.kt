@@ -54,4 +54,17 @@ class PeerSyncForegroundServiceTest {
   fun `foreground service never asks Android to restart it implicitly`() {
     assertEquals(android.app.Service.START_NOT_STICKY, PEER_SYNC_FOREGROUND_START_MODE)
   }
+
+  @Test
+  fun `single service accepts only an idempotent sequential START until exact destruction`() {
+    val p1 = PeerSyncForegroundIdentity("p1-source", operationId, 7L)
+    val p4 = PeerSyncForegroundIdentity("p4-target", "22222222-2222-4222-8222-222222222222", 8L)
+    assertTrue(canStartPeerSyncForeground(null, p1))
+    assertTrue(canStartPeerSyncForeground(p1, p1))
+    assertFalse(canStartPeerSyncForeground(p1, p4))
+    assertEquals(p4, rejectedPeerSyncForegroundStart(p1, p4))
+    assertEquals(null, rejectedPeerSyncForegroundStart(p1, p1))
+    assertEquals(p1, peerSyncForegroundIdentityForDestruction(p1))
+    assertEquals(null, peerSyncForegroundIdentityForDestruction(null))
+  }
 }

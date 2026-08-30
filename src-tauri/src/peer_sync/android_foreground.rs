@@ -1,11 +1,8 @@
 use crate::local_backup::CancellationProbe;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -70,7 +67,7 @@ struct ForegroundEntry {
 #[derive(Default)]
 pub(crate) struct AndroidForegroundRegistry {
     next_generation: AtomicU64,
-    entries: Mutex<HashMap<AndroidForegroundLane, ForegroundEntry>>,
+    entry: Mutex<Option<ForegroundEntry>>,
 }
 
 impl AndroidForegroundRegistry {
@@ -84,35 +81,27 @@ impl AndroidForegroundRegistry {
             operation_id: uuid::Uuid::new_v4().to_string(),
             generation,
         };
-        let mut entries = self
-            .entries
+        let mut entry = self
+            .entry
             .lock()
             .map_err(|_| "Android foreground registry is unavailable".to_owned())?;
-        if entries
-            .get(&lane)
-            .is_some_and(|entry| entry.attached && !entry.cancellation.load(Ordering::SeqCst))
-        {
-            return Err("Android foreground lane is already active".to_owned());
+        if entry.is_some() {
+            return Err("Android foreground service is already reserved".to_owned());
         }
-        if let Some(previous) = entries.insert(
-            lane,
-            ForegroundEntry {
-                key: key.clone(),
-                attached: false,
-                cancellation: Arc::new(AtomicBool::new(false)),
-                source_stop: None,
-            },
-        ) {
-            previous.cancellation.store(true, Ordering::SeqCst);
-        }
+        *entry = Some(ForegroundEntry {
+            key: key.clone(),
+            attached: false,
+            cancellation: Arc::new(AtomicBool::new(false)),
+            source_stop: None,
+        });
         Ok(key)
     }
 
     pub(crate) fn attach_exact(&self, key: &AndroidForegroundKey) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
+        let Ok(mut entry) = self.entry.lock() else {
             return false;
         };
-        let Some(entry) = entries.get_mut(&key.lane) else {
+        let Some(entry) = entry.as_mut() else {
             return false;
         };
         if entry.key != *key {
@@ -126,8 +115,8 @@ impl AndroidForegroundRegistry {
         &self,
         key: &AndroidForegroundKey,
     ) -> Option<AndroidCancellationProbe> {
-        let entries = self.entries.lock().ok()?;
-        let entry = entries.get(&key.lane)?;
+        let entry = self.entry.lock().ok()?;
+        let entry = entry.as_ref()?;
         (entry.attached && entry.key == *key && !entry.cancellation.load(Ordering::SeqCst))
             .then(|| AndroidCancellationProbe(Arc::clone(&entry.cancellation)))
     }
@@ -137,10 +126,10 @@ impl AndroidForegroundRegistry {
         key: &AndroidForegroundKey,
         callback: impl FnOnce() + Send + 'static,
     ) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
+        let Ok(mut entry) = self.entry.lock() else {
             return false;
         };
-        let Some(entry) = entries.get_mut(&key.lane) else {
+        let Some(entry) = entry.as_mut() else {
             return false;
         };
         if !entry.attached || entry.key != *key || entry.cancellation.load(Ordering::SeqCst) {
@@ -152,10 +141,10 @@ impl AndroidForegroundRegistry {
 
     pub(crate) fn cancel_exact(&self, key: &AndroidForegroundKey) -> bool {
         let callback = {
-            let Ok(mut entries) = self.entries.lock() else {
+            let Ok(mut entry) = self.entry.lock() else {
                 return false;
             };
-            let Some(entry) = entries.get_mut(&key.lane) else {
+            let Some(entry) = entry.as_mut() else {
                 return false;
             };
             if entry.key != *key {
@@ -171,13 +160,13 @@ impl AndroidForegroundRegistry {
     }
 
     pub(crate) fn detach_if_generation(&self, key: &AndroidForegroundKey) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
+        let Ok(mut entry) = self.entry.lock() else {
             return false;
         };
-        if entries.get(&key.lane).is_none_or(|entry| entry.key != *key) {
+        if entry.as_ref().is_none_or(|entry| entry.key != *key) {
             return false;
         }
-        entries.remove(&key.lane);
+        *entry = None;
         true
     }
 }
@@ -217,6 +206,7 @@ mod tests {
     fn attach_acquire_cancel_and_detach_are_generation_exact() {
         let registry = AndroidForegroundRegistry::default();
         let old = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert!(registry.detach_if_generation(&old));
         let current = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
         assert!(current.generation > old.generation);
         assert!(!registry.attach_exact(&old));
@@ -251,27 +241,20 @@ mod tests {
     }
 
     #[test]
-    fn p4_source_restart_and_target_cancellation_are_lane_and_generation_exact() {
+    fn foreground_owner_is_globally_exclusive_across_reserved_and_attached_lanes() {
         let registry = AndroidForegroundRegistry::default();
-        let old_source = registry.reserve(AndroidForegroundLane::P4Source).unwrap();
-        assert!(registry.attach_exact(&old_source));
-        assert!(registry.cancel_exact(&old_source));
-        let source = registry.reserve(AndroidForegroundLane::P4Source).unwrap();
-        let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
-        assert!(source.generation > old_source.generation);
-        assert!(target.generation > source.generation);
+        let source = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert!(registry.reserve(AndroidForegroundLane::P4Source).is_err());
         assert!(registry.attach_exact(&source));
-        assert!(registry.attach_exact(&target));
-        let source_probe = registry.acquire_exact(&source).unwrap();
-        let target_probe = registry.acquire_exact(&target).unwrap();
-
-        assert!(!registry.cancel_exact(&old_source));
-        assert!(!source_probe.is_cancelled());
-        assert!(!target_probe.is_cancelled());
-        assert!(registry.cancel_exact(&target));
-        assert!(target_probe.is_cancelled());
-        assert!(!source_probe.is_cancelled());
-        assert!(registry.detach_if_generation(&target));
+        assert!(registry.reserve(AndroidForegroundLane::P4Target).is_err());
+        assert!(registry.cancel_exact(&source));
+        assert!(registry.reserve(AndroidForegroundLane::P4Target).is_err());
         assert!(registry.detach_if_generation(&source));
+
+        let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
+        assert!(registry.attach_exact(&target));
+        assert!(!registry.detach_if_generation(&source));
+        assert!(registry.acquire_exact(&target).is_some());
+        assert!(registry.detach_if_generation(&target));
     }
 }

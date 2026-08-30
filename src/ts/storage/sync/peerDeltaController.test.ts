@@ -7,6 +7,7 @@ type Facade = ReturnType<typeof createPeerDeltaFacade>
 
 function facadeFixture(overrides: Partial<Facade> = {}): Facade {
     return {
+        recoverTargetForeground: vi.fn(async () => undefined),
         capabilities: vi.fn(async () => ({
             desktop: true,
             sourceReady: true,
@@ -53,6 +54,36 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
 }
 
 describe('peer delta controller', () => {
+    test('recovers native Android target foreground ownership before reconstructed status', async () => {
+        const events: string[] = []
+        const controller = createPeerDeltaController({
+            facade: facadeFixture({
+                recoverTargetForeground: vi.fn(async () => { events.push('recover-target') }),
+                capabilities: vi.fn(async () => {
+                    events.push('capabilities')
+                    return {
+                        desktop: false,
+                        sourceReady: true,
+                        atomicActivationReady: true,
+                        authenticatedTransportReady: true,
+                        productionEnabled: true,
+                        tunnelReady: false,
+                    }
+                }),
+                status: vi.fn(async () => {
+                    events.push('source-status')
+                    return { phase: 'stopped', devices: [] } as const
+                }),
+            }),
+        })
+
+        await controller.initialize()
+
+        expect(events[0]).toBe('recover-target')
+        expect(events.slice(1).sort()).toEqual(['capabilities', 'source-status'])
+        expect(controller.snapshot().sourceStatus.phase).toBe('stopped')
+    })
+
     test('refreshes exact native cleanup ownership after an uncertain tunnel start failure', async () => {
         const stopping = {
             phase: 'stopping', sessionId: 'session', manifestId: 'a'.repeat(64),
