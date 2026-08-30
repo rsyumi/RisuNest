@@ -146,6 +146,7 @@ export interface PeerBidirectionalFacade {
     resolve(
         operationId: string,
         winner: 'local' | 'remote',
+        pairingUri?: string,
     ): Promise<PeerBidirectionalSyncResult>
     resume(operationId: string): Promise<PeerBidirectionalSyncResult>
     acknowledge(operationId: string): Promise<void>
@@ -600,7 +601,16 @@ export function createPeerBidirectionalFacade(options: {
                 { ...pairing },
             )
         },
-        resolve(operationId, winner) {
+        resolve(operationId, winner, pairingUri) {
+            if (pairingUri) {
+                const pairing = parsePeerBidirectionalUri(pairingUri)
+                return runMutation(
+                    'peer-bidirectional-resolve',
+                    `operation:${operationId}:resolve:${winner}:pairing:${pairingUri}`,
+                    'peer_bidirectional_resolve_with_link',
+                    { operationId, winner, ...pairing },
+                )
+            }
             return runMutation(
                 'peer-bidirectional-resolve',
                 `operation:${operationId}:resolve:${winner}`,

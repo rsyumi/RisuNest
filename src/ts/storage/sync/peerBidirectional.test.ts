@@ -11,6 +11,10 @@ import {
 const pairingUri = 'risuailocal://peer-sync/v1?endpoint=http%3A%2F%2F192.168.1.20%3A32146'
     + '&session=123e4567-e89b-42d3-a456-426614174000'
     + `&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+const publicPairingUri = pairingUri.replace(
+    'http%3A%2F%2F192.168.1.20%3A32146',
+    'https%3A%2F%2Ffresh-public.example',
+)
 
 function runtime(log: string[]): PeerBidirectionalMutationRuntime {
     return {
@@ -138,6 +142,51 @@ describe('peer bidirectional facade', () => {
             'invoke:peer_bidirectional_status:',
             'release',
         ])
+    })
+
+    it.each(['local', 'remote'] as const)(
+        'resolves the %s winner with a fresh public link in one native mutation',
+        async (winner) => {
+            const events: string[] = []
+            const result = {
+                kind: 'conflict' as const,
+                operationId: 'operation-public-conflict',
+                conflicts: [{ key: 'r1:root', type: 'sameRecord' as const }],
+                localManifestHash: 'c'.repeat(64),
+                remoteManifestHash: 'd'.repeat(64),
+            }
+            const invoke = vi.fn(async () => result)
+            const facade = createPeerBidirectionalFacade({
+                platform: 'desktop',
+                runtime: runtime(events),
+                invoke: invoke as unknown as PeerBidirectionalInvoke,
+            })
+
+            await expect(facade.resolve('operation-public-conflict', winner, publicPairingUri))
+                .resolves.toEqual(result)
+            expect(invoke).toHaveBeenCalledWith('peer_bidirectional_resolve_with_link', {
+                operationId: 'operation-public-conflict',
+                winner,
+                endpoint: 'https://fresh-public.example',
+                sessionId: '123e4567-e89b-42d3-a456-426614174000',
+                manifestId: 'a'.repeat(64),
+                claim: 'b'.repeat(64),
+                expectedRevision: 7,
+            })
+        },
+    )
+
+    it('rejects a malformed linked conflict source before invoking native authority', async () => {
+        const invoke = vi.fn()
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime([]),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        expect(() => facade.resolve('operation-public-conflict', 'local', 'not-a-pairing-link'))
+            .toThrow('Invalid peer sync pairing URI')
+        expect(invoke).not.toHaveBeenCalled()
     })
 
     it('starts Quick and Named P5 tunnels through transient one-shot commands', async () => {

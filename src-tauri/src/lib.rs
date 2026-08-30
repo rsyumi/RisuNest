@@ -619,6 +619,8 @@ pub fn run() {
             #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_resolve,
             #[cfg(desktop)]
+            peer_sync::bidirectional_commands::peer_bidirectional_resolve_with_link,
+            #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_resume,
             #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_acknowledge,

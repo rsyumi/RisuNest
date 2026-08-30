@@ -435,8 +435,19 @@
     }
 
     async function resolveBidirectional(winner: 'local' | 'remote'): Promise<void> {
+        let pairingUri: string | undefined
+        if (bidirectionalPairingInput) {
+            try {
+                const pairing = parsePeerBidirectionalUri(bidirectionalPairingInput)
+                if (pairing.endpoint.startsWith('https://')) pairingUri = bidirectionalPairingInput
+            } catch {
+                bidirectionalInputError = language.peerBidirectional.invalidLink
+                return
+            }
+        }
+        bidirectionalInputError = ''
         await withBidirectionalBusy(async () => {
-            await bidirectionalController.resolve(winner)
+            await bidirectionalController.resolve(winner, pairingUri)
         })
     }
 

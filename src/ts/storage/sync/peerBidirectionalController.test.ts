@@ -719,6 +719,45 @@ describe('peer bidirectional controller', () => {
         expect(controller.snapshot()).toMatchObject({ operationPhase: 'completed' })
     })
 
+    it('passes a fresh conflict link atomically with the selected winner', async () => {
+        const resolve = vi.fn(async () => ({
+            kind: 'noChanges' as const,
+            operationId: 'operation-public-conflict',
+            revision: 4,
+            remoteRevision: 4,
+            transferredObjects: 0,
+            transferredBytes: 0,
+            backups: [],
+        }))
+        const controller = createPeerBidirectionalController({
+            facade: facade({
+                status: async () => ({
+                    source: { phase: 'idle', devices: [] },
+                    operation: {
+                        phase: 'awaitingConflict',
+                        result: {
+                            kind: 'conflict',
+                            operationId: 'operation-public-conflict',
+                            conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
+                            localManifestHash: 'a'.repeat(64),
+                            remoteManifestHash: 'b'.repeat(64),
+                        },
+                    },
+                }),
+                resolve,
+            }),
+        })
+        await controller.initialize()
+
+        await controller.resolve('remote', 'fresh-public-link')
+
+        expect(resolve).toHaveBeenCalledWith(
+            'operation-public-conflict',
+            'remote',
+            'fresh-public-link',
+        )
+    })
+
     it('resumes a native committed operation recovered after restart', async () => {
         const resume = vi.fn(async () => ({
             kind: 'noChanges' as const,

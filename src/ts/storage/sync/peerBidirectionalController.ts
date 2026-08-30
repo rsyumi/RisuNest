@@ -414,18 +414,21 @@ export function createPeerBidirectionalController(options: {
             }
             return runOperation(key, () => options.facade.sync(pairingUri))
         },
-        resolve(winner: 'local' | 'remote') {
+        resolve(winner: 'local' | 'remote', pairingUri?: string) {
             const operationId = snapshot.operationId
-            const key = `operation:${operationId ?? ''}:resolve:${winner}`
+            const key = `operation:${operationId ?? ''}:resolve:${winner}:${pairingUri ?? 'retained'}`
+            const resolve = (id: string) => pairingUri
+                ? options.facade.resolve(id, winner, pairingUri)
+                : options.facade.resolve(id, winner)
             if (activeOperation) {
-                return runOperation(key, () => options.facade.resolve(operationId ?? '', winner))
+                return runOperation(key, () => resolve(operationId ?? ''))
             }
             if (!operationId || snapshot.operationPhase !== 'awaitingConflict') {
                 return Promise.reject(new Error('No peer sync conflict is awaiting a choice'))
             }
             return runOperation(
                 key,
-                () => options.facade.resolve(operationId, winner),
+                () => resolve(operationId),
             )
         },
         resume() {

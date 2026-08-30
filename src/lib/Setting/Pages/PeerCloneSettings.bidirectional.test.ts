@@ -32,6 +32,8 @@ describe('peer bidirectional settings surface', () => {
         expect(languageKorean.peerBidirectional?.keepLocal).toContain('이 기기')
         expect(languageKorean.peerBidirectional?.keepRemote).toContain('다른 기기')
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.conflictReconnectHelp')
+        expect(peerCloneSettingsSource).toContain("pairing.endpoint.startsWith('https://')")
+        expect(peerCloneSettingsSource).toContain('bidirectionalController.resolve(winner, pairingUri)')
         expect(languageEnglish.peerBidirectional.conflictReconnectHelp).toContain('fresh link')
         expect(languageKorean.peerBidirectional?.conflictReconnectHelp).toContain('새 링크')
     })
