@@ -44,12 +44,12 @@
     const deltaController = getDesktopPeerDeltaController({
         flushPendingData,
         capturePersistentMutationToken,
-        acquirePersistentMutationFence: acquireDestructiveReplacementFence,
+        acquireDestructiveReplacementFence,
     })
     const bidirectionalController = getDesktopPeerBidirectionalController({
         flushPendingData,
         capturePersistentMutationToken,
-        acquirePersistentMutationFence: acquireDestructiveReplacementFence,
+        acquireDestructiveReplacementFence,
     })
     let capabilities = $state<PeerCloneNativeCapabilities>()
     let sourceStatus = $state<PeerCloneSourceStatus>({ phase: 'idle', devices: [] })

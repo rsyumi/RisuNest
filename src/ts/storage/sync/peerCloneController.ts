@@ -135,6 +135,31 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
             throw cause
         }
     }
+    const startTunnel = (start: () => Promise<PeerCloneSourceStatus>) => run(async () => {
+        try {
+            const sourceStatus = await start()
+            const tunnelStatus = await facade.tunnelStatus()
+            snapshot = {
+                ...snapshot,
+                sourceStatus,
+                tunnelStatus,
+                sourcePairingUri: sourceStatus.pairingUri ?? '',
+            }
+            beginSourcePolling()
+            return sourceStatus
+        } catch (cause) {
+            try {
+                const sourceStatus = await refreshSourceState()
+                snapshot = { ...snapshot, sourcePairingUri: '' }
+                if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                    beginSourcePolling()
+                }
+            } catch {
+                snapshot = { ...snapshot, sourcePairingUri: '' }
+            }
+            throw cause
+        }
+    })
 
     return {
         snapshot: () => snapshot,
@@ -155,7 +180,11 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
                         beginSourcePolling()
                     }
                 }),
-            ]).then(() => success()).catch((cause) => failure(cause))
+            ]).then(() => success()).catch((cause) => {
+                initialized = false
+                initialization = undefined
+                failure(cause)
+            })
             return initialization
         },
         clearError(): void {
@@ -184,56 +213,12 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
             beginSourcePolling()
             return sourceStatus
         }),
-        startQuickTunnel: (sessionId: string) => run(async () => {
-            try {
-                const sourceStatus = await facade.startQuickTunnel(sessionId)
-                const tunnelStatus = await facade.tunnelStatus()
-                snapshot = {
-                    ...snapshot,
-                    sourceStatus,
-                    tunnelStatus,
-                    sourcePairingUri: sourceStatus.pairingUri ?? '',
-                }
-                beginSourcePolling()
-                return sourceStatus
-            } catch (cause) {
-                try {
-                    const sourceStatus = await refreshSourceState()
-                    snapshot = { ...snapshot, sourcePairingUri: '' }
-                    if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
-                        beginSourcePolling()
-                    }
-                } catch {
-                    snapshot = { ...snapshot, sourcePairingUri: '' }
-                }
-                throw cause
-            }
-        }),
-        startNamedTunnel: (sessionId: string, token: string, expectedPublicBaseUrl: string) => run(async () => {
-            try {
-                const sourceStatus = await facade.startNamedTunnel(sessionId, token, expectedPublicBaseUrl)
-                const tunnelStatus = await facade.tunnelStatus()
-                snapshot = {
-                    ...snapshot,
-                    sourceStatus,
-                    tunnelStatus,
-                    sourcePairingUri: sourceStatus.pairingUri ?? '',
-                }
-                beginSourcePolling()
-                return sourceStatus
-            } catch (cause) {
-                try {
-                    const sourceStatus = await refreshSourceState()
-                    snapshot = { ...snapshot, sourcePairingUri: '' }
-                    if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
-                        beginSourcePolling()
-                    }
-                } catch {
-                    snapshot = { ...snapshot, sourcePairingUri: '' }
-                }
-                throw cause
-            }
-        }),
+        startQuickTunnel: (sessionId: string) => startTunnel(() => facade.startQuickTunnel(sessionId)),
+        startNamedTunnel: (
+            sessionId: string,
+            token: string,
+            expectedPublicBaseUrl: string,
+        ) => startTunnel(() => facade.startNamedTunnel(sessionId, token, expectedPublicBaseUrl)),
         stop: (sessionId: string) => run(async () => {
             try {
                 if (snapshot.sourceStatus.tunnel) {

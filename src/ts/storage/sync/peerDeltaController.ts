@@ -109,6 +109,22 @@ export function createPeerDeltaController(options: {
             throw cause
         }
     }
+    const startTunnel = (start: () => Promise<PeerDeltaSourceStatus>) => run(async () => {
+        try {
+            const sourceStatus = await start()
+            update({
+                sourceStatus,
+                sourcePairingUri: sourceStatus.pairingUri ?? '',
+                tunnelStatus: await options.facade.tunnelStatus(),
+            })
+            beginSourcePolling()
+            return sourceStatus
+        } catch (cause) {
+            const sourceStatus = await refreshSourceState()
+            if (['starting', 'running', 'stopping'].includes(sourceStatus.phase)) beginSourcePolling()
+            throw cause
+        }
+    })
 
     return {
         snapshot: (): PeerDeltaControllerSnapshot => snapshot,
@@ -155,42 +171,12 @@ export function createPeerDeltaController(options: {
             beginSourcePolling()
             return sourceStatus
         }),
-        startQuickTunnel: (sessionId: string) => run(async () => {
-            try {
-                const sourceStatus = await options.facade.startQuickTunnel(sessionId)
-                update({
-                    sourceStatus,
-                    sourcePairingUri: sourceStatus.pairingUri ?? '',
-                    tunnelStatus: await options.facade.tunnelStatus(),
-                })
-                beginSourcePolling()
-                return sourceStatus
-            } catch (cause) {
-                const sourceStatus = await refreshSourceState()
-                if (['starting', 'running', 'stopping'].includes(sourceStatus.phase)) beginSourcePolling()
-                throw cause
-            }
-        }),
-        startNamedTunnel: (sessionId: string, token: string, expectedPublicBaseUrl: string) => run(async () => {
-            try {
-                const sourceStatus = await options.facade.startNamedTunnel(
-                    sessionId,
-                    token,
-                    expectedPublicBaseUrl,
-                )
-                update({
-                    sourceStatus,
-                    sourcePairingUri: sourceStatus.pairingUri ?? '',
-                    tunnelStatus: await options.facade.tunnelStatus(),
-                })
-                beginSourcePolling()
-                return sourceStatus
-            } catch (cause) {
-                const sourceStatus = await refreshSourceState()
-                if (['starting', 'running', 'stopping'].includes(sourceStatus.phase)) beginSourcePolling()
-                throw cause
-            }
-        }),
+        startQuickTunnel: (sessionId: string) => startTunnel(() => options.facade.startQuickTunnel(sessionId)),
+        startNamedTunnel: (
+            sessionId: string,
+            token: string,
+            expectedPublicBaseUrl: string,
+        ) => startTunnel(() => options.facade.startNamedTunnel(sessionId, token, expectedPublicBaseUrl)),
         stop: (sessionId: string) => run(async () => {
             try {
                 if (snapshot.sourceStatus.tunnel) await options.facade.stopTunnel(sessionId)
@@ -245,4 +231,13 @@ export function getDesktopPeerDeltaController(runtime: PeerDeltaMutationRuntime)
         facade: createPeerDeltaFacade({ platform: 'desktop', runtime }),
     })
     return desktopPeerDeltaController
+}
+
+let androidPeerDeltaController: ReturnType<typeof createPeerDeltaController> | undefined
+
+export function getAndroidPeerDeltaController(runtime: PeerDeltaMutationRuntime) {
+    androidPeerDeltaController ??= createPeerDeltaController({
+        facade: createPeerDeltaFacade({ platform: 'android', runtime }),
+    })
+    return androidPeerDeltaController
 }

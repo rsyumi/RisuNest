@@ -156,6 +156,35 @@ describe('peer logical delta product facade', () => {
         ))).toThrow('Invalid peer delta pairing URI')
     })
 
+    test('flushes pending renderer data before native seals the served source generation', async () => {
+        const events: string[] = []
+        const runtime: PeerDeltaMutationRuntime = {
+            async flushPendingData(reason) { events.push(`flush:${reason}`) },
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 1, mutationGeneration: 0 })),
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: vi.fn(async () => undefined),
+                release: vi.fn(),
+            })),
+        }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            events.push(command)
+            return { phase: 'prepared', sessionId: 'session', devices: [] } as T
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'desktop', invoke, runtime })
+
+        await expect(facade.prepare()).resolves.toMatchObject({ phase: 'prepared' })
+
+        expect(events).toEqual(['flush:peer-delta-source-prepare', 'peer_delta_prepare'])
+    })
+
+    test('refuses to prepare a source without the mutation runtime', async () => {
+        const invoke = vi.fn(async <T>(): Promise<T> => ({ phase: 'prepared', devices: [] }) as T) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'desktop', invoke })
+
+        await expect(facade.prepare()).rejects.toThrow('Peer delta mutation runtime is unavailable')
+        expect(invoke).not.toHaveBeenCalled()
+    })
+
     test('starts and stops Quick and Named tunnel transports through P4-owned commands', async () => {
         const invokeMock = vi.fn(async <T>(command: string): Promise<T> => ({
             phase: 'running',
@@ -192,6 +221,38 @@ describe('peer logical delta product facade', () => {
         expect(parsePeerDeltaUri(loopbackPairing).endpoint).toBe(endpoint)
     })
 
+    test('fails closed when the Android foreground service rejects an exact source stop', async () => {
+        const foreground = { lane: 'p4-source', operationId: '44444444-4444-4444-8444-444444444444', generation: 9 } as const
+        const bridge = { startSource: vi.fn(() => true), stopSource: vi.fn(() => false) }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_stop') return foreground as T
+            throw new Error(`unexpected ${command}`)
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'android', invoke, bridge })
+
+        await expect(facade.stop('session')).rejects.toThrow(
+            'Android peer delta source foreground service could not stop',
+        )
+        expect(bridge.stopSource).toHaveBeenCalledWith(
+            foreground.lane,
+            foreground.operationId,
+            foreground.generation,
+        )
+    })
+
+    test('fails closed when an Android stop returns an identity without a foreground bridge', async () => {
+        const foreground = { lane: 'p4-source', operationId: '44444444-4444-4444-8444-444444444444', generation: 9 } as const
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_stop') return foreground as T
+            throw new Error(`unexpected ${command}`)
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'android', invoke })
+
+        await expect(facade.stop('session')).rejects.toThrow(
+            'Android peer delta foreground service is unavailable',
+        )
+    })
+
     test('does not expose native delta on web', async () => {
         const platform = 'web' as const
         const facade = createPeerDeltaFacade({ platform })
@@ -209,7 +270,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             async flushPendingData() { events.push('flush') },
             async capturePersistentMutationToken() { events.push('capture'); return { revision: 4, mutationGeneration: 2 } },
-            async acquirePersistentMutationFence() {
+            async acquireDestructiveReplacementFence() {
                 events.push('fence')
                 return {
                     async refreshCommittedWorkingSet(revision) { events.push(`refresh:${revision}`) },
@@ -232,8 +293,11 @@ describe('peer logical delta product facade', () => {
             'peer_delta_target_reserve', 'service-start', 'peer_delta_pull',
             'refresh:5', 'release', 'service-stop', 'peer_delta_target_foreground_release',
         ])
-        expect('startQuickTunnel' in facade).toBe(false)
-        expect('startNamedTunnel' in facade).toBe(false)
+        await expect(facade.startQuickTunnel('session')).rejects.toThrow('Peer delta is unsupported on android')
+        await expect(facade.startNamedTunnel('session', 'token', 'https://sync.example.com'))
+            .rejects.toThrow('Peer delta is unsupported on android')
+        await expect(facade.tunnelStatus()).rejects.toThrow('Peer delta is unsupported on android')
+        await expect(facade.stopTunnel('session')).rejects.toThrow('Peer delta is unsupported on android')
     })
 
     test('current renderer cleans exact Reserved target after foreground START throws', async () => {
@@ -248,7 +312,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             async flushPendingData() { events.push('flush') },
             async capturePersistentMutationToken() { events.push('capture'); return { revision: 4, mutationGeneration: 2 } },
-            async acquirePersistentMutationFence() {
+            async acquireDestructiveReplacementFence() {
                 events.push('fence')
                 return { refreshCommittedWorkingSet: vi.fn(), release: () => { events.push('release') } }
             },
@@ -293,7 +357,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 4, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: vi.fn(async () => { events.push('refresh') }),
                 release: () => { events.push('release') },
             })),
@@ -335,7 +399,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             async flushPendingData() { events.push('flush') },
             async capturePersistentMutationToken() { events.push('capture'); return { revision: 4, mutationGeneration: 2 } },
-            async acquirePersistentMutationFence() {
+            async acquireDestructiveReplacementFence() {
                 events.push('fence')
                 return {
                     async refreshCommittedWorkingSet(revision) { events.push(`refresh:${revision}`) },
@@ -388,7 +452,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 4, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: vi.fn(),
                 release: () => { events.push('release') },
             })),
@@ -446,7 +510,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 4, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: vi.fn(),
                 release: vi.fn(),
             })),
@@ -491,7 +555,7 @@ describe('peer logical delta product facade', () => {
             const runtime: PeerDeltaMutationRuntime = {
                 flushPendingData: vi.fn(async () => undefined),
                 capturePersistentMutationToken: vi.fn(async () => ({ revision: 4, mutationGeneration: 2 })),
-                acquirePersistentMutationFence: vi.fn(async () => ({
+                acquireDestructiveReplacementFence: vi.fn(async () => ({
                     refreshCommittedWorkingSet: vi.fn(),
                     release: vi.fn(),
                 })),
@@ -525,7 +589,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 4, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: vi.fn(async () => undefined),
                 release: vi.fn(),
             })),
@@ -571,7 +635,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 5, mutationGeneration: 3 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: vi.fn(async () => undefined),
                 release: vi.fn(),
             })),
@@ -617,7 +681,7 @@ describe('peer logical delta product facade', () => {
                 events.push('capture')
                 return { revision: 12, mutationGeneration: 4 }
             }),
-            acquirePersistentMutationFence: vi.fn(async () => {
+            acquireDestructiveReplacementFence: vi.fn(async () => {
                 events.push('fence')
                 return {
                     async refreshCommittedWorkingSet(revision) { events.push(`refresh:${revision}`) },
@@ -662,7 +726,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 12, mutationGeneration: 4 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({ refreshCommittedWorkingSet: refresh, release: vi.fn() })),
+            acquireDestructiveReplacementFence: vi.fn(async () => ({ refreshCommittedWorkingSet: refresh, release: vi.fn() })),
         }
         const invoke = vi.fn(async <T>(command: string): Promise<T> => {
             if (command === 'peer_delta_target_foreground_status') {
@@ -694,7 +758,7 @@ describe('peer logical delta product facade', () => {
                 events.push('capture')
                 return { revision: 14, mutationGeneration: 3 }
             },
-            async acquirePersistentMutationFence(token) {
+            async acquireDestructiveReplacementFence(token) {
                 events.push(`fence:${token.revision}:${token.mutationGeneration}`)
                 return {
                     async refreshCommittedWorkingSet(revision) {
@@ -746,7 +810,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 7, mutationGeneration: 1 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: refresh,
                 release,
             })),
@@ -770,7 +834,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 3, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: vi.fn(),
                 release,
             })),
@@ -793,7 +857,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 8, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: refresh,
                 release,
             })),
@@ -814,7 +878,7 @@ describe('peer logical delta product facade', () => {
         expect(invoke).toHaveBeenCalledOnce()
         expect(runtime.flushPendingData).toHaveBeenCalledOnce()
         expect(runtime.capturePersistentMutationToken).toHaveBeenCalledOnce()
-        expect(runtime.acquirePersistentMutationFence).toHaveBeenCalledOnce()
+        expect(runtime.acquireDestructiveReplacementFence).toHaveBeenCalledOnce()
         expect(refresh).toHaveBeenCalledTimes(2)
         expect(release).toHaveBeenCalledOnce()
     })
@@ -833,7 +897,7 @@ describe('peer logical delta product facade', () => {
         const runtime: PeerDeltaMutationRuntime = {
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({ revision: 8, mutationGeneration: 2 })),
-            acquirePersistentMutationFence: vi.fn(async () => ({
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
                 refreshCommittedWorkingSet: refresh,
                 release,
             })),
@@ -883,6 +947,6 @@ describe('peer logical delta product facade', () => {
         expect(invoke).toHaveBeenCalledWith('peer_delta_target_foreground_release', { foreground })
         expect(nativeReleaseCount).toBe(1)
         expect(runtime.flushPendingData).toHaveBeenCalledOnce()
-        expect(runtime.acquirePersistentMutationFence).toHaveBeenCalledOnce()
+        expect(runtime.acquireDestructiveReplacementFence).toHaveBeenCalledOnce()
     })
 })

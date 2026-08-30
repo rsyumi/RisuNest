@@ -102,6 +102,40 @@ describe('peer clone controller lifecycle', () => {
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_stop')).toHaveLength(2)
     })
 
+    it('retries initialization after a transient failure instead of caching it', async () => {
+        let failCapabilities = true
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') {
+                if (failCapabilities) {
+                    failCapabilities = false
+                    throw new Error('capabilities unavailable')
+                }
+                return capabilities() as T
+            }
+            if (command === 'peer_clone_status') {
+                return { phase: 'idle', devices: [] } as T
+            }
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async (_revision: number) => undefined), vi.fn()),
+            }),
+        })
+
+        await controller.initialize()
+        expect(controller.snapshot().error).toBe('capabilities unavailable')
+        expect(controller.snapshot().capabilities).toBeUndefined()
+
+        await controller.initialize()
+
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_capabilities')).toHaveLength(2)
+        expect(controller.snapshot().error).toBe('')
+        expect(controller.snapshot().capabilities).toMatchObject({ productionEnabled: true })
+    })
+
     it('preserves a native target failure until resume is accepted', async () => {
         vi.useFakeTimers()
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {

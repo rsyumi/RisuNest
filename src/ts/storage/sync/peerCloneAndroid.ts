@@ -2,10 +2,9 @@ import { invoke } from '@tauri-apps/api/core'
 
 import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
 import { parsePeerCloneUri, type PeerClonePairing } from './peerClone'
+import type { PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 
-export interface AndroidPeerCloneInvoke {
-    <T>(command: string, args?: Record<string, unknown>): Promise<T>
-}
+export type AndroidPeerCloneInvoke = PeerSyncInvoke
 
 export interface AndroidPeerCloneBridge {
     transferMode(): 'foreground' | 'uidt' | 'disabled'
@@ -13,18 +12,7 @@ export interface AndroidPeerCloneBridge {
     cancel(jobId: string): boolean
 }
 
-export interface AndroidPeerCloneReplacementRuntime {
-    capturePersistentMutationToken(reason: string): Promise<{
-        revision: number
-        mutationGeneration: number
-    }>
-    acquireDestructiveReplacementFence(token: {
-        revision: number
-        mutationGeneration: number
-    }): Promise<{
-        refreshCommittedWorkingSet(revision: number): Promise<void>
-        release(): void
-    }>
+export interface AndroidPeerCloneReplacementRuntime extends Omit<PeerSyncMutationRuntime, 'flushPendingData'> {
     afterRefresh?(): void | Promise<void>
 }
 
@@ -316,4 +304,11 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             return status.phase === 'awaitingActivation' ? finalize(status) : status
         },
     }
+}
+
+let androidPeerCloneFacade: ReturnType<typeof createAndroidPeerCloneFacade> | undefined
+
+export function getAndroidPeerCloneFacade(runtime: AndroidPeerCloneReplacementRuntime) {
+    androidPeerCloneFacade ??= createAndroidPeerCloneFacade({ runtime })
+    return androidPeerCloneFacade
 }

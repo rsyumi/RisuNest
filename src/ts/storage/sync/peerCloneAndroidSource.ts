@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import type { PeerCloneInvoke, PeerCloneSourceStatus } from './peerClone'
+import type { PeerSyncForegroundBridge } from './peerSyncShared'
 
 export interface AndroidPeerCloneSourceCapabilities {
     desktop: false
@@ -19,10 +20,7 @@ export interface AndroidPeerCloneForegroundIdentity {
     generation: number
 }
 
-export interface AndroidPeerCloneSourceBridge {
-    startSource(lane: string, operationId: string, generation: number): boolean
-    stopSource(lane: string, operationId: string, generation: number): boolean
-}
+export type AndroidPeerCloneSourceBridge = PeerSyncForegroundBridge
 
 export interface AndroidPeerCloneSourceFacadeOptions {
     invoke?: PeerCloneInvoke
@@ -129,7 +127,9 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
                 'peer_clone_android_source_stop',
                 { sessionId },
             )
-            if (identity) bridge.stopSource(identity.lane, identity.operationId, identity.generation)
+            if (identity && !bridge.stopSource(identity.lane, identity.operationId, identity.generation)) {
+                throw new Error('Android peer clone foreground service could not stop')
+            }
             foreground = undefined
         },
         revoke(sessionId: string, deviceId: string): Promise<void> {

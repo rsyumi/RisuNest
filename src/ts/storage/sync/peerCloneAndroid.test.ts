@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
     createAndroidPeerCloneFacade,
+    getAndroidPeerCloneFacade,
     type AndroidPeerCloneBridge,
     type AndroidPeerCloneInvoke,
     type AndroidPeerCloneReplacementRuntime,
@@ -31,6 +32,13 @@ function bridge(mode: 'foreground' | 'uidt' = 'uidt') {
 }
 
 describe('Android peer clone facade', () => {
+    it('caches one module-level facade so retained recovery fences survive settings remounts', () => {
+        const first = getAndroidPeerCloneFacade(runtime().replacement)
+        const second = getAndroidPeerCloneFacade(runtime().replacement)
+
+        expect(second).toBe(first)
+    })
+
     it('claims once and schedules API 34 UIDT with only the opaque native job id', async () => {
         const calls: [string, Record<string, unknown> | undefined][] = []
         const invoke: AndroidPeerCloneInvoke = async <T>(command: string, args?: Record<string, unknown>) => {

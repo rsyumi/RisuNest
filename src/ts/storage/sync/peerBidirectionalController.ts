@@ -274,6 +274,16 @@ export function createPeerBidirectionalController(options: {
         activeOperation = { key, promise }
         return promise
     }
+    const startSourceHost = (
+        key: string,
+        start: () => Promise<PeerBidirectionalSourceStatus>,
+    ) => runSource(key, async () => {
+        const sourceStatus = await start()
+        sourcePollEpoch += 1
+        update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
+        beginSourcePolling()
+        return sourceStatus
+    }, 'rehost')
     const clearRetainedOperation = async (
         operationId: string,
         refreshStatus = false,
@@ -344,35 +354,19 @@ export function createPeerBidirectionalController(options: {
             update({ sourceStatus, sourcePairingUri: '' })
             return sourceStatus
         }, 'rehost'),
-        start: (sessionId: string) => runSource(`start:${sessionId}`, async () => {
-            const sourceStatus = await options.facade.start(sessionId)
-            sourcePollEpoch += 1
-            update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
-            beginSourcePolling()
-            return sourceStatus
-        }, 'rehost'),
-        startQuickTunnel: (sessionId: string) => runSource(`start-quick:${sessionId}`, async () => {
-            const sourceStatus = await options.facade.startQuickTunnel(sessionId)
-            sourcePollEpoch += 1
-            update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
-            beginSourcePolling()
-            return sourceStatus
-        }, 'rehost'),
+        start: (sessionId: string) => startSourceHost(`start:${sessionId}`, () => options.facade.start(sessionId)),
+        startQuickTunnel: (sessionId: string) => startSourceHost(
+            `start-quick:${sessionId}`,
+            () => options.facade.startQuickTunnel(sessionId),
+        ),
         startNamedTunnel: (
             sessionId: string,
             token: string,
             expectedPublicBaseUrl: string,
-        ) => runSource(`start-named:${sessionId}`, async () => {
-            const sourceStatus = await options.facade.startNamedTunnel(
-                sessionId,
-                token,
-                expectedPublicBaseUrl,
-            )
-            sourcePollEpoch += 1
-            update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
-            beginSourcePolling()
-            return sourceStatus
-        }, 'rehost'),
+        ) => startSourceHost(
+            `start-named:${sessionId}`,
+            () => options.facade.startNamedTunnel(sessionId, token, expectedPublicBaseUrl),
+        ),
         stop: (sessionId: string) => runSource(`stop:${sessionId}`, async () => {
             await options.facade.stop(sessionId)
             stopSourcePolling()

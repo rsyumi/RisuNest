@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from 'vitest'
 
-import { createPeerDeltaController } from './peerDeltaController'
-import type { createPeerDeltaFacade } from './peerDelta'
+import { createPeerDeltaController, getAndroidPeerDeltaController } from './peerDeltaController'
+import type { createPeerDeltaFacade, PeerDeltaMutationRuntime } from './peerDelta'
 
 type Facade = ReturnType<typeof createPeerDeltaFacade>
 
@@ -54,6 +54,22 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
 }
 
 describe('peer delta controller', () => {
+    test('caches one module-level Android controller so retained pull fences survive settings remounts', () => {
+        const runtime = (): PeerDeltaMutationRuntime => ({
+            flushPendingData: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 1, mutationGeneration: 0 })),
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: vi.fn(async () => undefined),
+                release: vi.fn(),
+            })),
+        })
+
+        const first = getAndroidPeerDeltaController(runtime())
+        const second = getAndroidPeerDeltaController(runtime())
+
+        expect(second).toBe(first)
+    })
+
     test('recovers native Android target foreground ownership before reconstructed status', async () => {
         const events: string[] = []
         const controller = createPeerDeltaController({

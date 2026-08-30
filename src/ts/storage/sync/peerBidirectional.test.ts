@@ -25,7 +25,7 @@ function runtime(log: string[]): PeerBidirectionalMutationRuntime {
             log.push(`capture:${reason}`)
             return { revision: 7, mutationGeneration: 11 }
         },
-        async acquirePersistentMutationFence(token) {
+        async acquireDestructiveReplacementFence(token) {
             log.push(`acquire:${token.revision}:${token.mutationGeneration}`)
             return {
                 async refreshCommittedWorkingSet(revision) {
@@ -955,8 +955,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1011,8 +1011,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1110,8 +1110,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1175,8 +1175,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1247,8 +1247,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1315,8 +1315,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1376,8 +1376,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1776,8 +1776,8 @@ describe('peer bidirectional facade', () => {
             platform: 'desktop',
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {
@@ -1842,8 +1842,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
             runtime: {
                 ...base,
-                async acquirePersistentMutationFence(token) {
-                    const fence = await base.acquirePersistentMutationFence(token)
+                async acquireDestructiveReplacementFence(token) {
+                    const fence = await base.acquireDestructiveReplacementFence(token)
                     return {
                         ...fence,
                         async refreshCommittedWorkingSet(revision) {

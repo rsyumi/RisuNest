@@ -1,10 +1,10 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import {
-    parsePeerCloneEndpoint,
-    parsePeerLanEndpoint,
+    parsePeerPairingUri,
     type PeerClonePlatform,
 } from './peerClone'
+import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 
 export interface PeerBidirectionalPairing {
     endpoint: string
@@ -13,20 +13,7 @@ export interface PeerBidirectionalPairing {
     claim: string
 }
 
-export interface PeerBidirectionalMutationRuntime {
-    flushPendingData(reason: string): Promise<void>
-    capturePersistentMutationToken(reason: string): Promise<{
-        revision: number
-        mutationGeneration: number
-    }>
-    acquirePersistentMutationFence(token: {
-        revision: number
-        mutationGeneration: number
-    }): Promise<{
-        refreshCommittedWorkingSet(revision: number): Promise<void>
-        release(): void
-    }>
-}
+export type PeerBidirectionalMutationRuntime = PeerSyncMutationRuntime
 
 export interface PeerBidirectionalCapabilities {
     desktop: boolean
@@ -38,10 +25,7 @@ export interface PeerBidirectionalCapabilities {
     productionEnabled: boolean
 }
 
-export interface PeerBidirectionalForegroundBridge {
-    startSource(lane: string, operationId: string, generation: number): boolean
-    stopSource(lane: string, operationId: string, generation: number): boolean
-}
+export type PeerBidirectionalForegroundBridge = PeerSyncForegroundBridge
 
 interface PeerBidirectionalForegroundIdentity {
     lane: 'p5-source' | 'p5-target'
@@ -143,9 +127,7 @@ export interface PeerBidirectionalStatus {
     operation?: PeerBidirectionalDurableOperation
 }
 
-export interface PeerBidirectionalInvoke {
-    <T>(command: string, args?: Record<string, unknown>): Promise<T>
-}
+export type PeerBidirectionalInvoke = PeerSyncInvoke
 
 export interface PeerBidirectionalFacade {
     recoverTargetForeground?(): Promise<void>
@@ -171,56 +153,18 @@ export interface PeerBidirectionalFacade {
     acknowledge(operationId: string): Promise<void>
 }
 
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const sha256Pattern = /^[0-9a-f]{64}$/
-const maximumPairingUriLength = 8192
-
 function invalidPairingUri(): never {
     throw new Error('Invalid peer sync pairing URI')
 }
 
 export function parsePeerBidirectionalUri(value: string): PeerBidirectionalPairing {
-    if (value.length === 0 || value.length > maximumPairingUriLength) return invalidPairingUri()
-    let uri: URL
-    try {
-        uri = new URL(value)
-    } catch {
-        return invalidPairingUri()
-    }
-    if (uri.protocol !== 'risuailocal:' || uri.hostname !== 'peer-sync' || uri.pathname !== '/v1') {
-        return invalidPairingUri()
-    }
-    const expectedKeys = ['endpoint', 'session', 'manifest']
-    if (
-        [...uri.searchParams.keys()].length !== expectedKeys.length
-        || expectedKeys.some((key) => uri.searchParams.getAll(key).length !== 1)
-        || [...uri.searchParams.keys()].some((key) => !expectedKeys.includes(key))
-    ) return invalidPairingUri()
-
-    const sessionId = uri.searchParams.get('session')!
-    const manifestId = uri.searchParams.get('manifest')!
-    const fragment = uri.hash.slice(1)
-    if (
-        !uuidPattern.test(sessionId)
-        || !sha256Pattern.test(manifestId)
-        || !/^claim=[0-9a-f]{64}$/.test(fragment)
-    ) return invalidPairingUri()
-    let endpoint: string
-    try {
-        endpoint = parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!)
-    } catch {
-        try {
-            endpoint = parsePeerLanEndpoint(uri.searchParams.get('endpoint')!)
-        } catch {
-            return invalidPairingUri()
-        }
-    }
-    return {
-        endpoint: endpoint.endsWith('/') ? endpoint.slice(0, -1) : endpoint,
-        sessionId,
-        manifestId,
-        claim: fragment.slice('claim='.length),
-    }
+    return parsePeerPairingUri(value, {
+        hostname: 'peer-sync',
+        invalid: invalidPairingUri,
+        claimRule: 'hex64Fragment',
+        allowLanEndpoint: true,
+        trimTrailingSlash: true,
+    })
 }
 
 function unsupported(platform: Exclude<PeerClonePlatform, 'desktop'>): never {
@@ -256,7 +200,7 @@ export function createPeerBidirectionalFacade(options: {
     bridge?: PeerBidirectionalForegroundBridge
 }): PeerBidirectionalFacade {
     const nativeInvoke = options.invoke ?? invoke
-    type MutationFence = Awaited<ReturnType<PeerBidirectionalMutationRuntime['acquirePersistentMutationFence']>>
+    type MutationFence = Awaited<ReturnType<PeerBidirectionalMutationRuntime['acquireDestructiveReplacementFence']>>
     let pendingRefresh: {
         key: string
         result: PeerBidirectionalSyncResult
@@ -421,7 +365,7 @@ export function createPeerBidirectionalFacade(options: {
         if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
         await runtime.flushPendingData('peer-bidirectional-target-recovery')
         const token = await runtime.capturePersistentMutationToken('peer-bidirectional-target-recovery')
-        const fence = await runtime.acquirePersistentMutationFence(token)
+        const fence = await runtime.acquireDestructiveReplacementFence(token)
         try {
             await fence.refreshCommittedWorkingSet(revision)
         } finally {
@@ -490,7 +434,7 @@ export function createPeerBidirectionalFacade(options: {
         try {
             await runtime.flushPendingData(reason)
             const token = await runtime.capturePersistentMutationToken(reason)
-            fence = await runtime.acquirePersistentMutationFence(token)
+            fence = await runtime.acquireDestructiveReplacementFence(token)
             if (options.platform === 'android') {
                 if (!bridge) throw new Error('Android bidirectional foreground service is unavailable')
                 foreground = await nativeInvoke<PeerBidirectionalForegroundIdentity>(
@@ -692,7 +636,7 @@ export function createPeerBidirectionalFacade(options: {
             try {
                 await runtime.flushPendingData('peer-bidirectional-source-prepare')
                 const token = await runtime.capturePersistentMutationToken('peer-bidirectional-source-prepare')
-                fence = await runtime.acquirePersistentMutationFence(token)
+                fence = await runtime.acquireDestructiveReplacementFence(token)
                 const status = await nativeInvoke<PeerBidirectionalSourceStatus>('peer_bidirectional_prepare', {
                     expectedRevision: token.revision,
                 })

@@ -1,12 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import {
-    parsePeerCloneEndpoint,
-    parsePeerLanEndpoint,
+    parsePeerPairingUri,
     type PeerClonePlatform,
     type PeerCloneTunnelMetadata,
     type PeerCloneTunnelStatus,
 } from './peerClone'
+import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 
 export interface PeerDeltaPairing {
     endpoint: string
@@ -15,14 +15,9 @@ export interface PeerDeltaPairing {
     claim: string
 }
 
-export interface PeerDeltaInvoke {
-    <T>(command: string, args?: Record<string, unknown>): Promise<T>
-}
+export type PeerDeltaInvoke = PeerSyncInvoke
 
-export interface PeerDeltaForegroundBridge {
-    startSource(lane: string, operationId: string, generation: number): boolean
-    stopSource(lane: string, operationId: string, generation: number): boolean
-}
+export type PeerDeltaForegroundBridge = PeerSyncForegroundBridge
 
 interface PeerDeltaForegroundIdentity {
     lane: 'p4-source' | 'p4-target'
@@ -37,20 +32,7 @@ interface PeerDeltaTargetForegroundStatus {
     error?: string
 }
 
-export interface PeerDeltaMutationRuntime {
-    flushPendingData(reason: string): Promise<void>
-    capturePersistentMutationToken(reason: string): Promise<{
-        revision: number
-        mutationGeneration: number
-    }>
-    acquirePersistentMutationFence(token: {
-        revision: number
-        mutationGeneration: number
-    }): Promise<{
-        refreshCommittedWorkingSet(revision: number): Promise<void>
-        release(): void
-    }>
-}
+export type PeerDeltaMutationRuntime = PeerSyncMutationRuntime
 
 export interface PeerDeltaCapabilities {
     desktop: boolean
@@ -97,54 +79,18 @@ type CommittedPeerDeltaPullResult = Extract<
     { kind: 'noChanges' | 'updated' }
 >
 
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const sha256Pattern = /^[0-9a-f]{64}$/
-const maximumPairingUriLength = 8192
-
 function invalidPairingUri(): never {
     throw new Error('Invalid peer delta pairing URI')
 }
 
 export function parsePeerDeltaUri(value: string): PeerDeltaPairing {
-    if (value.length === 0 || value.length > maximumPairingUriLength) return invalidPairingUri()
-    let uri: URL
-    try {
-        uri = new URL(value)
-    } catch {
-        return invalidPairingUri()
-    }
-    if (uri.protocol !== 'risuailocal:' || uri.hostname !== 'peer-delta' || uri.pathname !== '/v1') {
-        return invalidPairingUri()
-    }
-    const expectedKeys = ['endpoint', 'session', 'manifest']
-    if (
-        [...uri.searchParams.keys()].length !== expectedKeys.length
-        || expectedKeys.some((key) => uri.searchParams.getAll(key).length !== 1)
-        || [...uri.searchParams.keys()].some((key) => !expectedKeys.includes(key))
-    ) return invalidPairingUri()
-
-    const sessionId = uri.searchParams.get('session')!
-    const manifestId = uri.searchParams.get('manifest')!
-    const fragment = uri.hash.slice(1)
-    if (!uuidPattern.test(sessionId)
-        || !sha256Pattern.test(manifestId)
-        || !/^claim=[0-9a-f]{64}$/.test(fragment)) return invalidPairingUri()
-    let endpoint: string
-    try {
-        endpoint = parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!)
-    } catch {
-        try {
-            endpoint = parsePeerLanEndpoint(uri.searchParams.get('endpoint')!)
-        } catch {
-            return invalidPairingUri()
-        }
-    }
-    return {
-        endpoint,
-        sessionId,
-        manifestId,
-        claim: fragment.slice('claim='.length),
-    }
+    return parsePeerPairingUri(value, {
+        hostname: 'peer-delta',
+        invalid: invalidPairingUri,
+        claimRule: 'hex64Fragment',
+        allowLanEndpoint: true,
+        trimTrailingSlash: false,
+    })
 }
 
 function unsupported(platform: Exclude<PeerClonePlatform, 'desktop'>): never {
@@ -168,7 +114,7 @@ export function createPeerDeltaFacade(options: {
     let pendingRefresh: {
         pairing: PeerDeltaPairing
         result: CommittedPeerDeltaPullResult
-        fence: Awaited<ReturnType<PeerDeltaMutationRuntime['acquirePersistentMutationFence']>>
+        fence: Awaited<ReturnType<PeerDeltaMutationRuntime['acquireDestructiveReplacementFence']>>
         foreground?: PeerDeltaForegroundIdentity
     } | undefined
     const requireDesktop = (): void => {
@@ -262,7 +208,7 @@ export function createPeerDeltaFacade(options: {
             if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
             await runtime.flushPendingData('peer-delta-target-recovery')
             const token = await runtime.capturePersistentMutationToken('peer-delta-target-recovery')
-            const fence = await runtime.acquirePersistentMutationFence(token)
+            const fence = await runtime.acquireDestructiveReplacementFence(token)
             try {
                 await fence.refreshCommittedWorkingSet(pending.result.revision)
             } finally {
@@ -279,6 +225,9 @@ export function createPeerDeltaFacade(options: {
         },
         async prepare(): Promise<PeerDeltaSourceStatus> {
             requireNative()
+            const runtime = options.runtime
+            if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
+            await runtime.flushPendingData('peer-delta-source-prepare')
             return nativeInvoke('peer_delta_prepare')
         },
         async start(sessionId: string): Promise<PeerDeltaSourceStatus> {
@@ -348,8 +297,11 @@ export function createPeerDeltaFacade(options: {
             requireNative()
             if (options.platform === 'desktop') return nativeInvoke('peer_delta_stop', { sessionId })
             const foreground = await nativeInvoke<PeerDeltaForegroundIdentity | null>('peer_delta_stop', { sessionId })
-            if (foreground && bridge) {
-                bridge.stopSource(foreground.lane, foreground.operationId, foreground.generation)
+            if (foreground) {
+                if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
+                if (!bridge.stopSource(foreground.lane, foreground.operationId, foreground.generation)) {
+                    throw new Error('Android peer delta source foreground service could not stop')
+                }
             }
         },
         async revoke(sessionId: string, deviceId: string): Promise<void> {
@@ -375,7 +327,7 @@ export function createPeerDeltaFacade(options: {
             await recoverTargetForeground()
             await runtime.flushPendingData('peer-delta-pull')
             const token = await runtime.capturePersistentMutationToken('peer-delta-pull')
-            const fence = await runtime.acquirePersistentMutationFence(token)
+            const fence = await runtime.acquireDestructiveReplacementFence(token)
             let foreground: PeerDeltaForegroundIdentity | undefined
             let fenceReleased = false
             try {
@@ -432,13 +384,6 @@ export function createPeerDeltaFacade(options: {
                 if (!fenceReleased && pendingRefresh?.fence !== fence) fence.release()
             }
         },
-    }
-    if (options.platform === 'android') {
-        const androidFacade = facade as Partial<typeof facade>
-        delete androidFacade.startQuickTunnel
-        delete androidFacade.startNamedTunnel
-        delete androidFacade.tunnelStatus
-        delete androidFacade.stopTunnel
     }
     return facade
 }

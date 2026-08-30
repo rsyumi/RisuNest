@@ -10,39 +10,32 @@
         flushPendingData,
     } from 'src/ts/storage/persistentDataRuntime.svelte'
     import {
-        createAndroidPeerCloneFacade,
+        getAndroidPeerCloneFacade,
         type AndroidPeerCloneCapabilities,
         type AndroidPeerCloneState,
     } from 'src/ts/storage/sync/peerCloneAndroid'
     import { createAndroidPeerCloneSourceFacade, type AndroidPeerCloneSourceCapabilities } from 'src/ts/storage/sync/peerCloneAndroidSource'
     import { createAndroidPeerCloneSourceController } from 'src/ts/storage/sync/peerCloneAndroidSourceController'
     import type { PeerCloneSourceStatus } from 'src/ts/storage/sync/peerClone'
-    import { createPeerDeltaFacade, parsePeerDeltaUri, type PeerDeltaCapabilities, type PeerDeltaPullResult, type PeerDeltaSourceStatus } from 'src/ts/storage/sync/peerDelta'
-    import { createPeerDeltaController } from 'src/ts/storage/sync/peerDeltaController'
+    import { parsePeerDeltaUri, type PeerDeltaCapabilities, type PeerDeltaPullResult, type PeerDeltaSourceStatus } from 'src/ts/storage/sync/peerDelta'
+    import { getAndroidPeerDeltaController } from 'src/ts/storage/sync/peerDeltaController'
     import {
         consumePendingPeerCloneUri,
         subscribePeerCloneUri,
     } from 'src/ts/storage/sync/peerCloneDeepLink'
     import Button from 'src/lib/UI/GUI/Button.svelte'
 
-    const facade = createAndroidPeerCloneFacade({
-        runtime: {
-            capturePersistentMutationToken,
-            acquireDestructiveReplacementFence,
-            afterRefresh: loadPluginsAfterAuthoritativeRestore,
-        },
+    const facade = getAndroidPeerCloneFacade({
+        capturePersistentMutationToken,
+        acquireDestructiveReplacementFence,
+        afterRefresh: loadPluginsAfterAuthoritativeRestore,
     })
     const sourceFacade = createAndroidPeerCloneSourceFacade({ flushPendingData })
     const sourceController = createAndroidPeerCloneSourceController(sourceFacade)
-    const deltaController = createPeerDeltaController({
-        facade: createPeerDeltaFacade({
-            platform: 'android',
-            runtime: {
-                flushPendingData,
-                capturePersistentMutationToken,
-                acquirePersistentMutationFence: acquireDestructiveReplacementFence,
-            },
-        }),
+    const deltaController = getAndroidPeerDeltaController({
+        flushPendingData,
+        capturePersistentMutationToken,
+        acquireDestructiveReplacementFence,
     })
     let capabilities = $state<AndroidPeerCloneCapabilities>()
     let sourceCapabilities = $state<AndroidPeerCloneSourceCapabilities>()
@@ -56,6 +49,7 @@
     let pairingInput = $state('')
     let busy = $state(false)
     let error = $state('')
+    let deltaError = $state('')
     let progressTimer: ReturnType<typeof setInterval> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
 
@@ -87,31 +81,45 @@
         deltaSourceStatus = snapshot.sourceStatus
         deltaPairingUri = snapshot.sourcePairingUri
         deltaResult = snapshot.pullResult
-        if (snapshot.error) error = snapshot.error
+        deltaError = snapshot.error
+    }
+
+    async function withDeltaBusy(operation: () => Promise<void>): Promise<void> {
+        if (busy) return
+        busy = true
+        deltaError = ''
+        try {
+            await operation()
+        } catch (cause) {
+            deltaError = cause instanceof Error ? cause.message : String(cause)
+        } finally {
+            busy = false
+            refreshDelta()
+        }
     }
 
     async function prepareDelta(): Promise<void> {
-        await withBusy(async () => { await deltaController.prepare(); refreshDelta() })
+        await withDeltaBusy(async () => { await deltaController.prepare() })
     }
 
     async function startDelta(): Promise<void> {
         if (!deltaSourceStatus.sessionId) return
-        await withBusy(async () => { await deltaController.start(deltaSourceStatus.sessionId!); refreshDelta() })
+        await withDeltaBusy(async () => { await deltaController.start(deltaSourceStatus.sessionId!) })
     }
 
     async function stopDelta(): Promise<void> {
         if (!deltaSourceStatus.sessionId) return
-        await withBusy(async () => { await deltaController.stop(deltaSourceStatus.sessionId!); refreshDelta() })
+        await withDeltaBusy(async () => { await deltaController.stop(deltaSourceStatus.sessionId!) })
     }
 
     async function pullDelta(): Promise<void> {
         try {
             parsePeerDeltaUri(deltaPairingInput)
         } catch {
-            error = language.peerDelta.invalidLink
+            deltaError = language.peerDelta.invalidLink
             return
         }
-        await withBusy(async () => { await deltaController.pull(deltaPairingInput); refreshDelta() })
+        await withDeltaBusy(async () => { await deltaController.pull(deltaPairingInput) })
     }
 
     async function prepareSource(): Promise<void> {
@@ -392,4 +400,8 @@
             <p class="mt-2 text-sm text-draculared">{deltaResult.reason === 'localAndRemoteChanged' ? language.peerDelta.conflictLocalRemote : language.peerDelta.conflictStaleRevision}</p>
         {/if}
     </div>
+
+    {#if deltaError}
+        <p class="mt-3 text-sm text-draculared">{deltaError}</p>
+    {/if}
 </section>

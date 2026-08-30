@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
+import type { PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
+
 export type PeerClonePlatform = 'desktop' | 'web' | 'android'
 
 export interface PeerClonePairing {
@@ -9,9 +11,7 @@ export interface PeerClonePairing {
     claim: string
 }
 
-export interface PeerCloneInvoke {
-    <T>(command: string, args?: Record<string, unknown>): Promise<T>
-}
+export type PeerCloneInvoke = PeerSyncInvoke
 
 export interface PeerCloneFacadeOptions {
     platform: PeerClonePlatform
@@ -19,20 +19,7 @@ export interface PeerCloneFacadeOptions {
     runtime?: PeerCloneReplacementRuntime
 }
 
-export interface PeerCloneReplacementRuntime {
-    flushPendingData(reason: string): Promise<void>
-    capturePersistentMutationToken(reason: string): Promise<{
-        revision: number
-        mutationGeneration: number
-    }>
-    acquireDestructiveReplacementFence(token: {
-        revision: number
-        mutationGeneration: number
-    }): Promise<{
-        refreshCommittedWorkingSet(revision: number): Promise<void>
-        release(): void
-    }>
-}
+export type PeerCloneReplacementRuntime = PeerSyncMutationRuntime
 
 export type PeerCloneCapability =
     | { kind: 'supported'; platform: 'desktop' }
@@ -268,44 +255,81 @@ export function parsePeerLanEndpoint(value: string): string {
     return endpoint.toString()
 }
 
-export function parsePeerCloneUri(value: string): PeerClonePairing {
-    if (value.length === 0 || value.length > maximumPairingUriLength) return invalidPairingUri()
+export interface PeerPairingUriRules {
+    /** Lane hostname in `risuailocal://<hostname>/v1`. */
+    hostname: string
+    /** Lane-specific rejection, e.g. `throw new Error('Invalid peer delta pairing URI')`. */
+    invalid(): never
+    /**
+     * `hex64Fragment` requires a literal 64-hex claim in the fragment (delta, bidirectional);
+     * `encodedHex64` accepts a percent-encoded fragment that decodes to 64 hex (clone).
+     */
+    claimRule: 'hex64Fragment' | 'encodedHex64'
+    /** Whether loopback LAN endpoints are accepted as a fallback (delta, bidirectional). */
+    allowLanEndpoint: boolean
+    /** Whether the canonical endpoint's trailing slash is stripped (bidirectional wire format). */
+    trimTrailingSlash: boolean
+}
+
+export function parsePeerPairingUri(value: string, rules: PeerPairingUriRules): PeerClonePairing {
+    if (value.length === 0 || value.length > maximumPairingUriLength) return rules.invalid()
     let uri: URL
     try {
         uri = new URL(value)
     } catch {
-        return invalidPairingUri()
+        return rules.invalid()
     }
-    if (uri.protocol !== 'risuailocal:' || uri.hostname !== 'peer-clone' || uri.pathname !== '/v1') {
-        return invalidPairingUri()
+    if (uri.protocol !== 'risuailocal:' || uri.hostname !== rules.hostname || uri.pathname !== '/v1') {
+        return rules.invalid()
     }
     const expectedKeys = ['endpoint', 'session', 'manifest']
     if (
         [...uri.searchParams.keys()].length !== expectedKeys.length
         || expectedKeys.some((key) => uri.searchParams.getAll(key).length !== 1)
         || [...uri.searchParams.keys()].some((key) => !expectedKeys.includes(key))
-    ) return invalidPairingUri()
+    ) return rules.invalid()
 
     const sessionId = uri.searchParams.get('session')!
     const manifestId = uri.searchParams.get('manifest')!
-    const endpointValue = uri.searchParams.get('endpoint')!
     const fragment = uri.hash.slice(1)
-    if (!uuidPattern.test(sessionId) || !sha256Pattern.test(manifestId) || !/^claim=[^&=\s]+$/.test(fragment)) {
-        return invalidPairingUri()
-    }
+    if (!uuidPattern.test(sessionId) || !sha256Pattern.test(manifestId)) return rules.invalid()
     let claim: string
+    if (rules.claimRule === 'encodedHex64') {
+        if (!/^claim=[^&=\s]+$/.test(fragment)) return rules.invalid()
+        try {
+            claim = decodeURIComponent(fragment.slice('claim='.length))
+        } catch {
+            return rules.invalid()
+        }
+        if (claim.length > maximumClaimLength || !claimPattern.test(claim)) return rules.invalid()
+    } else {
+        if (!/^claim=[0-9a-f]{64}$/.test(fragment)) return rules.invalid()
+        claim = fragment.slice('claim='.length)
+    }
+    const endpointValue = uri.searchParams.get('endpoint')!
+    let endpoint: string
     try {
-        claim = decodeURIComponent(fragment.slice('claim='.length))
+        endpoint = parsePeerCloneEndpoint(endpointValue)
     } catch {
-        return invalidPairingUri()
+        if (!rules.allowLanEndpoint) return rules.invalid()
+        try {
+            endpoint = parsePeerLanEndpoint(endpointValue)
+        } catch {
+            return rules.invalid()
+        }
     }
-    if (claim.length > maximumClaimLength || !claimPattern.test(claim)) return invalidPairingUri()
-    return {
-        endpoint: parsePeerCloneEndpoint(endpointValue),
-        sessionId,
-        manifestId,
-        claim,
-    }
+    if (rules.trimTrailingSlash && endpoint.endsWith('/')) endpoint = endpoint.slice(0, -1)
+    return { endpoint, sessionId, manifestId, claim }
+}
+
+export function parsePeerCloneUri(value: string): PeerClonePairing {
+    return parsePeerPairingUri(value, {
+        hostname: 'peer-clone',
+        invalid: invalidPairingUri,
+        claimRule: 'encodedHex64',
+        allowLanEndpoint: false,
+        trimTrailingSlash: false,
+    })
 }
 
 export function pairingUriForQr(pairingUri: string): string {
