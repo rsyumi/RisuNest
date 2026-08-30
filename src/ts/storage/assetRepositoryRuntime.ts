@@ -68,6 +68,7 @@ export type RuntimeAssetRepositoryDispatcher = BlobStore &
     }
 
 export interface StorageOnlyMutationCoordinator {
+    getStorageAuthorityEpoch(): number
     runStorageOnlyMutation(
         operation: (expectedRevision: number) => Promise<number>,
     ): Promise<void>
@@ -98,7 +99,7 @@ export function createCoordinatorOwnedAssetBlobStore(
     const mutate = async <T>(
         key: string,
         operation: () => Promise<T>,
-        abortBeforeActivation?: () => Promise<void>,
+        expectedAuthorityEpoch?: number,
     ): Promise<T> => {
         let result!: T
         let operationFailure: { error: unknown } | null = null
@@ -106,8 +107,15 @@ export function createCoordinatorOwnedAssetBlobStore(
             authority.gate.runKeyedWrite(key, async () => {
                 const before = await authority.rawStore.readRoot()
                 if (before.revision !== expectedRevision) {
-                    await abortBeforeActivation?.()
                     throw new RevisionConflictError(expectedRevision, before.revision)
+                }
+                if (
+                    expectedAuthorityEpoch !== undefined
+                    && runtime.getStorageAuthorityEpoch() !== expectedAuthorityEpoch
+                ) {
+                    throw new Error(
+                        'Asset storage authority changed before staged write activation',
+                    )
                 }
                 try {
                     result = await operation()
@@ -132,14 +140,28 @@ export function createCoordinatorOwnedAssetBlobStore(
         prepare: () => ReturnType<RuntimeAssetRepositoryDispatcher['stagePut']>,
     ): Promise<T> => {
         const invocation = reserveInvocation(key)
+        const expectedAuthorityEpoch = runtime.getStorageAuthorityEpoch()
+        let staged: StagedRuntimeAssetWrite | undefined
         try {
-            const staged = await prepare()
+            staged = await prepare()
             await invocation.previous
-            return await mutate(
-                key,
-                () => store.activateStagedWrite(staged) as Promise<T>,
-                () => store.abortStagedWrite(staged),
-            )
+            try {
+                return await mutate(
+                    key,
+                    () => store.activateStagedWrite(staged!) as Promise<T>,
+                    expectedAuthorityEpoch,
+                )
+            } catch (error) {
+                try {
+                    await store.abortStagedWrite(staged)
+                } catch (abortError) {
+                    throw new AggregateError(
+                        [error, abortError],
+                        `Staged asset write and cleanup failed for ${key}`,
+                    )
+                }
+                throw error
+            }
         } finally {
             invocation.release()
         }
@@ -226,6 +248,8 @@ export function createRuntimeAssetRepositoryDispatcher(input: {
     v2Capability: boolean
 }): RuntimeAssetRepositoryDispatcher {
     const selected = () => selectRuntimeAssetRepository(input)
+    const activationStarted = new WeakSet<StagedRuntimeAssetWrite>()
+    const abortStarted = new WeakSet<StagedRuntimeAssetWrite>()
     const stage = async (
         activateLegacy: (store: BlobStore) => Promise<BlobMetadata>,
         prepareV2: (store: CompleteAssetRepositoryBlobStore) => Promise<PreparedCompleteAssetWrite>,
@@ -269,7 +293,7 @@ export function createRuntimeAssetRepositoryDispatcher(input: {
                 )
                 if (staged.prepared) {
                     try {
-                        await staged.prepared.abort()
+                        await this.abortStagedWrite(staged)
                     } catch (abortError) {
                         throw new AggregateError(
                             [authorityError, abortError],
@@ -279,11 +303,14 @@ export function createRuntimeAssetRepositoryDispatcher(input: {
                 }
                 throw authorityError
             }
+            activationStarted.add(staged)
             if (staged.prepared) return staged.prepared.activate()
             if (staged.activateLegacy) return staged.activateLegacy()
             throw new Error('Staged asset write has no activation operation')
         },
         async abortStagedWrite(staged) {
+            if (activationStarted.has(staged) || abortStarted.has(staged)) return
+            abortStarted.add(staged)
             await staged.prepared?.abort()
         },
         async put(key, data, metadata) {

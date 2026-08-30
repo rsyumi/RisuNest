@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+    createCoordinatorOwnedAssetBlobStore,
     createRuntimeAssetRepositoryDispatcher,
     selectRuntimeAssetRepository,
 } from './assetRepositoryRuntime'
+import { PersistentMutationFencedError } from './saveCoordinator'
 import { createGatedBlobStore } from './platformBlobStore'
 import { createInRealmStorageLockManager, createStorageMutationGate } from './storageMutationGate'
 
@@ -209,5 +211,169 @@ describe('selectRuntimeAssetRepository', () => {
         expect(abort).toHaveBeenCalledOnce()
         expect(activate).not.toHaveBeenCalled()
         expect(legacy.put).not.toHaveBeenCalled()
+    })
+})
+
+describe('coordinated staged asset activation', () => {
+    const metadata = {
+        kind: 'asset' as const,
+        mime: 'application/octet-stream',
+        name: 'item.bin',
+        ext: 'bin',
+    }
+
+    function harness() {
+        let revision = 1
+        let authorityEpoch = 1
+        let failure: 'admission' | 'fence' | 'gate' | 'root' | 'authority' | null = null
+        let prepareHook: (() => Promise<void>) | null = null
+        let resolvePreparationStarted!: () => void
+        const preparationStarted = new Promise<void>((resolve) => {
+            resolvePreparationStarted = resolve
+        })
+        let authorityReads = 0
+        const handles: Array<{
+            abort: ReturnType<typeof vi.fn>
+            activate: ReturnType<typeof vi.fn>
+        }> = []
+        const legacy = facade()
+        const v2 = Object.assign(facade(), {
+            prepareOwnedPut: vi.fn(async () => {
+                resolvePreparationStarted()
+                await prepareHook?.()
+                const handle = {
+                    abort: vi.fn(async () => undefined),
+                    activate: vi.fn(async () => {
+                        revision++
+                        return {
+                            ...metadata,
+                            key: 'assets/item.bin',
+                            size: 1,
+                        }
+                    }),
+                }
+                handles.push(handle)
+                return handle
+            }),
+            prepareOwnedNewInlayImage: vi.fn(),
+        })
+        const store = {
+            readAssetRepositoryAuthority: vi.fn(async () => {
+                authorityReads++
+                if (failure === 'authority' && authorityReads === 2) {
+                    failure = null
+                    throw new Error('authority read failed')
+                }
+                return {
+                    revision,
+                    value: {
+                        format: 'v2' as const,
+                        migrationId: 'same-authority',
+                        compatibilityHash: 'ab'.repeat(32),
+                    },
+                }
+            }),
+        }
+        const dispatcher = createRuntimeAssetRepositoryDispatcher({
+            store: store as never,
+            legacy,
+            v2,
+            v2Capability: true,
+        })
+        const runtime = {
+            getStorageAuthorityEpoch: () => authorityEpoch,
+            runStorageOnlyMutation(operation: (expectedRevision: number) => Promise<number>) {
+                if (failure === 'admission' || failure === 'fence') {
+                    const current = failure
+                    failure = null
+                    throw current === 'fence'
+                        ? new PersistentMutationFencedError()
+                        : new Error('coordinator admission failed')
+                }
+                return operation(revision).then((nextRevision) => {
+                    revision = nextRevision
+                })
+            },
+        }
+        const authority = {
+            rawStore: {
+                async readRoot() {
+                    if (failure === 'root') {
+                        failure = null
+                        throw new Error('root read failed')
+                    }
+                    return { revision, value: {} }
+                },
+            },
+            gate: {
+                async runKeyedWrite(_key: string, operation: () => Promise<unknown>) {
+                    if (failure === 'gate') {
+                        failure = null
+                        throw new Error('keyed gate failed')
+                    }
+                    return operation()
+                },
+            },
+        }
+        return {
+            handles,
+            preparationStarted,
+            runtime,
+            setFailure(value: typeof failure) { failure = value },
+            setPrepareHook(value: (() => Promise<void>) | null) { prepareHook = value },
+            bumpAuthorityEpoch() { authorityEpoch++ },
+            blob: createCoordinatorOwnedAssetBlobStore(
+                dispatcher,
+                authority as never,
+                runtime,
+            ),
+        }
+    }
+
+    it.each([
+        ['synchronous coordinator admission', 'admission'],
+        ['destructive replacement fence', 'fence'],
+        ['keyed gate admission', 'gate'],
+        ['raw root precheck', 'root'],
+        ['current authority read', 'authority'],
+    ] as const)('aborts exactly once after %s failure and settles the key tail', async (_name, point) => {
+        const test = harness()
+        test.setFailure(point)
+
+        await expect(test.blob.put(
+            'assets/item.bin',
+            Uint8Array.of(1),
+            metadata,
+        )).rejects.toThrow()
+
+        expect(test.handles[0].abort).toHaveBeenCalledOnce()
+        expect(test.handles[0].activate).not.toHaveBeenCalled()
+        await expect(test.blob.put(
+            'assets/item.bin',
+            Uint8Array.of(2),
+            metadata,
+        )).resolves.toEqual(expect.objectContaining({ key: 'assets/item.bin' }))
+        expect(test.handles[1].activate).toHaveBeenCalledOnce()
+    })
+
+    it('aborts without alias resurrection when replacement preserves authority value', async () => {
+        const test = harness()
+        let releasePrepare!: () => void
+        const prepareBlocked = new Promise<void>((resolve) => { releasePrepare = resolve })
+        test.setPrepareHook(async () => prepareBlocked)
+
+        const write = test.blob.put(
+            'assets/item.bin',
+            Uint8Array.of(3),
+            metadata,
+        )
+        await test.preparationStarted
+        test.bumpAuthorityEpoch()
+        releasePrepare()
+
+        await expect(write).rejects.toThrow('authority changed')
+
+        expect(test.handles[0].abort).toHaveBeenCalledOnce()
+        expect(test.handles[0].activate).not.toHaveBeenCalled()
     })
 })

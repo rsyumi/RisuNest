@@ -757,6 +757,7 @@ describe('SaveCoordinator', () => {
         })
         coordinator.initialize(4, database)
         const generation = coordinator.mutationGeneration
+        const authorityEpoch = coordinator.storageAuthorityEpoch
 
         await coordinator.runStorageOnlyMutation(async (expectedRevision) => {
             expect(expectedRevision).toBe(4)
@@ -765,6 +766,7 @@ describe('SaveCoordinator', () => {
 
         expect(coordinator.revision).toBe(5)
         expect(coordinator.mutationGeneration).toBe(generation)
+        expect(coordinator.storageAuthorityEpoch).toBe(authorityEpoch)
         expect(coordinator.pendingBytes).toBe(0)
         expect(onStorageOnlyRevision).toHaveBeenCalledWith(5)
         expect(onLocalRevision).toHaveBeenCalledWith(5)
@@ -1340,6 +1342,7 @@ describe('SaveCoordinator', () => {
             isIncompleteWorkingSet: () => true,
         })
         coordinator.initialize(1)
+        const initializedAuthorityEpoch = coordinator.storageAuthorityEpoch
 
         await coordinator.replacePersistentDatabase(candidate, 'explicit-import', {
             authoritative: true,
@@ -1348,6 +1351,10 @@ describe('SaveCoordinator', () => {
         expect(store.replaceFromDatabase).toHaveBeenCalledWith(candidate, 1)
         expect(replaceDatabase).toHaveBeenCalledWith(candidate)
         expect(coordinator.revision).toBe(2)
+        expect(coordinator.storageAuthorityEpoch).toBe(initializedAuthorityEpoch + 1)
+
+        coordinator.initialize(2, candidate)
+        expect(coordinator.storageAuthorityEpoch).toBe(initializedAuthorityEpoch + 2)
     })
 
     it('rejects a replacement whose expected revision is already stale', async () => {

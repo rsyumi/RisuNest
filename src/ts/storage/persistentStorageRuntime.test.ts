@@ -176,6 +176,7 @@ vi.mock('../process/coldstorage.svelte', () => ({
 vi.mock('./persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => ({
         flushPendingData: mocks.flushPendingData,
+        getStorageAuthorityEpoch: () => 1,
         runStorageOnlyMutation: mocks.runStorageOnlyMutation,
     }),
 }))

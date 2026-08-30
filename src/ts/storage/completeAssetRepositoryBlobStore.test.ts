@@ -314,6 +314,44 @@ describe('complete AssetRepository BlobStore facade', () => {
         expect(release).toHaveBeenCalledExactlyOnceWith('aborted')
     })
 
+    it('retains durable ownership when seal commits natively but its IPC response fails', async () => {
+        const sealFailure = new Error('seal response lost after durable mutation')
+        const release = vi.fn(async () => undefined)
+        let durableSealed = false
+        const writeSessions: DurableAssetWriteSessionFactory = {
+            begin: vi.fn(async () => ({
+                prepare: vi.fn(async (data) => ({
+                    contentHash: assetHash,
+                    byteSize: data.byteLength,
+                    physicalKey: `assets-v2/objects/aa/${'a'.repeat(62)}`,
+                    deduplicated: false,
+                })),
+                seal: vi.fn(async () => {
+                    durableSealed = true
+                    throw sealFailure
+                }),
+                release,
+            })),
+        }
+        const { facade, store } = createFacade({ writeSessions })
+        const prepared = await facade.prepareOwnedPut(
+            'assets/ambiguous-seal.bin',
+            Uint8Array.of(5),
+            {
+                kind: 'asset',
+                mime: 'application/octet-stream',
+                name: 'ambiguous-seal.bin',
+                ext: 'bin',
+            },
+        )
+
+        await expect(prepared.activate()).rejects.toBe(sealFailure)
+
+        expect(durableSealed).toBe(true)
+        expect(release).not.toHaveBeenCalled()
+        expect(store.commitAssetAlias).not.toHaveBeenCalled()
+    })
+
     it('aborts an unsealed direct write but retains a sealed session on ambiguous activation failure', async () => {
         const preSealRelease = vi.fn(async () => undefined)
         const preSealFailure = new Error('prepare failed')

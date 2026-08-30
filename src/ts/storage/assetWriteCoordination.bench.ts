@@ -31,6 +31,7 @@ function createHarness() {
     })
     const queueOccupancies: number[] = []
     const runtime = {
+        getStorageAuthorityEpoch: () => 1,
         runStorageOnlyMutation(operation: (expectedRevision: number) => Promise<number>) {
             const run = coordinatorTail.then(async () => {
                 const startedAt = performance.now()

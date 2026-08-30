@@ -480,36 +480,19 @@ export function createCompleteTypedAssetRepository(
                         throw new Error(`Prepared asset write is already ${state}`)
                     }
                     state = 'activating'
-                    let sealed = false
-                    try {
-                        await session?.seal()
-                        sealed = session !== undefined
-                        for (;;) {
-                            const { revision } = await options.store.readRoot()
-                            try {
-                                await options.store.commitAssetAlias(alias, revision)
-                                break
-                            } catch (error) {
-                                if (!(error instanceof RevisionConflictError)) throw error
-                            }
+                    await session?.seal()
+                    for (;;) {
+                        const { revision } = await options.store.readRoot()
+                        try {
+                            await options.store.commitAssetAlias(alias, revision)
+                            break
+                        } catch (error) {
+                            if (!(error instanceof RevisionConflictError)) throw error
                         }
-                        await session?.release('committed')
-                        state = 'activated'
-                        return aliasBlobMetadata(alias)
-                    } catch (error) {
-                        if (session && !sealed) {
-                            try {
-                                await session.release('aborted')
-                                state = 'aborted'
-                            } catch (releaseError) {
-                                throw new AggregateError(
-                                    [error, releaseError],
-                                    `Asset write and durable CAS session cleanup failed for ${identity.key}`,
-                                )
-                            }
-                        }
-                        throw error
                     }
+                    await session?.release('committed')
+                    state = 'activated'
+                    return aliasBlobMetadata(alias)
                 },
                 async abort() {
                     if (state !== 'prepared') {

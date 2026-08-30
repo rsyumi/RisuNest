@@ -829,6 +829,7 @@ function defaultClock(): SaveCoordinatorClock {
 export class SaveCoordinator {
     private readonly clock: SaveCoordinatorClock
     private currentRevision: DataRevision | null = null
+    private authorityEpoch = 0
     private rootBaseline: string | null = null
     private pluginStorageBaseline: string | null = null
     private presetsBaseline: string | null = null
@@ -875,6 +876,10 @@ export class SaveCoordinator {
     get revision(): DataRevision {
         if (this.currentRevision === null) throw new Error('Save coordinator is not initialized')
         return this.currentRevision
+    }
+
+    get storageAuthorityEpoch(): number {
+        return this.authorityEpoch
     }
 
     get pendingBytes(): number {
@@ -925,6 +930,7 @@ export class SaveCoordinator {
         this.cancelDebounce()
         this.cancelOfficialPublishRetry()
         const captured = database ? this.captureDatabase(database) : this.capture()
+        this.authorityEpoch++
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
         this.pluginStorageBaseline = captured.pluginStorageCanonical
@@ -2600,6 +2606,7 @@ export class SaveCoordinator {
             candidate,
             options.expectedRevision ?? this.revision,
         )
+        this.authorityEpoch++
         const live = this.capture()
         const stalePublication = options.publishOfficial ? null : this.pendingPublication
         if (!options.publishOfficial) {

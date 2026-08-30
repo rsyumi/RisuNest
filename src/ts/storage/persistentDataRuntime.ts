@@ -267,6 +267,7 @@ export interface PersistentDataRuntimeDependencies {
 export interface PersistentDataRuntime {
     readonly store: PersistentDataStore
     readonly revision: DataRevision
+    getStorageAuthorityEpoch(): number
     initializeActiveWorkingSet(database: Database): Promise<void>
     refreshActiveWorkingSetFromStore(revision: DataRevision): Promise<void>
     runStorageOnlyMutation(
@@ -614,6 +615,7 @@ export function createPersistentDataRuntime(
         get revision() {
             return coordinator.revision
         },
+        getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
         initializeActiveWorkingSet: (database) => workingSet.initializeActiveWorkingSet(database),
         refreshActiveWorkingSetFromStore: (revision) =>
             refreshCommittedWorkingSet(revision),
