@@ -1,4 +1,5 @@
 import type { Database } from './database.svelte'
+import type { DurableAssetWriteSession, DurableAssetWriteSessionFactory } from './assetRepository'
 import { inferBlobMime, type BlobMetadata, type BlobStore } from './blobStore'
 import { encodeOwnerManifest, ownerManifestIdentity, type AssetTuple } from './ownerManifestCodec'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
@@ -43,6 +44,7 @@ function requireAssetTuple(value: unknown): AssetTuple {
 
 async function prepareOwnerHead(
     cas: ImmutablePayloadCas,
+    session: DurableAssetWriteSession | undefined,
     aliases: Map<string, AssetAlias>,
     owner: AssetOwnerLocator,
     parent: object,
@@ -80,7 +82,9 @@ async function prepareOwnerHead(
         }
     })
     const bytes = encodeOwnerManifest(entries)
-    const prepared = await cas.prepare(bytes)
+    const prepared = session
+        ? await session.prepare(bytes, 'owner-manifest')
+        : await cas.prepare(bytes)
     const manifestHash = await ownerManifestIdentity(bytes)
     if (prepared.contentHash !== manifestHash || prepared.byteSize !== bytes.byteLength) {
         throw new Error('Owner manifest CAS identity mismatch')
@@ -91,12 +95,14 @@ async function prepareOwnerHead(
 async function prepareOwnerHeads(
     database: Database,
     cas: ImmutablePayloadCas,
+    session: DurableAssetWriteSession | undefined,
     aliases: Map<string, AssetAlias>,
 ): Promise<AssetOwnerHead[]> {
     const heads: AssetOwnerHead[] = []
     for (const [index, module] of (database.modules ?? []).entries()) {
         heads.push(await prepareOwnerHead(
             cas,
+            session,
             aliases,
             { kind: 'root-module-assets', index },
             module,
@@ -107,6 +113,7 @@ async function prepareOwnerHeads(
         if (!persona.embeddedModule) continue
         heads.push(await prepareOwnerHead(
             cas,
+            session,
             aliases,
             { kind: 'persona-embedded-module-assets', index },
             persona.embeddedModule,
@@ -116,6 +123,7 @@ async function prepareOwnerHeads(
     for (const character of database.characters) {
         heads.push(await prepareOwnerHead(
             cas,
+            session,
             aliases,
             { kind: 'character-additional-assets', characterId: character.chaId },
             character,
@@ -129,6 +137,7 @@ export async function migrateLegacyAssetRepository(input: {
     store: PersistentDataStore
     legacy: BlobStore
     cas: ImmutablePayloadCas
+    writeSessions?: DurableAssetWriteSessionFactory
     migrationId?: string
 }): Promise<AssetRepositoryMigrationResult> {
     const authority = await input.store.readAssetRepositoryAuthority()
@@ -137,15 +146,20 @@ export async function migrateLegacyAssetRepository(input: {
     }
     const sourceRevision = authority.revision
     const lease = await input.store.acquireRevision(sourceRevision)
+    let session: DurableAssetWriteSession | undefined
+    let committed = false
     try {
         const database = await input.store.materializeDatabase(sourceRevision)
+        session = await input.writeSessions?.begin()
         const aliases = new Map<string, AssetAlias>()
         for (const metadata of await input.legacy.list()) {
             const data = await input.legacy.read(metadata.key)
             if (data === null) {
                 throw new Error(`Legacy asset disappeared during migration: ${metadata.key}`)
             }
-            const prepared = await input.cas.prepare(data)
+            const prepared = session
+                ? await session.prepare(data)
+                : await input.cas.prepare(data)
             if (prepared.byteSize !== data.byteLength) {
                 throw new Error(`CAS size mismatch during migration: ${metadata.key}`)
             }
@@ -156,7 +170,7 @@ export async function migrateLegacyAssetRepository(input: {
             }
             aliases.set(identity, alias)
         }
-        const ownerHeads = await prepareOwnerHeads(database, input.cas, aliases)
+        const ownerHeads = await prepareOwnerHeads(database, input.cas, session, aliases)
         for (const alias of aliases.values()) {
             if (alias.objectHash === null) continue
             if (await input.cas.statObject(alias.objectHash) !== alias.size) {
@@ -167,6 +181,7 @@ export async function migrateLegacyAssetRepository(input: {
             new TextEncoder().encode(canonicalJson(database)),
         )
         const migrationId = input.migrationId ?? globalThis.crypto.randomUUID()
+        await session?.seal()
         const activated = await input.store.activateAssetRepositoryMigration({
             sourceRevision,
             migrationId,
@@ -175,6 +190,8 @@ export async function migrateLegacyAssetRepository(input: {
             assetAliases: [...aliases.values()],
             assetOwnerHeads: ownerHeads,
         })
+        committed = true
+        await session?.release('committed')
         return {
             sourceRevision,
             revision: activated.revision,
@@ -183,6 +200,18 @@ export async function migrateLegacyAssetRepository(input: {
             aliases: aliases.size,
             ownerHeads: ownerHeads.length,
         }
+    } catch (error) {
+        if (session && !committed) {
+            try {
+                await session.release('aborted')
+            } catch (releaseError) {
+                throw new AggregateError(
+                    [error, releaseError],
+                    'Asset migration and durable CAS cleanup failed',
+                )
+            }
+        }
+        throw error
     } finally {
         await lease.release()
     }

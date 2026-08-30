@@ -166,6 +166,7 @@ vi.mock('./assetRepositoryRuntime', () => ({
 vi.mock('./nativeAssetRepository', () => ({
     createNativeAssetObjectUrlResolver: vi.fn(() => ({})),
     createNativeDurableAssetWriteSessionFactory: vi.fn(() => ({})),
+    createNativeDurableCasJobSessionFactory: vi.fn(() => ({})),
     createNativeImmutablePayloadCas: vi.fn(() => ({})),
     createNativeNewInlayImageEncoder: vi.fn(() => ({})),
 }))

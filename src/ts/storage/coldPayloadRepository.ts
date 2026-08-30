@@ -1,4 +1,5 @@
 import type { ColdPayloadStore } from './coldPayloadStore'
+import type { DurableAssetWriteSessionFactory } from './assetRepository'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
 import {
     RevisionConflictError,
@@ -43,6 +44,7 @@ export function createCompleteColdPayloadStore(input: {
     catalog: ColdAliasCatalog
     cas: ImmutablePayloadCas
     legacy: ColdPayloadStore
+    writeSessions?: DurableAssetWriteSessionFactory
 }): ColdPayloadStore {
     return {
         async read(key) {
@@ -80,30 +82,51 @@ export function createCompleteColdPayloadStore(input: {
         async write(key, data) {
             validateKey(key)
             const ownedData = data.slice()
-            const prepared = await input.cas.prepare(ownedData)
-            if (prepared.byteSize !== ownedData.byteLength) {
-                throw new Error(`Prepared cold payload size mismatch for ${key}`)
-            }
-            for (;;) {
-                const root = await input.catalog.readRoot()
-                const existing = validateVersionedAlias(
-                    await input.catalog.readColdAlias(key),
-                    key,
-                )
-                if (existing && existing.revision !== root.revision) continue
-                const alias: ColdAlias = {
-                    key,
-                    objectHash: prepared.contentHash,
-                    size: prepared.byteSize,
-                    metadata: structuredClone(existing?.value.metadata ?? {}),
+            const session = await input.writeSessions?.begin()
+            let committed = false
+            try {
+                const prepared = session
+                    ? await session.prepare(ownedData)
+                    : await input.cas.prepare(ownedData)
+                if (prepared.byteSize !== ownedData.byteLength) {
+                    throw new Error(`Prepared cold payload size mismatch for ${key}`)
                 }
-                validateColdAlias(alias)
-                try {
-                    await input.catalog.commitColdAlias(alias, root.revision)
-                    return
-                } catch (error) {
-                    if (!(error instanceof RevisionConflictError)) throw error
+                await session?.seal()
+                for (;;) {
+                    const root = await input.catalog.readRoot()
+                    const existing = validateVersionedAlias(
+                        await input.catalog.readColdAlias(key),
+                        key,
+                    )
+                    if (existing && existing.revision !== root.revision) continue
+                    const alias: ColdAlias = {
+                        key,
+                        objectHash: prepared.contentHash,
+                        size: prepared.byteSize,
+                        metadata: structuredClone(existing?.value.metadata ?? {}),
+                    }
+                    validateColdAlias(alias)
+                    try {
+                        await input.catalog.commitColdAlias(alias, root.revision)
+                        committed = true
+                        break
+                    } catch (error) {
+                        if (!(error instanceof RevisionConflictError)) throw error
+                    }
                 }
+                await session?.release('committed')
+            } catch (error) {
+                if (session && !committed) {
+                    try {
+                        await session.release('aborted')
+                    } catch (releaseError) {
+                        throw new AggregateError(
+                            [error, releaseError],
+                            `Cold payload write and durable CAS cleanup failed for ${key}`,
+                        )
+                    }
+                }
+                throw error
             }
         },
         async list() {

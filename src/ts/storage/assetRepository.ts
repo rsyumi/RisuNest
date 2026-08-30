@@ -336,9 +336,13 @@ export interface NewInlayImageEncoder {
 }
 
 export type DurableAssetWriteReleaseOutcome = 'committed' | 'aborted'
+export type DurableAssetWriteObjectRole = 'direct-object' | 'owner-manifest'
 
 export interface DurableAssetWriteSession {
-    prepare(data: Uint8Array): Promise<PreparedImmutablePayload>
+    prepare(
+        data: Uint8Array,
+        role?: DurableAssetWriteObjectRole,
+    ): Promise<PreparedImmutablePayload>
     seal(): Promise<void>
     release(outcome: DurableAssetWriteReleaseOutcome): Promise<void>
 }

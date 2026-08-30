@@ -189,21 +189,6 @@ pub(crate) async fn asset_cas_job_release(
 }
 
 #[tauri::command(async)]
-pub(crate) async fn asset_cas_prepare(
-    app: AppHandle,
-    data: Vec<u8>,
-) -> Result<PreparedPayload, String> {
-    let root = repository_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        PayloadCas::new(&root)
-            .and_then(|cas| cas.prepare_bytes(&data))
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| format!("failed to join CAS prepare operation: {error}"))?
-}
-
-#[tauri::command(async)]
 pub(crate) async fn asset_cas_read_object(
     app: AppHandle,
     content_hash: String,

@@ -26,6 +26,7 @@ export type NativeCasJobKind =
     | 'android-clone'
     | 'logical-delta-target'
     | 'cold-migration'
+    | 'cold-direct-write'
 
 export type NativeCasObjectRole = 'direct-object' | 'owner-manifest'
 export type NativeCasReleaseOutcome = 'committed' | 'aborted'
@@ -146,17 +147,24 @@ export async function releaseCasJob(
 export function createNativeDurableAssetWriteSessionFactory(
     invokeCommand: InvokeCommand = invoke,
 ): DurableAssetWriteSessionFactory {
+    return createNativeDurableCasJobSessionFactory(
+        'direct-asset-or-inlay-write',
+        invokeCommand,
+    )
+}
+
+export function createNativeDurableCasJobSessionFactory(
+    kind: NativeCasJobKind,
+    invokeCommand: InvokeCommand = invoke,
+): DurableAssetWriteSessionFactory {
     return {
         async begin() {
-            const sessionId = await beginCasJob(
-                'direct-asset-or-inlay-write',
-                invokeCommand,
-            )
+            const sessionId = await beginCasJob(kind, invokeCommand)
             return {
-                prepare: (data) => prepareCasObject(
+                prepare: (data, role = 'direct-object') => prepareCasObject(
                     sessionId,
                     data,
-                    'direct-object',
+                    role,
                     invokeCommand,
                 ),
                 seal: () => sealCasJob(sessionId, invokeCommand),
@@ -171,9 +179,8 @@ export function createNativeImmutablePayloadCas(
 ): ImmutablePayloadCas {
     return {
         async prepare(data) {
-            return preparedPayload(await invokeCommand('asset_cas_prepare', {
-                data: Array.from(data),
-            }), 'Native CAS prepare')
+            void data
+            throw new Error('Native CAS writes require a durable ownership session')
         },
         async readObject(contentHash) {
             const result = await invokeCommand('asset_cas_read_object', { contentHash })

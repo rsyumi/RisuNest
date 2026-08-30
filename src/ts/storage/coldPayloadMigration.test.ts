@@ -59,6 +59,12 @@ function migrationHarness(platform: 'tauri' | 'node' | 'opfs') {
         readObjectRange: vi.fn(),
         statObject: vi.fn(),
     }
+    const session = {
+        prepare: cas.prepare,
+        seal: vi.fn(async () => undefined),
+        release: vi.fn(async () => undefined),
+    }
+    const writeSessions = { begin: vi.fn(async () => session) }
     return {
         backend,
         legacy,
@@ -66,6 +72,8 @@ function migrationHarness(platform: 'tauri' | 'node' | 'opfs') {
         cas,
         prepared,
         release,
+        session,
+        writeSessions,
         setPinnedAuthority(value: ColdPayloadAuthorityState) {
             pinnedAuthority = value
         },
@@ -76,12 +84,26 @@ describe.each(['tauri', 'node', 'opfs'] as const)('legacy %s cold migration', (p
     it('prepares exact bytes and atomically publishes a sorted complete alias inventory', async () => {
         const fixture = migrationHarness(platform)
 
-        const result = await migrateLegacyColdPayloads({
+        let finishActivation!: () => void
+        fixture.catalog.activateColdPayloadMigration.mockImplementationOnce(
+            () => new Promise<{ revision: number }>((resolve) => {
+                finishActivation = () => resolve({ revision: 4 })
+            }),
+        )
+        const pending = migrateLegacyColdPayloads({
             store: fixture.catalog,
             legacy: fixture.legacy,
             cas: fixture.cas,
+            writeSessions: fixture.writeSessions,
             migrationId: 'cold-migration',
         })
+        await vi.waitFor(() => {
+            expect(fixture.catalog.activateColdPayloadMigration).toHaveBeenCalledOnce()
+        })
+        expect(fixture.session.seal).toHaveBeenCalledOnce()
+        expect(fixture.session.release).not.toHaveBeenCalled()
+        finishActivation()
+        const result = await pending
 
         expect(fixture.prepared).toEqual([Uint8Array.of(1, 2), Uint8Array.of(9)])
         expect(fixture.catalog.activateColdPayloadMigration).toHaveBeenCalledWith({
@@ -112,6 +134,7 @@ describe.each(['tauri', 'node', 'opfs'] as const)('legacy %s cold migration', (p
         expect(result.compatibilityHash).toMatch(/^[0-9a-f]{64}$/)
         expect(fixture.backend.remove).not.toHaveBeenCalled()
         expect(fixture.release).toHaveBeenCalledOnce()
+        expect(fixture.session.release).toHaveBeenCalledWith('committed')
     })
 })
 
@@ -124,9 +147,11 @@ describe('cold payload migration failure boundary', () => {
             store: fixture.catalog,
             legacy: fixture.legacy,
             cas: fixture.cas,
+            writeSessions: fixture.writeSessions,
         })).rejects.toThrow('disappeared during migration')
         expect(fixture.catalog.activateColdPayloadMigration).not.toHaveBeenCalled()
         expect(fixture.release).toHaveBeenCalledOnce()
+        expect(fixture.session.release).toHaveBeenCalledWith('aborted')
     })
 
     it('requires the pinned generation to remain legacy before doing any payload work', async () => {
@@ -141,10 +166,12 @@ describe('cold payload migration failure boundary', () => {
             store: fixture.catalog,
             legacy: fixture.legacy,
             cas: fixture.cas,
+            writeSessions: fixture.writeSessions,
         })).rejects.toThrow('pinned legacy authority')
         expect(fixture.backend.keys).not.toHaveBeenCalled()
         expect(fixture.cas.prepare).not.toHaveBeenCalled()
         expect(fixture.catalog.activateColdPayloadMigration).not.toHaveBeenCalled()
         expect(fixture.release).toHaveBeenCalledOnce()
+        expect(fixture.writeSessions.begin).not.toHaveBeenCalled()
     })
 })

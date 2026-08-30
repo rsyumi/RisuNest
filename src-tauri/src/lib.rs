@@ -618,7 +618,6 @@ pub fn run() {
             native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,
             native_media::native_media_encode_inlay_image,
-            asset_repository::commands::asset_cas_prepare,
             asset_repository::commands::asset_cas_read_object,
             asset_repository::commands::asset_cas_read_object_range,
             asset_repository::commands::asset_cas_stat_object,

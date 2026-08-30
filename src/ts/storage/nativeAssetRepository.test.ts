@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     beginCasJob,
     createNativeDurableAssetWriteSessionFactory,
+    createNativeDurableCasJobSessionFactory,
     createNativeImmutablePayloadCas,
     createNativeNewInlayImageEncoder,
     finalizeContentCasJob,
@@ -13,15 +14,8 @@ import {
 } from './nativeAssetRepository'
 
 describe('native asset repository adapters', () => {
-    it('uses native CAS commands for exact writes and bounded reads', async () => {
+    it('rejects bare native writes and uses native CAS commands for bounded reads', async () => {
         const invoke = vi.fn(async (command: string) => {
-            if (command === 'asset_cas_prepare') return {
-                contentHash: '11'.repeat(32),
-                byteSize: 3,
-                physicalKey: `assets-v2/objects/${'11'.repeat(32).slice(0, 2)}/${'11'.repeat(32).slice(2)}`,
-                deduplicated: false,
-                directoryEntriesSynced: true,
-            }
             if (command === 'asset_cas_read_object') return [1, 2, 3]
             if (command === 'asset_cas_read_object_range') return [2]
             if (command === 'asset_cas_stat_object') return 3
@@ -29,7 +23,9 @@ describe('native asset repository adapters', () => {
         })
         const cas = createNativeImmutablePayloadCas(invoke)
 
-        await expect(cas.prepare(Uint8Array.of(1, 2, 3))).resolves.toMatchObject({ byteSize: 3 })
+        await expect(cas.prepare(Uint8Array.of(1, 2, 3))).rejects.toThrow(
+            'durable ownership session',
+        )
         await expect(cas.readObject('11'.repeat(32))).resolves.toEqual(Uint8Array.of(1, 2, 3))
         await expect(cas.readObjectRange('11'.repeat(32), {
             start: 1,
@@ -143,6 +139,33 @@ describe('native asset repository adapters', () => {
                 sessionId: 'asset-write-1',
                 outcome: 'committed',
             }],
+        ])
+    })
+
+    it('labels direct cold ownership with its exact durable job kind', async () => {
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'asset_cas_job_begin') return 'cold-write-1'
+            if (command === 'asset_cas_job_prepare') return {
+                contentHash: '77'.repeat(32),
+                byteSize: 1,
+                physicalKey: `assets-v2/objects/77/${'77'.repeat(32).slice(2)}`,
+                deduplicated: false,
+            }
+            return null
+        })
+        expect(invoke.mock.calls.map(([command]) => command)).not.toContain('asset_cas_prepare')
+        const session = await createNativeDurableCasJobSessionFactory(
+            'cold-direct-write',
+            invoke,
+        ).begin()
+
+        await session.prepare(Uint8Array.of(7))
+        await session.seal()
+        await session.release('committed')
+
+        expect(invoke.mock.calls[0]).toEqual([
+            'asset_cas_job_begin',
+            { kind: 'cold-direct-write' },
         ])
     })
 

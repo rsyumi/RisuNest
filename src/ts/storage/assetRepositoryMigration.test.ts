@@ -61,10 +61,26 @@ describe('migrateLegacyAssetRepository', () => {
             }),
             statObject: vi.fn(async (hash: string) => sizes.get(hash) ?? null),
         }
+        let finishActivation!: () => void
         const activateAssetRepositoryMigration = vi.fn(
-            async (_input: AssetRepositoryMigrationInput) => ({ revision: 8 }),
+            (_input: AssetRepositoryMigrationInput) => new Promise<{ revision: number }>(
+                (resolve) => {
+                    finishActivation = () => resolve({ revision: 8 })
+                },
+            ),
         )
         const release = vi.fn(async () => undefined)
+        const seal = vi.fn(async () => undefined)
+        const sessionRelease = vi.fn(async () => undefined)
+        const sessionPrepare = vi.fn(
+            (data: Uint8Array, _role?: 'direct-object' | 'owner-manifest') => cas.prepare(data),
+        )
+        const session = {
+            prepare: sessionPrepare,
+            seal,
+            release: sessionRelease,
+        }
+        const writeSessions = { begin: vi.fn(async () => session) }
         const store = {
             readAssetRepositoryAuthority: vi.fn(async () => ({
                 revision: 7,
@@ -75,12 +91,18 @@ describe('migrateLegacyAssetRepository', () => {
             activateAssetRepositoryMigration,
         }
 
-        await expect(migrateLegacyAssetRepository({
+        const pending = migrateLegacyAssetRepository({
             store: store as never,
             legacy: legacy as never,
             cas: cas as never,
+            writeSessions,
             migrationId: 'migration-test',
-        })).resolves.toMatchObject({ revision: 8, aliases: 3 })
+        })
+        await vi.waitFor(() => expect(activateAssetRepositoryMigration).toHaveBeenCalledOnce())
+        expect(seal).toHaveBeenCalledOnce()
+        expect(sessionRelease).not.toHaveBeenCalled()
+        finishActivation()
+        await expect(pending).resolves.toMatchObject({ revision: 8, aliases: 3 })
 
         expect(prepared[0]).toEqual(ordinary)
         expect(prepared[1]).toEqual(restoredInlay)
@@ -109,6 +131,9 @@ describe('migrateLegacyAssetRepository', () => {
             entryCount: 2,
         }))
         expect(release).toHaveBeenCalledOnce()
+        expect(writeSessions.begin).toHaveBeenCalledOnce()
+        expect(sessionRelease).toHaveBeenCalledWith('committed')
+        expect(sessionPrepare.mock.calls.some((call) => call[1] === 'owner-manifest')).toBe(true)
     })
 
     it('keeps legacy authoritative and releases its lease when preparation fails', async () => {
@@ -136,13 +161,22 @@ describe('migrateLegacyAssetRepository', () => {
             read: vi.fn(async () => Uint8Array.of(1)),
         }
         const cas = { prepare: vi.fn(async () => { throw error }) }
+        const sessionRelease = vi.fn(async () => undefined)
 
         await expect(migrateLegacyAssetRepository({
             store: store as never,
             legacy: legacy as never,
             cas: cas as never,
+            writeSessions: {
+                begin: vi.fn(async () => ({
+                    prepare: cas.prepare,
+                    seal: vi.fn(),
+                    release: sessionRelease,
+                })),
+            },
         })).rejects.toBe(error)
         expect(activate).not.toHaveBeenCalled()
         expect(release).toHaveBeenCalledOnce()
+        expect(sessionRelease).toHaveBeenCalledWith('aborted')
     })
 })

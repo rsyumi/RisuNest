@@ -15,7 +15,7 @@ function alias(overrides: Partial<ColdAlias> = {}): ColdAlias {
     }
 }
 
-function harness(initial?: ColdAlias) {
+function harness(initial?: ColdAlias, writeSessions?: Parameters<typeof createCompleteColdPayloadStore>[0]['writeSessions']) {
     let revision = 4
     let current = initial
     const objects = new Map<string, Uint8Array>()
@@ -68,7 +68,7 @@ function harness(initial?: ColdAlias) {
         list: vi.fn(async () => [...legacyValues.keys()].sort()),
         remove: vi.fn(),
     }
-    const store = createCompleteColdPayloadStore({ catalog, cas, legacy })
+    const store = createCompleteColdPayloadStore({ catalog, cas, legacy, writeSessions })
     return { catalog, cas, legacy, legacyValues, objects, store, current: () => current }
 }
 
@@ -130,6 +130,45 @@ describe('revisioned cold payload repository', () => {
             objectHash: 'cd'.repeat(32),
             metadata: { source: 'fixture' },
         }))
+    })
+
+    it('keeps a durable cold-direct job sealed until the late alias commit becomes authoritative', async () => {
+        const order: string[] = []
+        const session = {
+            prepare: vi.fn(async (data: Uint8Array) => {
+                order.push('prepare')
+                return {
+                    contentHash: 'cd'.repeat(32),
+                    byteSize: data.byteLength,
+                    physicalKey: `assets-v2/objects/cd/${'cd'.repeat(31)}`,
+                    deduplicated: false,
+                }
+            }),
+            seal: vi.fn(async () => void order.push('seal')),
+            release: vi.fn(async (outcome: string) => void order.push(`release:${outcome}`)),
+        }
+        const fixture = harness(undefined, {
+            begin: vi.fn(async () => {
+                order.push('begin')
+                return session
+            }),
+        })
+        let finishActivation!: () => void
+        fixture.catalog.commitColdAlias.mockImplementationOnce(() => {
+            order.push('activate')
+            return new Promise<{ revision: number }>((resolve) => {
+                finishActivation = () => resolve({ revision: 5 })
+            })
+        })
+
+        const pending = fixture.store.write('cold-1', Uint8Array.of(1, 2, 3))
+        await vi.waitFor(() => expect(order).toEqual(['begin', 'prepare', 'seal', 'activate']))
+        expect(session.release).not.toHaveBeenCalled()
+        finishActivation()
+        await pending
+
+        expect(order).toEqual(['begin', 'prepare', 'seal', 'activate', 'release:committed'])
+        expect(fixture.cas.prepare).not.toHaveBeenCalled()
     })
 
     it('retries a revision conflict without preparing the immutable bytes again', async () => {

@@ -24,6 +24,7 @@ import {
 import {
     createNativeAssetObjectUrlResolver,
     createNativeDurableAssetWriteSessionFactory,
+    createNativeDurableCasJobSessionFactory,
     createNativeImmutablePayloadCas,
     createNativeNewInlayImageEncoder,
 } from './nativeAssetRepository'
@@ -168,6 +169,7 @@ async function installPersistentStorage(): Promise<void> {
             catalog: authority.rawStore,
             cas: createNativeImmutablePayloadCas(),
             legacy: coldLegacy,
+            writeSessions: createNativeDurableCasJobSessionFactory('cold-direct-write'),
         })
         : undefined
     const coldSelection = {
@@ -200,6 +202,10 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
         const legacy = getLegacyBlobStore()
         const coldLegacy = await createLocalColdPayloadStore()
         const cas = createNativeImmutablePayloadCas()
+        const assetMigrationSessions = createNativeDurableCasJobSessionFactory(
+            'direct-asset-or-inlay-write',
+        )
+        const coldMigrationSessions = createNativeDurableCasJobSessionFactory('cold-migration')
         const current = await authority.rawStore.readAssetRepositoryAuthority()
         const currentCold = await authority.rawStore.readColdPayloadAuthority()
         if (current.value.format === 'preparing') {
@@ -216,6 +222,7 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
                 store: authority.rawStore,
                 legacy,
                 cas,
+                writeSessions: assetMigrationSessions,
             })
         }
         const migratedCold = await authority.rawStore.readColdPayloadAuthority()
@@ -224,6 +231,7 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
                 store: authority.rawStore,
                 legacy: coldLegacy,
                 cas,
+                writeSessions: coldMigrationSessions,
             })
         }
         const v2 = createNativeV2BlobStore({
@@ -244,6 +252,7 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
             catalog: authority.rawStore,
             cas,
             legacy: coldLegacy,
+            writeSessions: createNativeDurableCasJobSessionFactory('cold-direct-write'),
         })
         const coldSelection = {
             store: authority.rawStore,

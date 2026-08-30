@@ -607,6 +607,10 @@ impl PersistentStore {
                 "prepared logical manifest object does not match its canonical bytes",
             );
         }
+        let _repository_guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+        if cas.stat_object(&built.manifest_hash)? != Some(built.manifest_bytes.len() as u64) {
+            return validation("prepared logical manifest disappeared before activation");
+        }
         let completed_at = unix_millis()?.max(created_at);
         let changed = transaction.execute(
             "UPDATE logical_sync_generations
@@ -4640,6 +4644,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(building_count, 1);
+    }
+
+    #[test]
+    fn logical_manifest_activation_waits_for_repository_mutation_exclusion() {
+        let (directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let expected = scan_compact_manifest(&store.connection, "library", "generation-0", false)
+            .expect("build expected manifest");
+        let observer = PayloadCas::new(directory.path()).expect("open observing CAS");
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("lock repository mutation");
+        let (sent, received) = std::sync::mpsc::channel();
+        let (ready_sent, ready_received) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_sent.send(()).expect("signal logical seal attempt");
+            let result = store.seal_active_logical_generation(&cas);
+            sent.send(result).expect("send logical seal result");
+        });
+
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached logical seal");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observer
+            .stat_object(&expected.manifest_hash)
+            .expect("stat prepared logical manifest")
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "logical manifest hashing held exclusion"
+            );
+            thread::yield_now();
+        }
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        let sealed = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("logical seal resumes after exclusion")
+            .expect("seal logical generation");
+        assert_eq!(sealed.manifest_hash.len(), 64);
+        worker.join().expect("join logical seal worker");
     }
 
     #[test]

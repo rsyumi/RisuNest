@@ -1,4 +1,5 @@
 import { parseColdPayloadAuthorityState } from './coldPayloadAuthority'
+import type { DurableAssetWriteSession, DurableAssetWriteSessionFactory } from './assetRepository'
 import type { ColdPayloadStore } from './coldPayloadStore'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
 import {
@@ -46,6 +47,7 @@ export async function migrateLegacyColdPayloads(input: {
     store: ColdPayloadMigrationStore
     legacy: ColdPayloadStore
     cas: ImmutablePayloadCas
+    writeSessions?: DurableAssetWriteSessionFactory
     migrationId?: string
 }): Promise<ColdPayloadMigrationResult> {
     const current = await input.store.readColdPayloadAuthority()
@@ -54,6 +56,8 @@ export async function migrateLegacyColdPayloads(input: {
     }
     const sourceRevision = current.revision
     const lease = await input.store.acquireRevision(sourceRevision)
+    let session: DurableAssetWriteSession | undefined
+    let committed = false
     try {
         const pinned = await lease.readColdPayloadAuthority()
         if (
@@ -63,6 +67,7 @@ export async function migrateLegacyColdPayloads(input: {
             throw new Error('Cold payload migration requires pinned legacy authority')
         }
         const keys = await input.legacy.list()
+        session = await input.writeSessions?.begin()
         const aliases: ColdAlias[] = []
         let previous: string | undefined
         for (const key of [...keys].sort()) {
@@ -74,7 +79,9 @@ export async function migrateLegacyColdPayloads(input: {
             if (data === null) {
                 throw new Error(`Legacy cold payload disappeared during migration: ${key}`)
             }
-            const prepared = await input.cas.prepare(data)
+            const prepared = session
+                ? await session.prepare(data)
+                : await input.cas.prepare(data)
             if (prepared.byteSize !== data.byteLength) {
                 throw new Error(`Cold payload CAS size mismatch during migration: ${key}`)
             }
@@ -89,12 +96,15 @@ export async function migrateLegacyColdPayloads(input: {
         }
         const compatibilityHash = await inventoryHash(aliases)
         const migrationId = input.migrationId ?? globalThis.crypto.randomUUID()
+        await session?.seal()
         const activated = await input.store.activateColdPayloadMigration({
             sourceRevision,
             migrationId,
             compatibilityHash,
             coldAliases: aliases,
         })
+        committed = true
+        await session?.release('committed')
         return {
             sourceRevision,
             revision: activated.revision,
@@ -102,6 +112,18 @@ export async function migrateLegacyColdPayloads(input: {
             compatibilityHash,
             aliases: aliases.length,
         }
+    } catch (error) {
+        if (session && !committed) {
+            try {
+                await session.release('aborted')
+            } catch (releaseError) {
+                throw new AggregateError(
+                    [error, releaseError],
+                    'Cold payload migration and durable CAS cleanup failed',
+                )
+            }
+        }
+        throw error
     } finally {
         await lease.release()
     }

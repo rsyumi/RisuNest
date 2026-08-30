@@ -30,6 +30,7 @@ pub(crate) enum CasJobKind {
     AndroidClone,
     LogicalDeltaTarget,
     ColdMigration,
+    ColdDirectWrite,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,6 +110,7 @@ impl DurableCasJob {
         if created_at_ms < 0 {
             return invalid_data("CAS job creation time must be nonnegative");
         }
+        let _repository_guard = super::coordinator::lock_repository_mutation()?;
         let (repository_root, directory) = job_pin_directory(repository_root, true)?
             .expect("requested job-pin directory creation");
         let journal_path = directory.join(format!("job-{job_id}.journal"));
@@ -313,6 +315,7 @@ impl DurableCasJob {
                 .register(batch, created_at_ms)
                 .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
         }
+        let _repository_guard = super::coordinator::lock_repository_mutation()?;
         let record = JobJournalRecord::Seal {
             sequence: self.state.next_sequence,
             job_id: self.state.job_id.clone(),
@@ -339,6 +342,7 @@ impl DurableCasJob {
         if outcome == CasReleaseOutcome::Committed && !self.state.sealed {
             return invalid_data("unsealed CAS job cannot be released as committed");
         }
+        let _repository_guard = super::coordinator::lock_repository_mutation()?;
         let record = JobJournalRecord::Release {
             sequence: self.state.next_sequence,
             job_id: self.state.job_id.clone(),
@@ -964,6 +968,96 @@ mod tests {
     use crate::persistent_store::PersistentStore;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn durable_job_transitions_wait_for_repository_mutation_exclusion() {
+        let directory = tempfile::tempdir().expect("create coordinated job directory");
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("lock repository mutation");
+        let root = directory.path().to_path_buf();
+        let (sent, received) = mpsc::channel();
+        let (ready_sent, ready_received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_sent.send(()).expect("signal begin attempt");
+            let job = DurableCasJob::begin(&root, "coordinated-job", CasJobKind::ColdMigration, 1)
+                .expect("begin coordinated job");
+            sent.send(job).expect("send coordinated job");
+        });
+
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached begin transition");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        let mut job = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job begins after exclusion releases");
+        assert!(job.journal_path().is_file());
+        worker.join().expect("join coordinated job worker");
+
+        let root = directory.path().to_path_buf();
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("lock repository mutation during payload streaming");
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let cas = PayloadCas::new(&root).expect("open payload CAS");
+            job.prepare_bytes(&cas, b"coordinated payload", CasObjectRole::DirectObject)
+                .expect("prepare coordinated payload without repository guard");
+            sent.send(job).expect("send prepared job");
+        });
+        let mut job = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("payload preparation does not wait for repository exclusion");
+        drop(guard);
+        worker.join().expect("join payload preparation worker");
+
+        let store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("lock repository mutation for seal");
+        let (sent, received) = mpsc::channel();
+        let (ready_sent, ready_received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut store = store;
+            ready_sent.send(()).expect("signal seal attempt");
+            job.seal(&mut store, 2).expect("seal coordinated job");
+            sent.send((job, store)).expect("send sealed job");
+        });
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached seal transition");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        let (mut job, store) = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job seals after exclusion releases");
+        assert!(job.is_sealed());
+        drop(store);
+        worker.join().expect("join coordinated seal worker");
+
+        let journal_path = job.journal_path().to_path_buf();
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("lock repository mutation for release");
+        let (sent, received) = mpsc::channel();
+        let (ready_sent, ready_received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_sent.send(()).expect("signal release attempt");
+            job.release(CasReleaseOutcome::Committed)
+                .expect("release coordinated job");
+            sent.send(()).expect("send release completion");
+        });
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached release transition");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job releases after exclusion releases");
+        assert!(!journal_path.exists());
+        worker.join().expect("join coordinated release worker");
+    }
 
     #[test]
     fn durable_job_supports_normal_fifty_thousand_asset_packages() {
