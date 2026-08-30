@@ -277,38 +277,27 @@ pub(crate) enum AssetRepositoryAuthorityState {
 
 impl AssetRepositoryAuthorityState {
     pub(crate) fn validate(&self) -> StoreResult<()> {
-        let migration_id = match self {
-            Self::Legacy => return Ok(()),
+        match self {
+            Self::Legacy => Ok(()),
             Self::Preparing {
                 migration_id,
                 source_revision,
-            } => {
-                if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(source_revision) {
-                    return Err(StoreError::Validation {
-                        message: "Asset repository sourceRevision is invalid".to_owned(),
-                    });
-                }
-                migration_id
-            }
+            } => validate_authority_fields(
+                "Asset repository",
+                migration_id,
+                Some(*source_revision),
+                None,
+            ),
             Self::V2 {
                 migration_id,
                 compatibility_hash,
-            } => {
-                validate_hash(compatibility_hash, "Asset repository compatibilityHash")?;
-                migration_id
-            }
-        };
-        if migration_id.is_empty()
-            || migration_id.len() > 64
-            || !migration_id
-                .bytes()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
-        {
-            return Err(StoreError::Validation {
-                message: "Asset repository migrationId is invalid".to_owned(),
-            });
+            } => validate_authority_fields(
+                "Asset repository",
+                migration_id,
+                None,
+                Some(compatibility_hash),
+            ),
         }
-        Ok(())
     }
 }
 
@@ -334,39 +323,60 @@ pub(crate) enum ColdPayloadAuthorityState {
 
 impl ColdPayloadAuthorityState {
     pub(crate) fn validate(&self) -> StoreResult<()> {
-        let migration_id = match self {
-            Self::Legacy => return Ok(()),
+        match self {
+            Self::Legacy => Ok(()),
             Self::Preparing {
                 migration_id,
                 source_revision,
-            } => {
-                if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(source_revision) {
-                    return Err(StoreError::Validation {
-                        message: "Cold payload sourceRevision is invalid".to_owned(),
-                    });
-                }
-                migration_id
-            }
+            } => validate_authority_fields(
+                "Cold payload",
+                migration_id,
+                Some(*source_revision),
+                None,
+            ),
             Self::V2 {
                 migration_id,
                 compatibility_hash,
-            } => {
-                validate_hash(compatibility_hash, "Cold payload compatibilityHash")?;
-                migration_id
-            }
-        };
-        if migration_id.is_empty()
-            || migration_id.len() > 64
-            || !migration_id
-                .bytes()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
-        {
+            } => validate_authority_fields(
+                "Cold payload",
+                migration_id,
+                None,
+                Some(compatibility_hash),
+            ),
+        }
+    }
+}
+
+// Shared field validation for the two structurally identical authority-state
+// enums so their rules cannot drift; the enums themselves stay distinct for
+// type safety between the two authorities.
+fn validate_authority_fields(
+    subject: &str,
+    migration_id: &str,
+    source_revision: Option<i64>,
+    compatibility_hash: Option<&str>,
+) -> StoreResult<()> {
+    if let Some(source_revision) = source_revision {
+        if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(&source_revision) {
             return Err(StoreError::Validation {
-                message: "Cold payload migrationId is invalid".to_owned(),
+                message: format!("{subject} sourceRevision is invalid"),
             });
         }
-        Ok(())
     }
+    if let Some(compatibility_hash) = compatibility_hash {
+        validate_hash(compatibility_hash, &format!("{subject} compatibilityHash"))?;
+    }
+    if migration_id.is_empty()
+        || migration_id.len() > 64
+        || !migration_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
+    {
+        return Err(StoreError::Validation {
+            message: format!("{subject} migrationId is invalid"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -551,11 +561,7 @@ impl AssetOwnerHead {
                     .to_owned(),
             });
         };
-        if hash.len() != 64
-            || !hash
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !is_lowercase_sha256_hex(hash) {
             return Err(StoreError::Validation {
                 message: "Present asset owner property requires a lowercase SHA-256 manifestHash"
                     .to_owned(),
@@ -614,13 +620,20 @@ impl ColdAlias {
     }
 }
 
+// The single source of truth for the lowercase SHA-256 hex shape used by
+// every hash validator in the persistent store.
+fn is_lowercase_sha256_hex(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn validate_object_hash(hash: &Option<String>, subject: &str) -> StoreResult<()> {
-    if hash.as_ref().is_some_and(|hash| {
-        hash.len() != 64
-            || !hash
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
+    if hash
+        .as_ref()
+        .is_some_and(|hash| !is_lowercase_sha256_hex(hash))
+    {
         return Err(StoreError::Validation {
             message: format!(
                 "{subject} objectHash must be null or 64 lowercase hexadecimal characters"
@@ -631,11 +644,7 @@ fn validate_object_hash(hash: &Option<String>, subject: &str) -> StoreResult<()>
 }
 
 fn validate_hash(hash: &str, subject: &str) -> StoreResult<()> {
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_lowercase_sha256_hex(hash) {
         return Err(StoreError::Validation {
             message: format!("{subject} must be 64 lowercase hexadecimal characters"),
         });
@@ -895,6 +904,7 @@ pub(crate) struct PersistentStore {
     repository_root: PathBuf,
     database_path: PathBuf,
     snapshots_dir: PathBuf,
+    pending_restore_failure: Option<String>,
 }
 
 pub(crate) struct PreparedReplaceCommit {
@@ -1156,7 +1166,8 @@ impl PersistentStore {
         let persistent_dir = app_data_dir.join("persistent");
         let snapshots_dir = persistent_dir.join("snapshots");
         std::fs::create_dir_all(&snapshots_dir)?;
-        snapshot::apply_pending_restore(&persistent_dir, &snapshots_dir)?;
+        let pending_restore_failure =
+            snapshot::apply_pending_restore(&persistent_dir, &snapshots_dir)?;
 
         let database_path = persistent_dir.join("persistent.db");
         let mut connection = Connection::open(&database_path)?;
@@ -1200,7 +1211,15 @@ impl PersistentStore {
             repository_root: app_data_dir.to_owned(),
             database_path,
             snapshots_dir,
+            pending_restore_failure,
         })
+    }
+
+    // Reports a user-requested snapshot restore that was skipped during this
+    // open, so command surfaces can tell the frontend instead of silently
+    // proceeding on the old database.
+    pub(crate) fn pending_restore_failure(&self) -> Option<&str> {
+        self.pending_restore_failure.as_deref()
     }
 
     pub(crate) fn open_native_job_store(&self) -> StoreResult<Self> {
@@ -1213,6 +1232,7 @@ impl PersistentStore {
             repository_root: self.repository_root.clone(),
             database_path: self.database_path.clone(),
             snapshots_dir: self.snapshots_dir.clone(),
+            pending_restore_failure: None,
         })
     }
 

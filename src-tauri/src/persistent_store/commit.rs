@@ -8,11 +8,23 @@ use crate::asset_repository::PayloadCas;
 use crate::peer_sync::logical_delta::LOGICAL_MESSAGE_PAGE_SIZE;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-pub(super) fn commit_asset_alias(
+// Every incremental mutation shares one transaction skeleton (Immediate
+// transaction, revision check, copy-on-write generation, incremental logical
+// commit, set_active) so a new mutation type cannot omit a step. `prepare`
+// runs against the active generation before the copy-on-write; `body` applies
+// the mutation to the writable generation and performs its logical-index
+// maintenance through the handle it receives.
+fn incremental_commit<T>(
     connection: &mut Connection,
-    cas: Option<&PayloadCas>,
-    alias: &AssetAlias,
     expected_revision: i64,
+    maintain_logical_index: bool,
+    prepare: impl FnOnce(&Transaction<'_>, &str) -> StoreResult<T>,
+    body: impl FnOnce(
+        &Transaction<'_>,
+        &str,
+        Option<&super::logical_index::IncrementalLogicalCommit>,
+        T,
+    ) -> StoreResult<()>,
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actual_revision = current_revision(&transaction)?;
@@ -22,26 +34,49 @@ pub(super) fn commit_asset_alias(
             actual: actual_revision,
         });
     }
-    alias.validate()?;
     let active = active_generation(&transaction)?;
+    let prepared = prepare(&transaction, &active)?;
     let revision = actual_revision + 1;
-    let generation = writable_generation(&transaction, &active, revision, cas.is_some())?;
+    let generation = writable_generation(&transaction, &active, revision, maintain_logical_index)?;
     let logical = super::logical_index::begin_incremental_logical_commit(
         &transaction,
         &active,
         &generation,
         revision,
     )?;
-    put_asset_alias(&transaction, &generation, alias)?;
-    if let Some(logical) = logical {
-        let cas = cas.ok_or_else(|| StoreError::Validation {
-            message: "active logical index requires a payload CAS".to_owned(),
-        })?;
-        super::logical_index::maintain_incremental_asset_alias(&transaction, cas, &logical, alias)?;
-    }
+    body(&transaction, &generation, logical.as_ref(), prepared)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })
+}
+
+pub(super) fn commit_asset_alias(
+    connection: &mut Connection,
+    cas: Option<&PayloadCas>,
+    alias: &AssetAlias,
+    expected_revision: i64,
+) -> StoreResult<RevisionResult> {
+    incremental_commit(
+        connection,
+        expected_revision,
+        cas.is_some(),
+        |_, _| alias.validate(),
+        |transaction, generation, logical, ()| {
+            put_asset_alias(transaction, generation, alias)?;
+            if let Some(logical) = logical {
+                let cas = cas.ok_or_else(|| StoreError::Validation {
+                    message: "active logical index requires a payload CAS".to_owned(),
+                })?;
+                super::logical_index::maintain_incremental_asset_alias(
+                    transaction,
+                    cas,
+                    logical,
+                    alias,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(super) fn delete_asset_alias(
@@ -52,38 +87,27 @@ pub(super) fn delete_asset_alias(
     expected_revision: i64,
 ) -> StoreResult<RevisionResult> {
     super::query::validate_asset_kind(kind)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
-    if actual_revision != expected_revision {
-        return Err(StoreError::RevisionConflict {
-            expected: expected_revision,
-            actual: actual_revision,
-        });
-    }
-    let active = active_generation(&transaction)?;
-    let revision = actual_revision + 1;
-    let generation = writable_generation(&transaction, &active, revision, maintain_logical_index)?;
-    let logical = super::logical_index::begin_incremental_logical_commit(
-        &transaction,
-        &active,
-        &generation,
-        revision,
-    )?;
-    transaction.execute(
-        "DELETE FROM asset_aliases WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
-        params![generation, kind, key],
-    )?;
-    if let Some(logical) = logical {
-        super::logical_index::maintain_incremental_asset_alias_deletion(
-            &transaction,
-            &logical,
-            kind,
-            key,
-        )?;
-    }
-    set_active(&transaction, revision, &generation)?;
-    transaction.commit()?;
-    Ok(RevisionResult { revision })
+    incremental_commit(
+        connection,
+        expected_revision,
+        maintain_logical_index,
+        |_, _| Ok(()),
+        |transaction, generation, logical, ()| {
+            transaction.execute(
+                "DELETE FROM asset_aliases WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
+                params![generation, kind, key],
+            )?;
+            if let Some(logical) = logical {
+                super::logical_index::maintain_incremental_asset_alias_deletion(
+                    transaction,
+                    logical,
+                    kind,
+                    key,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(super) fn commit_cold_alias(
@@ -92,41 +116,32 @@ pub(super) fn commit_cold_alias(
     alias: &ColdAlias,
     expected_revision: i64,
 ) -> StoreResult<RevisionResult> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
-    if actual_revision != expected_revision {
-        return Err(StoreError::RevisionConflict {
-            expected: expected_revision,
-            actual: actual_revision,
-        });
-    }
-    alias.validate()?;
-    if alias.object_hash.is_none() {
-        return Err(validation("Cold payload v2 alias requires an objectHash"));
-    }
-    let active = active_generation(&transaction)?;
-    require_cold_v2_authority(&transaction, &active)?;
-    let revision = actual_revision + 1;
-    let generation = writable_generation(&transaction, &active, revision, cas.is_some())?;
-    let logical = super::logical_index::begin_incremental_logical_commit(
-        &transaction,
-        &active,
-        &generation,
-        revision,
-    )?;
-    put_cold_alias(&transaction, &generation, alias)?;
-    if let Some(logical) = logical {
-        let cas = cas.ok_or_else(|| validation("active logical index requires a payload CAS"))?;
-        super::logical_index::maintain_incremental_cold_alias(
-            &transaction,
-            cas,
-            &logical,
-            &alias.key,
-        )?;
-    }
-    set_active(&transaction, revision, &generation)?;
-    transaction.commit()?;
-    Ok(RevisionResult { revision })
+    incremental_commit(
+        connection,
+        expected_revision,
+        cas.is_some(),
+        |transaction, active| {
+            alias.validate()?;
+            if alias.object_hash.is_none() {
+                return Err(validation("Cold payload v2 alias requires an objectHash"));
+            }
+            require_cold_v2_authority(transaction, active)
+        },
+        |transaction, generation, logical, ()| {
+            put_cold_alias(transaction, generation, alias)?;
+            if let Some(logical) = logical {
+                let cas =
+                    cas.ok_or_else(|| validation("active logical index requires a payload CAS"))?;
+                super::logical_index::maintain_incremental_cold_alias(
+                    transaction,
+                    cas,
+                    logical,
+                    &alias.key,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(super) fn delete_cold_alias(
@@ -142,38 +157,26 @@ pub(super) fn delete_cold_alias(
         metadata: Value::Object(Map::new()),
     }
     .validate()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
-    if actual_revision != expected_revision {
-        return Err(StoreError::RevisionConflict {
-            expected: expected_revision,
-            actual: actual_revision,
-        });
-    }
-    let active = active_generation(&transaction)?;
-    require_cold_v2_authority(&transaction, &active)?;
-    let revision = actual_revision + 1;
-    let generation = writable_generation(&transaction, &active, revision, maintain_logical_index)?;
-    let logical = super::logical_index::begin_incremental_logical_commit(
-        &transaction,
-        &active,
-        &generation,
-        revision,
-    )?;
-    transaction.execute(
-        "DELETE FROM cold_aliases WHERE generation = ?1 AND key = ?2",
-        params![generation, key],
-    )?;
-    if let Some(logical) = logical {
-        super::logical_index::maintain_incremental_cold_alias_deletion(
-            &transaction,
-            &logical,
-            key,
-        )?;
-    }
-    set_active(&transaction, revision, &generation)?;
-    transaction.commit()?;
-    Ok(RevisionResult { revision })
+    incremental_commit(
+        connection,
+        expected_revision,
+        maintain_logical_index,
+        |transaction, active| require_cold_v2_authority(transaction, active),
+        |transaction, generation, logical, ()| {
+            transaction.execute(
+                "DELETE FROM cold_aliases WHERE generation = ?1 AND key = ?2",
+                params![generation, key],
+            )?;
+            if let Some(logical) = logical {
+                super::logical_index::maintain_incremental_cold_alias_deletion(
+                    transaction,
+                    logical,
+                    key,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(super) fn activate_cold_payload_migration(
@@ -192,48 +195,40 @@ pub(super) fn activate_cold_payload_migration(
             return Err(validation("Duplicate cold alias"));
         }
     }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
-    if actual_revision != input.source_revision {
-        return Err(StoreError::RevisionConflict {
-            expected: input.source_revision,
-            actual: actual_revision,
-        });
-    }
-    let active = active_generation(&transaction)?;
-    let authority = read_cold_payload_authority(&transaction, &active)?;
-    if !matches!(authority, ColdPayloadAuthorityState::Legacy) {
-        return Err(validation(
-            "Cold payload migration requires legacy authority",
-        ));
-    }
-    let revision = actual_revision + 1;
-    let generation = writable_generation(&transaction, &active, revision, cas.is_some())?;
-    let logical = super::logical_index::begin_incremental_logical_commit(
-        &transaction,
-        &active,
-        &generation,
-        revision,
-    )?;
-    transaction.execute(
-        "DELETE FROM cold_aliases WHERE generation = ?1",
-        [&generation],
-    )?;
-    for alias in &input.cold_aliases {
-        put_cold_alias(&transaction, &generation, alias)?;
-    }
-    put_cold_payload_authority(&transaction, &generation, &input.authority())?;
-    if let Some(logical) = logical {
-        let cas = cas.ok_or_else(|| validation("active logical index requires a payload CAS"))?;
-        super::logical_index::maintain_incremental_cold_alias_replacement(
-            &transaction,
-            cas,
-            &logical,
-        )?;
-    }
-    set_active(&transaction, revision, &generation)?;
-    transaction.commit()?;
-    Ok(RevisionResult { revision })
+    incremental_commit(
+        connection,
+        input.source_revision,
+        cas.is_some(),
+        |transaction, active| {
+            let authority = read_cold_payload_authority(transaction, active)?;
+            if !matches!(authority, ColdPayloadAuthorityState::Legacy) {
+                return Err(validation(
+                    "Cold payload migration requires legacy authority",
+                ));
+            }
+            Ok(())
+        },
+        |transaction, generation, logical, ()| {
+            transaction.execute(
+                "DELETE FROM cold_aliases WHERE generation = ?1",
+                [generation],
+            )?;
+            for alias in &input.cold_aliases {
+                put_cold_alias(transaction, generation, alias)?;
+            }
+            put_cold_payload_authority(transaction, generation, &input.authority())?;
+            if let Some(logical) = logical {
+                let cas =
+                    cas.ok_or_else(|| validation("active logical index requires a payload CAS"))?;
+                super::logical_index::maintain_incremental_cold_alias_replacement(
+                    transaction,
+                    cas,
+                    logical,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
@@ -244,124 +239,112 @@ pub(super) fn commit(
     input: &WorkingSetCommit,
     asset_aliases: &[AssetAlias],
 ) -> StoreResult<RevisionResult> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
-    if actual_revision != input.expected_revision {
-        return Err(StoreError::RevisionConflict {
-            expected: input.expected_revision,
-            actual: actual_revision,
-        });
-    }
-
-    if let Some(character) = &input.replace_character {
-        validate_character(character, "Selected character replacement")?;
-    }
-    if let Some(character) = &input.add_character {
-        validate_character(character, "Character addition")?;
-    }
-    let mut alias_identities = HashSet::new();
-    for alias in asset_aliases {
-        alias.validate()?;
-        if !alias_identities.insert((alias.kind.as_str(), alias.key.as_str())) {
-            return Err(validation("Duplicate asset alias"));
-        }
-    }
-
-    let active = active_generation(&transaction)?;
-    if let Some(details) = &input.character_details {
-        validate_character_details(
-            &transaction,
-            &active,
-            details,
-            input.delete_character_id.as_deref(),
-        )?;
-    }
-    validate_owner_heads_for_commit(input)?;
-    let prior_character_conversations = if cas.is_some() {
-        prior_character_conversations(&transaction, &active, input)?
-    } else {
-        BTreeMap::new()
-    };
-    let revision = actual_revision + 1;
-    let generation = writable_generation(&transaction, &active, revision, cas.is_some())?;
-    let logical = super::logical_index::begin_incremental_logical_commit(
-        &transaction,
-        &active,
-        &generation,
-        revision,
-    )?;
-    if let Some(root) = &input.root {
-        put_root(&transaction, &generation, root)?;
-    }
-    if let Some(presets) = &input.replace_presets {
-        replace_presets(&transaction, &generation, presets)?;
-    }
-    if let Some(character_id) = &input.delete_character_id {
-        delete_character(&transaction, &generation, character_id)?;
-    }
-    if let Some(character) = &input.character {
-        put_character_detail(&transaction, &generation, character)?;
-    }
-    for detail in input.character_details.as_deref().unwrap_or_default() {
-        put_character_detail(&transaction, &generation, detail)?;
-    }
-    if let Some(character) = &input.replace_character {
-        replace_character(&transaction, &generation, character)?;
-    }
-    if let Some(character) = &input.add_character {
-        let character_id = required_string(character, "chaId", "Character addition")?;
-        if character_exists(&transaction, &generation, character_id)? {
-            return Err(validation(format!(
-                "Character {character_id} already exists"
-            )));
-        }
-        replace_character(&transaction, &generation, character)?;
-    }
-    let mut conversation_changes = Vec::new();
-    let mut shifted_conversation_indices = BTreeMap::new();
-    for mutation in input.conversations.as_deref().unwrap_or_default() {
-        let (change, shifted_index) =
-            apply_conversation_mutation(&transaction, &generation, mutation)?;
-        if let Some((character_id, configured_index)) = shifted_index {
-            shifted_conversation_indices
-                .entry(character_id)
-                .and_modify(|current: &mut u64| *current = (*current).min(configured_index))
-                .or_insert(configured_index);
-        }
-        super::logical_index::push_conversation_change(&mut conversation_changes, change)?;
-    }
-    for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
-        apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
-    }
-    for alias in asset_aliases {
-        put_asset_alias(&transaction, &generation, alias)?;
-    }
-    replace_changed_owner_heads(&transaction, &generation, input)?;
-    if let Some(logical) = logical {
-        let cas = cas.ok_or_else(|| StoreError::Validation {
-            message: "active logical index requires a payload CAS".to_owned(),
-        })?;
-        super::logical_index::maintain_incremental_logical_commit(
-            &transaction,
-            cas,
-            &logical,
-            input,
-            &conversation_changes,
-            &shifted_conversation_indices,
-            &prior_character_conversations,
-        )?;
-        for alias in asset_aliases {
-            super::logical_index::maintain_incremental_asset_alias(
-                &transaction,
-                cas,
-                &logical,
-                alias,
-            )?;
-        }
-    }
-    set_active(&transaction, revision, &generation)?;
-    transaction.commit()?;
-    Ok(RevisionResult { revision })
+    incremental_commit(
+        connection,
+        input.expected_revision,
+        cas.is_some(),
+        |transaction, active| {
+            if let Some(character) = &input.replace_character {
+                validate_character(character, "Selected character replacement")?;
+            }
+            if let Some(character) = &input.add_character {
+                validate_character(character, "Character addition")?;
+            }
+            let mut alias_identities = HashSet::new();
+            for alias in asset_aliases {
+                alias.validate()?;
+                if !alias_identities.insert((alias.kind.as_str(), alias.key.as_str())) {
+                    return Err(validation("Duplicate asset alias"));
+                }
+            }
+            if let Some(details) = &input.character_details {
+                validate_character_details(
+                    transaction,
+                    active,
+                    details,
+                    input.delete_character_id.as_deref(),
+                )?;
+            }
+            validate_owner_heads_for_commit(input)?;
+            if cas.is_some() {
+                prior_character_conversations(transaction, active, input)
+            } else {
+                Ok(BTreeMap::new())
+            }
+        },
+        |transaction, generation, logical, prior_character_conversations| {
+            if let Some(root) = &input.root {
+                put_root(transaction, generation, root)?;
+            }
+            if let Some(presets) = &input.replace_presets {
+                replace_presets(transaction, generation, presets)?;
+            }
+            if let Some(character_id) = &input.delete_character_id {
+                delete_character(transaction, generation, character_id)?;
+            }
+            if let Some(character) = &input.character {
+                put_character_detail(transaction, generation, character)?;
+            }
+            for detail in input.character_details.as_deref().unwrap_or_default() {
+                put_character_detail(transaction, generation, detail)?;
+            }
+            if let Some(character) = &input.replace_character {
+                replace_character(transaction, generation, character)?;
+            }
+            if let Some(character) = &input.add_character {
+                let character_id = required_string(character, "chaId", "Character addition")?;
+                if character_exists(transaction, generation, character_id)? {
+                    return Err(validation(format!(
+                        "Character {character_id} already exists"
+                    )));
+                }
+                replace_character(transaction, generation, character)?;
+            }
+            let mut conversation_changes = Vec::new();
+            let mut shifted_conversation_indices = BTreeMap::new();
+            for mutation in input.conversations.as_deref().unwrap_or_default() {
+                let (change, shifted_index) =
+                    apply_conversation_mutation(transaction, generation, mutation)?;
+                if let Some((character_id, configured_index)) = shifted_index {
+                    shifted_conversation_indices
+                        .entry(character_id)
+                        .and_modify(|current: &mut u64| *current = (*current).min(configured_index))
+                        .or_insert(configured_index);
+                }
+                super::logical_index::push_conversation_change(&mut conversation_changes, change)?;
+            }
+            for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
+                apply_plugin_storage_mutation(transaction, generation, mutation)?;
+            }
+            for alias in asset_aliases {
+                put_asset_alias(transaction, generation, alias)?;
+            }
+            replace_changed_owner_heads(transaction, generation, input)?;
+            if let Some(logical) = logical {
+                let cas = cas.ok_or_else(|| StoreError::Validation {
+                    message: "active logical index requires a payload CAS".to_owned(),
+                })?;
+                super::logical_index::maintain_incremental_logical_commit(
+                    transaction,
+                    cas,
+                    logical,
+                    input,
+                    &conversation_changes,
+                    &shifted_conversation_indices,
+                    &prior_character_conversations,
+                )?;
+                for alias in asset_aliases {
+                    super::logical_index::maintain_incremental_asset_alias(
+                        transaction,
+                        cas,
+                        logical,
+                        alias,
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )
 }
 
 fn prior_character_conversations(

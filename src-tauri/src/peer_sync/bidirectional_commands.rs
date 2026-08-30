@@ -4735,12 +4735,16 @@ impl PeerBidirectionalCommandState {
         &self,
         foreground: &AndroidForegroundKey,
     ) -> Result<bool, PeerSyncError> {
-        let runtime = self.lock()?;
-        Ok(runtime
+        let matches_target = self
+            .lock()?
             .target_foreground
             .as_ref()
-            .is_some_and(|target| target.foreground == *foreground)
-            && registry().cancel_exact(foreground))
+            .is_some_and(|target| target.foreground == *foreground);
+        // The runtime guard is dropped before cancel_exact: a registered
+        // source_stop callback runs synchronously on this thread and re-locks
+        // this non-reentrant mutex. cancel_exact keeps the exact-generation
+        // semantics through its own key equality check.
+        Ok(matches_target && registry().cancel_exact(foreground))
     }
 
     #[cfg(any(target_os = "android", test))]
@@ -4748,7 +4752,7 @@ impl PeerBidirectionalCommandState {
         &self,
         foreground: &AndroidForegroundKey,
     ) -> Result<bool, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
+        let operation = self.lock_lifecycle_operation()?;
         let mut runtime = self.lock()?;
         let Some(target) = runtime.target_foreground.as_ref() else {
             return Ok(registry().release_target_exact(foreground));
@@ -4757,6 +4761,12 @@ impl PeerBidirectionalCommandState {
             return Ok(false);
         }
         if target.phase == AndroidBidirectionalTargetPhase::Running {
+            // Both guards are dropped before cancel_exact: a registered
+            // source_stop callback runs synchronously on this thread and
+            // re-locks these non-reentrant mutexes. cancel_exact keeps the
+            // exact-generation semantics through its own key equality check.
+            drop(runtime);
+            drop(operation);
             let _ = registry().cancel_exact(foreground);
             return Ok(false);
         }

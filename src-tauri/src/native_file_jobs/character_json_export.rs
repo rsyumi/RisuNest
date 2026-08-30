@@ -441,10 +441,13 @@ mod tests {
     }
 }
 use super::content::JSON_CARD_MAX_METADATA_BYTES;
+use super::error::{
+    cancelled, destination_error_with, invalid_input, io_error, job_error, store_error,
+};
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
-use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError, StoreResult};
+use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreResult};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, write::EncoderWriter};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -1102,33 +1105,12 @@ fn finish_with_release(
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {
-    match error {
-        destination::DestinationWriteError::InvalidSource => {
-            NativeJobError::new("store-error", "character JSON source is invalid")
-        }
-        destination::DestinationWriteError::InvalidDestination => NativeJobError::new(
-            "invalid-destination",
-            "character JSON destination is invalid",
-        ),
-        destination::DestinationWriteError::Cancelled => {
-            cancelled("character JSON export cancelled before destination replacement")
-        }
-        destination::DestinationWriteError::Io { operation, source } => {
-            NativeJobError::new("destination-write-failed", format!("{operation}: {source}"))
-        }
-    }
-}
-
-fn store_error(error: StoreError) -> NativeJobError {
-    match error {
-        StoreError::RevisionConflict { .. } => {
-            NativeJobError::new("revision-conflict", error.to_string())
-        }
-        StoreError::Validation { .. } => invalid_input(error.to_string()),
-        StoreError::SnapshotReleased | StoreError::Store { .. } => {
-            NativeJobError::new("store-error", error.to_string())
-        }
-    }
+    destination_error_with(
+        error,
+        "character JSON source is invalid",
+        "character JSON destination is invalid",
+        "character JSON export cancelled before destination replacement",
+    )
 }
 
 fn json_serde_error(error: serde_json::Error) -> NativeJobError {
@@ -1145,20 +1127,4 @@ fn json_io_error(error: io::Error) -> NativeJobError {
     } else {
         io_error(error)
     }
-}
-
-fn io_error(error: io::Error) -> NativeJobError {
-    NativeJobError::new("store-error", error.to_string())
-}
-
-fn invalid_input(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("invalid-input", message)
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
-}
-
-fn job_error(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", message)
 }

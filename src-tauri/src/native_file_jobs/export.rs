@@ -1,3 +1,4 @@
+use super::error::{self, cancelled, destination_error_with, job_error};
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::persistent_store::export::{self, destination, EXPORT_CANCELLED_MESSAGE};
 use crate::persistent_store::{PreparedRisuSaveExport, StoreError};
@@ -227,47 +228,27 @@ fn finish_with_cleanup_failure(
 }
 
 fn store_error(error: StoreError) -> NativeJobError {
+    // Local override: a store-level export cancellation surfaces as
+    // "cancelled" here; everything else uses the shared mapping.
     match error {
-        StoreError::RevisionConflict { .. } => {
-            NativeJobError::new("revision-conflict", error.to_string())
-        }
         StoreError::Validation { ref message } if message == EXPORT_CANCELLED_MESSAGE => {
             cancelled(message)
         }
-        StoreError::Validation { .. } => NativeJobError::new("invalid-input", error.to_string()),
-        StoreError::SnapshotReleased | StoreError::Store { .. } => {
-            NativeJobError::new("store-error", error.to_string())
-        }
+        error => error::store_error(error),
     }
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {
-    match error {
-        destination::DestinationWriteError::InvalidSource => {
-            NativeJobError::new("invalid-source", "native export source is unavailable")
-        }
-        destination::DestinationWriteError::InvalidDestination => {
-            invalid_destination("desktop export destination is invalid")
-        }
-        destination::DestinationWriteError::Cancelled => {
-            cancelled("export cancelled before destination publication")
-        }
-        destination::DestinationWriteError::Io { operation, source } => {
-            NativeJobError::new("destination-write-failed", format!("{operation}: {source}"))
-        }
-    }
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
+    destination_error_with(
+        error,
+        "native export source is unavailable",
+        "desktop export destination is invalid",
+        "export cancelled before destination publication",
+    )
 }
 
 fn invalid_destination(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("invalid-destination", message)
-}
-
-fn job_error(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", message)
 }
 
 #[cfg(test)]

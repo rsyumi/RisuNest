@@ -125,13 +125,17 @@ impl Drop for RevisionReadLease {
     }
 }
 
+// Returns `Some(message)` when a pending restore existed but was skipped, so
+// the caller can surface the failure instead of silently opening the old
+// database. The marker is intentionally kept on failure so the restore retries
+// on the next open (pinned by the restore-marker preservation tests).
 pub(super) fn apply_pending_restore(
     persistent_dir: &Path,
     snapshots_dir: &Path,
-) -> StoreResult<()> {
+) -> StoreResult<Option<String>> {
     let marker = snapshots_dir.join(PENDING_RESTORE_FILE);
     if !marker.exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let result = (|| -> StoreResult<()> {
@@ -159,10 +163,16 @@ pub(super) fn apply_pending_restore(
     })();
 
     match result {
-        Ok(()) => fs::remove_file(&marker)?,
-        Err(error) => eprintln!("persistent snapshot restore skipped: {error}"),
+        Ok(()) => {
+            fs::remove_file(&marker)?;
+            Ok(None)
+        }
+        Err(error) => {
+            let message = format!("persistent snapshot restore skipped: {error}");
+            eprintln!("{message}");
+            Ok(Some(message))
+        }
     }
-    Ok(())
 }
 
 fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResult<PathBuf> {
@@ -521,65 +531,123 @@ pub(super) fn collect_asset_roots(
     connection: &Connection,
     cas: &PayloadCas,
 ) -> StoreResult<AssetRootSet> {
+    collect_asset_roots_scoped(connection, cas, None)
+}
+
+#[cfg(feature = "native-official-publication")]
+fn collect_asset_roots_for_generation(
+    connection: &Connection,
+    cas: &PayloadCas,
+    generation: &str,
+) -> StoreResult<AssetRootSet> {
+    collect_asset_roots_scoped(connection, cas, Some(generation))
+}
+
+// One scanner serves both the global GC-root collection and the per-generation
+// publication pinning so the two table lists can never drift apart. The global
+// scope additionally covers the logical-sync manifests and the cross-generation
+// cold-alias blocker, which are meaningless for a single generation.
+fn collect_asset_roots_scoped(
+    connection: &Connection,
+    cas: &PayloadCas,
+    generation: Option<&str>,
+) -> StoreResult<AssetRootSet> {
     let mut roots = AssetRootSet::default();
+    let scope_params: Vec<&dyn rusqlite::ToSql> = generation
+        .as_ref()
+        .map(|generation| vec![generation as &dyn rusqlite::ToSql])
+        .unwrap_or_default();
+    let scope_params = scope_params.as_slice();
+    let scoped = generation.is_some();
 
     scan_optional_hash_column(
         connection,
-        "SELECT manifest_hash FROM asset_owner_heads WHERE present = 1",
-        [],
+        if scoped {
+            "SELECT manifest_hash FROM asset_owner_heads
+         WHERE generation = ?1 AND present = 1"
+        } else {
+            "SELECT manifest_hash FROM asset_owner_heads WHERE present = 1"
+        },
+        scope_params,
         &mut roots.manifest_hashes,
     )?;
     scan_asset_alias_roots(
         connection,
-        "SELECT logical_key, object_hash FROM asset_aliases",
-        [],
+        if scoped {
+            "SELECT logical_key, object_hash FROM asset_aliases WHERE generation = ?1"
+        } else {
+            "SELECT logical_key, object_hash FROM asset_aliases"
+        },
+        scope_params,
         &mut roots,
     )?;
     let cold_aliases = scan_cold_alias_roots(
         connection,
-        "SELECT key, object_hash, size FROM cold_aliases
-         ORDER BY generation ASC, key ASC",
-        [],
+        if scoped {
+            "SELECT key, object_hash, size FROM cold_aliases
+         WHERE generation = ?1 ORDER BY key ASC"
+        } else {
+            "SELECT key, object_hash, size FROM cold_aliases
+         ORDER BY generation ASC, key ASC"
+        },
+        scope_params,
         &mut roots,
     )?;
-    let retained_generations: i64 =
-        connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
-    let has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();
-    if table_exists(connection, "logical_sync_generations")? {
-        scan_optional_hash_column(
-            connection,
-            "SELECT manifest_hash FROM logical_sync_generations WHERE state = 'complete'",
-            [],
-            &mut roots.object_hashes,
-        )?;
-    }
-    if table_exists(connection, "logical_peer_common_bases")? {
-        scan_optional_hash_column(
-            connection,
-            "SELECT manifest_hash FROM logical_peer_common_bases",
-            [],
-            &mut roots.object_hashes,
-        )?;
+    let mut has_cross_generation_cold_aliases = false;
+    if !scoped {
+        let retained_generations: i64 =
+            connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
+        has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();
+        if table_exists(connection, "logical_sync_generations")? {
+            scan_optional_hash_column(
+                connection,
+                "SELECT manifest_hash FROM logical_sync_generations WHERE state = 'complete'",
+                [],
+                &mut roots.object_hashes,
+            )?;
+        }
+        if table_exists(connection, "logical_peer_common_bases")? {
+            scan_optional_hash_column(
+                connection,
+                "SELECT manifest_hash FROM logical_peer_common_bases",
+                [],
+                &mut roots.object_hashes,
+            )?;
+        }
     }
 
-    for query in [
-        "SELECT value FROM root",
-        "SELECT value FROM bot_presets",
-        "SELECT detail FROM characters",
-        "SELECT detail FROM conversations",
-        "SELECT value FROM messages",
-        "SELECT value FROM plugin_storage",
+    for (table, column) in [
+        ("root", "value"),
+        ("bot_presets", "value"),
+        ("characters", "detail"),
+        ("conversations", "detail"),
+        ("messages", "value"),
+        ("plugin_storage", "value"),
     ] {
-        scan_json_column(connection, query, [], &mut roots)?;
+        let query = if scoped {
+            format!("SELECT {column} FROM {table} WHERE generation = ?1")
+        } else {
+            format!("SELECT {column} FROM {table}")
+        };
+        scan_json_column(connection, &query, scope_params, &mut roots)?;
     }
-    for query in [
-        "SELECT image FROM bot_presets WHERE image IS NOT NULL",
-        "SELECT image FROM characters WHERE image IS NOT NULL",
-    ] {
-        scan_text_column(connection, query, [], &mut roots)?;
+    for table in ["bot_presets", "characters"] {
+        let query = if scoped {
+            format!("SELECT image FROM {table} WHERE generation = ?1 AND image IS NOT NULL")
+        } else {
+            format!("SELECT image FROM {table} WHERE image IS NOT NULL")
+        };
+        scan_text_column(connection, &query, scope_params, &mut roots)?;
     }
-    let plugin_rows: i64 =
-        connection.query_row("SELECT COUNT(*) FROM plugin_storage", [], |row| row.get(0))?;
+    let plugin_rows: i64 = connection.query_row(
+        if scoped {
+            "SELECT COUNT(*) FROM plugin_storage WHERE generation = ?1"
+        } else {
+            "SELECT COUNT(*) FROM plugin_storage"
+        },
+        scope_params,
+        |row| row.get(0),
+    )?;
     if plugin_rows > 0 {
         roots.blockers.insert("plugin-storage-opaque".to_owned());
         roots.retain_all_objects = true;
@@ -591,67 +659,6 @@ pub(super) fn collect_asset_roots(
         roots.blockers.insert("cold-payload-unscanned".to_owned());
         roots.retain_all_objects = true;
     }
-    if !roots.cold_keys.is_empty() {
-        roots.blockers.insert("cold-payload-unscanned".to_owned());
-        roots.retain_all_objects = true;
-    }
-    Ok(roots)
-}
-
-#[cfg(feature = "native-official-publication")]
-fn collect_asset_roots_for_generation(
-    connection: &Connection,
-    cas: &PayloadCas,
-    generation: &str,
-) -> StoreResult<AssetRootSet> {
-    let mut roots = AssetRootSet::default();
-
-    scan_optional_hash_column(
-        connection,
-        "SELECT manifest_hash FROM asset_owner_heads
-         WHERE generation = ?1 AND present = 1",
-        [generation],
-        &mut roots.manifest_hashes,
-    )?;
-    scan_asset_alias_roots(
-        connection,
-        "SELECT logical_key, object_hash FROM asset_aliases WHERE generation = ?1",
-        [generation],
-        &mut roots,
-    )?;
-    let cold_aliases = scan_cold_alias_roots(
-        connection,
-        "SELECT key, object_hash, size FROM cold_aliases
-         WHERE generation = ?1 ORDER BY key ASC",
-        [generation],
-        &mut roots,
-    )?;
-    for query in [
-        "SELECT value FROM root WHERE generation = ?1",
-        "SELECT value FROM bot_presets WHERE generation = ?1",
-        "SELECT detail FROM characters WHERE generation = ?1",
-        "SELECT detail FROM conversations WHERE generation = ?1",
-        "SELECT value FROM messages WHERE generation = ?1",
-        "SELECT value FROM plugin_storage WHERE generation = ?1",
-    ] {
-        scan_json_column(connection, query, [generation], &mut roots)?;
-    }
-    for query in [
-        "SELECT image FROM bot_presets WHERE generation = ?1 AND image IS NOT NULL",
-        "SELECT image FROM characters WHERE generation = ?1 AND image IS NOT NULL",
-    ] {
-        scan_text_column(connection, query, [generation], &mut roots)?;
-    }
-    let plugin_rows: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM plugin_storage WHERE generation = ?1",
-        [generation],
-        |row| row.get(0),
-    )?;
-    if plugin_rows > 0 {
-        roots.blockers.insert("plugin-storage-opaque".to_owned());
-        roots.retain_all_objects = true;
-    }
-    resolve_nested_cold_roots(cas, cold_aliases, &mut roots)?;
     if !roots.cold_keys.is_empty() {
         roots.blockers.insert("cold-payload-unscanned".to_owned());
         roots.retain_all_objects = true;

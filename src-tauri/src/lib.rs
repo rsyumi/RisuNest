@@ -785,10 +785,36 @@ fn header_map_to_json(header_map: &HeaderMap) -> serde_json::Value {
     for (key, value) in header_map {
         map.insert(
             key.as_str().to_string(),
-            value.to_str().unwrap().to_string(),
+            String::from_utf8_lossy(value.as_bytes()).into_owned(),
         );
     }
     json!(map)
+}
+
+#[cfg(test)]
+mod header_map_tests {
+    use super::*;
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    #[test]
+    fn header_map_to_json_does_not_panic_on_non_ascii_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-disposition"),
+            HeaderValue::from_bytes("attachment; filename=\"캐릭터.png\"".as_bytes()).unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_static("x-latin1"),
+            HeaderValue::from_bytes(&[0xE9, 0x74, 0xE9]).unwrap(),
+        );
+        let json = header_map_to_json(&headers);
+        assert_eq!(
+            json["content-disposition"],
+            "attachment; filename=\"캐릭터.png\""
+        );
+        // Invalid UTF-8 bytes degrade to replacement characters instead of panicking.
+        assert_eq!(json["x-latin1"], "\u{FFFD}t\u{FFFD}");
+    }
 }
 
 #[cfg(all(test, desktop))]

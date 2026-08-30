@@ -1,10 +1,13 @@
 use super::charx::CharXLimits;
+use super::error::{
+    cancelled, destination_error_with, invalid_input, io_error, job_error, store_error,
+};
 use super::{
     CharacterCharxContainer, JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
 };
 use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
-use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError, StoreResult};
+use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreResult};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -1015,53 +1018,16 @@ fn finish_with_release(
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {
-    match error {
-        destination::DestinationWriteError::InvalidSource => {
-            NativeJobError::new("invalid-source", "character CharX source is unavailable")
-        }
-        destination::DestinationWriteError::InvalidDestination => NativeJobError::new(
-            "invalid-destination",
-            "character CharX destination is invalid",
-        ),
-        destination::DestinationWriteError::Cancelled => {
-            cancelled("character CharX export cancelled before destination replacement")
-        }
-        destination::DestinationWriteError::Io { operation, source } => {
-            NativeJobError::new("destination-write-failed", format!("{operation}: {source}"))
-        }
-    }
-}
-
-fn store_error(error: StoreError) -> NativeJobError {
-    match error {
-        StoreError::RevisionConflict { .. } => {
-            NativeJobError::new("revision-conflict", error.to_string())
-        }
-        StoreError::Validation { .. } => invalid_input(error.to_string()),
-        StoreError::SnapshotReleased | StoreError::Store { .. } => {
-            NativeJobError::new("store-error", error.to_string())
-        }
-    }
-}
-
-fn io_error(error: std::io::Error) -> NativeJobError {
-    NativeJobError::new("store-error", error.to_string())
+    destination_error_with(
+        error,
+        "character CharX source is unavailable",
+        "character CharX destination is invalid",
+        "character CharX export cancelled before destination replacement",
+    )
 }
 
 fn zip_error(error: zip::result::ZipError) -> NativeJobError {
     NativeJobError::new("store-error", error.to_string())
-}
-
-fn invalid_input(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("invalid-input", message)
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
-}
-
-fn job_error(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", message)
 }
 
 #[cfg(test)]
@@ -1072,7 +1038,7 @@ mod tests {
     use crate::native_file_jobs::{CharacterCharxContainer, JobKind, JobRegistry};
     use crate::persistent_store::{
         AssetAlias, AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState,
-        PersistentStore,
+        PersistentStore, StoreError,
     };
     use serde_json::json;
     use std::cell::Cell;

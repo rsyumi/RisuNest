@@ -1,15 +1,18 @@
+use super::error::{
+    cancelled, destination_error_with, invalid_input, io_error, job_error, store_error,
+};
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::asset_repository::owner_manifest_codec::OwnerManifestEntry;
 use crate::asset_repository::PayloadCas;
 use crate::persistent_store::{
     export::{self, destination},
-    PreparedRisuSaveExport, RevisionReadLease, StoreError, StoreResult,
+    PreparedRisuSaveExport, RevisionReadLease, StoreResult,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -428,48 +431,12 @@ fn finish_with_release(
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {
-    match error {
-        destination::DestinationWriteError::InvalidSource => {
-            NativeJobError::new("store-error", "RISUM source is invalid")
-        }
-        destination::DestinationWriteError::InvalidDestination => {
-            NativeJobError::new("invalid-destination", "RISUM destination is invalid")
-        }
-        destination::DestinationWriteError::Cancelled => {
-            cancelled("RISUM export cancelled before destination replacement")
-        }
-        destination::DestinationWriteError::Io { operation, source } => {
-            NativeJobError::new("destination-write-failed", format!("{operation}: {source}"))
-        }
-    }
-}
-
-fn store_error(error: StoreError) -> NativeJobError {
-    match error {
-        StoreError::RevisionConflict { .. } => {
-            NativeJobError::new("revision-conflict", error.to_string())
-        }
-        StoreError::Validation { .. } => invalid_input(error.to_string()),
-        StoreError::SnapshotReleased | StoreError::Store { .. } => {
-            NativeJobError::new("store-error", error.to_string())
-        }
-    }
-}
-
-fn job_error(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", message)
-}
-
-fn invalid_input(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("invalid-input", message)
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
-}
-
-fn io_error(error: io::Error) -> NativeJobError {
-    NativeJobError::new("io-error", error.to_string())
+    destination_error_with(
+        error,
+        "RISUM source is invalid",
+        "RISUM destination is invalid",
+        "RISUM export cancelled before destination replacement",
+    )
 }
 
 #[cfg(test)]

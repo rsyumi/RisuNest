@@ -1,3 +1,4 @@
+use super::error::{self, cancelled, invalid_input};
 use super::{
     JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
     OfficialPublicationAttemptResult, OfficialPublicationCredential, OfficialPublicationJobRequest,
@@ -734,19 +735,15 @@ fn job_control_error(job: &JobControl, error: impl AsRef<str>) -> NativeJobError
 }
 
 fn store_error(error: StoreError) -> NativeJobError {
+    // Local override: a store-level export cancellation surfaces as
+    // "cancelled" here; everything else uses the shared mapping.
     match error {
-        StoreError::RevisionConflict { .. } => {
-            NativeJobError::new("revision-conflict", error.to_string())
-        }
         StoreError::Validation { ref message }
             if message == crate::persistent_store::export::EXPORT_CANCELLED_MESSAGE =>
         {
             cancelled("official publication export was cancelled")
         }
-        StoreError::Validation { .. } => NativeJobError::new("invalid-input", error.to_string()),
-        StoreError::SnapshotReleased | StoreError::Store { .. } => {
-            NativeJobError::new("store-error", error.to_string())
-        }
+        error => error::store_error(error),
     }
 }
 
@@ -761,14 +758,6 @@ fn transport_error(error: reqwest::Error) -> NativeJobError {
         "official publication network request failed"
     };
     NativeJobError::new("transport-failed", message)
-}
-
-fn invalid_input(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("invalid-input", message)
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
 }
 
 fn now_millis() -> i64 {

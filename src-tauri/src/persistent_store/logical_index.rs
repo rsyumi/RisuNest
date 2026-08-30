@@ -416,13 +416,6 @@ impl PersistentStore {
             generation: active_generation(&transaction)?,
         };
         nonnegative_u64(target.revision, "source revision")?;
-        let active_pds_generation = super::active_generation(&transaction)?;
-        let active_revision = super::current_revision(&transaction)?;
-        if target.generation != active_pds_generation || target.revision != active_revision {
-            return validation(
-                "logical head initialization requires the current active PDS revision",
-            );
-        }
         let already_exists: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM logical_sync_generations
@@ -1030,7 +1023,10 @@ pub(super) fn detach_logical_head_for_full_replace(
     Ok(())
 }
 
-fn increment_decimal(value: &str) -> StoreResult<String> {
+// Canonical-decimal sequence increment shared by the local head advance and
+// the sync merge path (logical_delta_target). The result is capped at 64
+// characters so overflow fails here instead of through the schema CHECK.
+pub(super) fn increment_decimal(value: &str) -> StoreResult<String> {
     if value.is_empty()
         || value.bytes().any(|byte| !byte.is_ascii_digit())
         || (value.len() > 1 && value.starts_with('0'))
@@ -1048,6 +1044,9 @@ fn increment_decimal(value: &str) -> StoreResult<String> {
             });
         }
         bytes[index] = b'0';
+    }
+    if bytes.len() == 64 {
+        return validation("logical generation sequence overflow");
     }
     let mut result = Vec::with_capacity(bytes.len() + 1);
     result.push(b'1');

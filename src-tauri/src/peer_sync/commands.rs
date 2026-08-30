@@ -466,6 +466,35 @@ pub struct PeerCloneCommandState {
     tunnel_launcher: Arc<dyn SourceTunnelLauncher>,
 }
 
+// Clears source_preparing on drop so a panic (or any early return) in the
+// prepare path cannot wedge every later prepare with "already prepared"
+// until app restart. Disarm on the paths that consume the flag under the
+// runtime lock.
+struct SourcePrepareGuard<'a> {
+    runtime: &'a Mutex<PeerCloneRuntime>,
+    armed: bool,
+}
+
+impl SourcePrepareGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SourcePrepareGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Recover a poisoned lock: resetting the plain bool is always safe,
+        // and skipping it would wedge the prepare lane permanently.
+        self.runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .source_preparing = false;
+    }
+}
+
 impl Default for PeerCloneCommandState {
     fn default() -> Self {
         Self {
@@ -609,6 +638,10 @@ impl PeerCloneCommandState {
             runtime.source_preparing = true;
             runtime.source_recovery_error.is_some()
         };
+        let prepare_guard = SourcePrepareGuard {
+            runtime: &self.runtime,
+            armed: true,
+        };
 
         if retry_recovery {
             match recover_source(peer_root) {
@@ -617,15 +650,16 @@ impl PeerCloneCommandState {
                     runtime.source_preparing = false;
                     runtime.source_recovery_error = None;
                     runtime.source = Some(source);
-                    return source_status(&mut runtime);
+                    let status = source_status(&mut runtime);
+                    drop(runtime);
+                    prepare_guard.disarm();
+                    return status;
                 }
                 Ok(None) => {
                     self.lock_runtime()?.source_recovery_error = None;
                 }
                 Err(error) => {
-                    let mut runtime = self.lock_runtime()?;
-                    runtime.source_preparing = false;
-                    runtime.source_recovery_error = Some(error.to_string());
+                    self.lock_runtime()?.source_recovery_error = Some(error.to_string());
                     return Err(error);
                 }
             }
@@ -654,8 +688,6 @@ impl PeerCloneCommandState {
             Ok(prepared) => prepared,
             Err(error) => {
                 let cleanup = remove_directory_if_exists(&session_root);
-                let mut runtime = self.lock_runtime()?;
-                runtime.source_preparing = false;
                 return match cleanup {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(PeerSyncError::Storage(format!(
@@ -670,8 +702,6 @@ impl PeerCloneCommandState {
         let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
         if let Err(error) = write_active_source_marker(&marker_path, &marker) {
             let cleanup = remove_directory_if_exists(&session_root);
-            let mut runtime = self.lock_runtime()?;
-            runtime.source_preparing = false;
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(PeerSyncError::Storage(format!(
@@ -702,7 +732,10 @@ impl PeerCloneCommandState {
             #[cfg(test)]
             fail_cleanup_once: false,
         });
-        source_status(&mut runtime)
+        let status = source_status(&mut runtime);
+        drop(runtime);
+        prepare_guard.disarm();
+        status
     }
 
     pub fn start_source(

@@ -299,13 +299,13 @@ fn transport_error(error: reqwest::Error) -> NativeJobError {
     NativeJobError::new("network-error", error.to_string())
 }
 
+// Local override: snapshot spool IO failures keep the "store-error" code the
+// snapshot job protocol already reports, unlike the shared "io-error".
 fn store_error(error: std::io::Error) -> NativeJobError {
     NativeJobError::new("store-error", error.to_string())
 }
 
-fn job_state_error(error: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", error.as_ref())
-}
+use super::error::job_error as job_state_error;
 
 #[cfg(test)]
 mod tests {

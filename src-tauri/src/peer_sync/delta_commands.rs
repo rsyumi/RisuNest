@@ -69,24 +69,7 @@ pub fn peer_delta_capabilities() -> PeerDeltaCapabilities {
 }
 
 #[cfg(target_os = "android")]
-fn acquire_foreground(
-    key: &AndroidForegroundKey,
-    lane: AndroidForegroundLane,
-) -> Result<super::android_foreground::AndroidCancellationProbe, String> {
-    if key.lane != lane {
-        return Err("Android foreground lane is not allowed".to_owned());
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(cancellation) = registry().acquire_exact(key) {
-            return Ok(cancellation);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("Android foreground service did not attach".to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
+use super::android_foreground::acquire_foreground_lane as acquire_foreground;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -490,13 +473,19 @@ impl PeerDeltaCommandState {
         &self,
         foreground: &AndroidForegroundKey,
     ) -> Result<bool, PeerSyncError> {
-        let runtime = self.lock()?;
-        let Some(target) = runtime.target_foreground.as_ref() else {
-            return Ok(false);
-        };
-        if target.foreground != *foreground {
-            return Ok(false);
+        {
+            let runtime = self.lock()?;
+            let Some(target) = runtime.target_foreground.as_ref() else {
+                return Ok(false);
+            };
+            if target.foreground != *foreground {
+                return Ok(false);
+            }
         }
+        // The runtime guard is dropped before cancel_exact: a registered
+        // source_stop callback runs synchronously on this thread and
+        // re-locks this non-reentrant mutex. cancel_exact keeps the
+        // exact-generation semantics through its own key equality check.
         Ok(registry().cancel_exact(foreground))
     }
 
@@ -512,7 +501,7 @@ impl PeerDeltaCommandState {
         &self,
         foreground: &AndroidForegroundKey,
     ) -> Result<bool, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
+        let operation = self.lock_lifecycle_operation()?;
         let mut runtime = self.lock()?;
         let Some(target) = runtime.target_foreground.as_ref() else {
             return Ok(registry().release_target_exact(foreground));
@@ -521,6 +510,12 @@ impl PeerDeltaCommandState {
             return Ok(false);
         }
         if target.phase == AndroidTargetForegroundPhase::Running {
+            // Both guards are dropped before cancel_exact: a registered
+            // source_stop callback runs synchronously on this thread and
+            // re-locks these non-reentrant mutexes. cancel_exact keeps the
+            // exact-generation semantics through its own key equality check.
+            drop(runtime);
+            drop(operation);
             let _ = registry().cancel_exact(foreground);
             return Ok(false);
         }
@@ -1001,6 +996,34 @@ struct PullGuard {
     state: PeerDeltaCommandState,
 }
 
+// Clears source_preparing on drop (mirroring PullGuard) so a panic in the
+// prepare path cannot wedge every later prepare with "already prepared"
+// until app restart. Disarm once the flag has been consumed.
+struct SourcePrepareGuard<'a> {
+    runtime: &'a Mutex<PeerDeltaRuntime>,
+    armed: bool,
+}
+
+impl SourcePrepareGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SourcePrepareGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Recover a poisoned lock: resetting the plain bool is always safe,
+        // and skipping it would wedge the prepare lane permanently.
+        self.runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .source_preparing = false;
+    }
+}
+
 struct AbortUnsealedJobOnDrop<'a>(&'a RefCell<DurableCasJob>);
 
 impl Drop for AbortUnsealedJobOnDrop<'_> {
@@ -1460,6 +1483,10 @@ pub async fn peer_delta_prepare(
             }
             runtime.source_preparing = true;
         }
+        let guard = SourcePrepareGuard {
+            runtime: &state.runtime,
+            armed: true,
+        };
         let prepared = (|| {
             let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
             let built = persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1483,10 +1510,10 @@ pub async fn peer_delta_prepare(
                 .install_source(session, &source_device_id, built.manifest_bytes)
                 .map_err(|error| error.to_string())
         })();
-        if prepared.is_err() {
-            if let Ok(mut runtime) = state.runtime.lock() {
-                runtime.source_preparing = false;
-            }
+        if prepared.is_ok() {
+            // install_source consumed the flag atomically with publishing the
+            // prepared source.
+            guard.disarm();
         }
         prepared
     })
@@ -1561,7 +1588,7 @@ pub async fn peer_delta_start(
     session_id: String,
     foreground: AndroidForegroundKey,
 ) -> Result<PeerDeltaSourceStatus, String> {
-    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Source)?;
+    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Source).await?;
     let address = super::android_source_commands::discover_private_lan_address()?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1756,7 +1783,7 @@ pub async fn peer_delta_pull(
     expected_revision: i64,
     foreground: AndroidForegroundKey,
 ) -> Result<PeerDeltaPullResult, String> {
-    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target)?;
+    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target).await?;
     let state_owner = state.inner().clone();
     state_owner
         .mark_target_running_exact(&foreground)

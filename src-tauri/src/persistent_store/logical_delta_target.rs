@@ -34,44 +34,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const PDS_GENERATION_TABLES: &[(&str, &str)] = &[
-    ("root", "value"),
-    (
-        "bot_presets",
-        "preset_id, configured_index, name, image, value",
-    ),
-    (
-        "characters",
-        "character_id, configured_index, recent_at, trashed, name, image, conversation_count, type, creator_notes, trash_time, detail",
-    ),
-    (
-        "conversations",
-        "character_id, conversation_id, configured_index, recent_at, name, message_count, detail",
-    ),
-    (
-        "messages",
-        "character_id, conversation_id, message_index, message_id, value",
-    ),
-    (
-        "plugin_storage",
-        "storage_key, byte_size, ordinal, value",
-    ),
-    (
-        "asset_aliases",
-        "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata",
-    ),
-    (
-        "asset_alias_replacement_candidates",
-        "kind, logical_key, object_hash, byte_size",
-    ),
-    (
-        "asset_owner_heads",
-        "owner_kind, owner_locator, present, manifest_hash, entry_count",
-    ),
-    ("asset_repository_authority", "value"),
-    ("cold_payload_authority", "value"),
-    ("cold_aliases", "key, object_hash, size, metadata"),
-];
+// Staged clone/move/delete must cover exactly the same generation-scoped record
+// families as the canonical list; reference it so the two can never diverge.
+use super::GENERATION_TABLES as PDS_GENERATION_TABLES;
 
 pub(crate) struct PersistentLogicalDeltaTarget<'a> {
     store: &'a mut PersistentStore,
@@ -346,208 +311,162 @@ pub(crate) fn establish_logical_common_base(
     transaction.commit().map_err(sql_error)
 }
 
+// Generates the public constructor family for PersistentLogicalDeltaTarget.
+// Every constructor is a fixed point on the durable-job x conflict-policy x
+// activation-mode axes and forwards to new_inner; the table below is the
+// single place those axes are enumerated.
+macro_rules! logical_delta_target_constructor {
+    ($name:ident, policy: $policy:expr, mode: $mode:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn $name(
+            store: &'a mut PersistentStore,
+            cas: &'a PayloadCas,
+            peer_id: &str,
+            library_id: &str,
+            local_generation_id: &str,
+            remote_manifest_bytes: &[u8],
+            staging_root: &Path,
+        ) -> Result<Self, PeerSyncError> {
+            Self::new_inner(
+                store,
+                cas,
+                peer_id,
+                library_id,
+                local_generation_id,
+                remote_manifest_bytes,
+                staging_root,
+                None,
+                $policy,
+                $mode,
+            )
+        }
+    };
+    ($name:ident, policy_param, mode: $mode:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn $name(
+            store: &'a mut PersistentStore,
+            cas: &'a PayloadCas,
+            peer_id: &str,
+            library_id: &str,
+            local_generation_id: &str,
+            remote_manifest_bytes: &[u8],
+            staging_root: &Path,
+            conflict_policy: LogicalDeltaConflictPolicy,
+        ) -> Result<Self, PeerSyncError> {
+            Self::new_inner(
+                store,
+                cas,
+                peer_id,
+                library_id,
+                local_generation_id,
+                remote_manifest_bytes,
+                staging_root,
+                None,
+                conflict_policy,
+                $mode,
+            )
+        }
+    };
+    ($name:ident, durable_job, policy: $policy:expr, mode: $mode:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn $name(
+            store: &'a mut PersistentStore,
+            cas: &'a PayloadCas,
+            peer_id: &str,
+            library_id: &str,
+            local_generation_id: &str,
+            remote_manifest_bytes: &[u8],
+            staging_root: &Path,
+            durable_job: &'a RefCell<DurableCasJob>,
+        ) -> Result<Self, PeerSyncError> {
+            Self::new_inner(
+                store,
+                cas,
+                peer_id,
+                library_id,
+                local_generation_id,
+                remote_manifest_bytes,
+                staging_root,
+                Some(durable_job),
+                $policy,
+                $mode,
+            )
+        }
+    };
+    ($name:ident, durable_job, policy_param, mode: $mode:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn $name(
+            store: &'a mut PersistentStore,
+            cas: &'a PayloadCas,
+            peer_id: &str,
+            library_id: &str,
+            local_generation_id: &str,
+            remote_manifest_bytes: &[u8],
+            staging_root: &Path,
+            durable_job: &'a RefCell<DurableCasJob>,
+            conflict_policy: LogicalDeltaConflictPolicy,
+        ) -> Result<Self, PeerSyncError> {
+            Self::new_inner(
+                store,
+                cas,
+                peer_id,
+                library_id,
+                local_generation_id,
+                remote_manifest_bytes,
+                staging_root,
+                Some(durable_job),
+                conflict_policy,
+                $mode,
+            )
+        }
+    };
+}
+
 impl<'a> PersistentLogicalDeltaTarget<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            None,
-            LogicalDeltaConflictPolicy::Reject,
-            LogicalDeltaActivationMode::AdvanceRemoteBase,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_conflict_policy(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        conflict_policy: LogicalDeltaConflictPolicy,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            None,
-            conflict_policy,
-            LogicalDeltaActivationMode::AdvanceRemoteBase,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_durable_job(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        durable_job: &'a RefCell<DurableCasJob>,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            Some(durable_job),
-            LogicalDeltaConflictPolicy::Reject,
-            LogicalDeltaActivationMode::AdvanceRemoteBase,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_durable_job_and_conflict_policy(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        durable_job: &'a RefCell<DurableCasJob>,
-        conflict_policy: LogicalDeltaConflictPolicy,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            Some(durable_job),
-            conflict_policy,
-            LogicalDeltaActivationMode::AdvanceRemoteBase,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_p5_deferred(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        conflict_policy: LogicalDeltaConflictPolicy,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            None,
-            conflict_policy,
-            LogicalDeltaActivationMode::DeferPeerState,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_p5_deferred_with_durable_job(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        durable_job: &'a RefCell<DurableCasJob>,
-        conflict_policy: LogicalDeltaConflictPolicy,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            Some(durable_job),
-            conflict_policy,
-            LogicalDeltaActivationMode::DeferPeerState,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_p5_remote_shared_ack(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        conflict_policy: LogicalDeltaConflictPolicy,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            None,
-            conflict_policy,
-            LogicalDeltaActivationMode::AdvanceSharedAck,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_p5_remote_shared_ack_with_durable_job(
-        store: &'a mut PersistentStore,
-        cas: &'a PayloadCas,
-        peer_id: &str,
-        library_id: &str,
-        local_generation_id: &str,
-        remote_manifest_bytes: &[u8],
-        staging_root: &Path,
-        durable_job: &'a RefCell<DurableCasJob>,
-        conflict_policy: LogicalDeltaConflictPolicy,
-    ) -> Result<Self, PeerSyncError> {
-        Self::new_inner(
-            store,
-            cas,
-            peer_id,
-            library_id,
-            local_generation_id,
-            remote_manifest_bytes,
-            staging_root,
-            Some(durable_job),
-            conflict_policy,
-            LogicalDeltaActivationMode::AdvanceSharedAck,
-        )
-    }
+    logical_delta_target_constructor!(
+        new,
+        policy: LogicalDeltaConflictPolicy::Reject,
+        mode: LogicalDeltaActivationMode::AdvanceRemoteBase
+    );
+    logical_delta_target_constructor!(
+        new_with_conflict_policy,
+        policy_param,
+        mode: LogicalDeltaActivationMode::AdvanceRemoteBase
+    );
+    logical_delta_target_constructor!(
+        new_with_durable_job,
+        durable_job,
+        policy: LogicalDeltaConflictPolicy::Reject,
+        mode: LogicalDeltaActivationMode::AdvanceRemoteBase
+    );
+    logical_delta_target_constructor!(
+        new_with_durable_job_and_conflict_policy,
+        durable_job,
+        policy_param,
+        mode: LogicalDeltaActivationMode::AdvanceRemoteBase
+    );
+    logical_delta_target_constructor!(
+        new_p5_deferred,
+        policy_param,
+        mode: LogicalDeltaActivationMode::DeferPeerState
+    );
+    logical_delta_target_constructor!(
+        new_p5_deferred_with_durable_job,
+        durable_job,
+        policy_param,
+        mode: LogicalDeltaActivationMode::DeferPeerState
+    );
+    logical_delta_target_constructor!(
+        new_p5_remote_shared_ack,
+        policy_param,
+        mode: LogicalDeltaActivationMode::AdvanceSharedAck
+    );
+    logical_delta_target_constructor!(
+        new_p5_remote_shared_ack_with_durable_job,
+        durable_job,
+        policy_param,
+        mode: LogicalDeltaActivationMode::AdvanceSharedAck
+    );
 
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
@@ -2377,27 +2296,10 @@ fn validate_same_generation_identity(
 }
 
 fn increment_generation_sequence(sequence: &str) -> Result<String, PeerSyncError> {
-    let mut bytes = sequence.as_bytes().to_vec();
-    let mut carry = true;
-    for digit in bytes.iter_mut().rev() {
-        if !carry {
-            break;
-        }
-        if *digit == b'9' {
-            *digit = b'0';
-        } else {
-            *digit += 1;
-            carry = false;
-        }
-    }
-    if carry {
-        if bytes.len() == 64 {
-            return validation("logical generation sequence overflow");
-        }
-        bytes.insert(0, b'1');
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| PeerSyncError::Validation("logical generation sequence is invalid".to_owned()))
+    // Delegates to the canonical shared increment, which also validates
+    // canonical-decimal input and enforces the 64-character schema cap.
+    super::logical_index::increment_decimal(sequence)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))
 }
 
 fn merged_generation_sequence(local: &str, remote: &str) -> Result<String, PeerSyncError> {
@@ -2450,87 +2352,24 @@ fn derive_exact_three_way_plan(
     local: &LogicalManifest,
     remote: &LogicalManifest,
 ) -> Result<(Vec<LogicalDeltaApplyOperation>, Vec<String>, Vec<String>), PeerSyncError> {
-    let mut positions = [0_usize; 3];
-    let manifests = [base, local, remote];
-    let mut apply = Vec::new();
-    let mut preserve = Vec::new();
-    let mut candidates = BTreeSet::new();
-
-    while positions
-        .iter()
-        .enumerate()
-        .any(|(index, position)| *position < manifests[index].records.len())
-    {
-        let key = manifests
-            .iter()
-            .enumerate()
-            .filter_map(|(index, manifest)| manifest.records.get(positions[index]))
-            .map(LogicalManifestRecord::key)
-            .min()
-            .expect("at least one manifest record remains");
-        let mut triple: [Option<&LogicalManifestRecord>; 3] = [None, None, None];
-        for (index, manifest) in manifests.iter().enumerate() {
-            if manifest
-                .records
-                .get(positions[index])
-                .is_some_and(|record| record.key() == key)
-            {
-                triple[index] = manifest.records.get(positions[index]);
-                positions[index] += 1;
-            }
-        }
-        let [base_record, local_record, remote_record] = triple;
-        if matches!(base_record, Some(LogicalManifestRecord::Tombstone(_)))
-            && (!matches!(local_record, Some(LogicalManifestRecord::Tombstone(_)))
-                || !matches!(remote_record, Some(LogicalManifestRecord::Tombstone(_))))
-        {
-            return validation(format!(
-                "logical delta descendant must retain base tombstone {key}"
-            ));
-        }
-        if base_record.is_some() && (local_record.is_none() || remote_record.is_none()) {
-            return validation(format!(
-                "logical delta descendant must retain or tombstone base record {key}"
-            ));
-        }
-        let local_changed = local_record != base_record;
-        let remote_changed = remote_record != base_record;
-        if !local_changed && !remote_changed {
-            continue;
-        }
-        if local_changed && remote_changed {
-            if local_record == remote_record {
-                continue;
-            }
-            return Err(PeerSyncError::LogicalMergeConflict {
-                record: key.to_owned(),
-            });
-        }
-        if local_changed {
-            preserve.push(key.to_owned());
-            continue;
-        }
-        match remote_record {
-            Some(LogicalManifestRecord::Live(record)) => {
-                apply.push(LogicalDeltaApplyOperation::Put {
-                    key: record.key.clone(),
-                    object_hash: record.object_hash.clone(),
-                    dependencies: record.dependencies.clone(),
-                });
-                candidates.insert(record.object_hash.clone());
-                candidates.extend(record.dependencies.iter().cloned());
-            }
-            Some(LogicalManifestRecord::Tombstone(record)) => {
-                apply.push(LogicalDeltaApplyOperation::Delete {
-                    key: record.key.clone(),
-                    deleted_generation_sequence: record.deleted_generation_sequence.clone(),
-                });
-            }
-            None => {}
-        }
+    // One shared walker serves both the exact and the policy variants so the
+    // merge rules cannot drift; the exact variant simply refuses the first
+    // recorded conflict. The policy walker keeps walking after a conflict, so
+    // a manifest that also contains a later structural violation surfaces
+    // that validation error instead of the conflict - both are fail-closed
+    // rejections of the same invalid input.
+    let plan =
+        derive_policy_three_way_plan(base, local, remote, LogicalDeltaConflictPolicy::Reject)?;
+    if let Some(conflict) = plan.conflicts.into_iter().next() {
+        return Err(PeerSyncError::LogicalMergeConflict {
+            record: conflict.record,
+        });
     }
-
-    Ok((apply, preserve, candidates.into_iter().collect()))
+    Ok((
+        plan.apply,
+        plan.preserve_local_keys,
+        plan.candidate_object_hashes,
+    ))
 }
 
 fn exact_merged_content(

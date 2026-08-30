@@ -64,11 +64,8 @@ impl<'a> AssetObjectCatalog<'a> {
                 )
                 .optional()?;
             if let Some((deleted_size, physical_key)) = tombstone {
-                let expected_key = format!(
-                    "assets-v2/objects/{}/{}",
-                    &object.object_hash[..2],
-                    &object.object_hash[2..]
-                );
+                let expected_key =
+                    crate::asset_repository::object_physical_key(&object.object_hash);
                 if deleted_size != byte_size || physical_key != expected_key {
                     return validation(
                         "asset object deletion tombstone conflicts with the recreated object",
@@ -221,11 +218,7 @@ pub(super) fn cursor_has_successor(connection: &Connection, value: &str) -> Stor
 }
 
 fn validate_hash(hash: &str) -> StoreResult<()> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if super::is_lowercase_sha256_hex(hash) {
         return Ok(());
     }
     validation("asset object hash must be a lowercase SHA-256 hash")

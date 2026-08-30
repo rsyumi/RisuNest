@@ -1,3 +1,4 @@
+use super::error::{cancelled, destination_error_with, job_error as job_state_error};
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError, OpenedJobSource};
 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
 use crate::asset_repository::PayloadCas;
@@ -495,31 +496,18 @@ fn lossless_operation_error(error: LosslessError) -> NativeJobError {
 }
 
 fn destination_error(error: DestinationWriteError) -> NativeJobError {
-    match error {
-        DestinationWriteError::InvalidSource => {
-            NativeJobError::new("invalid-source", "verified lossless archive is unavailable")
-        }
-        DestinationWriteError::InvalidDestination => NativeJobError::new(
-            "invalid-destination",
-            "lossless backup destination is invalid",
-        ),
-        DestinationWriteError::Cancelled => cancelled("lossless backup publication was cancelled"),
-        DestinationWriteError::Io { operation, source } => {
-            NativeJobError::new("destination-write-failed", format!("{operation}: {source}"))
-        }
-    }
+    destination_error_with(
+        error,
+        "verified lossless archive is unavailable",
+        "lossless backup destination is invalid",
+        "lossless backup publication was cancelled",
+    )
 }
 
-fn job_state_error(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", message)
-}
-
+// Local override: lossless job IO failures keep the "store-error" code the
+// lossless job protocol already reports, unlike the shared "io-error".
 fn io_store_error(error: std::io::Error) -> NativeJobError {
     NativeJobError::new("store-error", error.to_string())
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
 }
 
 fn now_millis() -> i64 {

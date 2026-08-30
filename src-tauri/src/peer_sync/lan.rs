@@ -35,6 +35,18 @@ use std::{
 
 #[cfg(any(desktop, target_os = "android"))]
 const CLAIM_TTL: Duration = Duration::from_secs(10 * 60);
+
+// The LAN host mutexes guard plain data (claim state, tunnel-probe state, the
+// device map, and the active connection handle) with no cross-field
+// invariants, so a poisoned lock is recovered instead of propagated. stop()
+// also runs from Drop, where a poisoning panic would abort the process while
+// unwinding.
+#[cfg(any(desktop, target_os = "android"))]
+fn recovered_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 #[cfg(desktop)]
 pub(crate) const NAMED_TUNNEL_ORIGIN_PORT: u16 = 32145;
 #[cfg(desktop)]
@@ -731,10 +743,7 @@ impl LanCloneHostControl {
         let Some(shared) = self.shared.upgrade() else {
             return Vec::new();
         };
-        let devices = shared
-            .devices
-            .lock()
-            .unwrap()
+        let devices = recovered_lock(&shared.devices)
             .values()
             .map(|device| device.info.clone())
             .collect();
@@ -745,7 +754,7 @@ impl LanCloneHostControl {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
-        let mut devices = shared.devices.lock().unwrap();
+        let mut devices = recovered_lock(&shared.devices);
         let Some(device) = devices.get_mut(device_id) else {
             return false;
         };
@@ -857,7 +866,7 @@ impl LanCloneHost {
             ));
         }
         let claim = random_secret()?;
-        *self.shared.claim.lock().unwrap() = Some(ClaimState {
+        *recovered_lock(&self.shared.claim) = Some(ClaimState {
             digest: digest(&claim),
             expires_at: Instant::now() + CLAIM_TTL,
             consumed: false,
@@ -930,7 +939,7 @@ impl LanCloneHost {
         }
         let secret = random_secret()?;
         let expected_body = random_secret()?;
-        *self.shared.tunnel_probe.lock().unwrap() = Some(TunnelProbeState {
+        *recovered_lock(&self.shared.tunnel_probe) = Some(TunnelProbeState {
             digest: digest(&secret),
             expected_body,
         });
@@ -948,7 +957,7 @@ impl LanCloneHost {
 
     #[cfg(desktop)]
     pub(crate) fn clear_tunnel_probe(&self) {
-        *self.shared.tunnel_probe.lock().unwrap() = None;
+        *recovered_lock(&self.shared.tunnel_probe) = None;
     }
 
     pub fn devices(&self) -> Vec<LanDevice> {
@@ -964,7 +973,7 @@ impl LanCloneHost {
             stopped.store(true, Ordering::SeqCst);
         }
         if let Some(active_connection) = &self.active_connection {
-            if let Some(connection) = active_connection.lock().unwrap().take() {
+            if let Some(connection) = recovered_lock(active_connection).take() {
                 let _ = connection.shutdown(Shutdown::Both);
             }
         }
@@ -973,10 +982,10 @@ impl LanCloneHost {
                 .join()
                 .map_err(|_| PeerSyncError::Transport("LAN server thread panicked".to_owned()))??;
         }
-        *self.shared.claim.lock().unwrap() = None;
+        *recovered_lock(&self.shared.claim) = None;
         #[cfg(desktop)]
         self.clear_tunnel_probe();
-        self.shared.devices.lock().unwrap().clear();
+        recovered_lock(&self.shared.devices).clear();
         self.address = None;
         self.stopped = None;
         self.active_connection = None;
@@ -1022,7 +1031,7 @@ fn serve(
         configure_connection(&stream)?;
         let shutdown_handle = stream.try_clone().map_err(transport)?;
         {
-            let mut active = active_connection.lock().unwrap();
+            let mut active = recovered_lock(&active_connection);
             if stopped.load(Ordering::SeqCst) {
                 let _ = shutdown_handle.shutdown(Shutdown::Both);
                 break;
@@ -1030,7 +1039,7 @@ fn serve(
             *active = Some(shutdown_handle);
         }
         let _ = handle_connection(stream, &shared, &stopped);
-        active_connection.lock().unwrap().take();
+        recovered_lock(&active_connection).take();
     }
     Ok(())
 }
@@ -1358,7 +1367,7 @@ fn tunnel_probe(
     if secret.len() != 32 {
         return respond_empty(stream, 404);
     }
-    let mut probe = shared.tunnel_probe.lock().unwrap();
+    let mut probe = recovered_lock(&shared.tunnel_probe);
     let Some(current) = probe.as_ref() else {
         return respond_empty(stream, 404);
     };
@@ -1402,7 +1411,7 @@ fn claim(
         },
         LanSession::Clone(_) | LanSession::Logical(_) => uuid::Uuid::new_v4().to_string(),
     };
-    let mut claim = shared.claim.lock().unwrap();
+    let mut claim = recovered_lock(&shared.claim);
     let Some(claim) = claim.as_mut() else {
         return respond_empty(stream, 410);
     };
@@ -1420,7 +1429,7 @@ fn claim(
         permission: shared.session.permission(),
         source_device_id: shared.session.source_device_id(),
     };
-    shared.devices.lock().unwrap().insert(
+    recovered_lock(&shared.devices).insert(
         device_id,
         DeviceState {
             info: LanDevice {
@@ -1446,7 +1455,7 @@ fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
         return Err(401);
     }
     let candidate = digest(bearer.as_bytes());
-    let mut devices = shared.devices.lock().unwrap();
+    let mut devices = recovered_lock(&shared.devices);
     for (id, device) in devices.iter_mut() {
         if constant_time_eq(&device.bearer_digest, &candidate) {
             if device.info.revoked {
@@ -1476,7 +1485,7 @@ fn progress(
     {
         return respond_empty(stream, 400);
     }
-    if let Some(device) = shared.devices.lock().unwrap().get_mut(device_id) {
+    if let Some(device) = recovered_lock(&shared.devices).get_mut(device_id) {
         device.info.verified_bytes = progress.verified_bytes;
         device.info.current_object = progress.current_object;
         device.info.last_seen_unix_ms = now_ms();
@@ -1664,7 +1673,7 @@ fn logical_object(
 
 #[cfg(any(desktop, target_os = "android"))]
 fn set_current_object(shared: &LanShared, device_id: &str, object: Option<&str>) {
-    if let Some(device) = shared.devices.lock().unwrap().get_mut(device_id) {
+    if let Some(device) = recovered_lock(&shared.devices).get_mut(device_id) {
         device.info.current_object = object.map(str::to_owned);
         device.info.last_seen_unix_ms = now_ms();
     }

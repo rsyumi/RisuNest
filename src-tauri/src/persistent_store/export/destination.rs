@@ -70,137 +70,60 @@ pub(crate) fn write_desktop_destination_controlled(
     )
 }
 
-pub(crate) fn write_screenshot_destination_controlled(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    destination: &Path,
-    is_cancelled: impl Fn() -> bool,
-    on_progress: impl FnMut(DestinationProgress),
-    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
-) -> Result<DestinationWriteResult, DestinationWriteError> {
-    write_desktop_destination_with_commit_kind(
-        &RealFileSystem,
-        SourceKind::ScreenshotOutput,
-        source_root,
-        source,
-        destination_root,
-        destination,
-        is_cancelled,
-        on_progress,
-        before_replace,
-    )
+// Every per-kind controlled writer shares one delegation body; only the
+// SourceKind (and with it the filename allowlist) varies. Public names and
+// signatures are unchanged.
+macro_rules! destination_controlled_writer {
+    ($(#[$meta:meta])* $name:ident, $kind:expr) => {
+        $(#[$meta])*
+        pub(crate) fn $name(
+            source_root: &Path,
+            source: &Path,
+            destination_root: &Path,
+            destination: &Path,
+            is_cancelled: impl Fn() -> bool,
+            on_progress: impl FnMut(DestinationProgress),
+            before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
+        ) -> Result<DestinationWriteResult, DestinationWriteError> {
+            write_desktop_destination_with_commit_kind(
+                &RealFileSystem,
+                $kind,
+                source_root,
+                source,
+                destination_root,
+                destination,
+                is_cancelled,
+                on_progress,
+                before_replace,
+            )
+        }
+    };
 }
 
-pub(crate) fn write_lossless_destination_controlled(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    destination: &Path,
-    is_cancelled: impl Fn() -> bool,
-    on_progress: impl FnMut(DestinationProgress),
-    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
-) -> Result<DestinationWriteResult, DestinationWriteError> {
-    write_desktop_destination_with_commit_kind(
-        &RealFileSystem,
-        SourceKind::LosslessBackup,
-        source_root,
-        source,
-        destination_root,
-        destination,
-        is_cancelled,
-        on_progress,
-        before_replace,
-    )
-}
-
-pub(crate) fn write_legacy_backup_destination_controlled(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    destination: &Path,
-    is_cancelled: impl Fn() -> bool,
-    on_progress: impl FnMut(DestinationProgress),
-    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
-) -> Result<DestinationWriteResult, DestinationWriteError> {
-    write_desktop_destination_with_commit_kind(
-        &RealFileSystem,
-        SourceKind::LegacyBackup,
-        source_root,
-        source,
-        destination_root,
-        destination,
-        is_cancelled,
-        on_progress,
-        before_replace,
-    )
-}
-
-pub(crate) fn write_charx_destination_controlled(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    destination: &Path,
-    is_cancelled: impl Fn() -> bool,
-    on_progress: impl FnMut(DestinationProgress),
-    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
-) -> Result<DestinationWriteResult, DestinationWriteError> {
-    write_desktop_destination_with_commit_kind(
-        &RealFileSystem,
-        SourceKind::CharacterCharX,
-        source_root,
-        source,
-        destination_root,
-        destination,
-        is_cancelled,
-        on_progress,
-        before_replace,
-    )
-}
-
-pub(crate) fn write_character_card_destination_controlled(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    destination: &Path,
-    is_cancelled: impl Fn() -> bool,
-    on_progress: impl FnMut(DestinationProgress),
-    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
-) -> Result<DestinationWriteResult, DestinationWriteError> {
-    write_desktop_destination_with_commit_kind(
-        &RealFileSystem,
-        SourceKind::CharacterCard,
-        source_root,
-        source,
-        destination_root,
-        destination,
-        is_cancelled,
-        on_progress,
-        before_replace,
-    )
-}
-
-pub(crate) fn write_risu_module_destination_controlled(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    destination: &Path,
-    is_cancelled: impl Fn() -> bool,
-    on_progress: impl FnMut(DestinationProgress),
-    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
-) -> Result<DestinationWriteResult, DestinationWriteError> {
-    write_desktop_destination_with_commit_kind(
-        &RealFileSystem,
-        SourceKind::RisuModule,
-        source_root,
-        source,
-        destination_root,
-        destination,
-        is_cancelled,
-        on_progress,
-        before_replace,
-    )
-}
+destination_controlled_writer!(
+    write_screenshot_destination_controlled,
+    SourceKind::ScreenshotOutput
+);
+destination_controlled_writer!(
+    write_lossless_destination_controlled,
+    SourceKind::LosslessBackup
+);
+destination_controlled_writer!(
+    write_legacy_backup_destination_controlled,
+    SourceKind::LegacyBackup
+);
+destination_controlled_writer!(
+    write_charx_destination_controlled,
+    SourceKind::CharacterCharX
+);
+destination_controlled_writer!(
+    write_character_card_destination_controlled,
+    SourceKind::CharacterCard
+);
+destination_controlled_writer!(
+    write_risu_module_destination_controlled,
+    SourceKind::RisuModule
+);
 
 trait DestinationFileSystem {
     type Source: Read;
@@ -314,6 +237,24 @@ enum SourceKind {
     RisuModule,
 }
 
+impl SourceKind {
+    // The exact per-kind filename allowlists. None means the RisuSave
+    // managed-file check applies instead of a fixed name.
+    fn allowed_file_names(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::RisuSave => None,
+            Self::ScreenshotOutput => Some(&["archive.zip.part"]),
+            Self::LosslessBackup => {
+                Some(&["archive.risulossless.part", "recovery.risulossless.part"])
+            }
+            Self::LegacyBackup => Some(&["archive.bin.part"]),
+            Self::CharacterCharX => Some(&["character.charx", "character.jpeg"]),
+            Self::CharacterCard => Some(&["character.json", "character.png"]),
+            Self::RisuModule => Some(&["module.risum"]),
+        }
+    }
+}
+
 fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
     file_system: &F,
     source_kind: SourceKind,
@@ -325,14 +266,9 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
     mut on_progress: impl FnMut(DestinationProgress),
     before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
 ) -> Result<DestinationWriteResult, DestinationWriteError> {
-    let source = match source_kind {
-        SourceKind::RisuSave => validated_source(source_root, source)?,
-        SourceKind::ScreenshotOutput => validated_screenshot_source(source_root, source)?,
-        SourceKind::LosslessBackup => validated_lossless_source(source_root, source)?,
-        SourceKind::LegacyBackup => validated_legacy_backup_source(source_root, source)?,
-        SourceKind::CharacterCharX => validated_charx_source(source_root, source)?,
-        SourceKind::CharacterCard => validated_character_card_source(source_root, source)?,
-        SourceKind::RisuModule => validated_risu_module_source(source_root, source)?,
+    let source = match source_kind.allowed_file_names() {
+        None => validated_source(source_root, source)?,
+        Some(allowed) => validated_named_source(source_root, source, allowed)?,
     };
     let destination = validated_destination(destination_root, destination)?;
     if source.parent() == destination.parent() {
@@ -459,99 +395,20 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
     })
 }
 
-fn validated_character_card_source(
+// One shared validator enforces the path-containment boundary (canonical
+// root, direct child of it, regular file) for every named export source;
+// only the per-kind filename allowlist varies. The RisuSave managed-file
+// check stays in validated_source below.
+fn validated_named_source(
     source_root: &Path,
     source: &Path,
-) -> Result<PathBuf, DestinationWriteError> {
-    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
-    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
-    if source.parent() != Some(root.as_path())
-        || !matches!(
-            source.file_name().and_then(|name| name.to_str()),
-            Some("character.json" | "character.png")
-        )
-        || !source.is_file()
-    {
-        return Err(DestinationWriteError::InvalidSource);
-    }
-    Ok(source)
-}
-
-fn validated_risu_module_source(
-    source_root: &Path,
-    source: &Path,
-) -> Result<PathBuf, DestinationWriteError> {
-    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
-    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
-    if source.parent() != Some(root.as_path())
-        || source.file_name().and_then(|name| name.to_str()) != Some("module.risum")
-        || !source.is_file()
-    {
-        return Err(DestinationWriteError::InvalidSource);
-    }
-    Ok(source)
-}
-
-fn validated_legacy_backup_source(
-    source_root: &Path,
-    source: &Path,
-) -> Result<PathBuf, DestinationWriteError> {
-    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
-    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
-    if source.parent() != Some(root.as_path())
-        || source.file_name().and_then(|name| name.to_str()) != Some("archive.bin.part")
-        || !source.is_file()
-    {
-        return Err(DestinationWriteError::InvalidSource);
-    }
-    Ok(source)
-}
-
-fn validated_charx_source(
-    source_root: &Path,
-    source: &Path,
-) -> Result<PathBuf, DestinationWriteError> {
-    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
-    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
-    if source.parent() != Some(root.as_path())
-        || !matches!(
-            source.file_name().and_then(|name| name.to_str()),
-            Some("character.charx" | "character.jpeg")
-        )
-        || !source.is_file()
-    {
-        return Err(DestinationWriteError::InvalidSource);
-    }
-    Ok(source)
-}
-
-fn validated_lossless_source(
-    source_root: &Path,
-    source: &Path,
+    allowed_file_names: &[&str],
 ) -> Result<PathBuf, DestinationWriteError> {
     let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
     let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
     let name = source.file_name().and_then(|name| name.to_str());
     if source.parent() != Some(root.as_path())
-        || !matches!(
-            name,
-            Some("archive.risulossless.part" | "recovery.risulossless.part")
-        )
-        || !source.is_file()
-    {
-        return Err(DestinationWriteError::InvalidSource);
-    }
-    Ok(source)
-}
-
-fn validated_screenshot_source(
-    source_root: &Path,
-    source: &Path,
-) -> Result<PathBuf, DestinationWriteError> {
-    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
-    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
-    if source.parent() != Some(root.as_path())
-        || source.file_name().and_then(|name| name.to_str()) != Some("archive.zip.part")
+        || !name.is_some_and(|name| allowed_file_names.contains(&name))
         || !source.is_file()
     {
         return Err(DestinationWriteError::InvalidSource);

@@ -1,11 +1,12 @@
 use super::{
     character_json_export::{self, JsonAssetSource, FALLBACK_PORTRAIT},
+    error::{cancelled, destination_error_with, invalid_input, io_error, job_error, store_error},
     JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
 };
 use crate::asset_repository::PayloadCas;
 use crate::persistent_store::{
     export::{self, destination},
-    PreparedRisuSaveExport, StoreError, StoreResult,
+    PreparedRisuSaveExport, StoreResult,
 };
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter, Engine as _};
 use image::ImageEncoder;
@@ -645,36 +646,12 @@ fn finish_with_release(
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {
-    match error {
-        destination::DestinationWriteError::InvalidSource => {
-            NativeJobError::new("store-error", "PNG source is invalid")
-        }
-        destination::DestinationWriteError::InvalidDestination => {
-            NativeJobError::new("invalid-destination", "PNG destination is invalid")
-        }
-        destination::DestinationWriteError::Cancelled => {
-            cancelled("PNG export cancelled before destination replacement")
-        }
-        destination::DestinationWriteError::Io { operation, source } => {
-            NativeJobError::new("destination-write-failed", format!("{operation}: {source}"))
-        }
-    }
-}
-
-fn store_error(error: StoreError) -> NativeJobError {
-    match error {
-        StoreError::RevisionConflict { .. } => {
-            NativeJobError::new("revision-conflict", error.to_string())
-        }
-        StoreError::Validation { .. } => invalid_input(error.to_string()),
-        StoreError::SnapshotReleased | StoreError::Store { .. } => {
-            NativeJobError::new("store-error", error.to_string())
-        }
-    }
-}
-
-fn job_error(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("job-error", message)
+    destination_error_with(
+        error,
+        "PNG source is invalid",
+        "PNG destination is invalid",
+        "PNG export cancelled before destination replacement",
+    )
 }
 
 fn owned_text_chunk(data: &[u8]) -> bool {
@@ -708,18 +685,6 @@ fn write_chunk(output: &mut impl Write, kind: &[u8; 4], data: &[u8]) -> Result<(
     output
         .write_all(&crc.finalize().to_be_bytes())
         .map_err(io_error)
-}
-
-fn invalid_input(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("invalid-input", message)
-}
-
-fn cancelled(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("cancelled", message)
-}
-
-fn io_error(error: io::Error) -> NativeJobError {
-    NativeJobError::new("io-error", error.to_string())
 }
 
 #[cfg(test)]

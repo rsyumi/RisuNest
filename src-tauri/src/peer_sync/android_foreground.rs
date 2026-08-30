@@ -134,6 +134,19 @@ impl AndroidForegroundRegistry {
         key: &AndroidForegroundKey,
         callback: impl FnOnce() + Send + 'static,
     ) -> bool {
+        // Stop callbacks are a source-lane contract: cancel_exact runs them
+        // synchronously on the caller's thread, and the target-lane cancel
+        // paths hold command-state locks that those callbacks re-acquire.
+        // Rejecting target-lane registrations keeps that re-entrancy
+        // impossible.
+        if !matches!(
+            key.lane,
+            AndroidForegroundLane::P1Source
+                | AndroidForegroundLane::P4Source
+                | AndroidForegroundLane::P5Source
+        ) {
+            return false;
+        }
         let Ok(mut entry) = self.entry.lock() else {
             return false;
         };
@@ -285,6 +298,29 @@ pub(crate) fn registry() -> &'static AndroidForegroundRegistry {
     REGISTRY.get_or_init(AndroidForegroundRegistry::default)
 }
 
+// Shared attach-wait for Android foreground lanes. Async so command bodies
+// never block a tokio worker thread while polling for service attach.
+#[cfg(any(target_os = "android", test))]
+pub(crate) async fn acquire_foreground_lane(
+    key: &AndroidForegroundKey,
+    lane: AndroidForegroundLane,
+) -> Result<AndroidCancellationProbe, String> {
+    const SERVICE_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    if key.lane != lane {
+        return Err("Android foreground lane is not allowed".to_owned());
+    }
+    let deadline = std::time::Instant::now() + SERVICE_ATTACH_TIMEOUT;
+    loop {
+        if let Some(cancellation) = registry().acquire_exact(key) {
+            return Ok(cancellation);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Android foreground service did not attach".to_owned());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
     static TEST_REGISTRY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -396,6 +432,15 @@ mod tests {
         assert!(called.load(Ordering::SeqCst));
         assert!(registry.cancel_exact(&key));
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn source_stop_callbacks_are_rejected_for_target_lanes() {
+        let registry = AndroidForegroundRegistry::default();
+        let key = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
+        assert!(registry.attach_exact(&key));
+        assert!(!registry.set_source_stop_callback_exact(&key, || {}));
+        assert!(registry.cancel_exact(&key));
     }
 
     #[test]

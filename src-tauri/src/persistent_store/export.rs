@@ -545,7 +545,10 @@ fn open_regular_file_no_follow(path: &Path) -> StoreResult<(File, u64)> {
     Ok((file, metadata.len()))
 }
 
-#[cfg(feature = "native-official-publication")]
+#[cfg(any(
+    feature = "official-publication-upload-pilot",
+    feature = "native-official-publication"
+))]
 fn read_bounded_ownership(file: File, size_hint: u64) -> StoreResult<ExportOwnership> {
     let mut bytes = Vec::with_capacity(size_hint.min(MAX_EXPORT_OWNERSHIP_BYTES) as usize);
     file.take(MAX_EXPORT_OWNERSHIP_BYTES + 1)
@@ -558,11 +561,18 @@ fn read_bounded_ownership(file: File, size_hint: u64) -> StoreResult<ExportOwner
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-#[cfg(feature = "official-publication-upload-pilot")]
-pub(super) fn open_for_upload(
+// Shared managed-export open for the two upload paths (both features can be
+// enabled together). Returns the opened source with its export id and
+// ownership record; each wrapper applies its own lease handling so their
+// error messages stay unchanged.
+#[cfg(any(
+    feature = "official-publication-upload-pilot",
+    feature = "native-official-publication"
+))]
+fn open_managed_export_for_upload(
     snapshots_dir: &Path,
     path: &Path,
-) -> StoreResult<(File, u64, String)> {
+) -> StoreResult<(File, u64, String, ExportOwnership)> {
     let exports_dir = export_directory(snapshots_dir)?;
     let Some((id, ManagedFileKind::Completed)) = managed_file(path) else {
         return Err(StoreError::Validation {
@@ -583,6 +593,15 @@ pub(super) fn open_for_upload(
         });
     }
     let ownership = read_bounded_ownership(ownership_file, ownership_len)?;
+    Ok((source, source_len, id, ownership))
+}
+
+#[cfg(feature = "official-publication-upload-pilot")]
+pub(super) fn open_for_upload(
+    snapshots_dir: &Path,
+    path: &Path,
+) -> StoreResult<(File, u64, String)> {
+    let (source, source_len, id, ownership) = open_managed_export_for_upload(snapshots_dir, path)?;
     if ownership.export_id != id {
         return Err(StoreError::Validation {
             message: "Official publication source ownership does not match its export".to_owned(),
@@ -597,26 +616,7 @@ pub(super) fn open_owned_for_upload(
     path: &Path,
     expected_lease: &str,
 ) -> StoreResult<(File, u64)> {
-    let exports_dir = export_directory(snapshots_dir)?;
-    let Some((id, ManagedFileKind::Completed)) = managed_file(path) else {
-        return Err(StoreError::Validation {
-            message: "Official publication source is not a managed RisuSave export".to_owned(),
-        });
-    };
-    if path.parent() != Some(exports_dir.as_path()) {
-        return Err(StoreError::Validation {
-            message: "Official publication source is outside the export directory".to_owned(),
-        });
-    }
-    let (source, source_len) = open_regular_file_no_follow(path)?;
-    let ownership_path = exports_dir.join(format!("risusave-{id}.lease"));
-    let (ownership_file, ownership_len) = open_regular_file_no_follow(&ownership_path)?;
-    if ownership_len > MAX_EXPORT_OWNERSHIP_BYTES {
-        return Err(StoreError::Validation {
-            message: "Official publication source has no valid ownership marker".to_owned(),
-        });
-    }
-    let ownership = read_bounded_ownership(ownership_file, ownership_len)?;
+    let (source, source_len, id, ownership) = open_managed_export_for_upload(snapshots_dir, path)?;
     if ownership.export_id != id || ownership.lease != expected_lease {
         return Err(StoreError::Validation {
             message: "Official publication source ownership does not match its lease".to_owned(),

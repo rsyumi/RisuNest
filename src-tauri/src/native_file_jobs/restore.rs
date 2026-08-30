@@ -1319,6 +1319,8 @@ fn cleanup_failed(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("cleanup-failed", message)
 }
 
+// Intentional deviation from super::error::job_error: restore reports a
+// cancel-requested job as "cancelled" and everything else as "store-error".
 fn job_error(job: &dyn RestoreControl, message: String) -> NativeJobError {
     if job.is_cancel_requested() {
         cancelled(message)
@@ -1327,6 +1329,10 @@ fn job_error(job: &dyn RestoreControl, message: String) -> NativeJobError {
     }
 }
 
+// Intentional deviation from super::error::store_error: the restore job
+// protocol reports StoreError::Validation as "store-error" (not
+// "invalid-input") and pins its own message texts; TS restore surfaces read
+// these codes.
 fn store_error(error: StoreError) -> NativeJobError {
     match error {
         StoreError::RevisionConflict { expected, actual } => NativeJobError::new(

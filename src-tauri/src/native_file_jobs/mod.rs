@@ -3,6 +3,7 @@ mod character_json_export;
 mod character_png_export;
 pub mod charx;
 mod content;
+mod error;
 mod jpeg_asset;
 pub mod screenshot_output;
 
@@ -2953,9 +2954,12 @@ impl JobControl {
     }
 
     pub(crate) fn status(&self) -> JobStatus {
+        // JobStatus is plain data, so a snapshot taken from a poisoned mutex
+        // is still safe to read; recovering keeps list/status/forget usable
+        // after a worker-thread panic instead of panicking with it.
         self.status
             .lock()
-            .expect("job status mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
@@ -3506,10 +3510,12 @@ impl JobControl {
     }
 
     fn terminal_time(&self) -> Option<Instant> {
+        // Plain data; recover from poisoning so prune keeps working after a
+        // worker-thread panic.
         *self
             .terminal_at
             .lock()
-            .expect("native job terminal mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

@@ -44,6 +44,23 @@ fn now_ms() -> Result<i64, String> {
         .map_err(|_| "system time exceeds the supported millisecond range".to_owned())
 }
 
+// Recovers (opens and caches) an interrupted durable CAS job session, or
+// returns the cached one. Shared by every command that needs the recovered
+// job, including those that also hold the job map or the store lock.
+fn recover_job<'a>(
+    jobs: &'a mut HashMap<String, DurableCasJob>,
+    root: &std::path::Path,
+    session_id: &str,
+) -> Result<&'a mut DurableCasJob, String> {
+    if !jobs.contains_key(session_id) {
+        let recovered = DurableCasJob::open(root, session_id).map_err(|error| error.to_string())?;
+        jobs.insert(session_id.to_owned(), recovered);
+    }
+    Ok(jobs
+        .get_mut(session_id)
+        .expect("recovered CAS job session must be present"))
+}
+
 fn with_recovered_job<T>(
     app: &AppHandle,
     session_id: &str,
@@ -56,17 +73,7 @@ fn with_recovered_job<T>(
         .jobs
         .lock()
         .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-    if !jobs.contains_key(session_id) {
-        let recovered =
-            DurableCasJob::open(&root, session_id).map_err(|error| error.to_string())?;
-        jobs.insert(session_id.to_owned(), recovered);
-    }
-    operation(
-        jobs.get_mut(session_id)
-            .expect("recovered CAS job session must be present"),
-        &cas,
-    )
-    .map_err(|error| error.to_string())
+    operation(recover_job(&mut jobs, &root, session_id)?, &cas).map_err(|error| error.to_string())
 }
 
 #[tauri::command(async)]
@@ -132,14 +139,7 @@ pub(crate) async fn asset_cas_job_seal(app: AppHandle, session_id: String) -> Re
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-        if !jobs.contains_key(&session_id) {
-            let recovered =
-                DurableCasJob::open(&root, &session_id).map_err(|error| error.to_string())?;
-            jobs.insert(session_id.clone(), recovered);
-        }
-        let job = jobs
-            .get_mut(&session_id)
-            .expect("recovered CAS job session must be present");
+        let job = recover_job(&mut jobs, &root, &session_id)?;
         persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
             job.seal(
                 store,
@@ -166,14 +166,7 @@ pub(crate) async fn asset_cas_job_release(
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-        if !jobs.contains_key(&session_id) {
-            let recovered =
-                DurableCasJob::open(&root, &session_id).map_err(|error| error.to_string())?;
-            jobs.insert(session_id.clone(), recovered);
-        }
-        let release_result = jobs
-            .get_mut(&session_id)
-            .expect("recovered CAS job session must be present")
+        let release_result = recover_job(&mut jobs, &root, &session_id)?
             .release(outcome)
             .map_err(|error| error.to_string());
         if jobs
@@ -387,14 +380,7 @@ pub(crate) async fn asset_cas_job_finalize_content(
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-        if !jobs.contains_key(&session_id) {
-            let recovered =
-                DurableCasJob::open(&root, &session_id).map_err(|error| error.to_string())?;
-            jobs.insert(session_id.clone(), recovered);
-        }
-        let job = jobs
-            .get_mut(&session_id)
-            .expect("recovered CAS job session must be present");
+        let job = recover_job(&mut jobs, &root, &session_id)?;
         persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
             finalize_content_job(
                 job,
@@ -465,14 +451,7 @@ fn seal_prepared_content_job_by_id(
     {
         return Err("absent RISUM owner head is inconsistent".to_owned());
     }
-    if !jobs.contains_key(session_id) {
-        let recovered =
-            DurableCasJob::open(repository_root, session_id).map_err(|error| error.to_string())?;
-        jobs.insert(session_id.to_owned(), recovered);
-    }
-    let job = jobs
-        .get_mut(session_id)
-        .expect("recovered CAS job session must be present");
+    let job = recover_job(jobs, repository_root, session_id)?;
     if job.kind() != CasJobKind::CardOrModuleContentImport
         || job.is_sealed()
         || job.is_released()

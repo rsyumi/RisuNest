@@ -15,11 +15,8 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, State};
-
-const SERVICE_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -332,19 +329,11 @@ pub(crate) async fn peer_clone_android_source_start(
     session_id: String,
     foreground: AndroidForegroundKey,
 ) -> Result<AndroidSourceStatus, String> {
-    if foreground.lane != AndroidForegroundLane::P1Source {
-        return Err("Android foreground lane is not allowed".to_owned());
-    }
-    let deadline = Instant::now() + SERVICE_ATTACH_TIMEOUT;
-    let cancellation = loop {
-        if let Some(cancellation) = registry().acquire_exact(&foreground) {
-            break cancellation;
-        }
-        if Instant::now() >= deadline {
-            return Err("Android foreground service did not attach".to_owned());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let cancellation = super::android_foreground::acquire_foreground_lane(
+        &foreground,
+        AndroidForegroundLane::P1Source,
+    )
+    .await?;
     let address = discover_private_lan_address()?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {

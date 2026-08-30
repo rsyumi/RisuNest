@@ -40,6 +40,8 @@ impl Default for PersistentStoreState {
 pub(crate) struct PersistentStoreOpenResult {
     revision: i64,
     asset_gc_maintenance: crate::asset_repository::migration_gc::AssetGcDryRunPage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_failure: Option<String>,
 }
 
 fn current_time_ms() -> StoreResult<i64> {
@@ -235,9 +237,11 @@ pub(crate) fn pds_open(
     if let Some(store) = store.as_mut() {
         let revision = store.revision()?;
         let asset_gc_maintenance = store.asset_gc_product_maintenance_page(current_time_ms()?)?;
+        let restore_failure = store.pending_restore_failure().map(str::to_owned);
         return Ok(PersistentStoreOpenResult {
             revision,
             asset_gc_maintenance,
+            restore_failure,
         });
     }
 
@@ -252,11 +256,15 @@ pub(crate) fn pds_open(
     let revision = persistent_store.revision()?;
     let asset_gc_maintenance =
         persistent_store.asset_gc_product_maintenance_page(current_time_ms()?)?;
+    let restore_failure = persistent_store
+        .pending_restore_failure()
+        .map(str::to_owned);
     *store = Some(persistent_store);
 
     Ok(PersistentStoreOpenResult {
         revision,
         asset_gc_maintenance,
+        restore_failure,
     })
 }
 
@@ -1017,6 +1025,7 @@ mod tests {
             asset_gc_maintenance: store
                 .asset_gc_product_maintenance_page(100)
                 .expect("run product maintenance"),
+            restore_failure: None,
         };
 
         let encoded = serde_json::to_value(result).expect("serialize open result");
@@ -1029,6 +1038,42 @@ mod tests {
             .as_array()
             .expect("read blockers")
             .is_empty());
+        assert!(encoded.get("restoreFailure").is_none());
+    }
+
+    #[test]
+    fn open_result_reports_a_skipped_pending_restore() {
+        let directory = tempdir().expect("create restore failure directory");
+        let store = PersistentStore::open(directory.path()).expect("open persistent store");
+        drop(store);
+        fs::write(
+            directory
+                .path()
+                .join("persistent/snapshots/pending-restore.json"),
+            b"{ not json",
+        )
+        .expect("write corrupt restore marker");
+
+        let mut store =
+            PersistentStore::open(directory.path()).expect("reopen with corrupt marker");
+        let failure = store
+            .pending_restore_failure()
+            .expect("skipped restore is reported")
+            .to_owned();
+        assert!(failure.contains("persistent snapshot restore skipped"));
+
+        let result = PersistentStoreOpenResult {
+            revision: store.revision().expect("read revision"),
+            asset_gc_maintenance: store
+                .asset_gc_product_maintenance_page(100)
+                .expect("run product maintenance"),
+            restore_failure: store.pending_restore_failure().map(str::to_owned),
+        };
+        let encoded = serde_json::to_value(result).expect("serialize open result");
+        assert_eq!(
+            encoded["restoreFailure"].as_str().expect("restore failure"),
+            failure
+        );
     }
 
     #[test]

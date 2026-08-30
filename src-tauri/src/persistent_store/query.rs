@@ -806,15 +806,15 @@ pub(super) fn read_conversation_window(
                 let Some(anchor) = anchor else {
                     return Ok(None);
                 };
-                let before = query.before.unwrap_or(0).max(0);
-                let after = query.after.unwrap_or(0).max(0);
+                let before = validated_window_span(query.before, 0, "before")?;
+                let after = validated_window_span(query.after, 0, "after")?;
                 (
                     (anchor - before).max(0),
                     (anchor + after + 1).min(total_messages),
                 )
             }
             None => {
-                let limit = query.limit.unwrap_or(128).max(0);
+                let limit = validated_window_span(query.limit, 128, "limit")?;
                 ((total_messages - limit).max(0), total_messages)
             }
         },
@@ -840,6 +840,19 @@ pub(super) fn read_conversation_window(
             has_more_after: end_index < total_messages,
         },
     }))
+}
+
+// The anchor and anchorless window paths accept untrusted JSON, so their
+// spans get the same safe-integer bound as the absolute-range path to keep
+// the index arithmetic overflow-free.
+fn validated_window_span(value: Option<i64>, default: i64, name: &str) -> StoreResult<i64> {
+    let value = value.unwrap_or(default);
+    if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(&value) {
+        return Err(StoreError::Validation {
+            message: format!("conversation window {name} must be a nonnegative safe integer"),
+        });
+    }
+    Ok(value)
 }
 
 pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> StoreResult<Value> {
@@ -1060,7 +1073,10 @@ fn conversation_value(
 }
 
 fn into_object(value: Value, message: &str) -> StoreResult<Map<String, Value>> {
-    value.as_object().cloned().ok_or_else(|| StoreError::Store {
-        message: message.to_owned(),
-    })
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(StoreError::Store {
+            message: message.to_owned(),
+        }),
+    }
 }
