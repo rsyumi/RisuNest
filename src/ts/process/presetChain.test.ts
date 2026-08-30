@@ -48,9 +48,8 @@ describe('preset chain activation', () => {
         expect(onMissing).toHaveBeenCalledWith('Missing')
     })
 
-    it('clears busy state and never starts the request when preset activation fails', async () => {
+    it('never starts the request when preset activation fails', async () => {
         const events: string[] = []
-        let busy = false
         const changePreset = vi.fn(async () => {
             throw new Error('preset CAS failed')
         })
@@ -60,18 +59,12 @@ describe('preset chain activation', () => {
                 changePreset,
                 () => 0,
                 vi.fn(),
-                (value) => {
-                    busy = value
-                    events.push(`busy:${value}`)
-                },
             )
             events.push('request')
         }
 
         await expect(run()).rejects.toThrow('preset CAS failed')
 
-        expect(busy).toBe(false)
-        expect(events).toEqual(['busy:true', 'busy:false'])
         expect(events).not.toContain('request')
     })
 })

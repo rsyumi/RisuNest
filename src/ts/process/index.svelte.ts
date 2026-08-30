@@ -35,7 +35,6 @@ import { readImage } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { activatePresetChainForRequest } from "./presetChain";
 import {
-    doingChat,
     reserveGeneration,
     type GenerationReservation,
 } from './generationState'
@@ -198,13 +197,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         generationReturned = true
         return result
     }
-    catch(error) {
+    finally {
         if(lifecycle.responseApplied && !lifecycle.acknowledgementAttempted){
             lifecycle.acknowledgementAttempted = true
-            await acknowledgeGenerationCompletion()
+            try {
+                await acknowledgeGenerationCompletion()
+            } catch (acknowledgeError) {
+                console.error(acknowledgeError)
+            }
         }
-        throw error
-    } finally {
         completeLease?.release()
         ownedReservation?.release({
             preserveBusy: enteredGeneration && !generationReturned,
@@ -339,13 +340,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const generationSetupSession = getActiveConversationSession()
     if (hasMismatchedActiveConversationSession()) return false
 
-    await activatePresetChainForRequest(
-        chatProcessIndex === -1 ? DBState.db : { botPresets: [] },
-        changeToPreset,
-        Math.random,
-        (name) => alertToast(`Cannot find preset: ${name}`),
-        (busy) => doingChat.set(busy),
-    )
+    if (chatProcessIndex === -1) {
+        await activatePresetChainForRequest(
+            DBState.db,
+            changeToPreset,
+            Math.random,
+            (name) => alertToast(`Cannot find preset: ${name}`),
+        )
+    }
 
     if(connectionOpen){
         chatProcessStage.set(4)
@@ -1006,7 +1008,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         : null
     const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
     if(triggerResult){
-        if (triggerSessionSnapshot) {
+        if (triggerSessionSnapshot && triggerResult.chat !== currentChat) {
             requireCurrentConversationSession(
                 triggerSessionSnapshot.session,
                 getActiveConversationSession(),

@@ -1,24 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-    captureStreamingMessageTarget,
     consumeStreamingDisplayStream,
-    type StreamingMessageTarget,
     type StreamingDisplayReader,
 } from './streamingDisplayStream'
-
-interface TestMessage {
-    data: string
-}
-
-interface TestChat {
-    id: string
-    message: TestMessage[]
-}
-
-interface TestCharacter {
-    chaId: string
-    chats: TestChat[]
-}
 
 function readerFrom<T>(
     reads: Array<
@@ -38,65 +22,8 @@ function readerFrom<T>(
     return { reader, cancel }
 }
 
-function makeCallbacks(target: StreamingMessageTarget<TestCharacter, TestChat, TestMessage>) {
-    return {
-        processSemantic: async ({ value }: { value: string }, context: { canCommit(): boolean }) => {
-            if (context.canCommit()) target.message.data = `semantic:${value}`
-        },
-        processPreview: async ({ value }: { value: string }, context: { canCommit(): boolean }) => {
-            if (context.canCommit()) target.message.data = `preview:${value}`
-        },
-    }
-}
-
 describe('sendChat streaming response boundary', () => {
-    it('commits group streaming output to the captured group instead of the speaking member', async () => {
-        const group: TestCharacter = {
-            chaId: 'group',
-            chats: [{ id: 'group-chat', message: [{ data: '' }] }],
-        }
-        const speakingMember: TestCharacter = {
-            chaId: 'member',
-            chats: [{ id: 'member-chat', message: [] }],
-        }
-        const characters = [group, speakingMember]
-        const target = captureStreamingMessageTarget<TestCharacter, TestChat, TestMessage>(
-            () => characters,
-            0,
-            0,
-            0,
-        )
-        const { reader } = readerFrom([
-            { done: false, value: { text: 'hello' } },
-            { done: true, value: { text: 'hello group' } },
-        ])
-
-        const result = await consumeStreamingDisplayStream({
-            mode: 'balanced',
-            reader,
-            abortSignal: new AbortController().signal,
-            getSnapshot: (value) => value.text,
-            isOwned: target.isOwned,
-            ...makeCallbacks(target),
-        })
-
-        expect(speakingMember.chaId).not.toBe(target.character.chaId)
-        expect(target.character).toBe(group)
-        expect(group.chats[0].message[0].data).toBe('semantic:hello group')
-        expect(result.completed).toBe(true)
-    })
-
     it('processes a final provider value that arrives together with done', async () => {
-        const character: TestCharacter = {
-            chaId: 'character',
-            chats: [{ id: 'chat', message: [{ data: '' }] }],
-        }
-        const target = captureStreamingMessageTarget<TestCharacter, TestChat, TestMessage>(
-            () => [character],
-            0,
-            0,
-            0,
-        )
         const semanticValues: string[] = []
         const previewValues: string[] = []
         const { reader } = readerFrom([
@@ -108,7 +35,7 @@ describe('sendChat streaming response boundary', () => {
             reader,
             abortSignal: new AbortController().signal,
             getSnapshot: (value) => value.text,
-            isOwned: target.isOwned,
+            isOwned: () => true,
             processPreview: async ({ value }, context) => {
                 if (context.canCommit()) previewValues.push(value)
             },
@@ -123,16 +50,7 @@ describe('sendChat streaming response boundary', () => {
     })
 
     it('propagates reader failure without converting it into normal EOF', async () => {
-        const character: TestCharacter = {
-            chaId: 'character',
-            chats: [{ id: 'chat', message: [{ data: 'previous' }] }],
-        }
-        const target = captureStreamingMessageTarget<TestCharacter, TestChat, TestMessage>(
-            () => [character],
-            0,
-            0,
-            0,
-        )
+        const message = { data: 'previous' }
         const failure = new Error('reader failed')
         const cancel = vi.fn(async () => undefined)
         const reader: StreamingDisplayReader<{ text: string }> = {
@@ -141,42 +59,34 @@ describe('sendChat streaming response boundary', () => {
                 throw failure
             },
         }
-        const callbacks = makeCallbacks(target)
 
         await expect(consumeStreamingDisplayStream({
             mode: 'balanced',
             reader,
             abortSignal: new AbortController().signal,
             getSnapshot: (value) => value.text,
-            isOwned: target.isOwned,
-            ...callbacks,
+            isOwned: () => true,
+            processSemantic: async ({ value }, context) => {
+                if (context.canCommit()) message.data = `semantic:${value}`
+            },
+            processPreview: async ({ value }, context) => {
+                if (context.canCommit()) message.data = `preview:${value}`
+            },
         })).rejects.toBe(failure)
 
-        expect(character.chats[0].message[0].data).toBe('previous')
+        expect(message.data).toBe('previous')
         expect(cancel).toHaveBeenCalledTimes(1)
     })
 
-    it('drops a late commit when the captured message owner is replaced', async () => {
-        let characters: TestCharacter[] = [{
-            chaId: 'character',
-            chats: [{ id: 'chat', message: [{ data: 'previous' }] }],
-        }]
-        const original = characters[0]
-        const target = captureStreamingMessageTarget<TestCharacter, TestChat, TestMessage>(
-            () => characters,
-            0,
-            0,
-            0,
-        )
+    it('drops a late commit when ownership is lost during semantic processing', async () => {
+        const message = { data: 'previous' }
+        let owned = true
         let release!: () => void
         const active = new Promise<void>((resolve) => { release = resolve })
         const { reader } = readerFrom([
             { done: false, value: { text: 'late' } },
             () => {
-                characters = [{
-                    chaId: 'character',
-                    chats: [{ id: 'chat', message: [{ data: 'replacement' }] }],
-                }]
+                owned = false
                 release()
                 return { done: true, value: undefined }
             },
@@ -187,16 +97,15 @@ describe('sendChat streaming response boundary', () => {
             reader,
             abortSignal: new AbortController().signal,
             getSnapshot: (value) => value.text,
-            isOwned: target.isOwned,
+            isOwned: () => owned,
             processSemantic: async ({ value }, context) => {
                 await active
-                if (context.canCommit()) target.message.data = value
+                if (context.canCommit()) message.data = value
             },
             processPreview: async () => {},
         })
 
-        expect(original.chats[0].message[0].data).toBe('previous')
-        expect(characters[0].chats[0].message[0].data).toBe('replacement')
+        expect(message.data).toBe('previous')
         expect(result.completed).toBe(false)
     })
 

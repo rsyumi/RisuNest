@@ -638,6 +638,28 @@ describe('group working-set residency', () => {
         expect(mocks.markPersistentDataDirty).not.toHaveBeenCalled()
     })
 
+    it('reconciles active residency for the completed removal when activation is superseded', async () => {
+        const group = mocks.database.characters[0]
+        group.characters.push('member-b')
+        group.characterTalks.push(0.75)
+        group.characterActive.push(false)
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.selectedId = 1
+            return false
+        })
+
+        await expect(rmCharFromGroup(0)).resolves.toBe(false)
+
+        expect(group.characters).toEqual(['member-b'])
+        expect(group.characterTalks).toEqual([0.75])
+        expect(group.characterActive).toEqual([false])
+        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalledWith(
+            mocks.database,
+            'member-a',
+        )
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
+    })
+
     it('rolls back a removed member when same-group activation stays stale', async () => {
         const group = mocks.database.characters[0]
         group.characters.push('member-b')

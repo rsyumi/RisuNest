@@ -861,12 +861,16 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
 
     return finish({data, emoChanged})
     } catch (error) {
-        if (ownsConversationOperation && conversationOperation?.hasPendingMutations()) {
-            conversationOperation.commit(peekActiveConversationSession())
-            conversationOperationCommitted = true
-        }
-        else if (conversationAccess === 'read-only' && conversationOwner) {
-            requireScriptConversationOwner(conversationOwner)
+        try {
+            if (ownsConversationOperation && conversationOperation?.hasPendingMutations()) {
+                conversationOperation.commit(peekActiveConversationSession())
+                conversationOperationCommitted = true
+            }
+            else if (conversationAccess === 'read-only' && conversationOwner) {
+                requireScriptConversationOwner(conversationOwner)
+            }
+        } catch (cleanupError) {
+            console.error(cleanupError)
         }
         throw error
     } finally {

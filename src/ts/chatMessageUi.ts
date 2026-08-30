@@ -381,6 +381,11 @@ export async function toggleCapturedBookmark(
     if (!initial) return false
     const existingMessageId = initial.message.chatId
     if (existingMessageId && initial.conversation.bookmarks?.includes(existingMessageId)) {
+        if (initial.kind === 'persistent') {
+            return mutatePersistentBookmark(initial, context, 'toggle-bookmark', (current) =>
+                setCapturedBookmark(current, context, false),
+            )
+        }
         return setCapturedBookmark(initial, context, false)
     }
 
@@ -389,6 +394,11 @@ export async function toggleCapturedBookmark(
         initial.conversation.bookmarkNames?.[messageId] ?? '',
     )
     const name = requestedName?.trim() ? requestedName : options.defaultName(initial.message)
+    if (initial.kind === 'persistent') {
+        return mutatePersistentBookmark(initial, context, 'toggle-bookmark', (current) =>
+            setCapturedBookmark(current, context, true, messageId, name),
+        )
+    }
     return setCapturedBookmark(initial, context, true, messageId, name)
 }
 
@@ -499,6 +509,9 @@ function setCapturedBookmark(
     messageId?: string,
     name?: string,
 ): boolean {
+    // Persistent targets must be promoted to a session through
+    // mutatePersistentBookmark before any bookmark metadata mutation.
+    if (target.kind === 'persistent') return false
     const current = resolveChatMessageTarget(target, context)
     if (!current) return false
     if (current.session) {

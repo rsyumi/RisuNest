@@ -5,51 +5,6 @@ import {
     type StreamingDisplayProcessContext,
 } from './streamingDisplayScheduler'
 
-interface StreamingTargetChat<TMessage> {
-    id?: string
-    message: TMessage[]
-}
-
-interface StreamingTargetCharacter<TChat> {
-    chaId: string
-    chats: TChat[]
-}
-
-export interface StreamingMessageTarget<TCharacter, TChat, TMessage> {
-    character: TCharacter
-    chat: TChat
-    message: TMessage
-    isOwned(): boolean
-}
-
-export function captureStreamingMessageTarget<
-    TCharacter extends StreamingTargetCharacter<TChat>,
-    TChat extends StreamingTargetChat<TMessage>,
-    TMessage,
->(
-    getCharacters: () => readonly TCharacter[],
-    characterIndex: number,
-    chatIndex: number,
-    messageIndex: number,
-): StreamingMessageTarget<TCharacter, TChat, TMessage> {
-    const character = getCharacters()[characterIndex]
-    const chat = character.chats[chatIndex]
-    const message = chat.message[messageIndex]
-
-    return {
-        character,
-        chat,
-        message,
-        isOwned() {
-            const currentCharacter = getCharacters()[characterIndex]
-            const currentChat = currentCharacter?.chats[chatIndex]
-            return currentCharacter === character
-                && currentChat === chat
-                && currentChat?.message[messageIndex] === message
-        },
-    }
-}
-
 export interface StreamingDisplayReader<T> {
     read(): Promise<ReadableStreamReadResult<T>>
     cancel(): Promise<void>

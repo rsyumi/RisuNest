@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Chat, character, customscript } from '../storage/database.svelte'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
-import { ActiveConversationSession } from '../storage/activeConversationSession'
+import {
+    ActiveConversationSession,
+    ConversationSessionStaleError,
+} from '../storage/activeConversationSession'
 
 const mocks = vi.hoisted(() => {
     const state = {
@@ -22,6 +25,7 @@ const mocks = vi.hoisted(() => {
         currentChat: null as Chat | null,
         session: null as ActiveConversationSession | null,
         selectedCharIndex: 0,
+        onHypaAddText: null as null | (() => void),
     }
     const charEmotionStore = {
         set(value: Record<string, [string, string, number][]>) {
@@ -90,7 +94,14 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
     },
 }))
 vi.mock('src/ts/process/modules', () => moduleMocks)
-vi.mock('src/ts/process/memory/hypamemory', () => ({ HypaProcesser: class {} }))
+vi.mock('src/ts/process/memory/hypamemory', () => ({
+    HypaProcesser: class {
+        get addText() {
+            mocks.state.onHypaAddText?.()
+            return undefined as never
+        }
+    },
+}))
 vi.mock('src/ts/process/scriptings', () => ({
     runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => data,
 }))
@@ -213,6 +224,7 @@ describe('processScriptFull result caching', () => {
         mocks.state.currentChat = null
         mocks.state.session = null
         mocks.state.selectedCharIndex = 0
+        mocks.state.onHypaAddText = null
         mocks.database.dynamicAssets = false
         mocks.database.characters = [] as never[]
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
@@ -474,6 +486,7 @@ describe('history-sensitive regex conversation operations', () => {
         mocks.state.currentChat = null
         mocks.state.session = null
         mocks.state.selectedCharIndex = 0
+        mocks.state.onHypaAddText = null
         mocks.database.dynamicAssets = false
         mocks.database.characters = [] as never[]
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
@@ -878,5 +891,42 @@ describe('history-sensitive regex conversation operations', () => {
         expect(chat.message[0].data).toBe('x')
         expect(session.version).toBe(1)
         expect(session.activePinReasons).toEqual([])
+    })
+
+    it('propagates the original processing error when the error-path commit is stale', async () => {
+        const chat = {
+            id: 'regex-masking-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message-0' }],
+        } as Chat
+        const char = makeCharacter([makeScript('x', '@@inject')])
+        char.chaId = 'regex-masking-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        char.additionalAssets = [['asset', 'source', '']]
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 24,
+        })
+        mocks.database.dynamicAssets = true
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.state.onHypaAddText = () => {
+            session.append({ role: 'user', data: 'concurrent', chatId: 'message-1' })
+        }
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        await expect(processScriptFull(char, 'x', 'editoutput', 0, {}, {
+            cache: 'bypass',
+            regexWorker: false,
+        })).rejects.toThrow(/addText/)
+
+        expect(errorLog.mock.calls.flat().some(
+            (logged) => logged instanceof ConversationSessionStaleError,
+        )).toBe(true)
+        expect(session.activePinReasons).toEqual([])
+        errorLog.mockRestore()
     })
 })

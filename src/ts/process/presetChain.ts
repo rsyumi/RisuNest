@@ -25,13 +25,6 @@ export async function activatePresetChainForRequest(
     changePreset: (index: number, saveCurrent: boolean) => Promise<void>,
     random: () => number,
     onMissing: (name: string) => void,
-    setBusy: (busy: boolean) => void,
 ): Promise<void> {
-    setBusy(true)
-    try {
-        await activatePresetChain(database, changePreset, random, onMissing)
-    } catch (error) {
-        setBusy(false)
-        throw error
-    }
+    await activatePresetChain(database, changePreset, random, onMissing)
 }

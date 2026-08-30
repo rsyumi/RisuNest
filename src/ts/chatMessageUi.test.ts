@@ -646,6 +646,86 @@ describe('chat message UI targets', () => {
         expect(persistentRelease).toHaveBeenCalledTimes(2)
     })
 
+    it('holds short complete leases for persistent bookmark toggling in both directions', async () => {
+        const complete = fixture([{ role: 'user', data: 'far', chatId: 'far-id' }])
+        complete.conversation.bookmarks = ['far-id']
+        complete.conversation.bookmarkNames = { 'far-id': 'Before' }
+        const shell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = shell
+        const initialSelection = {
+            characterId: complete.character.chaId,
+            conversationId: shell.id,
+            navigationGeneration: 1,
+            storeRevision: 4,
+        } as any
+        let currentConversation: Chat = shell
+        let currentSession: ActiveConversationSession | null = null
+        let selection = initialSelection
+        const toggleRelease = vi.fn()
+        const acquireCompleteConversation = vi.fn(async (reason: string) => {
+            currentConversation = complete.conversation
+            complete.character.chats[0] = complete.conversation
+            currentSession = complete.session
+            return {
+                reason,
+                session: complete.session,
+                target: selection,
+                release: toggleRelease,
+            }
+        })
+        const context = {
+            captureCurrent: () => ({
+                character: complete.character,
+                conversation: currentConversation,
+            }),
+            getCurrentSession: () => currentSession,
+            captureSelectedConversationTarget: () => selection,
+            acquirePersistentRevision: vi.fn(async () => ({
+                revision: 4,
+                readConversationWindow: async () => ({
+                    revision: 4,
+                    value: {
+                        characterId: complete.character.chaId,
+                        conversationId: shell.id,
+                        startIndex: 0,
+                        endIndex: 1,
+                        totalMessages: 1,
+                        messages: [{ role: 'user', data: 'far', chatId: 'far-id' }],
+                        hasMoreBefore: false,
+                        hasMoreAfter: false,
+                    },
+                }),
+                release: vi.fn(),
+            })),
+            acquireCompleteConversation,
+        }
+        const toggleOptions = {
+            requestName: async () => 'Toggled',
+            createMessageId: () => 'unused-created-id',
+            defaultName: () => 'Default',
+        }
+        const offTarget = await queryChatMessageTargetById(context as any, 'far-id')
+        expect(offTarget?.kind).toBe('persistent')
+
+        await expect(toggleCapturedBookmark(offTarget!, context, toggleOptions)).resolves.toBe(true)
+        expect(acquireCompleteConversation).toHaveBeenCalledWith('toggle-bookmark', selection)
+        expect(complete.conversation.bookmarks).toEqual([])
+        expect(toggleRelease).toHaveBeenCalledOnce()
+
+        const updatedShell = createMetadataOnlySelectedConversation(complete.conversation)
+        complete.character.chats[0] = updatedShell
+        currentConversation = updatedShell
+        currentSession = null
+        const onTarget = await queryChatMessageTargetById(context as any, 'far-id')
+        expect(onTarget?.kind).toBe('persistent')
+
+        await expect(toggleCapturedBookmark(onTarget!, context, toggleOptions)).resolves.toBe(true)
+        expect(complete.conversation.bookmarks).toEqual(['far-id'])
+        expect(complete.conversation.bookmarkNames).toEqual({ 'far-id': 'Toggled' })
+        expect(acquireCompleteConversation).toHaveBeenCalledTimes(2)
+        expect(toggleRelease).toHaveBeenCalledTimes(2)
+    })
+
     it('rejects stale scroll, fold, and bookmark targets without changing canonical output', () => {
         const target = fixture([
             { role: 'user', data: 'zero', chatId: 'duplicate' },

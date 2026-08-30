@@ -66,81 +66,64 @@ vi.mock('./triggers', () => ({
     runTrigger: testState.runTrigger,
 }))
 
-vi.mock('../tokenizer', () => ({
-    ChatTokenizer: class {
-        async tokenizeChat(): Promise<number> {
-            await testState.onTokenizeChat?.()
-            return 1
-        }
-        async tokenizeChats(chats: unknown[]): Promise<number> {
-            for(const _chat of chats) await testState.onTokenizeChat?.()
-            return chats.length
-        }
+vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')).tokenizerModule({
+    tokenizeChat: async () => {
+        await testState.onTokenizeChat?.()
+        return 1
     },
-    tokenize: vi.fn(async () => 1),
+    tokenizeChats: async (chats: unknown[]) => {
+        for(const _chat of chats) await testState.onTokenizeChat?.()
+        return chats.length
+    },
     tokenizeNum: vi.fn(async () => 1),
 }))
 
-vi.mock('./lorebook.svelte', () => ({
-    loadLoreBookV3Prompt: vi.fn(async () => ({ actives: [] })),
-}))
+vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarness')).lorebookModule())
 
 vi.mock('./request/request', () => ({
     requestChatData: vi.fn(),
 }))
 
-vi.mock('./stableDiff', () => ({ stableDiff: vi.fn() }))
-vi.mock('./tts', () => ({ sayTTS: vi.fn() }))
-vi.mock('./exampleMessages', () => ({ exampleMessage: () => [] }))
-vi.mock('./group', () => ({ groupOrder: (items: unknown[]) => items }))
-vi.mock('./memory/hypamemory', () => ({ HypaProcesser: class {} }))
-vi.mock('./memory/supaMemory', () => ({ supaMemory: vi.fn() }))
-vi.mock('./memory/hanuraiMemory', () => ({ hanuraiMemory: vi.fn() }))
-vi.mock('./memory/hypav2', () => ({ hypaMemoryV2: vi.fn() }))
-vi.mock('./memory/hypav3', () => ({
+vi.mock('./stableDiff', async () => (await import('./tests/sendChatTestHarness')).stableDiffModule())
+vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsModule())
+vi.mock('./exampleMessages', async () => (await import('./tests/sendChatTestHarness')).exampleMessagesModule())
+vi.mock('./group', async () => (await import('./tests/sendChatTestHarness')).groupModule())
+vi.mock('./memory/hypamemory', async () => (await import('./tests/sendChatTestHarness')).hypamemoryModule())
+vi.mock('./memory/supaMemory', async () => (await import('./tests/sendChatTestHarness')).supaMemoryModule())
+vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
+vi.mock('./memory/hypav2', async () => (await import('./tests/sendChatTestHarness')).hypav2Module())
+vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module({
     createHypaV3Preset: (name: string, settings: Record<string, unknown>) => ({ name, settings }),
-    hypaMemoryV3: vi.fn(),
 }))
-vi.mock('./embedding/addinfo', () => ({ additionalInformations: vi.fn(async () => '') }))
-vi.mock('./files/inlays', () => ({
-    getInlayAsset: vi.fn(async () => null),
+vi.mock('./embedding/addinfo', async () => (await import('./tests/sendChatTestHarness')).addinfoModule())
+vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness')).inlaysModule({
     getInlayAssetMetadata: vi.fn(async () => null),
 }))
-vi.mock('./models/modelString', () => ({ getGenerationModelString: () => 'test-model' }))
-vi.mock('../sync/multiuser', () => ({
-    connectionOpen: false,
-    peerRevertChat: vi.fn(),
-    peerSafeCheck: vi.fn(async () => true),
-    peerSync: vi.fn(),
-}))
+vi.mock('./models/modelString', async () => (await import('./tests/sendChatTestHarness')).modelStringModule())
+vi.mock('../sync/multiuser', async () => (await import('./tests/sendChatTestHarness')).multiuserModule())
 vi.mock('./inlayScreen', () => ({ runInlayScreen: vi.fn() }))
-vi.mock('./prereroll', () => ({ addRerolls: vi.fn() }))
-vi.mock('./transformers', () => ({ runImageEmbedding: vi.fn(async () => []) }))
-vi.mock('./scriptings', () => ({
-    runLuaEditTrigger: vi.fn(async (_char, _mode, content) => content),
+vi.mock('./prereroll', async () => (await import('./tests/sendChatTestHarness')).prerollModule())
+vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule({
+    runImageEmbedding: vi.fn(async () => []),
 }))
-vi.mock('../model/modellist', () => ({
-    getModelInfo: () => ({ flags: [] }),
+vi.mock('./scriptings', async () => (await import('./tests/sendChatTestHarness')).scriptingsModule())
+vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHarness')).modellistModule({
     LLMFlags: { hasImageInput: 0 },
     LLMFormat: { OpenAICompatible: 0, Ollama: 15 },
 }))
-vi.mock('./modules', () => ({
-    getModuleAssets: () => [],
+vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule({
     getModuleLorebooks: () => [],
     getModuleRegexScripts: () => [],
-    getModuleToggles: () => '',
     getModules: () => [],
-    moduleUpdate: vi.fn(),
 }))
-vi.mock('../globalApi.svelte', () => ({
+vi.mock('../globalApi.svelte', async () => (await import('./tests/sendChatTestHarness')).globalApiModule({
     aiWatermarkingLawApplies: () => false,
     downloadFile: vi.fn(),
     getFileSrc: vi.fn(async () => ''),
     readImage: vi.fn(async () => new Uint8Array()),
 }))
-vi.mock('./presetChain', () => ({ activatePresetChainForRequest: vi.fn() }))
+vi.mock('./presetChain', async () => (await import('./tests/sendChatTestHarness')).presetChainModule())
 vi.mock('./streamingDisplayStream', () => ({
-    captureStreamingMessageTarget: vi.fn(),
     consumeStreamingDisplayStream: vi.fn(),
 }))
 

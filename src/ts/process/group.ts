@@ -18,6 +18,7 @@ import {
 import { restoreColdPersistentCharacter } from './coldCharacterRestore'
 import { doingChat } from './generationState'
 import { appendCurrentConversationMessage } from '../conversationMutations'
+import type { groupChat } from '../storage/database.svelte'
 import type { CompleteConversationLease } from '../storage/activeWorkingSet.svelte'
 import { v4 } from 'uuid'
 
@@ -28,6 +29,13 @@ function markGroupDirty(group: unknown) {
 function isSelectedGroup(groupId: string): boolean {
     const selected = DBState.db.characters[get(selectedCharID)]
     return selected?.type === 'group' && selected.chaId === groupId
+}
+
+function revalidateSelectedGroup(groupId: string, pendingMemberId: string): groupChat | null {
+    const selected = DBState.db.characters[get(selectedCharID)]
+    if (selected?.type !== 'group' || selected.chaId !== groupId) return null
+    if (selected.characters.includes(pendingMemberId)) return null
+    return selected
 }
 
 async function activateSelectedGroup(groupId: string): Promise<'activated' | 'failed' | 'superseded'> {
@@ -59,8 +67,7 @@ async function settleGroupRollback(groupId: string): Promise<void> {
 }
 
 export async function addGroupChar(): Promise<boolean> {
-    let selectedId = get(selectedCharID)
-    let group = DBState.db.characters[selectedId]
+    const group = DBState.db.characters[get(selectedCharID)]
     if(group.type === 'group'){
         const res = await alertSelectChar()
         if(res){
@@ -72,10 +79,7 @@ export async function addGroupChar(): Promise<boolean> {
                 const loadFirstMessage = await alertConfirm(language.askLoadFirstMsg)
                 const groupId = group.chaId
                 if (get(doingChat)) return false
-                selectedId = get(selectedCharID)
-                group = DBState.db.characters[selectedId]
-                if (group?.type !== 'group' || group.chaId !== groupId) return false
-                if (group.characters.includes(res)) return false
+                if (!revalidateSelectedGroup(groupId, res)) return false
                 const activation = await activateSelectedGroup(groupId)
                 if (activation !== 'activated') return false
                 if (!isSelectedGroup(groupId) || get(doingChat)) return false
@@ -90,12 +94,9 @@ export async function addGroupChar(): Promise<boolean> {
                     }
                 }
                 try {
-                    if (!isSelectedGroup(groupId)) return false
-                    selectedId = get(selectedCharID)
-                    group = DBState.db.characters[selectedId]
-                    if (group?.type !== 'group' || group.chaId !== groupId) return false
-                    if (group.characters.includes(res) || get(doingChat)) return false
-                    const selectedChat = group.chats[group.chatPage]
+                    const activatedGroup = revalidateSelectedGroup(groupId, res)
+                    if (!activatedGroup || get(doingChat)) return false
+                    const selectedChat = activatedGroup.chats[activatedGroup.chatPage]
                     const activeSession = completeLease?.session ?? getActiveConversationSession()
                     if (
                         activeSession &&
@@ -115,11 +116,9 @@ export async function addGroupChar(): Promise<boolean> {
                         !isSelectedGroup(groupId) ||
                         get(doingChat)
                     ) return false
-                    selectedId = get(selectedCharID)
-                    group = DBState.db.characters[selectedId]
-                    if (group?.type !== 'group' || group.chaId !== groupId) return false
-                    if (group.characters.includes(res)) return false
-                    const restoredSelectedChat = group.chats[group.chatPage]
+                    const restoredGroup = revalidateSelectedGroup(groupId, res)
+                    if (!restoredGroup) return false
+                    const restoredSelectedChat = restoredGroup.chats[restoredGroup.chatPage]
                     const restoredActiveSession = completeLease?.session
                         ?? getActiveConversationSession()
                     if (
@@ -127,9 +126,9 @@ export async function addGroupChar(): Promise<boolean> {
                         !restoredActiveSession.matchesConversation(groupId, restoredSelectedChat)
                     ) return false
                     if (!hydrateCurrentGroupMemberDetail(groupId, member)) return false
-                    group.characters.push(res)
-                    group.characterTalks.push(1 / 6 * 4)
-                    group.characterActive.push(true)
+                    restoredGroup.characters.push(res)
+                    restoredGroup.characterTalks.push(1 / 6 * 4)
+                    restoredGroup.characterActive.push(true)
                     reconcilePersistentActiveCharacterIds(DBState.db, groupId)
                     if(loadFirstMessage){
                         const messageId = v4()
@@ -140,13 +139,13 @@ export async function addGroupChar(): Promise<boolean> {
                             chatId: messageId,
                         } as const
                         appendCurrentConversationMessage(
-                            group,
+                            restoredGroup,
                             restoredSelectedChat,
                             restoredActiveSession,
                             message,
                         )
                     }
-                    markGroupDirty(group)
+                    markGroupDirty(restoredGroup)
                     return true
                 } finally {
                     completeLease?.release()
@@ -174,7 +173,16 @@ export async function rmCharFromGroup(index:number): Promise<boolean> {
         markGroupDirty(group)
         const activation = await activateSelectedGroup(groupId)
         if (activation === 'activated') return true
-        if (activation === 'superseded') return false
+        if (activation === 'superseded') {
+            // The removal is already applied and marked dirty; false only means
+            // the group is no longer selected, so residency still needs to follow
+            // the mutated membership.
+            reconcilePersistentActiveCharacterIds(
+                DBState.db,
+                DBState.db.characters[get(selectedCharID)]?.chaId ?? null,
+            )
+            return false
+        }
         group = DBState.db.characters.find((character) => character.chaId === groupId)
         if (!group || group.type !== 'group') return false
         if (!group.characters.includes(removedCharacter)) {
