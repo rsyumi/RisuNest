@@ -21,9 +21,15 @@ import type { NativeAndroidCharacterSpoolResult } from './nativeCharacterFileRou
 import {
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
+    prepareNativeContentImport,
     runNativeBlockRisuSaveRestore,
     runNativeLosslessBackupRestore,
+    type NativeFileJobOptions,
+    type NativeFileJobSource,
+    type PreparedNativeContent,
+    type PreparedNativeContentReceipt,
 } from './nativeFileJobs'
+import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 
@@ -36,12 +42,14 @@ export interface AndroidOpenedSpoolDispatchDependencies {
     reportDestinationRequired(source: AndroidSpoolReady): void
 }
 
-function isAndroidNativeCharacterSpool(source: AndroidSpoolReady): boolean {
+function isAndroidNativeContentSpool(source: AndroidSpoolReady): boolean {
     const displayName = source.displayName.toLocaleLowerCase('en-US')
     return displayName.endsWith('.json')
         || displayName.endsWith('.charx')
         || displayName.endsWith('.jpg')
         || displayName.endsWith('.jpeg')
+        || displayName.endsWith('.png')
+        || displayName.endsWith('.risum')
 }
 
 export async function dispatchAndroidOpenedSpoolBatch(
@@ -49,10 +57,10 @@ export async function dispatchAndroidOpenedSpoolBatch(
     dependencies: AndroidOpenedSpoolDispatchDependencies,
     handledCharacterTokens?: Set<string>,
 ): Promise<void> {
-    const characterSources = batch.ready.filter(isAndroidNativeCharacterSpool)
+    const characterSources = batch.ready.filter(isAndroidNativeContentSpool)
     await dependencies.enqueueRestore({
         ...batch,
-        ready: batch.ready.filter((source) => !isAndroidNativeCharacterSpool(source)),
+        ready: batch.ready.filter((source) => !isAndroidNativeContentSpool(source)),
     })
     for (const source of characterSources) {
         if (handledCharacterTokens?.has(source.token)) continue
@@ -92,18 +100,64 @@ export function createAndroidOpenedSpoolDispatcher(
     }
 }
 
+export interface AndroidOpenedPreparedContentDependencies {
+    prepare(
+        source: NativeFileJobSource,
+        displayName: string,
+        options?: NativeFileJobOptions,
+    ): Promise<PreparedNativeContentReceipt>
+    activateCharacter(
+        content: PreparedNativeContent,
+        lifecycle: PreparedNativeContentReceipt,
+        signal?: AbortSignal,
+    ): Promise<{ characterId: string } | null>
+    activateModule(
+        content: PreparedNativeContent,
+        lifecycle: PreparedNativeContentReceipt,
+        signal?: AbortSignal,
+    ): Promise<{ moduleId: string } | null>
+}
+
+export async function importAndroidOpenedPreparedContent(
+    source: AndroidSpoolReady,
+    dependencies: AndroidOpenedPreparedContentDependencies,
+    options: NativeFileJobOptions = {},
+): Promise<{ kind: 'declined' } | { kind: 'imported'; value: string }> {
+    const result = await runNativePreparedContentRoute(
+        { type: 'androidSpool', token: source.token },
+        source.displayName,
+        {
+            prepare: dependencies.prepare,
+            map: async (content) => content,
+            activate: async (content, lifecycle, signal) => {
+                if (content.format === 'risu-module') {
+                    const activated = await dependencies.activateModule(content, lifecycle, signal)
+                    return activated ? activated.moduleId : null
+                }
+                const activated = await dependencies.activateCharacter(content, lifecycle, signal)
+                return activated ? activated.characterId : null
+            },
+        },
+        options,
+    )
+    return result === null
+        ? { kind: 'declined' }
+        : { kind: 'imported', value: result }
+}
+
 async function importAndroidCharacterSpool(
     source: AndroidSpoolReady,
 ): Promise<NativeAndroidCharacterSpoolResult<string>> {
     const [
         { importAndroidNativeCharacterSpool },
-        {
-            importPreparedNativeCharacterContent,
-            isNativeCharacterContentImportEnabled,
-        },
+        { isNativeCharacterContentImportEnabled },
+        { activatePreparedNativeCharacterContent },
+        { activatePreparedNativeModuleContent },
     ] = await Promise.all([
         import('./nativeCharacterFileRoute'),
         import('../characterCards'),
+        import('./nativeCharacterContentActivation'),
+        import('./nativeModuleContentActivation'),
     ])
     return await importAndroidNativeCharacterSpool(source, {
         chooseDesktopPath: async () => null,
@@ -111,12 +165,25 @@ async function importAndroidCharacterSpool(
             throw new Error('Android spool character import cannot read source bytes in TypeScript')
         },
         nativeEnabled: isNativeCharacterContentImportEnabled,
-        nativeImport: async (input) => await runExternalAndroidNativeFileOperation(
+        nativeImport: async () => await runExternalAndroidNativeFileOperation(
             'import',
-            ({ signal, onStatus }) => importPreparedNativeCharacterContent(input, {
-                signal,
-                onStatus,
-            }),
+            ({ signal, onStatus }) => importAndroidOpenedPreparedContent(source, {
+                prepare: prepareNativeContentImport,
+                activateCharacter: (content, lifecycle, activationSignal) =>
+                    activatePreparedNativeCharacterContent(
+                        content,
+                        lifecycle,
+                        undefined,
+                        activationSignal,
+                    ),
+                activateModule: (content, lifecycle, activationSignal) =>
+                    activatePreparedNativeModuleContent(
+                        content,
+                        lifecycle,
+                        undefined,
+                        activationSignal,
+                    ),
+            }, { signal, onStatus }),
         ),
         legacyImport: async () => {
             throw new Error('Android spool character import has no legacy byte fallback')

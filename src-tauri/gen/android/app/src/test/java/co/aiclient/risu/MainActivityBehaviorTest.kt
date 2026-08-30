@@ -16,14 +16,16 @@ class MainActivityBehaviorTest {
     assertEquals(true, shouldUseNativeFileJobSpool("backup.risudat"))
     assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISUDAT"))
     assertEquals(true, shouldUseNativeFileJobSpool("backup.risulossless"))
+    assertEquals(true, shouldUseNativeFileJobSpool("card.PnG"))
+    assertEquals(true, shouldUseNativeFileJobSpool("module.RiSuM"))
     assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISULOSSLESS"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.charx"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.json"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.jpg"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.JPEG"))
-    assertEquals(false, shouldUseNativeFileJobSpool("module.risum"))
+    assertEquals(false, shouldUseNativeFileJobSpool("module.risup"))
     assertEquals(false, shouldUseNativeFileJobSpool("preset.risup"))
-    assertEquals(false, shouldUseNativeFileJobSpool("character.png"))
+    assertEquals(true, shouldUseNativeFileJobSpool("character.png"))
     assertEquals(false, shouldUseNativeFileJobSpool("unknown"))
   }
 
@@ -31,12 +33,20 @@ class MainActivityBehaviorTest {
   fun `long native SAF candidate names preserve their persisted extension for dispatch`() {
     val character = safeSafDisplayName("a".repeat(181) + ".charx")
     val risuSave = safeSafDisplayName("b".repeat(181) + ".risudat")
+    val png = safeSafDisplayName("p".repeat(181) + ".PNG")
+    val risum = safeSafDisplayName("m".repeat(181) + ".RISUM")
 
     assertEquals(180, character.length)
     assertEquals(true, character.endsWith(".charx"))
     assertEquals(true, shouldUseNativeFileJobSpool(character))
     assertEquals(180, risuSave.length)
     assertEquals(true, risuSave.endsWith(".risudat"))
+    assertEquals(180, png.length)
+    assertEquals(true, png.endsWith(".PNG"))
+    assertEquals(true, shouldUseNativeFileJobSpool(png))
+    assertEquals(180, risum.length)
+    assertEquals(true, risum.endsWith(".RISUM"))
+    assertEquals(true, shouldUseNativeFileJobSpool(risum))
     assertEquals(true, shouldUseNativeFileJobSpool(risuSave))
   }
 

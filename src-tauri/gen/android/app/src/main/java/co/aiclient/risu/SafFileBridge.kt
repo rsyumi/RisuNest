@@ -24,6 +24,8 @@ private val NATIVE_FILE_JOB_SPOOL_SUFFIXES = listOf(
   ".json",
   ".jpeg",
   ".jpg",
+  ".png",
+  ".risum",
 )
 private val CANONICAL_TOKEN = Regex(
   "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",

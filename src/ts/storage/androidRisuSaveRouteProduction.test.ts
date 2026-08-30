@@ -17,8 +17,13 @@ vi.mock('./persistentDataRuntime.svelte', () => ({
 import {
     createAndroidOpenedSpoolDispatcher,
     dispatchAndroidOpenedSpoolBatch,
+    importAndroidOpenedPreparedContent,
     type AndroidOpenedSpoolDispatchDependencies,
 } from './androidRisuSaveRouteProduction.svelte'
+import type {
+    PreparedNativeContent,
+    PreparedNativeContentReceipt,
+} from './nativeFileJobs'
 
 describe('Android opened spool production route', () => {
     it('keeps the inactive content capability fallback out of the restore discard path', async () => {
@@ -42,22 +47,30 @@ describe('Android opened spool production route', () => {
             displayName: 'backup.risudat',
             bytes: 30,
         }
-        const unsupported = {
+        const png = {
             token: '33333333-3333-4333-8333-333333333333',
             displayName: 'portrait.png',
             bytes: 40,
         }
+        const risum = {
+            token: '44444444-4444-4444-8444-444444444444',
+            displayName: 'module.risum',
+            bytes: 50,
+        }
 
         await dispatchAndroidOpenedSpoolBatch({
             requestId: 'opened-1',
-            ready: [character, save, unsupported],
+            ready: [character, save, png, risum],
             failures: [],
         }, dependencies)
 
-        expect(importCharacter).toHaveBeenCalledExactlyOnceWith(character)
+        expect(importCharacter).toHaveBeenCalledTimes(3)
+        expect(importCharacter).toHaveBeenNthCalledWith(1, character)
+        expect(importCharacter).toHaveBeenNthCalledWith(2, png)
+        expect(importCharacter).toHaveBeenNthCalledWith(3, risum)
         expect(enqueueRestore).toHaveBeenCalledExactlyOnceWith({
             requestId: 'opened-1',
-            ready: [save, unsupported],
+            ready: [save],
             failures: [],
         })
         expect(dependencies.reportCharacterError).not.toHaveBeenCalled()
@@ -78,6 +91,8 @@ describe('Android opened spool production route', () => {
             'card.json',
             'card.jpg',
             'card.JPEG',
+            `${'p'.repeat(174)}.PnG`,
+            `${'m'.repeat(174)}.RiSuM`,
         ].map((displayName, index) => ({
             token: `00000000-0000-4000-8000-00000000000${index + 1}`,
             displayName,
@@ -90,11 +105,10 @@ describe('Android opened spool production route', () => {
             failures: [],
         }, dependencies)
 
-        expect(importCharacter).toHaveBeenCalledTimes(4)
-        expect(importCharacter).toHaveBeenNthCalledWith(1, ready[0])
-        expect(importCharacter).toHaveBeenNthCalledWith(2, ready[1])
-        expect(importCharacter).toHaveBeenNthCalledWith(3, ready[2])
-        expect(importCharacter).toHaveBeenNthCalledWith(4, ready[3])
+        expect(importCharacter).toHaveBeenCalledTimes(6)
+        ready.forEach((source, index) => {
+            expect(importCharacter).toHaveBeenNthCalledWith(index + 1, source)
+        })
         expect(enqueueRestore).toHaveBeenCalledExactlyOnceWith({
             requestId: 'opened-2',
             ready: [],
@@ -135,7 +149,7 @@ describe('Android opened spool production route', () => {
         const dispatcher = createAndroidOpenedSpoolDispatcher(dependencies)
         const source = {
             token: '11111111-1111-4111-8111-111111111111',
-            displayName: 'card.charx',
+            displayName: 'module.RISUM',
             bytes: 10,
         }
 
@@ -163,12 +177,12 @@ describe('Android opened spool production route', () => {
         const dispatcher = createAndroidOpenedSpoolDispatcher(dependencies)
         const first = {
             token: '11111111-1111-4111-8111-111111111111',
-            displayName: 'card.charx',
+            displayName: 'card.PNG',
             bytes: 10,
         }
         const second = {
             token: '22222222-2222-4222-8222-222222222222',
-            displayName: 'card.charx',
+            displayName: 'card.PNG',
             bytes: 10,
         }
 
@@ -189,5 +203,85 @@ describe('Android opened spool production route', () => {
         releaseFirst()
         await Promise.all([firstBatch, secondBatch])
         expect(calls).toEqual([first.token, second.token])
+    })
+
+    it.each([
+        ['png-card', 'character'] as const,
+        ['risu-module', 'module'] as const,
+    ])('prepares one Android token once and activates %s as %s', async (format, expected) => {
+        const cancel = vi.fn(async () => undefined)
+        const confirmActivated = vi.fn(async () => undefined)
+        const receipt = {
+            content: {
+                casSessionId: 'session-1',
+                format,
+                metadata: {},
+                assets: [],
+                ...(format === 'risu-module'
+                    ? { ownerHead: { present: false, manifestHash: null, entryCount: 0 } }
+                    : {}),
+            } as PreparedNativeContent,
+            cancel,
+            confirmActivated,
+        } as unknown as PreparedNativeContentReceipt
+        const prepare = vi.fn(async () => receipt)
+        const activateCharacter = vi.fn(async () => ({ characterId: 'character-1' }))
+        const activateModule = vi.fn(async () => ({ moduleId: 'module-1' }))
+        const source = {
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: format === 'risu-module' ? 'module.RISUM' : 'card.PNG',
+            bytes: 10,
+        }
+
+        const result = await importAndroidOpenedPreparedContent(source, {
+            prepare,
+            activateCharacter,
+            activateModule,
+        })
+
+        expect(prepare).toHaveBeenCalledExactlyOnceWith(
+            { type: 'androidSpool', token: source.token },
+            source.displayName,
+            {},
+        )
+        expect(activateCharacter).toHaveBeenCalledTimes(expected === 'character' ? 1 : 0)
+        expect(activateModule).toHaveBeenCalledTimes(expected === 'module' ? 1 : 0)
+        expect(result).toEqual({
+            kind: 'imported',
+            value: expected === 'character' ? 'character-1' : 'module-1',
+        })
+        expect(confirmActivated).toHaveBeenCalledOnce()
+        expect(cancel).not.toHaveBeenCalled()
+    })
+
+    it('cancels a prepared Android token when activation is declined', async () => {
+        const cancel = vi.fn(async () => undefined)
+        const confirmActivated = vi.fn(async () => undefined)
+        const prepare = vi.fn(async () => ({
+            content: {
+                casSessionId: 'session-1',
+                format: 'risu-module',
+                metadata: {},
+                assets: [],
+                ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+            },
+            cancel,
+            confirmActivated,
+        } as unknown as PreparedNativeContentReceipt))
+
+        const result = await importAndroidOpenedPreparedContent({
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'module.risum',
+            bytes: 10,
+        }, {
+            prepare,
+            activateCharacter: vi.fn(async () => ({ characterId: 'unused' })),
+            activateModule: vi.fn(async () => null),
+        })
+
+        expect(result).toEqual({ kind: 'declined' })
+        expect(prepare).toHaveBeenCalledOnce()
+        expect(cancel).toHaveBeenCalledOnce()
+        expect(confirmActivated).not.toHaveBeenCalled()
     })
 })
