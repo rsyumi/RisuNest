@@ -19,11 +19,53 @@ describe('peer logical delta product facade', () => {
         })
         expect(() => parsePeerDeltaUri(pairing.replace('peer-delta', 'peer-clone'))).toThrow()
         expect(() => parsePeerDeltaUri(pairing.replace('192.168.1.20', '8.8.8.8'))).toThrow()
-        expect(() => parsePeerDeltaUri(pairing.replace(
+        expect(parsePeerDeltaUri(pairing.replace(
             'http%3A%2F%2F192.168.1.20%3A32145%2F',
             'https%3A%2F%2Fsync.example.com',
-        ))).toThrow()
+        )).endpoint).toBe('https://sync.example.com/')
         expect(() => parsePeerDeltaUri(`${pairing}&extra=1`)).toThrow()
+    })
+
+    test.each([
+        'https%3A%2F%2F127.0.0.1',
+        'https%3A%2F%2Flocalhost',
+        'https%3A%2F%2Fsync.example.com%3A443',
+        'https%3A%2F%2Fsync.example.com%2Fpath',
+        'https%3A%2F%2Fsync.example.com%3Fquery%3D1',
+        'https%3A%2F%2Fuser%40sync.example.com',
+    ])('rejects malformed or non-canonical public HTTPS endpoint %s', (endpoint) => {
+        expect(() => parsePeerDeltaUri(pairing.replace(
+            'http%3A%2F%2F192.168.1.20%3A32145%2F',
+            endpoint,
+        ))).toThrow('Invalid peer delta pairing URI')
+    })
+
+    test('starts and stops Quick and Named tunnel transports through P4-owned commands', async () => {
+        const invokeMock = vi.fn(async <T>(command: string): Promise<T> => ({
+            phase: 'running',
+            sessionId: 'session',
+            manifestId: 'a'.repeat(64),
+            pairingUri: 'risuailocal://peer-delta/v1',
+            tunnel: { kind: command.includes('status') ? 'quick' : 'named', experimental: false, oneShot: false },
+            devices: [],
+        }) as T)
+        const invoke = invokeMock as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'desktop', invoke })
+
+        await facade.startQuickTunnel('session')
+        await facade.startNamedTunnel('session', 'secret-token', 'https://sync.example.com')
+        await facade.tunnelStatus()
+        await facade.stopTunnel('session')
+
+        expect(invokeMock.mock.calls).toEqual([
+            ['peer_delta_tunnel_start', { sessionId: 'session', tunnel: { kind: 'quick' } }],
+            ['peer_delta_tunnel_start', {
+                sessionId: 'session',
+                tunnel: { kind: 'named', token: 'secret-token', expectedPublicBaseUrl: 'https://sync.example.com' },
+            }],
+            ['peer_delta_tunnel_status'],
+            ['peer_delta_tunnel_stop', { sessionId: 'session' }],
+        ])
     })
 
     test.each([

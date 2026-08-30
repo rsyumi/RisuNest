@@ -586,6 +586,9 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_prepare,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_start,
+            peer_sync::delta_commands::peer_delta_tunnel_start,
+            peer_sync::delta_commands::peer_delta_tunnel_status,
+            peer_sync::delta_commands::peer_delta_tunnel_stop,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_status,
             #[cfg(desktop)]
@@ -710,6 +713,8 @@ pub fn run() {
         #[cfg(desktop)]
         if run_event_requires_peer_clone_shutdown(&event) {
             app.state::<peer_sync::commands::PeerCloneCommandState>()
+                .shutdown_for_exit();
+            app.state::<peer_sync::delta_commands::PeerDeltaCommandState>()
                 .shutdown_for_exit();
         }
         #[cfg(not(desktop))]

@@ -3461,7 +3461,7 @@ impl LanLogicalDeltaClient {
                 "invalid logical delta pairing data".to_owned(),
             ));
         }
-        let endpoint = validate_private_lan_endpoint(endpoint)?;
+        let endpoint = validate_lan_endpoint(endpoint)?;
         let session_url = format!("{endpoint}/v1/sessions/{session_id}");
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(

@@ -70,6 +70,9 @@
     let deltaPullResult = $state<PeerDeltaPullResult>()
     let deltaBusy = $state(false)
     let deltaError = $state('')
+    let deltaSourceMode = $state<'lan' | 'quick' | 'named'>('lan')
+    let deltaNamedTunnelToken = $state('')
+    let deltaNamedTunnelPublicBaseUrl = $state('')
     let bidirectionalCapabilities = $state<PeerBidirectionalCapabilities>()
     let bidirectionalSourceStatus = $state<PeerBidirectionalSourceStatus>({ phase: 'idle', devices: [] })
     let bidirectionalSourcePairingUri = $state('')
@@ -86,6 +89,12 @@
     $effect(() => {
         if (sourceMode !== 'named' || sourceStatus.phase !== 'prepared') {
             namedTunnelToken = ''
+        }
+    })
+
+    $effect(() => {
+        if (deltaSourceMode !== 'named' || deltaSourceStatus.phase !== 'prepared') {
+            deltaNamedTunnelToken = ''
         }
     })
 
@@ -251,6 +260,7 @@
         deltaPullPhase = snapshot.pullPhase
         deltaPullResult = snapshot.pullResult
         deltaError = snapshot.error
+        if (deltaSourceStatus.phase !== 'prepared') deltaNamedTunnelToken = ''
     }
 
     async function withDeltaBusy(operation: () => Promise<void>): Promise<void> {
@@ -275,9 +285,23 @@
 
     async function startDeltaSource(): Promise<void> {
         if (!deltaSourceStatus.sessionId) return
-        await withDeltaBusy(async () => {
-            await deltaController.start(deltaSourceStatus.sessionId!)
-        })
+        if (deltaSourceMode === 'quick' && !await alertConfirm(language.peerClone.quickTunnelConfirm)) return
+        const sessionId = deltaSourceStatus.sessionId
+        const token = deltaNamedTunnelToken
+        if (deltaSourceMode === 'named') deltaNamedTunnelToken = ''
+        try {
+            await withDeltaBusy(async () => {
+                if (deltaSourceMode === 'quick') {
+                    await deltaController.startQuickTunnel(sessionId)
+                } else if (deltaSourceMode === 'named') {
+                    await deltaController.startNamedTunnel(sessionId, token, deltaNamedTunnelPublicBaseUrl)
+                } else {
+                    await deltaController.start(sessionId)
+                }
+            })
+        } finally {
+            deltaNamedTunnelToken = ''
+        }
     }
 
     async function stopDeltaSource(): Promise<void> {
@@ -420,6 +444,7 @@
         if (pendingUri) acceptPairingUri(pendingUri)
         const unsubscribe = subscribePeerCloneUri(acceptPairingUri)
         return () => {
+            deltaNamedTunnelToken = ''
             unsubscribe()
             unsubscribeController()
             unsubscribeDeltaController()
@@ -591,6 +616,38 @@
             <span class="font-bold">{language.peerDelta.sourceStatus}:</span>
             {deltaSourcePhaseText()}
         </p>
+        {#if deltaSourceStatus.phase === 'prepared'}
+            <p class="mt-3 text-sm font-bold">{language.peerClone.shareMode}</p>
+            <SelectInput bind:value={deltaSourceMode} className="mt-1 w-full">
+                <option value="lan">{language.peerClone.lanMode}</option>
+                <option value="quick">{language.peerClone.quickTunnelMode}</option>
+                <option value="named">{language.peerClone.namedTunnelMode}</option>
+            </SelectInput>
+            {#if deltaSourceMode === 'quick'}
+                <p class="mt-2 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">
+                    {language.peerClone.quickTunnelHelp}
+                </p>
+            {:else if deltaSourceMode === 'named'}
+                <label class="mt-3 block text-sm font-bold" for="peer-delta-named-token">{language.peerClone.namedTunnelToken}</label>
+                <input
+                    id="peer-delta-named-token"
+                    bind:value={deltaNamedTunnelToken}
+                    type="password"
+                    autocomplete="new-password"
+                    class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"
+                />
+                <label class="mt-3 block text-sm font-bold" for="peer-delta-named-public-url">{language.peerClone.namedTunnelPublicUrl}</label>
+                <input
+                    id="peer-delta-named-public-url"
+                    bind:value={deltaNamedTunnelPublicBaseUrl}
+                    type="url"
+                    autocomplete="off"
+                    placeholder="https://sync.example.com"
+                    class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"
+                />
+                <p class="mt-2 text-sm text-textcolor2">{language.peerClone.namedTunnelHelp}</p>
+            {/if}
+        {/if}
         <div class="mt-2 flex flex-wrap gap-2">
             <Button disabled={!deltaSourceEnabled || deltaOperationRunning} onclick={prepareDeltaSource}>
                 {language.peerDelta.prepare}
@@ -601,7 +658,7 @@
             >{language.peerDelta.start}</Button>
             <Button
                 styled="danger"
-                disabled={deltaOperationRunning || !['prepared', 'running'].includes(deltaSourceStatus.phase)}
+                disabled={deltaOperationRunning || !['prepared', 'starting', 'running', 'stopping'].includes(deltaSourceStatus.phase)}
                 onclick={stopDeltaSource}
             >{language.peerDelta.stop}</Button>
         </div>

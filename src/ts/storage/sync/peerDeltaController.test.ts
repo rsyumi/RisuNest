@@ -27,6 +27,18 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
             pairingUri: 'risuailocal://peer-delta/v1',
             devices: [],
         })),
+        startQuickTunnel: vi.fn(async () => ({
+            phase: 'running', sessionId: 'session', manifestId: 'a'.repeat(64),
+            pairingUri: 'risuailocal://peer-delta/v1',
+            tunnel: { kind: 'quick', experimental: true, oneShot: true }, devices: [],
+        })),
+        startNamedTunnel: vi.fn(async () => ({
+            phase: 'running', sessionId: 'session', manifestId: 'a'.repeat(64),
+            pairingUri: 'risuailocal://peer-delta/v1',
+            tunnel: { kind: 'named', experimental: false, oneShot: false }, devices: [],
+        })),
+        tunnelStatus: vi.fn(async () => ({ phase: 'idle' })),
+        stopTunnel: vi.fn(async () => undefined),
         status: vi.fn(async () => ({ phase: 'idle', devices: [] })),
         stop: vi.fn(async () => undefined),
         revoke: vi.fn(async () => undefined),
@@ -41,6 +53,63 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
 }
 
 describe('peer delta controller', () => {
+    test('refreshes exact native cleanup ownership after an uncertain tunnel start failure', async () => {
+        const stopping = {
+            phase: 'stopping', sessionId: 'session', manifestId: 'a'.repeat(64),
+            tunnel: { kind: 'quick', experimental: true, oneShot: true }, devices: [],
+        } as const
+        const controller = createPeerDeltaController({
+            facade: facadeFixture({
+                startQuickTunnel: vi.fn(async () => { throw new Error('tunnel failed to start') }),
+                status: vi.fn(async () => stopping),
+                tunnelStatus: vi.fn(async () => ({
+                    phase: 'stopping', sessionId: 'session', tunnel: stopping.tunnel,
+                } as const)),
+            }),
+            sourcePollMilliseconds: 60_000,
+        })
+
+        await expect(controller.startQuickTunnel('session')).rejects.toThrow('tunnel failed to start')
+        expect(controller.snapshot()).toMatchObject({
+            sourceStatus: stopping,
+            tunnelStatus: { phase: 'stopping', sessionId: 'session' },
+            sourcePairingUri: '',
+        })
+    })
+
+    test('owns tunnel polling, natural-exit cleanup, and exact stop retries', async () => {
+        vi.useFakeTimers()
+        const stopTunnel = vi.fn()
+            .mockRejectedValueOnce(new Error('tunnel cleanup failed'))
+            .mockResolvedValueOnce(undefined)
+        const status = vi.fn(async () => stopTunnel.mock.calls.length < 2
+            ? ({
+                phase: 'stopping', sessionId: 'session', manifestId: 'a'.repeat(64),
+                tunnel: { kind: 'quick', experimental: true, oneShot: true }, devices: [],
+            } as const)
+            : ({ phase: 'stopped', devices: [] } as const))
+        const controller = createPeerDeltaController({
+            facade: facadeFixture({
+                status,
+                tunnelStatus: vi.fn(async () => ({
+                    phase: 'stopped', sessionId: 'session',
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                } as const)),
+                stopTunnel,
+            }),
+            sourcePollMilliseconds: 10,
+        })
+
+        await controller.startQuickTunnel('session')
+        await vi.advanceTimersByTimeAsync(10)
+        await expect(controller.stop('session')).rejects.toThrow('tunnel cleanup failed')
+        expect(controller.snapshot().sourceStatus.phase).toBe('stopping')
+        await controller.stop('session')
+
+        expect(stopTunnel).toHaveBeenCalledTimes(2)
+        expect(controller.snapshot().sourcePairingUri).toBe('')
+        vi.useRealTimers()
+    })
     test('keeps source ownership and one in-flight pull outside component subscriptions', async () => {
         let resolvePull!: (value: Awaited<ReturnType<Facade['pull']>>) => void
         const pull = vi.fn(() => new Promise<Awaited<ReturnType<Facade['pull']>>>((resolve) => {

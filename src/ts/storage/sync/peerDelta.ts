@@ -1,8 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import {
+    parsePeerCloneEndpoint,
     parsePeerLanEndpoint,
     type PeerClonePlatform,
+    type PeerCloneTunnelMetadata,
+    type PeerCloneTunnelStatus,
 } from './peerClone'
 
 export interface PeerDeltaPairing {
@@ -43,7 +46,8 @@ export interface PeerDeltaSourceStatus {
     sessionId?: string
     manifestId?: string
     pairingUri?: string
-    phase: 'idle' | 'prepared' | 'running' | 'stopped'
+    phase: 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'stopped'
+    tunnel?: PeerCloneTunnelMetadata
     devices: readonly {
         deviceId: string
         transferredBytes: number
@@ -106,8 +110,18 @@ export function parsePeerDeltaUri(value: string): PeerDeltaPairing {
     if (!uuidPattern.test(sessionId)
         || !sha256Pattern.test(manifestId)
         || !/^claim=[0-9a-f]{64}$/.test(fragment)) return invalidPairingUri()
+    let endpoint: string
+    try {
+        endpoint = parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!)
+    } catch {
+        try {
+            endpoint = parsePeerLanEndpoint(uri.searchParams.get('endpoint')!)
+        } catch {
+            return invalidPairingUri()
+        }
+    }
     return {
-        endpoint: parsePeerLanEndpoint(uri.searchParams.get('endpoint')!),
+        endpoint,
         sessionId,
         manifestId,
         claim: fragment.slice('claim='.length),
@@ -151,6 +165,32 @@ export function createPeerDeltaFacade(options: {
         async start(sessionId: string): Promise<PeerDeltaSourceStatus> {
             requireDesktop()
             return nativeInvoke('peer_delta_start', { sessionId })
+        },
+        async startQuickTunnel(sessionId: string): Promise<PeerDeltaSourceStatus> {
+            requireDesktop()
+            return nativeInvoke('peer_delta_tunnel_start', {
+                sessionId,
+                tunnel: { kind: 'quick' },
+            })
+        },
+        async startNamedTunnel(
+            sessionId: string,
+            token: string,
+            expectedPublicBaseUrl: string,
+        ): Promise<PeerDeltaSourceStatus> {
+            requireDesktop()
+            return nativeInvoke('peer_delta_tunnel_start', {
+                sessionId,
+                tunnel: { kind: 'named', token, expectedPublicBaseUrl },
+            })
+        },
+        async tunnelStatus(): Promise<PeerCloneTunnelStatus> {
+            requireDesktop()
+            return nativeInvoke('peer_delta_tunnel_status')
+        },
+        async stopTunnel(sessionId: string): Promise<void> {
+            requireDesktop()
+            await nativeInvoke('peer_delta_tunnel_stop', { sessionId })
         },
         async status(): Promise<PeerDeltaSourceStatus> {
             requireDesktop()

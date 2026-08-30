@@ -5,12 +5,14 @@ import {
     type PeerDeltaPullResult,
     type PeerDeltaSourceStatus,
 } from './peerDelta'
+import type { PeerCloneTunnelStatus } from './peerClone'
 
 type PeerDeltaFacade = ReturnType<typeof createPeerDeltaFacade>
 
 export interface PeerDeltaControllerSnapshot {
     capabilities?: PeerDeltaCapabilities
     sourceStatus: PeerDeltaSourceStatus
+    tunnelStatus: PeerCloneTunnelStatus
     sourcePairingUri: string
     pullPhase: 'idle' | 'running' | 'completed' | 'fullCloneRequired' | 'conflict' | 'failed'
     pullResult?: PeerDeltaPullResult
@@ -24,6 +26,7 @@ export function createPeerDeltaController(options: {
     const listeners = new Set<(snapshot: PeerDeltaControllerSnapshot) => void>()
     let snapshot: PeerDeltaControllerSnapshot = {
         sourceStatus: { phase: 'idle', devices: [] },
+        tunnelStatus: { phase: 'idle' },
         sourcePairingUri: '',
         pullPhase: 'idle',
         error: '',
@@ -48,14 +51,32 @@ export function createPeerDeltaController(options: {
         if (sourceTimer) clearInterval(sourceTimer)
         sourceTimer = undefined
     }
+    const refreshSourceState = async (): Promise<PeerDeltaSourceStatus> => {
+        const sourceStatus = await options.facade.status()
+        const tunnelStatus = sourceStatus.tunnel
+            ? await options.facade.tunnelStatus()
+            : { phase: 'idle' as const }
+        update({
+            sourceStatus,
+            tunnelStatus,
+            sourcePairingUri: sourceStatus.phase === 'running'
+                ? sourceStatus.pairingUri ?? snapshot.sourcePairingUri
+                : '',
+        })
+        return sourceStatus
+    }
     const pollSource = async (): Promise<void> => {
         if (sourcePolling) return
         sourcePolling = true
         try {
             const sourceStatus = await options.facade.status()
+            const tunnelStatus = sourceStatus.tunnel
+                ? await options.facade.tunnelStatus()
+                : { phase: 'idle' as const }
             sourceError = ''
             update({
                 sourceStatus,
+                tunnelStatus,
                 sourcePairingUri: sourceStatus.phase === 'running'
                     ? sourceStatus.pairingUri ?? snapshot.sourcePairingUri
                     : '',
@@ -134,11 +155,51 @@ export function createPeerDeltaController(options: {
             beginSourcePolling()
             return sourceStatus
         }),
+        startQuickTunnel: (sessionId: string) => run(async () => {
+            try {
+                const sourceStatus = await options.facade.startQuickTunnel(sessionId)
+                update({
+                    sourceStatus,
+                    sourcePairingUri: sourceStatus.pairingUri ?? '',
+                    tunnelStatus: await options.facade.tunnelStatus(),
+                })
+                beginSourcePolling()
+                return sourceStatus
+            } catch (cause) {
+                const sourceStatus = await refreshSourceState()
+                if (['starting', 'running', 'stopping'].includes(sourceStatus.phase)) beginSourcePolling()
+                throw cause
+            }
+        }),
+        startNamedTunnel: (sessionId: string, token: string, expectedPublicBaseUrl: string) => run(async () => {
+            try {
+                const sourceStatus = await options.facade.startNamedTunnel(
+                    sessionId,
+                    token,
+                    expectedPublicBaseUrl,
+                )
+                update({
+                    sourceStatus,
+                    sourcePairingUri: sourceStatus.pairingUri ?? '',
+                    tunnelStatus: await options.facade.tunnelStatus(),
+                })
+                beginSourcePolling()
+                return sourceStatus
+            } catch (cause) {
+                const sourceStatus = await refreshSourceState()
+                if (['starting', 'running', 'stopping'].includes(sourceStatus.phase)) beginSourcePolling()
+                throw cause
+            }
+        }),
         stop: (sessionId: string) => run(async () => {
-            await options.facade.stop(sessionId)
-            stopSourcePolling()
-            const sourceStatus = await options.facade.status()
-            update({ sourceStatus, sourcePairingUri: '' })
+            try {
+                if (snapshot.sourceStatus.tunnel) await options.facade.stopTunnel(sessionId)
+                else await options.facade.stop(sessionId)
+            } finally {
+                const sourceStatus = await refreshSourceState()
+                if (['starting', 'running', 'stopping'].includes(sourceStatus.phase)) beginSourcePolling()
+                else stopSourcePolling()
+            }
         }),
         revoke: (sessionId: string, deviceId: string) => run(async () => {
             await options.facade.revoke(sessionId, deviceId)

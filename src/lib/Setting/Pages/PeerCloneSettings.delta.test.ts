@@ -37,4 +37,14 @@ describe('peer delta settings surface', () => {
         expect(languageEnglish.peerDelta.invalidLink).toContain('invalid')
         expect(languageKorean.peerDelta?.invalidLink).toContain('잘못')
     })
+
+    it('keeps LAN as the P4 default and clears Named tunnel tokens on every terminal path', () => {
+        expect(peerCloneSettingsSource).toContain("let deltaSourceMode = $state<'lan' | 'quick' | 'named'>('lan')")
+        expect(peerCloneSettingsSource).toContain('deltaController.startQuickTunnel(sessionId)')
+        expect(peerCloneSettingsSource).toContain(
+            'deltaController.startNamedTunnel(sessionId, token, deltaNamedTunnelPublicBaseUrl)',
+        )
+        expect(peerCloneSettingsSource).toContain("if (deltaSourceMode !== 'named' || deltaSourceStatus.phase !== 'prepared')")
+        expect(peerCloneSettingsSource.match(/deltaNamedTunnelToken = ''/g)?.length).toBeGreaterThanOrEqual(4)
+    })
 })
