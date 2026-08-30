@@ -3,7 +3,11 @@ mod android_client;
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod android_commands;
 #[cfg(any(target_os = "android", test))]
+mod android_foreground;
+#[cfg(any(target_os = "android", test))]
 mod android_jni;
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod android_source_commands;
 #[cfg(desktop)]
 pub(crate) mod bidirectional_commands;
 mod client;
@@ -37,14 +41,14 @@ pub use client::{
 #[cfg(desktop)]
 pub use host::LoopbackCloneHost;
 pub use lan::LanCloneClient;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub use lan::{LanCloneHost, LanDevice, LanPairing};
 pub use logical_delta_transfer::{
     execute_logical_delta_pull, select_missing_logical_delta_objects, LogicalDeltaActivation,
     LogicalDeltaApplyOperation, LogicalDeltaObject, LogicalDeltaObjectSource,
     LogicalDeltaStagedTarget, LogicalDeltaTransferSelection, ReadyLogicalDeltaPlan,
 };
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub(crate) use production::prepare_lossless_clone_session;
 #[cfg(any(desktop, target_os = "android", test))]
 pub(crate) use production::LosslessCloneTargetAdapter;

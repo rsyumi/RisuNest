@@ -7,12 +7,16 @@
     import {
         acquireDestructiveReplacementFence,
         capturePersistentMutationToken,
+        flushPendingData,
     } from 'src/ts/storage/persistentDataRuntime.svelte'
     import {
         createAndroidPeerCloneFacade,
         type AndroidPeerCloneCapabilities,
         type AndroidPeerCloneState,
     } from 'src/ts/storage/sync/peerCloneAndroid'
+    import { createAndroidPeerCloneSourceFacade, type AndroidPeerCloneSourceCapabilities } from 'src/ts/storage/sync/peerCloneAndroidSource'
+    import { createAndroidPeerCloneSourceController } from 'src/ts/storage/sync/peerCloneAndroidSourceController'
+    import type { PeerCloneSourceStatus } from 'src/ts/storage/sync/peerClone'
     import {
         consumePendingPeerCloneUri,
         subscribePeerCloneUri,
@@ -26,12 +30,17 @@
             afterRefresh: loadPluginsAfterAuthoritativeRestore,
         },
     })
+    const sourceFacade = createAndroidPeerCloneSourceFacade({ flushPendingData })
+    const sourceController = createAndroidPeerCloneSourceController(sourceFacade)
     let capabilities = $state<AndroidPeerCloneCapabilities>()
+    let sourceCapabilities = $state<AndroidPeerCloneSourceCapabilities>()
+    let sourceStatus = $state<PeerCloneSourceStatus>({ phase: 'idle', devices: [] })
     let cloneState = $state<AndroidPeerCloneState>(facade.getState())
     let pairingInput = $state('')
     let busy = $state(false)
     let error = $state('')
     let progressTimer: ReturnType<typeof setInterval> | undefined
+    let sourceTimer: ReturnType<typeof setInterval> | undefined
 
     const targetEnabled = $derived(!!(
         capabilities?.productionEnabled
@@ -41,6 +50,31 @@
         && capabilities.httpTransportReady
     ))
     const progressMaximum = $derived(cloneState.totalBytes ?? Math.max(1, cloneState.completedBytes))
+    const sourceEnabled = $derived(!!(
+        sourceCapabilities?.productionEnabled
+        && sourceCapabilities.sourceReady
+        && sourceCapabilities.httpTransportReady
+        && !sourceCapabilities.tunnelReady
+    ))
+
+    async function prepareSource(): Promise<void> {
+        await withBusy(async () => { sourceStatus = await sourceController.prepare() })
+    }
+
+    async function startSource(): Promise<void> {
+        if (!sourceStatus.sessionId) return
+        await withBusy(async () => { sourceStatus = await sourceController.start(sourceStatus.sessionId!) })
+    }
+
+    async function stopSource(): Promise<void> {
+        if (!sourceStatus.sessionId) return
+        await withBusy(async () => { sourceStatus = await sourceController.stop(sourceStatus.sessionId!) })
+    }
+
+    async function revokeSource(deviceId: string): Promise<void> {
+        if (!sourceStatus.sessionId) return
+        await withBusy(async () => { sourceStatus = await sourceController.revoke(sourceStatus.sessionId!, deviceId) })
+    }
 
     function refreshState(): void {
         cloneState = facade.getState()
@@ -136,20 +170,26 @@
             if (initialized) acceptPairingUri(uri)
             else pendingUri = uri
         })
-        void Promise.all([facade.capabilities(), facade.recover()])
-            .then(([available]) => {
+        void Promise.all([facade.capabilities(), facade.recover(), sourceFacade.capabilities(), sourceController.refresh()])
+            .then(([available, , availableSource, currentSource]) => {
                 capabilities = available
+                sourceCapabilities = availableSource
+                sourceStatus = currentSource
                 refreshState()
                 initialized = true
                 if (pendingUri) acceptPairingUri(pendingUri)
                 if (cloneState.phase === 'downloading') {
                     beginProgressPolling()
                 }
+                sourceTimer = setInterval(() => {
+                    void sourceController.refresh().then((current) => { sourceStatus = current })
+                }, 1_000)
             })
             .catch(reportError)
         return () => {
             unsubscribe()
             if (progressTimer) clearInterval(progressTimer)
+            if (sourceTimer) clearInterval(sourceTimer)
         }
     })
 </script>
@@ -163,6 +203,34 @@
             {language.peerClone.unavailable}
         </p>
     {/if}
+
+    <div class="mt-3 rounded-md border border-darkborderc p-3">
+        <h4 class="font-bold">{language.peerClone.source}</h4>
+        <p class="mt-1 text-sm text-textcolor2">{language.peerClone.sourceHelp}</p>
+        <p class="mt-1 text-sm text-textcolor2">Trusted LAN only. Android tunnel modes are unavailable.</p>
+        <div class="mt-2 flex flex-wrap gap-2">
+            <Button disabled={!sourceEnabled || busy || sourceStatus.phase !== 'idle'} onclick={prepareSource}>
+                {language.peerClone.prepare}
+            </Button>
+            <Button disabled={!sourceEnabled || busy || sourceStatus.phase !== 'prepared'} onclick={startSource}>
+                {language.peerClone.start}
+            </Button>
+            <Button styled="danger" disabled={busy || !sourceStatus.sessionId} onclick={stopSource}>
+                {language.peerClone.stop}
+            </Button>
+        </div>
+        {#if sourceStatus.pairingUri}
+            <textarea readonly rows="3" class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={sourceStatus.pairingUri}></textarea>
+        {/if}
+        {#each sourceStatus.devices as device (device.deviceId)}
+            <div class="mt-2 flex items-center justify-between gap-2 text-sm">
+                <span>{device.deviceId}</span>
+                <Button styled="danger" disabled={busy || device.revoked} onclick={() => revokeSource(device.deviceId)}>
+                    {language.peerClone.revoke}
+                </Button>
+            </div>
+        {/each}
+    </div>
 
     <div class="mt-3 rounded-md border border-darkborderc p-3">
         <h4 class="font-bold">{language.peerClone.target}</h4>

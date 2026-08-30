@@ -489,6 +489,10 @@ pub fn run() {
                     app_data_dir.clone(),
                 ),
             );
+            #[cfg(target_os = "android")]
+            app.manage(
+                peer_sync::android_source_commands::AndroidPeerCloneSourceState::initialize(),
+            );
             #[cfg(desktop)]
             app.manage(peer_sync::delta_commands::PeerDeltaCommandState::default());
             #[cfg(desktop)]
@@ -580,6 +584,20 @@ pub fn run() {
             peer_sync::android_commands::peer_clone_android_finalize,
             #[cfg(target_os = "android")]
             peer_sync::android_commands::peer_clone_android_release,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_capabilities,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_reserve,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_prepare,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_start,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_status,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_stop,
+            #[cfg(target_os = "android")]
+            peer_sync::android_source_commands::peer_clone_android_source_revoke,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_capabilities,
             #[cfg(desktop)]

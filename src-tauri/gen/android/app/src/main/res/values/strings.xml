@@ -11,4 +11,8 @@
     <string name="peer_clone_notification_text">Verified progress is saved automatically.</string>
     <string name="peer_clone_notification_progress">Transferred %1$d bytes in this run.</string>
     <string name="peer_clone_notification_cancel">Cancel</string>
+    <string name="peer_sync_source_notification_channel">Connected device transfer</string>
+    <string name="peer_sync_source_notification_title">Sharing RisuNest data</string>
+    <string name="peer_sync_source_notification_text">A nearby device can copy the prepared library.</string>
+    <string name="peer_sync_source_notification_stop">Stop sharing</string>
 </resources>

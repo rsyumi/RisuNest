@@ -1,5 +1,8 @@
 use super::{
     android_client::{AndroidCloneStopReason, AndroidCloneStopState},
+    android_foreground::{
+        registry as foreground_registry, AndroidForegroundKey, AndroidForegroundLane,
+    },
     AndroidResumableCloneJob, PeerSyncError, TransferCancellation,
 };
 #[cfg(target_os = "android")]
@@ -305,6 +308,79 @@ fn cleanup_completed_job(job_id: &str, app_data_root: &str) -> bool {
 #[cfg(target_os = "android")]
 fn java_string(environment: &mut JNIEnv<'_>, value: &JString<'_>) -> Option<String> {
     environment.get_string(value).ok().map(Into::into)
+}
+
+#[cfg(target_os = "android")]
+fn foreground_key(
+    environment: &mut JNIEnv<'_>,
+    lane: &JString<'_>,
+    operation_id: &JString<'_>,
+    generation: jlong,
+) -> Option<AndroidForegroundKey> {
+    let lane = AndroidForegroundLane::parse(&java_string(environment, lane)?)?;
+    let operation_id = java_string(environment, operation_id)?;
+    if uuid::Uuid::parse_str(&operation_id).ok()?.to_string() != operation_id || generation <= 0 {
+        return None;
+    }
+    Some(AndroidForegroundKey {
+        lane,
+        operation_id,
+        generation: generation as u64,
+    })
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_attach(
+    mut environment: JNIEnv,
+    _class: JClass,
+    lane: JString,
+    operation_id: JString,
+    generation: jlong,
+) -> jboolean {
+    if foreground_key(&mut environment, &lane, &operation_id, generation)
+        .is_some_and(|key| foreground_registry().attach_exact(&key))
+    {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_cancel(
+    mut environment: JNIEnv,
+    _class: JClass,
+    lane: JString,
+    operation_id: JString,
+    generation: jlong,
+) -> jboolean {
+    if foreground_key(&mut environment, &lane, &operation_id, generation)
+        .is_some_and(|key| foreground_registry().cancel_exact(&key))
+    {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_detach(
+    mut environment: JNIEnv,
+    _class: JClass,
+    lane: JString,
+    operation_id: JString,
+    generation: jlong,
+) -> jboolean {
+    if foreground_key(&mut environment, &lane, &operation_id, generation)
+        .is_some_and(|key| foreground_registry().detach_if_generation(&key))
+    {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
 }
 
 #[cfg(target_os = "android")]

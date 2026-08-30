@@ -456,6 +456,11 @@ fn lan_host_binds_only_on_explicit_start_and_stops_completely() {
     assert!(!pairing.claim.is_empty());
     host.stop().unwrap();
     assert!(TcpStream::connect(("127.0.0.1", address.port())).is_err());
+
+    let restarted_pairing = host.start().unwrap();
+    assert_eq!(restarted_pairing.session_id, pairing.session_id);
+    assert!(host.address().is_some());
+    host.stop().unwrap();
 }
 
 #[test]

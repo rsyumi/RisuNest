@@ -3,17 +3,17 @@ use super::{
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
     PeerSyncError,
 };
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 use super::{LogicalDeltaObject, LogicalDeltaObjectSource, PreparedCloneSession};
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 use crate::{
     asset_repository::PayloadCas,
     local_backup::{AtomicCancellation, CancellationProbe},
 };
 use serde::{Deserialize, Serialize};
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 use sha2::{Digest, Sha256};
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
@@ -33,7 +33,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const CLAIM_TTL: Duration = Duration::from_secs(10 * 60);
 #[cfg(desktop)]
 pub(crate) const NAMED_TUNNEL_ORIGIN_PORT: u16 = 32145;
@@ -43,32 +43,32 @@ pub(crate) const NAMED_TUNNEL_ORIGIN_UNAVAILABLE: &str =
 #[cfg(all(test, desktop))]
 pub(crate) static NAMED_TUNNEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 const MAX_URL_BYTES: usize = 512;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const MAX_BODY_BYTES: usize = 1024;
 const MAX_CLAIM_RESPONSE_BYTES: usize = 1024;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const MAX_REQUEST_LINE_BYTES: usize = MAX_URL_BYTES + 32;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_REQUEST_LINE_BYTES + 2 + MAX_HEADER_BYTES + 4;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const CONNECTION_READ_POLL_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(2);
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 const LOGICAL_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub struct LanPairing {
     pub session_id: String,
     pub manifest_id: String,
@@ -519,7 +519,7 @@ impl PersistedLanCredential {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub struct LanDevice {
     pub device_id: String,
     pub verified_bytes: u64,
@@ -528,13 +528,13 @@ pub struct LanDevice {
     pub revoked: bool,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct DeviceState {
     info: LanDevice,
     bearer_digest: [u8; 32],
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct ClaimState {
     digest: [u8; 32],
     expires_at: Instant,
@@ -554,16 +554,17 @@ pub(crate) struct TunnelOriginProbe {
     pub(crate) expected_body: [u8; 32],
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct LanShared {
     session: LanSession,
     manifest_bytes: Arc<[u8]>,
     claim: Mutex<Option<ClaimState>>,
+    #[cfg(desktop)]
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
     devices: Mutex<BTreeMap<String, DeviceState>>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub struct PreparedLogicalLanSession {
     session_id: String,
     source_device_id: String,
@@ -573,13 +574,13 @@ pub struct PreparedLogicalLanSession {
     source: Mutex<Box<dyn LogicalDeltaObjectSource + Send>>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub(crate) struct PreparedBidirectionalLogicalLanSession {
     logical: PreparedLogicalLanSession,
     control: Arc<dyn LanBidirectionalControl>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl PreparedBidirectionalLogicalLanSession {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -605,7 +606,7 @@ impl PreparedBidirectionalLogicalLanSession {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl PreparedLogicalLanSession {
     pub fn new(
         session_id: &str,
@@ -661,14 +662,14 @@ impl PreparedLogicalLanSession {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 enum LanSession {
     Clone(PreparedCloneSession),
     Logical(PreparedLogicalLanSession),
     BidirectionalLogical(PreparedBidirectionalLogicalLanSession),
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanSession {
     fn session_id(&self) -> &str {
         match self {
@@ -718,13 +719,13 @@ impl LanSession {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone)]
 pub(crate) struct LanCloneHostControl {
     shared: Weak<LanShared>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHostControl {
     pub(crate) fn devices(&self) -> Vec<LanDevice> {
         let Some(shared) = self.shared.upgrade() else {
@@ -758,7 +759,7 @@ impl LanCloneHostControl {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub struct LanCloneHost {
     shared: Arc<LanShared>,
     address: Option<SocketAddr>,
@@ -767,7 +768,7 @@ pub struct LanCloneHost {
     thread: Option<JoinHandle<Result<(), PeerSyncError>>>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHost {
     pub fn prepare(session: PreparedCloneSession) -> Self {
         let manifest_bytes = Arc::from(session.manifest_bytes());
@@ -776,6 +777,7 @@ impl LanCloneHost {
                 manifest_bytes,
                 session: LanSession::Clone(session),
                 claim: Mutex::new(None),
+                #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
             }),
@@ -792,6 +794,7 @@ impl LanCloneHost {
                 manifest_bytes: Arc::clone(&session.manifest_bytes),
                 session: LanSession::Logical(session),
                 claim: Mutex::new(None),
+                #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
             }),
@@ -810,6 +813,7 @@ impl LanCloneHost {
                 manifest_bytes: Arc::clone(&session.logical.manifest_bytes),
                 session: LanSession::BidirectionalLogical(session),
                 claim: Mutex::new(None),
+                #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
             }),
@@ -824,10 +828,12 @@ impl LanCloneHost {
         self.start_on(Ipv4Addr::UNSPECIFIED, 0)
     }
 
+    #[cfg(desktop)]
     pub(crate) fn start_quick_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
         self.start_on(Ipv4Addr::LOCALHOST, 0)
     }
 
+    #[cfg(desktop)]
     pub(crate) fn start_named_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
         self.start_on(Ipv4Addr::LOCALHOST, NAMED_TUNNEL_ORIGIN_PORT)
     }
@@ -845,14 +851,14 @@ impl LanCloneHost {
             consumed: false,
         });
         let listener = TcpListener::bind((bind_address, port)).map_err(|error| {
+            #[cfg(desktop)]
             if bind_address == Ipv4Addr::LOCALHOST
                 && port == NAMED_TUNNEL_ORIGIN_PORT
                 && error.kind() == io::ErrorKind::AddrInUse
             {
-                PeerSyncError::Transport(NAMED_TUNNEL_ORIGIN_UNAVAILABLE.to_owned())
-            } else {
-                transport(error)
+                return PeerSyncError::Transport(NAMED_TUNNEL_ORIGIN_UNAVAILABLE.to_owned());
             }
+            transport(error)
         })?;
         listener.set_nonblocking(true).map_err(transport)?;
         let address = listener.local_addr().map_err(transport)?;
@@ -898,6 +904,7 @@ impl LanCloneHost {
         }
     }
 
+    #[cfg(desktop)]
     pub(crate) fn issue_tunnel_probe(&self) -> Result<TunnelOriginProbe, PeerSyncError> {
         let Some(address) = self.address else {
             return Err(PeerSyncError::Protocol(
@@ -927,6 +934,7 @@ impl LanCloneHost {
         })
     }
 
+    #[cfg(desktop)]
     pub(crate) fn clear_tunnel_probe(&self) {
         *self.shared.tunnel_probe.lock().unwrap() = None;
     }
@@ -954,6 +962,7 @@ impl LanCloneHost {
                 .map_err(|_| PeerSyncError::Transport("LAN server thread panicked".to_owned()))??;
         }
         *self.shared.claim.lock().unwrap() = None;
+        #[cfg(desktop)]
         self.clear_tunnel_probe();
         self.shared.devices.lock().unwrap().clear();
         self.address = None;
@@ -970,14 +979,14 @@ impl LanCloneHost {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl Drop for LanCloneHost {
     fn drop(&mut self) {
         let _ = self.stop();
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn serve(
     listener: TcpListener,
     shared: Arc<LanShared>,
@@ -1009,7 +1018,7 @@ fn serve(
     Ok(())
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn configure_connection(stream: &TcpStream) -> Result<(), PeerSyncError> {
     stream.set_nonblocking(false).map_err(transport)?;
     stream
@@ -1021,7 +1030,7 @@ fn configure_connection(stream: &TcpStream) -> Result<(), PeerSyncError> {
     Ok(())
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct HttpRequest {
     method: String,
     url: String,
@@ -1031,14 +1040,14 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 enum RequestReadError {
     Http(u16),
     Io(io::Error),
     Stopped,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn handle_connection(
     mut stream: TcpStream,
     shared: &LanShared,
@@ -1056,7 +1065,7 @@ fn handle_connection(
     handle_request(&mut stream, request, shared, stopped)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn read_request(
     stream: &mut TcpStream,
     stopped: &AtomicBool,
@@ -1064,7 +1073,7 @@ fn read_request(
     read_request_started(stream, stopped, Instant::now())
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn read_request_started(
     stream: &mut TcpStream,
     stopped: &AtomicBool,
@@ -1073,7 +1082,7 @@ fn read_request_started(
     read_request_with_elapsed(stream, stopped, || request_started.elapsed())
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn read_request_with_elapsed(
     stream: &mut impl Read,
     stopped: &AtomicBool,
@@ -1234,7 +1243,7 @@ pub(super) fn read_request_with_elapsed_for_test(
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn handle_request(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -1242,13 +1251,16 @@ fn handle_request(
     stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
     let prefix = format!("/v1/sessions/{}", shared.session.session_id());
-    let tunnel_probe_prefix = format!("{prefix}/tunnel-check/");
-    if let Some(candidate) = request
-        .url
-        .strip_prefix(&tunnel_probe_prefix)
-        .map(str::to_owned)
+    #[cfg(desktop)]
     {
-        return tunnel_probe(stream, request, shared, &candidate);
+        let tunnel_probe_prefix = format!("{prefix}/tunnel-check/");
+        if let Some(candidate) = request
+            .url
+            .strip_prefix(&tunnel_probe_prefix)
+            .map(str::to_owned)
+        {
+            return tunnel_probe(stream, request, shared, &candidate);
+        }
     }
     if request.url == format!("{prefix}/claim") {
         return claim(stream, request, shared);
@@ -1345,7 +1357,7 @@ fn tunnel_probe(
     )
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn claim(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -1407,7 +1419,7 @@ fn claim(
     respond_json(stream, 200, &response)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
     let value = request.authorization.as_deref().ok_or(401_u16)?;
     let Some(bearer) = value.strip_prefix("Bearer ") else {
@@ -1430,7 +1442,7 @@ fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
     Err(401)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn progress(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -1455,7 +1467,7 @@ fn progress(
     respond_empty(stream, 204)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn authenticated_bidirectional_session(
     shared: &LanShared,
     target_device_id: &str,
@@ -1471,7 +1483,7 @@ fn authenticated_bidirectional_session(
         })
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn bidirectional_registration(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -1501,7 +1513,7 @@ fn bidirectional_registration(
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn bidirectional_remote_apply(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -1536,7 +1548,7 @@ fn bidirectional_remote_apply(
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
     let size = shared
         .session
@@ -1554,7 +1566,7 @@ fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), 
     write_response_head(stream, 200, &headers, size)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn range(
     stream: &mut TcpStream,
     request: &HttpRequest,
@@ -1603,7 +1615,7 @@ fn range(
     copy_exact_response(stream, &mut file, chunk.size, stopped)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn logical_object(
     stream: &mut TcpStream,
     shared: &LanShared,
@@ -1633,7 +1645,7 @@ fn logical_object(
     result
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn set_current_object(shared: &LanShared, device_id: &str, object: Option<&str>) {
     if let Some(device) = shared.devices.lock().unwrap().get_mut(device_id) {
         device.info.current_object = object.map(str::to_owned);
@@ -1649,7 +1661,7 @@ struct ClaimRequest {
     device_id: Option<String>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LanBidirectionalSession {
     pub(crate) session_id: String,
@@ -1657,7 +1669,7 @@ pub(crate) struct LanBidirectionalSession {
     pub(crate) target_device_id: String,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub(crate) trait LanBidirectionalControl: Send + Sync {
     fn register(
         &self,
@@ -1673,7 +1685,7 @@ pub(crate) trait LanBidirectionalControl: Send + Sync {
     ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>;
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LanBidirectionalGeneration {
@@ -1682,7 +1694,7 @@ pub(crate) struct LanBidirectionalGeneration {
     pub(crate) generation_sequence: String,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalGeneration {
     fn is_valid(&self) -> bool {
         !self.generation_id.is_empty()
@@ -1692,7 +1704,7 @@ impl LanBidirectionalGeneration {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LanBidirectionalRegistrationRequest {
@@ -1701,7 +1713,7 @@ pub(crate) struct LanBidirectionalRegistrationRequest {
     pub(crate) expected_revision: i64,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalRegistrationRequest {
     fn is_valid(&self) -> bool {
         !self.library_id.is_empty()
@@ -1711,7 +1723,7 @@ impl LanBidirectionalRegistrationRequest {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LanBidirectionalRemoteApplyRequest {
@@ -1726,7 +1738,7 @@ pub(crate) struct LanBidirectionalRemoteApplyRequest {
     pub(crate) backup_losing_side: bool,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalRemoteApplyRequest {
     fn is_valid(&self) -> bool {
         is_canonical_uuid(&self.operation_id)
@@ -1740,7 +1752,7 @@ impl LanBidirectionalRemoteApplyRequest {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LanBidirectionalBackupReceipt {
@@ -1748,7 +1760,7 @@ pub(crate) struct LanBidirectionalBackupReceipt {
     pub(crate) path: String,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalBackupReceipt {
     fn is_valid(&self) -> bool {
         !self.package_id.is_empty()
@@ -1758,7 +1770,7 @@ impl LanBidirectionalBackupReceipt {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LanBidirectionalRemoteApplyReceipt {
@@ -1769,7 +1781,7 @@ pub(crate) struct LanBidirectionalRemoteApplyReceipt {
     pub(crate) backup: Option<LanBidirectionalBackupReceipt>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalRemoteApplyReceipt {
     fn is_valid(&self) -> bool {
         self.committed_revision >= 0
@@ -1782,7 +1794,7 @@ impl LanBidirectionalRemoteApplyReceipt {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct ClaimResponse<'a> {
     device_id: String,
     bearer: String,
@@ -1876,7 +1888,7 @@ pub(crate) fn validate_p4_logical_delta_endpoint(value: &str) -> Result<String, 
     validate_lan_endpoint(value)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub(crate) fn validate_p5_desktop_endpoint(value: &str) -> Result<String, PeerSyncError> {
     validate_lan_endpoint(value)
 }
@@ -2157,32 +2169,32 @@ fn sync_parent_directory(_path: &Path) -> Result<(), PeerSyncError> {
     Ok(())
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn random_secret() -> Result<[u8; 32], PeerSyncError> {
     let mut secret = [0; 32];
     getrandom::getrandom(&mut secret)
         .map_err(|error| PeerSyncError::Transport(error.to_string()))?;
     Ok(secret)
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn digest(bytes: impl AsRef<[u8]>) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
     left.iter()
         .zip(right)
         .fold(0_u8, |different, (a, b)| different | (a ^ b))
         == 0
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn parse_range(value: &str) -> Option<(u64, u64)> {
     let value = value.strip_prefix("bytes=")?;
     if value.contains(',') || value.contains(char::is_whitespace) {
@@ -2197,13 +2209,13 @@ fn quoted(value: &str) -> String {
 fn transport(error: impl std::fmt::Display) -> PeerSyncError {
     PeerSyncError::Transport(error.to_string())
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn valid_header_name(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
@@ -2227,14 +2239,14 @@ fn valid_header_name(value: &str) -> bool {
                 )
         })
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn is_timeout(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     )
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -2252,7 +2264,7 @@ fn status_reason(status: u16) -> &'static str {
         _ => "Error",
     }
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn write_response_head(
     stream: &mut TcpStream,
     status: u16,
@@ -2277,11 +2289,11 @@ fn write_response_head(
     response.push_str("\r\n");
     stream.write_all(response.as_bytes()).map_err(transport)
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn respond_empty(stream: &mut TcpStream, status: u16) -> Result<(), PeerSyncError> {
     write_response_head(stream, status, &[], 0)
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn respond_bytes(
     stream: &mut TcpStream,
     status: u16,
@@ -2291,7 +2303,7 @@ fn respond_bytes(
     write_response_head(stream, status, headers, body.len() as u64)?;
     stream.write_all(body).map_err(transport)
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn respond_json<T: Serialize>(
     stream: &mut TcpStream,
     status: u16,
@@ -2306,7 +2318,7 @@ fn respond_json<T: Serialize>(
         &body,
     )
 }
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn copy_exact_response(
     stream: &mut TcpStream,
     reader: &mut dyn Read,
@@ -3415,7 +3427,7 @@ mod timeout_tests {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub struct LanLogicalDeltaClient {
     control_client: reqwest::blocking::Client,
     object_client: reqwest::blocking::Client,
@@ -3428,21 +3440,21 @@ pub struct LanLogicalDeltaClient {
     verified_bytes: Arc<Mutex<u64>>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogicalRequestKind {
     Control,
     Object,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Copy)]
 struct LogicalClientTimeouts {
     control_request: Duration,
     object_idle: Duration,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn logical_request_timeout(kind: LogicalRequestKind, timeouts: LogicalClientTimeouts) -> Duration {
     match kind {
         LogicalRequestKind::Control => timeouts.control_request,
@@ -3450,7 +3462,7 @@ fn logical_request_timeout(kind: LogicalRequestKind, timeouts: LogicalClientTime
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn build_logical_http_client(
     kind: LogicalRequestKind,
     timeouts: LogicalClientTimeouts,
@@ -3464,7 +3476,7 @@ fn build_logical_http_client(
         .map_err(transport)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 fn build_bidirectional_remote_apply_client() -> Result<reqwest::Client, PeerSyncError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
@@ -3474,7 +3486,7 @@ fn build_bidirectional_remote_apply_client() -> Result<reqwest::Client, PeerSync
         .map_err(transport)
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanLogicalDeltaClient {
     pub fn claim(
         endpoint: &str,
@@ -3709,7 +3721,7 @@ impl LanLogicalDeltaClient {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
     fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
         validate_object_hash(&object.hash)?;
@@ -3751,7 +3763,7 @@ impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LanBidirectionalLogicalCredential {
@@ -3763,7 +3775,7 @@ pub(crate) struct LanBidirectionalLogicalCredential {
     pub(crate) bearer: String,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalLogicalCredential {
     fn validate(&self) -> Result<String, PeerSyncError> {
         self.validate_with(validate_private_lan_endpoint)
@@ -3791,7 +3803,7 @@ impl LanBidirectionalLogicalCredential {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub(crate) struct LanBidirectionalLogicalClient {
     inner: LanLogicalDeltaClient,
     remote_apply_client: reqwest::Client,
@@ -3799,7 +3811,7 @@ pub(crate) struct LanBidirectionalLogicalClient {
     session_id: String,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalLogicalClient {
     pub(crate) fn claim(
         endpoint: &str,
@@ -4004,14 +4016,14 @@ impl LanBidirectionalLogicalClient {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LogicalDeltaObjectSource for LanBidirectionalLogicalClient {
     fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
         self.inner.open_object(object)
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct LogicalProgressReporter {
     client: reqwest::blocking::Client,
     control_timeout: Duration,
@@ -4020,7 +4032,7 @@ struct LogicalProgressReporter {
     verified_bytes: Arc<Mutex<u64>>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LogicalProgressReporter {
     fn verified_bytes(&self) -> Result<u64, PeerSyncError> {
         self.verified_bytes
@@ -4065,7 +4077,7 @@ impl LogicalProgressReporter {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 struct LogicalProgressReader {
     inner: reqwest::blocking::Response,
     reporter: LogicalProgressReporter,
@@ -4076,7 +4088,7 @@ struct LogicalProgressReader {
     completed: bool,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl LogicalProgressReader {
     fn finish_if_verified(&mut self) {
         if self.completed {
@@ -4090,7 +4102,7 @@ impl LogicalProgressReader {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 impl Read for LogicalProgressReader {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {

@@ -638,6 +638,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     @JavascriptInterface
     fun cancel(jobId: String): Boolean =
       PeerCloneTransferScheduler.cancel(this@MainActivity, jobId)
+
+    @JavascriptInterface
+    fun startSource(lane: String, operationId: String, generation: Long): Boolean {
+      val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
+      return PeerSyncForegroundService.start(this@MainActivity, identity)
+    }
+
+    @JavascriptInterface
+    fun stopSource(lane: String, operationId: String, generation: Long): Boolean {
+      val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
+      return PeerSyncForegroundService.stop(this@MainActivity, identity)
+    }
   }
 
   private fun currentPeerCloneTransferMode() = peerCloneTransferMode(
