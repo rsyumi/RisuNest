@@ -160,4 +160,54 @@ describe('selectRuntimeAssetRepository', () => {
         expect(v2.put).toHaveBeenCalledOnce()
         expect(legacy.put).toHaveBeenCalledOnce()
     })
+
+    it('aborts an unactivated staged v2 write when repository authority changes', async () => {
+        const legacy = facade()
+        const abort = vi.fn(async () => undefined)
+        const activate = vi.fn(async () => ({
+            kind: 'asset' as const,
+            key: 'assets/item',
+            size: 1,
+            mime: 'application/octet-stream',
+            name: 'item',
+            ext: 'bin',
+        }))
+        const v2 = Object.assign(facade(), {
+            prepareOwnedPut: vi.fn(async () => ({ activate, abort })),
+            prepareOwnedNewInlayImage: vi.fn(),
+        })
+        let value: object = {
+            format: 'v2',
+            migrationId: 'migration',
+            compatibilityHash: 'ef'.repeat(32),
+        }
+        const store = {
+            readAssetRepositoryAuthority: vi.fn(async () => ({ revision: 5, value })),
+        }
+        const dispatcher = createRuntimeAssetRepositoryDispatcher({
+            store: store as never,
+            legacy,
+            v2,
+            v2Capability: true,
+        })
+        const staged = await dispatcher.stagePut(
+            'assets/item',
+            Uint8Array.of(1),
+            {
+                kind: 'asset',
+                mime: 'application/octet-stream',
+                name: 'item',
+                ext: 'bin',
+            },
+        )
+
+        value = { format: 'legacy' }
+
+        await expect(dispatcher.activateStagedWrite(staged)).rejects.toThrow(
+            'authority changed',
+        )
+        expect(abort).toHaveBeenCalledOnce()
+        expect(activate).not.toHaveBeenCalled()
+        expect(legacy.put).not.toHaveBeenCalled()
+    })
 })

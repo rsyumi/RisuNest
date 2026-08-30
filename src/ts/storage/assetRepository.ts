@@ -3,6 +3,7 @@ import {
     type BlobReadRange,
     type BlobMetadata,
     type BlobStore,
+    type BlobWriteMetadata,
     type InlayBlobMetadata,
 } from './blobStore'
 import {
@@ -362,10 +363,36 @@ export interface CompleteAssetRepositoryBlobStoreOptions {
     listPageSize?: number
 }
 
+export interface PreparedCompleteAssetWrite {
+    activate(): Promise<BlobMetadata>
+    abort(): Promise<void>
+}
+
 export type CompleteAssetRepositoryBlobStore = BlobStore &
-    Required<Pick<BlobStore, 'putNewInlayImage'>>
+    Required<Pick<BlobStore, 'putNewInlayImage'>> & {
+        prepareOwnedPut(
+            key: string,
+            ownedData: Uint8Array,
+            metadata: BlobWriteMetadata,
+        ): Promise<PreparedCompleteAssetWrite>
+        prepareOwnedNewInlayImage(
+            key: string,
+            ownedData: Uint8Array,
+            input: { name: string },
+        ): Promise<PreparedCompleteAssetWrite>
+    }
 
 export interface CompleteTypedAssetRepository {
+    prepareOwnedPut(
+        identity: AssetAliasIdentity,
+        ownedData: Uint8Array,
+        metadata: BlobWriteMetadata,
+    ): Promise<PreparedCompleteAssetWrite>
+    prepareOwnedNewInlayImage(
+        identity: AssetAliasIdentity,
+        ownedData: Uint8Array,
+        input: { name: string },
+    ): Promise<PreparedCompleteAssetWrite>
     put(
         identity: AssetAliasIdentity,
         data: Uint8Array,
@@ -420,16 +447,15 @@ export function createCompleteTypedAssetRepository(
         legacyFallback: options.legacyFallback ? 'null-hash-only' : false,
     })
 
-    const publish = async (
+    const preparePublish = async (
         identity: AssetAliasIdentity,
-        data: Uint8Array,
+        ownedData: Uint8Array,
         metadata: Parameters<BlobStore['put']>[2],
-    ): Promise<BlobMetadata> => {
+    ): Promise<PreparedCompleteAssetWrite> => {
         validateAssetAliasIdentity(identity)
         if (metadata.kind !== identity.kind) {
             throw new TypeError('Asset alias metadata kind does not match its identity')
         }
-        const ownedData = data.slice()
         const pendingAlias = {
             ...metadata,
             key: identity.key,
@@ -438,7 +464,6 @@ export function createCompleteTypedAssetRepository(
         } as AssetAlias
         validateAssetAlias(pendingAlias)
         const session = await options.writeSessions?.begin()
-        let releaseAsAbortedOnFailure = session !== undefined
         try {
             const prepared = session
                 ? await session.prepare(ownedData)
@@ -448,22 +473,54 @@ export function createCompleteTypedAssetRepository(
             }
             const alias = { ...pendingAlias, objectHash: prepared.contentHash } as AssetAlias
             validateAssetAlias(alias)
-            await session?.seal()
-            for (;;) {
-                const { revision } = await options.store.readRoot()
-                try {
-                    releaseAsAbortedOnFailure = false
-                    await options.store.commitAssetAlias(alias, revision)
-                    break
-                } catch (error) {
-                    if (!(error instanceof RevisionConflictError)) throw error
-                    releaseAsAbortedOnFailure = session !== undefined
-                }
+            let state: 'prepared' | 'activating' | 'activated' | 'aborted' = 'prepared'
+            return {
+                async activate() {
+                    if (state !== 'prepared') {
+                        throw new Error(`Prepared asset write is already ${state}`)
+                    }
+                    state = 'activating'
+                    let sealed = false
+                    try {
+                        await session?.seal()
+                        sealed = session !== undefined
+                        for (;;) {
+                            const { revision } = await options.store.readRoot()
+                            try {
+                                await options.store.commitAssetAlias(alias, revision)
+                                break
+                            } catch (error) {
+                                if (!(error instanceof RevisionConflictError)) throw error
+                            }
+                        }
+                        await session?.release('committed')
+                        state = 'activated'
+                        return aliasBlobMetadata(alias)
+                    } catch (error) {
+                        if (session && !sealed) {
+                            try {
+                                await session.release('aborted')
+                                state = 'aborted'
+                            } catch (releaseError) {
+                                throw new AggregateError(
+                                    [error, releaseError],
+                                    `Asset write and durable CAS session cleanup failed for ${identity.key}`,
+                                )
+                            }
+                        }
+                        throw error
+                    }
+                },
+                async abort() {
+                    if (state !== 'prepared') {
+                        throw new Error(`Prepared asset write is already ${state}`)
+                    }
+                    if (session) await session.release('aborted')
+                    state = 'aborted'
+                },
             }
-            await session?.release('committed')
-            return aliasBlobMetadata(alias)
         } catch (error) {
-            if (session && releaseAsAbortedOnFailure) {
+            if (session) {
                 try {
                     await session.release('aborted')
                 } catch (releaseError) {
@@ -477,25 +534,45 @@ export function createCompleteTypedAssetRepository(
         }
     }
 
+    const publish = async (
+        identity: AssetAliasIdentity,
+        data: Uint8Array,
+        metadata: Parameters<BlobStore['put']>[2],
+    ): Promise<BlobMetadata> => {
+        const prepared = await preparePublish(identity, data.slice(), metadata)
+        return prepared.activate()
+    }
+
+    const prepareNewInlayImage = async (
+        identity: AssetAliasIdentity,
+        ownedData: Uint8Array,
+        input: { name: string },
+    ): Promise<PreparedCompleteAssetWrite> => {
+        validateAssetAliasIdentity(identity)
+        if (identity.kind !== 'inlay') {
+            throw new TypeError('New Inlay image requires an Inlay identity')
+        }
+        const encoded = await options.newInlayImages.encodeNewInlayImage(
+            identity.key,
+            ownedData,
+            { ...input },
+        )
+        if (!(encoded.data instanceof Uint8Array)) {
+            throw new TypeError('New Inlay image encoder must return Uint8Array bytes')
+        }
+        if (encoded.metadata.kind !== 'inlay') {
+            throw new TypeError('New Inlay image encoder must return Inlay metadata')
+        }
+        return preparePublish(identity, encoded.data, encoded.metadata)
+    }
+
     return {
+        prepareOwnedPut: preparePublish,
+        prepareOwnedNewInlayImage: prepareNewInlayImage,
         put: publish,
         async putNewInlayImage(identity, data, input) {
-            validateAssetAliasIdentity(identity)
-            if (identity.kind !== 'inlay') {
-                throw new TypeError('New Inlay image requires an Inlay identity')
-            }
-            const encoded = await options.newInlayImages.encodeNewInlayImage(
-                identity.key,
-                data.slice(),
-                { ...input },
-            )
-            if (!(encoded.data instanceof Uint8Array)) {
-                throw new TypeError('New Inlay image encoder must return Uint8Array bytes')
-            }
-            if (encoded.metadata.kind !== 'inlay') {
-                throw new TypeError('New Inlay image encoder must return Inlay metadata')
-            }
-            return await publish(identity, encoded.data, encoded.metadata) as InlayBlobMetadata
+            const prepared = await prepareNewInlayImage(identity, data.slice(), input)
+            return await prepared.activate() as InlayBlobMetadata
         },
         async read(identity, range) {
             return (await repository.read(identity, range))?.value.data ?? null
@@ -587,6 +664,20 @@ export function createCompleteAssetRepositoryBlobStore(
 ): CompleteAssetRepositoryBlobStore {
     const repository = createCompleteTypedAssetRepository(options)
     return {
+        prepareOwnedPut(key, ownedData, metadata) {
+            return repository.prepareOwnedPut(
+                requireNamespacedBlobIdentity(key, metadata.kind),
+                ownedData,
+                metadata,
+            )
+        },
+        prepareOwnedNewInlayImage(key, ownedData, input) {
+            return repository.prepareOwnedNewInlayImage(
+                requireNamespacedBlobIdentity(key, 'inlay'),
+                ownedData,
+                input,
+            )
+        },
         async put(key, data, metadata) {
             return await repository.put(
                 requireNamespacedBlobIdentity(key, metadata.kind),

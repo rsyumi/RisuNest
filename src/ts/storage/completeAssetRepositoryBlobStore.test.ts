@@ -230,6 +230,90 @@ describe('complete AssetRepository BlobStore facade', () => {
         expect(cas.prepare).not.toHaveBeenCalled()
     })
 
+    it('prepares native bytes without sealing or committing until guarded activation', async () => {
+        const events: string[] = []
+        const writeSessions: DurableAssetWriteSessionFactory = {
+            begin: vi.fn(async () => {
+                events.push('begin')
+                return {
+                    prepare: vi.fn(async (data) => {
+                        events.push(`prepare:${[...data].join(',')}`)
+                        return {
+                            contentHash: assetHash,
+                            byteSize: data.byteLength,
+                            physicalKey: `assets-v2/objects/aa/${'a'.repeat(62)}`,
+                            deduplicated: false,
+                        }
+                    }),
+                    seal: vi.fn(async () => { events.push('seal') }),
+                    release: vi.fn(async (outcome) => { events.push(`release:${outcome}`) }),
+                }
+            }),
+        }
+        const store = createStore({
+            commitAssetAlias: vi.fn(async () => {
+                events.push('commit-alias')
+                return { revision: 11 }
+            }),
+        })
+        const { facade } = createFacade({ store, writeSessions })
+
+        const prepared = await facade.prepareOwnedPut(
+            'assets/photo.bin',
+            Uint8Array.of(1, 2, 3),
+            {
+                kind: 'asset',
+                mime: 'application/octet-stream',
+                name: 'photo.bin',
+                ext: 'bin',
+            },
+        )
+
+        expect(events).toEqual(['begin', 'prepare:1,2,3'])
+        await prepared.activate()
+        expect(events).toEqual([
+            'begin',
+            'prepare:1,2,3',
+            'seal',
+            'commit-alias',
+            'release:committed',
+        ])
+    })
+
+    it('aborts prepared but unactivated native bytes without sealing them', async () => {
+        const seal = vi.fn(async () => undefined)
+        const release = vi.fn(async () => undefined)
+        const writeSessions: DurableAssetWriteSessionFactory = {
+            begin: vi.fn(async () => ({
+                prepare: vi.fn(async (data) => ({
+                    contentHash: assetHash,
+                    byteSize: data.byteLength,
+                    physicalKey: `assets-v2/objects/aa/${'a'.repeat(62)}`,
+                    deduplicated: false,
+                })),
+                seal,
+                release,
+            })),
+        }
+        const { facade, store } = createFacade({ writeSessions })
+
+        const prepared = await facade.prepareOwnedPut(
+            'assets/aborted.bin',
+            Uint8Array.of(9),
+            {
+                kind: 'asset',
+                mime: 'application/octet-stream',
+                name: 'aborted.bin',
+                ext: 'bin',
+            },
+        )
+        await prepared.abort()
+
+        expect(seal).not.toHaveBeenCalled()
+        expect(store.commitAssetAlias).not.toHaveBeenCalled()
+        expect(release).toHaveBeenCalledExactlyOnceWith('aborted')
+    })
+
     it('aborts an unsealed direct write but retains a sealed session on ambiguous activation failure', async () => {
         const preSealRelease = vi.fn(async () => undefined)
         const preSealFailure = new Error('prepare failed')

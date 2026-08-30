@@ -18,8 +18,10 @@ import {
 } from './coldPayloadRuntime'
 import {
     createNativeV2BlobStore,
+    createCoordinatorOwnedAssetBlobStore,
     createRuntimeAssetRepositoryDispatcher,
     selectRuntimeAssetRepository,
+    type RuntimeAssetRepositoryDispatcher,
 } from './assetRepositoryRuntime'
 import {
     createNativeAssetObjectUrlResolver,
@@ -80,65 +82,16 @@ function createConfiguredColdPayloadStore(
         : createGatedColdPayloadStore(store, authority.gate)
 }
 
-function createCoordinatorOwnedAssetBlobStore(
-    store: BlobStore,
-    authority: PersistentStorageAuthority,
-): BlobStore {
-    const mutate = async <T>(key: string, operation: () => Promise<T>): Promise<T> => {
-        let result!: T
-        let operationFailure: { error: unknown } | null = null
-        await getPersistentDataRuntime().runStorageOnlyMutation((expectedRevision) =>
-            authority.gate.runKeyedWrite(key, async () => {
-                const before = await authority.rawStore.readRoot()
-                if (before.revision !== expectedRevision) {
-                    throw new RevisionConflictError(expectedRevision, before.revision)
-                }
-                try {
-                    result = await operation()
-                } catch (error) {
-                    operationFailure = { error }
-                }
-                try {
-                    return (await authority.rawStore.readRoot()).revision
-                } catch (error) {
-                    if (!operationFailure) throw error
-                    throw new AggregateError(
-                        [operationFailure.error, error],
-                        `Asset mutation and revision read failed for ${key}`,
-                    )
-                }
-            }))
-        if (operationFailure) throw operationFailure.error
-        return result
-    }
-    const coordinated: BlobStore = {
-        async put(key, data, metadata) {
-            const ownedData = data.slice()
-            const ownedMetadata = { ...metadata }
-            return mutate(key, () => store.put(key, ownedData, ownedMetadata))
-        },
-        read: (key, range) => store.read(key, range),
-        stat: (key) => store.stat(key),
-        list: (query) => store.list(query),
-        remove: (key) => mutate(key, () => store.remove(key)),
-        resolveUrl: (key) => store.resolveUrl(key),
-    }
-    if (store.putNewInlayImage) {
-        coordinated.putNewInlayImage = (key, data, input) => {
-            const ownedData = data.slice()
-            const ownedInput = { ...input }
-            return mutate(key, () => store.putNewInlayImage!(key, ownedData, ownedInput))
-        }
-    }
-    return coordinated
-}
-
 function createConfiguredAssetBlobStore(
-    store: BlobStore,
+    store: RuntimeAssetRepositoryDispatcher,
     authority: PersistentStorageAuthority,
 ): BlobStore {
     return isTauri
-        ? createCoordinatorOwnedAssetBlobStore(store, authority)
+        ? createCoordinatorOwnedAssetBlobStore(
+            store,
+            authority,
+            getPersistentDataRuntime(),
+        )
         : createGatedBlobStore(store, authority.gate)
 }
 
