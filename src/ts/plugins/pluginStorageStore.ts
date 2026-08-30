@@ -1,11 +1,13 @@
 import {
-    RevisionConflictError,
     type PersistentDataStore,
     type PluginStorageMutation,
     type PluginStorageSummary,
 } from '../storage/persistentDataStore'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
-import { withPersistentRevisionLease } from '../storage/persistentRecordIterator'
+import {
+    acquireCurrentRevisionWithRetry,
+    withPersistentRevisionLease,
+} from '../storage/persistentRecordIterator'
 
 export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
 
@@ -119,14 +121,10 @@ export function createPluginStorageStore(
     const acquirePinnedPluginStorageLease = async () => {
         const store = getStore()
         await store.open()
-        for (let attempt = 0; ; attempt++) {
-            const catalog = await store.queryPluginStorage()
-            try {
-                return await store.acquireRevision(catalog.revision)
-            } catch (error) {
-                if (!(error instanceof RevisionConflictError) || attempt >= 2) throw error
-            }
-        }
+        return acquireCurrentRevisionWithRetry(
+            (revision) => store.acquireRevision(revision),
+            async () => (await store.queryPluginStorage()).revision,
+        )
     }
 
     const initialize = async (): Promise<void> => {

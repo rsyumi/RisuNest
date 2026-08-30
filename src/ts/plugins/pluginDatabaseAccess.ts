@@ -11,8 +11,8 @@ import type {
     PersistentRevisionLease,
     PluginStorageMutation,
 } from '../storage/persistentDataStore'
-import { RevisionConflictError } from '../storage/persistentDataStore'
 import {
+    acquireCurrentRevisionWithRetry,
     assertPinnedRevision,
     iteratePinnedCharacters,
     iteratePinnedConversations,
@@ -302,16 +302,11 @@ export function createPluginDatabaseAccess(
 ): PluginDatabaseAccess {
     let openPromise: Promise<void> | undefined
     const openStore = () => (openPromise ??= dependencies.store.open())
-    const acquireCurrentRevisionReader = async (): Promise<PersistentRevisionLease> => {
-        for (let attempt = 0; ; attempt++) {
-            const rootRecord = await dependencies.store.readRoot()
-            try {
-                return await dependencies.store.acquireRevision(rootRecord.revision)
-            } catch (error) {
-                if (!(error instanceof RevisionConflictError) || attempt >= 2) throw error
-            }
-        }
-    }
+    const acquireCurrentRevisionReader = (): Promise<PersistentRevisionLease> =>
+        acquireCurrentRevisionWithRetry(
+            (revision) => dependencies.store.acquireRevision(revision),
+            async () => (await dependencies.store.readRoot()).revision,
+        )
     const prepareQuery = async (signal?: AbortSignal) => {
         throwIfQueryAborted(signal)
         await dependencies.flushPendingData('plugin-database-query')
