@@ -147,6 +147,7 @@ describe('peer bidirectional facade', () => {
 
     it('runs Android P5 source through exact foreground ownership and private LAN native start', async () => {
         const events: string[] = []
+        let notificationCallbackRan = false
         const foreground = {
             lane: 'p5-source' as const,
             operationId: '55555555-5555-4555-8555-555555555555',
@@ -163,7 +164,10 @@ describe('peer bidirectional facade', () => {
                 return { phase: 'running', sessionId: 'source-session', devices: [] } as T
             }
             if (command === 'peer_bidirectional_stop') return foreground as T
-            if (command === 'peer_bidirectional_source_release') return true as T
+            if (command === 'peer_bidirectional_source_release') {
+                if (!notificationCallbackRan) return false as T
+                return true as T
+            }
             if (command === 'peer_bidirectional_status') {
                 return { source: { phase: 'stopped', devices: [] } } as T
             }
@@ -171,7 +175,12 @@ describe('peer bidirectional facade', () => {
         })
         const bridge = {
             startSource: vi.fn(() => { events.push('service-start'); return true }),
-            stopSource: vi.fn(() => { events.push('service-stop'); return true }),
+            stopSource: vi.fn(() => {
+                events.push('service-stop')
+                notificationCallbackRan = true
+                events.push('native-cancel-callback')
+                return true
+            }),
         }
         const facade = createPeerBidirectionalFacade({
             platform: 'android',
@@ -194,6 +203,8 @@ describe('peer bidirectional facade', () => {
         })
         expect(events.indexOf('service-start')).toBeLessThan(events.indexOf('peer_bidirectional_start'))
         expect(events.indexOf('peer_bidirectional_stop')).toBeLessThan(events.indexOf('service-stop'))
+        expect(events.indexOf('native-cancel-callback'))
+            .toBeLessThan(events.indexOf('peer_bidirectional_source_release'))
         expect(events.indexOf('service-stop')).toBeLessThan(events.indexOf('peer_bidirectional_source_release'))
     })
 

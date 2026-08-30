@@ -4607,6 +4607,8 @@ struct PeerBidirectionalRuntime {
     stopped: bool,
     #[cfg(any(target_os = "android", test))]
     released_source_foreground: Option<(String, AndroidForegroundKey)>,
+    #[cfg(any(target_os = "android", test))]
+    pending_source_full_stop: Option<(String, AndroidForegroundKey)>,
     target_active: bool,
     #[cfg(any(target_os = "android", test))]
     target_foreground: Option<AndroidBidirectionalTargetStatus>,
@@ -4830,6 +4832,7 @@ impl PeerBidirectionalCommandState {
         #[cfg(any(target_os = "android", test))]
         {
             runtime.released_source_foreground = None;
+            runtime.pending_source_full_stop = None;
         }
         runtime.source = Some(BidirectionalSourceRuntime {
             session_id: session_id.to_owned(),
@@ -5097,14 +5100,23 @@ impl PeerBidirectionalCommandState {
     ) -> Result<Option<AndroidForegroundKey>, PeerSyncError> {
         loop {
             let operation = self.lock_lifecycle_operation()?;
-            let runtime = self.lock()?;
+            let mut runtime = self.lock()?;
             if let Some(source) = runtime
                 .source
                 .as_ref()
                 .filter(|source| source.session_id == session_id)
             {
                 if let Some(foreground) = source.foreground.clone() {
+                    runtime.pending_source_full_stop =
+                        Some((session_id.to_owned(), foreground.clone()));
                     return Ok(Some(foreground));
+                }
+                if let Some((pending_session, foreground)) =
+                    runtime.pending_source_full_stop.as_ref()
+                {
+                    if pending_session == session_id {
+                        return Ok(Some(foreground.clone()));
+                    }
                 }
                 drop(runtime);
                 drop(operation);
@@ -5153,7 +5165,18 @@ impl PeerBidirectionalCommandState {
                     )
                 }));
             };
-            if source.session_id != session_id || source.foreground.as_ref() != expected {
+            let identity_matches = match expected {
+                Some(expected) => {
+                    source.foreground.as_ref() == Some(expected)
+                        || runtime.pending_source_full_stop.as_ref().is_some_and(
+                            |(pending_session, pending_foreground)| {
+                                pending_session == session_id && pending_foreground == expected
+                            },
+                        )
+                }
+                None => source.foreground.is_none() && runtime.pending_source_full_stop.is_none(),
+            };
+            if source.session_id != session_id || !identity_matches {
                 return Ok(false);
             }
             let source = runtime.source.take().expect("checked source");
@@ -5172,6 +5195,7 @@ impl PeerBidirectionalCommandState {
         drop(source);
         if let Some(expected) = expected {
             let mut runtime = self.lock()?;
+            runtime.pending_source_full_stop = None;
             runtime.released_source_foreground = Some((session_id.to_owned(), expected.clone()));
         }
         drop(operation);
@@ -7268,7 +7292,7 @@ mod tests {
     }
 
     #[test]
-    fn android_p5_source_release_waits_for_exact_service_stop_acceptance() {
+    fn android_p5_source_release_consumes_exact_full_stop_after_notification_callback() {
         let _registry_guard = super::super::android_foreground::test_registry_guard();
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
@@ -7329,6 +7353,15 @@ mod tests {
         assert!(state.source_is_active().unwrap());
         assert_eq!(lease_count(), 1);
         assert!(registry().reserve(AndroidForegroundLane::P4Source).is_err());
+
+        state.pause_source_exact(&foreground);
+        assert!(state.source_is_active().unwrap());
+        assert_eq!(lease_count(), 1);
+        assert!(registry().reserve(AndroidForegroundLane::P4Source).is_err());
+        assert_eq!(
+            state.source_stop_foreground(session_id).unwrap(),
+            Some(foreground.clone()),
+        );
 
         let stale = AndroidForegroundKey {
             generation: foreground.generation + 1,
