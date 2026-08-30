@@ -1,0 +1,110 @@
+{
+    "description": "Golden vectors for the r1: logical record key codec. Consumed by src/ts/storage/sync/logicalRecordKey.test.ts and the parity tests in src-tauri/src/peer_sync/logical_delta.rs; a vector change must keep both suites passing.",
+    "roundTrip": [
+        {
+            "locator": {
+                "kind": "root"
+            },
+            "encoded": "r1:root"
+        },
+        {
+            "locator": {
+                "kind": "preset",
+                "presetId": "0"
+            },
+            "encoded": "r1:preset:WyIwIl0"
+        },
+        {
+            "locator": {
+                "kind": "plugin",
+                "storageKey": "plugin:key/with spaces"
+            },
+            "encoded": "r1:plugin:WyJwbHVnaW46a2V5L3dpdGggc3BhY2VzIl0"
+        },
+        {
+            "locator": {
+                "kind": "plugin",
+                "storageKey": "unicode-한국어\\path"
+            },
+            "encoded": "r1:plugin:WyJ1bmljb2RlLe2VnOq1reyWtFxccGF0aCJd"
+        },
+        {
+            "locator": {
+                "kind": "character",
+                "characterId": "character-1"
+            },
+            "encoded": "r1:character:WyJjaGFyYWN0ZXItMSJd"
+        },
+        {
+            "locator": {
+                "kind": "conversation",
+                "characterId": "character-1",
+                "conversationId": "chat/1"
+            },
+            "encoded": "r1:conversation:WyJjaGFyYWN0ZXItMSIsImNoYXQvMSJd"
+        },
+        {
+            "locator": {
+                "kind": "conversation",
+                "characterId": "character-1",
+                "conversationId": "chat:1/alpha"
+            },
+            "encoded": "r1:conversation:WyJjaGFyYWN0ZXItMSIsImNoYXQ6MS9hbHBoYSJd"
+        },
+        {
+            "locator": {
+                "kind": "asset",
+                "logicalKey": "assets/한글 image.png"
+            },
+            "encoded": "r1:asset:WyJhc3NldHMv7ZWc6riAIGltYWdlLnBuZyJd"
+        },
+        {
+            "locator": {
+                "kind": "asset",
+                "logicalKey": ""
+            },
+            "encoded": "r1:asset:WyIiXQ"
+        },
+        {
+            "locator": {
+                "kind": "inlay",
+                "logicalKey": "inlay\u0000id"
+            },
+            "encoded": "r1:inlay:WyJpbmxheVx1MDAwMGlkIl0"
+        },
+        {
+            "locator": {
+                "kind": "cold",
+                "logicalKey": "cold-key"
+            },
+            "encoded": "r1:cold:WyJjb2xkLWtleSJd"
+        }
+    ],
+    "rejectedEncoded": [
+        "r1:unknown:WyJpZCJd",
+        "r1:root:WyJleHRyYSJd",
+        "r1:root:W10",
+        "r1:conversation:WyJvbmx5LWNoYXJhY3RlciJd",
+        "r1:character:Wzdd",
+        "r1:character:WyJhIl0=",
+        "r1:preset:WyIwIl0=",
+        "r1:character:WyJcdTAwNjEiXQ",
+        "r1:character:not+base64url",
+        "r1:cold:WyIiXQ",
+        "r1:cold:WyJjb2xkXHUwMDAwa2V5Il0"
+    ],
+    "rejectedLocators": [
+        {
+            "kind": "character",
+            "characterId": ""
+        },
+        {
+            "kind": "cold",
+            "logicalKey": ""
+        },
+        {
+            "kind": "cold",
+            "logicalKey": "cold\u0000key"
+        }
+    ]
+}

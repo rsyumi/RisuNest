@@ -1213,38 +1213,51 @@ mod tests {
         ProjectedLogicalRecord, LOGICAL_MANIFEST_SCHEMA, LOGICAL_MESSAGE_PAGE_SIZE,
     };
 
+    fn logical_record_key_golden() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../src/ts/storage/tests/fixtures/logicalRecordKeyV1Golden.json"
+        ))
+        .expect("valid logical record key golden fixture")
+    }
+
+    fn golden_locator(value: &Value) -> LogicalRecordLocator {
+        let field = |name: &str| value[name].as_str().expect("string field").to_owned();
+        match value["kind"].as_str().expect("locator kind") {
+            "root" => LogicalRecordLocator::Root,
+            "preset" => LogicalRecordLocator::Preset {
+                preset_id: field("presetId"),
+            },
+            "plugin" => LogicalRecordLocator::Plugin {
+                storage_key: field("storageKey"),
+            },
+            "character" => LogicalRecordLocator::Character {
+                character_id: field("characterId"),
+            },
+            "conversation" => LogicalRecordLocator::Conversation {
+                character_id: field("characterId"),
+                conversation_id: field("conversationId"),
+            },
+            "asset" => LogicalRecordLocator::Asset {
+                logical_key: field("logicalKey"),
+            },
+            "inlay" => LogicalRecordLocator::Inlay {
+                logical_key: field("logicalKey"),
+            },
+            "cold" => LogicalRecordLocator::Cold {
+                logical_key: field("logicalKey"),
+            },
+            other => panic!("unknown golden locator kind {other}"),
+        }
+    }
+
     #[test]
     fn logical_record_keys_match_typescript_v1_literals_and_round_trip_opaque_components() {
-        let fixtures = [
-            (LogicalRecordLocator::Root, "r1:root"),
-            (
-                LogicalRecordLocator::Preset {
-                    preset_id: "0".to_owned(),
-                },
-                "r1:preset:WyIwIl0",
-            ),
-            (
-                LogicalRecordLocator::Plugin {
-                    storage_key: "unicode-한국어\\path".to_owned(),
-                },
-                "r1:plugin:WyJ1bmljb2RlLe2VnOq1reyWtFxccGF0aCJd",
-            ),
-            (
-                LogicalRecordLocator::Conversation {
-                    character_id: "character-1".to_owned(),
-                    conversation_id: "chat:1/alpha".to_owned(),
-                },
-                "r1:conversation:WyJjaGFyYWN0ZXItMSIsImNoYXQ6MS9hbHBoYSJd",
-            ),
-            (
-                LogicalRecordLocator::Asset {
-                    logical_key: String::new(),
-                },
-                "r1:asset:WyIiXQ",
-            ),
-        ];
-
-        for (locator, expected) in fixtures {
+        let golden = logical_record_key_golden();
+        let fixtures = golden["roundTrip"].as_array().expect("roundTrip vectors");
+        assert!(!fixtures.is_empty());
+        for fixture in fixtures {
+            let locator = golden_locator(&fixture["locator"]);
+            let expected = fixture["encoded"].as_str().expect("encoded key");
             assert_eq!(encode_logical_record_key(&locator).unwrap(), expected);
             assert_eq!(decode_logical_record_key(expected).unwrap(), locator);
         }
@@ -1252,19 +1265,24 @@ mod tests {
 
     #[test]
     fn logical_record_keys_reject_noncanonical_or_invalid_components() {
-        assert!(decode_logical_record_key("r1:preset:WyIwIl0=").is_err());
-        assert!(decode_logical_record_key("r1:root:W10").is_err());
-        assert!(encode_logical_record_key(&LogicalRecordLocator::Character {
-            character_id: String::new(),
-        })
-        .is_err());
-        for logical_key in [String::new(), "cold\0key".to_owned()] {
+        let golden = logical_record_key_golden();
+        for encoded in golden["rejectedEncoded"].as_array().expect("rejected keys") {
+            let encoded = encoded.as_str().expect("encoded key");
             assert!(
-                encode_logical_record_key(&LogicalRecordLocator::Cold { logical_key }).is_err()
+                decode_logical_record_key(encoded).is_err(),
+                "expected rejection of {encoded}"
             );
         }
-        assert!(decode_logical_record_key("r1:cold:WyIiXQ").is_err());
-        assert!(decode_logical_record_key("r1:cold:WyJjb2xkXHUwMDAwa2V5Il0").is_err());
+        for locator in golden["rejectedLocators"]
+            .as_array()
+            .expect("rejected locators")
+        {
+            let locator = golden_locator(locator);
+            assert!(
+                encode_logical_record_key(&locator).is_err(),
+                "expected encode rejection of {locator:?}"
+            );
+        }
     }
 
     #[test]
