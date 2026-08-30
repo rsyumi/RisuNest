@@ -1,5 +1,7 @@
 use super::charx::CharXLimits;
-use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
+use super::{
+    CharacterCharxContainer, JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
+};
 use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
 use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError};
@@ -7,13 +9,15 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 use uuid::Uuid;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_JPEG_PORTRAIT_DIMENSION: u32 = 8_192;
+const MAX_JPEG_PORTRAIT_PIXELS: u64 = 16 * 1024 * 1024;
 const RPACK_MAP: &[u8; 512] = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
 const FALLBACK_PORTRAIT: &[u8] = include_bytes!("../../../public/none.webp");
 
@@ -24,7 +28,7 @@ enum EmbeddedAssetSource {
 }
 
 pub(crate) fn export_character_charx(
-    mut prepared: PreparedRisuSaveExport,
+    prepared: PreparedRisuSaveExport,
     character_id: &str,
     card: Value,
     module: Value,
@@ -33,13 +37,38 @@ pub(crate) fn export_character_charx(
     destination_path: Option<&Path>,
     job: &JobControl,
 ) -> Result<JobResultSummary, NativeJobError> {
+    export_character_charx_container(
+        prepared,
+        character_id,
+        card,
+        module,
+        CharacterCharxContainer::PlainCharx,
+        owned_directory,
+        handoff_directory,
+        destination_path,
+        job,
+    )
+}
+
+pub(crate) fn export_character_charx_container(
+    mut prepared: PreparedRisuSaveExport,
+    character_id: &str,
+    card: Value,
+    module: Value,
+    container: CharacterCharxContainer,
+    owned_directory: &Path,
+    handoff_directory: &Path,
+    destination_path: Option<&Path>,
+    job: &JobControl,
+) -> Result<JobResultSummary, NativeJobError> {
     let reader = prepared.take_reader().map_err(store_error)?;
-    let outcome = export_character_charx_with_reader(
+    let outcome = export_character_charx_container_with_reader(
         &prepared,
         &reader,
         character_id,
         card,
         module,
+        container,
         owned_directory,
         handoff_directory,
         destination_path,
@@ -53,8 +82,37 @@ fn export_character_charx_with_reader(
     prepared: &PreparedRisuSaveExport,
     reader: &RevisionReadLease,
     character_id: &str,
+    card: Value,
+    module: Value,
+    owned_directory: &Path,
+    handoff_directory: &Path,
+    destination_path: Option<&Path>,
+    job: &JobControl,
+    limits: CharXLimits,
+) -> Result<JobResultSummary, NativeJobError> {
+    export_character_charx_container_with_reader(
+        prepared,
+        reader,
+        character_id,
+        card,
+        module,
+        CharacterCharxContainer::PlainCharx,
+        owned_directory,
+        handoff_directory,
+        destination_path,
+        job,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_character_charx_container_with_reader(
+    prepared: &PreparedRisuSaveExport,
+    reader: &RevisionReadLease,
+    character_id: &str,
     mut card: Value,
     module: Value,
+    container: CharacterCharxContainer,
     owned_directory: &Path,
     handoff_directory: &Path,
     destination_path: Option<&Path>,
@@ -116,11 +174,11 @@ fn export_character_charx_with_reader(
 
     let repository =
         PayloadCas::new(prepared.repository_root().map_err(store_error)?).map_err(io_error)?;
-    let source = owned_directory.join("character.charx");
+    let archive_source = owned_directory.join("character.charx");
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&source)
+        .open(&archive_source)
         .map_err(io_error)?;
     let mut archive = ZipWriter::new(BufWriter::with_capacity(COPY_BUFFER_BYTES, file));
     let mut completed_bytes = 0_u64;
@@ -260,6 +318,18 @@ fn export_character_charx_with_reader(
     output.flush().map_err(io_error)?;
     output.get_ref().sync_all().map_err(io_error)?;
     drop(output);
+    let source = match container {
+        CharacterCharxContainer::PlainCharx => archive_source,
+        CharacterCharxContainer::AppendedCharxJpeg => create_appended_jpeg_source(
+            reader,
+            &character,
+            &repository,
+            &archive_source,
+            owned_directory,
+            job,
+            limits,
+        )?,
+    };
     let source_bytes = fs::metadata(&source).map_err(io_error)?.len();
     job.set_progress(JobProgress {
         completed_bytes: source_bytes,
@@ -289,7 +359,11 @@ fn export_character_charx_with_reader(
         ),
         None => {
             fs::create_dir_all(handoff_directory).map_err(io_error)?;
-            let path = handoff_directory.join(format!("risu-charx-{}.charx", Uuid::new_v4()));
+            let extension = match container {
+                CharacterCharxContainer::PlainCharx => "charx",
+                CharacterCharxContainer::AppendedCharxJpeg => "jpeg",
+            };
+            let path = handoff_directory.join(format!("risu-charx-{}.{extension}", Uuid::new_v4()));
             (
                 handoff_directory,
                 path.clone(),
@@ -342,6 +416,181 @@ fn export_character_charx_with_reader(
         recovery_path: None,
         publication: None,
     })
+}
+
+fn create_appended_jpeg_source(
+    reader: &RevisionReadLease,
+    character: &Value,
+    repository: &PayloadCas,
+    archive_source: &Path,
+    owned_directory: &Path,
+    job: &JobControl,
+    limits: CharXLimits,
+) -> Result<std::path::PathBuf, NativeJobError> {
+    if job.is_cancel_requested() {
+        return Err(cancelled(
+            "appended CharX JPEG export cancelled before portrait encoding",
+        ));
+    }
+    let portrait = match character
+        .get("image")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        Some(key) => {
+            let alias = export::pinned_asset_alias(&reader.connection, &reader.target, key)
+                .map_err(store_error)?;
+            let hash = alias.object_hash.ok_or_else(|| {
+                invalid_input(format!(
+                    "pinned character portrait has no native payload: {key}"
+                ))
+            })?;
+            let size = u64::try_from(alias.size)
+                .map_err(|_| invalid_input("pinned character portrait size is invalid"))?;
+            if size > limits.max_entry_decoded_bytes {
+                return Err(invalid_input(format!(
+                    "character JPEG portrait exceeds the per-entry decoded limit of {} bytes",
+                    limits.max_entry_decoded_bytes
+                )));
+            }
+            let source = repository
+                .open_object(&hash)
+                .map_err(io_error)?
+                .ok_or_else(|| {
+                    invalid_input(format!("pinned character portrait is missing: {key}"))
+                })?;
+            read_verified_bytes(source, &hash, size, job)?
+        }
+        None => FALLBACK_PORTRAIT.to_vec(),
+    };
+    let portrait = bounded_jpeg_portrait(&portrait, limits.max_entry_decoded_bytes, job)?;
+    let source = owned_directory.join("character.jpeg");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&source)
+        .map_err(io_error)?;
+    let mut output = BufWriter::with_capacity(COPY_BUFFER_BYTES, file);
+    output.write_all(&portrait).map_err(io_error)?;
+    let archive = File::open(archive_source).map_err(io_error)?;
+    copy_cancellable(&mut output, archive, job)?;
+    output.flush().map_err(io_error)?;
+    output.get_ref().sync_all().map_err(io_error)?;
+    drop(output);
+    Ok(source)
+}
+
+fn read_verified_bytes(
+    mut source: File,
+    expected_hash: &str,
+    expected_size: u64,
+    job: &JobControl,
+) -> Result<Vec<u8>, NativeJobError> {
+    let capacity = usize::try_from(expected_size)
+        .map_err(|_| invalid_input("character portrait size does not fit this platform"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        if job.is_cancel_requested() {
+            return Err(cancelled(
+                "appended CharX JPEG export cancelled while reading the portrait",
+            ));
+        }
+        let read = source.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > capacity {
+            return Err(invalid_input("pinned character portrait size changed"));
+        }
+        hasher.update(&buffer[..read]);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    if bytes.len() != capacity || hex::encode(hasher.finalize()) != expected_hash {
+        return Err(invalid_input(
+            "pinned character portrait payload hash changed",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn bounded_jpeg_portrait(
+    bytes: &[u8],
+    maximum_bytes: u64,
+    job: &JobControl,
+) -> Result<Vec<u8>, NativeJobError> {
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(invalid_input(
+            "character JPEG portrait exceeds the per-entry decoded limit",
+        ));
+    }
+    let mut image_reader = image::ImageReader::new(BufReader::new(Cursor::new(bytes)))
+        .with_guessed_format()
+        .map_err(|error| invalid_input(format!("character portrait is invalid: {error}")))?;
+    let source_format = image_reader
+        .format()
+        .ok_or_else(|| invalid_input("character portrait format is unsupported"))?;
+    let mut image_limits = image::Limits::default();
+    image_limits.max_image_width = Some(MAX_JPEG_PORTRAIT_DIMENSION);
+    image_limits.max_image_height = Some(MAX_JPEG_PORTRAIT_DIMENSION);
+    image_limits.max_alloc = Some(maximum_bytes);
+    image_reader.limits(image_limits);
+    let decoder = image_reader
+        .into_decoder()
+        .map_err(|error| invalid_input(format!("character portrait is invalid: {error}")))?;
+    let (width, height) = image::ImageDecoder::dimensions(&decoder);
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 || pixels > MAX_JPEG_PORTRAIT_PIXELS {
+        return Err(invalid_input(
+            "character portrait dimensions exceed their limit",
+        ));
+    }
+    let decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| invalid_input(format!("character portrait is invalid: {error}")))?;
+    if job.is_cancel_requested() {
+        return Err(cancelled(
+            "appended CharX JPEG export cancelled while encoding the portrait",
+        ));
+    }
+    if source_format == image::ImageFormat::Jpeg
+        && bytes.starts_with(&[0xff, 0xd8, 0xff])
+        && bytes.ends_with(&[0xff, 0xd9])
+    {
+        return Ok(bytes.to_vec());
+    }
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&decoded)
+        .map_err(|error| invalid_input(format!("character portrait cannot be encoded: {error}")))?;
+    if jpeg.len() as u64 > maximum_bytes {
+        return Err(invalid_input(
+            "encoded character JPEG portrait exceeds its byte limit",
+        ));
+    }
+    Ok(jpeg)
+}
+
+fn copy_cancellable(
+    destination: &mut impl Write,
+    mut source: impl Read,
+    job: &JobControl,
+) -> Result<u64, NativeJobError> {
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    let mut copied = 0_u64;
+    loop {
+        if job.is_cancel_requested() {
+            return Err(cancelled(
+                "appended CharX JPEG export cancelled while concatenating the archive",
+            ));
+        }
+        let read = source.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        destination.write_all(&buffer[..read]).map_err(io_error)?;
+        copied = copied.saturating_add(read as u64);
+    }
 }
 
 fn validate_character_identity(
@@ -805,7 +1054,7 @@ mod tests {
     use super::*;
     use crate::asset_repository::{owner_manifest_codec, PayloadCas};
     use crate::native_file_jobs::charx::{inspect_charx_file, CharXInspection, CharXLimits};
-    use crate::native_file_jobs::{JobKind, JobRegistry};
+    use crate::native_file_jobs::{CharacterCharxContainer, JobKind, JobRegistry};
     use crate::persistent_store::{
         AssetAlias, AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState,
         PersistentStore,
@@ -813,6 +1062,15 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
     use zip::ZipArchive;
+
+    fn synthetic_jpeg() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([17, 34, 51]));
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90)
+            .encode_image(&image)
+            .unwrap();
+        bytes
+    }
 
     struct Fixture {
         directory: TempDir,
@@ -851,7 +1109,8 @@ mod tests {
         let shared = alias("assets/shared.bin", b"shared-original", "BIN", &cas);
         let second_occurrence = cas.prepare_bytes(b"second-occurrence").unwrap();
         let emotion = alias("assets/emotion.webp", b"emotion-original", "WEBP", &cas);
-        let portrait = alias("assets/portrait.png", b"portrait-original", "PNG", &cas);
+        let portrait_bytes = synthetic_jpeg();
+        let portrait = alias("assets/portrait.jpg", &portrait_bytes, "jpg", &cas);
         let cc = alias("assets/cc.dat", b"cc-original", "DAT", &cas);
         let manifest_bytes = owner_manifest_codec::encode_owner_manifest(&[
             owner_manifest_codec::OwnerManifestEntry {
@@ -1054,6 +1313,130 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn appended_jpeg_keeps_the_standalone_zip_offsets_relative_to_the_zip_itself() {
+        let mut fixture = fixture();
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let chosen = fixture.directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("current.jpeg");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCharx)
+            .unwrap();
+
+        let result = export_character_charx_container(
+            prepared,
+            "current-character",
+            fixture.card,
+            fixture.module,
+            CharacterCharxContainer::AppendedCharxJpeg,
+            &owned,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+
+        assert_eq!(result.revision, fixture.revision);
+        let parsed_root = fixture.directory.path().join("parsed-appended");
+        fs::create_dir(&parsed_root).unwrap();
+        let CharXInspection::Card(parsed) = inspect_charx_file(
+            &destination,
+            "current.jpeg",
+            &parsed_root,
+            CharXLimits::default(),
+            || false,
+        )
+        .unwrap() else {
+            panic!("exported file must be an appended CharX JPEG")
+        };
+        assert_eq!(
+            parsed.container_kind,
+            crate::native_file_jobs::charx::CharXContainerKind::AppendedCharXJpeg
+        );
+        assert!(parsed.archive_offset > 4);
+        let bytes = fs::read(&destination).unwrap();
+        assert_eq!(&bytes[..3], &[0xff, 0xd8, 0xff]);
+        assert_eq!(
+            &bytes[parsed.archive_offset as usize - 2..parsed.archive_offset as usize],
+            &[0xff, 0xd9]
+        );
+        let archive = &bytes[parsed.archive_offset as usize..];
+        assert_eq!(&archive[..4], b"PK\x03\x04");
+        let eocd = archive
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("ZIP EOCD");
+        let central_offset =
+            u32::from_le_bytes(archive[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        assert_eq!(&archive[central_offset..central_offset + 4], b"PK\x01\x02");
+        let first_local_offset = u32::from_le_bytes(
+            archive[central_offset + 42..central_offset + 46]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(
+            &archive[first_local_offset..first_local_offset + 4],
+            b"PK\x03\x04"
+        );
+        let standalone = fixture
+            .directory
+            .path()
+            .join("standalone-from-appended.charx");
+        fs::write(&standalone, archive).unwrap();
+        let mut zip = ZipArchive::new(File::open(standalone).unwrap()).unwrap();
+        assert!(zip.by_name("card.json").is_ok());
+        assert_eq!(
+            parsed
+                .payloads
+                .iter()
+                .filter(|payload| payload.original_name.starts_with("assets/"))
+                .map(|payload| payload.sha256.clone())
+                .collect::<Vec<_>>(),
+            fixture.payload_hashes
+        );
+    }
+
+    #[test]
+    fn appended_jpeg_cancellation_preserves_an_existing_destination() {
+        let mut fixture = fixture();
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let chosen = fixture.directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("current.jpeg");
+        fs::write(&destination, b"previous JPEG").unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCharx)
+            .unwrap();
+        job.request_cancel().unwrap();
+
+        let error = export_character_charx_container(
+            prepared,
+            "current-character",
+            fixture.card,
+            fixture.module,
+            CharacterCharxContainer::AppendedCharxJpeg,
+            &owned,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(fs::read(destination).unwrap(), b"previous JPEG");
     }
 
     #[test]

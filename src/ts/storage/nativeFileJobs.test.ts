@@ -10,6 +10,7 @@ import {
     runNativeLegacyLocalBackupRestore,
     runNativeLosslessBackupExport,
     runNativeCharacterCharxExport,
+    runNativeCharacterCardExport,
     runNativeLosslessBackupRestore,
     runNativeOfficialPublicationAttempt,
     resumeNativeOfficialPublication,
@@ -308,6 +309,76 @@ describe('native file jobs', () => {
             'native_character_charx_handoff_cleanup',
             'native_file_job_forget',
         ])
+    })
+
+    it('hands a descriptor-only JSON character card to Android SAF and cleans both receipts', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-character-card-123e4567-e89b-42d3-a456-426614174006.json'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'json-export',
+            kind: 'export-character-card',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 2048, completedItems: 2 },
+            result: {
+                revision: 44,
+                sourceBytes: 2048,
+                sourceSha256: 'd'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+        const metadata = {
+            spec: 'chara_card_v3',
+            spec_version: '3.0',
+            data: { name: 'JSON', assets: [{ uri: 'asset-key' }] },
+        }
+
+        const result = await runNativeCharacterCardExport(
+            {
+                characterId: 'json-character',
+                destination: { type: 'androidSaf', suggestedName: 'JSON.json' },
+                expectedRevision: 44,
+                format: 'json-card',
+                metadata,
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'json-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_character_card_handoff_cleanup') return undefined
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({
+                    bytes: 2048,
+                    warningCodes: ['android-saf-provider-not-atomic'],
+                }),
+            },
+        )
+
+        expect(result.handoffPath).toBeUndefined()
+        expect(result.warningCodes).toEqual(['android-saf-provider-not-atomic'])
+        expect(calls).toEqual([
+            ['native_file_job_start', { request: {
+                kind: 'export-character-card',
+                expectedRevision: 44,
+                characterId: 'json-character',
+                format: 'json-card',
+                metadata,
+            } }],
+            ['native_file_job_status', { jobId: 'json-export' }],
+            ['native_character_card_handoff_cleanup', { path: handoffPath }],
+            ['native_file_job_forget', { jobId: 'json-export' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+        expect(JSON.stringify(calls)).not.toContain('data:image')
     })
 
     it('restores an official snapshot without transferring its database bytes through IPC', async () => {

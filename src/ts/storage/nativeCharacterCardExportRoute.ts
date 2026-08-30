@@ -5,46 +5,49 @@ import type { CharacterDetail, DataRevision } from './persistentDataStore'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import { assertPinnedRevision, withPersistentRevisionLease } from './persistentRecordIterator'
 import {
-    runNativeCharacterCharxExport,
-    type NativeCharacterCharxExportInput,
+    runNativeCharacterCardExport,
+    type NativeCharacterCardExportInput,
     type NativeFileJobOptions,
     type NativeFileJobResult,
 } from './nativeFileJobs'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 
-interface NativeCharacterCharxPickerInput {
+interface NativeCharacterCardPickerInput {
     characterId: string
     suggestedName: string
-    container?: 'appended-charx-jpeg'
-    projectCharacter(character: CharacterDetail): {
-        card: Record<string, unknown>
-        module: Record<string, unknown>
-    }
+    format: 'json-card' | 'png-card'
+    projectCharacter(character: CharacterDetail): Record<string, unknown>
 }
 
-interface NativeCharacterCharxExportRuntime {
+interface NativeCharacterCardExportRuntime {
     readonly revision: number
     flushPendingData(reason: string): Promise<void>
 }
 
-interface NativeCharacterCharxExportRouteDependencies {
+interface NativeCharacterCardExportRouteDependencies {
     isDesktop(): boolean
     isAndroid(): boolean
-    chooseDestination(suggestedName: string): Promise<string | null>
-    runtime(): NativeCharacterCharxExportRuntime
+    chooseDestination(
+        suggestedName: string,
+        format: NativeCharacterCardPickerInput['format'],
+    ): Promise<string | null>
+    runtime(): NativeCharacterCardExportRuntime
     readCharacter(characterId: string, revision: DataRevision): Promise<CharacterDetail>
     runExport(
-        input: NativeCharacterCharxExportInput,
+        input: NativeCharacterCardExportInput,
         options?: NativeFileJobOptions,
     ): Promise<NativeFileJobResult>
 }
 
-const productionDependencies: NativeCharacterCharxExportRouteDependencies = {
+const productionDependencies: NativeCharacterCardExportRouteDependencies = {
     isDesktop: () => isTauriDesktop,
     isAndroid: () => isTauriAndroid,
-    chooseDestination: (suggestedName) => save({
+    chooseDestination: (suggestedName, format) => save({
         defaultPath: suggestedName,
-        filters: [{ name: 'CharX', extensions: ['charx'] }],
+        filters: [{
+            name: format === 'json-card' ? 'JSON character card' : 'PNG character card',
+            extensions: [format === 'json-card' ? 'json' : 'png'],
+        }],
     }),
     runtime: getPersistentDataRuntime,
     readCharacter: async (characterId, revision) => {
@@ -56,36 +59,32 @@ const productionDependencies: NativeCharacterCharxExportRouteDependencies = {
             return found.value
         })
     },
-    runExport: runNativeCharacterCharxExport,
+    runExport: runNativeCharacterCardExport,
 }
 
-export async function exportNativeCharacterCharxFromPicker(
-    input: NativeCharacterCharxPickerInput,
+export async function exportNativeCharacterCardFromPicker(
+    input: NativeCharacterCardPickerInput,
     options: NativeFileJobOptions = {},
-    dependencies: NativeCharacterCharxExportRouteDependencies = productionDependencies,
+    dependencies: NativeCharacterCardExportRouteDependencies = productionDependencies,
 ): Promise<NativeFileJobResult | null | undefined> {
     if (!dependencies.isDesktop() && !dependencies.isAndroid()) return undefined
     const destination = dependencies.isDesktop()
-        ? await dependencies.chooseDestination(input.suggestedName)
+        ? await dependencies.chooseDestination(input.suggestedName, input.format)
         : undefined
     if (dependencies.isDesktop() && !destination) return null
     const runtime = dependencies.runtime()
-    await runtime.flushPendingData('native-character-charx-export')
+    await runtime.flushPendingData('native-character-card-export')
     if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
     const expectedRevision = runtime.revision
     const character = await dependencies.readCharacter(input.characterId, expectedRevision)
-    const projected = input.projectCharacter(character)
-    return dependencies.runExport(
-        {
-            characterId: input.characterId,
-            destination: destination
-                ? { type: 'desktopPath', path: destination }
-                : { type: 'androidSaf', suggestedName: input.suggestedName },
-            expectedRevision,
-            ...(input.container ? { container: input.container } : {}),
-            card: projected.card,
-            module: projected.module,
-        },
-        options,
-    )
+    const metadata = input.projectCharacter(character)
+    return dependencies.runExport({
+        characterId: input.characterId,
+        destination: destination
+            ? { type: 'desktopPath', path: destination }
+            : { type: 'androidSaf', suggestedName: input.suggestedName },
+        expectedRevision,
+        format: input.format,
+        metadata,
+    }, options)
 }

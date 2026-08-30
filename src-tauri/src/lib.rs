@@ -638,6 +638,7 @@ pub fn run() {
             native_file_jobs::native_lossless_handoff_cleanup,
             native_file_jobs::native_legacy_backup_handoff_cleanup,
             native_file_jobs::native_character_charx_handoff_cleanup,
+            native_file_jobs::native_character_card_handoff_cleanup,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_start,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_append,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,

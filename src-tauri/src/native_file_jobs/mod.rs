@@ -1,4 +1,5 @@
 mod character_charx_export;
+mod character_json_export;
 pub mod charx;
 mod content;
 mod jpeg_asset;
@@ -801,7 +802,27 @@ fn cleanup_legacy_backup_handoff_path(root: &Path, path: &Path) -> Result<bool, 
 }
 
 fn cleanup_character_charx_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
-    cleanup_handoff_path(root, path, "risu-charx-", ".charx", "character CharX")
+    let suffix = match path.extension().and_then(|extension| extension.to_str()) {
+        Some("charx") => ".charx",
+        Some("jpeg") => ".jpeg",
+        _ => {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "character CharX handoff cleanup target is not app-owned",
+            ))
+        }
+    };
+    cleanup_handoff_path(root, path, "risu-charx-", suffix, "character CharX")
+}
+
+fn cleanup_character_card_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
+    cleanup_handoff_path(
+        root,
+        path,
+        "risu-character-card-",
+        ".json",
+        "character card",
+    )
 }
 
 fn cleanup_spool_directories_at(
@@ -1222,22 +1243,16 @@ impl NativeFileJobState {
                 card,
                 module,
             } => {
-                if container == CharacterCharxContainer::AppendedCharxJpeg {
-                    return Err(NativeJobError::new(
-                        "capability-unavailable",
-                        "appended CharX JPEG export is not implemented yet",
-                    ));
-                }
                 let card = card.ok_or_else(|| {
                     NativeJobError::new(
                         "invalid-input",
-                        "plain CharX export requires card metadata",
+                        "character CharX export requires card metadata",
                     )
                 })?;
                 let module = module.ok_or_else(|| {
                     NativeJobError::new(
                         "invalid-input",
-                        "plain CharX export requires module metadata",
+                        "character CharX export requires module metadata",
                     )
                 })?;
                 let destination = destination.map(PathBuf::from);
@@ -1268,6 +1283,7 @@ impl NativeFileJobState {
                     character_id,
                     card,
                     module,
+                    container,
                     prepared,
                 }
             }
@@ -1278,17 +1294,41 @@ impl NativeFileJobState {
                 format,
                 metadata,
             } => {
-                let _ = (
+                if format != CharacterCardExportFormat::JsonCard {
+                    return Err(NativeJobError::new(
+                        "capability-unavailable",
+                        "native PNG character card export is not implemented yet",
+                    ));
+                }
+                let destination = destination.map(PathBuf::from);
+                if let Some(destination) = destination.as_deref() {
+                    validate_desktop_destination(destination)?;
+                }
+                if character_id.is_empty() || character_id.len() > 512 {
+                    return Err(NativeJobError::new(
+                        "invalid-input",
+                        "character export requires a bounded character ID",
+                    ));
+                }
+                let metadata_bytes = serde_json::to_vec(&metadata)
+                    .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
+                if metadata_bytes.len() > content::JSON_CARD_MAX_METADATA_BYTES {
+                    return Err(NativeJobError::new(
+                        "invalid-input",
+                        "character export metadata exceeds the 8 MiB limit",
+                    ));
+                }
+                let prepared =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.prepare_risu_save_export(expected_revision)
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ExportCharacterCard {
                     destination,
-                    expected_revision,
                     character_id,
-                    format,
                     metadata,
-                );
-                return Err(NativeJobError::new(
-                    "capability-unavailable",
-                    "native character card export is not implemented yet",
-                ));
+                    prepared,
+                }
             }
             NativeFileJobStartRequest::ExportRisuModule {
                 destination,
@@ -1778,12 +1818,28 @@ impl NativeFileJobState {
                     character_id,
                     card,
                     module,
+                    container,
                     prepared,
-                } => character_charx_export::export_character_charx(
+                } => character_charx_export::export_character_charx_container(
                     prepared,
                     &character_id,
                     card,
                     module,
+                    container,
+                    &owned_directory,
+                    &root.join("handoffs"),
+                    destination.as_deref(),
+                    &job,
+                ),
+                NativeFileJobTask::ExportCharacterCard {
+                    destination,
+                    character_id,
+                    metadata,
+                    prepared,
+                } => character_json_export::export_character_json(
+                    prepared,
+                    &character_id,
+                    metadata,
                     &owned_directory,
                     &root.join("handoffs"),
                     destination.as_deref(),
@@ -2157,6 +2213,13 @@ enum NativeFileJobTask {
         character_id: String,
         card: Value,
         module: Value,
+        container: CharacterCharxContainer,
+        prepared: crate::persistent_store::PreparedRisuSaveExport,
+    },
+    ExportCharacterCard {
+        destination: Option<PathBuf>,
+        character_id: String,
+        metadata: Value,
         prepared: crate::persistent_store::PreparedRisuSaveExport,
     },
     ImportJpegAsset {
@@ -2189,6 +2252,7 @@ impl NativeFileJobTask {
             Self::RestoreLegacyLocalBackup { .. } => JobKind::RestoreLegacyLocalBackup,
             Self::ExportLegacyLocalBackup { .. } => JobKind::ExportLegacyLocalBackup,
             Self::ExportCharacterCharx { .. } => JobKind::ExportCharacterCharx,
+            Self::ExportCharacterCard { .. } => JobKind::ExportCharacterCard,
             Self::ImportJpegAsset { .. } => JobKind::ImportJpegAsset,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
@@ -2223,7 +2287,8 @@ impl NativeFileJobTask {
             | Self::ImportJpegAsset {
                 expected_revision, ..
             } => *expected_revision,
-            Self::ExportCharacterCharx { prepared, .. } => prepared.revision,
+            Self::ExportCharacterCharx { prepared, .. }
+            | Self::ExportCharacterCard { prepared, .. } => prepared.revision,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { prepared } => prepared.revision(),
             #[cfg(feature = "native-official-publication")]
@@ -2487,6 +2552,14 @@ pub(crate) fn native_character_charx_handoff_cleanup(
     path: String,
 ) -> Result<bool, NativeJobError> {
     cleanup_character_charx_handoff_path(&state.root, Path::new(&path))
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_character_card_handoff_cleanup(
+    state: State<'_, NativeFileJobState>,
+    path: String,
+) -> Result<bool, NativeJobError> {
+    cleanup_character_card_handoff_path(&state.root, Path::new(&path))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -6390,6 +6463,40 @@ mod tests {
         assert!(unrelated.is_file());
         assert_eq!(
             cleanup_character_charx_handoff_path(&root, &unrelated)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+
+        let jpeg = handoffs.join(format!("risu-charx-{}.jpeg", Uuid::new_v4()));
+        fs::write(&jpeg, b"jpeg").unwrap();
+        assert!(cleanup_character_charx_handoff_path(&root, &jpeg).unwrap());
+        let wrong_extension = handoffs.join(format!("risu-charx-{}.jpg", Uuid::new_v4()));
+        fs::write(&wrong_extension, b"jpg").unwrap();
+        assert_eq!(
+            cleanup_character_charx_handoff_path(&root, &wrong_extension)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+    }
+
+    #[test]
+    fn character_card_handoff_cleanup_removes_only_exact_owned_files_and_is_idempotent() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        let handoffs = root.join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        let owned = handoffs.join(format!("risu-character-card-{}.json", Uuid::new_v4()));
+        let unrelated = handoffs.join("character-card.json");
+        fs::write(&owned, b"owned").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        assert!(cleanup_character_card_handoff_path(&root, &owned).unwrap());
+        assert!(!cleanup_character_card_handoff_path(&root, &owned).unwrap());
+        assert!(unrelated.is_file());
+        assert_eq!(
+            cleanup_character_card_handoff_path(&root, &unrelated)
                 .unwrap_err()
                 .code,
             "invalid-input"

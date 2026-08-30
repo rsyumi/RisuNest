@@ -32,8 +32,10 @@ function androidSafHandoffId(status: NativeFileJobStatus): string | null {
         : status.kind === 'export-legacy-local-backup'
             ? /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/
             : status.kind === 'export-character-charx'
-                ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.charx$/
-                : null
+                ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:charx|jpeg)$/
+                : status.kind === 'export-character-card'
+                    ? /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/
+                    : null
     return pattern?.exec(path)?.[1] ?? null
 }
 
@@ -111,6 +113,13 @@ async function reconcileExportInBackground(
             })
             retainNativeJob = false
         }
+        else if (status.kind === 'export-character-card' && status.result?.handoffPath) {
+            retainNativeJob = true
+            await dependencies.invoke('native_character_card_handoff_cleanup', {
+                path: status.result.handoffPath,
+            })
+            retainNativeJob = false
+        }
     }
     finally {
         if (!retainNativeJob) {
@@ -170,6 +179,8 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
             case 'export-lossless-backup':
             case 'export-legacy-local-backup':
             case 'export-character-charx':
+            case 'export-character-card':
+            case 'export-risu-module':
             case 'kei-backup-upload':
                 void reconcileExportInBackground(job, dependencies).catch((error) => {
                     console.error('Native export reconciliation failed', error)

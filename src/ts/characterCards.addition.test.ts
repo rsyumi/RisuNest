@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
     desktopPickerPaths: [] as string[],
     openDesktopPicker: vi.fn(async () => mocks.desktopPickerPaths),
     exportNativeCharacterCharxFromPicker: vi.fn(),
+    exportNativeCharacterCardFromPicker: vi.fn(),
     nextId: 0,
 }))
 
@@ -87,6 +88,9 @@ vi.mock('./storage/nativeCharacterFileRoute', () => ({
 }))
 vi.mock('./storage/nativeCharacterCharxExportRoute', () => ({
     exportNativeCharacterCharxFromPicker: mocks.exportNativeCharacterCharxFromPicker,
+}))
+vi.mock('./storage/nativeCharacterCardExportRoute', () => ({
+    exportNativeCharacterCardFromPicker: mocks.exportNativeCharacterCardFromPicker,
 }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({
     open: mocks.openDesktopPicker,
@@ -170,6 +174,7 @@ describe('character card additions', () => {
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertCardExport.mockResolvedValue({ type: 'cancelled' })
         mocks.exportNativeCharacterCharxFromPicker.mockResolvedValue({ characterCount: 1 })
+        mocks.exportNativeCharacterCardFromPicker.mockResolvedValue({ characterCount: 1 })
         mocks.commitDetachedCharacter.mockImplementation(async (character, _reason) => {
             mocks.database.characters.push(character)
             return character.chaId
@@ -638,6 +643,74 @@ describe('character card additions', () => {
         expect(mocks.exportNativeCharacterCharxFromPicker).toHaveBeenCalledOnce()
         expect(fetchMock).not.toHaveBeenCalled()
         expect(mocks.saveAsset).not.toHaveBeenCalled()
+    })
+
+    it('routes appended JPEG through native CharX with the explicit container discriminator', async () => {
+        mocks.database.characters = [{
+            type: 'character',
+            name: 'JPEG card',
+            image: 'assets/avatar.png',
+            chats: [],
+            chaId: 'jpeg-card',
+            globalLore: [],
+            customscript: [],
+            triggerscript: [],
+        }]
+        mocks.alertCardExport.mockResolvedValue({ type: '', type2: 'charxJpeg' } as any)
+
+        await exportChar(0)
+
+        expect(mocks.exportNativeCharacterCharxFromPicker).toHaveBeenCalledWith(expect.objectContaining({
+            characterId: 'jpeg-card',
+            suggestedName: 'JPEG card.jpeg',
+            container: 'appended-charx-jpeg',
+        }))
+        expect(mocks.readImage).not.toHaveBeenCalled()
+        expect(mocks.charxWrites).toEqual([])
+    })
+
+    it('routes selected CCv3 JSON through native export without renderer payload bytes', async () => {
+        const character = {
+            type: 'character',
+            name: 'Native JSON card',
+            image: '',
+            firstMessage: 'Hello',
+            desc: 'Description',
+            chats: [],
+            chatFolders: [],
+            chatPage: 0,
+            viewScreen: 'none',
+            bias: [],
+            emotionImages: [],
+            globalLore: [],
+            chaId: 'native-json-card',
+            customscript: [{ comment: 'regex' }],
+            triggerscript: [{ comment: 'trigger' }],
+            alternateGreetings: [],
+            tags: [],
+            additionalAssets: [],
+            ccAssets: [],
+            extentions: {},
+        } as any
+        mocks.database.characters = [character]
+        mocks.alertCardExport.mockResolvedValue({ type: '', type2: 'json' } as any)
+
+        await exportChar(0)
+
+        expect(mocks.exportNativeCharacterCardFromPicker).toHaveBeenCalledOnce()
+        const input = mocks.exportNativeCharacterCardFromPicker.mock.calls[0][0]
+        expect(input).toMatchObject({
+            characterId: 'native-json-card',
+            suggestedName: 'Native JSON card.json',
+            format: 'json-card',
+        })
+        const projected = input.projectCharacter(character)
+        expect(projected.data.extensions.risuai.triggerscript).toEqual(character.triggerscript)
+        expect(projected.data.extensions.risuai.customScripts).toEqual(character.customscript)
+        expect(JSON.stringify(projected)).not.toMatch(/data:[^,]*;base64/)
+        expect(mocks.readImage).not.toHaveBeenCalled()
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.downloads).toEqual([])
     })
 
     it('shows the established export error alert when native CharX export fails', async () => {

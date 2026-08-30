@@ -166,6 +166,8 @@ export interface NativeFileJobStatus {
         | 'restore-lossless-backup'
         | 'export-lossless-backup'
         | 'export-character-charx'
+        | 'export-character-card'
+        | 'export-risu-module'
         | 'restore-legacy-local-backup'
         | 'export-legacy-local-backup'
         | 'prepare-content-import'
@@ -254,6 +256,15 @@ export interface NativeCharacterCharxExportInput {
     expectedRevision: number
     card: Record<string, unknown>
     module: Record<string, unknown>
+    container?: 'appended-charx-jpeg'
+}
+
+export interface NativeCharacterCardExportInput {
+    characterId: string
+    destination: NativeCharacterCharxExportDestination
+    expectedRevision: number
+    format: 'json-card' | 'png-card'
+    metadata: Record<string, unknown>
 }
 
 export type NativeCharacterCharxExportDestination =
@@ -1030,6 +1041,7 @@ export async function runNativeCharacterCharxExport(
                 : {}),
             expectedRevision: input.expectedRevision,
             characterId: input.characterId,
+            ...(input.container ? { container: input.container } : {}),
             card: input.card,
             module: input.module,
         },
@@ -1113,6 +1125,138 @@ export async function runNativeCharacterCharxExport(
         if (managedSource) {
             try {
                 await invokeNative(dependencies, 'native_character_charx_handoff_cleanup', {
+                    path: managedSource,
+                })
+            }
+            catch {
+                handoffCleanupFailed = true
+                if (result && !outcomeFailed) {
+                    result.warningCodes = [
+                        ...result.warningCodes
+                            .filter((code) => code !== 'cleanup-failed')
+                            .slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+            }
+        }
+        if (!handoffCleanupFailed) {
+            try {
+                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+            }
+            catch (error) {
+                if (result) {
+                    result.warningCodes = [
+                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+                else if (!outcomeFailed) throw error
+            }
+        }
+    }
+}
+
+export async function runNativeCharacterCardExport(
+    input: NativeCharacterCardExportInput,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native character card export requires Tauri')
+    }
+    if (options.signal?.aborted) throw abortError()
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request: {
+            kind: 'export-character-card',
+            ...(input.destination.type === 'desktopPath'
+                ? { destination: input.destination.path }
+                : {}),
+            expectedRevision: input.expectedRevision,
+            characterId: input.characterId,
+            format: input.format,
+            metadata: input.metadata,
+        },
+    }) as { jobId: string; warningCodes?: string[] }
+    let cancellationRequested = false
+    let terminal: NativeFileJobStatus | undefined
+
+    while (!terminal) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (isTerminalJob(status)) terminal = status
+        else await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+
+    let outcomeFailed = false
+    let result: NativeFileJobResult | undefined
+    let managedSource: string | undefined
+    let handoffCleanupFailed = false
+    try {
+        if (terminal.state === 'cancelled') throw abortError()
+        if (terminal.state !== 'succeeded') {
+            throw new NativeFileJobError(
+                terminal.error?.code ?? 'export-failed',
+                terminal.error?.message ?? 'Native character card export failed',
+            )
+        }
+        if (!terminal.result) {
+            throw new NativeFileJobError(
+                'missing-result',
+                'Native character card export returned no result',
+            )
+        }
+        result = {
+            ...terminal.result,
+            warningCodes: [...new Set([
+                ...(started.warningCodes ?? []),
+                ...terminal.result.warningCodes,
+            ])].slice(0, 16),
+        }
+        if (input.destination.type === 'androidSaf') {
+            managedSource = result.handoffPath
+            if (!managedSource) {
+                throw new NativeFileJobError(
+                    'missing-handoff',
+                    'Native character card export returned no Android handoff path',
+                )
+            }
+            const published = await dependencies.copyToAndroidSaf({
+                sourcePath: managedSource,
+                suggestedName: input.destination.suggestedName,
+                signal: options.signal,
+            })
+            if (published.bytes !== result.sourceBytes) {
+                throw new NativeFileJobError(
+                    'length-mismatch',
+                    'Android SAF character card length differs from its native source',
+                )
+            }
+            const { handoffPath: _handoffPath, ...publishedResult } = result
+            result = {
+                ...publishedResult,
+                warningCodes: [...new Set([
+                    ...publishedResult.warningCodes,
+                    ...published.warningCodes,
+                ])].slice(0, 16),
+            }
+        }
+        return result
+    }
+    catch (error) {
+        outcomeFailed = true
+        throw error
+    }
+    finally {
+        if (managedSource) {
+            try {
+                await invokeNative(dependencies, 'native_character_card_handoff_cleanup', {
                     path: managedSource,
                 })
             }

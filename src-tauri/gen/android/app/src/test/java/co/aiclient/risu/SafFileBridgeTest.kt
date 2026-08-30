@@ -726,6 +726,48 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `destination source accepts only exact app-owned appended JPEG handoffs`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs")
+    handoffs.mkdirs()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val source = handoffs.resolve("risu-charx-$id.jpeg").apply { writeBytes(byteArrayOf(1)) }
+    val outside = appData.resolve("outside/risu-charx-$id.jpeg").apply {
+      parentFile!!.mkdirs()
+      writeBytes(byteArrayOf(2))
+    }
+    val unrelated = handoffs.resolve("risu-charx-$id.jpg").apply { writeBytes(byteArrayOf(3)) }
+
+    assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(id, managedExportId(source))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
+    assertNull(resolveManagedExportSource(appData, outside.path))
+    assertNull(resolveManagedExportSource(appData, unrelated.path))
+  }
+
+  @Test
+  fun `destination source accepts only exact app-owned JSON character card handoffs`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs")
+    handoffs.mkdirs()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val source = handoffs.resolve("risu-character-card-$id.json").apply {
+      writeBytes(byteArrayOf(1))
+    }
+    val outside = appData.resolve("outside/risu-character-card-$id.json").apply {
+      parentFile!!.mkdirs()
+      writeBytes(byteArrayOf(2))
+    }
+    val unrelated = handoffs.resolve("character-card-$id.json").apply { writeBytes(byteArrayOf(3)) }
+
+    assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(id, managedExportId(source))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
+    assertNull(resolveManagedExportSource(appData, outside.path))
+    assertNull(resolveManagedExportSource(appData, unrelated.path))
+  }
+
+  @Test
   fun `acknowledged screenshot cleanup removes only the matching owned handoff`() {
     val appData = temporaryDirectory()
     val id = "99999999-9999-4999-8999-999999999999"
@@ -784,6 +826,8 @@ class SafFileBridgeTest {
     assertEquals("opened-file.risudat", safeSafDestinationName("///"))
     assertEquals("chat.zip", safeSafDestinationName("folder/chat.zip"))
     assertEquals("Leased.charx", safeSafDestinationName("Leased.charx"))
+    assertEquals("Leased.jpeg", safeSafDestinationName("Leased.jpeg"))
+    assertEquals("Leased.json", safeSafDestinationName("Leased.json"))
     assertEquals(
       "risunest-2026-08-29T00-00-00-000Z.risulossless",
       safeSafDestinationName("risunest-2026-08-29T00-00-00-000Z.risulossless"),

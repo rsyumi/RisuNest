@@ -29,6 +29,7 @@ import {
     type PreparedNativePngCardMetadata,
 } from './storage/nativePngCardAdapter'
 import { exportNativeCharacterCharxFromPicker } from './storage/nativeCharacterCharxExportRoute'
+import { exportNativeCharacterCardFromPicker } from './storage/nativeCharacterCardExportRoute'
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -744,11 +745,13 @@ export async function exportChar(charaID:number):Promise<string> {
 
     const option = await alertCardExport()
     if(option.type === ''){
-        if(option.type2 === 'charx'){
+        if(option.type2 === 'charx' || option.type2 === 'charxJpeg'){
             try {
+                const appendedJpeg = option.type2 === 'charxJpeg'
                 const nativeResult = await exportNativeCharacterCharxFromPicker({
                     characterId: char.chaId,
-                    suggestedName: `${char.name || 'character'}.charx`,
+                    suggestedName: `${char.name || 'character'}.${appendedJpeg ? 'jpeg' : 'charx'}`,
+                    ...(appendedJpeg ? { container: 'appended-charx-jpeg' as const } : {}),
                     projectCharacter: (leasedDetail) => {
                         const leasedCharacter = {
                             ...safeStructuredClone(leasedDetail),
@@ -770,6 +773,27 @@ export async function exportChar(charaID:number):Promise<string> {
                             module: module as unknown as Record<string, unknown>,
                         }
                     },
+                })
+                if(nativeResult !== undefined){
+                    if(nativeResult) alertNormal(language.successExport)
+                    return ''
+                }
+            }
+            catch(error){
+                alertError(error)
+                return ''
+            }
+        }
+        if(option.type2 === 'json'){
+            try {
+                const nativeResult = await exportNativeCharacterCardFromPicker({
+                    characterId: char.chaId,
+                    suggestedName: `${char.name || 'character'}.json`,
+                    format: 'json-card',
+                    projectCharacter: (leasedDetail) => createBaseV3({
+                        ...safeStructuredClone(leasedDetail),
+                        chats: [],
+                    } as character) as unknown as Record<string, unknown>,
                 })
                 if(nativeResult !== undefined){
                     if(nativeResult) alertNormal(language.successExport)

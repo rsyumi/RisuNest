@@ -27,6 +27,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+pub(super) const JSON_CARD_MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODULE_OVERLAY_ITEMS: usize = 256;
 const ZIP_LOCAL_FILE_HEADER_BYTES: u64 = 30;
 const ZIP_LOCAL_VARIABLE_HEADER_MAX_BYTES: u64 = u16::MAX as u64 * 2;
@@ -987,7 +988,7 @@ fn abort_failed_content_session(
 
 fn content_import_limits() -> ImportLimits {
     ImportLimits {
-        max_metadata_bytes: 8 * 1024 * 1024,
+        max_metadata_bytes: JSON_CARD_MAX_METADATA_BYTES,
         max_payload_bytes: 64 * 1024 * 1024,
         max_aggregate_payload_bytes: 256 * 1024 * 1024,
         max_payload_count: 256,

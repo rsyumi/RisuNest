@@ -392,6 +392,70 @@ describe('native file job bootstrap reconciliation', () => {
         })
     })
 
+    it.each([
+        ['export-character-charx', 'risu-charx-123e4567-e89b-42d3-a456-426614174004.jpeg', 'native_character_charx_handoff_cleanup'],
+        ['export-character-card', 'risu-character-card-123e4567-e89b-42d3-a456-426614174004.json', 'native_character_card_handoff_cleanup'],
+    ] as const)('cleans an abandoned Android %s handoff before forgetting its terminal job', async (kind, fileName, cleanupCommand) => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\${fileName}`
+        const dependencies = {
+            invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('character-export', 'succeeded', 'complete'),
+                    kind,
+                    result: {
+                        ...restoreStatus('character-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }]
+                if (command === cleanupCommand) return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        await vi.waitFor(() => {
+            expect(calls).toEqual([
+                ['native_file_job_list', undefined],
+                [cleanupCommand, { path: handoffPath }],
+                ['native_file_job_forget', { jobId: 'character-export' }],
+            ])
+        })
+    })
+
+    it.each([
+        ['export-character-charx', 'risu-charx-123e4567-e89b-42d3-a456-426614174004.jpeg'],
+        ['export-character-card', 'risu-character-card-123e4567-e89b-42d3-a456-426614174004.json'],
+    ] as const)('preserves a %s handoff still owned by persisted Android SAF state', async (kind, fileName) => {
+        const calls: string[] = []
+        const exportId = '123e4567-e89b-42d3-a456-426614174004'
+        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\${fileName}`
+        const androidSafExportId = vi.fn(() => exportId)
+        const dependencies = {
+            invoke: vi.fn(async (command: string) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('character-export', 'succeeded', 'complete'),
+                    kind,
+                    result: {
+                        ...restoreStatus('character-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }]
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+            androidSafExportId,
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        await vi.waitFor(() => expect(androidSafExportId).toHaveBeenCalledOnce())
+        expect(calls).toEqual(['native_file_job_list'])
+    })
+
     it('preserves a character CharX handoff still owned by persisted Android SAF state', async () => {
         const calls: string[] = []
         const exportId = '123e4567-e89b-42d3-a456-426614174004'

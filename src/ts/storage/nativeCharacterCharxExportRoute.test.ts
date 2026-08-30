@@ -156,4 +156,45 @@ describe('native character CharX export route', () => {
             }],
         ])
     })
+
+    it('adds only the appended-JPEG discriminator while plain CharX remains omitted', async () => {
+        const inputs: unknown[] = []
+        const base = {
+            characterId: 'current-character',
+            suggestedName: 'Current.jpeg',
+            projectCharacter: () => ({
+                card: { spec: 'chara_card_v3' },
+                module: {},
+            }),
+        }
+        const dependencies = {
+            isDesktop: () => false,
+            isAndroid: () => true,
+            chooseDestination: async () => null,
+            runtime: () => ({ revision: 7, flushPendingData: async () => undefined }),
+            readCharacter: async () => ({ name: 'Current' }) as never,
+            runExport: async (input: unknown) => {
+                inputs.push(input)
+                return {
+                    revision: 7,
+                    sourceBytes: 1,
+                    sourceSha256: 'a'.repeat(64),
+                    characterCount: 1,
+                    presetCount: 0,
+                    warningCodes: [],
+                }
+            },
+        }
+
+        await exportNativeCharacterCharxFromPicker(base, {}, dependencies as never)
+        await exportNativeCharacterCharxFromPicker({
+            ...base,
+            container: 'appended-charx-jpeg',
+        }, {}, dependencies as never)
+
+        expect(inputs).toEqual([
+            expect.not.objectContaining({ container: expect.anything() }),
+            expect.objectContaining({ container: 'appended-charx-jpeg' }),
+        ])
+    })
 })
