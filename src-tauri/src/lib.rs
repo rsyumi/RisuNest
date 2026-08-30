@@ -495,7 +495,7 @@ pub fn run() {
             );
             #[cfg(any(desktop, target_os = "android"))]
             app.manage(peer_sync::delta_commands::PeerDeltaCommandState::default());
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             app.manage(peer_sync::bidirectional_commands::PeerBidirectionalCommandState::default());
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
@@ -632,29 +632,39 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_revoke,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_pull,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_capabilities,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_prepare,
-            #[cfg(desktop)]
+            #[cfg(target_os = "android")]
+            peer_sync::bidirectional_commands::peer_bidirectional_source_reserve,
+            #[cfg(target_os = "android")]
+            peer_sync::bidirectional_commands::peer_bidirectional_target_reserve,
+            #[cfg(target_os = "android")]
+            peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_status,
+            #[cfg(target_os = "android")]
+            peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_cancel,
+            #[cfg(target_os = "android")]
+            peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_release,
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_start,
             #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_tunnel_start,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_status,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_stop,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_revoke,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_sync,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_resolve,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_resolve_with_link,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_resume,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_acknowledge,
             oauth_login,
             native_tokenizer::tokenize_batch,

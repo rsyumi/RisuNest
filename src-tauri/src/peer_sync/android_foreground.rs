@@ -11,6 +11,8 @@ pub(crate) enum AndroidForegroundLane {
     P1Source,
     P4Source,
     P4Target,
+    P5Source,
+    P5Target,
 }
 
 impl AndroidForegroundLane {
@@ -19,6 +21,8 @@ impl AndroidForegroundLane {
             "p1-source" => Some(Self::P1Source),
             "p4-source" => Some(Self::P4Source),
             "p4-target" => Some(Self::P4Target),
+            "p5-source" => Some(Self::P5Source),
+            "p5-target" => Some(Self::P5Target),
             _ => None,
         }
     }
@@ -28,6 +32,8 @@ impl AndroidForegroundLane {
             Self::P1Source => "p1-source",
             Self::P4Source => "p4-source",
             Self::P4Target => "p4-target",
+            Self::P5Source => "p5-source",
+            Self::P5Target => "p5-target",
         }
     }
 }
@@ -164,7 +170,9 @@ impl AndroidForegroundRegistry {
     pub(crate) fn abandon_source_exact(&self, key: &AndroidForegroundKey) -> bool {
         if !matches!(
             key.lane,
-            AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+            AndroidForegroundLane::P1Source
+                | AndroidForegroundLane::P4Source
+                | AndroidForegroundLane::P5Source
         ) {
             return false;
         }
@@ -195,7 +203,9 @@ impl AndroidForegroundRegistry {
     ) -> Option<AndroidForegroundKey> {
         if !matches!(
             lane,
-            AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+            AndroidForegroundLane::P1Source
+                | AndroidForegroundLane::P4Source
+                | AndroidForegroundLane::P5Source
         ) {
             return None;
         }
@@ -214,8 +224,10 @@ impl AndroidForegroundRegistry {
         let Some(entry) = entry.as_mut() else {
             return false;
         };
-        if key.lane != AndroidForegroundLane::P4Target
-            || entry.key != *key
+        if !matches!(
+            key.lane,
+            AndroidForegroundLane::P4Target | AndroidForegroundLane::P5Target
+        ) || entry.key != *key
             || !entry.attached
             || entry.cancellation.load(Ordering::SeqCst)
         {
@@ -226,7 +238,10 @@ impl AndroidForegroundRegistry {
     }
 
     pub(crate) fn release_target_exact(&self, key: &AndroidForegroundKey) -> bool {
-        if key.lane != AndroidForegroundLane::P4Target {
+        if !matches!(
+            key.lane,
+            AndroidForegroundLane::P4Target | AndroidForegroundLane::P5Target
+        ) {
             return false;
         }
         let callback = {
@@ -286,7 +301,9 @@ pub(crate) fn peer_sync_foreground_source_abandon(
 ) -> Result<bool, String> {
     if !matches!(
         foreground.lane,
-        AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+        AndroidForegroundLane::P1Source
+            | AndroidForegroundLane::P4Source
+            | AndroidForegroundLane::P5Source
     ) {
         return Err("Android foreground identity is not a source lane".to_owned());
     }
@@ -300,7 +317,9 @@ pub(crate) fn peer_sync_foreground_source_status(
 ) -> Result<Option<AndroidForegroundKey>, String> {
     if !matches!(
         lane,
-        AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+        AndroidForegroundLane::P1Source
+            | AndroidForegroundLane::P4Source
+            | AndroidForegroundLane::P5Source
     ) {
         return Err("Android foreground lane is not a source lane".to_owned());
     }
@@ -328,6 +347,14 @@ mod tests {
         assert_eq!(
             AndroidForegroundLane::parse("p4-target"),
             Some(AndroidForegroundLane::P4Target)
+        );
+        assert_eq!(
+            AndroidForegroundLane::parse("p5-source"),
+            Some(AndroidForegroundLane::P5Source)
+        );
+        assert_eq!(
+            AndroidForegroundLane::parse("p5-target"),
+            Some(AndroidForegroundLane::P5Target)
         );
         assert_eq!(AndroidForegroundLane::parse("p3-target"), None);
         assert_eq!(AndroidForegroundLane::parse("quick-tunnel"), None);

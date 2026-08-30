@@ -1,3 +1,9 @@
+#[cfg(any(desktop, target_os = "android", test))]
+use super::android_foreground::{
+    registry, AndroidCancellationProbe, AndroidForegroundKey, AndroidForegroundLane,
+};
+#[cfg(desktop)]
+use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
     execute_logical_delta_pull,
     lan::{
@@ -12,7 +18,6 @@ use super::{
     logical_delta_transfer::{
         execute_logical_delta_pull_with_pre_activation, select_missing_logical_delta_objects,
     },
-    tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure},
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     LogicalDeltaStagedTarget, PeerSyncError,
 };
@@ -1458,6 +1463,37 @@ fn resolve_awaiting_conflict_with_fresh_source<S: LogicalDeltaObjectSource + ?Si
     remote_manifest_bytes: &[u8],
     source: &mut S,
 ) -> Result<LocalMergeOutcome, PeerSyncError> {
+    resolve_awaiting_conflict_with_fresh_source_and_cancellation(
+        store,
+        cas,
+        app_root,
+        retained,
+        operation_id,
+        winner,
+        expected_revision,
+        credential,
+        remote_manifest_bytes,
+        source,
+        &NeverCancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_awaiting_conflict_with_fresh_source_and_cancellation<
+    S: LogicalDeltaObjectSource + ?Sized,
+>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    retained: &PeerBidirectionalDurableOperation,
+    operation_id: &str,
+    winner: PeerBidirectionalConflictWinner,
+    expected_revision: i64,
+    credential: &LanBidirectionalLogicalCredential,
+    remote_manifest_bytes: &[u8],
+    source: &mut S,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LocalMergeOutcome, PeerSyncError> {
     let remote_manifest = decode_logical_manifest(remote_manifest_bytes)
         .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
     let remote_revision = i64::try_from(remote_manifest.source_revision).map_err(|_| {
@@ -1477,7 +1513,7 @@ fn resolve_awaiting_conflict_with_fresh_source<S: LogicalDeltaObjectSource + ?Si
         remote_revision,
         &remote_generation,
     )?;
-    resolve_bidirectional_conflict(
+    resolve_bidirectional_conflict_with_cancellation(
         store,
         cas,
         app_root,
@@ -1486,6 +1522,7 @@ fn resolve_awaiting_conflict_with_fresh_source<S: LogicalDeltaObjectSource + ?Si
         expected_revision,
         remote_manifest_bytes,
         source,
+        cancellation,
     )
 }
 
@@ -1789,6 +1826,32 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
     remote_manifest_bytes: &[u8],
     remote_source: &mut S,
 ) -> Result<LocalMergeOutcome, PeerSyncError> {
+    begin_bidirectional_local_merge_with_cancellation(
+        store,
+        cas,
+        app_root,
+        credential,
+        expected_revision,
+        remote_manifest_bytes,
+        remote_source,
+        &NeverCancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    credential: LanBidirectionalLogicalCredential,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LocalMergeOutcome, PeerSyncError> {
+    if cancellation.is_cancelled() {
+        return Err(PeerSyncError::Cancelled);
+    }
     let journal = PeerBidirectionalOperationJournal::new(app_root);
     if journal.load()?.is_some() {
         return Err(PeerSyncError::Validation(
@@ -1886,6 +1949,9 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
                 unreachable!();
             };
             open_or_begin_target_job(app_root, &context.durable_job_id)?;
+            if cancellation.is_cancelled() {
+                return Err(PeerSyncError::Cancelled);
+            }
             Ok(LocalMergeOutcome::Conflict(
                 PeerBidirectionalConflictResult {
                     kind: "conflict",
@@ -1978,7 +2044,7 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
                     remaining_totals.set(Some(totals));
                     Ok(())
                 },
-                &NeverCancelled,
+                cancellation,
             );
             let measured_totals = measured_source.totals();
             drop(target);
@@ -2008,6 +2074,31 @@ fn resume_bidirectional_target_prepared<S: LogicalDeltaObjectSource + ?Sized>(
     replacement_credential: Option<LanBidirectionalLogicalCredential>,
     remote_manifest_bytes: &[u8],
     remote_source: &mut S,
+) -> Result<LocalMergeOutcome, PeerSyncError> {
+    resume_bidirectional_target_prepared_with_cancellation(
+        store,
+        cas,
+        app_root,
+        operation_id,
+        expected_revision,
+        replacement_credential,
+        remote_manifest_bytes,
+        remote_source,
+        &NeverCancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_bidirectional_target_prepared_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    operation_id: &str,
+    expected_revision: i64,
+    replacement_credential: Option<LanBidirectionalLogicalCredential>,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<LocalMergeOutcome, PeerSyncError> {
     let journal = PeerBidirectionalOperationJournal::new(app_root);
     let mut prepared = journal.load()?.ok_or_else(|| {
@@ -2202,7 +2293,7 @@ fn resume_bidirectional_target_prepared<S: LogicalDeltaObjectSource + ?Sized>(
             remaining_totals.set(Some(totals));
             Ok(())
         },
-        &NeverCancelled,
+        cancellation,
     );
     let measured_totals = measured_source.totals();
     drop(target);
@@ -2380,6 +2471,31 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
     remote_manifest_bytes: &[u8],
     remote_source: &mut S,
 ) -> Result<LocalMergeOutcome, PeerSyncError> {
+    resolve_bidirectional_conflict_with_cancellation(
+        store,
+        cas,
+        app_root,
+        operation_id,
+        winner,
+        expected_revision,
+        remote_manifest_bytes,
+        remote_source,
+        &NeverCancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_bidirectional_conflict_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    operation_id: &str,
+    winner: PeerBidirectionalConflictWinner,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LocalMergeOutcome, PeerSyncError> {
     let journal = PeerBidirectionalOperationJournal::new(app_root);
     let operation = journal.load()?.ok_or_else(|| {
         PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
@@ -2467,7 +2583,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
                     PeerBidirectionalBackupSide::Local,
                     &local_generation,
                     Some(&receipt.package_id),
-                    &NeverCancelled,
+                    cancellation,
                 )?,
             }
         } else {
@@ -2480,7 +2596,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
                 PeerBidirectionalBackupSide::Local,
                 &local_generation,
                 None,
-                &NeverCancelled,
+                cancellation,
             )?;
             backups.push(verified.receipt().clone());
             journal.store(&PeerBidirectionalDurableOperation::AwaitingConflict {
@@ -2585,7 +2701,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
             prepared.replace(Some(operation));
             Ok(())
         },
-        &NeverCancelled,
+        cancellation,
     );
     let measured_totals = measured_source.totals();
     drop(target);
@@ -4213,8 +4329,10 @@ impl PeerBidirectionalTunnelMetadata {
     }
 }
 
+#[cfg(desktop)]
 struct BidirectionalTunnel(tunnel::RunningTunnel);
 
+#[cfg(desktop)]
 impl BidirectionalTunnel {
     fn transport_url(&self) -> &url::Url {
         self.0.transport_url()
@@ -4231,12 +4349,14 @@ impl BidirectionalTunnel {
     }
 }
 
+#[cfg(desktop)]
 trait SourceTunnelProcess: Send {
     fn transport_url(&self) -> &url::Url;
     fn stop(&mut self) -> Result<(), PeerSyncError>;
     fn lifecycle(&mut self) -> Result<RunningTunnelLifecycle, PeerSyncError>;
 }
 
+#[cfg(desktop)]
 impl SourceTunnelProcess for BidirectionalTunnel {
     fn transport_url(&self) -> &url::Url {
         BidirectionalTunnel::transport_url(self)
@@ -4251,23 +4371,31 @@ impl SourceTunnelProcess for BidirectionalTunnel {
     }
 }
 
+#[cfg(desktop)]
 type FailedBidirectionalTunnel = TunnelStartFailure<SystemTunnelProcess, LanCloneHost>;
 
+#[cfg(desktop)]
 trait ReverseTunnelProcess: Send {
     fn stop(&mut self) -> Result<(), PeerSyncError>;
 }
 
+#[cfg(desktop)]
 impl ReverseTunnelProcess for BidirectionalTunnel {
     fn stop(&mut self) -> Result<(), PeerSyncError> {
         BidirectionalTunnel::stop(self)
     }
 }
 
+#[cfg(desktop)]
 enum ReverseTunnelCleanupOwner {
     Running(Box<dyn ReverseTunnelProcess>),
     Failed(FailedBidirectionalTunnel),
 }
 
+#[cfg(target_os = "android")]
+enum ReverseTunnelCleanupOwner {}
+
+#[cfg(desktop)]
 impl ReverseTunnelCleanupOwner {
     fn stop(&mut self) -> Result<(), PeerSyncError> {
         match self {
@@ -4279,9 +4407,11 @@ impl ReverseTunnelCleanupOwner {
     }
 }
 
+#[cfg(desktop)]
 static REVERSE_TUNNEL_CLEANUP: LazyLock<Mutex<BTreeMap<String, ReverseTunnelCleanupOwner>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+#[cfg(desktop)]
 fn retry_reverse_tunnel_cleanup(operation_id: &str) -> Result<(), PeerSyncError> {
     let mut tunnel = REVERSE_TUNNEL_CLEANUP
         .lock()
@@ -4305,6 +4435,7 @@ fn retry_reverse_tunnel_cleanup(operation_id: &str) -> Result<(), PeerSyncError>
     Ok(())
 }
 
+#[cfg(desktop)]
 fn retain_reverse_cleanup_owner(
     operation_id: &str,
     mut owner: ReverseTunnelCleanupOwner,
@@ -4325,6 +4456,7 @@ fn retain_reverse_cleanup_owner(
     }
 }
 
+#[cfg(desktop)]
 fn cleanup_reverse_tunnels_for_exit() {
     let operation_ids = REVERSE_TUNNEL_CLEANUP
         .lock()
@@ -4334,6 +4466,22 @@ fn cleanup_reverse_tunnels_for_exit() {
         let _ = retry_reverse_tunnel_cleanup(&operation_id);
     }
 }
+
+#[cfg(target_os = "android")]
+fn retry_reverse_tunnel_cleanup(_operation_id: &str) -> Result<(), PeerSyncError> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn retain_reverse_cleanup_owner(
+    _operation_id: &str,
+    owner: ReverseTunnelCleanupOwner,
+) -> Result<(), PeerSyncError> {
+    match owner {}
+}
+
+#[cfg(target_os = "android")]
+fn cleanup_reverse_tunnels_for_exit() {}
 
 fn resolve_remote_apply_result(
     result: Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>,
@@ -4417,6 +4565,25 @@ pub struct PeerBidirectionalStatus {
     operation: Option<PeerBidirectionalStatusOperation>,
 }
 
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AndroidBidirectionalTargetStatus {
+    foreground: AndroidForegroundKey,
+    phase: AndroidBidirectionalTargetPhase,
+    result: Option<PeerBidirectionalSyncResult>,
+    error: Option<String>,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AndroidBidirectionalTargetPhase {
+    Reserved,
+    Running,
+    Terminal,
+}
+
 struct BidirectionalSourceRuntime {
     session_id: String,
     manifest_id: String,
@@ -4424,9 +4591,13 @@ struct BidirectionalSourceRuntime {
     host: Option<LanCloneHost>,
     control: LanCloneHostControl,
     phase: PeerBidirectionalSourcePhase,
+    #[cfg(desktop)]
     tunnel: Option<Box<dyn SourceTunnelProcess>>,
+    #[cfg(desktop)]
     failed_tunnel: Option<FailedBidirectionalTunnel>,
     tunnel_metadata: Option<PeerBidirectionalTunnelMetadata>,
+    #[cfg(any(target_os = "android", test))]
+    foreground: Option<AndroidForegroundKey>,
 }
 
 #[derive(Default)]
@@ -4435,6 +4606,8 @@ struct PeerBidirectionalRuntime {
     source: Option<BidirectionalSourceRuntime>,
     stopped: bool,
     target_active: bool,
+    #[cfg(any(target_os = "android", test))]
+    target_foreground: Option<AndroidBidirectionalTargetStatus>,
 }
 
 #[derive(Clone)]
@@ -4466,6 +4639,128 @@ impl PeerBidirectionalCommandState {
                 "peer bidirectional command state mutex poisoned: {error}"
             ))
         })
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn reserve_target_foreground(&self) -> Result<AndroidForegroundKey, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        if runtime.target_foreground.is_some() {
+            return Err(PeerSyncError::Protocol(
+                "Android bidirectional target foreground cleanup is pending".to_owned(),
+            ));
+        }
+        let foreground = registry()
+            .reserve(AndroidForegroundLane::P5Target)
+            .map_err(PeerSyncError::Protocol)?;
+        runtime.target_foreground = Some(AndroidBidirectionalTargetStatus {
+            foreground: foreground.clone(),
+            phase: AndroidBidirectionalTargetPhase::Reserved,
+            result: None,
+            error: None,
+        });
+        Ok(foreground)
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn mark_target_running_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+    ) -> Result<AndroidCancellationProbe, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        let target = runtime.target_foreground.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("Android bidirectional target foreground is absent".to_owned())
+        })?;
+        if target.foreground != *foreground
+            || target.phase != AndroidBidirectionalTargetPhase::Reserved
+        {
+            return Err(PeerSyncError::Protocol(
+                "Android bidirectional target foreground identity is stale".to_owned(),
+            ));
+        }
+        if !registry().retain_target_exact(foreground) {
+            return Err(PeerSyncError::Protocol(
+                "Android bidirectional target foreground could not be retained".to_owned(),
+            ));
+        }
+        let cancellation = registry().acquire_exact(foreground).ok_or_else(|| {
+            PeerSyncError::Protocol(
+                "Android bidirectional target foreground is not attached".to_owned(),
+            )
+        })?;
+        target.phase = AndroidBidirectionalTargetPhase::Running;
+        Ok(cancellation)
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn publish_target_terminal_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+        outcome: Result<PeerBidirectionalSyncResult, String>,
+    ) -> Result<(), PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        let target = runtime.target_foreground.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("Android bidirectional target foreground is absent".to_owned())
+        })?;
+        if target.foreground != *foreground
+            || target.phase != AndroidBidirectionalTargetPhase::Running
+        {
+            return Err(PeerSyncError::Protocol(
+                "Android bidirectional target foreground identity is stale".to_owned(),
+            ));
+        }
+        target.phase = AndroidBidirectionalTargetPhase::Terminal;
+        match outcome {
+            Ok(result) => target.result = Some(result),
+            Err(error) => target.error = Some(error),
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn target_foreground_status(
+        &self,
+    ) -> Result<Option<AndroidBidirectionalTargetStatus>, PeerSyncError> {
+        Ok(self.lock()?.target_foreground.clone())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn cancel_target_foreground_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+    ) -> Result<bool, PeerSyncError> {
+        let runtime = self.lock()?;
+        Ok(runtime
+            .target_foreground
+            .as_ref()
+            .is_some_and(|target| target.foreground == *foreground)
+            && registry().cancel_exact(foreground))
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn release_target_foreground_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+    ) -> Result<bool, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        let Some(target) = runtime.target_foreground.as_ref() else {
+            return Ok(registry().release_target_exact(foreground));
+        };
+        if target.foreground != *foreground {
+            return Ok(false);
+        }
+        if target.phase == AndroidBidirectionalTargetPhase::Running {
+            let _ = registry().cancel_exact(foreground);
+            return Ok(false);
+        }
+        if !registry().release_target_exact(foreground) {
+            return Ok(false);
+        }
+        runtime.target_foreground = None;
+        Ok(true)
     }
 
     fn begin_source_prepare(&self) -> Result<PeerBidirectionalStateGuard, PeerSyncError> {
@@ -4537,9 +4832,13 @@ impl PeerBidirectionalCommandState {
             host: Some(host),
             control,
             phase: PeerBidirectionalSourcePhase::Prepared,
+            #[cfg(desktop)]
             tunnel: None,
+            #[cfg(desktop)]
             failed_tunnel: None,
             tunnel_metadata: None,
+            #[cfg(any(target_os = "android", test))]
+            foreground: None,
         });
         Ok(source_status(&runtime, &[]))
     }
@@ -4551,7 +4850,11 @@ impl PeerBidirectionalCommandState {
     ) -> Result<PeerBidirectionalSourceStatus, PeerSyncError> {
         let _operation = self.lock_lifecycle_operation()?;
         let mut host = self.take_prepared_host(session_id, None)?;
-        let pairing = match host.start() {
+        #[cfg(desktop)]
+        let started = host.start();
+        #[cfg(target_os = "android")]
+        let started = host.start_private_lan(advertised_ip);
+        let pairing = match started {
             Ok(pairing) => pairing,
             Err(error) => {
                 self.restore_prepared_host(session_id, host)?;
@@ -4605,6 +4908,7 @@ impl PeerBidirectionalCommandState {
         Ok(())
     }
 
+    #[cfg(desktop)]
     fn start_tunnel(
         &self,
         session_id: &str,
@@ -4662,6 +4966,7 @@ impl PeerBidirectionalCommandState {
     }
 
     fn stop_source_inner(&self, session_id: &str) -> Result<(), PeerSyncError> {
+        #[cfg(desktop)]
         let (mut host, mut tunnel, mut failed) = {
             let mut runtime = self.lock()?;
             let source = require_source(&mut runtime, session_id)?;
@@ -4673,7 +4978,16 @@ impl PeerBidirectionalCommandState {
                 source.failed_tunnel.take(),
             )
         };
+        #[cfg(target_os = "android")]
+        let mut host = {
+            let mut runtime = self.lock()?;
+            let source = require_source(&mut runtime, session_id)?;
+            source.phase = PeerBidirectionalSourcePhase::Stopping;
+            source.pairing_uri = None;
+            source.host.take()
+        };
         let mut primary = None;
+        #[cfg(desktop)]
         if let Some(owner) = tunnel.as_mut() {
             if let Err(error) = owner.stop() {
                 primary = Some(error);
@@ -4681,6 +4995,7 @@ impl PeerBidirectionalCommandState {
                 tunnel = None;
             }
         }
+        #[cfg(desktop)]
         if let Some(owner) = failed.as_mut() {
             if owner.retry_cleanup().is_ok() {
                 failed = None;
@@ -4703,8 +5018,11 @@ impl PeerBidirectionalCommandState {
             let mut runtime = self.lock()?;
             let source = require_source(&mut runtime, session_id)?;
             source.host = host;
-            source.tunnel = tunnel;
-            source.failed_tunnel = failed;
+            #[cfg(desktop)]
+            {
+                source.tunnel = tunnel;
+                source.failed_tunnel = failed;
+            }
             return Err(error);
         }
         let mut runtime = self.lock()?;
@@ -4727,12 +5045,92 @@ impl PeerBidirectionalCommandState {
         Ok(())
     }
 
+    #[cfg(any(target_os = "android", test))]
+    fn attach_source_foreground(
+        &self,
+        session_id: &str,
+        key: AndroidForegroundKey,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock()?;
+        require_source(&mut runtime, session_id)?.foreground = Some(key);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn pause_source_exact(&self, key: &AndroidForegroundKey) {
+        let Ok(_operation) = self.lifecycle_operation.lock() else {
+            return;
+        };
+        let Ok(mut runtime) = self.lock() else {
+            return;
+        };
+        let Some(source) = runtime.source.as_mut() else {
+            return;
+        };
+        if source.foreground.as_ref() != Some(key) {
+            return;
+        }
+        let Some(mut host) = source.host.take() else {
+            return;
+        };
+        if host.stop().is_err() {
+            source.host = Some(host);
+            source.phase = PeerBidirectionalSourcePhase::Stopping;
+            return;
+        }
+        source.host = Some(host);
+        source.foreground = None;
+        source.pairing_uri = None;
+        source.phase = PeerBidirectionalSourcePhase::Prepared;
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn release_source_android(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AndroidForegroundKey>, PeerSyncError> {
+        let operation = self.lock_lifecycle_operation()?;
+        let (foreground, mut source) = {
+            let mut runtime = self.lock()?;
+            let source = runtime
+                .source
+                .as_ref()
+                .filter(|source| source.session_id == session_id)
+                .ok_or_else(|| {
+                    PeerSyncError::Validation(
+                        "peer bidirectional source session is absent".to_owned(),
+                    )
+                })?;
+            let foreground = source.foreground.clone();
+            let source = runtime.source.take().expect("checked source");
+            runtime.stopped = true;
+            (foreground, source)
+        };
+        if let Some(host) = source.host.as_mut() {
+            if let Err(error) = host.stop() {
+                let mut runtime = self.lock()?;
+                runtime.stopped = false;
+                runtime.source = Some(source);
+                return Err(error);
+            }
+        }
+        source.foreground = None;
+        drop(source);
+        drop(operation);
+        if let Some(key) = foreground.as_ref() {
+            let _ = registry().cancel_exact(key);
+            let _ = registry().detach_if_generation(key);
+        }
+        Ok(foreground)
+    }
+
     fn status(
         &self,
         app_root: &Path,
         store: &mut PersistentStore,
     ) -> Result<PeerBidirectionalStatus, PeerSyncError> {
         let _operation = self.lock_lifecycle_operation()?;
+        #[cfg(desktop)]
         self.poll_source_tunnel()?;
         let journal = PeerBidirectionalOperationJournal::new(app_root);
         let mut retained = journal.load()?;
@@ -4801,6 +5199,7 @@ impl PeerBidirectionalCommandState {
         Ok(PeerBidirectionalStatus { source, operation })
     }
 
+    #[cfg(desktop)]
     fn poll_source_tunnel(&self) -> Result<(), PeerSyncError> {
         let owner = {
             let mut runtime = self.lock()?;
@@ -5045,7 +5444,7 @@ pub struct PeerBidirectionalCapabilities {
 #[tauri::command]
 pub fn peer_bidirectional_capabilities() -> PeerBidirectionalCapabilities {
     PeerBidirectionalCapabilities {
-        desktop: true,
+        desktop: cfg!(desktop),
         source_ready: true,
         atomic_activation_ready: true,
         authenticated_transport_ready: true,
@@ -5053,6 +5452,54 @@ pub fn peer_bidirectional_capabilities() -> PeerBidirectionalCapabilities {
         durable_state_ready: true,
         production_enabled: true,
     }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn peer_bidirectional_source_reserve() -> Result<AndroidForegroundKey, String> {
+    registry().reserve(AndroidForegroundLane::P5Source)
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn peer_bidirectional_target_reserve(
+    state: State<'_, PeerBidirectionalCommandState>,
+) -> Result<AndroidForegroundKey, String> {
+    state
+        .reserve_target_foreground()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn peer_bidirectional_target_foreground_status(
+    state: State<'_, PeerBidirectionalCommandState>,
+) -> Result<Option<AndroidBidirectionalTargetStatus>, String> {
+    state
+        .target_foreground_status()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn peer_bidirectional_target_foreground_cancel(
+    state: State<'_, PeerBidirectionalCommandState>,
+    foreground: AndroidForegroundKey,
+) -> Result<bool, String> {
+    state
+        .cancel_target_foreground_exact(&foreground)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn peer_bidirectional_target_foreground_release(
+    state: State<'_, PeerBidirectionalCommandState>,
+    foreground: AndroidForegroundKey,
+) -> Result<bool, String> {
+    state
+        .release_target_foreground_exact(&foreground)
+        .map_err(|error| error.to_string())
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
@@ -5094,6 +5541,35 @@ fn open_command_store(app: &AppHandle) -> Result<PersistentStore, PeerSyncError>
         .map_err(store_error)
 }
 
+fn claim_bidirectional_client(
+    endpoint: &str,
+    session_id: &str,
+    manifest_id: &str,
+    claim: &str,
+    device_id: &str,
+) -> Result<LanBidirectionalLogicalClient, PeerSyncError> {
+    #[cfg(desktop)]
+    {
+        LanBidirectionalLogicalClient::claim_p5_desktop(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            device_id,
+        )
+    }
+    #[cfg(target_os = "android")]
+    {
+        LanBidirectionalLogicalClient::claim_p5_android(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            device_id,
+        )
+    }
+}
+
 fn prepare_product_source_host(
     app_root: &Path,
     store: PersistentStore,
@@ -5126,6 +5602,7 @@ fn prepare_product_source_host(
     ))
 }
 
+#[cfg(desktop)]
 fn request_remote_apply_from_shared(
     app_root: &Path,
     local_device_id: &str,
@@ -5222,6 +5699,61 @@ fn request_remote_apply_from_shared(
         result,
         reverse_owner,
         lan_host,
+    )
+}
+
+#[cfg(target_os = "android")]
+fn request_remote_apply_from_shared(
+    app_root: &Path,
+    local_device_id: &str,
+    client: &LanBidirectionalLogicalClient,
+    context: &PeerBidirectionalOperationContext,
+    shared_generation: &SyncGenerationIdentity,
+    shared_manifest_bytes: &[u8],
+    backup_losing_side: bool,
+) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+    let source = LogicalDeltaSourceSession::open(
+        app_root,
+        app_root,
+        &context.library_id,
+        &shared_generation.generation_id,
+    )?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let prepared = super::lan::PreparedLogicalLanSession::new(
+        &session_id,
+        local_device_id,
+        shared_generation.manifest_hash.clone(),
+        shared_manifest_bytes.to_vec(),
+        source.objects().to_vec(),
+        Box::new(source),
+    )?;
+    let mut host = LanCloneHost::prepare_logical(prepared);
+    let address = super::android_source_commands::discover_private_lan_address()
+        .map_err(PeerSyncError::Transport)?;
+    let pairing = host.start_private_lan(address)?;
+    let port = host
+        .address()
+        .ok_or_else(|| {
+            PeerSyncError::Transport("temporary shared source address is unavailable".to_owned())
+        })?
+        .port();
+    let result = client.request_remote_apply(LanBidirectionalRemoteApplyRequest {
+        operation_id: context.operation_id.clone(),
+        source_endpoint: format!("http://{address}:{port}"),
+        source_session_id: pairing.session_id,
+        source_manifest_id: pairing.manifest_id,
+        source_claim: pairing.claim,
+        expected_source_revision: context.expected_remote_revision,
+        expected_source_generation: context.expected_remote_generation.clone(),
+        expected_common_base_manifest_hash: context.previous_shared.manifest_hash.clone(),
+        backup_losing_side,
+    });
+    finish_remote_apply_request(
+        app_root,
+        &context.operation_id,
+        result,
+        None,
+        Some(&mut host),
     )
 }
 
@@ -5346,10 +5878,11 @@ fn recover_target_prepared_with_client(
     expected_revision: i64,
     rebind_credential: bool,
     client: &mut LanBidirectionalLogicalClient,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<PeerBidirectionalSyncResult, PeerSyncError> {
     let manifest = client.fetch_manifest()?;
     let replacement_credential = rebind_credential.then(|| client.credential());
-    resume_bidirectional_target_prepared(
+    resume_bidirectional_target_prepared_with_cancellation(
         store,
         &PayloadCas::new(app_root)?,
         app_root,
@@ -5358,7 +5891,17 @@ fn recover_target_prepared_with_client(
         replacement_credential,
         &manifest,
         client,
+        cancellation,
     )?;
+    if cancellation.is_cancelled() {
+        return retained_result(
+            &PeerBidirectionalOperationJournal::new(app_root)
+                .load()?
+                .ok_or_else(|| {
+                    PeerSyncError::Storage("bidirectional operation was not retained".to_owned())
+                })?,
+        );
+    }
     let committed_revision = store.revision().map_err(store_error)?;
     run_retained_remote_completion(
         store,
@@ -5450,6 +5993,7 @@ pub async fn peer_bidirectional_prepare(
     .map_err(|error| format!("peer bidirectional source preparation worker failed: {error}"))?
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 pub fn peer_bidirectional_start(
     state: State<'_, PeerBidirectionalCommandState>,
@@ -5463,6 +6007,46 @@ pub fn peer_bidirectional_start(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn peer_bidirectional_start(
+    state: State<'_, PeerBidirectionalCommandState>,
+    session_id: String,
+    foreground: AndroidForegroundKey,
+) -> Result<PeerBidirectionalSourceStatus, String> {
+    if foreground.lane != AndroidForegroundLane::P5Source {
+        return Err("Android bidirectional source foreground identity is invalid".to_owned());
+    }
+    let cancellation = registry()
+        .acquire_exact(&foreground)
+        .ok_or_else(|| "Android bidirectional source foreground is not attached".to_owned())?;
+    let address = super::android_source_commands::discover_private_lan_address()?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if cancellation.is_cancelled() {
+            return Err("Android foreground service was cancelled".to_owned());
+        }
+        let status = state
+            .start_source(&session_id, address)
+            .map_err(|error| error.to_string())?;
+        state
+            .attach_source_foreground(&session_id, foreground.clone())
+            .map_err(|error| error.to_string())?;
+        let callback_state = state.clone();
+        let callback_key = foreground.clone();
+        if !registry().set_source_stop_callback_exact(&foreground, move || {
+            callback_state.pause_source_exact(&callback_key);
+        }) {
+            state.pause_source_exact(&foreground);
+            return Err("Android foreground service detached before source start".to_owned());
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|error| format!("peer bidirectional source start worker failed: {error}"))?
+}
+
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_bidirectional_tunnel_start(
     state: State<'_, PeerBidirectionalCommandState>,
@@ -5487,6 +6071,7 @@ pub fn peer_bidirectional_status(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_bidirectional_stop(
     state: State<'_, PeerBidirectionalCommandState>,
@@ -5494,6 +6079,19 @@ pub async fn peer_bidirectional_stop(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || state.stop_source(&session_id))
+        .await
+        .map_err(|error| format!("peer bidirectional source stop worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn peer_bidirectional_stop(
+    state: State<'_, PeerBidirectionalCommandState>,
+    session_id: String,
+) -> Result<Option<AndroidForegroundKey>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.release_source_android(&session_id))
         .await
         .map_err(|error| format!("peer bidirectional source stop worker failed: {error}"))?
         .map_err(|error| error.to_string())
@@ -5551,11 +6149,31 @@ pub async fn peer_bidirectional_sync(
     manifest_id: String,
     claim: String,
     expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
+    #[cfg(target_os = "android")]
+    let foreground = foreground
+        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    #[cfg(target_os = "android")]
+    let cancellation = state
+        .mark_target_running_exact(&foreground)
+        .map_err(|error| error.to_string())?;
+    #[cfg(desktop)]
+    let cancellation = {
+        let _ = foreground;
+        NeverCancelled
+    };
+    let worker_state = state.clone();
     let root = app_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state.begin_target().map_err(|error| error.to_string())?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = worker_state
+            .begin_target()
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "android")]
+        if cancellation.is_cancelled() {
+            return Err("Android foreground service was cancelled".to_owned());
+        }
         if let Some(retained) = PeerBidirectionalOperationJournal::new(&root)
             .load()
             .map_err(|error| error.to_string())?
@@ -5572,7 +6190,7 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let mut client = LanBidirectionalLogicalClient::claim_p5_desktop(
+                    let mut client = claim_bidirectional_client(
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -5593,6 +6211,7 @@ pub async fn peer_bidirectional_sync(
                         expected_revision,
                         true,
                         &mut client,
+                        &cancellation,
                     )
                     .map_err(|error| error.to_string());
                 }
@@ -5619,7 +6238,7 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let client = LanBidirectionalLogicalClient::claim_p5_desktop(
+                    let client = claim_bidirectional_client(
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -5657,7 +6276,7 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let client = LanBidirectionalLogicalClient::claim_p5_desktop(
+                    let client = claim_bidirectional_client(
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -5696,7 +6315,7 @@ pub async fn peer_bidirectional_sync(
             &root.join("peer-delta").join("source-device-id"),
         )
         .map_err(|error| error.to_string())?;
-        let mut client = LanBidirectionalLogicalClient::claim_p5_desktop(
+        let mut client = claim_bidirectional_client(
             &endpoint,
             &session_id,
             &manifest_id,
@@ -5727,7 +6346,7 @@ pub async fn peer_bidirectional_sync(
                 expected_revision: remote_revision,
             })
             .map_err(|error| error.to_string())?;
-        let outcome = begin_bidirectional_local_merge(
+        let outcome = begin_bidirectional_local_merge_with_cancellation(
             &mut store,
             &PayloadCas::new(&root).map_err(|error| error.to_string())?,
             &root,
@@ -5735,11 +6354,21 @@ pub async fn peer_bidirectional_sync(
             expected_revision,
             &remote_manifest_bytes,
             &mut client,
+            &cancellation,
         )
         .map_err(|error| error.to_string())?;
         match outcome {
             LocalMergeOutcome::Conflict(result) => Ok(conflict_result(result)),
             LocalMergeOutcome::LocalCommitted => {
+                if cancellation.is_cancelled() {
+                    return retained_result(
+                        &PeerBidirectionalOperationJournal::new(&root)
+                            .load()
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| "bidirectional operation was not retained".to_owned())?,
+                    )
+                    .map_err(|error| error.to_string());
+                }
                 let committed_revision = store.revision().map_err(|error| error.to_string())?;
                 run_retained_remote_completion(
                     &mut store,
@@ -5758,7 +6387,12 @@ pub async fn peer_bidirectional_sync(
         }
     })
     .await
-    .map_err(|error| format!("peer bidirectional sync worker failed: {error}"))?
+    .map_err(|error| format!("peer bidirectional sync worker failed: {error}"))?;
+    #[cfg(target_os = "android")]
+    state
+        .publish_target_terminal_exact(&foreground, outcome.clone())
+        .map_err(|error| error.to_string())?;
+    outcome
 }
 
 #[tauri::command]
@@ -5768,11 +6402,31 @@ pub async fn peer_bidirectional_resolve(
     operation_id: String,
     winner: PeerBidirectionalConflictWinner,
     expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
+    #[cfg(target_os = "android")]
+    let foreground = foreground
+        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    #[cfg(target_os = "android")]
+    let cancellation = state
+        .mark_target_running_exact(&foreground)
+        .map_err(|error| error.to_string())?;
+    #[cfg(desktop)]
+    let cancellation = {
+        let _ = foreground;
+        NeverCancelled
+    };
+    let worker_state = state.clone();
     let root = app_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state.begin_target().map_err(|error| error.to_string())?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = worker_state
+            .begin_target()
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "android")]
+        if cancellation.is_cancelled() {
+            return Err("Android foreground service was cancelled".to_owned());
+        }
         let operation = PeerBidirectionalOperationJournal::new(&root)
             .load()
             .map_err(|error| error.to_string())?
@@ -5790,7 +6444,7 @@ pub async fn peer_bidirectional_resolve(
             LanBidirectionalLogicalClient::resume(credential).map_err(|error| error.to_string())?;
         let remote_manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
-        let outcome = resolve_bidirectional_conflict(
+        let outcome = resolve_bidirectional_conflict_with_cancellation(
             &mut store,
             &PayloadCas::new(&root).map_err(|error| error.to_string())?,
             &root,
@@ -5799,11 +6453,21 @@ pub async fn peer_bidirectional_resolve(
             expected_revision,
             &remote_manifest,
             &mut client,
+            &cancellation,
         )
         .map_err(|error| error.to_string())?;
         match outcome {
             LocalMergeOutcome::Conflict(result) => Ok(conflict_result(result)),
             LocalMergeOutcome::LocalCommitted => {
+                if cancellation.is_cancelled() {
+                    return retained_result(
+                        &PeerBidirectionalOperationJournal::new(&root)
+                            .load()
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| "bidirectional operation was not retained".to_owned())?,
+                    )
+                    .map_err(|error| error.to_string());
+                }
                 let committed_revision = store.revision().map_err(|error| error.to_string())?;
                 run_retained_remote_completion(
                     &mut store,
@@ -5817,7 +6481,12 @@ pub async fn peer_bidirectional_resolve(
         }
     })
     .await
-    .map_err(|error| format!("peer bidirectional resolution worker failed: {error}"))?
+    .map_err(|error| format!("peer bidirectional resolution worker failed: {error}"))?;
+    #[cfg(target_os = "android")]
+    state
+        .publish_target_terminal_exact(&foreground, outcome.clone())
+        .map_err(|error| error.to_string())?;
+    outcome
 }
 
 #[tauri::command]
@@ -5832,11 +6501,31 @@ pub async fn peer_bidirectional_resolve_with_link(
     manifest_id: String,
     claim: String,
     expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
+    #[cfg(target_os = "android")]
+    let foreground = foreground
+        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    #[cfg(target_os = "android")]
+    let cancellation = state
+        .mark_target_running_exact(&foreground)
+        .map_err(|error| error.to_string())?;
+    #[cfg(desktop)]
+    let cancellation = {
+        let _ = foreground;
+        NeverCancelled
+    };
+    let worker_state = state.clone();
     let root = app_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state.begin_target().map_err(|error| error.to_string())?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = worker_state
+            .begin_target()
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "android")]
+        if cancellation.is_cancelled() {
+            return Err("Android foreground service was cancelled".to_owned());
+        }
         let retained = PeerBidirectionalOperationJournal::new(&root)
             .load()
             .map_err(|error| error.to_string())?
@@ -5856,7 +6545,7 @@ pub async fn peer_bidirectional_resolve_with_link(
                 "retained bidirectional operation belongs to another target device".to_owned(),
             );
         }
-        let mut client = LanBidirectionalLogicalClient::claim_p5_desktop(
+        let mut client = claim_bidirectional_client(
             &endpoint,
             &session_id,
             &manifest_id,
@@ -5866,7 +6555,7 @@ pub async fn peer_bidirectional_resolve_with_link(
         .map_err(|error| error.to_string())?;
         let remote_manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
-        let outcome = resolve_awaiting_conflict_with_fresh_source(
+        let outcome = resolve_awaiting_conflict_with_fresh_source_and_cancellation(
             &mut store,
             &PayloadCas::new(&root).map_err(|error| error.to_string())?,
             &root,
@@ -5877,11 +6566,21 @@ pub async fn peer_bidirectional_resolve_with_link(
             &client.credential(),
             &remote_manifest,
             &mut client,
+            &cancellation,
         )
         .map_err(|error| error.to_string())?;
         match outcome {
             LocalMergeOutcome::Conflict(result) => Ok(conflict_result(result)),
             LocalMergeOutcome::LocalCommitted => {
+                if cancellation.is_cancelled() {
+                    return retained_result(
+                        &PeerBidirectionalOperationJournal::new(&root)
+                            .load()
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| "bidirectional operation was not retained".to_owned())?,
+                    )
+                    .map_err(|error| error.to_string());
+                }
                 let committed_revision = store.revision().map_err(|error| error.to_string())?;
                 run_retained_remote_completion(
                     &mut store,
@@ -5895,7 +6594,12 @@ pub async fn peer_bidirectional_resolve_with_link(
         }
     })
     .await
-    .map_err(|error| format!("peer bidirectional linked resolution worker failed: {error}"))?
+    .map_err(|error| format!("peer bidirectional linked resolution worker failed: {error}"))?;
+    #[cfg(target_os = "android")]
+    state
+        .publish_target_terminal_exact(&foreground, outcome.clone())
+        .map_err(|error| error.to_string())?;
+    outcome
 }
 
 #[tauri::command]
@@ -5904,11 +6608,31 @@ pub async fn peer_bidirectional_resume(
     state: State<'_, PeerBidirectionalCommandState>,
     operation_id: String,
     expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
+    #[cfg(target_os = "android")]
+    let foreground = foreground
+        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    #[cfg(target_os = "android")]
+    let cancellation = state
+        .mark_target_running_exact(&foreground)
+        .map_err(|error| error.to_string())?;
+    #[cfg(desktop)]
+    let cancellation = {
+        let _ = foreground;
+        NeverCancelled
+    };
+    let worker_state = state.clone();
     let root = app_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state.begin_target().map_err(|error| error.to_string())?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = worker_state
+            .begin_target()
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "android")]
+        if cancellation.is_cancelled() {
+            return Err("Android foreground service was cancelled".to_owned());
+        }
         let retained = PeerBidirectionalOperationJournal::new(&root)
             .load()
             .map_err(|error| error.to_string())?;
@@ -5926,15 +6650,29 @@ pub async fn peer_bidirectional_resume(
                 expected_revision,
                 false,
                 &mut client,
+                &cancellation,
             )
             .map_err(|error| error.to_string());
+        }
+        if cancellation.is_cancelled() {
+            return retained
+                .as_ref()
+                .ok_or_else(|| "bidirectional operation is not retained".to_owned())
+                .and_then(|operation| {
+                    retained_result(operation).map_err(|error| error.to_string())
+                });
         }
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
         run_retained_remote_completion(&mut store, &root, &operation_id, expected_revision, None)
             .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| format!("peer bidirectional resume worker failed: {error}"))?
+    .map_err(|error| format!("peer bidirectional resume worker failed: {error}"))?;
+    #[cfg(target_os = "android")]
+    state
+        .publish_target_terminal_exact(&foreground, outcome.clone())
+        .map_err(|error| error.to_string())?;
+    outcome
 }
 
 #[tauri::command]
@@ -6427,6 +7165,37 @@ fn sync_destination_parent(destination: &Path) -> Result<(), PeerSyncError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_p5_target_foreground_retains_running_until_durable_terminal_projection() {
+        let _registry_guard = super::super::android_foreground::test_registry_guard();
+        let state = PeerBidirectionalCommandState::default();
+        let foreground = state.reserve_target_foreground().unwrap();
+        assert_eq!(foreground.lane, AndroidForegroundLane::P5Target);
+        assert!(registry().attach_exact(&foreground));
+        let cancellation = state.mark_target_running_exact(&foreground).unwrap();
+        assert!(!cancellation.is_cancelled());
+        assert!(state.cancel_target_foreground_exact(&foreground).unwrap());
+        assert!(cancellation.is_cancelled());
+        assert!(!state.release_target_foreground_exact(&foreground).unwrap());
+        assert!(registry().reserve(AndroidForegroundLane::P5Source).is_err());
+
+        let result = PeerBidirectionalSyncResult::ResumeRequired {
+            operation_id: "123e4567-e89b-42d3-a456-426614174188".to_owned(),
+            phase: "localCommitted",
+            committed_revision: 9,
+        };
+        state
+            .publish_target_terminal_exact(&foreground, Ok(result.clone()))
+            .unwrap();
+        let terminal = state.target_foreground_status().unwrap().unwrap();
+        assert_eq!(terminal.phase, AndroidBidirectionalTargetPhase::Terminal);
+        assert_eq!(terminal.result, Some(result));
+        assert!(terminal.error.is_none());
+        assert!(state.release_target_foreground_exact(&foreground).unwrap());
+        let source = registry().reserve(AndroidForegroundLane::P5Source).unwrap();
+        assert!(registry().abandon_source_exact(&source));
+    }
     use crate::{
         asset_repository::{
             job_pins::{collect_durable_cas_job_roots, CasObjectRole},
@@ -8040,6 +8809,74 @@ mod tests {
             bearer: "d".repeat(64),
         };
         (directory, cas, store, remote, credential)
+    }
+
+    struct CancelOnProbeCall {
+        calls: Cell<usize>,
+        cancel_on: usize,
+    }
+
+    impl CancellationProbe for CancelOnProbeCall {
+        fn is_cancelled(&self) -> bool {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            call >= self.cancel_on
+        }
+    }
+
+    #[test]
+    fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable_boundaries() {
+        let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
+        let mut source = fixture_source(&remote);
+        let before_journal = CancelOnProbeCall {
+            calls: Cell::new(0),
+            cancel_on: 1,
+        };
+        assert_eq!(
+            begin_bidirectional_local_merge_with_cancellation(
+                &mut store,
+                &cas,
+                directory.path(),
+                credential,
+                1,
+                &remote.manifest_bytes,
+                &mut source,
+                &before_journal,
+            ),
+            Err(PeerSyncError::Cancelled),
+        );
+        assert!(PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(store.revision().unwrap(), 1);
+
+        let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
+        let mut source = fixture_source(&remote);
+        let after_prepared = CancelOnProbeCall {
+            calls: Cell::new(0),
+            cancel_on: 2,
+        };
+        assert_eq!(
+            begin_bidirectional_local_merge_with_cancellation(
+                &mut store,
+                &cas,
+                directory.path(),
+                credential,
+                1,
+                &remote.manifest_bytes,
+                &mut source,
+                &after_prepared,
+            ),
+            Err(PeerSyncError::Cancelled),
+        );
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::TargetPrepared { .. })
+        ));
+        assert_eq!(store.revision().unwrap(), 1);
     }
 
     fn copy_tree(source: &Path, destination: &Path) {

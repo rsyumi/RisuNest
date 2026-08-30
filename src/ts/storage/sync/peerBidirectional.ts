@@ -29,13 +29,31 @@ export interface PeerBidirectionalMutationRuntime {
 }
 
 export interface PeerBidirectionalCapabilities {
-    desktop: true
+    desktop: boolean
     sourceReady: boolean
     atomicActivationReady: boolean
     authenticatedTransportReady: boolean
     losslessBackupReady: boolean
     durableStateReady: boolean
     productionEnabled: boolean
+}
+
+export interface PeerBidirectionalForegroundBridge {
+    startSource(lane: string, operationId: string, generation: number): boolean
+    stopSource(lane: string, operationId: string, generation: number): boolean
+}
+
+interface PeerBidirectionalForegroundIdentity {
+    lane: 'p5-source' | 'p5-target'
+    operationId: string
+    generation: number
+}
+
+interface PeerBidirectionalTargetForegroundStatus {
+    foreground: PeerBidirectionalForegroundIdentity
+    phase: 'reserved' | 'running' | 'terminal'
+    result?: PeerBidirectionalSyncResult
+    error?: string
 }
 
 export interface PeerBidirectionalSourceStatus {
@@ -130,6 +148,7 @@ export interface PeerBidirectionalInvoke {
 }
 
 export interface PeerBidirectionalFacade {
+    recoverTargetForeground?(): Promise<void>
     capabilities(): Promise<PeerBidirectionalCapabilities>
     prepare(): Promise<PeerBidirectionalSourceStatus>
     start(sessionId: string): Promise<PeerBidirectionalSourceStatus>
@@ -234,6 +253,7 @@ export function createPeerBidirectionalFacade(options: {
     platform: PeerClonePlatform
     invoke?: PeerBidirectionalInvoke
     runtime?: PeerBidirectionalMutationRuntime
+    bridge?: PeerBidirectionalForegroundBridge
 }): PeerBidirectionalFacade {
     const nativeInvoke = options.invoke ?? invoke
     type MutationFence = Awaited<ReturnType<PeerBidirectionalMutationRuntime['acquirePersistentMutationFence']>>
@@ -242,6 +262,7 @@ export function createPeerBidirectionalFacade(options: {
         result: PeerBidirectionalSyncResult
         revision: number
         fence: MutationFence
+        foreground?: PeerBidirectionalForegroundIdentity
         rejection?: { cause: unknown }
     } | undefined
     let sourceFence: MutationFence | undefined
@@ -260,8 +281,12 @@ export function createPeerBidirectionalFacade(options: {
     let sourceStopCompleted = false
     let sourceStopStatusPending = false
     let targetMutationActive = false
+    const bridge = options.bridge ?? (typeof window === 'undefined' ? undefined : window.RisuPeerCloneBridge)
     const requireDesktop = (): void => {
         if (options.platform !== 'desktop') unsupported(options.platform)
+    }
+    const requireNative = (): void => {
+        if (options.platform === 'web') unsupported(options.platform)
     }
     const committedRevision = (result: PeerBidirectionalSyncResult): number | undefined => {
         if (completed(result)) return result.revision
@@ -310,14 +335,115 @@ export function createPeerBidirectionalFacade(options: {
         }
         return command === 'peer_bidirectional_resume' && operation.phase === 'completed'
     }
+    const sameForegroundIdentity = (
+        left: PeerBidirectionalForegroundIdentity,
+        right: PeerBidirectionalForegroundIdentity,
+    ): boolean => left.lane === right.lane
+        && left.operationId === right.operationId
+        && left.generation === right.generation
+    const abandonSourceReservation = async (
+        foreground: PeerBidirectionalForegroundIdentity,
+    ): Promise<void> => {
+        const abandoned = await nativeInvoke<boolean>('peer_sync_foreground_source_abandon', { foreground })
+        if (!abandoned) throw new Error('Android bidirectional source foreground identity is stale')
+    }
+    const stopAndAbandonSourceReservation = async (
+        foreground: PeerBidirectionalForegroundIdentity,
+    ): Promise<void> => {
+        if (!bridge?.stopSource(foreground.lane, foreground.operationId, foreground.generation)) {
+            throw new Error('Android bidirectional source foreground service could not stop')
+        }
+        await abandonSourceReservation(foreground)
+    }
+    const recoverSourceReservation = async (): Promise<void> => {
+        const pending = await nativeInvoke<PeerBidirectionalForegroundIdentity | null>(
+            'peer_sync_foreground_source_status',
+            { lane: 'p5-source' },
+        )
+        if (pending?.lane === 'p5-source') await stopAndAbandonSourceReservation(pending)
+    }
+    const failAfterCleanup = async <T>(
+        error: unknown,
+        cleanup: () => Promise<void>,
+        message: string,
+    ): Promise<T> => {
+        try {
+            await cleanup()
+        } catch (cleanupError) {
+            throw new AggregateError([error, cleanupError], message)
+        }
+        throw error
+    }
+    const releaseTargetForeground = async (
+        foreground: PeerBidirectionalForegroundIdentity,
+    ): Promise<void> => {
+        if (!bridge?.stopSource(foreground.lane, foreground.operationId, foreground.generation)) {
+            throw new Error('Android bidirectional foreground service could not stop')
+        }
+        const released = await nativeInvoke<boolean>('peer_bidirectional_target_foreground_release', { foreground })
+        if (!released) throw new Error('Android bidirectional foreground identity is stale')
+    }
+    const settleTargetForeground = async (
+        expected?: PeerBidirectionalForegroundIdentity,
+    ): Promise<PeerBidirectionalTargetForegroundStatus | null> => {
+        let pending = await nativeInvoke<PeerBidirectionalTargetForegroundStatus | null>(
+            'peer_bidirectional_target_foreground_status',
+        )
+        if (pending && expected && !sameForegroundIdentity(pending.foreground, expected)) {
+            throw new Error('Android bidirectional foreground identity is stale')
+        }
+        if (!pending || pending.phase !== 'running') return pending
+        const cancelled = await nativeInvoke<boolean>('peer_bidirectional_target_foreground_cancel', {
+            foreground: pending.foreground,
+        })
+        if (!cancelled) throw new Error('Android bidirectional foreground identity is stale')
+        const exact = pending.foreground
+        for (let attempt = 0; attempt < 500 && pending?.phase === 'running'; attempt += 1) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 10))
+            pending = await nativeInvoke<PeerBidirectionalTargetForegroundStatus | null>(
+                'peer_bidirectional_target_foreground_status',
+            )
+            if (pending && !sameForegroundIdentity(pending.foreground, exact)) {
+                throw new Error('Android bidirectional foreground identity is stale')
+            }
+        }
+        if (pending?.phase === 'running') {
+            throw new Error('Android bidirectional foreground cancellation timed out')
+        }
+        return pending
+    }
+    const refreshRecoveredTarget = async (
+        result: PeerBidirectionalSyncResult,
+    ): Promise<void> => {
+        const revision = committedRevision(result)
+        if (revision === undefined) return
+        const runtime = options.runtime
+        if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
+        await runtime.flushPendingData('peer-bidirectional-target-recovery')
+        const token = await runtime.capturePersistentMutationToken('peer-bidirectional-target-recovery')
+        const fence = await runtime.acquirePersistentMutationFence(token)
+        try {
+            await fence.refreshCommittedWorkingSet(revision)
+        } finally {
+            fence.release()
+        }
+    }
+    const recoverTargetForeground = async (): Promise<void> => {
+        if (options.platform !== 'android') return
+        const pending = await settleTargetForeground()
+        if (!pending) return
+        if (pending.result) await refreshRecoveredTarget(pending.result)
+        await releaseTargetForeground(pending.foreground)
+    }
     const refreshTargetResult = async (
         key: string,
         result: PeerBidirectionalSyncResult,
         revision: number,
         fence: MutationFence,
+        foreground?: PeerBidirectionalForegroundIdentity,
         rejection?: { cause: unknown },
     ): Promise<void> => {
-        pendingRefresh = { key, result, revision, fence, rejection }
+        pendingRefresh = { key, result, revision, fence, foreground, rejection }
         try {
             await fence.refreshCommittedWorkingSet(revision)
         } catch (cause) {
@@ -332,7 +458,7 @@ export function createPeerBidirectionalFacade(options: {
         command: string,
         args: Record<string, unknown>,
     ): Promise<PeerBidirectionalSyncResult> => {
-        requireDesktop()
+        requireNative()
         if (sourceFence || sourcePrepareActive) throw new Error('A peer sync source is active')
         if (targetMutationActive) throw new Error('A peer sync target is active')
         const runtime = options.runtime
@@ -349,20 +475,40 @@ export function createPeerBidirectionalFacade(options: {
             }
             pendingRefresh = undefined
             pending.fence.release()
+            if (pending.foreground) await releaseTargetForeground(pending.foreground)
             if (pending.rejection) throw pending.rejection.cause
             return pending.result
         }
+        if (options.platform === 'android') await recoverTargetForeground()
         targetMutationActive = true
         let fence: MutationFence | undefined
+        let foreground: PeerBidirectionalForegroundIdentity | undefined
+        let foregroundReleased = false
+        let foregroundResultRefreshed = false
         try {
             await runtime.flushPendingData(reason)
             const token = await runtime.capturePersistentMutationToken(reason)
             fence = await runtime.acquirePersistentMutationFence(token)
+            if (options.platform === 'android') {
+                if (!bridge) throw new Error('Android bidirectional foreground service is unavailable')
+                foreground = await nativeInvoke<PeerBidirectionalForegroundIdentity>(
+                    'peer_bidirectional_target_reserve',
+                )
+                if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
+                    const released = await nativeInvoke<boolean>(
+                        'peer_bidirectional_target_foreground_release',
+                        { foreground },
+                    )
+                    if (released) foreground = undefined
+                    throw new Error('Android bidirectional foreground service could not start')
+                }
+            }
             let result: PeerBidirectionalSyncResult
             try {
                 result = await nativeInvoke<PeerBidirectionalSyncResult>(command, {
                     ...args,
                     expectedRevision: token.revision,
+                    ...(foreground ? { foreground } : {}),
                 })
             } catch (cause) {
                 let status: PeerBidirectionalStatus
@@ -377,13 +523,20 @@ export function createPeerBidirectionalFacade(options: {
                     if (recovered) {
                         const revision = committedRevision(recovered)
                         if (revision !== undefined) {
-                            await refreshTargetResult(
-                                key,
-                                recovered,
-                                revision,
-                                fence,
-                                advances ? undefined : { cause },
-                            )
+                            try {
+                                await refreshTargetResult(
+                                    key,
+                                    recovered,
+                                    revision,
+                                    fence,
+                                    foreground,
+                                    advances ? undefined : { cause },
+                                )
+                                foregroundResultRefreshed = true
+                            } catch (refreshError) {
+                                if (refreshError === cause) foregroundResultRefreshed = true
+                                throw refreshError
+                            }
                         }
                         if (advances) return recovered
                     }
@@ -392,12 +545,34 @@ export function createPeerBidirectionalFacade(options: {
             }
             const revision = committedRevision(result)
             if (revision !== undefined) {
-                await refreshTargetResult(key, result, revision, fence)
+                await refreshTargetResult(key, result, revision, fence, foreground)
+                foregroundResultRefreshed = true
+            }
+            if (foreground && pendingRefresh?.foreground !== foreground) {
+                await releaseTargetForeground(foreground)
+                foregroundReleased = true
             }
             return result
+        } catch (error) {
+            if (!foreground || pendingRefresh?.foreground === foreground) throw error
+            try {
+                const pending = await settleTargetForeground(foreground)
+                if (pending?.result && !foregroundResultRefreshed) {
+                    await refreshRecoveredTarget(pending.result)
+                }
+                await releaseTargetForeground(foreground)
+                foregroundReleased = true
+            } catch (cleanupError) {
+                throw new AggregateError(
+                    [error, cleanupError],
+                    'Android bidirectional operation and foreground cleanup both failed',
+                )
+            }
+            throw error
         } finally {
             targetMutationActive = false
             if (fence && pendingRefresh?.fence !== fence) fence.release()
+            void foregroundReleased
         }
     }
 
@@ -470,8 +645,9 @@ export function createPeerBidirectionalFacade(options: {
     }
 
     return {
+        recoverTargetForeground,
         async capabilities() {
-            requireDesktop()
+            requireNative()
             const capabilities = await nativeInvoke<PeerBidirectionalCapabilities>('peer_bidirectional_capabilities')
             return {
                 ...capabilities,
@@ -484,7 +660,7 @@ export function createPeerBidirectionalFacade(options: {
             }
         },
         async prepare() {
-            requireDesktop()
+            requireNative()
             if (sourceFence || sourcePrepareActive || targetMutationActive || pendingRefresh) {
                 throw new Error('A peer sync source or target is already active')
             }
@@ -513,9 +689,40 @@ export function createPeerBidirectionalFacade(options: {
             }
         },
         async start(sessionId) {
-            requireDesktop()
+            requireNative()
             if (!sourceFence) throw new Error('Peer sync source is not prepared')
-            return nativeInvoke('peer_bidirectional_start', { sessionId })
+            if (options.platform === 'desktop') return nativeInvoke('peer_bidirectional_start', { sessionId })
+            if (!bridge) throw new Error('Android bidirectional foreground service is unavailable')
+            await recoverSourceReservation()
+            const foreground = await nativeInvoke<PeerBidirectionalForegroundIdentity>(
+                'peer_bidirectional_source_reserve',
+            )
+            let started: boolean
+            try {
+                started = bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)
+            } catch (error) {
+                return failAfterCleanup(
+                    error,
+                    () => stopAndAbandonSourceReservation(foreground),
+                    'Android bidirectional foreground start and cleanup both failed',
+                )
+            }
+            if (!started) {
+                return failAfterCleanup(
+                    new Error('Android bidirectional foreground service could not start'),
+                    () => abandonSourceReservation(foreground),
+                    'Android bidirectional foreground start and cleanup both failed',
+                )
+            }
+            try {
+                return await nativeInvoke('peer_bidirectional_start', { sessionId, foreground })
+            } catch (error) {
+                return failAfterCleanup(
+                    error,
+                    () => stopAndAbandonSourceReservation(foreground),
+                    'Android bidirectional foreground start and cleanup both failed',
+                )
+            }
         },
         async startQuickTunnel(sessionId) {
             requireDesktop()
@@ -534,7 +741,7 @@ export function createPeerBidirectionalFacade(options: {
             })
         },
         async status() {
-            requireDesktop()
+            requireNative()
             if (pendingSourceRefresh && !sourceStopStatusPending) {
                 const pending = pendingSourceRefresh
                 return refreshSourceStatus(pending.status, pending.key, pending.revision)
@@ -562,11 +769,21 @@ export function createPeerBidirectionalFacade(options: {
             return status
         },
         async stop(sessionId) {
-            requireDesktop()
+            requireNative()
             sourceStopStatusPending = true
             if (!sourceStopCompleted) {
                 try {
-                    await nativeInvoke('peer_bidirectional_stop', { sessionId })
+                    const foreground = await nativeInvoke<PeerBidirectionalForegroundIdentity | null>(
+                        'peer_bidirectional_stop',
+                        { sessionId },
+                    )
+                    if (foreground && options.platform === 'android' && bridge) {
+                        if (!bridge.stopSource(
+                            foreground.lane,
+                            foreground.operationId,
+                            foreground.generation,
+                        )) throw new Error('Android bidirectional foreground service could not stop')
+                    }
                 } catch (cause) {
                     sourceStopStatusPending = false
                     throw cause
@@ -592,7 +809,7 @@ export function createPeerBidirectionalFacade(options: {
             }
         },
         async revoke(sessionId, deviceId) {
-            requireDesktop()
+            requireNative()
             await nativeInvoke('peer_bidirectional_revoke', { sessionId, deviceId })
         },
         sync(pairingUri) {
@@ -630,7 +847,7 @@ export function createPeerBidirectionalFacade(options: {
             )
         },
         async acknowledge(operationId) {
-            requireDesktop()
+            requireNative()
             await nativeInvoke('peer_bidirectional_acknowledge', { operationId })
         },
     }

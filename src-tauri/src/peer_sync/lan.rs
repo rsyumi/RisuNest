@@ -3885,10 +3885,24 @@ impl LanBidirectionalLogicalClient {
         })
     }
 
+    #[cfg(target_os = "android")]
+    pub(crate) fn claim_p5_android(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        device_id: &str,
+    ) -> Result<Self, PeerSyncError> {
+        Self::claim(endpoint, session_id, manifest_id, claim, device_id)
+    }
+
     pub(crate) fn resume(
         credential: LanBidirectionalLogicalCredential,
     ) -> Result<Self, PeerSyncError> {
+        #[cfg(desktop)]
         let endpoint = credential.validate_p5_desktop()?;
+        #[cfg(target_os = "android")]
+        let endpoint = credential.validate()?;
         let session_url = format!("{endpoint}/v1/sessions/{}", credential.session_id);
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(

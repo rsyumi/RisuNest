@@ -23,6 +23,13 @@ describe('peer bidirectional settings surface', () => {
         expect(languageKorean.peerBidirectional?.sourceUnavailable).toContain('새 링크')
     })
 
+    it('keeps Android P5 on the LAN controls and hides desktop tunnel selection', () => {
+        expect(peerCloneSettingsSource).toContain(
+            "bidirectionalSourceStatus.phase === 'prepared' && bidirectionalCapabilities?.desktop",
+        )
+        expect(peerCloneSettingsSource).toContain("<option value=\"lan\">")
+    })
+
     it('offers an explicit whole-operation winner for same-record conflicts', () => {
         expect(peerCloneSettingsSource).toContain("bidirectionalOperationPhase === 'awaitingConflict'")
         expect(peerCloneSettingsSource).toContain("resolveBidirectional('local')")

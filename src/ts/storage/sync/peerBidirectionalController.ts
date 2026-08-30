@@ -316,10 +316,10 @@ export function createPeerBidirectionalController(options: {
         initialize(): Promise<void> {
             if (initialized) return initialization ?? Promise.resolve()
             initialized = true
-            initialization = Promise.all([
+            initialization = (options.facade.recoverTargetForeground?.() ?? Promise.resolve()).then(() => Promise.all([
                 options.facade.capabilities(),
                 options.facade.status(),
-            ]).then(([capabilities, status]) => {
+            ])).then(([capabilities, status]) => {
                 update({
                     capabilities,
                     sourceStatus: status.source,
@@ -482,8 +482,11 @@ export function createPeerBidirectionalController(options: {
 let desktopPeerBidirectionalController: ReturnType<typeof createPeerBidirectionalController> | undefined
 
 export function getDesktopPeerBidirectionalController(runtime: PeerBidirectionalMutationRuntime) {
+    const platform = typeof window !== 'undefined' && window.RisuPeerCloneBridge
+        ? 'android' as const
+        : 'desktop' as const
     desktopPeerBidirectionalController ??= createPeerBidirectionalController({
-        facade: createPeerBidirectionalFacade({ platform: 'desktop', runtime }),
+        facade: createPeerBidirectionalFacade({ platform, runtime }),
     })
     return desktopPeerBidirectionalController
 }
