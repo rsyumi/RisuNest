@@ -1963,12 +1963,7 @@ impl PersistentStore {
         &mut self,
         now_ms: i64,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
-        self.asset_gc_delete_page(
-            ASSET_GC_PRODUCT_PAGE_LIMIT,
-            None,
-            now_ms,
-            ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
-        )
+        self.asset_gc_product_maintenance_page_with_hook_inner(now_ms, |_| Ok(()))
     }
 
     #[cfg(test)]
@@ -1979,13 +1974,74 @@ impl PersistentStore {
             crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
         ) -> StoreResult<()>,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
-        self.asset_gc_delete_page_with_hook(
+        self.asset_gc_product_maintenance_page_with_hook_inner(now_ms, hook)
+    }
+
+    fn asset_gc_product_maintenance_page_with_hook_inner(
+        &mut self,
+        now_ms: i64,
+        hook: impl FnMut(
+            crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
+        ) -> StoreResult<()>,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        use crate::asset_repository::migration_gc::{AssetGcDryRunPage, AssetGcDryRunReport};
+
+        let cursor: Option<String> = self.connection.query_row(
+            "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if let Some(cursor) = cursor.as_deref() {
+            let blocker = if asset_object_catalog::validate_cursor(cursor).is_err() {
+                Some("asset-gc-cursor-invalid")
+            } else if !asset_object_catalog::cursor_has_successor(&self.connection, cursor)? {
+                Some("asset-gc-cursor-stale")
+            } else {
+                None
+            };
+            if let Some(blocker) = blocker {
+                self.record_asset_gc_maintenance_cursor(None)?;
+                return Ok(AssetGcDryRunPage {
+                    report: AssetGcDryRunReport {
+                        marked_hashes: Vec::new(),
+                        grace_retained_hashes: Vec::new(),
+                        potential_delete_hashes: Vec::new(),
+                        potential_delete_bytes: 0,
+                        deleted_hashes: Vec::new(),
+                        deleted_bytes: 0,
+                        blockers: vec![blocker.to_owned()],
+                        deletion_enabled: false,
+                    },
+                    next_cursor: None,
+                });
+            }
+        }
+        let page = self.asset_gc_delete_page_with_hook(
             ASSET_GC_PRODUCT_PAGE_LIMIT,
-            None,
+            cursor.as_deref(),
             now_ms,
             ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
             hook,
-        )
+        )?;
+        self.record_asset_gc_maintenance_cursor(page.next_cursor.as_deref())?;
+        Ok(page)
+    }
+
+    fn record_asset_gc_maintenance_cursor(&mut self, cursor: Option<&str>) -> StoreResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if transaction.execute(
+            "UPDATE asset_gc_maintenance_state SET catalog_cursor = ?1 WHERE singleton = 1",
+            [cursor],
+        )? != 1
+        {
+            return Err(StoreError::Validation {
+                message: "asset GC maintenance state row is missing".to_owned(),
+            });
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn asset_gc_delete_page_with_hook(

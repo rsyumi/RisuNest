@@ -45,7 +45,7 @@ fn current_schema_creates_shared_ack_local_proof_registry() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        16
+        17
     );
     assert_eq!(
         store
@@ -418,7 +418,8 @@ fn schema_v13_migration_backfills_active_and_revoked_proofs_only() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_alias_replacement_candidates;
@@ -433,7 +434,7 @@ fn schema_v13_migration_backfills_active_and_revoked_proofs_only() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        16
+        17
     );
     let proofs = migrated
         .connection
@@ -493,7 +494,8 @@ fn schema_v13_migration_preserves_p4_common_base_without_device_or_proof() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_alias_replacement_candidates;
@@ -548,7 +550,8 @@ fn v13_snapshot_restore_migrates_shared_ack_proofs_before_activation() {
         rusqlite::Connection::open(&snapshot.path).expect("open proof snapshot for v13 fixture");
     snapshot_connection
         .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_alias_replacement_candidates;
@@ -1144,7 +1147,8 @@ fn schema_v12_common_bases_migrate_to_revoked_exact_audit_rows() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
@@ -1188,7 +1192,8 @@ fn invalid_v12_common_base_rolls_back_the_entire_v13_migration() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
@@ -1247,6 +1252,7 @@ fn invalid_v12_common_base_hash_sequence_and_timestamp_each_roll_back_v13() {
                 "PRAGMA ignore_check_constraints = ON;
                  {corruption};
                  PRAGMA ignore_check_constraints = OFF;
+                 DROP TABLE asset_gc_maintenance_state;
                  DROP INDEX logical_sync_device_ack_proofs_local_generation;
                  DROP TABLE logical_sync_device_ack_proofs;
                  DROP INDEX logical_sync_devices_status;
@@ -1336,7 +1342,8 @@ fn v12_snapshot_restore_migrates_common_base_to_revoked_device() {
         rusqlite::Connection::open(&snapshot.path).expect("open snapshot candidate");
     snapshot_connection
         .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;

@@ -2,9 +2,19 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 16;
+pub(super) const SCHEMA_VERSION: u32 = 17;
 const SCHEMA_VERSION_V14: u32 = 14;
 const SCHEMA_VERSION_V15: u32 = 15;
+const SCHEMA_VERSION_V16: u32 = 16;
+
+const ASSET_GC_MAINTENANCE_STATE_TABLE_SQL: &str = r#"
+CREATE TABLE asset_gc_maintenance_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    catalog_cursor TEXT CHECK (
+        catalog_cursor IS NULL OR length(catalog_cursor) BETWEEN 1 AND 512
+    )
+)
+"#;
 
 const ASSET_ALIAS_REPLACEMENT_CANDIDATE_TABLE_SQL: &str = r#"
 CREATE TABLE asset_alias_replacement_candidates (
@@ -160,25 +170,33 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
             migrate_v12_to_v13(connection)?;
             migrate_v13_to_v14(connection)?;
             migrate_v14_to_v15(connection)?;
-            return migrate_v15_to_v16(connection);
+            migrate_v15_to_v16(connection)?;
+            return migrate_v16_to_v17(connection);
         }
         12 => {
             migrate_v12_to_v13(connection)?;
             migrate_v13_to_v14(connection)?;
             migrate_v14_to_v15(connection)?;
-            return migrate_v15_to_v16(connection);
+            migrate_v15_to_v16(connection)?;
+            return migrate_v16_to_v17(connection);
         }
         13 => {
             migrate_v13_to_v14(connection)?;
             migrate_v14_to_v15(connection)?;
-            return migrate_v15_to_v16(connection);
+            migrate_v15_to_v16(connection)?;
+            return migrate_v16_to_v17(connection);
         }
         14 => {
             migrate_v14_to_v15(connection)?;
-            return migrate_v15_to_v16(connection);
+            migrate_v15_to_v16(connection)?;
+            return migrate_v16_to_v17(connection);
         }
-        15 => return migrate_v15_to_v16(connection),
-        SCHEMA_VERSION => return validate_v16_schema(connection),
+        15 => {
+            migrate_v15_to_v16(connection)?;
+            return migrate_v16_to_v17(connection);
+        }
+        16 => return migrate_v16_to_v17(connection),
+        SCHEMA_VERSION => return validate_v17_schema(connection),
         _ => {
             return Err(StoreError::Store {
                 message: format!("unsupported persistent schema version {version}"),
@@ -190,7 +208,8 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     migrate_v12_to_v13(connection)?;
     migrate_v13_to_v14(connection)?;
     migrate_v14_to_v15(connection)?;
-    migrate_v15_to_v16(connection)
+    migrate_v15_to_v16(connection)?;
+    migrate_v16_to_v17(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -532,6 +551,20 @@ fn migrate_v15_to_v16(connection: &mut Connection) -> StoreResult<()> {
     validate_v15_schema(&transaction)?;
     transaction.execute_batch(ASSET_ALIAS_REPLACEMENT_CANDIDATE_TABLE_SQL)?;
     validate_v16_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION_V16)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v16_to_v17(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_v16_schema(&transaction)?;
+    transaction.execute_batch(ASSET_GC_MAINTENANCE_STATE_TABLE_SQL)?;
+    transaction.execute(
+        "INSERT INTO asset_gc_maintenance_state (singleton, catalog_cursor) VALUES (1, NULL)",
+        [],
+    )?;
+    validate_v17_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -664,6 +697,41 @@ fn validate_v16_schema(connection: &Connection) -> StoreResult<()> {
     {
         return Err(StoreError::Validation {
             message: "asset alias replacement provenance table definition is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_v17_schema(connection: &Connection) -> StoreResult<()> {
+    validate_v16_schema(connection)?;
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'asset_gc_maintenance_state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(ASSET_GC_MAINTENANCE_STATE_TABLE_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "asset GC maintenance state table definition is invalid".to_owned(),
+        });
+    }
+    let rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM asset_gc_maintenance_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let total_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM asset_gc_maintenance_state",
+        [],
+        |row| row.get(0),
+    )?;
+    if rows != 1 || total_rows != 1 {
+        return Err(StoreError::Validation {
+            message: "asset GC maintenance state row is invalid".to_owned(),
         });
     }
     Ok(())

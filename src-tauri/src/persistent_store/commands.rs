@@ -70,7 +70,14 @@ pub(crate) fn with_store_mut<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
-    let mut store = state.store.lock().map_err(|error| StoreError::Store {
+    with_store_mutex_mut(&state.store, operation)
+}
+
+fn with_store_mutex_mut<T>(
+    store: &Mutex<Option<PersistentStore>>,
+    operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
+) -> StoreResult<T> {
+    let mut store = store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     let store = store.as_mut().ok_or_else(|| StoreError::Validation {
@@ -1022,5 +1029,48 @@ mod tests {
             .as_array()
             .expect("read blockers")
             .is_empty());
+    }
+
+    #[test]
+    fn product_maintenance_commands_share_one_store_serialization_lock() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+        use std::{thread, time::Duration};
+
+        let directory = tempdir().expect("create serialized maintenance directory");
+        let state = Arc::new(PersistentStoreState {
+            store: Mutex::new(Some(
+                PersistentStore::open(directory.path()).expect("open persistent store"),
+            )),
+            snapshot_operations: Mutex::new(()),
+        });
+        let barrier = Arc::new(Barrier::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                with_store_mutex_mut(&state.store, |_| {
+                    let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(concurrent, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .expect("run serialized maintenance operation");
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("join maintenance worker");
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 }

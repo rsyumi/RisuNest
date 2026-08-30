@@ -203,6 +203,23 @@ fn decode_cursor(value: &str) -> StoreResult<CatalogCursor> {
     Ok(cursor)
 }
 
+pub(super) fn validate_cursor(value: &str) -> StoreResult<()> {
+    decode_cursor(value).map(|_| ())
+}
+
+pub(super) fn cursor_has_successor(connection: &Connection, value: &str) -> StoreResult<bool> {
+    let cursor = decode_cursor(value)?;
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM asset_objects
+            WHERE created_at_ms > ?1
+               OR (created_at_ms = ?1 AND object_hash > ?2)
+        )",
+        params![cursor.created_at_ms, cursor.object_hash],
+        |row| row.get(0),
+    )?)
+}
+
 fn validate_hash(hash: &str) -> StoreResult<()> {
     if hash.len() == 64
         && hash

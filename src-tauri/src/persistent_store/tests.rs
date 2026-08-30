@@ -5229,7 +5229,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        16
+        17
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -6955,7 +6955,7 @@ fn fresh_schema_v16_contains_dual_authority_and_empty_p4_logical_tables() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        16
+        17
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -7002,6 +7002,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_gc_maintenance_state;
             DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
@@ -7019,7 +7020,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated cold schema version"),
-        16
+        17
     );
     assert_cold_v11_authority_schema(&connection, 2);
     for generation in ["revision-0", "snapshot-v10-cold"] {
@@ -7092,6 +7093,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_gc_maintenance_state;
             DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
@@ -7115,7 +7117,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        16
+        17
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -7248,6 +7250,7 @@ fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_gc_maintenance_state;
             DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
@@ -7357,6 +7360,7 @@ fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_gc_maintenance_state;
             DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
@@ -7433,7 +7437,7 @@ fn schema_v10_logical_rows_survive_snapshot_restore_and_reopen() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read restored schema version"),
-        16
+        17
     );
     assert_logical_schema_fixture(&restored.connection);
     drop(restored);
@@ -7460,6 +7464,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_gc_maintenance_state;
              DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
@@ -7491,7 +7496,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -7513,6 +7518,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_gc_maintenance_state;
              DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
@@ -7533,7 +7539,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -7643,6 +7649,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_gc_maintenance_state;
             DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
@@ -7664,7 +7671,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -7740,6 +7747,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_gc_maintenance_state;
             DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
@@ -7772,7 +7780,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -7862,7 +7870,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     let snapshot_rows: i64 = store
         .connection
@@ -8003,7 +8011,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        16
+        17
     );
     assert_eq!(
         store
@@ -8031,7 +8039,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        16
+        17
     );
     assert_eq!(
         store
@@ -8072,7 +8080,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 }
 
 #[test]
@@ -8097,7 +8105,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 }
 
 #[test]
@@ -8235,7 +8243,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 }
 
 #[test]
@@ -8377,7 +8385,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 }
 
 #[test]
@@ -8523,7 +8531,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 16);
+    assert_eq!(integer_pragma("user_version"), 17);
 }
 
 #[test]
@@ -9795,7 +9803,7 @@ fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read current version"),
-        16
+        17
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -9836,6 +9844,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_gc_maintenance_state;
              DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
@@ -9856,7 +9865,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated version"),
-        16
+        17
     );
     assert_eq!(
         migrated
@@ -9884,6 +9893,7 @@ fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_gc_maintenance_state;
              DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
@@ -9953,7 +9963,7 @@ fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         table_columns(&store.connection, "asset_alias_replacement_candidates")
@@ -9982,7 +9992,8 @@ fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE asset_alias_replacement_candidates;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP TABLE asset_alias_replacement_candidates;
              PRAGMA user_version = 15;",
         )
         .expect("create v15 schema fixture");
@@ -9994,7 +10005,7 @@ fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         migrated
@@ -10021,13 +10032,96 @@ fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
 }
 
 #[test]
+fn schema_v17_adds_one_validated_asset_gc_maintenance_cursor_row() {
+    let directory = tempfile::tempdir().expect("create v17 schema directory");
+    let store = PersistentStore::open(directory.path()).expect("open current store");
+
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        17
+    );
+    assert_eq!(
+        table_columns(&store.connection, "asset_gc_maintenance_state")
+            .into_iter()
+            .map(|column| column.0)
+            .collect::<Vec<_>>(),
+        vec!["singleton".to_owned(), "catalog_cursor".to_owned()]
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT singleton, catalog_cursor FROM asset_gc_maintenance_state",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        (1, None)
+    );
+    assert!(super::GENERATION_TABLES
+        .iter()
+        .all(|(table, _)| *table != "asset_gc_maintenance_state"));
+
+    store
+        .connection
+        .execute(
+            "INSERT INTO app_kv (key, value) VALUES ('v16-sentinel', 'true')",
+            [],
+        )
+        .expect("seed v16 migration sentinel");
+    store
+        .connection
+        .execute_batch(
+            "DROP TABLE asset_gc_maintenance_state;
+             PRAGMA user_version = 16;",
+        )
+        .expect("create exact v16 schema fixture");
+    drop(store);
+
+    let migrated = PersistentStore::open(directory.path()).expect("migrate v16 schema");
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        17
+    );
+    assert_eq!(
+        migrated
+            .connection
+            .query_row(
+                "SELECT singleton, catalog_cursor FROM asset_gc_maintenance_state",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        (1, None)
+    );
+    assert_eq!(
+        migrated
+            .connection
+            .query_row(
+                "SELECT value FROM app_kv WHERE key = 'v16-sentinel'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "true"
+    );
+}
+
+#[test]
 fn schema_v15_migrates_v14_without_scanning_cas_objects() {
     let directory = tempfile::tempdir().expect("create v14 migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     store
         .connection
         .execute_batch(
-            "DROP TABLE asset_alias_replacement_candidates;
+            "DROP TABLE asset_gc_maintenance_state;
+             DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              PRAGMA user_version = 14;",
         )
@@ -10046,7 +10140,7 @@ fn schema_v15_migrates_v14_without_scanning_cas_objects() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated version"),
-        16
+        17
     );
     assert_eq!(
         migrated
@@ -10072,6 +10166,7 @@ fn schema_v13_to_v14_commit_is_a_resumable_boundary_before_v15() {
         .execute_batch(
             "DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
+             DROP TABLE asset_gc_maintenance_state;
              DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              PRAGMA user_version = 13;",
@@ -10103,7 +10198,7 @@ fn schema_v13_to_v14_commit_is_a_resumable_boundary_before_v15() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert!(!table_columns(&resumed.connection, "asset_object_deletions").is_empty());
 }
@@ -10808,19 +10903,221 @@ fn asset_gc_product_maintenance_is_bounded_and_repeatable() {
         super::ASSET_GC_PRODUCT_PAGE_LIMIT as usize
     );
     assert!(first.next_cursor.is_some());
+    let first_cursor = first.next_cursor.clone();
+    drop(store);
 
+    let mut store = PersistentStore::open(directory.path()).expect("reopen bounded maintenance");
     let second = store
         .asset_gc_product_maintenance_page(now_ms)
         .expect("repeat product maintenance page");
     assert!(second.report.deletion_enabled);
     assert_eq!(second.report.deleted_hashes.len(), 1);
     assert!(second.next_cursor.is_none());
+    assert!(
+        first_cursor.is_some(),
+        "deleted cursor anchors remain safe keyset boundaries"
+    );
 
     let third = store
         .asset_gc_product_maintenance_page(now_ms)
         .expect("repeat completed product maintenance");
     assert!(third.report.deletion_enabled);
     assert!(third.report.deleted_hashes.is_empty());
+}
+
+#[test]
+fn asset_gc_product_maintenance_persists_progress_past_a_rooted_first_page() {
+    let directory = tempfile::tempdir().expect("create durable progress directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let total = super::ASSET_GC_PRODUCT_PAGE_LIMIT + 1;
+    for index in 0..total {
+        let prepared = cas
+            .prepare_bytes(format!("durable-progress-{index}").as_bytes())
+            .expect("prepare maintenance candidate");
+        register_gc_candidate(&mut store, &prepared);
+    }
+    let first_page_hashes = store
+        .query_asset_object_catalog(super::ASSET_GC_PRODUCT_PAGE_LIMIT, None)
+        .expect("query first catalog page")
+        .items
+        .into_iter()
+        .map(|candidate| candidate.object_hash)
+        .collect::<Vec<_>>();
+    let generation = super::active_generation(&store.connection).expect("read active generation");
+    let transaction = store
+        .connection
+        .transaction()
+        .expect("begin root transaction");
+    for (index, object_hash) in first_page_hashes.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO asset_aliases (
+                    generation, logical_key, object_hash, kind, size, mime, name, ext,
+                    inlay_type, width, height, metadata
+                 ) VALUES (?1, ?2, ?3, 'asset', 1, 'application/octet-stream', ?2, 'bin',
+                           NULL, NULL, NULL, '{}')",
+                rusqlite::params![generation, format!("rooted-{index}"), object_hash],
+            )
+            .expect("root first-page object");
+    }
+    transaction.commit().expect("commit first-page roots");
+
+    let now_ms = super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1;
+    let first = store
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("run rooted first page");
+    assert!(first.report.deletion_enabled);
+    assert!(first.report.deleted_hashes.is_empty());
+    assert!(first.next_cursor.is_some());
+    let persisted_cursor: Option<String> = store
+        .connection
+        .query_row(
+            "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read persisted cursor");
+    assert_eq!(persisted_cursor, first.next_cursor);
+    drop(store);
+
+    let mut reopened = PersistentStore::open(directory.path()).expect("reopen persistent store");
+    let second = reopened
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("run eligible second page");
+    assert!(second.report.deletion_enabled);
+    assert_eq!(second.report.deleted_hashes.len(), 1);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None
+    );
+
+    let wrapped = reopened
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("wrap to rooted first page");
+    assert!(wrapped.report.deletion_enabled);
+    assert!(wrapped.report.deleted_hashes.is_empty());
+}
+
+#[test]
+fn asset_gc_product_maintenance_resets_a_malformed_cursor_fail_closed() {
+    let directory = tempfile::tempdir().expect("create malformed cursor directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"malformed-cursor-candidate")
+        .expect("prepare maintenance candidate");
+    register_gc_candidate(&mut store, &prepared);
+    store
+        .connection
+        .execute(
+            "UPDATE asset_gc_maintenance_state SET catalog_cursor = 'not-a-cursor'",
+            [],
+        )
+        .expect("corrupt maintenance cursor");
+
+    let reset = store
+        .asset_gc_product_maintenance_page(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1)
+        .expect("reset malformed cursor");
+    assert!(!reset.report.deletion_enabled);
+    assert_eq!(reset.report.blockers, ["asset-gc-cursor-invalid"]);
+    assert!(reset.report.deleted_hashes.is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None
+    );
+    assert!(cas.stat_object(&prepared.content_hash).unwrap().is_some());
+
+    let retried = store
+        .asset_gc_product_maintenance_page(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1)
+        .expect("retry after cursor reset");
+    assert_eq!(retried.report.deleted_hashes, [prepared.content_hash]);
+}
+
+#[test]
+fn asset_gc_product_maintenance_resets_a_stale_ordering_cursor_fail_closed() {
+    let directory = tempfile::tempdir().expect("create stale cursor directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let first = cas.prepare_bytes(b"stale-cursor-first").unwrap();
+    let second = cas.prepare_bytes(b"stale-cursor-second").unwrap();
+    use super::asset_object_catalog::AssetObjectRegistration;
+    store
+        .asset_object_catalog()
+        .register(
+            &[
+                AssetObjectRegistration {
+                    object_hash: first.content_hash.clone(),
+                    byte_size: first.byte_size,
+                },
+                AssetObjectRegistration {
+                    object_hash: second.content_hash.clone(),
+                    byte_size: second.byte_size,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+    let catalog_page = store.query_asset_object_catalog(1, None).unwrap();
+    let cursor = catalog_page.next_cursor.expect("create ordering cursor");
+    let successor = store
+        .query_asset_object_catalog(1, Some(&cursor))
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .expect("read cursor successor");
+    store
+        .connection
+        .execute(
+            "DELETE FROM asset_objects WHERE object_hash = ?1",
+            [&successor.object_hash],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE asset_gc_maintenance_state SET catalog_cursor = ?1",
+            [&cursor],
+        )
+        .unwrap();
+
+    let reset = store
+        .asset_gc_product_maintenance_page(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1)
+        .expect("reset stale cursor");
+    assert!(!reset.report.deletion_enabled);
+    assert_eq!(reset.report.blockers, ["asset-gc-cursor-stale"]);
+    assert!(reset.report.deleted_hashes.is_empty());
+    assert!(cas
+        .stat_object(&catalog_page.items[0].object_hash)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -10849,6 +11146,18 @@ fn asset_gc_product_maintenance_interruption_recovers_on_next_open() {
     assert!(error
         .to_string()
         .contains("injected product maintenance interruption"));
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None,
+        "an interrupted page must not commit progress"
+    );
     drop(store);
 
     let mut reopened = PersistentStore::open(directory.path()).expect("recover product tombstone");
@@ -10901,6 +11210,55 @@ fn asset_gc_product_maintenance_keeps_blockers_fail_closed() {
         .stat_object(&prepared.content_hash)
         .expect("stat blocked candidate")
         .is_some());
+}
+
+#[test]
+fn asset_gc_product_maintenance_advances_blocked_pages_and_revisits_after_wrap() {
+    use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
+
+    let directory = tempfile::tempdir().expect("create blocked cycle directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let total = super::ASSET_GC_PRODUCT_PAGE_LIMIT + 1;
+    for index in 0..total {
+        let prepared = cas
+            .prepare_bytes(format!("blocked-cycle-{index}").as_bytes())
+            .expect("prepare blocked candidate");
+        register_gc_candidate(&mut store, &prepared);
+    }
+    let mut job = DurableCasJob::begin(
+        directory.path(),
+        "blocked-maintenance-cycle",
+        CasJobKind::DirectAssetOrInlayWrite,
+        0,
+    )
+    .expect("begin maintenance blocker");
+
+    let first = store
+        .asset_gc_product_maintenance_page(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1)
+        .expect("run blocked first page");
+    assert!(!first.report.deletion_enabled);
+    assert!(!first.report.blockers.is_empty());
+    assert!(first.next_cursor.is_some());
+
+    let second = store
+        .asset_gc_product_maintenance_page(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1)
+        .expect("run blocked second page");
+    assert!(!second.report.deletion_enabled);
+    assert!(!second.report.blockers.is_empty());
+    assert!(second.report.deleted_hashes.is_empty());
+    assert!(second.next_cursor.is_none());
+    job.release(CasReleaseOutcome::Aborted)
+        .expect("release maintenance blocker");
+
+    let revisited = store
+        .asset_gc_product_maintenance_page(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1)
+        .expect("revisit first page after wrap");
+    assert!(revisited.report.deletion_enabled);
+    assert_eq!(
+        revisited.report.deleted_hashes.len(),
+        super::ASSET_GC_PRODUCT_PAGE_LIMIT as usize
+    );
 }
 
 #[test]
