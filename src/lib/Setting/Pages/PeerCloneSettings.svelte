@@ -790,7 +790,7 @@
 
     <div class="mt-4 rounded-md border border-darkborderc p-3">
         <h4 class="font-bold">{language.peerBidirectional.source}</h4>
-        <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.sourceHelp}</p>
+        <p class="mt-1 text-sm text-textcolor2">{bidirectionalCapabilities?.desktop ? language.peerBidirectional.sourceHelp : language.peerBidirectional.sourceHelpLan}</p>
         {#if bidirectionalSourceStatus.phase === 'prepared' && bidirectionalCapabilities?.desktop}
             <p class="mt-3 text-sm font-bold">{language.peerClone.shareMode}</p>
             <SelectInput bind:value={bidirectionalSourceMode} className="mt-1 w-full">

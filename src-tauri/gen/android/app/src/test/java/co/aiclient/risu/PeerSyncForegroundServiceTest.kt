@@ -14,6 +14,8 @@ class PeerSyncForegroundServiceTest {
     assertTrue(isAllowedPeerSyncForegroundLane("p1-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p4-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p4-target"))
+    assertTrue(isAllowedPeerSyncForegroundLane("p5-source"))
+    assertTrue(isAllowedPeerSyncForegroundLane("p5-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("p3-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("quick-tunnel"))
   }
@@ -85,5 +87,21 @@ class PeerSyncForegroundServiceTest {
     nativeOwner = p4
     assertTrue(canStartPeerSyncForeground(attached, nativeOwner))
     assertEquals(p4, nativeOwner)
+  }
+
+  @Test
+  fun `stale P5 Stop retains Kotlin identity and blocks a fresh cross lane START`() {
+    val p5 = PeerSyncForegroundIdentity("p5-source", operationId, 9L)
+    val stale = p5.copy(generation = 8L)
+    val fresh = PeerSyncForegroundIdentity(
+      "p4-target",
+      "22222222-2222-4222-8222-222222222222",
+      10L,
+    )
+
+    val attached = peerSyncForegroundIdentityAfterStop(p5, stale)
+
+    assertEquals(p5, attached)
+    assertFalse(canStartPeerSyncForeground(attached, fresh))
   }
 }

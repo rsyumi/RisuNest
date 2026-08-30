@@ -654,6 +654,8 @@ pub fn run() {
             peer_sync::bidirectional_commands::peer_bidirectional_status,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_stop,
+            #[cfg(target_os = "android")]
+            peer_sync::bidirectional_commands::peer_bidirectional_source_release,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_revoke,
             #[cfg(any(desktop, target_os = "android"))]

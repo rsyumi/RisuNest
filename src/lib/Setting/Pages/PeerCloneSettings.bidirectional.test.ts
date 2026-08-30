@@ -28,6 +28,15 @@ describe('peer bidirectional settings surface', () => {
             "bidirectionalSourceStatus.phase === 'prepared' && bidirectionalCapabilities?.desktop",
         )
         expect(peerCloneSettingsSource).toContain("<option value=\"lan\">")
+        expect(peerCloneSettingsSource).toContain(
+            'bidirectionalCapabilities?.desktop'
+                + ' ? language.peerBidirectional.sourceHelp'
+                + ' : language.peerBidirectional.sourceHelpLan',
+        )
+        expect(languageEnglish.peerBidirectional.sourceHelpLan).toContain('LAN session')
+        expect(languageEnglish.peerBidirectional.sourceHelpLan).not.toContain('tunnel')
+        expect(languageKorean.peerBidirectional?.sourceHelpLan).toContain('LAN 세션')
+        expect(languageKorean.peerBidirectional?.sourceHelpLan).not.toContain('터널')
     })
 
     it('offers an explicit whole-operation winner for same-record conflicts', () => {

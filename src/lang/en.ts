@@ -1824,6 +1824,7 @@ export const languageEnglish = {
         unavailable: "Bidirectional sync is not available on this desktop build.",
         source: "Pair this device",
         sourceHelp: "Prepare and start a LAN or tunnel session, then keep this device open until sync finishes.",
+        sourceHelpLan: "Prepare and start a LAN session, then keep this device open until sync finishes.",
         prepare: "Prepare pairing",
         start: "Start pairing",
         stop: "Stop pairing",

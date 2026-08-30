@@ -485,6 +485,8 @@ export function createPeerBidirectionalFacade(options: {
         let foreground: PeerBidirectionalForegroundIdentity | undefined
         let foregroundReleased = false
         let foregroundResultRefreshed = false
+        let foregroundCleanupAttempted = false
+        let recoveredResponseError: unknown
         try {
             await runtime.flushPendingData(reason)
             const token = await runtime.capturePersistentMutationToken(reason)
@@ -503,7 +505,7 @@ export function createPeerBidirectionalFacade(options: {
                     throw new Error('Android bidirectional foreground service could not start')
                 }
             }
-            let result: PeerBidirectionalSyncResult
+            let result: PeerBidirectionalSyncResult | undefined
             try {
                 result = await nativeInvoke<PeerBidirectionalSyncResult>(command, {
                     ...args,
@@ -538,23 +540,42 @@ export function createPeerBidirectionalFacade(options: {
                                 throw refreshError
                             }
                         }
-                        if (advances) return recovered
+                        if (advances) {
+                            result = recovered
+                            recoveredResponseError = cause
+                        }
                     }
                 }
-                throw cause
+                if (!result) throw cause
             }
+            if (!result) throw new Error('Peer bidirectional mutation returned no result')
             const revision = committedRevision(result)
-            if (revision !== undefined) {
+            if (revision !== undefined && !foregroundResultRefreshed) {
                 await refreshTargetResult(key, result, revision, fence, foreground)
                 foregroundResultRefreshed = true
             }
             if (foreground && pendingRefresh?.foreground !== foreground) {
-                await releaseTargetForeground(foreground)
+                foregroundCleanupAttempted = true
+                try {
+                    await releaseTargetForeground(foreground)
+                } catch (cleanupError) {
+                    if (recoveredResponseError !== undefined) {
+                        throw new AggregateError(
+                            [recoveredResponseError, cleanupError],
+                            'Android bidirectional response recovery and foreground cleanup both failed',
+                        )
+                    }
+                    throw cleanupError
+                }
                 foregroundReleased = true
             }
             return result
         } catch (error) {
-            if (!foreground || pendingRefresh?.foreground === foreground) throw error
+            if (
+                !foreground
+                || pendingRefresh?.foreground === foreground
+                || foregroundCleanupAttempted
+            ) throw error
             try {
                 const pending = await settleTargetForeground(foreground)
                 if (pending?.result && !foregroundResultRefreshed) {
@@ -777,12 +798,22 @@ export function createPeerBidirectionalFacade(options: {
                         'peer_bidirectional_stop',
                         { sessionId },
                     )
-                    if (foreground && options.platform === 'android' && bridge) {
+                    if (foreground && options.platform === 'android') {
+                        if (!bridge) {
+                            throw new Error('Android bidirectional foreground service is unavailable')
+                        }
                         if (!bridge.stopSource(
                             foreground.lane,
                             foreground.operationId,
                             foreground.generation,
                         )) throw new Error('Android bidirectional foreground service could not stop')
+                        const released = await nativeInvoke<boolean>(
+                            'peer_bidirectional_source_release',
+                            { sessionId, foreground },
+                        )
+                        if (!released) {
+                            throw new Error('Android bidirectional source foreground identity is stale')
+                        }
                     }
                 } catch (cause) {
                     sourceStopStatusPending = false

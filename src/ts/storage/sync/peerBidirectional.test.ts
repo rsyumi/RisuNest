@@ -163,6 +163,7 @@ describe('peer bidirectional facade', () => {
                 return { phase: 'running', sessionId: 'source-session', devices: [] } as T
             }
             if (command === 'peer_bidirectional_stop') return foreground as T
+            if (command === 'peer_bidirectional_source_release') return true as T
             if (command === 'peer_bidirectional_status') {
                 return { source: { phase: 'stopped', devices: [] } } as T
             }
@@ -188,8 +189,117 @@ describe('peer bidirectional facade', () => {
         })
         expect(bridge.startSource).toHaveBeenCalledWith('p5-source', foreground.operationId, 15)
         expect(bridge.stopSource).toHaveBeenCalledWith('p5-source', foreground.operationId, 15)
+        expect(invoke).toHaveBeenCalledWith('peer_bidirectional_source_release', {
+            sessionId: 'source-session', foreground,
+        })
         expect(events.indexOf('service-start')).toBeLessThan(events.indexOf('peer_bidirectional_start'))
         expect(events.indexOf('peer_bidirectional_stop')).toBeLessThan(events.indexOf('service-stop'))
+        expect(events.indexOf('service-stop')).toBeLessThan(events.indexOf('peer_bidirectional_source_release'))
+    })
+
+    it.each(['false', 'throw'] as const)(
+        'retains Android P5 source authority when exact service Stop returns %s, then releases on retry',
+        async (failure) => {
+            const events: string[] = []
+            const foreground = {
+                lane: 'p5-source' as const,
+                operationId: '56565656-5656-4565-8565-565656565656',
+                generation: 23,
+            }
+            let releaseCalls = 0
+            const invoke = vi.fn(async <T>(command: string) => {
+                events.push(command)
+                if (command === 'peer_bidirectional_prepare') {
+                    return { phase: 'prepared', sessionId: 'source-stop-session', devices: [] } as T
+                }
+                if (command === 'peer_sync_foreground_source_status') return null as T
+                if (command === 'peer_bidirectional_source_reserve') return foreground as T
+                if (command === 'peer_bidirectional_start') {
+                    return { phase: 'running', sessionId: 'source-stop-session', devices: [] } as T
+                }
+                if (command === 'peer_bidirectional_stop') return foreground as T
+                if (command === 'peer_bidirectional_source_release') {
+                    releaseCalls += 1
+                    return true as T
+                }
+                if (command === 'peer_bidirectional_status') {
+                    return { source: { phase: 'stopped', devices: [] } } as T
+                }
+                throw new Error(`Unexpected command: ${command}`)
+            })
+            let stopCalls = 0
+            const bridge = {
+                startSource: vi.fn(() => true),
+                stopSource: vi.fn(() => {
+                    stopCalls += 1
+                    events.push('service-stop')
+                    if (stopCalls === 1 && failure === 'throw') throw new Error('service Stop threw')
+                    return stopCalls > 1
+                }),
+            }
+            const facade = createPeerBidirectionalFacade({
+                platform: 'android',
+                invoke: invoke as PeerBidirectionalInvoke,
+                runtime: runtime(events),
+                bridge,
+            })
+
+            await facade.prepare()
+            await facade.start('source-stop-session')
+            await expect(facade.stop('source-stop-session')).rejects.toThrow(
+                failure === 'throw' ? 'service Stop threw' : 'could not stop',
+            )
+            expect(releaseCalls).toBe(0)
+            await expect(facade.stop('source-stop-session')).resolves.toBeUndefined()
+            expect(stopCalls).toBe(2)
+            expect(releaseCalls).toBe(1)
+            expect(events.indexOf('service-stop')).toBeLessThan(events.indexOf('peer_bidirectional_source_release'))
+        },
+    )
+
+    it('retains exact Android P5 source ownership when accepted Stop has a stale native release', async () => {
+        const events: string[] = []
+        const foreground = {
+            lane: 'p5-source' as const,
+            operationId: '57575757-5757-4575-8575-575757575757',
+            generation: 24,
+        }
+        let releaseCalls = 0
+        const invoke = vi.fn(async <T>(command: string) => {
+            events.push(command)
+            if (command === 'peer_bidirectional_prepare') {
+                return { phase: 'prepared', sessionId: 'source-stale-session', devices: [] } as T
+            }
+            if (command === 'peer_sync_foreground_source_status') return null as T
+            if (command === 'peer_bidirectional_source_reserve') return foreground as T
+            if (command === 'peer_bidirectional_start') {
+                return { phase: 'running', sessionId: 'source-stale-session', devices: [] } as T
+            }
+            if (command === 'peer_bidirectional_stop') return foreground as T
+            if (command === 'peer_bidirectional_source_release') {
+                releaseCalls += 1
+                return (releaseCalls > 1) as T
+            }
+            if (command === 'peer_bidirectional_status') {
+                return { source: { phase: 'stopped', devices: [] } } as T
+            }
+            throw new Error(`Unexpected command: ${command}`)
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'android',
+            invoke: invoke as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+            bridge: {
+                startSource: vi.fn(() => true),
+                stopSource: vi.fn(() => true),
+            },
+        })
+
+        await facade.prepare()
+        await facade.start('source-stale-session')
+        await expect(facade.stop('source-stale-session')).rejects.toThrow('identity is stale')
+        await expect(facade.stop('source-stale-session')).resolves.toBeUndefined()
+        expect(releaseCalls).toBe(2)
     })
 
     it('runs Android P5 target to committed refresh before exact service cleanup', async () => {
@@ -313,6 +423,156 @@ describe('peer bidirectional facade', () => {
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_sync'))
             .toHaveLength(1)
     })
+
+    it.each([
+        {
+            name: 'resolve',
+            command: 'peer_bidirectional_resolve',
+            invokeOperation: (facade: ReturnType<typeof createPeerBidirectionalFacade>) => (
+                facade.resolve('operation-android-recovered', 'local')
+            ),
+            operation: {
+                phase: 'localCommitted' as const,
+                operationId: 'operation-android-recovered',
+                committedRevision: 20,
+            },
+            expected: {
+                kind: 'resumeRequired' as const,
+                operationId: 'operation-android-recovered',
+                phase: 'localCommitted' as const,
+                committedRevision: 20,
+            },
+        },
+        {
+            name: 'resume',
+            command: 'peer_bidirectional_resume',
+            invokeOperation: (facade: ReturnType<typeof createPeerBidirectionalFacade>) => (
+                facade.resume('operation-android-recovered')
+            ),
+            operation: {
+                phase: 'completed' as const,
+                result: {
+                    kind: 'updated' as const,
+                    operationId: 'operation-android-recovered',
+                    revision: 20,
+                    remoteRevision: 21,
+                    transferredObjects: 1,
+                    transferredBytes: 12,
+                    backups: [],
+                },
+            },
+            expected: {
+                kind: 'updated' as const,
+                operationId: 'operation-android-recovered',
+                revision: 20,
+                remoteRevision: 21,
+                transferredObjects: 1,
+                transferredBytes: 12,
+                backups: [],
+            },
+        },
+    ])('cleans exact Android foreground ownership after a recovered lost $name response', async ({
+        command, invokeOperation, operation, expected,
+    }) => {
+        const events: string[] = []
+        const foreground = {
+            lane: 'p5-target' as const,
+            operationId: '79797979-7979-4797-8797-797979797979',
+            generation: 20,
+        }
+        const invoke = vi.fn(async <T>(nativeCommand: string) => {
+            events.push(nativeCommand)
+            if (nativeCommand === 'peer_bidirectional_target_foreground_status') return null as T
+            if (nativeCommand === 'peer_bidirectional_target_reserve') return foreground as T
+            if (nativeCommand === command) throw new Error(`${command} response lost`)
+            if (nativeCommand === 'peer_bidirectional_status') {
+                return { source: { phase: 'idle', devices: [] }, operation } as T
+            }
+            if (nativeCommand === 'peer_bidirectional_target_foreground_release') return true as T
+            throw new Error(`Unexpected command: ${nativeCommand}`)
+        })
+        const bridge = {
+            startSource: vi.fn(() => true),
+            stopSource: vi.fn(() => { events.push('service-stop'); return true }),
+        }
+        const facade = createPeerBidirectionalFacade({
+            platform: 'android',
+            invoke: invoke as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+            bridge,
+        })
+
+        await expect(invokeOperation(facade)).resolves.toEqual(expected)
+        expect(events.filter((event) => event === command)).toHaveLength(1)
+        expect(events.filter((event) => event === 'refresh:20')).toHaveLength(1)
+        expect(events.filter((event) => event === 'service-stop')).toHaveLength(1)
+        expect(events.filter((event) => event === 'peer_bidirectional_target_foreground_release'))
+            .toHaveLength(1)
+    })
+
+    it.each([
+        ['resolve', 'peer_bidirectional_resolve', (facade: ReturnType<typeof createPeerBidirectionalFacade>) => (
+            facade.resolve('operation-android-cleanup-error', 'local')
+        ), {
+            phase: 'localCommitted' as const,
+            operationId: 'operation-android-cleanup-error',
+            committedRevision: 22,
+        }],
+        ['resume', 'peer_bidirectional_resume', (facade: ReturnType<typeof createPeerBidirectionalFacade>) => (
+            facade.resume('operation-android-cleanup-error')
+        ), {
+            phase: 'completed' as const,
+            result: {
+                kind: 'noChanges' as const,
+                operationId: 'operation-android-cleanup-error',
+                revision: 22,
+                remoteRevision: 22,
+                transferredObjects: 0,
+                transferredBytes: 0,
+                backups: [],
+            },
+        }],
+    ] as const)(
+        'retains the lost Android %s response and exact cleanup failure without retrying either',
+        async (_name, command, invokeOperation, operation) => {
+            const events: string[] = []
+            const foreground = {
+                lane: 'p5-target' as const,
+                operationId: '89898989-8989-4898-8898-898989898989',
+                generation: 22,
+            }
+            const primary = new Error(`${command} response lost`)
+            const invoke = vi.fn(async <T>(nativeCommand: string) => {
+                events.push(nativeCommand)
+                if (nativeCommand === 'peer_bidirectional_target_foreground_status') return null as T
+                if (nativeCommand === 'peer_bidirectional_target_reserve') return foreground as T
+                if (nativeCommand === command) throw primary
+                if (nativeCommand === 'peer_bidirectional_status') {
+                    return { source: { phase: 'idle', devices: [] }, operation } as T
+                }
+                throw new Error(`Unexpected command: ${nativeCommand}`)
+            })
+            const cleanup = new Error('Android bidirectional foreground service could not stop')
+            const facade = createPeerBidirectionalFacade({
+                platform: 'android',
+                invoke: invoke as PeerBidirectionalInvoke,
+                runtime: runtime(events),
+                bridge: {
+                    startSource: vi.fn(() => true),
+                    stopSource: vi.fn(() => false),
+                },
+            })
+
+            const error = await invokeOperation(facade).catch((cause) => cause)
+            expect(error).toBeInstanceOf(AggregateError)
+            expect((error as AggregateError).errors).toEqual([primary, cleanup])
+            expect(events.filter((event) => event === command)).toHaveLength(1)
+            expect(events.filter((event) => event === 'refresh:22')).toHaveLength(1)
+            expect(events.filter((event) => event === 'peer_bidirectional_target_foreground_status'))
+                .toHaveLength(1)
+            expect(events).not.toContain('peer_bidirectional_target_foreground_release')
+        },
+    )
 
     it('recovers a cancelled Android P5 Running operation from durable LocalCommitted authority', async () => {
         const events: string[] = []

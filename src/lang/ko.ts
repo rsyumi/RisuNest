@@ -1604,6 +1604,7 @@ export const languageKorean = {
         unavailable: "이 데스크톱 빌드에서는 양방향 동기화를 사용할 수 없습니다.",
         source: "이 기기 페어링",
         sourceHelp: "LAN 또는 터널 세션을 준비하고 시작한 다음 동기화가 끝날 때까지 이 기기를 열어 두세요.",
+        sourceHelpLan: "LAN 세션을 준비하고 시작한 다음 동기화가 끝날 때까지 이 기기를 열어 두세요.",
         prepare: "페어링 준비",
         start: "페어링 시작",
         stop: "페어링 중지",
