@@ -254,6 +254,72 @@ describe('Android opened spool production route', () => {
         expect(cancel).not.toHaveBeenCalled()
     })
 
+    it.each([
+        ['card.PNG', 'risu-module', 'module'] as const,
+        ['module.RISUM', 'png-card', 'character'] as const,
+    ])(
+        'uses native %s classifier result %s to activate %s',
+        async (displayName, format, expected) => {
+            const cancel = vi.fn(async () => undefined)
+            const confirmActivated = vi.fn(async () => undefined)
+            const receipt = {
+                content: {
+                    casSessionId: 'session-crossed',
+                    format,
+                    metadata: {},
+                    assets: [],
+                    ...(format === 'risu-module'
+                        ? { ownerHead: { present: false, manifestHash: null, entryCount: 0 } }
+                        : {}),
+                } as PreparedNativeContent,
+                cancel,
+                confirmActivated,
+            } as unknown as PreparedNativeContentReceipt
+            const prepare = vi.fn(async () => receipt)
+            const activateCharacter = vi.fn(async () => ({ characterId: 'character-crossed' }))
+            const activateModule = vi.fn(async () => ({ moduleId: 'module-crossed' }))
+            const enqueueRestore = vi.fn(async () => undefined)
+            const source = {
+                token: '55555555-5555-4555-8555-555555555555',
+                displayName,
+                bytes: 10,
+            }
+            const importCharacter = vi.fn(async (openedSource) =>
+                await importAndroidOpenedPreparedContent(openedSource, {
+                    prepare,
+                    activateCharacter,
+                    activateModule,
+                }))
+
+            await dispatchAndroidOpenedSpoolBatch({
+                requestId: 'opened-crossed-classifier',
+                ready: [source],
+                failures: [],
+            }, {
+                enqueueRestore,
+                importCharacter,
+                reportCharacterError: vi.fn(),
+                reportDestinationRequired: vi.fn(),
+            })
+
+            expect(enqueueRestore).toHaveBeenCalledExactlyOnceWith({
+                requestId: 'opened-crossed-classifier',
+                ready: [],
+                failures: [],
+            })
+            expect(importCharacter).toHaveBeenCalledExactlyOnceWith(source)
+            expect(prepare).toHaveBeenCalledExactlyOnceWith(
+                { type: 'androidSpool', token: source.token },
+                displayName,
+                {},
+            )
+            expect(activateCharacter).toHaveBeenCalledTimes(expected === 'character' ? 1 : 0)
+            expect(activateModule).toHaveBeenCalledTimes(expected === 'module' ? 1 : 0)
+            expect(confirmActivated).toHaveBeenCalledOnce()
+            expect(cancel).not.toHaveBeenCalled()
+        },
+    )
+
     it('cancels a prepared Android token when activation is declined', async () => {
         const cancel = vi.fn(async () => undefined)
         const confirmActivated = vi.fn(async () => undefined)
