@@ -153,7 +153,12 @@ impl DurableCasJob {
             .read(true)
             .write(true)
             .open(&journal_path)?;
-        let state = read_job_state(&mut file, Some(job_id), true)?;
+        let inspected = inspect_job_state(&mut file, Some(job_id))?;
+        if let Some(valid_length) = inspected.incomplete_tail {
+            let _repository_guard = super::coordinator::lock_repository_mutation()?;
+            recover_incomplete_tail_already_guarded(&mut file, valid_length)?;
+        }
+        let state = inspected.state;
         Ok(Self {
             repository_root,
             journal_path,
@@ -309,13 +314,13 @@ impl DurableCasJob {
                 byte_size: pin.byte_size,
             })
             .collect::<Vec<_>>();
+        let _repository_guard = super::coordinator::lock_repository_mutation()?;
         let mut catalog = store.asset_object_catalog();
         for batch in registrations.chunks(ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
             catalog
                 .register(batch, created_at_ms)
                 .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
         }
-        let _repository_guard = super::coordinator::lock_repository_mutation()?;
         let record = JobJournalRecord::Seal {
             sequence: self.state.next_sequence,
             job_id: self.state.job_id.clone(),
@@ -337,6 +342,7 @@ impl DurableCasJob {
 
     pub(crate) fn release(&mut self, outcome: CasReleaseOutcome) -> io::Result<()> {
         if self.state.released {
+            let _repository_guard = super::coordinator::lock_repository_mutation()?;
             return self.cleanup_released_journal();
         }
         if outcome == CasReleaseOutcome::Committed && !self.state.sealed {
@@ -527,7 +533,7 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
         }
     }
     paths.sort();
-    let mut removed = false;
+    let mut released_journals = Vec::new();
     for path in paths {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             roots.blockers.insert("job-pin-unknown-entry".to_owned());
@@ -552,8 +558,7 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
             roots.blockers.insert("job-pin-invalid-name".to_owned());
             continue;
         }
-        let state =
-            File::open(&path).and_then(|mut file| read_job_state(&mut file, Some(job_id), false));
+        let state = File::open(&path).and_then(|mut file| read_job_state(&mut file, Some(job_id)));
         let state = match state {
             Ok(state) => state,
             Err(_) => {
@@ -562,13 +567,7 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
             }
         };
         if state.released {
-            if fs::remove_file(&path).is_ok() {
-                removed = true;
-            } else {
-                roots
-                    .blockers
-                    .insert(format!("job-pin-release-cleanup:{job_id}"));
-            }
+            released_journals.push((job_id.to_owned(), path));
         } else {
             let job_roots = root_set_from_state(&state);
             roots.manifest_hashes.extend(job_roots.manifest_hashes);
@@ -578,8 +577,48 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
             }
         }
     }
-    if removed && sync_directory(&directory).is_err() {
-        roots.blockers.insert("job-pin-release-cleanup".to_owned());
+    if !released_journals.is_empty() {
+        match super::coordinator::lock_repository_mutation() {
+            Ok(_repository_guard) => {
+                let mut removed = false;
+                for (job_id, path) in released_journals {
+                    let state = File::open(&path)
+                        .and_then(|mut file| read_job_state(&mut file, Some(&job_id)));
+                    match state {
+                        Ok(state) if !state.released => {
+                            let job_roots = root_set_from_state(&state);
+                            roots.manifest_hashes.extend(job_roots.manifest_hashes);
+                            roots.object_hashes.extend(job_roots.object_hashes);
+                            if !state.sealed {
+                                roots.blockers.insert(format!("job-pin-unsealed:{job_id}"));
+                            }
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            roots.blockers.insert(format!("job-pin-corrupt:{job_id}"));
+                            continue;
+                        }
+                    }
+                    match fs::remove_file(&path) {
+                        Ok(()) => removed = true,
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(_) => {
+                            roots
+                                .blockers
+                                .insert(format!("job-pin-release-cleanup:{job_id}"));
+                        }
+                    }
+                }
+                if removed && sync_directory(&directory).is_err() {
+                    roots.blockers.insert("job-pin-release-cleanup".to_owned());
+                }
+            }
+            Err(_) => {
+                roots.blockers.insert("job-pin-release-cleanup".to_owned());
+            }
+        }
     }
     roots
 }
@@ -634,8 +673,8 @@ pub(crate) fn reclaim_abandoned_durable_cas_jobs(
         if !metadata.is_file() || is_link_like(&metadata) {
             return invalid_data("owned CAS job journal is not a real file");
         }
-        let state = File::open(&path)
-            .and_then(|mut file| read_job_state(&mut file, Some(job_id), false))?;
+        let state =
+            File::open(&path).and_then(|mut file| read_job_state(&mut file, Some(job_id)))?;
         if state.kind != expected_kind {
             return invalid_data("owned CAS job kind does not match its cleanup owner");
         }
@@ -741,20 +780,33 @@ fn write_record(file: &mut File, record: &JobJournalRecord, sync: bool) -> io::R
     Ok(())
 }
 
-fn read_job_state(
+struct InspectedJobState {
+    state: JobState,
+    incomplete_tail: Option<u64>,
+}
+
+fn read_job_state(file: &mut File, expected_job_id: Option<&str>) -> io::Result<JobState> {
+    let inspected = inspect_job_state(file, expected_job_id)?;
+    if inspected.incomplete_tail.is_some() {
+        return invalid_data("CAS job journal has a truncated frame");
+    }
+    Ok(inspected.state)
+}
+
+fn inspect_job_state(
     file: &mut File,
     expected_job_id: Option<&str>,
-    recover_tail: bool,
-) -> io::Result<JobState> {
+) -> io::Result<InspectedJobState> {
     file.seek(SeekFrom::Start(0))?;
     let mut state = None;
     let mut valid_length = 0_u64;
+    let mut incomplete_tail = None;
     loop {
         let mut length_bytes = [0_u8; 4];
         match read_exact_or_eof(file, &mut length_bytes)? {
             ExactRead::CleanEof => break,
             ExactRead::Partial => {
-                recover_incomplete_tail(file, valid_length, recover_tail)?;
+                incomplete_tail = Some(valid_length);
                 break;
             }
             ExactRead::Complete => {}
@@ -765,12 +817,12 @@ fn read_job_state(
         }
         let mut payload = vec![0; length];
         if read_exact_or_eof(file, &mut payload)? != ExactRead::Complete {
-            recover_incomplete_tail(file, valid_length, recover_tail)?;
+            incomplete_tail = Some(valid_length);
             break;
         }
         let mut checksum = [0_u8; 32];
         if read_exact_or_eof(file, &mut checksum)? != ExactRead::Complete {
-            recover_incomplete_tail(file, valid_length, recover_tail)?;
+            incomplete_tail = Some(valid_length);
             break;
         }
         if Sha256::digest(&payload).as_slice() != checksum {
@@ -780,7 +832,12 @@ fn read_job_state(
         apply_record(&mut state, record, expected_job_id)?;
         valid_length = file.stream_position()?;
     }
-    state.ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "CAS job journal is empty"))
+    let state =
+        state.ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "CAS job journal is empty"))?;
+    Ok(InspectedJobState {
+        state,
+        incomplete_tail,
+    })
 }
 
 fn apply_record(
@@ -913,10 +970,7 @@ fn read_exact_or_eof(reader: &mut impl Read, target: &mut [u8]) -> io::Result<Ex
     Ok(ExactRead::Complete)
 }
 
-fn recover_incomplete_tail(file: &mut File, valid_length: u64, enabled: bool) -> io::Result<()> {
-    if !enabled {
-        return invalid_data("CAS job journal has a truncated frame");
-    }
+fn recover_incomplete_tail_already_guarded(file: &mut File, valid_length: u64) -> io::Result<()> {
     file.set_len(valid_length)?;
     file.sync_data()?;
     file.seek(SeekFrom::Start(valid_length))?;
@@ -1057,6 +1111,65 @@ mod tests {
             .expect("job releases after exclusion releases");
         assert!(!journal_path.exists());
         worker.join().expect("join coordinated release worker");
+    }
+
+    #[test]
+    fn seal_catalog_registration_waits_for_repository_mutation_exclusion() {
+        let directory = tempfile::tempdir().expect("create catalog coordination directory");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "catalog-coordinated-job",
+            CasJobKind::DirectAssetOrInlayWrite,
+            1,
+        )
+        .expect("begin catalog coordinated job");
+        let prepared = job
+            .prepare_bytes(
+                &cas,
+                b"catalog coordinated payload",
+                CasObjectRole::DirectObject,
+            )
+            .expect("prepare catalog coordinated payload");
+        let store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("hold final recheck exclusion");
+        let (ready_sent, ready_received) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut store = store;
+            ready_sent.send(()).expect("signal seal attempt");
+            job.seal(&mut store, 2)
+                .expect("seal coordinated catalog job");
+            sent.send(()).expect("send seal completion");
+        });
+
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached seal attempt");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        let observer =
+            PersistentStore::open(directory.path()).expect("open catalog observer store");
+        let before = observer
+            .query_asset_object_catalog(16, None)
+            .expect("inspect catalog while final recheck owns exclusion");
+        assert!(!before
+            .items
+            .iter()
+            .any(|item| item.object_hash == prepared.content_hash));
+
+        drop(guard);
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("seal completes after final recheck releases");
+        worker.join().expect("join catalog coordination worker");
+        let after = observer
+            .query_asset_object_catalog(16, None)
+            .expect("inspect catalog after seal");
+        assert!(after
+            .items
+            .iter()
+            .any(|item| item.object_hash == prepared.content_hash));
     }
 
     #[test]
@@ -1335,6 +1448,62 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_tail_recovery_waits_for_repository_exclusion() {
+        let directory = tempfile::tempdir().expect("create coordinated recovery directory");
+        let job = DurableCasJob::begin(
+            directory.path(),
+            "coordinated-tail-recovery",
+            CasJobKind::LocalBackupRestore,
+            1,
+        )
+        .expect("begin coordinated recovery job");
+        let journal_path = job.journal_path().to_path_buf();
+        drop(job);
+        OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .expect("open journal tail")
+            .write_all(&[3, 0])
+            .expect("append incomplete frame");
+        let incomplete_length = std::fs::metadata(&journal_path)
+            .expect("stat incomplete journal")
+            .len();
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("hold final recheck exclusion during tail recovery");
+        let root = directory.path().to_path_buf();
+        let (ready_sent, ready_received) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_sent.send(()).expect("signal recovery open");
+            let recovered = DurableCasJob::open(&root, "coordinated-tail-recovery")
+                .expect("recover incomplete journal tail");
+            sent.send(recovered).expect("send recovered job");
+        });
+
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached recovery open");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            std::fs::metadata(&journal_path)
+                .expect("restat blocked recovery journal")
+                .len(),
+            incomplete_length
+        );
+        drop(guard);
+        let recovered = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recovery completes after exclusion releases");
+        worker.join().expect("join tail recovery worker");
+        assert!(
+            std::fs::metadata(recovered.journal_path())
+                .expect("stat recovered journal")
+                .len()
+                < incomplete_length
+        );
+    }
+
+    #[test]
     fn job_rejects_conflicting_existing_object_pins_and_recovers_by_session_id() {
         let directory = tempfile::tempdir().expect("create pin conflict directory");
         let cas = PayloadCas::new(directory.path()).expect("open CAS");
@@ -1444,6 +1613,93 @@ mod tests {
             .release(CasReleaseOutcome::Committed)
             .expect("retry release cleanup");
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn root_collection_release_cleanup_waits_for_repository_exclusion() {
+        let directory = tempfile::tempdir().expect("create coordinated recovery directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "collector-cleanup-job",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .expect("begin collector cleanup job");
+        job.seal(&mut store, 2).expect("seal collector cleanup job");
+        job.leave_release_record_for_cleanup_retry(CasReleaseOutcome::Committed)
+            .expect("leave released journal for collector");
+        let journal_path = job.journal_path().to_path_buf();
+        drop(job);
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("hold final recheck exclusion during collection");
+        let root = directory.path().to_path_buf();
+        let (ready_sent, ready_received) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_sent.send(()).expect("signal root collection");
+            sent.send(collect_durable_cas_job_roots(&root))
+                .expect("send collected roots");
+        });
+
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached root collection");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(journal_path.exists());
+        drop(guard);
+        let roots = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("collection completes after exclusion releases");
+        worker.join().expect("join coordinated root collector");
+        assert!(roots.blockers.is_empty());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn reopened_release_cleanup_waits_for_exclusion_and_remains_idempotent() {
+        let directory = tempfile::tempdir().expect("create coordinated release retry directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "coordinated-release-retry",
+            CasJobKind::PeerClone,
+            1,
+        )
+        .expect("begin coordinated release retry job");
+        job.seal(&mut store, 2).expect("seal coordinated retry job");
+        job.leave_release_record_for_cleanup_retry(CasReleaseOutcome::Committed)
+            .expect("leave terminal release for retry");
+        let journal_path = job.journal_path().to_path_buf();
+        drop(job);
+        let mut recovered = DurableCasJob::open(directory.path(), "coordinated-release-retry")
+            .expect("reopen released session");
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation()
+            .expect("hold final recheck exclusion during release cleanup");
+        let (ready_sent, ready_received) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_sent.send(()).expect("signal cleanup retry");
+            recovered
+                .release(CasReleaseOutcome::Committed)
+                .expect("clean released journal");
+            sent.send(recovered).expect("send cleaned session");
+        });
+
+        ready_received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached cleanup retry");
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(journal_path.exists());
+        drop(guard);
+        let mut recovered = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cleanup retry completes after exclusion releases");
+        worker.join().expect("join cleanup retry worker");
+        assert!(!journal_path.exists());
+        recovered
+            .release(CasReleaseOutcome::Committed)
+            .expect("repeat cleanup remains idempotent");
     }
 
     #[test]
