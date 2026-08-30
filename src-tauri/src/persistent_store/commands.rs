@@ -909,8 +909,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_sweep_after_database_recovery_preserves_active_data_and_revision() {
+    fn crashed_p4_startup_recovery_combines_database_and_directory_sweeps() {
         let directory = tempdir().expect("create temporary directory");
+        let abandoned_staging_id;
         {
             let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
             let committed = store.replace_begin().expect("begin committed staging");
@@ -922,6 +923,7 @@ mod tests {
                 .expect("commit active root");
 
             let abandoned = store.replace_begin().expect("begin abandoned staging");
+            abandoned_staging_id = abandoned.staging_id.clone();
             store
                 .replace_put_root(&abandoned.staging_id, &json!({ "username": "abandoned" }))
                 .expect("stage abandoned root");
@@ -944,5 +946,22 @@ mod tests {
         );
         assert_eq!(revision_before_sweep, 1);
         assert_eq!(root_before_sweep.value["username"], "active");
+        for (table, _) in super::super::GENERATION_TABLES {
+            let remaining: i64 = reopened
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE generation = ?1"),
+                    [&abandoned_staging_id],
+                    |row| row.get(0),
+                )
+                .expect("count swept P4 database staging rows");
+            assert_eq!(remaining, 0, "{table}");
+        }
+        assert!(!directory
+            .path()
+            .join("peer-delta")
+            .join("staging")
+            .join(CANONICAL_STAGING_NAME)
+            .exists());
     }
 }

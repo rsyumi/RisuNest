@@ -61,6 +61,10 @@ const PDS_GENERATION_TABLES: &[(&str, &str)] = &[
         "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata",
     ),
     (
+        "asset_alias_replacement_candidates",
+        "kind, logical_key, object_hash, byte_size",
+    ),
+    (
         "asset_owner_heads",
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),

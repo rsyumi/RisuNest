@@ -6,7 +6,7 @@ use super::{
 };
 use crate::asset_repository::PayloadCas;
 use crate::peer_sync::logical_delta::LOGICAL_MESSAGE_PAGE_SIZE;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(super) fn commit_asset_alias(
     connection: &mut Connection,
@@ -737,6 +737,19 @@ pub(super) fn replace_preserve_repositories(
          FROM asset_aliases WHERE generation = ?2",
         params![staging_id, active],
     )?;
+    transaction.execute(
+        "DELETE FROM asset_alias_replacement_candidates WHERE generation = ?1",
+        [staging_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO asset_alias_replacement_candidates (
+            generation, kind, logical_key, object_hash, byte_size
+         )
+         SELECT ?1, kind, logical_key, object_hash, size
+         FROM asset_aliases
+         WHERE generation = ?1 AND object_hash IS NOT NULL",
+        [staging_id],
+    )?;
     put_asset_repository_authority(&transaction, staging_id, &asset_authority)?;
 
     transaction.execute(
@@ -749,6 +762,7 @@ pub(super) fn replace_preserve_repositories(
          FROM cold_aliases WHERE generation = ?2",
         params![staging_id, active],
     )?;
+    prune_proven_unreachable_forwarded_aliases(&transaction, staging_id)?;
     put_cold_payload_authority(&transaction, staging_id, &cold_authority)?;
 
     transaction.execute(
@@ -760,6 +774,184 @@ pub(super) fn replace_preserve_repositories(
     }
     transaction.commit()?;
     Ok(actual_revision)
+}
+
+fn prune_proven_unreachable_forwarded_aliases(
+    transaction: &Transaction<'_>,
+    generation: &str,
+) -> StoreResult<()> {
+    if !replacement_asset_owner_scan_is_complete(transaction, generation)? {
+        return Ok(());
+    }
+    let plugin_rows: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM plugin_storage WHERE generation = ?1",
+        [generation],
+        |row| row.get(0),
+    )?;
+    let cold_rows: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
+        [generation],
+        |row| row.get(0),
+    )?;
+    if plugin_rows != 0 || cold_rows != 0 {
+        return Ok(());
+    }
+
+    let mut references = BTreeSet::new();
+    for query in [
+        "SELECT value FROM root WHERE generation = ?1",
+        "SELECT value FROM bot_presets WHERE generation = ?1",
+        "SELECT detail FROM characters WHERE generation = ?1",
+        "SELECT detail FROM conversations WHERE generation = ?1",
+        "SELECT value FROM messages WHERE generation = ?1",
+    ] {
+        let mut statement = transaction.prepare(query)?;
+        let mut rows = statement.query([generation])?;
+        while let Some(row) = rows.next()? {
+            let encoded: String = row.get(0)?;
+            observe_replacement_alias_references(&serde_json::from_str(&encoded)?, &mut references);
+        }
+    }
+    for query in [
+        "SELECT image FROM bot_presets WHERE generation = ?1 AND image IS NOT NULL",
+        "SELECT image FROM characters WHERE generation = ?1 AND image IS NOT NULL",
+    ] {
+        let mut statement = transaction.prepare(query)?;
+        let mut rows = statement.query([generation])?;
+        while let Some(row) = rows.next()? {
+            observe_replacement_alias_text(&row.get::<_, String>(0)?, &mut references);
+        }
+    }
+
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT kind, logical_key, object_hash, byte_size
+             FROM asset_alias_replacement_candidates
+             WHERE generation = ?1
+             ORDER BY kind ASC, logical_key ASC, object_hash ASC",
+        )?;
+        let candidates = statement
+            .query_map([generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        candidates
+    };
+    for (kind, logical_key, object_hash, byte_size) in candidates {
+        if references.contains(&logical_key) {
+            continue;
+        }
+        transaction.execute(
+            "DELETE FROM asset_aliases
+             WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3
+               AND object_hash = ?4 AND size = ?5",
+            params![generation, kind, logical_key, object_hash, byte_size],
+        )?;
+    }
+    Ok(())
+}
+
+fn replacement_asset_owner_scan_is_complete(
+    transaction: &Transaction<'_>,
+    generation: &str,
+) -> StoreResult<bool> {
+    let root = replacement_root(transaction, generation)?;
+    let root = root
+        .as_object()
+        .ok_or_else(|| validation("Replacement root must be an object"))?;
+    for property in ["modules", "personas"] {
+        if root.get(property).is_some_and(|value| !value.is_array()) {
+            return Ok(false);
+        }
+    }
+    for module in root
+        .get("modules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(module) = module.as_object() else {
+            return Ok(false);
+        };
+        if module.get("assets").is_some_and(|value| !value.is_array()) {
+            return Ok(false);
+        }
+    }
+    for persona in root
+        .get("personas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(persona) = persona.as_object() else {
+            return Ok(false);
+        };
+        let Some(module) = persona.get("embeddedModule") else {
+            continue;
+        };
+        let Some(module) = module.as_object() else {
+            return Ok(false);
+        };
+        if module.get("assets").is_some_and(|value| !value.is_array()) {
+            return Ok(false);
+        }
+    }
+
+    let mut statement = transaction
+        .prepare("SELECT detail FROM characters WHERE generation = ?1 ORDER BY character_id ASC")?;
+    let mut rows = statement.query([generation])?;
+    while let Some(row) = rows.next()? {
+        let detail: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let Some(detail) = detail.as_object() else {
+            return Ok(false);
+        };
+        if detail
+            .get("additionalAssets")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn observe_replacement_alias_references(value: &Value, references: &mut BTreeSet<String>) {
+    match value {
+        Value::String(value) => observe_replacement_alias_text(value, references),
+        Value::Array(values) => {
+            for value in values {
+                observe_replacement_alias_references(value, references);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                observe_replacement_alias_references(value, references);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn observe_replacement_alias_text(value: &str, references: &mut BTreeSet<String>) {
+    if value.starts_with("assets/") {
+        references.insert(value.to_owned());
+    }
+    for prefix in ["{{inlay::", "{{inlayed::", "{{inlayeddata::"] {
+        let mut remainder = value;
+        while let Some(start) = remainder.find(prefix) {
+            remainder = &remainder[start + prefix.len()..];
+            let Some(end) = remainder.find("}}") else {
+                break;
+            };
+            references.insert(remainder[..end].to_owned());
+            remainder = &remainder[end + 2..];
+        }
+    }
 }
 
 fn put_asset_repository_authority(

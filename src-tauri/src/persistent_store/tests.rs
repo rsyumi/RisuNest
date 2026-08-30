@@ -5229,7 +5229,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        15
+        16
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -6033,6 +6033,209 @@ fn database_only_replace_preserves_repositories_and_only_matching_owner_heads() 
 }
 
 #[test]
+fn database_only_replace_prunes_only_exact_forwarded_alias_candidates_after_complete_scan() {
+    let directory = tempfile::tempdir().expect("create alias provenance directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let reachable = cas.prepare_bytes(b"reachable replacement alias").unwrap();
+    let unreachable = cas.prepare_bytes(b"unreachable replacement alias").unwrap();
+    let aliases = [
+        AssetAlias {
+            key: "assets/reachable.bin".to_owned(),
+            object_hash: Some(reachable.content_hash.clone()),
+            kind: "asset".to_owned(),
+            size: reachable.byte_size as i64,
+            mime: "application/octet-stream".to_owned(),
+            name: "Reachable".to_owned(),
+            ext: "bin".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({}),
+        },
+        AssetAlias {
+            key: "assets/unreachable.bin".to_owned(),
+            object_hash: Some(unreachable.content_hash.clone()),
+            kind: "asset".to_owned(),
+            size: unreachable.byte_size as i64,
+            mime: "application/octet-stream".to_owned(),
+            name: "Unreachable".to_owned(),
+            ext: "bin".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({}),
+        },
+    ];
+    let initial = store.replace_begin().unwrap();
+    store
+        .replace_put_root(
+            &initial.staging_id,
+            &json!({ "activeAsset": "assets/reachable.bin" }),
+        )
+        .unwrap();
+    store
+        .replace_put_asset_aliases(&initial.staging_id, &aliases)
+        .unwrap();
+    store
+        .replace_put_asset_repository_authority(
+            &initial.staging_id,
+            &AssetRepositoryAuthorityState::V2 {
+                migration_id: "replacement-provenance".to_owned(),
+                compatibility_hash: "8a".repeat(32),
+            },
+        )
+        .unwrap();
+    let activated = store.replace_commit(&initial.staging_id, Some(0)).unwrap();
+
+    let replacement = store.replace_begin().unwrap();
+    store
+        .replace_put_root(
+            &replacement.staging_id,
+            &json!({ "activeAsset": "assets/reachable.bin", "changed": true }),
+        )
+        .unwrap();
+    store
+        .replace_preserve_repositories(&replacement.staging_id, Some(activated.revision))
+        .unwrap();
+    let replaced = store
+        .replace_commit(&replacement.staging_id, Some(activated.revision))
+        .unwrap();
+
+    assert!(store
+        .read_asset_alias("asset", "assets/reachable.bin", None)
+        .unwrap()
+        .is_some());
+    assert!(store
+        .read_asset_alias("asset", "assets/unreachable.bin", None)
+        .unwrap()
+        .is_none());
+    let roots = super::snapshot::collect_asset_roots(&store.connection, &cas).unwrap();
+    assert!(roots.object_hashes.contains(&reachable.content_hash));
+    assert!(!roots.object_hashes.contains(&unreachable.content_hash));
+    let provenance = store
+        .connection
+        .query_row(
+            "SELECT logical_key, object_hash, byte_size
+             FROM asset_alias_replacement_candidates
+             WHERE generation = 'revision-2' AND logical_key = 'assets/unreachable.bin'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .expect("read exact forwarded alias provenance");
+    assert_eq!(
+        provenance,
+        (
+            "assets/unreachable.bin".to_owned(),
+            unreachable.content_hash,
+            unreachable.byte_size as i64,
+        )
+    );
+    assert_eq!(replaced.revision, 2);
+}
+
+#[test]
+fn historical_alias_without_replacement_provenance_remains_a_gc_root() {
+    let directory = tempfile::tempdir().expect("create historical alias directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"historical alias payload").unwrap();
+    let alias = AssetAlias {
+        key: "assets/historical.bin".to_owned(),
+        object_hash: Some(prepared.content_hash.clone()),
+        kind: "asset".to_owned(),
+        size: prepared.byte_size as i64,
+        mime: "application/octet-stream".to_owned(),
+        name: "Historical".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    store.commit_asset_alias(&alias, 0).unwrap();
+
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_alias_replacement_candidates",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let roots = super::snapshot::collect_asset_roots(&store.connection, &cas).unwrap();
+    assert!(roots.object_hashes.contains(&prepared.content_hash));
+    assert!(store
+        .read_asset_alias("asset", &alias.key, None)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn database_only_replace_retains_forwarded_aliases_when_plugin_scan_is_opaque() {
+    let directory = tempfile::tempdir().expect("create opaque alias directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let alias = AssetAlias {
+        key: "assets/ambiguous.bin".to_owned(),
+        object_hash: Some("8b".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 9,
+        mime: "application/octet-stream".to_owned(),
+        name: "Ambiguous".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let initial = store.replace_begin().unwrap();
+    store
+        .replace_put_root(&initial.staging_id, &json!({}))
+        .unwrap();
+    store
+        .replace_put_asset_aliases(&initial.staging_id, std::slice::from_ref(&alias))
+        .unwrap();
+    let activated = store.replace_commit(&initial.staging_id, Some(0)).unwrap();
+    let replacement = store.replace_begin().unwrap();
+    store
+        .replace_put_root(
+            &replacement.staging_id,
+            &json!({ "pluginCustomStorage": { "opaque-plugin": { "state": true } } }),
+        )
+        .unwrap();
+    store
+        .replace_preserve_repositories(&replacement.staging_id, Some(activated.revision))
+        .unwrap();
+    store
+        .replace_commit(&replacement.staging_id, Some(activated.revision))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .read_asset_alias("asset", &alias.key, None)
+            .unwrap()
+            .unwrap()
+            .value,
+        alias
+    );
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let roots = super::snapshot::collect_asset_roots(&store.connection, &cas).unwrap();
+    assert!(roots
+        .object_hashes
+        .contains(alias.object_hash.as_deref().unwrap()));
+    assert!(roots.retain_all_objects);
+}
+
+#[test]
 fn database_only_replace_preserves_owner_head_across_nested_object_key_order() {
     let (_directory, mut store, mut database) = open_fixture();
     let source_assets: Value = serde_json::from_str(r#"[[{"metadata":{"first":1,"second":2}}]]"#)
@@ -6653,16 +6856,16 @@ fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
 }
 
 #[test]
-fn fresh_schema_v15_contains_dual_authority_and_empty_p4_logical_tables() {
-    let directory = tempfile::tempdir().expect("create fresh v15 directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v15 store");
+fn fresh_schema_v16_contains_dual_authority_and_empty_p4_logical_tables() {
+    let directory = tempfile::tempdir().expect("create fresh v16 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v16 store");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        15
+        16
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -6709,6 +6912,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             PRAGMA user_version = 10;
@@ -6725,7 +6929,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated cold schema version"),
-        15
+        16
     );
     assert_cold_v11_authority_schema(&connection, 2);
     for generation in ["revision-0", "snapshot-v10-cold"] {
@@ -6798,6 +7002,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             PRAGMA user_version = 8;
@@ -6820,7 +7025,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        15
+        16
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -6953,6 +7158,7 @@ fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
@@ -7061,6 +7267,7 @@ fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
@@ -7136,7 +7343,7 @@ fn schema_v10_logical_rows_survive_snapshot_restore_and_reopen() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read restored schema version"),
-        15
+        16
     );
     assert_logical_schema_fixture(&restored.connection);
     drop(restored);
@@ -7163,6 +7370,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
@@ -7193,7 +7401,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -7215,6 +7423,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
@@ -7234,7 +7443,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -7344,6 +7553,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
@@ -7364,7 +7574,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -7440,6 +7650,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE logical_sync_device_ack_proofs;
             DROP INDEX logical_sync_devices_status;
             DROP TABLE logical_sync_devices;
+            DROP TABLE asset_alias_replacement_candidates;
             DROP TABLE asset_object_deletions;
             DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
@@ -7471,7 +7682,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -7561,7 +7772,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 
     let snapshot_rows: i64 = store
         .connection
@@ -7702,7 +7913,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        15
+        16
     );
     assert_eq!(
         store
@@ -7730,7 +7941,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        15
+        16
     );
     assert_eq!(
         store
@@ -7771,7 +7982,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 }
 
 #[test]
@@ -7796,7 +8007,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 }
 
 #[test]
@@ -7934,7 +8145,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 }
 
 #[test]
@@ -8076,7 +8287,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 }
 
 #[test]
@@ -8222,7 +8433,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 15);
+    assert_eq!(integer_pragma("user_version"), 16);
 }
 
 #[test]
@@ -9461,7 +9672,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 16;")
+                .execute_batch("PRAGMA user_version = 17;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
@@ -9494,7 +9705,7 @@ fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read current version"),
-        15
+        16
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -9535,6 +9746,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              PRAGMA user_version = 11;",
@@ -9554,7 +9766,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated version"),
-        15
+        16
     );
     assert_eq!(
         migrated
@@ -9582,6 +9794,7 @@ fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
              DROP TABLE logical_sync_device_ack_proofs;
              DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
+             DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              DROP TABLE asset_objects;
              CREATE TABLE asset_objects (collision_marker TEXT NOT NULL);
@@ -9641,13 +9854,91 @@ fn schema_v15_adds_exact_durable_asset_deletion_tombstones() {
 }
 
 #[test]
+fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
+    let directory = tempfile::tempdir().expect("create v16 schema directory");
+    let store = PersistentStore::open(directory.path()).expect("open current store");
+
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        16
+    );
+    assert_eq!(
+        table_columns(&store.connection, "asset_alias_replacement_candidates")
+            .into_iter()
+            .map(|column| column.0)
+            .collect::<Vec<_>>(),
+        vec![
+            "generation".to_owned(),
+            "kind".to_owned(),
+            "logical_key".to_owned(),
+            "object_hash".to_owned(),
+            "byte_size".to_owned(),
+        ]
+    );
+    assert!(super::GENERATION_TABLES
+        .iter()
+        .any(|(table, _)| *table == "asset_alias_replacement_candidates"));
+
+    store
+        .connection
+        .execute(
+            "INSERT INTO app_kv (key, value) VALUES ('v15-sentinel', 'true')",
+            [],
+        )
+        .expect("seed v15 migration sentinel");
+    store
+        .connection
+        .execute_batch(
+            "DROP TABLE asset_alias_replacement_candidates;
+             PRAGMA user_version = 15;",
+        )
+        .expect("create v15 schema fixture");
+    drop(store);
+
+    let migrated = PersistentStore::open(directory.path()).expect("migrate v15 schema");
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        16
+    );
+    assert_eq!(
+        migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_alias_replacement_candidates",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count migrated replacement candidates"),
+        0
+    );
+    assert_eq!(
+        migrated
+            .connection
+            .query_row(
+                "SELECT value FROM app_kv WHERE key = 'v15-sentinel'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read preserved v15 migration sentinel"),
+        "true"
+    );
+}
+
+#[test]
 fn schema_v15_migrates_v14_without_scanning_cas_objects() {
     let directory = tempfile::tempdir().expect("create v14 migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     store
         .connection
         .execute_batch(
-            "DROP TABLE asset_object_deletions;
+            "DROP TABLE asset_alias_replacement_candidates;
+             DROP TABLE asset_object_deletions;
              PRAGMA user_version = 14;",
         )
         .expect("create v14 fixture");
@@ -9665,7 +9956,7 @@ fn schema_v15_migrates_v14_without_scanning_cas_objects() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated version"),
-        15
+        16
     );
     assert_eq!(
         migrated
@@ -9691,6 +9982,7 @@ fn schema_v13_to_v14_commit_is_a_resumable_boundary_before_v15() {
         .execute_batch(
             "DROP INDEX logical_sync_device_ack_proofs_local_generation;
              DROP TABLE logical_sync_device_ack_proofs;
+             DROP TABLE asset_alias_replacement_candidates;
              DROP TABLE asset_object_deletions;
              PRAGMA user_version = 13;",
         )
@@ -9721,7 +10013,7 @@ fn schema_v13_to_v14_commit_is_a_resumable_boundary_before_v15() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     assert!(!table_columns(&resumed.connection, "asset_object_deletions").is_empty());
 }

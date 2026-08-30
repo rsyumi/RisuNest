@@ -13,6 +13,7 @@ use crate::{
     persistent_store::{self, PersistentStore, StoreError},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -534,6 +535,9 @@ impl PeerCloneCommandState {
 
     pub(crate) fn initialize(peer_root: &Path) -> Self {
         let state = Self::default();
+        if let Err(error) = sweep_activated_target_residues(peer_root) {
+            eprintln!("warning: failed to sweep activated peer clone target residues: {error}");
+        }
         let source = match recover_source(peer_root) {
             Ok(source) => source,
             Err(error) => {
@@ -1007,7 +1011,13 @@ impl PeerCloneCommandState {
                 "injected peer clone source cleanup failure".to_owned(),
             ))
         } else {
-            cleanup_source_artifacts(&session_root, &marker_path, &marker)
+            cleanup_source_artifacts(&session_root, &marker_path, &marker).and_then(|()| {
+                sweep_canonical_owned_directories(session_root.parent().ok_or_else(|| {
+                    PeerSyncError::Storage(
+                        "peer clone source session has no owned parent".to_owned(),
+                    )
+                })?)
+            })
         };
         let mut runtime = self.lock_runtime()?;
         let source = require_source_mut(&mut runtime, session_id)?;
@@ -1863,11 +1873,146 @@ fn require_target_mut<'a>(
 }
 
 fn remove_directory_if_exists(path: &Path) -> Result<(), PeerSyncError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata_is_symlink_or_reparse(&metadata) {
+        return Err(PeerSyncError::Validation(
+            "peer clone cleanup target is not an ordinary directory".to_owned(),
+        ));
+    }
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn metadata_is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn ordinary_directory(path: &Path) -> Result<bool, PeerSyncError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir() && !metadata_is_symlink_or_reparse(&metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn sweep_canonical_owned_directories(parent: &Path) -> Result<(), PeerSyncError> {
+    if !ordinary_directory(parent)? {
+        return Ok(());
+    }
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_canonical_uuid(&name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() && !metadata_is_symlink_or_reparse(&metadata) {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn active_target_manifest_evidence(peer_root: &Path) -> Result<Option<String>, PeerSyncError> {
+    let Some(repository_root) = peer_root.parent() else {
+        return Ok(None);
+    };
+    let store = match PersistentStore::open(repository_root) {
+        Ok(store) => store,
+        Err(_) => return Ok(None),
+    };
+    let revision = store.revision().map_err(store_error)?;
+    let Some(value) = store
+        .get_app_kv("peerCloneActiveManifest")
+        .map_err(store_error)?
+    else {
+        return Ok(None);
+    };
+    let Some(marker) = value.as_object() else {
+        return Ok(None);
+    };
+    if marker.len() != 2 || marker.get("revision").and_then(Value::as_i64) != Some(revision) {
+        return Ok(None);
+    }
+    let Some(manifest_id) = marker.get("manifestId").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if super::protocol::validate_hash(manifest_id).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(manifest_id.to_owned()))
+}
+
+fn sweep_activated_target_residues(peer_root: &Path) -> Result<(), PeerSyncError> {
+    let Some(active_manifest_id) = active_target_manifest_evidence(peer_root)? else {
+        return Ok(());
+    };
+    let targets_root = peer_root.join("targets");
+    if !ordinary_directory(peer_root)? || !ordinary_directory(&targets_root)? {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&targets_root)? {
+        let entry = entry?;
+        let Some(session_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_canonical_uuid(&session_id) {
+            continue;
+        }
+        let job_root = entry.path();
+        if !ordinary_directory(&job_root)? {
+            continue;
+        }
+        let transfer_root = job_root.join("transfer");
+        if !ordinary_directory(&transfer_root)? {
+            continue;
+        }
+        let manifest_path = transfer_root.join("manifest.json");
+        let metadata = match fs::symlink_metadata(&manifest_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file()
+            || metadata_is_symlink_or_reparse(&metadata)
+            || metadata.len() > super::protocol::MAX_MANIFEST_BYTES as u64
+        {
+            continue;
+        }
+        let bytes = fs::read(&manifest_path)?;
+        let manifest: super::CloneManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        if manifest.validate().is_err()
+            || manifest.session_id != session_id
+            || manifest.canonical_bytes().ok().as_deref() != Some(bytes.as_slice())
+            || manifest.identity().ok().as_deref() != Some(active_manifest_id.as_str())
+        {
+            continue;
+        }
+        remove_directory_if_exists(&job_root)?;
+    }
+    Ok(())
 }
 
 fn read_active_source_marker(path: &Path) -> Result<Option<ActiveSourceMarker>, PeerSyncError> {
@@ -1877,7 +2022,7 @@ fn read_active_source_marker(path: &Path) -> Result<Option<ActiveSourceMarker>, 
         Err(error) => return Err(error.into()),
     };
     if !metadata.is_file()
-        || metadata.file_type().is_symlink()
+        || metadata_is_symlink_or_reparse(&metadata)
         || metadata.len() > MAX_ACTIVE_SOURCE_MARKER_BYTES
     {
         return Err(PeerSyncError::Validation(
@@ -1939,6 +2084,17 @@ fn cleanup_source_artifacts(
     marker_path: &Path,
     marker: &ActiveSourceMarker,
 ) -> Result<(), PeerSyncError> {
+    let peer_root = marker_path.parent().ok_or_else(|| {
+        PeerSyncError::Storage("prepared clone source marker has no owned parent".to_owned())
+    })?;
+    let sessions_root = session_root.parent().ok_or_else(|| {
+        PeerSyncError::Storage("prepared clone source session has no owned parent".to_owned())
+    })?;
+    if !ordinary_directory(peer_root)? || !ordinary_directory(sessions_root)? {
+        return Err(PeerSyncError::Validation(
+            "peer clone source cleanup root is not an ordinary directory".to_owned(),
+        ));
+    }
     remove_directory_if_exists(session_root)?;
     match read_active_source_marker(marker_path)? {
         None => Ok(()),
@@ -2315,6 +2471,26 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("invoke junction creation");
+        assert!(
+            output.status.success(),
+            "create directory junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn public_lan_clone_exposes_verified_production_gates() {
@@ -3414,6 +3590,145 @@ mod tests {
             PeerCloneSourcePhase::Stopped
         );
         assert!(!session_root.exists());
+    }
+
+    #[test]
+    fn successful_source_stop_sweeps_only_canonical_markerless_session_directories() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let peer_root = source_root.path().join("peer-sync");
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(&mut source_store, &source_cas, &peer_root, &NeverCancelled)
+            .unwrap();
+        let sessions_root = peer_root.join("source-sessions");
+        let markerless = sessions_root.join("123e4567-e89b-42d3-a456-426614174000");
+        let uppercase = sessions_root.join("223E4567-E89B-42D3-A456-426614174000");
+        let unrelated = sessions_root.join("unrelated");
+        let canonical_file = sessions_root.join("323e4567-e89b-42d3-a456-426614174000");
+        let link_target = source_root.path().join("source-link-target");
+        let canonical_link = sessions_root.join("423e4567-e89b-42d3-a456-426614174000");
+        fs::create_dir(&markerless).unwrap();
+        fs::create_dir(&uppercase).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(&canonical_file, b"preserve file").unwrap();
+        fs::create_dir(&link_target).unwrap();
+        fs::write(link_target.join("sentinel"), b"preserve link target").unwrap();
+        create_directory_link(&link_target, &canonical_link);
+
+        source
+            .stop_source(prepared.session_id.as_deref().unwrap())
+            .unwrap();
+
+        assert!(!markerless.exists());
+        assert!(uppercase.is_dir());
+        assert!(unrelated.is_dir());
+        assert!(canonical_file.is_file());
+        assert!(fs::symlink_metadata(&canonical_link).is_ok());
+        assert_eq!(
+            fs::read(link_target.join("sentinel")).unwrap(),
+            b"preserve link target"
+        );
+    }
+
+    #[test]
+    fn activated_target_residue_is_reclaimed_after_process_restart() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        let mut target_store = PersistentStore::open(target_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        seed_product_store(&mut target_store, "Target", 0);
+        let source = PeerCloneCommandState::default();
+        let source_peer_root = source_root.path().join("peer-sync");
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_peer_root,
+                &NeverCancelled,
+            )
+            .unwrap();
+        let running = source
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+        let request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                source.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+        };
+        let target_peer_root = target_root.path().join("peer-sync");
+        let target = PeerCloneCommandState::default();
+        target
+            .claim_target(
+                &target_peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                &pairing.claim,
+            )
+            .unwrap();
+        target
+            .start_target_download(&target_peer_root, request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        target
+            .finalize_target(&mut target_store, &target_cas, &target_peer_root, &request)
+            .unwrap();
+        let target_job_root = target_peer_root.join("targets").join(&request.session_id);
+        assert!(target_job_root.is_dir());
+        let targets_root = target_peer_root.join("targets");
+        let mismatched = targets_root.join("523e4567-e89b-42d3-a456-426614174000");
+        fs::create_dir_all(mismatched.join("transfer")).unwrap();
+        fs::copy(
+            target_job_root.join("transfer/manifest.json"),
+            mismatched.join("transfer/manifest.json"),
+        )
+        .unwrap();
+        let noncanonical = targets_root.join("823E4567-E89B-42D3-A456-426614174000");
+        fs::create_dir_all(noncanonical.join("transfer")).unwrap();
+        fs::copy(
+            target_job_root.join("transfer/manifest.json"),
+            noncanonical.join("transfer/manifest.json"),
+        )
+        .unwrap();
+        let canonical_file = targets_root.join("623e4567-e89b-42d3-a456-426614174000");
+        fs::write(&canonical_file, b"preserve target file").unwrap();
+        let external = target_root.path().join("target-link-external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("sentinel"), b"preserve linked target").unwrap();
+        let canonical_link = targets_root.join("723e4567-e89b-42d3-a456-426614174000");
+        create_directory_link(&external, &canonical_link);
+        drop(target);
+        drop(target_store);
+
+        let restarted = PeerCloneCommandState::initialize(&target_peer_root);
+
+        assert!(!target_job_root.exists());
+        assert!(mismatched.is_dir());
+        assert!(noncanonical.is_dir());
+        assert!(canonical_file.is_file());
+        assert!(fs::symlink_metadata(&canonical_link).is_ok());
+        assert_eq!(
+            fs::read(external.join("sentinel")).unwrap(),
+            b"preserve linked target"
+        );
+        assert_eq!(
+            restarted.target_status_current().unwrap().phase,
+            PeerCloneTargetPhase::Idle
+        );
+        source.stop_source(&request.session_id).unwrap();
     }
 
     #[test]

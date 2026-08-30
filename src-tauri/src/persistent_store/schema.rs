@@ -2,8 +2,25 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 15;
+pub(super) const SCHEMA_VERSION: u32 = 16;
 const SCHEMA_VERSION_V14: u32 = 14;
+const SCHEMA_VERSION_V15: u32 = 15;
+
+const ASSET_ALIAS_REPLACEMENT_CANDIDATE_TABLE_SQL: &str = r#"
+CREATE TABLE asset_alias_replacement_candidates (
+    generation TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('asset', 'inlay')),
+    logical_key TEXT NOT NULL CHECK (
+        length(logical_key) > 0 AND instr(logical_key, char(0)) = 0
+    ),
+    object_hash TEXT NOT NULL CHECK (
+        length(object_hash) = 64
+        AND object_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+    PRIMARY KEY (generation, kind, logical_key, object_hash)
+)
+"#;
 
 const ASSET_OBJECT_DELETION_TABLE_SQL: &str = r#"
 CREATE TABLE asset_object_deletions (
@@ -142,19 +159,26 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
             migrate_v11_to_v12(connection)?;
             migrate_v12_to_v13(connection)?;
             migrate_v13_to_v14(connection)?;
-            return migrate_v14_to_v15(connection);
+            migrate_v14_to_v15(connection)?;
+            return migrate_v15_to_v16(connection);
         }
         12 => {
             migrate_v12_to_v13(connection)?;
             migrate_v13_to_v14(connection)?;
-            return migrate_v14_to_v15(connection);
+            migrate_v14_to_v15(connection)?;
+            return migrate_v15_to_v16(connection);
         }
         13 => {
             migrate_v13_to_v14(connection)?;
-            return migrate_v14_to_v15(connection);
+            migrate_v14_to_v15(connection)?;
+            return migrate_v15_to_v16(connection);
         }
-        14 => return migrate_v14_to_v15(connection),
-        SCHEMA_VERSION => return validate_v15_schema(connection),
+        14 => {
+            migrate_v14_to_v15(connection)?;
+            return migrate_v15_to_v16(connection);
+        }
+        15 => return migrate_v15_to_v16(connection),
+        SCHEMA_VERSION => return validate_v16_schema(connection),
         _ => {
             return Err(StoreError::Store {
                 message: format!("unsupported persistent schema version {version}"),
@@ -165,7 +189,8 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     migrate_v11_to_v12(connection)?;
     migrate_v12_to_v13(connection)?;
     migrate_v13_to_v14(connection)?;
-    migrate_v14_to_v15(connection)
+    migrate_v14_to_v15(connection)?;
+    migrate_v15_to_v16(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -497,6 +522,16 @@ fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()> {
     transaction.execute_batch(ASSET_OBJECT_DELETION_TABLE_SQL)?;
     transaction.execute_batch(ASSET_OBJECT_DELETION_INDEX_SQL)?;
     validate_v15_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION_V15)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v15_to_v16(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_v15_schema(&transaction)?;
+    transaction.execute_batch(ASSET_ALIAS_REPLACEMENT_CANDIDATE_TABLE_SQL)?;
+    validate_v16_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -607,6 +642,28 @@ fn validate_v15_schema(connection: &Connection) -> StoreResult<()> {
     {
         return Err(StoreError::Validation {
             message: "asset object deletion tombstone index definition is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_v16_schema(connection: &Connection) -> StoreResult<()> {
+    validate_v15_schema(connection)?;
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'asset_alias_replacement_candidates'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(
+            ASSET_ALIAS_REPLACEMENT_CANDIDATE_TABLE_SQL,
+        ))
+    {
+        return Err(StoreError::Validation {
+            message: "asset alias replacement provenance table definition is invalid".to_owned(),
         });
     }
     Ok(())
