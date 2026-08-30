@@ -405,6 +405,7 @@ export function createPeerDeltaFacade(options: {
                 if (foreground) await releaseAndroidTargetForeground(foreground)
                 return result
             } catch (error) {
+                if (pendingRefresh?.fence === fence) throw error
                 if (!foreground) throw error
                 try {
                     const pending = await settleTargetForeground(foreground)

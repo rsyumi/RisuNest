@@ -818,4 +818,71 @@ describe('peer logical delta product facade', () => {
         expect(refresh).toHaveBeenCalledTimes(2)
         expect(release).toHaveBeenCalledOnce()
     })
+
+    test('retains Android Terminal cleanup ownership when committed refresh fails', async () => {
+        const foreground = {
+            lane: 'p4-target',
+            operationId: '22222222-2222-4222-8222-222222222222',
+            generation: 4,
+        } as const
+        const release = vi.fn()
+        const refresh = vi.fn()
+            .mockRejectedValueOnce(new Error('renderer refresh failed'))
+            .mockResolvedValueOnce(undefined)
+        const stopSource = vi.fn(() => true)
+        const runtime: PeerDeltaMutationRuntime = {
+            flushPendingData: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 8, mutationGeneration: 2 })),
+            acquirePersistentMutationFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: refresh,
+                release,
+            })),
+        }
+        const result = {
+            kind: 'updated',
+            revision: 9,
+            transferredObjects: 1,
+            transferredBytes: 32,
+        } as const
+        let phase: 'absent' | 'terminal' = 'absent'
+        let nativeReleaseCount = 0
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_target_foreground_status') {
+                return (phase === 'terminal' ? { foreground, phase, result } : null) as T
+            }
+            if (command === 'peer_delta_target_reserve') return foreground as T
+            if (command === 'peer_delta_pull') {
+                phase = 'terminal'
+                return result as T
+            }
+            if (command === 'peer_delta_target_foreground_release') {
+                nativeReleaseCount += 1
+                phase = 'absent'
+                return true as T
+            }
+            throw new Error(`unexpected ${command}`)
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({
+            platform: 'android',
+            invoke,
+            runtime,
+            bridge: { startSource: vi.fn(() => true), stopSource },
+        })
+
+        await expect(facade.pull(pairing)).rejects.toThrow('renderer refresh failed')
+        expect(refresh).toHaveBeenCalledOnce()
+        expect(release).not.toHaveBeenCalled()
+        expect(stopSource).not.toHaveBeenCalled()
+        expect(invoke).not.toHaveBeenCalledWith('peer_delta_target_foreground_release', expect.anything())
+
+        await expect(facade.pull(pairing)).resolves.toEqual(result)
+        expect(refresh).toHaveBeenCalledTimes(2)
+        expect(release).toHaveBeenCalledOnce()
+        expect(stopSource).toHaveBeenCalledOnce()
+        expect(stopSource).toHaveReturnedWith(true)
+        expect(invoke).toHaveBeenCalledWith('peer_delta_target_foreground_release', { foreground })
+        expect(nativeReleaseCount).toBe(1)
+        expect(runtime.flushPendingData).toHaveBeenCalledOnce()
+        expect(runtime.acquirePersistentMutationFence).toHaveBeenCalledOnce()
+    })
 })
