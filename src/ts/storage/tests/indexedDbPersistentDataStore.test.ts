@@ -2257,6 +2257,114 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         rawDatabase.close()
     })
 
+    it('rejects and rolls back a malformed occurrence row during generation copy', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `revision-occurrence-copy-invalid-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const lease = await store.acquireRevision(imported.revision)
+        const occurrenceKey = [
+            'revision-1:message-occurrence-page:char-a:conv-long:',
+            '0'.repeat(16),
+        ].join('')
+        const originalOccurrence = await readRawRecord(
+            indexedDB,
+            databaseName,
+            'messageOccurrences',
+            occurrenceKey,
+        ) as Record<string, unknown>
+        const originalRoot = await store.readRoot()
+        const originalCounts = await countPersistentDataRecords(indexedDB, databaseName)
+        await writeRawRecords(indexedDB, databaseName, 'messageOccurrences', [{
+            ...originalOccurrence,
+            lookupKeys: [JSON.stringify([
+                'wrong-generation',
+                'char-a',
+                'conv-long',
+                'msg-000',
+            ])],
+        }])
+
+        const commit = store.commit({
+            expectedRevision: imported.revision,
+            root: { ...originalRoot.value, username: 'Must roll back' },
+        })
+        let timeout: ReturnType<typeof setTimeout> | undefined
+        const boundedCommit = Promise.race([
+            commit,
+            new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(
+                    () => reject(new Error('generation copy did not settle within 1 second')),
+                    1_000,
+                )
+            }),
+        ]).finally(() => {
+            if (timeout !== undefined) clearTimeout(timeout)
+        })
+        await expect(boundedCommit).rejects.toThrow(
+            'Persistent message occurrence lookup key does not match its row',
+        )
+
+        await expect(store.readRoot()).resolves.toEqual(originalRoot)
+        await expect(lease.readConversation('char-a', 'conv-long')).resolves.toMatchObject({
+            revision: imported.revision,
+            value: { id: 'conv-long' },
+        })
+        expect(await countPersistentDataRecords(indexedDB, databaseName)).toEqual(originalCounts)
+
+        const rawDatabase = await openDatabase(indexedDB, databaseName)
+        const generationStores = [
+            'root',
+            'presets',
+            'catalog',
+            'characters',
+            'conversations',
+            'messagePages',
+            'messageOccurrences',
+            'pluginStorage',
+            'pluginStorageMetadata',
+            'assetAliases',
+            'assetOwnerHeads',
+            'assetRepositoryAuthority',
+            'coldAliases',
+            'coldPayloadAuthority',
+        ]
+        const residueTransaction = rawDatabase.transaction(generationStores, 'readonly')
+        const targetResidue = await Promise.all(generationStores.map(async (storeName) => {
+            const objectStore = residueTransaction.objectStore(storeName)
+            if (storeName === 'root') {
+                return requestResultForTest(objectStore.count('revision-2'))
+            }
+            return requestResultForTest(objectStore.index('byGeneration').count('revision-2'))
+        }))
+        expect(targetResidue).toEqual(generationStores.map(() => 0))
+        await completeTransaction(residueTransaction)
+        rawDatabase.close()
+
+        await writeRawRecords(
+            indexedDB,
+            databaseName,
+            'messageOccurrences',
+            [originalOccurrence],
+        )
+        const committed = await store.commit({
+            expectedRevision: imported.revision,
+            root: { ...originalRoot.value, username: 'Retry succeeded' },
+        })
+        await expect(store.readConversationWindow({
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            anchorMessageId: 'msg-127',
+            before: 0,
+            after: 0,
+        })).resolves.toMatchObject({
+            revision: committed.revision,
+            value: { startIndex: 127 },
+        })
+        await lease.release()
+    })
+
     it('rejects every old lease view after another realm removes its durable lease', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `externally-expired-revision-${databaseSequence++}`

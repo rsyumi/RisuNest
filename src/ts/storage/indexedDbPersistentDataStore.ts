@@ -2081,26 +2081,36 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const request = store.index('byGeneration').openCursor(this.keyRangeFactory.only(sourceGeneration))
             request.onerror = () => reject(request.error)
             request.onsuccess = () => {
-                const cursor = request.result
-                if (!cursor) {
-                    resolve()
+                try {
+                    const cursor = request.result
+                    if (!cursor) {
+                        resolve()
+                        return
+                    }
+                    const record = cursor.value as StoredRecord<unknown>
+                    const copiedRecord: StoredRecord<unknown> & Record<string, unknown> = {
+                        ...record,
+                        key: `${targetGeneration}${record.key.slice(sourceGeneration.length)}`,
+                        generation: targetGeneration,
+                    }
+                    if (store.name === 'messageOccurrences') {
+                        copiedRecord.lookupKeys = this.retargetMessageOccurrenceLookupKeys(
+                            record as unknown as StoredMessageOccurrencePage,
+                            sourceGeneration,
+                            targetGeneration,
+                        )
+                    }
+                    store.put(copiedRecord)
+                    cursor.continue()
+                } catch (error) {
+                    reject(error)
+                    try {
+                        store.transaction.abort()
+                    } catch {
+                        // Preserve the original cursor validation or write error.
+                    }
                     return
                 }
-                const record = cursor.value as StoredRecord<unknown>
-                const copiedRecord: StoredRecord<unknown> & Record<string, unknown> = {
-                    ...record,
-                    key: `${targetGeneration}${record.key.slice(sourceGeneration.length)}`,
-                    generation: targetGeneration,
-                }
-                if (store.name === 'messageOccurrences') {
-                    copiedRecord.lookupKeys = this.retargetMessageOccurrenceLookupKeys(
-                        record as unknown as StoredMessageOccurrencePage,
-                        sourceGeneration,
-                        targetGeneration,
-                    )
-                }
-                store.put(copiedRecord)
-                cursor.continue()
             }
         })
     }
