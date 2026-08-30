@@ -1,4 +1,9 @@
 import type { Database } from './database.svelte'
+import {
+    AndroidSafDestinationError,
+    type AndroidSafDestinationRequest,
+    type AndroidSafDestinationResult,
+} from './androidSafBridge'
 import type { PersistentDataRuntime } from './persistentDataRuntime.svelte'
 import {
     NativeFileJobError,
@@ -7,6 +12,10 @@ import {
     type NativeFileJobSource,
     type NativeFileRestoreJobOptions,
 } from './nativeFileJobs'
+import type {
+    PinnedRisuSaveExport,
+    RisuSaveExportRuntime,
+} from './risuSaveStoreAdapter'
 
 type FileLike = {
     name: string
@@ -15,6 +24,7 @@ type FileLike = {
 
 type FileRouteRuntime = Pick<
     PersistentDataRuntime,
+    | 'store'
     | 'revision'
     | 'flushPendingData'
     | 'capturePersistentMutationToken'
@@ -23,7 +33,7 @@ type FileRouteRuntime = Pick<
 >
 
 export interface RisuSaveFileRouteDependencies {
-    platform(): 'native-desktop' | 'web'
+    platform(): 'native-desktop' | 'native-android' | 'web'
     runtime(): FileRouteRuntime
     chooseNativeImport(): Promise<string | null>
     chooseNativeExport(defaultName: string): Promise<string | null>
@@ -41,8 +51,98 @@ export interface RisuSaveFileRouteDependencies {
     decodeRisuSave(bytes: Uint8Array): Promise<unknown>
     collectWebExport(omitAccount: boolean): Promise<Uint8Array>
     downloadWebExport(name: string, bytes: Uint8Array): Promise<void>
+    withFlushedExport<T>(
+        runtime: RisuSaveExportRuntime,
+        reason: string,
+        callback: (pinned: PinnedRisuSaveExport) => Promise<T>,
+    ): Promise<T>
+    copyAndroidExport(
+        request: AndroidSafDestinationRequest,
+    ): Promise<AndroidSafDestinationResult>
     reloadPlugins(): void | Promise<void>
     reloadPluginsAfterNativeRestore(): void | Promise<void>
+}
+
+function deduplicateWarningCodes(codes: string[]): string[] {
+    return [...new Set(codes)].slice(0, 16)
+}
+
+async function exportThroughAndroidSaf(
+    runtime: FileRouteRuntime,
+    name: string,
+    options: RisuSaveFileRouteOptions,
+    dependencies: RisuSaveFileRouteDependencies,
+): Promise<RisuSaveFileRouteResult> {
+    return dependencies.withFlushedExport(
+        runtime,
+        'risu-save-file-export',
+        async (pinned) => {
+            if (!pinned.withNativeFile) {
+                throw new NativeFileJobError(
+                    'capability-unavailable',
+                    'Pinned RisuSave revision does not support a managed native export file',
+                )
+            }
+            return pinned.withNativeFile(
+                { omitAccount: options.omitAccount ?? false },
+                async (file) => {
+                    let published: AndroidSafDestinationResult
+                    try {
+                        published = await dependencies.copyAndroidExport({
+                            sourcePath: file.path,
+                            suggestedName: name,
+                            signal: options.signal,
+                            onProgress: (progress) => options.onStatus?.({
+                                jobId: progress.requestId,
+                                kind: 'export-block-risu-save',
+                                state: 'running',
+                                phase: 'writing-export',
+                                progress: {
+                                    completedBytes: progress.copiedBytes,
+                                    ...(progress.totalBytes === null
+                                        ? {}
+                                        : { totalBytes: progress.totalBytes }),
+                                    completedItems: 0,
+                                    totalItems: 1,
+                                },
+                            }),
+                        })
+                    }
+                    catch (error) {
+                        if (
+                            error
+                            && typeof error === 'object'
+                            && 'warningCodes' in error
+                            && Array.isArray(error.warningCodes)
+                        ) {
+                            error.warningCodes = deduplicateWarningCodes(
+                                error.warningCodes.filter((code): code is string =>
+                                    typeof code === 'string'),
+                            )
+                        }
+                        throw error
+                    }
+                    const warningCodes = deduplicateWarningCodes(published.warningCodes)
+                    if (published.bytes !== file.bytes) {
+                        throw new AndroidSafDestinationError(
+                            published.requestId ?? '',
+                            'byte-count-mismatch',
+                            deduplicateWarningCodes([
+                                ...warningCodes,
+                                'partial-destination-may-remain',
+                            ]),
+                            `Android SAF copied ${published.bytes} of ${file.bytes} RisuSave bytes`,
+                        )
+                    }
+                    return {
+                        mode: 'native',
+                        warningCodes,
+                        bytes: file.bytes,
+                    }
+                },
+            )
+        },
+    )
 }
 
 export interface RisuSaveFileRouteOptions extends NativeFileRestoreJobOptions {
@@ -147,7 +247,11 @@ export async function exportRisuSaveFromPicker(
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult | null> {
     const name = defaultExportName()
-    if (dependencies.platform() === 'native-desktop') {
+    const platform = dependencies.platform()
+    if (platform === 'native-android') {
+        return exportThroughAndroidSaf(dependencies.runtime(), name, options, dependencies)
+    }
+    if (platform === 'native-desktop') {
         const destination = await dependencies.chooseNativeExport(name)
         if (!destination) return null
         let result: NativeFileJobResult

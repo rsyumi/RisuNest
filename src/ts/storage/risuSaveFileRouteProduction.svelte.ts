@@ -1,7 +1,10 @@
 import { open, save } from '@tauri-apps/plugin-dialog'
 
 import { downloadFile } from '../globalApi.svelte'
-import { isTauriDesktop } from '../platform'
+import { isTauriAndroid, isTauriDesktop } from '../platform'
+import {
+    copyNativeExportToAndroidSaf,
+} from './androidSafBridge'
 import {
     loadPlugins,
     loadPluginsAfterAuthoritativeRestore,
@@ -26,7 +29,11 @@ import {
 import { withFlushedRisuSaveExport } from './risuSaveStoreAdapter'
 
 const productionDependencies: RisuSaveFileRouteDependencies = {
-    platform: () => isTauriDesktop ? 'native-desktop' : 'web',
+    platform: () => isTauriDesktop
+        ? 'native-desktop'
+        : isTauriAndroid
+            ? 'native-android'
+            : 'web',
     runtime: getPersistentDataRuntime,
     chooseNativeImport: async () => {
         const selected = await open({
@@ -52,6 +59,8 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
     downloadWebExport: async (name, bytes) => {
         await downloadFile(name, bytes)
     },
+    withFlushedExport: withFlushedRisuSaveExport,
+    copyAndroidExport: copyNativeExportToAndroidSaf,
     reloadPlugins: loadPlugins,
     reloadPluginsAfterNativeRestore: loadPluginsAfterAuthoritativeRestore,
 }

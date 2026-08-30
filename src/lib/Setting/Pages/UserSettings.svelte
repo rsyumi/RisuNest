@@ -75,7 +75,20 @@
     }
 
     function showRisuSaveError(error: unknown): void {
-        if(error instanceof DOMException && error.name === 'AbortError') return
+        const partialDestinationMayRemain = !!(
+            error
+            && typeof error === 'object'
+            && 'warningCodes' in error
+            && Array.isArray((error as { warningCodes?: unknown }).warningCodes)
+            && (error as { warningCodes: unknown[] }).warningCodes
+                .includes('partial-destination-may-remain')
+        )
+        if(error instanceof DOMException && error.name === 'AbortError') {
+            if(partialDestinationMayRemain) {
+                alertError(language.screenshotPartialDestinationMayRemain)
+            }
+            return
+        }
         if(error instanceof NativeFileJobActivationCommittedError) {
             alertError(language.risuSaveImportCommittedRefreshFailed)
             return
@@ -84,7 +97,10 @@
             alertError(language.risuSaveRevisionConflict)
             return
         }
-        alertError(error instanceof Error ? error.message : String(error))
+        const detail = error instanceof Error ? error.message : String(error)
+        alertError(partialDestinationMayRemain
+            ? `${detail} ${language.screenshotPartialDestinationMayRemain}`
+            : detail)
     }
 
     async function runRisuSaveOperation(kind: 'import' | 'export'): Promise<void> {
@@ -205,13 +221,15 @@
         {language.importRisuSave}
     </Button>
 
+{/if}
+
+{#if !isTauri || isTauriDesktop || isTauriAndroid}
     <Button
         disabled={risuSaveOperation !== null}
         onclick={() => runRisuSaveOperation('export')}
         className="mt-2">
         {language.exportRisuSave}
     </Button>
-
 {/if}
 
 {#if risuSaveOperation}

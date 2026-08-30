@@ -13,6 +13,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
     return {
         platform: () => platform,
         runtime: () => ({
+            store: {} as never,
             revision: 4,
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({
@@ -66,12 +67,228 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         decodeRisuSave: vi.fn(async () => ({ username: 'Web import', characters: [] })),
         collectWebExport: vi.fn(async () => Uint8Array.from([4, 5, 6])),
         downloadWebExport: vi.fn(async () => undefined),
+        withFlushedExport: vi.fn(async () => {
+            throw new Error('Unexpected managed Android export')
+        }),
+        copyAndroidExport: vi.fn(async () => {
+            throw new Error('Unexpected Android SAF copy')
+        }),
         reloadPlugins: vi.fn(async () => undefined),
         reloadPluginsAfterNativeRestore: vi.fn(async () => undefined),
     }
 }
 
 describe('RisuSave picker route', () => {
+    function installAndroidExport(
+        deps: RisuSaveFileRouteDependencies,
+        input: {
+            withFlushedExport: (...args: any[]) => Promise<unknown>
+            copyAndroidExport: (...args: any[]) => Promise<unknown>
+        },
+    ): void {
+        deps.platform = () => 'native-android' as never
+        Object.assign(deps, input)
+    }
+
+    it('keeps the managed native file alive through the Android SAF terminal without exposing payload bytes', async () => {
+        const deps = dependencies('native-desktop')
+        const events: string[] = []
+        let releaseTerminal!: () => void
+        const terminal = new Promise<void>((resolve) => releaseTerminal = resolve)
+        const copyAndroidExport = vi.fn(async (request: Record<string, unknown>) => {
+            events.push('saf-copy-start')
+            expect(request).toEqual(expect.objectContaining({
+                sourcePath: '/app/persistent/exports/risusave-a.risudat',
+                suggestedName: expect.stringMatching(/^risunest-.*\.risudat$/),
+            }))
+            expect(JSON.stringify(request)).not.toContain('Uint8Array')
+            await terminal
+            events.push('saf-terminal')
+            return {
+                requestId: 'saf-request-1',
+                bytes: 8_192,
+                warningCodes: ['android-saf-provider-not-atomic'],
+            }
+        })
+        const withFlushedExport = vi.fn(async (
+            _runtime: unknown,
+            reason: string,
+            callback: (pinned: Record<string, unknown>) => Promise<unknown>,
+        ) => {
+            events.push(`pin:${reason}`)
+            try {
+                return await callback({
+                    revision: 4,
+                    withNativeFile: async (
+                        options: unknown,
+                        nativeCallback: (file: { path: string; bytes: number }) => Promise<unknown>,
+                    ) => {
+                        events.push(`native-file:${JSON.stringify(options)}`)
+                        try {
+                            return await nativeCallback({
+                                path: '/app/persistent/exports/risusave-a.risudat',
+                                bytes: 8_192,
+                            })
+                        }
+                        finally {
+                            events.push('native-file-cleanup')
+                        }
+                    },
+                })
+            }
+            finally {
+                events.push('lease-release')
+            }
+        })
+        installAndroidExport(deps, { withFlushedExport, copyAndroidExport })
+
+        const pending = exportRisuSaveFromPicker({ omitAccount: true }, deps)
+        await vi.waitFor(() => expect(events).toEqual([
+            'pin:risu-save-file-export',
+            'native-file:{"omitAccount":true}',
+            'saf-copy-start',
+        ]))
+        expect(deps.collectWebExport).not.toHaveBeenCalled()
+        expect(deps.downloadWebExport).not.toHaveBeenCalled()
+
+        releaseTerminal()
+
+        await expect(pending).resolves.toEqual({
+            mode: 'native',
+            bytes: 8_192,
+            warningCodes: ['android-saf-provider-not-atomic'],
+        })
+        expect(events).toEqual([
+            'pin:risu-save-file-export',
+            'native-file:{"omitAccount":true}',
+            'saf-copy-start',
+            'saf-terminal',
+            'native-file-cleanup',
+            'lease-release',
+        ])
+    })
+
+    it('fails closed when Android SAF reports a different byte count', async () => {
+        const deps = dependencies('native-desktop')
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                withNativeFile: async (_options: unknown, nativeCallback: Function) =>
+                    await nativeCallback({ path: '/app/persistent/exports/source.risudat', bytes: 10 }),
+            }),
+            copyAndroidExport: async () => ({
+                requestId: 'saf-request-2',
+                bytes: 9,
+                warningCodes: ['android-saf-provider-not-atomic'],
+            }),
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            code: 'byte-count-mismatch',
+            warningCodes: [
+                'android-saf-provider-not-atomic',
+                'partial-destination-may-remain',
+            ],
+        })
+        expect(deps.collectWebExport).not.toHaveBeenCalled()
+    })
+
+    it('deduplicates Android SAF warning codes', async () => {
+        const deps = dependencies('native-desktop')
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                withNativeFile: async (_options: unknown, nativeCallback: Function) =>
+                    await nativeCallback({ path: '/app/persistent/exports/source.risudat', bytes: 10 }),
+            }),
+            copyAndroidExport: async () => ({
+                requestId: 'saf-request-3',
+                bytes: 10,
+                warningCodes: [
+                    'android-saf-provider-not-atomic',
+                    'android-saf-provider-not-atomic',
+                    'partial-destination-may-remain',
+                ],
+            }),
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).resolves.toEqual({
+            mode: 'native',
+            bytes: 10,
+            warningCodes: [
+                'android-saf-provider-not-atomic',
+                'partial-destination-may-remain',
+            ],
+        })
+    })
+
+    it('releases the managed file only after a cancelled SAF terminal preserves its partial warning', async () => {
+        const deps = dependencies('native-desktop')
+        const events: string[] = []
+        const cancellation = Object.assign(
+            new DOMException('copy cancelled', 'AbortError'),
+            {
+                warningCodes: [
+                    'partial-destination-may-remain',
+                    'partial-destination-may-remain',
+                ],
+            },
+        )
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => {
+                try {
+                    return await callback({
+                        withNativeFile: async (_options: unknown, nativeCallback: Function) => {
+                            try {
+                                return await nativeCallback({
+                                    path: '/app/persistent/exports/source.risudat',
+                                    bytes: 10,
+                                })
+                            }
+                            finally {
+                                events.push('native-file-cleanup')
+                            }
+                        },
+                    })
+                }
+                finally {
+                    events.push('lease-release')
+                }
+            },
+            copyAndroidExport: async () => {
+                events.push('saf-cancelled-terminal')
+                throw cancellation
+            },
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            name: 'AbortError',
+            warningCodes: ['partial-destination-may-remain'],
+        })
+        expect(events).toEqual([
+            'saf-cancelled-terminal',
+            'native-file-cleanup',
+            'lease-release',
+        ])
+    })
+
+    it('fails closed when the pinned Android revision has no managed native file', async () => {
+        const deps = dependencies('native-desktop')
+        const copyAndroidExport = vi.fn()
+        installAndroidExport(deps, {
+            withFlushedExport: async (_runtime, _reason, callback) => await callback({
+                revision: 4,
+                collectBytes: vi.fn(async () => Uint8Array.from([1, 2, 3])),
+            }),
+            copyAndroidExport,
+        })
+
+        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            code: 'capability-unavailable',
+        })
+        expect(copyAndroidExport).not.toHaveBeenCalled()
+        expect(deps.collectWebExport).not.toHaveBeenCalled()
+        expect(deps.downloadWebExport).not.toHaveBeenCalled()
+    })
+
     it('passes only the selected desktop path to native import and refreshes through the job facade', async () => {
         const deps = dependencies('native-desktop')
 
