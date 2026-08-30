@@ -892,17 +892,17 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
 
     @JavascriptInterface
-    fun acknowledgeExport(requestId: String): Boolean {
-      if (!isCanonicalUuidV4(requestId)) return false
-      val record = loadSafDestinationState()
-        ?.takeIf { it.requestId == requestId && it.isTerminal() }
-        ?: return false
-      if (!prepareManagedExportAcknowledgement(dataDir, record.exportId, record.sourceKind)) {
-        return false
-      }
-      if (!clearSafDestinationState(requestId)) return false
-      return true
-    }
+    fun acknowledgeExport(requestId: String): Boolean = acknowledgeSafDestinationExport(
+      requestId,
+      ::loadSafDestinationState,
+      { record ->
+        requiresRisuSavePublicationProof(dataDir, record.exportId, record.sourceKind)
+      },
+      { record ->
+        prepareManagedExportAcknowledgement(dataDir, record.exportId, record.sourceKind)
+      },
+      ::clearSafDestinationState,
+    )
   }
 
   private fun onLosslessSourceSelected(uri: Uri?) {

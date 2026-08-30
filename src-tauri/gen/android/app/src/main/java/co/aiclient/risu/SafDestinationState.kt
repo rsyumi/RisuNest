@@ -271,6 +271,25 @@ internal fun completedSafPublicationPrerequisites(
   )
 }
 
+internal fun acknowledgeSafDestinationExport(
+  requestId: String,
+  load: () -> SafDestinationRecord?,
+  requiresPublicationProof: (SafDestinationRecord) -> Boolean,
+  prepare: (SafDestinationRecord) -> Boolean,
+  clear: (String) -> Boolean,
+): Boolean {
+  if (!isCanonicalUuidV4(requestId)) return false
+  val record = load()
+    ?.takeIf { it.requestId == requestId && it.isTerminal() }
+    ?: return false
+  if (
+    requiresPublicationProof(record) &&
+    !record.publicationPrerequisitesComplete
+  ) return false
+  if (!prepare(record)) return false
+  return clear(requestId)
+}
+
 internal fun interruptedSafDestinationWarnings(deletePartial: () -> Boolean): List<String> {
   val warnings = mutableListOf("android-saf-provider-not-atomic")
   if (!runCatching(deletePartial).getOrDefault(false)) {

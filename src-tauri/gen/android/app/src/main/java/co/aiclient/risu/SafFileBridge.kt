@@ -649,6 +649,16 @@ internal fun prepareManagedExportAcknowledgement(
   return discardManagedScreenshotSource(appDataRoot, exportId)
 }
 
+internal fun requiresRisuSavePublicationProof(
+  appDataRoot: File,
+  exportId: String,
+  sourceKind: SafDestinationSourceKind,
+): Boolean {
+  if (sourceKind != SafDestinationSourceKind.RISU_SAVE) return false
+  val source = resolveManagedExportById(appDataRoot, exportId) ?: return true
+  return MANAGED_EXPORT_NAME.matches(source.name)
+}
+
 private fun withPartialCleanup(
   error: SafDestinationException,
   deletePartial: () -> Boolean,

@@ -18,6 +18,40 @@ import org.junit.Test
 class SafFileBridgeTest {
   private fun temporaryDirectory(): File = Files.createTempDirectory("risu-saf-test").toFile()
 
+  private fun terminalDestinationRecord(
+    requestId: String,
+    exportId: String,
+    sourceKind: SafDestinationSourceKind,
+    publicationPrerequisitesComplete: Boolean,
+  ) = SafDestinationRecord(
+    requestId = requestId,
+    exportId = exportId,
+    phase = SafDestinationPhase.SUCCEEDED,
+    destinationUri = "content://provider/document/42",
+    bytes = 42,
+    code = null,
+    warningCodes = emptyList(),
+    updatedAtMillis = 2_000,
+    sourceKind = sourceKind,
+    publicationPrerequisitesComplete = publicationPrerequisitesComplete,
+  )
+
+  private fun acknowledgeStoredDestination(
+    appData: File,
+    store: SafDestinationStateStore,
+    requestId: String,
+  ) = acknowledgeSafDestinationExport(
+    requestId,
+    store::load,
+    { record ->
+      requiresRisuSavePublicationProof(appData, record.exportId, record.sourceKind)
+    },
+    { record ->
+      prepareManagedExportAcknowledgement(appData, record.exportId, record.sourceKind)
+    },
+    store::clear,
+  )
+
   @Test
   fun `multiple sources spool to separate ready tokens without using display names as paths`() = runBlocking {
     val root = temporaryDirectory()
@@ -421,6 +455,100 @@ class SafFileBridgeTest {
     assertEquals(true, afterRecreation?.publicationPrerequisitesComplete)
     assertEquals(2_002L, afterRecreation?.updatedAtMillis)
     assertTrue(stateFile.readText().contains("\"publicationPrerequisitesComplete\":true"))
+  }
+
+  @Test
+  fun `production acknowledgement rejects and preserves RisuSave without publication proof`() {
+    val appData = temporaryDirectory()
+    val stateFile = appData.resolve("native-file-jobs/android-saf-destination.json")
+    val store = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    val terminal = terminalDestinationRecord(
+      requestId = "10101010-1010-4010-8010-101010101010",
+      exportId = "20202020-2020-4020-8020-202020202020",
+      sourceKind = SafDestinationSourceKind.RISU_SAVE,
+      publicationPrerequisitesComplete = false,
+    )
+    store.save(terminal)
+
+    assertFalse(acknowledgeStoredDestination(appData, store, terminal.requestId))
+    assertEquals(terminal, store.load())
+  }
+
+  @Test
+  fun `production acknowledgement removes proved RisuSave terminal`() {
+    val appData = temporaryDirectory()
+    val stateFile = appData.resolve("native-file-jobs/android-saf-destination.json")
+    val store = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    val terminal = terminalDestinationRecord(
+      requestId = "30303030-3030-4030-8030-303030303030",
+      exportId = "40404040-4040-4040-8040-404040404040",
+      sourceKind = SafDestinationSourceKind.RISU_SAVE,
+      publicationPrerequisitesComplete = true,
+    )
+    store.save(terminal)
+
+    assertTrue(acknowledgeStoredDestination(appData, store, terminal.requestId))
+    assertNull(store.load())
+  }
+
+  @Test
+  fun `production acknowledgement keeps screenshot legacy character and module authority unchanged`() {
+    val appData = temporaryDirectory()
+    val stateFile = appData.resolve("native-file-jobs/android-saf-destination.json")
+    val store = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    val screenshot = terminalDestinationRecord(
+      requestId = "50505050-5050-4050-8050-505050505050",
+      exportId = "60606060-6060-4060-8060-606060606060",
+      sourceKind = SafDestinationSourceKind.SCREENSHOT,
+      publicationPrerequisitesComplete = false,
+    )
+    val screenshotDirectory = appData.resolve(
+      "native-file-jobs/screenshot-output/${screenshot.exportId}",
+    )
+    screenshotDirectory.mkdirs()
+    screenshotDirectory.resolve("ownership").writeText(screenshot.exportId)
+    screenshotDirectory.resolve("ready").writeText(screenshot.exportId)
+    screenshotDirectory.resolve("archive.zip.part").writeBytes(byteArrayOf(1))
+    store.save(screenshot)
+
+    fun acknowledge(requestId: String) = acknowledgeStoredDestination(appData, store, requestId)
+
+    assertTrue(acknowledge(screenshot.requestId))
+    assertFalse(screenshotDirectory.exists())
+    assertNull(store.load())
+
+    val legacy = terminalDestinationRecord(
+      requestId = "70707070-7070-4070-8070-707070707070",
+      exportId = "80808080-8080-4080-8080-808080808080",
+      sourceKind = SafDestinationSourceKind.LEGACY_BACKUP,
+      publicationPrerequisitesComplete = false,
+    )
+    store.save(legacy)
+    assertTrue(acknowledge(legacy.requestId))
+    assertNull(store.load())
+
+    val handoffs = appData.resolve("native-file-jobs/handoffs").apply { mkdirs() }
+    val character = terminalDestinationRecord(
+      requestId = "90909090-9090-4090-8090-909090909090",
+      exportId = "a0a0a0a0-a0a0-40a0-80a0-a0a0a0a0a0a0",
+      sourceKind = SafDestinationSourceKind.RISU_SAVE,
+      publicationPrerequisitesComplete = false,
+    )
+    handoffs.resolve("risu-character-card-${character.exportId}.png").writeBytes(byteArrayOf(1))
+    store.save(character)
+    assertTrue(acknowledge(character.requestId))
+    assertNull(store.load())
+
+    val module = terminalDestinationRecord(
+      requestId = "b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0",
+      exportId = "c0c0c0c0-c0c0-40c0-80c0-c0c0c0c0c0c0",
+      sourceKind = SafDestinationSourceKind.RISU_SAVE,
+      publicationPrerequisitesComplete = false,
+    )
+    handoffs.resolve("risu-module-${module.exportId}.risum").writeBytes(byteArrayOf(1))
+    store.save(module)
+    assertTrue(acknowledge(module.requestId))
+    assertNull(store.load())
   }
 
   @Test
