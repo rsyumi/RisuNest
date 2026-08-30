@@ -846,6 +846,8 @@ class SafFileBridgeTest {
     assertEquals("Leased.charx", safeSafDestinationName("Leased.charx"))
     assertEquals("Leased.jpeg", safeSafDestinationName("Leased.jpeg"))
     assertEquals("Leased.json", safeSafDestinationName("Leased.json"))
+    assertEquals("character.png", safeSafDestinationName("character.png"))
+    assertEquals("module.risum", safeSafDestinationName("module.risum"))
     assertEquals(
       "risunest-2026-08-29T00-00-00-000Z.risulossless",
       safeSafDestinationName("risunest-2026-08-29T00-00-00-000Z.risulossless"),

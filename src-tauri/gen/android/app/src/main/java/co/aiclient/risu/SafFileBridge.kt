@@ -717,6 +717,8 @@ internal fun safeSafDestinationName(name: String): String {
     || safe.endsWith(".charx", ignoreCase = true)
     || safe.endsWith(".jpeg", ignoreCase = true)
     || safe.endsWith(".json", ignoreCase = true)
+    || safe.endsWith(".png", ignoreCase = true)
+    || safe.endsWith(".risum", ignoreCase = true)
   ) safe else "$safe.risudat"
 }
 
