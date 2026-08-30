@@ -9683,6 +9683,50 @@ fn schema_v15_migrates_v14_without_scanning_cas_objects() {
 }
 
 #[test]
+fn schema_v13_to_v14_commit_is_a_resumable_boundary_before_v15() {
+    let directory = tempfile::tempdir().expect("create resumable v13 migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             DROP TABLE asset_object_deletions;
+             PRAGMA user_version = 13;",
+        )
+        .expect("create exact v13 fixture");
+    drop(store);
+
+    let database_path = directory.path().join("persistent/persistent.db");
+    let mut interrupted = Connection::open(&database_path).expect("open v13 database");
+    super::schema::migrate_v13_to_v14_for_test(&mut interrupted)
+        .expect("commit exact v14 boundary");
+    assert_eq!(
+        interrupted
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        14
+    );
+    assert!(
+        table_columns(&interrupted, "logical_sync_device_ack_proofs")
+            .iter()
+            .any(|column| column.0 == "local_generation_id")
+    );
+    assert!(table_columns(&interrupted, "asset_object_deletions").is_empty());
+    drop(interrupted);
+
+    let resumed = PersistentStore::open(directory.path()).expect("resume v14 to v15 migration");
+    assert_eq!(
+        resumed
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    assert!(!table_columns(&resumed.connection, "asset_object_deletions").is_empty());
+}
+
+#[test]
 fn asset_object_catalog_is_idempotent_conflict_safe_and_stably_paged() {
     use super::asset_object_catalog::AssetObjectRegistration;
 
@@ -10069,6 +10113,50 @@ fn asset_gc_delete_page_refuses_unsealed_jobs_and_unready_migrations() {
     assert_eq!(
         cas.stat_object(&prepared.content_hash).unwrap(),
         Some(prepared.byte_size)
+    );
+}
+
+#[test]
+fn asset_gc_delete_page_rejects_same_size_corruption_and_keeps_recovery_evidence() {
+    let directory = tempfile::tempdir().expect("create corrupted candidate directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"original candidate bytes").unwrap();
+    register_gc_candidate(&mut store, &prepared);
+    let object_path = directory.path().join(&prepared.physical_key);
+    fs::write(&object_path, b"corrupt! candidate bytes").unwrap();
+    assert_eq!(
+        fs::metadata(&object_path).unwrap().len(),
+        prepared.byte_size
+    );
+
+    let error = store
+        .asset_gc_delete_page(16, None, 100, 10)
+        .expect_err("same-size corrupt object must not be deleted");
+
+    assert!(error.to_string().contains("corruption"));
+    assert_eq!(fs::read(&object_path).unwrap(), b"corrupt! candidate bytes");
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_objects WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT state FROM asset_object_deletions WHERE object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "pending"
     );
 }
 

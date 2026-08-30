@@ -5,8 +5,13 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::{
+    fs::{MetadataExt, OpenOptionsExt},
+    io::AsRawHandle,
+};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -229,6 +234,37 @@ impl PayloadCas {
         expected_byte_size: u64,
         expected_physical_key: &str,
     ) -> io::Result<ExactObjectUnlink> {
+        self.unlink_exact_object_inner(
+            content_hash,
+            expected_byte_size,
+            expected_physical_key,
+            |_| Ok(()),
+        )
+    }
+
+    #[cfg(test)]
+    fn unlink_exact_object_with_hash_hook(
+        &self,
+        content_hash: &str,
+        expected_byte_size: u64,
+        expected_physical_key: &str,
+        after_hash: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<ExactObjectUnlink> {
+        self.unlink_exact_object_inner(
+            content_hash,
+            expected_byte_size,
+            expected_physical_key,
+            after_hash,
+        )
+    }
+
+    fn unlink_exact_object_inner(
+        &self,
+        content_hash: &str,
+        expected_byte_size: u64,
+        expected_physical_key: &str,
+        after_hash: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<ExactObjectUnlink> {
         validate_content_hash(content_hash)?;
         let physical_key = object_physical_key(content_hash);
         if expected_physical_key != physical_key {
@@ -240,13 +276,27 @@ impl PayloadCas {
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(ExactObjectUnlink::Missing);
         };
-        let metadata = fs::symlink_metadata(&path)?;
-        self.validate_owned_file(&path, &metadata)?;
-        if metadata.len() != expected_byte_size {
+        let mut file = self.open_exact_owned_file(&path)?;
+        let identity = exact_file_identity(&file)?;
+        if identity.byte_size() != expected_byte_size {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "deletion tombstone size does not match the exact canonical object",
             ));
+        }
+        let actual_hash = hash_open_file(&mut file)?;
+        if exact_file_identity(&file)? != identity {
+            return exact_object_changed();
+        }
+        if actual_hash != content_hash {
+            return collision_or_corruption(expected_physical_key);
+        }
+        after_hash(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        self.validate_owned_file(&path, &metadata)?;
+        let final_file = self.open_exact_owned_file(&path)?;
+        if exact_file_identity(&final_file)? != identity {
+            return exact_object_changed();
         }
         fs::remove_file(&path)?;
         let parent = path.parent().ok_or_else(|| {
@@ -360,6 +410,26 @@ impl PayloadCas {
         self.ensure_canonical_confinement(path)
     }
 
+    fn open_exact_owned_file(&self, path: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            };
+            options
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        self.validate_owned_file(path, &metadata)?;
+        Ok(file)
+    }
+
     fn ensure_canonical_confinement(&self, path: &Path) -> io::Result<()> {
         let canonical = fs::canonicalize(path)?;
         if !canonical.starts_with(&self.repository_root) {
@@ -375,22 +445,11 @@ impl PayloadCas {
         expected_size: u64,
         physical_key: &str,
     ) -> io::Result<()> {
-        let metadata = fs::symlink_metadata(path)?;
-        self.validate_owned_file(path, &metadata)?;
-        if metadata.len() != expected_size {
+        let mut file = self.open_exact_owned_file(path)?;
+        if file.metadata()?.len() != expected_size {
             return collision_or_corruption(physical_key);
         }
-        let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        if hex::encode(hasher.finalize()) != expected_hash {
+        if hash_open_file(&mut file)? != expected_hash {
             return collision_or_corruption(physical_key);
         }
         Ok(())
@@ -489,6 +548,132 @@ fn collision_or_corruption<T>(physical_key: &str) -> io::Result<T> {
         ErrorKind::InvalidData,
         format!("payload collision or corruption at {physical_key}"),
     ))
+}
+
+fn hash_open_file(file: &mut File) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn exact_object_changed<T>() -> io::Result<T> {
+    Err(io::Error::new(
+        ErrorKind::InvalidData,
+        "exact canonical object changed while it was being verified for deletion",
+    ))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactFileIdentity {
+    device: u64,
+    inode: u64,
+    byte_size: u64,
+    mode: u32,
+    links: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl ExactFileIdentity {
+    fn byte_size(self) -> u64 {
+        self.byte_size
+    }
+}
+
+#[cfg(unix)]
+fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
+    let metadata = file.metadata()?;
+    Ok(ExactFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        byte_size: metadata.len(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactFileIdentity {
+    volume: u32,
+    file_index: u64,
+    byte_size: u64,
+    links: u32,
+    attributes: u32,
+    creation_time: u64,
+    modified_time: u64,
+}
+
+#[cfg(windows)]
+impl ExactFileIdentity {
+    fn byte_size(self) -> u64 {
+        self.byte_size
+    }
+}
+
+#[cfg(windows)]
+fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ExactFileIdentity {
+        volume: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        byte_size: (u64::from(information.nFileSizeHigh) << 32)
+            | u64::from(information.nFileSizeLow),
+        links: information.nNumberOfLinks,
+        attributes: information.dwFileAttributes,
+        creation_time: (u64::from(information.ftCreationTime.dwHighDateTime) << 32)
+            | u64::from(information.ftCreationTime.dwLowDateTime),
+        modified_time: (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(information.ftLastWriteTime.dwLowDateTime),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactFileIdentity {
+    byte_size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(not(any(unix, windows)))]
+impl ExactFileIdentity {
+    fn byte_size(self) -> u64 {
+        self.byte_size
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
+    let metadata = file.metadata()?;
+    Ok(ExactFileIdentity {
+        byte_size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 #[cfg(unix)]
@@ -702,5 +887,30 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn exact_object_unlink_rejects_same_size_replacement_after_streamed_hashing() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let original = vec![0x51; super::COPY_BUFFER_BYTES * 3 + 17];
+        let replacement = vec![0x72; original.len()];
+        let prepared = cas.prepare_bytes(&original).unwrap();
+        let object_path = directory.path().join(&prepared.physical_key);
+
+        let error = cas
+            .unlink_exact_object_with_hash_hook(
+                &prepared.content_hash,
+                prepared.byte_size,
+                &prepared.physical_key,
+                |_| {
+                    std::fs::remove_file(&object_path)?;
+                    std::fs::write(&object_path, &replacement)
+                },
+            )
+            .expect_err("same-size replacement after hashing must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(object_path).unwrap(), replacement);
     }
 }

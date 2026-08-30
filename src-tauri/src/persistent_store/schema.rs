@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::Value;
 
 pub(super) const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION_V14: u32 = 14;
 
 const ASSET_OBJECT_DELETION_TABLE_SQL: &str = r#"
 CREATE TABLE asset_object_deletions (
@@ -485,7 +486,7 @@ fn migrate_v13_to_v14(connection: &mut Connection) -> StoreResult<()> {
          WHERE status != 'forgotten';",
     )?;
     validate_v14_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION_V14)?;
     transaction.commit()?;
     Ok(())
 }
@@ -499,6 +500,11 @@ fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()> {
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn migrate_v13_to_v14_for_test(connection: &mut Connection) -> StoreResult<()> {
+    migrate_v13_to_v14(connection)
 }
 
 fn validate_v13_schema(connection: &Connection) -> StoreResult<()> {
