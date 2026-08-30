@@ -456,9 +456,9 @@ use uuid::Uuid;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const JSON_LIMIT_MESSAGE: &str = "native JSON character card exceeds the 8 MiB importer limit";
-const FALLBACK_PORTRAIT: &[u8] = include_bytes!("../../../public/none.webp");
+pub(super) const FALLBACK_PORTRAIT: &[u8] = include_bytes!("../../../public/none.webp");
 
-enum JsonAssetSource {
+pub(super) enum JsonAssetSource {
     Cas {
         key: String,
         hash: String,
@@ -682,7 +682,7 @@ where
     })
 }
 
-fn validate_metadata(
+pub(super) fn validate_metadata(
     character: &Value,
     character_id: &str,
     metadata: &Value,
@@ -787,7 +787,7 @@ fn expected_card_assets(character: &Map<String, Value>) -> Result<Vec<Value>, Na
     Ok(assets)
 }
 
-fn json_asset_sources(
+pub(super) fn json_asset_sources(
     character: &Value,
     additional_entries: Option<&[OwnerManifestEntry]>,
     metadata: &Value,

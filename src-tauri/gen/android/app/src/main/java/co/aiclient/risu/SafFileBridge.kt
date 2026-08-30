@@ -51,7 +51,10 @@ private val MANAGED_CHARACTER_CHARX_NAME = Regex(
   "risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.(?:charx|jpeg)",
 )
 private val MANAGED_CHARACTER_CARD_NAME = Regex(
-  "risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.json",
+  "risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.(?:json|png)",
+)
+private val MANAGED_RISU_MODULE_NAME = Regex(
+  "risu-module-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risum",
 )
 private const val MANAGED_SCREENSHOT_FILE = "archive.zip.part"
 private const val MANAGED_SCREENSHOT_OWNERSHIP = "ownership"
@@ -477,6 +480,7 @@ internal fun resolveManagedExportSource(appDataRoot: File, sourcePath: String): 
   resolveManagedLegacyBackupSource(appDataRoot, sourcePath)?.let { return it }
   resolveManagedCharacterCharxSource(appDataRoot, sourcePath)?.let { return it }
   resolveManagedCharacterCardSource(appDataRoot, sourcePath)?.let { return it }
+  resolveManagedRisuModuleSource(appDataRoot, sourcePath)?.let { return it }
   return resolveManagedScreenshotSource(appDataRoot, sourcePath)
 }
 
@@ -557,6 +561,17 @@ private fun resolveManagedCharacterCardSource(appDataRoot: File, sourcePath: Str
   return source
 }
 
+private fun resolveManagedRisuModuleSource(appDataRoot: File, sourcePath: String): File? {
+  val handoffsRoot = runCatching {
+    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
+  }.getOrNull() ?: return null
+  if (!handoffsRoot.isDirectory) return null
+  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
+  if (!source.isFile || source.parentFile != handoffsRoot) return null
+  if (MANAGED_RISU_MODULE_NAME.matchEntire(source.name) == null) return null
+  return source
+}
+
 private fun readExactOwner(marker: File): String? {
   if (!marker.isFile || marker.length() > 64) return null
   return runCatching { marker.readText(Charsets.UTF_8) }.getOrNull()
@@ -568,6 +583,7 @@ internal fun managedExportId(source: File): String? {
   MANAGED_LEGACY_BACKUP_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
   MANAGED_CHARACTER_CHARX_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
   MANAGED_CHARACTER_CARD_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
+  MANAGED_RISU_MODULE_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
   if (source.name != MANAGED_SCREENSHOT_FILE) return null
   return source.parentFile?.name?.takeIf(::isCanonicalUuidV4)
 }
@@ -601,6 +617,12 @@ internal fun resolveManagedExportById(appDataRoot: File, exportId: String): File
     "native-file-jobs/handoffs/risu-character-card-$exportId.json",
   )
   resolveManagedCharacterCardSource(appDataRoot, characterCard.absolutePath)?.let { return it }
+  val characterPng = appDataRoot.resolve(
+    "native-file-jobs/handoffs/risu-character-card-$exportId.png",
+  )
+  resolveManagedCharacterCardSource(appDataRoot, characterPng.absolutePath)?.let { return it }
+  val risuModule = appDataRoot.resolve("native-file-jobs/handoffs/risu-module-$exportId.risum")
+  resolveManagedRisuModuleSource(appDataRoot, risuModule.absolutePath)?.let { return it }
   val screenshot = appDataRoot.resolve(
     "native-file-jobs/screenshot-output/$exportId/$MANAGED_SCREENSHOT_FILE",
   )

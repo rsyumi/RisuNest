@@ -34,7 +34,9 @@ function androidSafHandoffId(status: NativeFileJobStatus): string | null {
             : status.kind === 'export-character-charx'
                 ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:charx|jpeg)$/
                 : status.kind === 'export-character-card'
-                    ? /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/
+                    ? /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:json|png)$/
+                    : status.kind === 'export-risu-module'
+                        ? /(?:^|[\\/])risu-module-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risum$/
                     : null
     return pattern?.exec(path)?.[1] ?? null
 }
@@ -116,6 +118,13 @@ async function reconcileExportInBackground(
         else if (status.kind === 'export-character-card' && status.result?.handoffPath) {
             retainNativeJob = true
             await dependencies.invoke('native_character_card_handoff_cleanup', {
+                path: status.result.handoffPath,
+            })
+            retainNativeJob = false
+        }
+        else if (status.kind === 'export-risu-module' && status.result?.handoffPath) {
+            retainNativeJob = true
+            await dependencies.invoke('native_risu_module_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
             retainNativeJob = false

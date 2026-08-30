@@ -180,6 +180,28 @@ pub(crate) fn write_character_card_destination_controlled(
     )
 }
 
+pub(crate) fn write_risu_module_destination_controlled(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(DestinationProgress),
+    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
+) -> Result<DestinationWriteResult, DestinationWriteError> {
+    write_desktop_destination_with_commit_kind(
+        &RealFileSystem,
+        SourceKind::RisuModule,
+        source_root,
+        source,
+        destination_root,
+        destination,
+        is_cancelled,
+        on_progress,
+        before_replace,
+    )
+}
+
 trait DestinationFileSystem {
     type Source: Read;
     type Destination: Write;
@@ -289,6 +311,7 @@ enum SourceKind {
     LegacyBackup,
     CharacterCharX,
     CharacterCard,
+    RisuModule,
 }
 
 fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
@@ -309,6 +332,7 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
         SourceKind::LegacyBackup => validated_legacy_backup_source(source_root, source)?,
         SourceKind::CharacterCharX => validated_charx_source(source_root, source)?,
         SourceKind::CharacterCard => validated_character_card_source(source_root, source)?,
+        SourceKind::RisuModule => validated_risu_module_source(source_root, source)?,
     };
     let destination = validated_destination(destination_root, destination)?;
     if source.parent() == destination.parent() {
@@ -442,7 +466,25 @@ fn validated_character_card_source(
     let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
     let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
     if source.parent() != Some(root.as_path())
-        || source.file_name().and_then(|name| name.to_str()) != Some("character.json")
+        || !matches!(
+            source.file_name().and_then(|name| name.to_str()),
+            Some("character.json" | "character.png")
+        )
+        || !source.is_file()
+    {
+        return Err(DestinationWriteError::InvalidSource);
+    }
+    Ok(source)
+}
+
+fn validated_risu_module_source(
+    source_root: &Path,
+    source: &Path,
+) -> Result<PathBuf, DestinationWriteError> {
+    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
+    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
+    if source.parent() != Some(root.as_path())
+        || source.file_name().and_then(|name| name.to_str()) != Some("module.risum")
         || !source.is_file()
     {
         return Err(DestinationWriteError::InvalidSource);

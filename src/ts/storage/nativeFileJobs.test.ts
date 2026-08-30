@@ -11,6 +11,7 @@ import {
     runNativeLosslessBackupExport,
     runNativeCharacterCharxExport,
     runNativeCharacterCardExport,
+    runNativeRisuModuleExport,
     runNativeLosslessBackupRestore,
     runNativeOfficialPublicationAttempt,
     resumeNativeOfficialPublication,
@@ -379,6 +380,55 @@ describe('native file jobs', () => {
         ])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
         expect(JSON.stringify(calls)).not.toContain('data:image')
+    })
+
+    it('hands an exact-index RISUM descriptor to Android SAF and cleans both receipts', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-module-123e4567-e89b-42d3-a456-426614174006.risum'
+        const result = await runNativeRisuModuleExport({
+            moduleIndex: 7,
+            destination: { type: 'androidSaf', suggestedName: 'Module.risum' },
+            expectedRevision: 44,
+        }, {}, {
+            isTauri: () => true,
+            invoke: async (command, args) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_start') return { jobId: 'risum-export' }
+                if (command === 'native_file_job_status') return {
+                    jobId: 'risum-export',
+                    kind: 'export-risu-module',
+                    state: 'succeeded',
+                    phase: 'complete',
+                    progress: { completedBytes: 9, completedItems: 3 },
+                    result: {
+                        revision: 44,
+                        sourceBytes: 9,
+                        sourceSha256: 'e'.repeat(64),
+                        characterCount: 0,
+                        presetCount: 0,
+                        warningCodes: [],
+                        handoffPath,
+                    },
+                }
+                if (command === 'native_risu_module_handoff_cleanup') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+            copyToAndroidSaf: async () => ({ bytes: 9, warningCodes: [] }),
+        })
+        expect(result.handoffPath).toBeUndefined()
+        expect(calls).toEqual([
+            ['native_file_job_start', { request: {
+                kind: 'export-risu-module',
+                expectedRevision: 44,
+                moduleIndex: 7,
+            } }],
+            ['native_file_job_status', { jobId: 'risum-export' }],
+            ['native_risu_module_handoff_cleanup', { path: handoffPath }],
+            ['native_file_job_forget', { jobId: 'risum-export' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
     it('restores an official snapshot without transferring its database bytes through IPC', async () => {

@@ -267,6 +267,12 @@ export interface NativeCharacterCardExportInput {
     metadata: Record<string, unknown>
 }
 
+export interface NativeRisuModuleExportInput {
+    moduleIndex: number
+    destination: NativeCharacterCharxExportDestination
+    expectedRevision: number
+}
+
 export type NativeCharacterCharxExportDestination =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSaf'; suggestedName: string }
@@ -1267,6 +1273,127 @@ export async function runNativeCharacterCardExport(
                         ...result.warningCodes
                             .filter((code) => code !== 'cleanup-failed')
                             .slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+            }
+        }
+        if (!handoffCleanupFailed) {
+            try {
+                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+            }
+            catch (error) {
+                if (result) {
+                    result.warningCodes = [
+                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+                else if (!outcomeFailed) throw error
+            }
+        }
+    }
+}
+
+export async function runNativeRisuModuleExport(
+    input: NativeRisuModuleExportInput,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) throw new Error('Native RISUM export requires Tauri')
+    if (options.signal?.aborted) throw abortError()
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request: {
+            kind: 'export-risu-module',
+            ...(input.destination.type === 'desktopPath'
+                ? { destination: input.destination.path }
+                : {}),
+            expectedRevision: input.expectedRevision,
+            moduleIndex: input.moduleIndex,
+        },
+    }) as { jobId: string; warningCodes?: string[] }
+    let cancellationRequested = false
+    let terminal: NativeFileJobStatus | undefined
+    while (!terminal) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (isTerminalJob(status)) terminal = status
+        else await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+    let outcomeFailed = false
+    let result: NativeFileJobResult | undefined
+    let managedSource: string | undefined
+    let handoffCleanupFailed = false
+    try {
+        if (terminal.state === 'cancelled') throw abortError()
+        if (terminal.state !== 'succeeded') {
+            throw new NativeFileJobError(
+                terminal.error?.code ?? 'export-failed',
+                terminal.error?.message ?? 'Native RISUM export failed',
+            )
+        }
+        if (!terminal.result) {
+            throw new NativeFileJobError('missing-result', 'Native RISUM export returned no result')
+        }
+        result = {
+            ...terminal.result,
+            warningCodes: [...new Set([
+                ...(started.warningCodes ?? []),
+                ...terminal.result.warningCodes,
+            ])].slice(0, 16),
+        }
+        if (input.destination.type === 'androidSaf') {
+            managedSource = result.handoffPath
+            if (!managedSource) {
+                throw new NativeFileJobError(
+                    'missing-handoff',
+                    'Native RISUM export returned no Android handoff path',
+                )
+            }
+            const published = await dependencies.copyToAndroidSaf({
+                sourcePath: managedSource,
+                suggestedName: input.destination.suggestedName,
+                signal: options.signal,
+            })
+            if (published.bytes !== result.sourceBytes) {
+                throw new NativeFileJobError(
+                    'length-mismatch',
+                    'Android SAF RISUM length differs from its native source',
+                )
+            }
+            const { handoffPath: _handoffPath, ...publishedResult } = result
+            result = {
+                ...publishedResult,
+                warningCodes: [...new Set([
+                    ...publishedResult.warningCodes,
+                    ...published.warningCodes,
+                ])].slice(0, 16),
+            }
+        }
+        return result
+    }
+    catch (error) {
+        outcomeFailed = true
+        throw error
+    }
+    finally {
+        if (managedSource) {
+            try {
+                await invokeNative(dependencies, 'native_risu_module_handoff_cleanup', {
+                    path: managedSource,
+                })
+            }
+            catch {
+                handoffCleanupFailed = true
+                if (result && !outcomeFailed) {
+                    result.warningCodes = [
+                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
                         'cleanup-failed',
                     ]
                 }

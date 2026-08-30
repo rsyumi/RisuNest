@@ -713,6 +713,39 @@ describe('character card additions', () => {
         expect(mocks.downloads).toEqual([])
     })
 
+    it('routes selected CCv3 PNG through the native card exporter', async () => {
+        const character = {
+            type: 'character',
+            name: 'Native PNG card',
+            image: 'assets/avatar.png',
+            chats: [],
+            chaId: 'native-png-card',
+            globalLore: [],
+            customscript: [],
+            triggerscript: [],
+            alternateGreetings: [],
+            tags: [],
+            additionalAssets: [],
+            ccAssets: [],
+            extentions: {},
+        } as any
+        mocks.database.characters = [character]
+        mocks.alertCardExport.mockResolvedValue({ type: '', type2: 'png' } as any)
+
+        await exportChar(0)
+
+        expect(mocks.exportNativeCharacterCardFromPicker).toHaveBeenCalledOnce()
+        expect(mocks.exportNativeCharacterCardFromPicker).toHaveBeenCalledWith(expect.objectContaining({
+            characterId: 'native-png-card',
+            suggestedName: 'Native PNG card.png',
+            format: 'png-card',
+        }))
+        expect(mocks.readImage).not.toHaveBeenCalled()
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.pngWrites).toEqual([])
+        expect(mocks.downloads).toEqual([])
+    })
+
     it('shows the established export error alert when native CharX export fails', async () => {
         const error = new Error('destination is full')
         mocks.database.characters = [{

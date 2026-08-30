@@ -768,6 +768,24 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `destination source accepts exact PNG card and RISUM handoffs`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs")
+    handoffs.mkdirs()
+    val pngId = "99999999-9999-4999-8999-999999999999"
+    val moduleId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val png = handoffs.resolve("risu-character-card-$pngId.png").apply { writeBytes(byteArrayOf(1)) }
+    val module = handoffs.resolve("risu-module-$moduleId.risum").apply { writeBytes(byteArrayOf(2)) }
+
+    assertEquals(png.canonicalFile, resolveManagedExportSource(appData, png.path))
+    assertEquals(module.canonicalFile, resolveManagedExportSource(appData, module.path))
+    assertEquals(pngId, managedExportId(png))
+    assertEquals(moduleId, managedExportId(module))
+    assertEquals(png.canonicalFile, resolveManagedExportById(appData, pngId))
+    assertEquals(module.canonicalFile, resolveManagedExportById(appData, moduleId))
+  }
+
+  @Test
   fun `acknowledged screenshot cleanup removes only the matching owned handoff`() {
     val appData = temporaryDirectory()
     val id = "99999999-9999-4999-8999-999999999999"

@@ -784,12 +784,12 @@ export async function exportChar(charaID:number):Promise<string> {
                 return ''
             }
         }
-        if(option.type2 === 'json'){
+        if(option.type2 === 'json' || option.type2 === 'png'){
             try {
                 const nativeResult = await exportNativeCharacterCardFromPicker({
                     characterId: char.chaId,
-                    suggestedName: `${char.name || 'character'}.json`,
-                    format: 'json-card',
+                    suggestedName: `${char.name || 'character'}.${option.type2}`,
+                    format: option.type2 === 'json' ? 'json-card' : 'png-card',
                     projectCharacter: (leasedDetail) => createBaseV3({
                         ...safeStructuredClone(leasedDetail),
                         chats: [],

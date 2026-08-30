@@ -11,7 +11,7 @@ import { DBState, HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } f
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
-import { isTauriDesktop } from '../platform'
+import { isTauri, isTauriDesktop } from '../platform'
 import { open } from '@tauri-apps/plugin-dialog'
 import { readFile } from '@tauri-apps/plugin-fs'
 import type { NativeFileJobOptions, NativeFileJobSource } from '../storage/nativeFileJobs'
@@ -92,6 +92,14 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
 } = {}){
     const alertEnd = arg.alertEnd ?? true
     const saveData = arg.saveData ?? true
+    if(saveData && isTauri){
+        const { exportNativeModuleRisumFromPicker } = await import('../storage/nativeModuleRisumExportRoute')
+        const result = await exportNativeModuleRisumFromPicker(module)
+        if(result !== undefined){
+            if(result && alertEnd) alertNormal(language.successExport)
+            return new Uint8Array(0)
+        }
+    }
     const apb = new AppendableBuffer()
     const writeLength = (len:number) => {
         const lenbuf = Buffer.alloc(4)
