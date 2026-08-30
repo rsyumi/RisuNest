@@ -10,6 +10,65 @@ import {
 const pairing = 'risuailocal://peer-delta/v1?endpoint=http%3A%2F%2F192.168.1.20%3A32145%2F&session=00000000-0000-4000-8000-000000000001&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 
 describe('peer logical delta product facade', () => {
+    test.each(['false', 'throw', 'timeout'] as const)(
+        'abandons exact P4 source reservation after %s foreground start failure',
+        async (failure) => {
+            const foreground = { lane: 'p4-source', operationId: '44444444-4444-4444-8444-444444444444', generation: 9 } as const
+            let owner: typeof foreground | undefined
+            const bridge = {
+                startSource: vi.fn(() => {
+                    if (failure === 'throw') throw new Error('service throw')
+                    return failure !== 'false'
+                }),
+                stopSource: vi.fn(() => true),
+            }
+            const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+                if (command === 'peer_delta_source_reserve') {
+                    if (owner) throw new Error('owner retained')
+                    owner = foreground
+                    return foreground as T
+                }
+                if (command === 'peer_sync_foreground_source_abandon') {
+                    owner = undefined
+                    return true as T
+                }
+                if (command === 'peer_delta_start' && failure === 'timeout') throw new Error('attach timeout')
+                return { phase: 'running', devices: [] } as T
+            }) as PeerDeltaInvoke
+            const facade = createPeerDeltaFacade({ platform: 'android', invoke, bridge })
+
+            await expect(facade.start('session')).rejects.toThrow()
+            expect(bridge.stopSource).toHaveBeenCalledWith(
+                foreground.lane,
+                foreground.operationId,
+                foreground.generation,
+            )
+            expect(invoke).toHaveBeenCalledWith('peer_sync_foreground_source_abandon', { foreground })
+            expect(owner).toBeUndefined()
+        },
+    )
+
+    test('retains both the P4 primary start error and exact-abandon failure', async () => {
+        const foreground = { lane: 'p4-source', operationId: '44444444-4444-4444-8444-444444444444', generation: 9 } as const
+        const primary = new Error('attach timeout')
+        const cleanup = new Error('abandon response lost')
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_source_reserve') return foreground as T
+            if (command === 'peer_sync_foreground_source_abandon') throw cleanup
+            throw primary
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({
+            platform: 'android',
+            invoke,
+            bridge: { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) },
+        })
+
+        const failure = await facade.start('session').catch((error: unknown) => error)
+
+        expect(failure).toBeInstanceOf(AggregateError)
+        expect((failure as AggregateError).errors).toEqual([primary, cleanup])
+    })
+
     test('parses only the dedicated strict delta pairing URI', () => {
         expect(parsePeerDeltaUri(pairing)).toEqual({
             endpoint: 'http://192.168.1.20:32145/',
@@ -200,6 +259,87 @@ describe('peer logical delta product facade', () => {
         await reconstructed.recoverTargetForeground()
         await expect(reconstructed.pull(pairing)).resolves.toMatchObject({ kind: 'noChanges' })
         expect(nativeOwner).toBeUndefined()
+    })
+
+    test('reconstructed recovery cancels Running and waits for Terminal committed publication', async () => {
+        const foreground = { lane: 'p4-target', operationId: '55555555-5555-4555-8555-555555555555', generation: 12 } as const
+        const events: string[] = []
+        let phase: 'running' | 'terminal' = 'running'
+        const bridge = {
+            startSource: vi.fn(() => true),
+            stopSource: vi.fn(() => { events.push('service-stop'); return true }),
+        }
+        const runtime: PeerDeltaMutationRuntime = {
+            flushPendingData: vi.fn(async () => { events.push('flush') }),
+            capturePersistentMutationToken: vi.fn(async () => {
+                events.push('capture')
+                return { revision: 12, mutationGeneration: 4 }
+            }),
+            acquirePersistentMutationFence: vi.fn(async () => {
+                events.push('fence')
+                return {
+                    async refreshCommittedWorkingSet(revision) { events.push(`refresh:${revision}`) },
+                    release() { events.push('release') },
+                }
+            }),
+        }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            events.push(command)
+            if (command === 'peer_delta_target_foreground_status') {
+                return {
+                    foreground,
+                    phase,
+                    ...(phase === 'terminal' ? {
+                        result: { kind: 'updated', revision: 13, transferredObjects: 1, transferredBytes: 32 },
+                    } : {}),
+                } as T
+            }
+            if (command === 'peer_delta_target_foreground_cancel') {
+                phase = 'terminal'
+                return true as T
+            }
+            if (command === 'peer_delta_target_foreground_release') return true as T
+            throw new Error(`unexpected ${command}`)
+        }) as PeerDeltaInvoke
+        const reconstructed = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+
+        await reconstructed.recoverTargetForeground()
+
+        expect(events).toEqual([
+            'peer_delta_target_foreground_status',
+            'peer_delta_target_foreground_cancel',
+            'peer_delta_target_foreground_status',
+            'flush', 'capture', 'fence', 'refresh:13', 'release',
+            'service-stop', 'peer_delta_target_foreground_release',
+        ])
+    })
+
+    test('Terminal precommit failure releases without refreshing data authority', async () => {
+        const foreground = { lane: 'p4-target', operationId: '66666666-6666-4666-8666-666666666666', generation: 13 } as const
+        const refresh = vi.fn()
+        const runtime: PeerDeltaMutationRuntime = {
+            flushPendingData: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 12, mutationGeneration: 4 })),
+            acquirePersistentMutationFence: vi.fn(async () => ({ refreshCommittedWorkingSet: refresh, release: vi.fn() })),
+        }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_target_foreground_status') {
+                return { foreground, phase: 'terminal', error: 'cancelled before activation' } as T
+            }
+            if (command === 'peer_delta_target_foreground_release') return true as T
+            throw new Error(`unexpected ${command}`)
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({
+            platform: 'android',
+            invoke,
+            runtime,
+            bridge: { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) },
+        })
+
+        await facade.recoverTargetForeground()
+
+        expect(refresh).not.toHaveBeenCalled()
+        expect(runtime.flushPendingData).not.toHaveBeenCalled()
     })
 
     test('flushes and fences the exact revision while native Rust applies and renderer refreshes', async () => {

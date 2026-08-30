@@ -349,7 +349,18 @@ struct PeerDeltaRuntime {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AndroidTargetForegroundStatus {
     foreground: AndroidForegroundKey,
+    phase: AndroidTargetForegroundPhase,
     result: Option<PeerDeltaPullResult>,
+    error: Option<String>,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AndroidTargetForegroundPhase {
+    Reserved,
+    Running,
+    Terminal,
 }
 
 #[derive(Clone)]
@@ -407,17 +418,19 @@ impl PeerDeltaCommandState {
             .map_err(PeerSyncError::Protocol)?;
         runtime.target_foreground = Some(AndroidTargetForegroundStatus {
             foreground: foreground.clone(),
+            phase: AndroidTargetForegroundPhase::Reserved,
             result: None,
+            error: None,
         });
         Ok(foreground)
     }
 
     #[cfg(any(target_os = "android", test))]
-    fn record_target_result_exact(
+    fn mark_target_running_exact(
         &self,
         foreground: &AndroidForegroundKey,
-        result: PeerDeltaPullResult,
     ) -> Result<(), PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
         let mut runtime = self.lock()?;
         let target = runtime.target_foreground.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("Android peer delta target foreground is absent".to_owned())
@@ -427,8 +440,62 @@ impl PeerDeltaCommandState {
                 "Android peer delta target foreground identity is stale".to_owned(),
             ));
         }
-        target.result = Some(result);
+        if target.phase != AndroidTargetForegroundPhase::Reserved {
+            return Err(PeerSyncError::Protocol(
+                "Android peer delta target foreground is not reserved".to_owned(),
+            ));
+        }
+        if !registry().retain_target_exact(foreground) {
+            return Err(PeerSyncError::Protocol(
+                "Android peer delta target foreground could not be retained".to_owned(),
+            ));
+        }
+        target.phase = AndroidTargetForegroundPhase::Running;
         Ok(())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn publish_target_terminal_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+        outcome: Result<PeerDeltaPullResult, String>,
+    ) -> Result<(), PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        let target = runtime.target_foreground.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("Android peer delta target foreground is absent".to_owned())
+        })?;
+        if target.foreground != *foreground {
+            return Err(PeerSyncError::Protocol(
+                "Android peer delta target foreground identity is stale".to_owned(),
+            ));
+        }
+        if target.phase != AndroidTargetForegroundPhase::Running {
+            return Err(PeerSyncError::Protocol(
+                "Android peer delta target foreground is not running".to_owned(),
+            ));
+        }
+        target.phase = AndroidTargetForegroundPhase::Terminal;
+        match outcome {
+            Ok(result) => target.result = Some(result),
+            Err(error) => target.error = Some(error),
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn cancel_target_foreground_exact(
+        &self,
+        foreground: &AndroidForegroundKey,
+    ) -> Result<bool, PeerSyncError> {
+        let runtime = self.lock()?;
+        let Some(target) = runtime.target_foreground.as_ref() else {
+            return Ok(false);
+        };
+        if target.foreground != *foreground {
+            return Ok(false);
+        }
+        Ok(registry().cancel_exact(foreground))
     }
 
     #[cfg(any(target_os = "android", test))]
@@ -446,13 +513,18 @@ impl PeerDeltaCommandState {
         let _operation = self.lock_lifecycle_operation()?;
         let mut runtime = self.lock()?;
         let Some(target) = runtime.target_foreground.as_ref() else {
-            return Ok(false);
+            return Ok(registry().release_target_exact(foreground));
         };
         if target.foreground != *foreground {
             return Ok(false);
         }
-        let _ = registry().cancel_exact(foreground);
-        let _ = registry().detach_if_generation(foreground);
+        if target.phase == AndroidTargetForegroundPhase::Running {
+            let _ = registry().cancel_exact(foreground);
+            return Ok(false);
+        }
+        if !registry().release_target_exact(foreground) {
+            return Ok(false);
+        }
         runtime.target_foreground = None;
         Ok(true)
     }
@@ -1457,6 +1529,17 @@ pub fn peer_delta_target_foreground_release(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub fn peer_delta_target_foreground_cancel(
+    state: State<'_, PeerDeltaCommandState>,
+    foreground: AndroidForegroundKey,
+) -> Result<bool, String> {
+    state
+        .cancel_target_foreground_exact(&foreground)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(desktop)]
 #[tauri::command]
 pub fn peer_delta_start(
@@ -1673,7 +1756,10 @@ pub async fn peer_delta_pull(
 ) -> Result<PeerDeltaPullResult, String> {
     let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target)?;
     let state_owner = state.inner().clone();
-    let result = peer_delta_pull_with_cancellation(
+    state_owner
+        .mark_target_running_exact(&foreground)
+        .map_err(|error| error.to_string())?;
+    let outcome = peer_delta_pull_with_cancellation(
         app,
         state,
         endpoint,
@@ -1683,11 +1769,11 @@ pub async fn peer_delta_pull(
         expected_revision,
         cancellation,
     )
-    .await?;
+    .await;
     state_owner
-        .record_target_result_exact(&foreground, result.clone())
+        .publish_target_terminal_exact(&foreground, outcome.clone())
         .map_err(|error| error.to_string())?;
-    Ok(result)
+    outcome
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2053,30 +2139,36 @@ mod tests {
     fn android_target_foreground_release_is_native_owned_and_generation_exact() {
         let state = PeerDeltaCommandState::default();
         let foreground = state.reserve_target_foreground().unwrap();
+        assert!(registry().attach_exact(&foreground));
         assert_eq!(
-            state
-                .target_foreground_status()
-                .unwrap()
-                .unwrap()
-                .foreground,
-            foreground,
+            state.target_foreground_status().unwrap().unwrap().phase,
+            AndroidTargetForegroundPhase::Reserved,
         );
+        state.mark_target_running_exact(&foreground).unwrap();
+        assert!(!registry().detach_if_generation(&foreground));
+        assert!(state.cancel_target_foreground_exact(&foreground).unwrap());
+        assert!(!state.release_target_foreground_exact(&foreground).unwrap());
         state
-            .record_target_result_exact(
+            .publish_target_terminal_exact(
                 &foreground,
-                PeerDeltaPullResult::NoChanges {
+                Ok(PeerDeltaPullResult::NoChanges {
                     revision: 7,
                     transferred_objects: 0,
                     transferred_bytes: 0,
-                },
+                }),
             )
             .unwrap();
+        let terminal = state.target_foreground_status().unwrap().unwrap();
+        assert_eq!(terminal.phase, AndroidTargetForegroundPhase::Terminal);
+        assert!(matches!(
+            terminal.result,
+            Some(PeerDeltaPullResult::NoChanges { revision: 7, .. })
+        ));
         let mut stale = foreground.clone();
         stale.generation -= 1;
 
         assert!(!state.release_target_foreground_exact(&stale).unwrap());
-        assert!(registry().acquire_exact(&foreground).is_none());
-        assert!(registry().attach_exact(&foreground));
+        assert!(state.release_target_foreground_exact(&foreground).unwrap());
         assert!(state.release_target_foreground_exact(&foreground).unwrap());
         assert!(state.target_foreground_status().unwrap().is_none());
 
@@ -2084,6 +2176,71 @@ mod tests {
         assert!(fresh.generation > foreground.generation);
         assert!(!registry().detach_if_generation(&foreground));
         assert!(state.release_target_foreground_exact(&fresh).unwrap());
+    }
+
+    #[test]
+    fn committed_target_stays_running_during_terminal_publication_pause() {
+        let state = PeerDeltaCommandState::default();
+        let foreground = state.reserve_target_foreground().unwrap();
+        assert!(registry().attach_exact(&foreground));
+        state.mark_target_running_exact(&foreground).unwrap();
+        let (committed_tx, committed_rx) = mpsc::channel();
+        let (publish_tx, publish_rx) = mpsc::channel();
+        let operation_state = state.clone();
+        let operation_foreground = foreground.clone();
+
+        let operation = thread::spawn(move || {
+            let committed = PeerDeltaPullResult::Updated {
+                revision: 12,
+                transferred_objects: 1,
+                transferred_bytes: 32,
+            };
+            committed_tx.send(()).unwrap();
+            publish_rx.recv().unwrap();
+            operation_state
+                .publish_target_terminal_exact(&operation_foreground, Ok(committed))
+                .unwrap();
+        });
+
+        committed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            state.target_foreground_status().unwrap().unwrap().phase,
+            AndroidTargetForegroundPhase::Running,
+        );
+        assert!(state.cancel_target_foreground_exact(&foreground).unwrap());
+        assert!(!state.release_target_foreground_exact(&foreground).unwrap());
+        assert!(!registry().detach_if_generation(&foreground));
+        publish_tx.send(()).unwrap();
+        operation.join().unwrap();
+        let terminal = state.target_foreground_status().unwrap().unwrap();
+        assert!(matches!(
+            terminal.result,
+            Some(PeerDeltaPullResult::Updated { revision: 12, .. })
+        ));
+        assert!(state.release_target_foreground_exact(&foreground).unwrap());
+    }
+
+    #[test]
+    fn target_precommit_failure_is_terminal_and_releases_without_a_result() {
+        let state = PeerDeltaCommandState::default();
+        let foreground = state.reserve_target_foreground().unwrap();
+        assert!(registry().attach_exact(&foreground));
+        state.mark_target_running_exact(&foreground).unwrap();
+        state
+            .publish_target_terminal_exact(
+                &foreground,
+                Err("cancelled before activation".to_owned()),
+            )
+            .unwrap();
+
+        let terminal = state.target_foreground_status().unwrap().unwrap();
+        assert_eq!(terminal.phase, AndroidTargetForegroundPhase::Terminal);
+        assert_eq!(terminal.result, None);
+        assert_eq!(
+            terminal.error.as_deref(),
+            Some("cancelled before activation")
+        );
+        assert!(state.release_target_foreground_exact(&foreground).unwrap());
     }
 
     struct FixtureSource {

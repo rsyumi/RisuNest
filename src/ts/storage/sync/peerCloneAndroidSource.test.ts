@@ -11,6 +11,68 @@ const prepared = {
 }
 
 describe('Android P1 source facade', () => {
+    it.each(['false', 'throw', 'timeout'] as const)(
+        'abandons the exact native reservation after %s start failure',
+        async (failure) => {
+            const foreground = { lane: 'p1-source' as const, operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
+            let owner: typeof foreground | undefined
+            const bridge = {
+                startSource: vi.fn(() => {
+                    if (failure === 'throw') throw new Error('service throw')
+                    return failure !== 'false'
+                }),
+                stopSource: vi.fn(() => true),
+            }
+            const invoke = vi.fn(async (command: string) => {
+                if (command.endsWith('_reserve')) {
+                    if (owner) throw new Error('owner retained')
+                    owner = foreground
+                    return foreground
+                }
+                if (command === 'peer_sync_foreground_source_abandon') {
+                    owner = undefined
+                    return true
+                }
+                if (command.endsWith('_start') && failure === 'timeout') throw new Error('attach timeout')
+                return { ...prepared, phase: 'running' }
+            })
+            const facade = createAndroidPeerCloneSourceFacade({
+                invoke: invoke as PeerCloneInvoke,
+                bridge,
+                flushPendingData: vi.fn(async () => undefined),
+            })
+
+            await expect(facade.start(prepared.sessionId)).rejects.toThrow()
+            expect(bridge.stopSource).toHaveBeenCalledWith(
+                foreground.lane,
+                foreground.operationId,
+                foreground.generation,
+            )
+            expect(invoke).toHaveBeenCalledWith('peer_sync_foreground_source_abandon', { foreground })
+            expect(owner).toBeUndefined()
+        },
+    )
+
+    it('retains both the primary start error and exact-abandon failure', async () => {
+        const foreground = { lane: 'p1-source' as const, operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
+        const primary = new Error('attach timeout')
+        const cleanup = new Error('abandon response lost')
+        const facade = createAndroidPeerCloneSourceFacade({
+            invoke: vi.fn(async (command) => {
+                if (command.endsWith('_reserve')) return foreground
+                if (command === 'peer_sync_foreground_source_abandon') throw cleanup
+                throw primary
+            }) as PeerCloneInvoke,
+            bridge: { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) },
+            flushPendingData: vi.fn(async () => undefined),
+        })
+
+        const failure = await facade.start(prepared.sessionId).catch((error: unknown) => error)
+
+        expect(failure).toBeInstanceOf(AggregateError)
+        expect((failure as AggregateError).errors).toEqual([primary, cleanup])
+    })
+
     it('starts only after an explicit service request and forwards identity only', async () => {
         const calls: Array<[string, unknown]> = []
         const foreground = { lane: 'p1-source' as const, operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }

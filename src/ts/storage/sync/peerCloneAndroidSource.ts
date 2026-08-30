@@ -50,6 +50,19 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
     const nativeInvoke = options.invoke ?? invoke
     const bridge = options.bridge ?? nativeBridge()
     let foreground: AndroidPeerCloneForegroundIdentity | undefined
+    const abandonReservation = async (identity: AndroidPeerCloneForegroundIdentity): Promise<void> => {
+        let stopError: unknown
+        try {
+            bridge.stopSource(identity.lane, identity.operationId, identity.generation)
+        } catch (error) {
+            stopError = error
+        }
+        const abandoned = await nativeInvoke<boolean>('peer_sync_foreground_source_abandon', {
+            foreground: identity,
+        })
+        if (!abandoned) throw new Error('Android peer clone foreground identity is stale')
+        if (stopError) throw stopError
+    }
 
     return {
         foregroundIdentity: () => foreground,
@@ -67,10 +80,10 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
             const identity = await nativeInvoke<AndroidPeerCloneForegroundIdentity>(
                 'peer_clone_android_source_reserve',
             )
-            if (!bridge.startSource(identity.lane, identity.operationId, identity.generation)) {
-                throw new Error('Android peer clone foreground service could not start')
-            }
             try {
+                if (!bridge.startSource(identity.lane, identity.operationId, identity.generation)) {
+                    throw new Error('Android peer clone foreground service could not start')
+                }
                 const status = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_android_source_start', {
                     sessionId,
                     foreground: identity,
@@ -78,7 +91,14 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
                 foreground = identity
                 return status
             } catch (error) {
-                bridge.stopSource(identity.lane, identity.operationId, identity.generation)
+                try {
+                    await abandonReservation(identity)
+                } catch (cleanupError) {
+                    throw new AggregateError(
+                        [error, cleanupError],
+                        'Android peer clone foreground start and cleanup both failed',
+                    )
+                }
                 throw error
             }
         },

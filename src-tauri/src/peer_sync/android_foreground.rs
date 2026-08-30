@@ -60,6 +60,7 @@ type StopCallback = Box<dyn FnOnce() + Send + 'static>;
 struct ForegroundEntry {
     key: AndroidForegroundKey,
     attached: bool,
+    target_retained: bool,
     cancellation: Arc<AtomicBool>,
     source_stop: Option<StopCallback>,
 }
@@ -91,6 +92,7 @@ impl AndroidForegroundRegistry {
         *entry = Some(ForegroundEntry {
             key: key.clone(),
             attached: false,
+            target_retained: false,
             cancellation: Arc::new(AtomicBool::new(false)),
             source_stop: None,
         });
@@ -159,11 +161,85 @@ impl AndroidForegroundRegistry {
         true
     }
 
+    pub(crate) fn abandon_source_exact(&self, key: &AndroidForegroundKey) -> bool {
+        if !matches!(
+            key.lane,
+            AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+        ) {
+            return false;
+        }
+        let callback = {
+            let Ok(mut entry) = self.entry.lock() else {
+                return false;
+            };
+            let Some(current) = entry.as_mut() else {
+                return true;
+            };
+            if current.key != *key {
+                return false;
+            }
+            current.cancellation.store(true, Ordering::SeqCst);
+            let callback = current.source_stop.take();
+            *entry = None;
+            callback
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
+        true
+    }
+
+    pub(crate) fn retain_target_exact(&self, key: &AndroidForegroundKey) -> bool {
+        let Ok(mut entry) = self.entry.lock() else {
+            return false;
+        };
+        let Some(entry) = entry.as_mut() else {
+            return false;
+        };
+        if key.lane != AndroidForegroundLane::P4Target
+            || entry.key != *key
+            || !entry.attached
+            || entry.cancellation.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        entry.target_retained = true;
+        true
+    }
+
+    pub(crate) fn release_target_exact(&self, key: &AndroidForegroundKey) -> bool {
+        if key.lane != AndroidForegroundLane::P4Target {
+            return false;
+        }
+        let callback = {
+            let Ok(mut entry) = self.entry.lock() else {
+                return false;
+            };
+            let Some(current) = entry.as_mut() else {
+                return true;
+            };
+            if current.key != *key {
+                return false;
+            }
+            current.cancellation.store(true, Ordering::SeqCst);
+            let callback = current.source_stop.take();
+            *entry = None;
+            callback
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
+        true
+    }
+
     pub(crate) fn detach_if_generation(&self, key: &AndroidForegroundKey) -> bool {
         let Ok(mut entry) = self.entry.lock() else {
             return false;
         };
-        if entry.as_ref().is_none_or(|entry| entry.key != *key) {
+        if entry
+            .as_ref()
+            .is_none_or(|entry| entry.key != *key || entry.target_retained)
+        {
             return false;
         }
         *entry = None;
@@ -174,6 +250,20 @@ impl AndroidForegroundRegistry {
 pub(crate) fn registry() -> &'static AndroidForegroundRegistry {
     static REGISTRY: OnceLock<AndroidForegroundRegistry> = OnceLock::new();
     REGISTRY.get_or_init(AndroidForegroundRegistry::default)
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub(crate) fn peer_sync_foreground_source_abandon(
+    foreground: AndroidForegroundKey,
+) -> Result<bool, String> {
+    if !matches!(
+        foreground.lane,
+        AndroidForegroundLane::P1Source | AndroidForegroundLane::P4Source
+    ) {
+        return Err("Android foreground identity is not a source lane".to_owned());
+    }
+    Ok(registry().abandon_source_exact(&foreground))
 }
 
 #[cfg(test)]
@@ -256,5 +346,39 @@ mod tests {
         assert!(!registry.detach_if_generation(&source));
         assert!(registry.acquire_exact(&target).is_some());
         assert!(registry.detach_if_generation(&target));
+    }
+
+    #[test]
+    fn source_abandon_is_exact_idempotent_and_allows_a_different_lane() {
+        let registry = AndroidForegroundRegistry::default();
+        for lane in [
+            AndroidForegroundLane::P1Source,
+            AndroidForegroundLane::P4Source,
+        ] {
+            let source = registry.reserve(lane).unwrap();
+            let mut stale = source.clone();
+            stale.generation += 1;
+            assert!(!registry.abandon_source_exact(&stale));
+            assert!(registry.abandon_source_exact(&source));
+            assert!(registry.abandon_source_exact(&source));
+            let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
+            assert!(!registry.abandon_source_exact(&source));
+            assert!(registry.detach_if_generation(&target));
+        }
+    }
+
+    #[test]
+    fn retained_running_target_ignores_service_detach_until_native_release() {
+        let registry = AndroidForegroundRegistry::default();
+        let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
+        assert!(registry.attach_exact(&target));
+        assert!(registry.retain_target_exact(&target));
+        assert!(registry.cancel_exact(&target));
+        assert!(!registry.detach_if_generation(&target));
+        assert!(registry.reserve(AndroidForegroundLane::P1Source).is_err());
+        assert!(registry.release_target_exact(&target));
+        let source = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert!(!registry.release_target_exact(&target));
+        assert!(registry.detach_if_generation(&source));
     }
 }

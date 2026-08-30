@@ -3,7 +3,7 @@ mod android_client;
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod android_commands;
 #[cfg(any(target_os = "android", test))]
-mod android_foreground;
+pub(crate) mod android_foreground;
 #[cfg(any(target_os = "android", test))]
 mod android_jni;
 #[cfg(any(target_os = "android", test))]

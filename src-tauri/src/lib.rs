@@ -589,6 +589,8 @@ pub fn run() {
             #[cfg(target_os = "android")]
             peer_sync::android_source_commands::peer_clone_android_source_reserve,
             #[cfg(target_os = "android")]
+            peer_sync::android_foreground::peer_sync_foreground_source_abandon,
+            #[cfg(target_os = "android")]
             peer_sync::android_source_commands::peer_clone_android_source_prepare,
             #[cfg(target_os = "android")]
             peer_sync::android_source_commands::peer_clone_android_source_start,
@@ -606,6 +608,8 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_target_foreground_status,
             #[cfg(target_os = "android")]
             peer_sync::delta_commands::peer_delta_target_foreground_release,
+            #[cfg(target_os = "android")]
+            peer_sync::delta_commands::peer_delta_target_foreground_cancel,
             #[cfg(target_os = "android")]
             peer_sync::delta_commands::peer_delta_source_reserve,
             #[cfg(any(desktop, target_os = "android"))]
