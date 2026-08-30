@@ -376,11 +376,15 @@ mod tests {
     fn stalled_response_headers_fail_on_the_no_progress_deadline() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        // The server holds the stalled socket until the client has already failed, so the
+        // error can only come from the no-progress deadline (the socket provably never
+        // progressed or closed), independent of scheduling.
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).unwrap();
-            thread::sleep(Duration::from_millis(500));
+            let _ = hold_rx.recv();
         });
         let stream = HttpRangeStream::new(Duration::from_secs(1))
             .unwrap()
@@ -392,18 +396,23 @@ mod tests {
             .read(url, None, OBJECT, 0, 0, Some(1), &|| false, &mut |_| Ok(()))
             .unwrap_err();
         let elapsed = started.elapsed();
+        let _ = hold_tx.send(());
         server.join().unwrap();
 
         assert!(
             matches!(error, PeerSyncError::Transport(message) if message.contains("no progress"))
         );
-        assert!(elapsed < Duration::from_millis(400));
+        // Generous hang guard only; the deadline itself is proven by the error message.
+        assert!(elapsed < Duration::from_secs(5));
     }
 
     #[test]
     fn stalled_range_fails_on_the_no_progress_deadline() {
-        let (url, server) = range_server(1, |stream| {
-            thread::sleep(Duration::from_millis(500));
+        // As above: the server holds the body back until the client has already failed,
+        // so only the no-progress deadline can have produced the error.
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let (url, server) = range_server(1, move |stream| {
+            let _ = hold_rx.recv();
             let _ = stream.write_all(&[1]);
         });
         let stream = HttpRangeStream::new(Duration::from_secs(1))
@@ -415,12 +424,14 @@ mod tests {
             .read(url, None, OBJECT, 0, 0, Some(1), &|| false, &mut |_| Ok(()))
             .unwrap_err();
         let elapsed = started.elapsed();
+        let _ = hold_tx.send(());
         server.join().unwrap();
 
         assert!(
             matches!(error, PeerSyncError::Transport(message) if message.contains("no progress"))
         );
-        assert!(elapsed < Duration::from_millis(400));
+        // Generous hang guard only; the deadline itself is proven by the error message.
+        assert!(elapsed < Duration::from_secs(5));
     }
 
     #[test]

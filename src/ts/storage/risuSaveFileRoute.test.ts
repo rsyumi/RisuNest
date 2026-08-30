@@ -195,6 +195,11 @@ describe('RisuSave picker route', () => {
         expect(acknowledgeAndroidExport).toHaveBeenCalledExactlyOnceWith('saf-request-1')
     })
 
+    // Any post-copy rejection out of the awaited withFlushedExport call (managed source
+    // cleanup failure, pinned revision release failure, ...) is indistinguishable at the
+    // route boundary and must leave the terminal unacknowledged; the cleanup-vs-release
+    // distinction itself is covered by the lease and cleanup implementation tests in
+    // nativePersistentExport.test.ts.
     it('leaves the SAF terminal replayable when managed source cleanup fails', async () => {
         const deps = dependencies('native-desktop')
         const markAndroidExportReady = vi.fn(() => true)
@@ -228,48 +233,6 @@ describe('RisuSave picker route', () => {
         expect(risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify({
             requestId: '77777777-7777-4777-8777-777777777777',
             exportId: '88888888-8888-4888-8888-888888888888',
-            sourceKind: 'risuSave',
-            state: 'succeeded',
-            publicationPrerequisitesComplete: false,
-            warningCodes: [],
-        }), replayAck)).toBeNull()
-        expect(replayAck).not.toHaveBeenCalled()
-    })
-
-    it('leaves the SAF terminal replayable when pinned revision release fails', async () => {
-        const deps = dependencies('native-desktop')
-        const markAndroidExportReady = vi.fn(() => true)
-        const acknowledgeAndroidExport = vi.fn(() => true)
-        installAndroidExport(deps, {
-            withFlushedExport: async (_runtime, _reason, callback) => {
-                await callback({
-                    withNativeFile: async (_options: unknown, nativeCallback: Function) =>
-                        await nativeCallback({
-                            path: '/app/persistent/exports/source.risudat',
-                            bytes: 10,
-                        }),
-                })
-                throw new Error('revision release failed')
-            },
-            copyAndroidExport: async () => ({
-                requestId: 'saf-request-release',
-                bytes: 10,
-                warningCodes: [],
-            }),
-            markAndroidExportReady,
-            acknowledgeAndroidExport,
-        })
-
-        await expect(exportRisuSaveFromPicker({}, deps)).rejects.toThrow(
-            'revision release failed',
-        )
-        expect(markAndroidExportReady).not.toHaveBeenCalled()
-        expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
-
-        const replayAck = vi.fn(() => true)
-        expect(risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify({
-            requestId: '99999999-9999-4999-8999-999999999999',
-            exportId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
             sourceKind: 'risuSave',
             state: 'succeeded',
             publicationPrerequisitesComplete: false,

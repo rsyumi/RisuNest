@@ -9370,7 +9370,9 @@ fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
     let error = store
         .checkpoint(CheckpointMode::Truncate)
         .expect_err("truncate must reject an active lease");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    // Far above scheduler/disk jitter, comfortably below the 5s SQLite busy timeout:
+    // proves the call rejected promptly instead of waiting out the busy handler.
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(matches!(
         error,
         StoreError::Store { message } if message.contains("active read lease")
@@ -9402,7 +9404,8 @@ fn detached_export_reader_rejects_truncate_until_it_is_released() {
     let error = store
         .checkpoint(CheckpointMode::Truncate)
         .expect_err("truncate must reject a detached export reader");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    // Far above scheduler/disk jitter, comfortably below the 5s SQLite busy timeout.
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(matches!(
         error,
         StoreError::Store { message } if message.contains("active read lease")
@@ -9437,7 +9440,8 @@ fn detached_export_release_stays_prompt_while_an_attached_reader_remains() {
     prepared
         .release(reader)
         .expect("release detached reader with attached reader remaining");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    // Far above scheduler/disk jitter, comfortably below the 5s SQLite busy timeout.
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
         store
             .read_root(Some(&attached.lease))
