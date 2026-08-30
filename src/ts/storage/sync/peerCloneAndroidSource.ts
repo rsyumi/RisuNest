@@ -83,8 +83,10 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
             }
         },
         async stop(sessionId: string): Promise<void> {
-            const identity = foreground
-            await nativeInvoke('peer_clone_android_source_stop', { sessionId })
+            const identity = await nativeInvoke<AndroidPeerCloneForegroundIdentity | null>(
+                'peer_clone_android_source_stop',
+                { sessionId },
+            )
             if (identity) bridge.stopSource(identity.lane, identity.operationId, identity.generation)
             foreground = undefined
         },

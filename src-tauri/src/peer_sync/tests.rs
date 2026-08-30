@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
     path::Path,
     process::{Child, Command, Stdio},
     sync::{
@@ -461,6 +461,44 @@ fn lan_host_binds_only_on_explicit_start_and_stops_completely() {
     assert_eq!(restarted_pairing.session_id, pairing.session_id);
     assert!(host.address().is_some());
     host.stop().unwrap();
+}
+
+#[test]
+fn private_lan_host_binds_the_exact_selected_interface() {
+    let selected = if_addrs::get_if_addrs()
+        .unwrap()
+        .into_iter()
+        .find_map(|interface| match interface.ip() {
+            IpAddr::V4(address) if address.is_private() || address.is_link_local() => Some(address),
+            _ => None,
+        })
+        .expect("test machine has no private or link-local IPv4 interface");
+
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    host.start_private_lan(selected).unwrap();
+    assert_eq!(host.address().unwrap().ip(), IpAddr::V4(selected));
+    host.stop().unwrap();
+}
+
+#[test]
+fn private_lan_host_rejects_non_lan_bind_addresses() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    for address in [
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(203, 0, 113, 5),
+    ] {
+        assert!(host.start_private_lan(address).is_err());
+        assert!(host.address().is_none());
+    }
 }
 
 #[test]

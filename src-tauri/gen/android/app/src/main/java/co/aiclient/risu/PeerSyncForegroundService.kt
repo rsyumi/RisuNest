@@ -16,7 +16,9 @@ internal const val PEER_SYNC_FOREGROUND_START_MODE = Service.START_NOT_STICKY
 private const val PEER_SYNC_FOREGROUND_CHANNEL = "risu-peer-sync-source"
 private const val PEER_SYNC_FOREGROUND_NOTIFICATION_ID = 0x52535031
 private const val PEER_SYNC_FOREGROUND_START = "co.aiclient.risu.PEER_SYNC_SOURCE_START"
-private const val PEER_SYNC_FOREGROUND_STOP = "co.aiclient.risu.PEER_SYNC_SOURCE_STOP"
+internal const val PEER_SYNC_FOREGROUND_STOP_ACTION = "co.aiclient.risu.PEER_SYNC_SOURCE_STOP"
+internal const val PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS =
+  PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
 private const val PEER_SYNC_LANE_EXTRA = "lane"
 private const val PEER_SYNC_OPERATION_ID_EXTRA = "operationId"
 private const val PEER_SYNC_GENERATION_EXTRA = "generation"
@@ -76,7 +78,7 @@ class PeerSyncForegroundService : Service() {
       stopSelfResult(startId)
       return PEER_SYNC_FOREGROUND_START_MODE
     }
-    if (intent.action == PEER_SYNC_FOREGROUND_STOP) {
+    if (intent.action == PEER_SYNC_FOREGROUND_STOP_ACTION) {
       PeerSyncForegroundNativeBridge.cancel(identity.lane, identity.operationId, identity.generation)
       val exactAttachedStop = isExactAttachedPeerSyncStop(attached, identity)
       if (exactAttachedStop) stopForeground(STOP_FOREGROUND_REMOVE)
@@ -109,12 +111,12 @@ class PeerSyncForegroundService : Service() {
   }
 
   private fun notification(identity: PeerSyncForegroundIdentity): Notification {
-    val stopIntent = identity.intent(this, PEER_SYNC_FOREGROUND_STOP)
+    val stopIntent = identity.intent(this, PEER_SYNC_FOREGROUND_STOP_ACTION)
     val stopPendingIntent = PendingIntent.getService(
       this,
       identity.generation.hashCode(),
       stopIntent,
-      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS,
     )
     return NotificationCompat.Builder(this, PEER_SYNC_FOREGROUND_CHANNEL)
       .setSmallIcon(android.R.drawable.stat_sys_upload)
@@ -150,7 +152,7 @@ class PeerSyncForegroundService : Service() {
     }.getOrDefault(false)
 
     internal fun stop(context: Context, identity: PeerSyncForegroundIdentity): Boolean = runCatching {
-      context.startService(identity.intent(context, PEER_SYNC_FOREGROUND_STOP)) != null
+      context.startService(identity.intent(context, PEER_SYNC_FOREGROUND_STOP_ACTION)) != null
     }.getOrDefault(false)
   }
 }

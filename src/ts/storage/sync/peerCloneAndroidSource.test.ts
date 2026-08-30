@@ -60,6 +60,31 @@ describe('Android P1 source facade', () => {
         expect(generation).toBe(2)
     })
 
+    it('fully stops a reconstructed running source through the native foreground identity', async () => {
+        const foreground = { lane: 'p1-source' as const, operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
+        const bridge = { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) }
+        const invoke = vi.fn(async (command: string) => {
+            if (command.endsWith('_status')) return { ...prepared, phase: 'running' }
+            if (command.endsWith('_stop')) return foreground
+            return prepared
+        })
+        const facade = createAndroidPeerCloneSourceFacade({
+            invoke: invoke as PeerCloneInvoke,
+            bridge,
+            flushPendingData: vi.fn(async () => undefined),
+        })
+
+        await facade.status()
+        await facade.stop(prepared.sessionId)
+
+        expect(bridge.stopSource).toHaveBeenCalledTimes(1)
+        expect(bridge.stopSource).toHaveBeenCalledWith(
+            foreground.lane,
+            foreground.operationId,
+            foreground.generation,
+        )
+    })
+
     it('reports LAN source capability with tunnels disabled', async () => {
         const facade = createAndroidPeerCloneSourceFacade({
             invoke: vi.fn(async () => ({ sourceReady: true, productionEnabled: true, tunnelReady: false })) as PeerCloneInvoke,

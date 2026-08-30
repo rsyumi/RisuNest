@@ -10,7 +10,7 @@ use crate::{
 use serde::Serialize;
 use std::{
     fs,
-    net::{IpAddr, Ipv4Addr, UdpSocket},
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -131,44 +131,94 @@ impl AndroidPeerCloneSourceState {
         source.phase = AndroidSourcePhase::Prepared;
     }
 
-    fn release(&self, session_id: &str) -> Result<(), String> {
+    fn start_exact(
+        &self,
+        session_id: &str,
+        foreground: AndroidForegroundKey,
+        address: Ipv4Addr,
+    ) -> Result<AndroidSourceStatus, String> {
+        let mut source_slot = self
+            .source
+            .lock()
+            .map_err(|_| "Peer clone source is unavailable")?;
+        let source = source_slot
+            .as_mut()
+            .ok_or_else(|| "Peer clone source is not prepared".to_owned())?;
+        if source.session_id != session_id || source.phase != AndroidSourcePhase::Prepared {
+            return Err("Peer clone source is not prepared".to_owned());
+        }
+        let pairing = source
+            .host
+            .start_private_lan(address)
+            .map_err(|error| error.to_string())?;
+        let port = source
+            .host
+            .address()
+            .ok_or_else(|| "Peer clone listener is unavailable".to_owned())?
+            .port();
+        source.pairing_uri = Some(build_pairing_uri(
+            &format!("http://{address}:{port}"),
+            &pairing,
+        )?);
+        source.foreground = Some(foreground.clone());
+        source.phase = AndroidSourcePhase::Running;
+        drop(source_slot);
+
+        let callback_state = self.clone();
+        let callback_key = foreground.clone();
+        if !registry().set_source_stop_callback_exact(&foreground, move || {
+            callback_state.pause_exact(&callback_key);
+        }) {
+            self.pause_exact(&foreground);
+            return Err("Android foreground service detached before source start".to_owned());
+        }
+        self.status()
+    }
+
+    fn release(&self, session_id: &str) -> Result<Option<AndroidForegroundKey>, String> {
         let mut source_slot = self
             .source
             .lock()
             .map_err(|_| "Peer clone source is unavailable")?;
         let Some(source) = source_slot.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         if source.session_id != session_id {
             return Err("Peer clone source session does not match".to_owned());
         }
+        let foreground = source.foreground.clone();
         let mut source = source_slot.take().expect("checked source");
         drop(source_slot);
-        if let Some(key) = source.foreground.take() {
-            let _ = registry().cancel_exact(&key);
-            let _ = registry().detach_if_generation(&key);
+        source.foreground = None;
+        if let Some(key) = foreground.as_ref() {
+            let _ = registry().cancel_exact(key);
+            let _ = registry().detach_if_generation(key);
         }
         source.host.stop().map_err(|error| error.to_string())?;
         fs::remove_dir_all(&source.root).map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(foreground)
     }
 }
 
 fn private_lan_address(candidates: impl IntoIterator<Item = IpAddr>) -> Option<Ipv4Addr> {
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates
-        .into_iter()
+        .iter()
         .find_map(|candidate| match candidate {
-            IpAddr::V4(address) if address.is_private() || address.is_link_local() => Some(address),
+            IpAddr::V4(address) if address.is_private() => Some(*address),
             _ => None,
+        })
+        .or_else(|| {
+            candidates.iter().find_map(|candidate| match candidate {
+                IpAddr::V4(address) if address.is_link_local() => Some(*address),
+                _ => None,
+            })
         })
 }
 
 fn discover_private_lan_address() -> Result<Ipv4Addr, String> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|error| error.to_string())?;
-    socket
-        .connect((Ipv4Addr::new(192, 0, 2, 1), 9))
-        .map_err(|error| error.to_string())?;
-    private_lan_address([socket.local_addr().map_err(|error| error.to_string())?.ip()])
+    let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
+    private_lan_address(interfaces.into_iter().map(|interface| interface.ip()))
         .ok_or_else(|| "No private IPv4 LAN address is available".to_owned())
 }
 
@@ -295,42 +345,11 @@ pub(crate) async fn peer_clone_android_source_start(
     };
     let address = discover_private_lan_address()?;
     let state = state.inner().clone();
-    let callback_state = state.clone();
-    let callback_key = foreground.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut source_slot = state
-            .source
-            .lock()
-            .map_err(|_| "Peer clone source is unavailable")?;
-        let source = source_slot
-            .as_mut()
-            .ok_or_else(|| "Peer clone source is not prepared".to_owned())?;
-        if source.session_id != session_id || source.phase != AndroidSourcePhase::Prepared {
-            return Err("Peer clone source is not prepared".to_owned());
-        }
         if cancellation.is_cancelled() {
             return Err("Android foreground service was cancelled".to_owned());
         }
-        let pairing = source.host.start().map_err(|error| error.to_string())?;
-        let port = source
-            .host
-            .address()
-            .ok_or_else(|| "Peer clone listener is unavailable".to_owned())?
-            .port();
-        source.pairing_uri = Some(build_pairing_uri(
-            &format!("http://{address}:{port}"),
-            &pairing,
-        )?);
-        source.foreground = Some(foreground.clone());
-        source.phase = AndroidSourcePhase::Running;
-        drop(source_slot);
-        if !registry().set_source_stop_callback_exact(&foreground, move || {
-            callback_state.pause_exact(&callback_key);
-        }) {
-            state.pause_exact(&foreground);
-            return Err("Android foreground service detached before source start".to_owned());
-        }
-        state.status()
+        state.start_exact(&session_id, foreground, address)
     })
     .await
     .map_err(|error| format!("Peer clone source start failed: {error}"))?
@@ -347,7 +366,7 @@ pub(crate) fn peer_clone_android_source_status(
 pub(crate) async fn peer_clone_android_source_stop(
     state: State<'_, AndroidPeerCloneSourceState>,
     session_id: String,
-) -> Result<(), String> {
+) -> Result<Option<AndroidForegroundKey>, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || state.release(&session_id))
         .await
@@ -376,6 +395,44 @@ pub(crate) fn peer_clone_android_source_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer_sync::{
+        prepare_clone_session, CloneSource, PinnedCloneRevision, PinnedSourceObject,
+    };
+    use reqwest::blocking::Client;
+    use serde_json::{json, Value};
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        time::Duration,
+    };
+
+    struct FixtureSource {
+        database: PathBuf,
+    }
+
+    struct FixtureLease {
+        database: PathBuf,
+    }
+
+    impl CloneSource for FixtureSource {
+        type Lease = FixtureLease;
+
+        fn pin(&self) -> Result<Self::Lease, PeerSyncError> {
+            Ok(FixtureLease {
+                database: self.database.clone(),
+            })
+        }
+    }
+
+    impl PinnedCloneRevision for FixtureLease {
+        fn source_revision(&self) -> u64 {
+            7
+        }
+
+        fn objects(&self) -> Result<Vec<PinnedSourceObject>, PeerSyncError> {
+            Ok(vec![PinnedSourceObject::database(&self.database)])
+        }
+    }
 
     #[test]
     fn address_selection_accepts_only_private_or_link_local_ipv4() {
@@ -388,6 +445,30 @@ mod tests {
             Some(Ipv4Addr::new(192, 168, 1, 4)),
         );
         assert_eq!(private_lan_address(["8.8.8.8".parse().unwrap()]), None);
+        assert_eq!(
+            private_lan_address([
+                "127.0.0.1".parse().unwrap(),
+                "0.0.0.0".parse().unwrap(),
+                "203.0.113.5".parse().unwrap(),
+            ]),
+            None,
+        );
+        assert_eq!(
+            private_lan_address([
+                "10.2.3.4".parse().unwrap(),
+                "192.168.1.4".parse().unwrap(),
+                "169.254.7.8".parse().unwrap(),
+            ]),
+            Some(Ipv4Addr::new(10, 2, 3, 4)),
+        );
+        assert_eq!(
+            private_lan_address([
+                "169.254.7.8".parse().unwrap(),
+                "203.0.113.5".parse().unwrap(),
+                "192.168.9.4".parse().unwrap(),
+            ]),
+            Some(Ipv4Addr::new(192, 168, 9, 4)),
+        );
     }
 
     #[test]
@@ -397,5 +478,143 @@ mod tests {
         assert!(capabilities.source_ready);
         assert!(!capabilities.desktop);
         assert!(!capabilities.tunnel_ready);
+    }
+
+    #[test]
+    fn notification_stop_pauses_real_source_and_full_release_cleans_up() {
+        let fixture_root = tempfile::tempdir().unwrap();
+        let database = fixture_root.path().join("database.risusave");
+        fs::write(&database, b"synthetic-android-source").unwrap();
+        let source_root = fixture_root.path().join("prepared-source");
+        let prepared = prepare_clone_session(&FixtureSource { database }, &source_root).unwrap();
+        let session_id = prepared.manifest().session_id.clone();
+        let manifest_id = prepared.manifest_id().to_owned();
+        let host = LanCloneHost::prepare(prepared);
+        let retained = host.control();
+        let state = AndroidPeerCloneSourceState::default();
+        *state.source.lock().unwrap() = Some(AndroidSource {
+            session_id: session_id.clone(),
+            manifest_id,
+            root: source_root.clone(),
+            host,
+            pairing_uri: None,
+            foreground: None,
+            phase: AndroidSourcePhase::Prepared,
+        });
+        let address = discover_private_lan_address().unwrap();
+        let foreground = registry().reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert!(registry().attach_exact(&foreground));
+
+        let running = state
+            .start_exact(&session_id, foreground.clone(), address)
+            .unwrap();
+        let pairing_uri = url::Url::parse(running.pairing_uri.as_ref().unwrap()).unwrap();
+        assert!(state
+            .source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .host
+            .has_claim_for_test());
+        let endpoint = pairing_uri
+            .query_pairs()
+            .find_map(|(name, value)| (name == "endpoint").then(|| value.into_owned()))
+            .unwrap();
+        let claim = pairing_uri
+            .fragment()
+            .unwrap()
+            .strip_prefix("claim=")
+            .unwrap();
+        let claimed: Value = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{endpoint}/v1/sessions/{session_id}/claim"))
+            .json(&json!({ "claim": claim }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert!(claimed["deviceId"].is_string());
+        assert_eq!(state.status().unwrap().devices.len(), 1);
+
+        let listener_address = state
+            .source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .host
+            .address()
+            .unwrap();
+        let mut active = TcpStream::connect(listener_address).unwrap();
+        active
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        active.write_all(b"GET /incomplete HTTP/1.1\r\n").unwrap();
+
+        assert!(registry().cancel_exact(&foreground));
+        let paused = state.status().unwrap();
+        assert_eq!(paused.phase, AndroidSourcePhase::Prepared);
+        assert_eq!(paused.session_id.as_deref(), Some(session_id.as_str()));
+        assert!(paused.pairing_uri.is_none());
+        assert!(paused.devices.is_empty());
+        assert!(source_root.exists());
+        assert!(retained.is_attached_for_test());
+        assert!(TcpStream::connect(listener_address).is_err());
+        let mut byte = [0_u8; 1];
+        match active.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            result => {
+                panic!("active source stream remained open after notification Stop: {result:?}")
+            }
+        }
+        assert!(registry().detach_if_generation(&foreground));
+
+        let restarted = registry().reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert!(registry().attach_exact(&restarted));
+        let running_again = state
+            .start_exact(&session_id, restarted.clone(), address)
+            .unwrap();
+        assert_eq!(running_again.phase, AndroidSourcePhase::Running);
+        assert!(state
+            .source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .host
+            .has_claim_for_test());
+        assert!(registry().cancel_exact(&restarted));
+        assert!(!state
+            .source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .host
+            .has_claim_for_test());
+        assert!(registry().detach_if_generation(&restarted));
+
+        let released = registry().reserve(AndroidForegroundLane::P1Source).unwrap();
+        assert!(registry().attach_exact(&released));
+        assert_eq!(
+            state
+                .start_exact(&session_id, released.clone(), address)
+                .unwrap()
+                .phase,
+            AndroidSourcePhase::Running
+        );
+
+        assert_eq!(state.release(&session_id).unwrap(), Some(released));
+        assert_eq!(state.status().unwrap().phase, AndroidSourcePhase::Idle);
+        assert!(!source_root.exists());
+        assert!(!retained.is_attached_for_test());
     }
 }

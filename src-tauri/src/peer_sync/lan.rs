@@ -828,6 +828,18 @@ impl LanCloneHost {
         self.start_on(Ipv4Addr::UNSPECIFIED, 0)
     }
 
+    pub(crate) fn start_private_lan(
+        &mut self,
+        address: Ipv4Addr,
+    ) -> Result<LanPairing, PeerSyncError> {
+        if !address.is_private() && !address.is_link_local() {
+            return Err(PeerSyncError::Validation(
+                "LAN source address must be private or link-local IPv4".to_owned(),
+            ));
+        }
+        self.start_on(address, 0)
+    }
+
     #[cfg(desktop)]
     pub(crate) fn start_quick_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
         self.start_on(Ipv4Addr::LOCALHOST, 0)
@@ -976,6 +988,11 @@ impl LanCloneHost {
         if let Some(claim) = self.shared.claim.lock().unwrap().as_mut() {
             claim.expires_at = Instant::now() - Duration::from_secs(1);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_claim_for_test(&self) -> bool {
+        self.shared.claim.lock().unwrap().is_some()
     }
 }
 

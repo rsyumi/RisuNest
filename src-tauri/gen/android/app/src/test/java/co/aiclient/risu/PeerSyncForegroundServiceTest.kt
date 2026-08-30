@@ -33,6 +33,17 @@ class PeerSyncForegroundServiceTest {
   }
 
   @Test
+  fun `notification uses the explicit Stop action with immutable identity-only intent`() {
+    assertEquals("co.aiclient.risu.PEER_SYNC_SOURCE_STOP", PEER_SYNC_FOREGROUND_STOP_ACTION)
+    assertTrue(PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS and android.app.PendingIntent.FLAG_IMMUTABLE != 0)
+    assertEquals(0, PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS and android.app.PendingIntent.FLAG_MUTABLE)
+    assertEquals(
+      setOf("lane", "operationId", "generation"),
+      peerSyncForegroundIdentityExtras("p1-source", operationId, 7L).keys,
+    )
+  }
+
+  @Test
   fun `foreground service never asks Android to restart it implicitly`() {
     assertEquals(android.app.Service.START_NOT_STICKY, PEER_SYNC_FOREGROUND_START_MODE)
   }

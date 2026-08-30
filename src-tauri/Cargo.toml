@@ -95,6 +95,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 getrandom = "0.2.15"
+if-addrs = "0.14.0"
 jni = "0.21.1"
 reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 
@@ -102,5 +103,6 @@ reqwest = { version = "0.11.16", default-features = false, features = ["blocking
 reqwest = { version = "0.11.16", features = ["json", "stream"] }
 
 [dev-dependencies]
+if-addrs = "0.14.0"
 regex = "1.13.1"
 tempfile = "3"
