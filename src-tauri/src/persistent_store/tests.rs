@@ -6032,8 +6032,7 @@ fn database_only_replace_preserves_repositories_and_only_matching_owner_heads() 
     );
 }
 
-#[test]
-fn database_only_replace_prunes_only_exact_forwarded_alias_candidates_after_complete_scan() {
+fn assert_database_only_replace_prunes_exact_candidates(replacement_root: Value) {
     let directory = tempfile::tempdir().expect("create alias provenance directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
@@ -6090,10 +6089,7 @@ fn database_only_replace_prunes_only_exact_forwarded_alias_candidates_after_comp
 
     let replacement = store.replace_begin().unwrap();
     store
-        .replace_put_root(
-            &replacement.staging_id,
-            &json!({ "activeAsset": "assets/reachable.bin", "changed": true }),
-        )
+        .replace_put_root(&replacement.staging_id, &replacement_root)
         .unwrap();
     store
         .replace_preserve_repositories(&replacement.staging_id, Some(activated.revision))
@@ -6138,6 +6134,18 @@ fn database_only_replace_prunes_only_exact_forwarded_alias_candidates_after_comp
         )
     );
     assert_eq!(replaced.revision, 2);
+}
+
+#[test]
+fn database_only_replace_prunes_only_exact_forwarded_alias_candidates_after_complete_scan() {
+    assert_database_only_replace_prunes_exact_candidates(
+        json!({ "activeAsset": "assets/reachable.bin", "changed": true }),
+    );
+    assert_database_only_replace_prunes_exact_candidates(json!({
+        "activeAsset": "assets/reachable.bin",
+        "changed": true,
+        "plugins": []
+    }));
 }
 
 #[test]
@@ -6233,6 +6241,88 @@ fn database_only_replace_retains_forwarded_aliases_when_plugin_scan_is_opaque() 
         .object_hashes
         .contains(alias.object_hash.as_deref().unwrap()));
     assert!(roots.retain_all_objects);
+}
+
+fn assert_database_only_replace_retains_alias_for_opaque_plugin_root(replacement_root: Value) {
+    let directory = tempfile::tempdir().expect("create plugin script alias directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas.prepare_bytes(b"plugin script alias payload").unwrap();
+    let alias = AssetAlias {
+        key: "assets/plugin-only.bin".to_owned(),
+        object_hash: Some(prepared.content_hash.clone()),
+        kind: "asset".to_owned(),
+        size: prepared.byte_size as i64,
+        mime: "application/octet-stream".to_owned(),
+        name: "Plugin only".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let initial = store.replace_begin().unwrap();
+    store
+        .replace_put_root(&initial.staging_id, &json!({}))
+        .unwrap();
+    store
+        .replace_put_asset_aliases(&initial.staging_id, std::slice::from_ref(&alias))
+        .unwrap();
+    let activated = store.replace_commit(&initial.staging_id, Some(0)).unwrap();
+
+    let replacement = store.replace_begin().unwrap();
+    store
+        .replace_put_root(&replacement.staging_id, &replacement_root)
+        .unwrap();
+    store
+        .replace_preserve_repositories(&replacement.staging_id, Some(activated.revision))
+        .unwrap();
+    store
+        .replace_commit(&replacement.staging_id, Some(activated.revision))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .read_asset_alias("asset", &alias.key, None)
+            .unwrap()
+            .unwrap()
+            .value,
+        alias
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_alias_replacement_candidates
+                 WHERE generation = 'revision-2' AND kind = 'asset'
+                   AND logical_key = 'assets/plugin-only.bin' AND object_hash = ?1",
+                [&prepared.content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count plugin script alias provenance"),
+        1
+    );
+    let roots = super::snapshot::collect_asset_roots(&store.connection, &cas).unwrap();
+    assert!(roots.object_hashes.contains(&prepared.content_hash));
+}
+
+#[test]
+fn database_only_replace_retains_alias_referenced_only_by_installed_plugin_script() {
+    assert_database_only_replace_retains_alias_for_opaque_plugin_root(json!({
+        "plugins": [{
+            "name": "Script asset reader",
+            "script": "await readImage('assets/plugin-only.bin')"
+        }],
+        "pluginCustomStorage": {}
+    }));
+}
+
+#[test]
+fn database_only_replace_treats_malformed_installed_plugins_as_opaque() {
+    assert_database_only_replace_retains_alias_for_opaque_plugin_root(json!({
+        "plugins": { "malformed": true },
+        "pluginCustomStorage": {}
+    }));
 }
 
 #[test]

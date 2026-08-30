@@ -864,6 +864,11 @@ fn replacement_asset_owner_scan_is_complete(
     let root = root
         .as_object()
         .ok_or_else(|| validation("Replacement root must be an object"))?;
+    match root.get("plugins") {
+        None => {}
+        Some(Value::Array(plugins)) if plugins.is_empty() => {}
+        Some(_) => return Ok(false),
+    }
     for property in ["modules", "personas"] {
         if root.get(property).is_some_and(|value| !value.is_array()) {
             return Ok(false);

@@ -56,7 +56,7 @@ Schema v16 adds `asset_alias_replacement_candidates`, keyed by generation, kind,
 
 Only a future database-only replacement creates candidate rows. It first forwards the active aliases, then records exact non-null hash and size provenance for those forwarded rows. Ordinary historical aliases receive no retroactive provenance.
 
-Pruning runs in the same replacement transaction. It aborts pruning unless the supported replacement owner shapes are complete and well-typed. Any plugin storage or cold alias row makes the scan opaque and retains all forwarded aliases. Otherwise it recursively scans root, presets, characters, conversations, and messages, plus preset and character image fields, for exact asset and inlay logical-key references. An alias is removed only when:
+Pruning runs in the same replacement transaction. It aborts pruning unless the supported replacement owner shapes are complete and well-typed. Any installed plugin, malformed `plugins` value, plugin storage, or cold alias row makes the scan opaque and retains all forwarded aliases. A missing `plugins` property or an empty plugin array remains complete. Otherwise it recursively scans root, presets, characters, conversations, and messages, plus preset and character image fields, for exact asset and inlay logical-key references. An alias is removed only when:
 
 - the exact generation-scoped candidate exists;
 - the complete non-opaque scan found no reference to its logical key;
@@ -68,14 +68,28 @@ Ruling: Provenance applies prospectively to aliases forwarded by future database
 
 Ruling: Only exact candidates proven unreachable by a complete non-opaque scan are pruned.
 
-Ruling: Historical aliases, malformed owner shapes, plugin-owned ambiguity, cold payload ambiguity, and any exact-match uncertainty are retained.
+Ruling: Historical aliases, installed or malformed plugins, malformed owner shapes, plugin-owned ambiguity, cold payload ambiguity, and any exact-match uncertainty are retained.
 
 ### Risks and limits
 
 - Filesystem proof is intentionally fail-closed. Interrupted or malformed residues can remain for later diagnosis instead of risking deletion.
 - Source cleanup assumes the existing single command-state ownership model. It does not introduce cross-process locking or a new lifecycle authority.
-- Plugin and cold payload presence conservatively disables alias pruning for that replacement. This can retain bytes, but it prevents deletion where the supported scan cannot prove reachability.
+- Installed plugins, malformed plugin metadata, plugin storage, and cold payload presence conservatively disable alias pruning for that replacement. This can retain bytes, but it prevents deletion where the supported scan cannot prove reachability.
 - Aliases with no object hash are not provenance candidates because they do not identify CAS bytes. They remain preserved.
 - Existing dead-code warnings remain unchanged. Live RisuRealm validation was intentionally skipped under the required test isolation flag.
 
 Ruling: Conservative retention is the required outcome whenever proof is incomplete or opaque.
+
+### Critical review follow-up
+
+Review identified that installed plugin scripts under `root.plugins` are arbitrary code and can call `readImage` with an `assets/...` key embedded inside script text even when `pluginCustomStorage` is empty. Heuristic string scanning cannot prove those script references absent.
+
+The RED regression `database_only_replace_retains_alias_referenced_only_by_installed_plugin_script` initially failed because the forwarded alias was pruned. After the fix it proves that the exact alias, replacement provenance row, and GC root remain. `database_only_replace_treats_malformed_installed_plugins_as_opaque` proves malformed plugin metadata also retains the alias. The exact-candidate pruning regression now executes once with no `plugins` property and once with `plugins: []`, proving both complete cases still prune unreachable exact candidates.
+
+Follow-up replacement validation passed 8 tests with 0 failures. Asset GC passed 17 tests plus the historical alias root regression. Schema passed 33 tests, startup sweeps passed 7 tests, and the broad persistent-store suite passed 311 tests with 2 ignored and 0 failures. `cargo fmt --check`, `cargo check`, and `pnpm check` also passed. All follow-up commands ran with `VITE_DISABLE_REALM=true`.
+
+Ruling: Any nonempty installed-plugin list is opaque because installed scripts can reference assets through arbitrary code, regardless of custom storage state.
+
+Ruling: Plugin script text is never heuristically scanned to authorize deletion.
+
+Ruling: Missing plugins and an empty plugin list remain complete scan states, while malformed plugin metadata fails closed as opaque.
