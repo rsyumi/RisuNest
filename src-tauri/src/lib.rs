@@ -586,8 +586,11 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_prepare,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_start,
+            #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_tunnel_start,
+            #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_tunnel_status,
+            #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_tunnel_stop,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_status,

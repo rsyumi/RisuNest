@@ -1872,6 +1872,10 @@ pub(crate) fn validate_private_lan_endpoint(value: &str) -> Result<String, PeerS
     }
 }
 
+pub(crate) fn validate_p4_logical_delta_endpoint(value: &str) -> Result<String, PeerSyncError> {
+    validate_lan_endpoint(value)
+}
+
 fn has_explicit_authority_port(value: &str) -> bool {
     let Some((_, remainder)) = value.split_once("://") else {
         return false;
@@ -1959,6 +1963,44 @@ mod endpoint_tests {
             bearer: "b".repeat(64),
         };
         assert!(credential.validate().is_err());
+    }
+
+    #[test]
+    fn p4_delta_policy_accepts_private_lan_and_only_canonical_public_https() {
+        assert_eq!(
+            validate_p4_logical_delta_endpoint("http://192.168.1.2:8080").unwrap(),
+            "http://192.168.1.2:8080"
+        );
+        assert_eq!(
+            validate_p4_logical_delta_endpoint("https://sync.example.com/").unwrap(),
+            "https://sync.example.com"
+        );
+        for endpoint in [
+            "https://sync.example.com:443",
+            "https://sync.example.com/path",
+            "https://localhost",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                validate_p4_logical_delta_endpoint(endpoint).is_err(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn p5_claim_rejects_public_https_before_transport() {
+        let failure = match LanBidirectionalLogicalClient::claim(
+            "https://sync.example.invalid",
+            "00000000-0000-4000-8000-000000000001",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            "00000000-0000-4000-8000-000000000002",
+        ) {
+            Ok(_) => panic!("P5 accepted a public HTTPS endpoint"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(failure, PeerSyncError::Protocol(_)), "{failure}");
     }
 
     #[test]
@@ -3424,6 +3466,27 @@ impl LanLogicalDeltaClient {
         )
     }
 
+    pub(crate) fn claim_p4(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        Self::claim_with_timeouts_and_policy(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            None,
+            "logical-read",
+            LogicalClientTimeouts {
+                control_request: CONTROL_REQUEST_TIMEOUT,
+                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+            },
+            validate_p4_logical_delta_endpoint,
+        )
+    }
+
     fn claim_with_timeouts(
         endpoint: &str,
         session_id: &str,
@@ -3451,6 +3514,29 @@ impl LanLogicalDeltaClient {
         permission: &str,
         timeouts: LogicalClientTimeouts,
     ) -> Result<Self, PeerSyncError> {
+        Self::claim_with_timeouts_and_policy(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            device_id,
+            permission,
+            timeouts,
+            validate_private_lan_endpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_with_timeouts_and_policy(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        device_id: Option<&str>,
+        permission: &str,
+        timeouts: LogicalClientTimeouts,
+        validate_endpoint: fn(&str) -> Result<String, PeerSyncError>,
+    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
@@ -3461,7 +3547,7 @@ impl LanLogicalDeltaClient {
                 "invalid logical delta pairing data".to_owned(),
             ));
         }
-        let endpoint = validate_lan_endpoint(endpoint)?;
+        let endpoint = validate_endpoint(endpoint)?;
         let session_url = format!("{endpoint}/v1/sessions/{session_id}");
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(
