@@ -52,6 +52,8 @@ pub(super) type StoreResult<T> = Result<T, StoreError>;
 
 pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+pub(crate) const ASSET_GC_PRODUCT_PAGE_LIMIT: i64 = 128;
+const ASSET_GC_PRODUCT_MINIMUM_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 // Add every generation-scoped record family here so staged moves and cleanup cannot omit it.
 pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
@@ -1957,6 +1959,35 @@ impl PersistentStore {
         self.asset_gc_delete_page_with_hook(limit, cursor, now_ms, minimum_grace_ms, |_| Ok(()))
     }
 
+    pub(crate) fn asset_gc_product_maintenance_page(
+        &mut self,
+        now_ms: i64,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        self.asset_gc_delete_page(
+            ASSET_GC_PRODUCT_PAGE_LIMIT,
+            None,
+            now_ms,
+            ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn asset_gc_product_maintenance_page_with_hook(
+        &mut self,
+        now_ms: i64,
+        hook: impl FnMut(
+            crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
+        ) -> StoreResult<()>,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        self.asset_gc_delete_page_with_hook(
+            ASSET_GC_PRODUCT_PAGE_LIMIT,
+            None,
+            now_ms,
+            ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
+            hook,
+        )
+    }
+
     pub(crate) fn asset_gc_delete_page_with_hook(
         &mut self,
         limit: i64,
@@ -1980,10 +2011,17 @@ impl PersistentStore {
             now_ms,
             minimum_grace_ms,
         )?;
-        if !initial_report.blockers.is_empty() || initial_report.potential_delete_hashes.is_empty()
-        {
+        if !initial_report.blockers.is_empty() {
             return Ok(AssetGcDryRunPage {
                 report: initial_report,
+                next_cursor: initial_candidates.next_cursor,
+            });
+        }
+        if initial_report.potential_delete_hashes.is_empty() {
+            let mut report = initial_report;
+            report.deletion_enabled = true;
+            return Ok(AssetGcDryRunPage {
+                report,
                 next_cursor: initial_candidates.next_cursor,
             });
         }
@@ -2003,7 +2041,14 @@ impl PersistentStore {
             now_ms,
             minimum_grace_ms,
         )?;
-        if !report.blockers.is_empty() || report.potential_delete_hashes.is_empty() {
+        if !report.blockers.is_empty() {
+            return Ok(AssetGcDryRunPage {
+                report,
+                next_cursor: final_candidates.next_cursor,
+            });
+        }
+        report.deletion_enabled = true;
+        if report.potential_delete_hashes.is_empty() {
             return Ok(AssetGcDryRunPage {
                 report,
                 next_cursor: final_candidates.next_cursor,
@@ -2084,7 +2129,6 @@ impl PersistentStore {
                 })?;
             report.deleted_hashes.push(object_hash);
         }
-        report.deletion_enabled = true;
         Ok(AssetGcDryRunPage {
             report,
             next_cursor: final_candidates.next_cursor,

@@ -10385,6 +10385,7 @@ fn asset_gc_delete_page_recollects_a_late_root_under_writer_exclusion() {
         .expect("late root must conservatively retain the object");
 
     assert!(injected);
+    assert!(page.report.deletion_enabled);
     assert!(page.report.marked_hashes.contains(&prepared.content_hash));
     assert!(page.report.deleted_hashes.is_empty());
     assert_eq!(
@@ -10767,6 +10768,139 @@ fn asset_gc_delete_page_is_bounded_and_never_enumerates_untracked_cas_entries() 
         .items
         .is_empty());
     assert_eq!(fs::read(&sentinel).unwrap(), b"untracked sentinel");
+}
+
+#[test]
+fn asset_gc_product_maintenance_reports_a_blocker_free_empty_executor() {
+    let directory = tempfile::tempdir().expect("create empty maintenance directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+
+    let page = store
+        .asset_gc_product_maintenance_page(100)
+        .expect("run empty product maintenance page");
+
+    assert!(page.report.deletion_enabled);
+    assert!(page.report.blockers.is_empty());
+    assert!(page.report.deleted_hashes.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn asset_gc_product_maintenance_is_bounded_and_repeatable() {
+    let directory = tempfile::tempdir().expect("create bounded maintenance directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let total = super::ASSET_GC_PRODUCT_PAGE_LIMIT + 1;
+    for index in 0..total {
+        let prepared = cas
+            .prepare_bytes(format!("bounded-maintenance-{index}").as_bytes())
+            .expect("prepare maintenance candidate");
+        register_gc_candidate(&mut store, &prepared);
+    }
+
+    let now_ms = super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1;
+    let first = store
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("run first product maintenance page");
+    assert!(first.report.deletion_enabled);
+    assert_eq!(
+        first.report.deleted_hashes.len(),
+        super::ASSET_GC_PRODUCT_PAGE_LIMIT as usize
+    );
+    assert!(first.next_cursor.is_some());
+
+    let second = store
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("repeat product maintenance page");
+    assert!(second.report.deletion_enabled);
+    assert_eq!(second.report.deleted_hashes.len(), 1);
+    assert!(second.next_cursor.is_none());
+
+    let third = store
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("repeat completed product maintenance");
+    assert!(third.report.deletion_enabled);
+    assert!(third.report.deleted_hashes.is_empty());
+}
+
+#[test]
+fn asset_gc_product_maintenance_interruption_recovers_on_next_open() {
+    use crate::asset_repository::migration_gc::AssetGcDeleteHookPoint;
+
+    let directory = tempfile::tempdir().expect("create interrupted maintenance directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"interrupted-product-maintenance")
+        .expect("prepare interrupted candidate");
+    register_gc_candidate(&mut store, &prepared);
+    let now_ms = super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS + 1;
+
+    let error = store
+        .asset_gc_product_maintenance_page_with_hook(now_ms, |point| {
+            if point == AssetGcDeleteHookPoint::AfterUnlink {
+                return Err(StoreError::Store {
+                    message: "injected product maintenance interruption".to_owned(),
+                });
+            }
+            Ok(())
+        })
+        .expect_err("interrupt after product unlink");
+    assert!(error
+        .to_string()
+        .contains("injected product maintenance interruption"));
+    drop(store);
+
+    let mut reopened = PersistentStore::open(directory.path()).expect("recover product tombstone");
+    let page = reopened
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("repeat recovered product maintenance");
+    assert!(page.report.deletion_enabled);
+    assert!(page.report.deleted_hashes.is_empty());
+    drop(reopened);
+
+    let mut reopened = PersistentStore::open(directory.path()).expect("confirm recovery absence");
+    let page = reopened
+        .asset_gc_product_maintenance_page(now_ms)
+        .expect("repeat idempotent product maintenance");
+    assert!(page.report.deletion_enabled);
+    assert!(page.report.deleted_hashes.is_empty());
+    assert!(cas
+        .stat_object(&prepared.content_hash)
+        .expect("stat interrupted candidate")
+        .is_none());
+}
+
+#[test]
+fn asset_gc_product_maintenance_keeps_blockers_fail_closed() {
+    use crate::asset_repository::job_pins::{CasJobKind, DurableCasJob};
+
+    let directory = tempfile::tempdir().expect("create blocked maintenance directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let prepared = cas
+        .prepare_bytes(b"blocked-product-maintenance")
+        .expect("prepare blocked candidate");
+    register_gc_candidate(&mut store, &prepared);
+    let _job = DurableCasJob::begin(
+        directory.path(),
+        "product-maintenance-blocker",
+        CasJobKind::DirectAssetOrInlayWrite,
+        0,
+    )
+    .expect("begin unsealed blocker");
+
+    let page = store
+        .asset_gc_product_maintenance_page(100)
+        .expect("run blocked product maintenance");
+
+    assert!(!page.report.deletion_enabled);
+    assert!(!page.report.blockers.is_empty());
+    assert!(page.report.deleted_hashes.is_empty());
+    assert!(cas
+        .stat_object(&prepared.content_hash)
+        .expect("stat blocked candidate")
+        .is_some());
 }
 
 #[test]

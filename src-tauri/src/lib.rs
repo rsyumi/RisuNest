@@ -644,6 +644,7 @@ pub fn run() {
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_cancel,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_release,
             persistent_store::commands::pds_open,
+            persistent_store::commands::pds_asset_gc_maintenance,
             persistent_store::commands::pds_read_root,
             persistent_store::commands::pds_query_presets,
             persistent_store::commands::pds_read_preset,

@@ -652,7 +652,8 @@ pub struct AssetGcCandidate {
     pub created_at_ms: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetGcDryRunReport {
     pub marked_hashes: Vec<String>,
     pub grace_retained_hashes: Vec<String>,
@@ -671,7 +672,8 @@ pub(crate) enum AssetGcDeleteHookPoint {
     AfterUnlink,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct AssetGcDryRunPage {
     pub(crate) report: AssetGcDryRunReport,
     pub(crate) next_cursor: Option<String>,

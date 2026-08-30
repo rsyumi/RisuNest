@@ -11,6 +11,7 @@ use super::{
 };
 use serde_json::Value;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, path::Path};
 use tauri::{AppHandle, Manager, State};
 
@@ -32,6 +33,24 @@ impl Default for PersistentStoreState {
             snapshot_operations: Mutex::new(()),
         }
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PersistentStoreOpenResult {
+    revision: i64,
+    asset_gc_maintenance: crate::asset_repository::migration_gc::AssetGcDryRunPage,
+}
+
+fn current_time_ms() -> StoreResult<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StoreError::Store {
+            message: format!("system clock is before the Unix epoch: {error}"),
+        })?;
+    i64::try_from(duration.as_millis()).map_err(|_| StoreError::Store {
+        message: "system time exceeds the persistent asset maintenance range".to_owned(),
+    })
 }
 
 fn with_store<T>(
@@ -201,14 +220,17 @@ fn sweep_peer_logical_staging_directories(app_root: &Path) {
 pub(crate) fn pds_open(
     app: AppHandle,
     state: State<'_, PersistentStoreState>,
-) -> Result<RevisionResult, StoreError> {
+) -> Result<PersistentStoreOpenResult, StoreError> {
     let mut store = state.store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
 
-    if let Some(store) = store.as_ref() {
-        return Ok(RevisionResult {
-            revision: store.revision()?,
+    if let Some(store) = store.as_mut() {
+        let revision = store.revision()?;
+        let asset_gc_maintenance = store.asset_gc_product_maintenance_page(current_time_ms()?)?;
+        return Ok(PersistentStoreOpenResult {
+            revision,
+            asset_gc_maintenance,
         });
     }
 
@@ -218,12 +240,26 @@ pub(crate) fn pds_open(
         .map_err(|error| StoreError::Store {
             message: format!("failed to resolve application data directory: {error}"),
         })?;
-    let persistent_store = PersistentStore::open(&app_data_dir)?;
+    let mut persistent_store = PersistentStore::open(&app_data_dir)?;
     sweep_peer_logical_staging_directories(&app_data_dir);
     let revision = persistent_store.revision()?;
+    let asset_gc_maintenance =
+        persistent_store.asset_gc_product_maintenance_page(current_time_ms()?)?;
     *store = Some(persistent_store);
 
-    Ok(RevisionResult { revision })
+    Ok(PersistentStoreOpenResult {
+        revision,
+        asset_gc_maintenance,
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_asset_gc_maintenance(
+    state: State<'_, PersistentStoreState>,
+) -> Result<crate::asset_repository::migration_gc::AssetGcDryRunPage, StoreError> {
+    with_store_mut(state, |store| {
+        store.asset_gc_product_maintenance_page(current_time_ms()?)
+    })
 }
 
 #[tauri::command(async)]
@@ -963,5 +999,28 @@ mod tests {
             .join("staging")
             .join(CANONICAL_STAGING_NAME)
             .exists());
+    }
+
+    #[test]
+    fn open_result_exposes_truthful_product_maintenance_evidence() {
+        let directory = tempdir().expect("create open result directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let result = PersistentStoreOpenResult {
+            revision: store.revision().expect("read revision"),
+            asset_gc_maintenance: store
+                .asset_gc_product_maintenance_page(100)
+                .expect("run product maintenance"),
+        };
+
+        let encoded = serde_json::to_value(result).expect("serialize open result");
+        assert_eq!(encoded["revision"], 0);
+        assert_eq!(
+            encoded["assetGcMaintenance"]["report"]["deletionEnabled"],
+            true
+        );
+        assert!(encoded["assetGcMaintenance"]["report"]["blockers"]
+            .as_array()
+            .expect("read blockers")
+            .is_empty());
     }
 }
