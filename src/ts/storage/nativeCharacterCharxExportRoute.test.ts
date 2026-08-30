@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
-vi.mock('../platform', () => ({ isTauriDesktop: false }))
+vi.mock('../platform', () => ({ isTauriDesktop: true, isTauriAndroid: false }))
 vi.mock('./persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: vi.fn(),
 }))
+
+import { save } from '@tauri-apps/plugin-dialog'
 
 import { exportNativeCharacterCharxFromPicker } from './nativeCharacterCharxExportRoute'
 
@@ -155,6 +157,33 @@ describe('native character CharX export route', () => {
                 module: {},
             }],
         ])
+    })
+
+    it('matches the desktop dialog filter to the requested container', async () => {
+        vi.mocked(save).mockResolvedValue(null)
+        const base = {
+            characterId: 'current-character',
+            projectCharacter: () => ({ card: {}, module: {} }),
+        }
+
+        await expect(exportNativeCharacterCharxFromPicker({
+            ...base,
+            suggestedName: 'Current.jpeg',
+            container: 'appended-charx-jpeg',
+        })).resolves.toBeNull()
+        expect(save).toHaveBeenLastCalledWith({
+            defaultPath: 'Current.jpeg',
+            filters: [{ name: 'CharX JPEG', extensions: ['jpeg'] }],
+        })
+
+        await expect(exportNativeCharacterCharxFromPicker({
+            ...base,
+            suggestedName: 'Current.charx',
+        })).resolves.toBeNull()
+        expect(save).toHaveBeenLastCalledWith({
+            defaultPath: 'Current.charx',
+            filters: [{ name: 'CharX', extensions: ['charx'] }],
+        })
     })
 
     it('adds only the appended-JPEG discriminator while plain CharX remains omitted', async () => {

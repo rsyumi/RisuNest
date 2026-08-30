@@ -21,12 +21,12 @@ import {
     type ConversationViewportSource,
 } from '../conversationViewportSource'
 import { createMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
+import { removeGroupMemberReferences } from './groupMembership'
 
 type CompleteCharacter = character | groupChat
 
 const CONVERSATION_HYDRATION_CONCURRENCY = 8
 const RELATED_CHARACTER_HYDRATION_CONCURRENCY = 4
-const DEFAULT_GROUP_TALKNESS = 1 / 6 * 4
 
 class MissingCharacterError extends Error {}
 
@@ -636,18 +636,9 @@ export class ActiveWorkingSet {
         const persistedCharacterValue = characterValue
         if (characterValue.type === 'group' && missingRelatedIds.size > 0) {
             const groupValue = characterValue
-            const retainedIndices = groupValue.characters
-                .map((memberId, index) => ({ memberId, index }))
-                .filter(({ memberId }) => !missingRelatedIds.has(memberId))
             characterValue = {
                 ...groupValue,
-                characters: retainedIndices.map(({ memberId }) => memberId),
-                characterTalks: retainedIndices.map(
-                    ({ index }) => groupValue.characterTalks?.[index] ?? DEFAULT_GROUP_TALKNESS,
-                ),
-                characterActive: retainedIndices.map(
-                    ({ index }) => groupValue.characterActive?.[index] ?? true,
-                ),
+                ...removeGroupMemberReferences(groupValue, missingRelatedIds),
             }
             relatedIds = relatedIds.filter((memberId) => !missingRelatedIds.has(memberId))
         }

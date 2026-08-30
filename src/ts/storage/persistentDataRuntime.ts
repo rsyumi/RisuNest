@@ -1,5 +1,6 @@
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
+import { removeGroupMemberReferences } from './groupMembership'
 import {
     ActiveWorkingSet,
     type ActiveConversationViewportSourceListener,
@@ -151,16 +152,13 @@ export function publishPersistentCharacterMutationToWorkingSet(
             Array.isArray(selected.characters) &&
             selected.chaId !== state.characterId
         ) {
-            const retainedIndices = selected.characters
-                .map((id, memberIndex) => ({ id, memberIndex }))
-                .filter(({ id }) => id !== state.characterId)
-            selected.characters = retainedIndices.map(({ id }) => id)
-            selected.characterTalks = retainedIndices.map(
-                ({ memberIndex }) => selected.characterTalks?.[memberIndex] ?? 1 / 6 * 4,
+            const retained = removeGroupMemberReferences(
+                selected,
+                new Set([state.characterId]),
             )
-            selected.characterActive = retainedIndices.map(
-                ({ memberIndex }) => selected.characterActive?.[memberIndex] ?? true,
-            )
+            selected.characters = retained.characters
+            selected.characterTalks = retained.characterTalks
+            selected.characterActive = retained.characterActive
         }
         if (index >= 0) database.characters.splice(index, 1)
         residency.forgetCharacter(state.characterId)

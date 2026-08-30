@@ -1062,6 +1062,75 @@ describe('native file jobs', () => {
         ])
     })
 
+    it.each([
+        {
+            label: 'lossless backup',
+            run: runNativeLosslessBackupExport,
+            kind: 'export-lossless-backup' as const,
+            cleanupCommand: 'native_lossless_handoff_cleanup',
+            suggestedName: 'backup.risulossless',
+            handoffPath: 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174005.risulossless',
+        },
+        {
+            label: 'legacy backup',
+            run: runNativeLegacyLocalBackupExport,
+            kind: 'export-legacy-local-backup' as const,
+            cleanupCommand: 'native_legacy_backup_handoff_cleanup',
+            suggestedName: 'risu-backup.bin',
+            handoffPath: 'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174005.bin',
+        },
+    ])('retains a successful Android $label job when native source cleanup fails', async ({
+        run,
+        kind,
+        cleanupCommand,
+        suggestedName,
+        handoffPath,
+    }) => {
+        const commands: string[] = []
+        const terminal: NativeFileJobStatus = {
+            jobId: 'portable-export',
+            kind,
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4096, completedItems: 3 },
+            result: {
+                revision: 22,
+                sourceBytes: 4096,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 3,
+                presetCount: 2,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        const result = await run(
+            { revision: 22, flushPendingData: async () => undefined },
+            { type: 'androidSaf', suggestedName },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'portable-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === cleanupCommand) throw new Error('handoff is still in use')
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 4096, warningCodes: [] }),
+            },
+        )
+
+        expect(result.warningCodes).toEqual(['cleanup-failed'])
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            cleanupCommand,
+        ])
+    })
+
     it('restores from a descriptor without sending file or database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const statuses = [

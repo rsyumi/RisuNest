@@ -39,6 +39,7 @@ import {
 import { RevisionConflictError } from './persistentDataStore'
 import type { BlobStore } from './blobStore'
 import type { ColdPayloadStore } from './coldPayloadStore'
+import type { ImmutablePayloadCas } from './payloadCas'
 import type { PersistentStorageAuthority } from './persistentStorageAuthority'
 
 async function createLocalColdPayloadStore() {
@@ -95,16 +96,21 @@ function createConfiguredAssetBlobStore(
         : createGatedBlobStore(store, authority.gate)
 }
 
-async function installPersistentStorage(): Promise<void> {
-    const authority = getPersistentStorageAuthority()
-    await authority.rawStore.open()
-    const coldLegacy = await createLocalColdPayloadStore()
-    const legacy = getLegacyBlobStore()
-    const v2 = isTauri
+async function installRepositorySelections(
+    authority: PersistentStorageAuthority,
+    input: {
+        legacy: BlobStore
+        coldLegacy: ColdPayloadStore
+        v2Capability: boolean
+        createAssetCas(): ImmutablePayloadCas
+        createColdCas(): ImmutablePayloadCas
+    },
+): Promise<void> {
+    const v2 = input.v2Capability
         ? createNativeV2BlobStore({
             store: authority.rawStore,
-            legacy,
-            cas: createNativeImmutablePayloadCas(),
+            legacy: input.legacy,
+            cas: input.createAssetCas(),
             objectUrls: createNativeAssetObjectUrlResolver(),
             newInlayImages: createNativeNewInlayImageEncoder(),
             writeSessions: createNativeDurableAssetWriteSessionFactory(),
@@ -112,25 +118,25 @@ async function installPersistentStorage(): Promise<void> {
         : undefined
     const selection = {
         store: authority.rawStore,
-        legacy,
+        legacy: input.legacy,
         v2,
-        v2Capability: isTauri,
+        v2Capability: input.v2Capability,
     }
-    await selectRuntimeAssetRepository(selection)
-    const coldV2 = isTauri
+    const coldV2 = input.v2Capability
         ? createCompleteColdPayloadStore({
             catalog: authority.rawStore,
-            cas: createNativeImmutablePayloadCas(),
-            legacy: coldLegacy,
+            cas: input.createColdCas(),
+            legacy: input.coldLegacy,
             writeSessions: createNativeDurableCasJobSessionFactory('cold-direct-write'),
         })
         : undefined
     const coldSelection = {
         store: authority.rawStore,
-        legacy: coldLegacy,
+        legacy: input.coldLegacy,
         v2: coldV2,
-        v2Capability: isTauri,
+        v2Capability: input.v2Capability,
     }
+    await selectRuntimeAssetRepository(selection)
     await selectRuntimeColdPayloadStore(coldSelection)
     configureActiveBlobStore(
         authority.gate,
@@ -146,6 +152,20 @@ async function installPersistentStorage(): Promise<void> {
             authority,
         )),
     )
+}
+
+async function installPersistentStorage(): Promise<void> {
+    const authority = getPersistentStorageAuthority()
+    await authority.rawStore.open()
+    const coldLegacy = await createLocalColdPayloadStore()
+    const legacy = getLegacyBlobStore()
+    await installRepositorySelections(authority, {
+        legacy,
+        coldLegacy,
+        v2Capability: isTauri,
+        createAssetCas: () => createNativeImmutablePayloadCas(),
+        createColdCas: () => createNativeImmutablePayloadCas(),
+    })
 }
 
 export async function activateNativeAssetRepository(): Promise<number | null> {
@@ -187,48 +207,13 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
                 writeSessions: coldMigrationSessions,
             })
         }
-        const v2 = createNativeV2BlobStore({
-            store: authority.rawStore,
+        await installRepositorySelections(authority, {
             legacy,
-            cas,
-            objectUrls: createNativeAssetObjectUrlResolver(),
-            newInlayImages: createNativeNewInlayImageEncoder(),
-            writeSessions: createNativeDurableAssetWriteSessionFactory(),
-        })
-        const selection = {
-            store: authority.rawStore,
-            legacy,
-            v2,
+            coldLegacy,
             v2Capability: true,
-        }
-        const coldV2 = createCompleteColdPayloadStore({
-            catalog: authority.rawStore,
-            cas,
-            legacy: coldLegacy,
-            writeSessions: createNativeDurableCasJobSessionFactory('cold-direct-write'),
+            createAssetCas: () => cas,
+            createColdCas: () => cas,
         })
-        const coldSelection = {
-            store: authority.rawStore,
-            legacy: coldLegacy,
-            v2: coldV2,
-            v2Capability: true,
-        }
-        await selectRuntimeAssetRepository(selection)
-        await selectRuntimeColdPayloadStore(coldSelection)
-        configureActiveBlobStore(
-            authority.gate,
-            createConfiguredAssetBlobStore(
-                createRuntimeAssetRepositoryDispatcher(selection),
-                authority,
-            ),
-            { alreadyGuarded: true },
-        )
-        configureLocalColdStorageRuntime(
-            createLocalColdStorageRuntime(createConfiguredColdPayloadStore(
-                createRuntimeColdPayloadDispatcher(coldSelection),
-                authority,
-            )),
-        )
         return (await authority.rawStore.readColdPayloadAuthority()).revision
     })
 }

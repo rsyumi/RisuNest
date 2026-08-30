@@ -332,10 +332,23 @@ function abortError(): Error {
     return new DOMException('Native file job was cancelled', 'AbortError')
 }
 
-function isTerminalJob(status: NativeFileJobStatus): boolean {
+export function isTerminalJob(status: NativeFileJobStatus): boolean {
     return status.state === 'succeeded'
         || status.state === 'failed'
         || status.state === 'cancelled'
+}
+
+function mergeWarningCodes(
+    ...groups: ReadonlyArray<readonly string[] | undefined>
+): string[] {
+    return [...new Set(groups.flatMap((group) => group ?? []))].slice(0, 16)
+}
+
+function withCleanupFailedWarning(codes: readonly string[]): string[] {
+    return [
+        ...codes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
+        'cleanup-failed',
+    ]
 }
 
 function preparedContentError(message: string): NativeFileJobError {
@@ -643,6 +656,26 @@ async function invokeNative(
     }
 }
 
+async function pollNativeFileJobUntilTerminal(
+    jobId: string,
+    options: NativeFileJobOptions,
+    dependencies: NativeFileJobDependencies,
+): Promise<NativeFileJobStatus> {
+    let cancellationRequested = false
+    while (true) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId })
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (isTerminalJob(status)) return status
+        await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+}
+
 function abortBeforeNativeRestoreStart(
     source: NativeFileJobSource | NativeOfficialAccountSnapshotRestoreRequest,
     dependencies: NativeFileJobDependencies,
@@ -791,10 +824,7 @@ async function runNativeReplacementRestore(
             }
             const committedResult = {
                 ...terminal.result,
-                warningCodes: [...new Set([
-                    ...(started.warningCodes ?? []),
-                    ...terminal.result.warningCodes,
-                ])].slice(0, 16),
+                warningCodes: mergeWarningCodes(started.warningCodes, terminal.result.warningCodes),
             }
             try {
                 await invokeNative(dependencies, 'native_file_job_forget', {
@@ -802,12 +832,7 @@ async function runNativeReplacementRestore(
                 })
             }
             catch {
-                committedResult.warningCodes = [
-                    ...committedResult.warningCodes
-                        .filter((code) => code !== 'cleanup-failed')
-                        .slice(0, 15),
-                    'cleanup-failed',
-                ]
+                committedResult.warningCodes = withCleanupFailedWarning(committedResult.warningCodes)
             }
             return committedResult
         }
@@ -915,10 +940,7 @@ export function runNativeLegacyLocalBackupRestore(
     )
 }
 
-async function runNativePathExport(
-    kind: 'export-block-risu-save' | 'export-legacy-local-backup',
-    flushReason: string,
-    operation: string,
+export async function runNativeBlockRisuSaveExport(
     runtime: {
         readonly revision: number
         flushPendingData(reason: string): Promise<void>
@@ -928,41 +950,22 @@ async function runNativePathExport(
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
     if (!dependencies.isTauri()) {
-        throw new Error(`${operation} requires Tauri`)
+        throw new Error('Native block RisuSave export requires Tauri')
     }
     if (options.signal?.aborted) throw abortError()
 
-    await runtime.flushPendingData(flushReason)
+    await runtime.flushPendingData('native-block-risu-save-export')
     if (options.signal?.aborted) throw abortError()
     const expectedRevision = runtime.revision
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
-            kind,
+            kind: 'export-block-risu-save',
             destination,
             expectedRevision,
-            ...(kind === 'export-block-risu-save'
-                ? { omitAccount: options.omitAccount ?? false }
-                : {}),
+            omitAccount: options.omitAccount ?? false,
         },
     }) as { jobId: string; warningCodes?: string[] }
-    let cancellationRequested = false
-    let terminal: NativeFileJobStatus | undefined
-
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
-            terminal = status
-            break
-        }
-        await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
+    const terminal = await pollNativeFileJobUntilTerminal(started.jobId, options, dependencies)
 
     let outcomeFailed = false
     let committedResult: NativeFileJobResult | undefined
@@ -973,10 +976,7 @@ async function runNativePathExport(
             }
             committedResult = {
                 ...terminal.result,
-                warningCodes: [...new Set([
-                    ...(started.warningCodes ?? []),
-                    ...terminal.result.warningCodes,
-                ])].slice(0, 16),
+                warningCodes: mergeWarningCodes(started.warningCodes, terminal.result.warningCodes),
             }
             return committedResult
         }
@@ -997,50 +997,156 @@ async function runNativePathExport(
         }
         catch (error) {
             if (committedResult) {
-                committedResult.warningCodes = [
-                    ...committedResult.warningCodes
-                        .filter((code) => code !== 'cleanup-failed')
-                        .slice(0, 15),
-                    'cleanup-failed',
-                ]
+                committedResult.warningCodes = withCleanupFailedWarning(committedResult.warningCodes)
             }
             else if (!outcomeFailed) throw error
         }
     }
 }
 
-
-export function runNativeBlockRisuSaveExport(
-    runtime: {
-        readonly revision: number
-        flushPendingData(reason: string): Promise<void>
-    },
-    destination: string,
-    options: NativeFileExportJobOptions = {},
-    dependencies: NativeFileJobDependencies = productionDependencies,
-): Promise<NativeFileJobResult> {
-    return runNativePathExport(
-        'export-block-risu-save',
-        'native-block-risu-save-export',
-        'Native block RisuSave export',
-        runtime,
-        destination,
-        options,
-        dependencies,
-    )
+interface NativeManagedExportSpec {
+    operation: string
+    safLengthMismatchLabel: string
+    handoffCleanupCommand: string
+    destination: NativeCharacterCharxExportDestination
+    relaySafCopyProgress?: boolean
+    prepareRequest(): Record<string, unknown> | Promise<Record<string, unknown>>
 }
 
-export async function runNativeCharacterCharxExport(
+/**
+ * Shared start/poll/terminal/SAF-handoff/cleanup skeleton for every managed
+ * native export kind. When the Android handoff cleanup fails, the native job
+ * is intentionally retained (fail closed) so bootstrap recovery can retry the
+ * cleanup before forgetting the job.
+ */
+async function runNativeManagedExport(
+    spec: NativeManagedExportSpec,
+    options: NativeFileJobOptions,
+    dependencies: NativeLosslessBackupDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) {
+        throw new Error(`${spec.operation} requires Tauri`)
+    }
+    if (options.signal?.aborted) throw abortError()
+    const request = await spec.prepareRequest()
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request,
+    }) as { jobId: string; warningCodes?: string[] }
+    const terminal = await pollNativeFileJobUntilTerminal(started.jobId, options, dependencies)
+
+    let outcomeFailed = false
+    let result: NativeFileJobResult | undefined
+    let managedSource: string | undefined
+    let handoffCleanupFailed = false
+    try {
+        if (terminal.state === 'cancelled') throw abortError()
+        if (terminal.state !== 'succeeded') {
+            throw new NativeFileJobError(
+                terminal.error?.code ?? 'export-failed',
+                terminal.error?.message ?? `${spec.operation} failed`,
+            )
+        }
+        if (!terminal.result) {
+            throw new NativeFileJobError(
+                'missing-result',
+                `${spec.operation} returned no result`,
+            )
+        }
+        result = {
+            ...terminal.result,
+            warningCodes: mergeWarningCodes(started.warningCodes, terminal.result.warningCodes),
+        }
+        if (spec.destination.type === 'androidSaf') {
+            managedSource = result.handoffPath
+            if (!managedSource) {
+                throw new NativeFileJobError(
+                    'missing-handoff',
+                    `${spec.operation} returned no Android handoff path`,
+                )
+            }
+            const committedResult = result
+            const published = await dependencies.copyToAndroidSaf({
+                sourcePath: managedSource,
+                suggestedName: spec.destination.suggestedName,
+                signal: options.signal,
+                ...(spec.relaySafCopyProgress
+                    ? {
+                        onProgress: (progress) => options.onStatus?.({
+                            ...terminal,
+                            state: 'running',
+                            phase: 'publishing-destination',
+                            progress: {
+                                completedBytes: progress.copiedBytes,
+                                ...(progress.totalBytes === null
+                                    ? { totalBytes: committedResult.sourceBytes }
+                                    : { totalBytes: progress.totalBytes }),
+                                completedItems: 0,
+                                totalItems: 1,
+                            },
+                        }),
+                    }
+                    : {}),
+            })
+            if (published.bytes !== result.sourceBytes) {
+                throw new NativeFileJobError(
+                    'length-mismatch',
+                    `Android SAF ${spec.safLengthMismatchLabel} length differs from its native source`,
+                )
+            }
+            const { handoffPath: _handoffPath, ...publishedResult } = result
+            result = {
+                ...publishedResult,
+                warningCodes: mergeWarningCodes(
+                    publishedResult.warningCodes,
+                    published.warningCodes,
+                ),
+            }
+        }
+        return result
+    }
+    catch (error) {
+        outcomeFailed = true
+        throw error
+    }
+    finally {
+        if (managedSource) {
+            try {
+                await invokeNative(dependencies, spec.handoffCleanupCommand, {
+                    path: managedSource,
+                })
+            }
+            catch {
+                handoffCleanupFailed = true
+                if (result && !outcomeFailed) {
+                    result.warningCodes = withCleanupFailedWarning(result.warningCodes)
+                }
+            }
+        }
+        if (!handoffCleanupFailed) {
+            try {
+                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+            }
+            catch (error) {
+                if (result && !outcomeFailed) {
+                    result.warningCodes = withCleanupFailedWarning(result.warningCodes)
+                }
+                else if (!outcomeFailed) throw error
+            }
+        }
+    }
+}
+
+export function runNativeCharacterCharxExport(
     input: NativeCharacterCharxExportInput,
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    if (!dependencies.isTauri()) {
-        throw new Error('Native character CharX export requires Tauri')
-    }
-    if (options.signal?.aborted) throw abortError()
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
-        request: {
+    return runNativeManagedExport({
+        operation: 'Native character CharX export',
+        safLengthMismatchLabel: 'character CharX',
+        handoffCleanupCommand: 'native_character_charx_handoff_cleanup',
+        destination: input.destination,
+        prepareRequest: () => ({
             kind: 'export-character-charx',
             ...(input.destination.type === 'desktopPath'
                 ? { destination: input.destination.path }
@@ -1050,130 +1156,21 @@ export async function runNativeCharacterCharxExport(
             ...(input.container ? { container: input.container } : {}),
             card: input.card,
             module: input.module,
-        },
-    }) as { jobId: string; warningCodes?: string[] }
-    let cancellationRequested = false
-    let terminal: NativeFileJobStatus | undefined
-
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (isTerminalJob(status)) terminal = status
-        else await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
-
-    let outcomeFailed = false
-    let result: NativeFileJobResult | undefined
-    let managedSource: string | undefined
-    let handoffCleanupFailed = false
-    try {
-        if (terminal.state === 'cancelled') throw abortError()
-        if (terminal.state !== 'succeeded') {
-            throw new NativeFileJobError(
-                terminal.error?.code ?? 'export-failed',
-                terminal.error?.message ?? 'Native character CharX export failed',
-            )
-        }
-        if (!terminal.result) {
-            throw new NativeFileJobError(
-                'missing-result',
-                'Native character CharX export returned no result',
-            )
-        }
-        result = {
-            ...terminal.result,
-            warningCodes: [...new Set([
-                ...(started.warningCodes ?? []),
-                ...terminal.result.warningCodes,
-            ])].slice(0, 16),
-        }
-        if (input.destination.type === 'androidSaf') {
-            managedSource = result.handoffPath
-            if (!managedSource) {
-                throw new NativeFileJobError(
-                    'missing-handoff',
-                    'Native character CharX export returned no Android handoff path',
-                )
-            }
-            const published = await dependencies.copyToAndroidSaf({
-                sourcePath: managedSource,
-                suggestedName: input.destination.suggestedName,
-                signal: options.signal,
-            })
-            if (published.bytes !== result.sourceBytes) {
-                throw new NativeFileJobError(
-                    'length-mismatch',
-                    'Android SAF character CharX length differs from its native source',
-                )
-            }
-            const { handoffPath: _handoffPath, ...publishedResult } = result
-            result = {
-                ...publishedResult,
-                warningCodes: [...new Set([
-                    ...publishedResult.warningCodes,
-                    ...published.warningCodes,
-                ])].slice(0, 16),
-            }
-        }
-        return result
-    }
-    catch (error) {
-        outcomeFailed = true
-        throw error
-    }
-    finally {
-        if (managedSource) {
-            try {
-                await invokeNative(dependencies, 'native_character_charx_handoff_cleanup', {
-                    path: managedSource,
-                })
-            }
-            catch {
-                handoffCleanupFailed = true
-                if (result && !outcomeFailed) {
-                    result.warningCodes = [
-                        ...result.warningCodes
-                            .filter((code) => code !== 'cleanup-failed')
-                            .slice(0, 15),
-                        'cleanup-failed',
-                    ]
-                }
-            }
-        }
-        if (!handoffCleanupFailed) {
-            try {
-                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-            }
-            catch (error) {
-                if (result) {
-                    result.warningCodes = [
-                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
-                        'cleanup-failed',
-                    ]
-                }
-                else if (!outcomeFailed) throw error
-            }
-        }
-    }
+        }),
+    }, options, dependencies)
 }
 
-export async function runNativeCharacterCardExport(
+export function runNativeCharacterCardExport(
     input: NativeCharacterCardExportInput,
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    if (!dependencies.isTauri()) {
-        throw new Error('Native character card export requires Tauri')
-    }
-    if (options.signal?.aborted) throw abortError()
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
-        request: {
+    return runNativeManagedExport({
+        operation: 'Native character card export',
+        safLengthMismatchLabel: 'character card',
+        handoffCleanupCommand: 'native_character_card_handoff_cleanup',
+        destination: input.destination,
+        prepareRequest: () => ({
             kind: 'export-character-card',
             ...(input.destination.type === 'desktopPath'
                 ? { destination: input.destination.path }
@@ -1182,238 +1179,29 @@ export async function runNativeCharacterCardExport(
             characterId: input.characterId,
             format: input.format,
             metadata: input.metadata,
-        },
-    }) as { jobId: string; warningCodes?: string[] }
-    let cancellationRequested = false
-    let terminal: NativeFileJobStatus | undefined
-
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (isTerminalJob(status)) terminal = status
-        else await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
-
-    let outcomeFailed = false
-    let result: NativeFileJobResult | undefined
-    let managedSource: string | undefined
-    let handoffCleanupFailed = false
-    try {
-        if (terminal.state === 'cancelled') throw abortError()
-        if (terminal.state !== 'succeeded') {
-            throw new NativeFileJobError(
-                terminal.error?.code ?? 'export-failed',
-                terminal.error?.message ?? 'Native character card export failed',
-            )
-        }
-        if (!terminal.result) {
-            throw new NativeFileJobError(
-                'missing-result',
-                'Native character card export returned no result',
-            )
-        }
-        result = {
-            ...terminal.result,
-            warningCodes: [...new Set([
-                ...(started.warningCodes ?? []),
-                ...terminal.result.warningCodes,
-            ])].slice(0, 16),
-        }
-        if (input.destination.type === 'androidSaf') {
-            managedSource = result.handoffPath
-            if (!managedSource) {
-                throw new NativeFileJobError(
-                    'missing-handoff',
-                    'Native character card export returned no Android handoff path',
-                )
-            }
-            const published = await dependencies.copyToAndroidSaf({
-                sourcePath: managedSource,
-                suggestedName: input.destination.suggestedName,
-                signal: options.signal,
-            })
-            if (published.bytes !== result.sourceBytes) {
-                throw new NativeFileJobError(
-                    'length-mismatch',
-                    'Android SAF character card length differs from its native source',
-                )
-            }
-            const { handoffPath: _handoffPath, ...publishedResult } = result
-            result = {
-                ...publishedResult,
-                warningCodes: [...new Set([
-                    ...publishedResult.warningCodes,
-                    ...published.warningCodes,
-                ])].slice(0, 16),
-            }
-        }
-        return result
-    }
-    catch (error) {
-        outcomeFailed = true
-        throw error
-    }
-    finally {
-        if (managedSource) {
-            try {
-                await invokeNative(dependencies, 'native_character_card_handoff_cleanup', {
-                    path: managedSource,
-                })
-            }
-            catch {
-                handoffCleanupFailed = true
-                if (result && !outcomeFailed) {
-                    result.warningCodes = [
-                        ...result.warningCodes
-                            .filter((code) => code !== 'cleanup-failed')
-                            .slice(0, 15),
-                        'cleanup-failed',
-                    ]
-                }
-            }
-        }
-        if (!handoffCleanupFailed) {
-            try {
-                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-            }
-            catch (error) {
-                if (result) {
-                    result.warningCodes = [
-                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
-                        'cleanup-failed',
-                    ]
-                }
-                else if (!outcomeFailed) throw error
-            }
-        }
-    }
+        }),
+    }, options, dependencies)
 }
 
-export async function runNativeRisuModuleExport(
+export function runNativeRisuModuleExport(
     input: NativeRisuModuleExportInput,
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    if (!dependencies.isTauri()) throw new Error('Native RISUM export requires Tauri')
-    if (options.signal?.aborted) throw abortError()
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
-        request: {
+    return runNativeManagedExport({
+        operation: 'Native RISUM export',
+        safLengthMismatchLabel: 'RISUM',
+        handoffCleanupCommand: 'native_risu_module_handoff_cleanup',
+        destination: input.destination,
+        prepareRequest: () => ({
             kind: 'export-risu-module',
             ...(input.destination.type === 'desktopPath'
                 ? { destination: input.destination.path }
                 : {}),
             expectedRevision: input.expectedRevision,
             moduleIndex: input.moduleIndex,
-        },
-    }) as { jobId: string; warningCodes?: string[] }
-    let cancellationRequested = false
-    let terminal: NativeFileJobStatus | undefined
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (isTerminalJob(status)) terminal = status
-        else await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
-    let outcomeFailed = false
-    let result: NativeFileJobResult | undefined
-    let managedSource: string | undefined
-    let handoffCleanupFailed = false
-    try {
-        if (terminal.state === 'cancelled') throw abortError()
-        if (terminal.state !== 'succeeded') {
-            throw new NativeFileJobError(
-                terminal.error?.code ?? 'export-failed',
-                terminal.error?.message ?? 'Native RISUM export failed',
-            )
-        }
-        if (!terminal.result) {
-            throw new NativeFileJobError('missing-result', 'Native RISUM export returned no result')
-        }
-        result = {
-            ...terminal.result,
-            warningCodes: [...new Set([
-                ...(started.warningCodes ?? []),
-                ...terminal.result.warningCodes,
-            ])].slice(0, 16),
-        }
-        if (input.destination.type === 'androidSaf') {
-            managedSource = result.handoffPath
-            if (!managedSource) {
-                throw new NativeFileJobError(
-                    'missing-handoff',
-                    'Native RISUM export returned no Android handoff path',
-                )
-            }
-            const published = await dependencies.copyToAndroidSaf({
-                sourcePath: managedSource,
-                suggestedName: input.destination.suggestedName,
-                signal: options.signal,
-            })
-            if (published.bytes !== result.sourceBytes) {
-                throw new NativeFileJobError(
-                    'length-mismatch',
-                    'Android SAF RISUM length differs from its native source',
-                )
-            }
-            const { handoffPath: _handoffPath, ...publishedResult } = result
-            result = {
-                ...publishedResult,
-                warningCodes: [...new Set([
-                    ...publishedResult.warningCodes,
-                    ...published.warningCodes,
-                ])].slice(0, 16),
-            }
-        }
-        return result
-    }
-    catch (error) {
-        outcomeFailed = true
-        throw error
-    }
-    finally {
-        if (managedSource) {
-            try {
-                await invokeNative(dependencies, 'native_risu_module_handoff_cleanup', {
-                    path: managedSource,
-                })
-            }
-            catch {
-                handoffCleanupFailed = true
-                if (result && !outcomeFailed) {
-                    result.warningCodes = [
-                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
-                        'cleanup-failed',
-                    ]
-                }
-            }
-        }
-        if (!handoffCleanupFailed) {
-            try {
-                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-            }
-            catch (error) {
-                if (result) {
-                    result.warningCodes = [
-                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
-                        'cleanup-failed',
-                    ]
-                }
-                else if (!outcomeFailed) throw error
-            }
-        }
-    }
+        }),
+    }, options, dependencies)
 }
 
 export function runNativeLegacyLocalBackupExport(
@@ -1437,7 +1225,7 @@ export function runNativeLegacyLocalBackupExport(
     )
 }
 
-async function runNativePortableBackupExport(
+function runNativePortableBackupExport(
     kind: 'export-lossless-backup' | 'export-legacy-local-backup',
     flushReason: string,
     operation: string,
@@ -1450,147 +1238,28 @@ async function runNativePortableBackupExport(
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    if (!dependencies.isTauri()) {
-        throw new Error(`${operation} requires Tauri`)
-    }
-    if (options.signal?.aborted) throw abortError()
-
-    await runtime.flushPendingData(flushReason)
-    if (options.signal?.aborted) throw abortError()
-    const expectedRevision = runtime.revision
-    const request = destination.type === 'desktopPath'
-        ? {
-            kind,
-            destination: destination.path,
-            expectedRevision,
-        }
-        : {
-            kind,
-            expectedRevision,
-        }
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
-        request,
-    }) as { jobId: string; warningCodes?: string[] }
-    let cancellationRequested = false
-    let terminal: NativeFileJobStatus | undefined
-
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
-            terminal = status
-            break
-        }
-        await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
-
-    let outcomeFailed = false
-    let committedResult: NativeFileJobResult | undefined
-    let managedSource: string | undefined
-    try {
-        if (terminal.state === 'cancelled') throw abortError()
-        if (terminal.state !== 'succeeded') {
-            throw new NativeFileJobError(
-                terminal.error?.code ?? 'export-failed',
-                terminal.error?.message ?? `${operation} failed`,
-            )
-        }
-        if (!terminal.result) {
-            throw new NativeFileJobError('missing-result', `${operation} returned no result`)
-        }
-        committedResult = {
-            ...terminal.result,
-            warningCodes: [...new Set([
-                ...(started.warningCodes ?? []),
-                ...terminal.result.warningCodes,
-            ])].slice(0, 16),
-        }
-        if (destination.type === 'androidSaf') {
-            managedSource = committedResult.handoffPath
-            if (!managedSource) {
-                throw new NativeFileJobError(
-                    'missing-handoff',
-                    `${operation} returned no Android handoff path`,
-                )
-            }
-            const published = await dependencies.copyToAndroidSaf({
-                sourcePath: managedSource,
-                suggestedName: destination.suggestedName,
-                signal: options.signal,
-                onProgress: (progress) => options.onStatus?.({
-                    ...terminal,
-                    state: 'running',
-                    phase: 'publishing-destination',
-                    progress: {
-                        completedBytes: progress.copiedBytes,
-                        ...(progress.totalBytes === null
-                            ? { totalBytes: committedResult?.sourceBytes }
-                            : { totalBytes: progress.totalBytes }),
-                        completedItems: 0,
-                        totalItems: 1,
-                    },
-                }),
-            })
-            if (published.bytes !== committedResult.sourceBytes) {
-                throw new NativeFileJobError(
-                    'length-mismatch',
-                    `Android SAF ${operation} length differs from its native source`,
-                )
-            }
-            const { handoffPath: _handoffPath, ...publishedResult } = committedResult
-            committedResult = {
-                ...publishedResult,
-                warningCodes: [...new Set([
-                    ...publishedResult.warningCodes,
-                    ...published.warningCodes,
-                ])].slice(0, 16),
-            }
-        }
-        return committedResult
-    }
-    catch (error) {
-        outcomeFailed = true
-        throw error
-    }
-    finally {
-        if (managedSource) {
-            try {
-                await invokeNative(dependencies, handoffCleanupCommand, {
-                    path: managedSource,
-                })
-            }
-            catch (error) {
-                if (committedResult && !outcomeFailed) {
-                    committedResult.warningCodes = [
-                        ...committedResult.warningCodes
-                            .filter((code) => code !== 'cleanup-failed')
-                            .slice(0, 15),
-                        'cleanup-failed',
-                    ]
+    return runNativeManagedExport({
+        operation,
+        safLengthMismatchLabel: operation,
+        handoffCleanupCommand,
+        destination,
+        relaySafCopyProgress: true,
+        prepareRequest: async () => {
+            await runtime.flushPendingData(flushReason)
+            if (options.signal?.aborted) throw abortError()
+            const expectedRevision = runtime.revision
+            return destination.type === 'desktopPath'
+                ? {
+                    kind,
+                    destination: destination.path,
+                    expectedRevision,
                 }
-            }
-        }
-        try {
-            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-        }
-        catch (error) {
-            if (committedResult && !outcomeFailed) {
-                committedResult.warningCodes = [
-                    ...committedResult.warningCodes
-                        .filter((code) => code !== 'cleanup-failed')
-                        .slice(0, 15),
-                    'cleanup-failed',
-                ]
-            }
-            else if (!outcomeFailed) throw error
-        }
-    }
+                : {
+                    kind,
+                    expectedRevision,
+                }
+        },
+    }, options, dependencies)
 }
 
 export function runNativeLosslessBackupExport(
@@ -1855,10 +1524,7 @@ export async function prepareNativeContentImport(
             return {
                 jobId: started.jobId,
                 content,
-                warningCodes: [...new Set([
-                    ...(started.warningCodes ?? []),
-                    ...(status.warningCodes ?? []),
-                ])].slice(0, 16),
+                warningCodes: mergeWarningCodes(started.warningCodes, status.warningCodes),
                 prepareOwnerManifestAndSeal,
                 sealPreparedContent,
                 abortPreparedContent,
@@ -1993,11 +1659,11 @@ function createOfficialPublicationReceipt(
     const result = {
         ...terminal.result,
         publication,
-        warningCodes: [...new Set([
-            ...startWarningCodes,
-            ...(terminal.warningCodes ?? []),
-            ...terminal.result.warningCodes,
-        ])].slice(0, 16),
+        warningCodes: mergeWarningCodes(
+            startWarningCodes,
+            terminal.warningCodes,
+            terminal.result.warningCodes,
+        ),
     } as NativeOfficialPublicationReceipt['result']
     let acknowledged = false
     let acknowledgement: Promise<void> | undefined

@@ -3,7 +3,7 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { isTauriAndroid, isTauriDesktop } from '../platform'
 import type { CharacterDetail, DataRevision } from './persistentDataStore'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
-import { assertPinnedRevision, withPersistentRevisionLease } from './persistentRecordIterator'
+import { readPinnedCharacterDetail } from './persistentRecordIterator'
 import {
     runNativeCharacterCardExport,
     type NativeCharacterCardExportInput,
@@ -11,6 +11,7 @@ import {
     type NativeFileJobResult,
 } from './nativeFileJobs'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
+import { prepareNativeContentExportFromPicker } from './nativeContentExportPicker'
 
 interface NativeCharacterCardPickerInput {
     characterId: string
@@ -50,15 +51,8 @@ const productionDependencies: NativeCharacterCardExportRouteDependencies = {
         }],
     }),
     runtime: getPersistentDataRuntime,
-    readCharacter: async (characterId, revision) => {
-        const lease = await getPersistentDataStore().acquireRevision(revision)
-        return withPersistentRevisionLease(lease, async (reader) => {
-            const found = await reader.readCharacter(characterId)
-            if (!found) throw new Error(`Character ${characterId} is missing from revision ${revision}`)
-            assertPinnedRevision(revision, found.revision, `Character ${characterId}`)
-            return found.value
-        })
-    },
+    readCharacter: (characterId, revision) =>
+        readPinnedCharacterDetail(getPersistentDataStore(), characterId, revision),
     runExport: runNativeCharacterCardExport,
 }
 
@@ -67,23 +61,20 @@ export async function exportNativeCharacterCardFromPicker(
     options: NativeFileJobOptions = {},
     dependencies: NativeCharacterCardExportRouteDependencies = productionDependencies,
 ): Promise<NativeFileJobResult | null | undefined> {
-    if (!dependencies.isDesktop() && !dependencies.isAndroid()) return undefined
-    const destination = dependencies.isDesktop()
-        ? await dependencies.chooseDestination(input.suggestedName, input.format)
-        : undefined
-    if (dependencies.isDesktop() && !destination) return null
-    const runtime = dependencies.runtime()
-    await runtime.flushPendingData('native-character-card-export')
-    if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
-    const expectedRevision = runtime.revision
-    const character = await dependencies.readCharacter(input.characterId, expectedRevision)
+    const flow = await prepareNativeContentExportFromPicker({
+        suggestedName: input.suggestedName,
+        flushReason: 'native-character-card-export',
+        chooseDestination: () =>
+            dependencies.chooseDestination(input.suggestedName, input.format),
+    }, options, dependencies)
+    if (flow.kind === 'unsupported') return undefined
+    if (flow.kind === 'cancelled') return null
+    const character = await dependencies.readCharacter(input.characterId, flow.expectedRevision)
     const metadata = input.projectCharacter(character)
     return dependencies.runExport({
         characterId: input.characterId,
-        destination: destination
-            ? { type: 'desktopPath', path: destination }
-            : { type: 'androidSaf', suggestedName: input.suggestedName },
-        expectedRevision,
+        destination: flow.destination,
+        expectedRevision: flow.expectedRevision,
         format: input.format,
         metadata,
     }, options)

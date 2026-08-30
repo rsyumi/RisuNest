@@ -1,11 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
-    cancelAndroidSafSource,
     consumeAndroidSpoolBatch,
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
-    getActiveAndroidSafSourceRequestIds,
     getAndroidSafExportSourceId,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
@@ -503,30 +501,6 @@ describe('Android SAF bridge', () => {
             warningCodes: ['partial-destination-may-remain'],
         })
         expect(listeners.size).toBe(0)
-    })
-
-    it('forwards a source spool cancellation request without exposing source bytes', () => {
-        const cancelSource = vi.fn()
-
-        cancelAndroidSafSource('source-request-1', { copyExport: vi.fn(), cancelSource })
-
-        expect(cancelSource).toHaveBeenCalledExactlyOnceWith('source-request-1')
-    })
-
-    it('can discover and cancel a source request before its first progress event', () => {
-        const requestId = '11111111-1111-4111-8111-111111111111'
-        const cancelSource = vi.fn()
-        const bridge = {
-            copyExport: vi.fn(),
-            cancelSource,
-            getActiveSourceRequestIds: () => JSON.stringify([requestId]),
-        }
-
-        const active = getActiveAndroidSafSourceRequestIds(bridge)
-        cancelAndroidSafSource(active[0], bridge)
-
-        expect(active).toEqual([requestId])
-        expect(cancelSource).toHaveBeenCalledExactlyOnceWith(requestId)
     })
 
     it('reports matching destination progress and ignores other requests', async () => {

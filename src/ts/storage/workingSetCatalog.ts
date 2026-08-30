@@ -178,6 +178,32 @@ export function createCatalogPresetWorkingSet(
     return presets
 }
 
+export function createPresetCatalogWorkingSetFromValues(
+    presets: Database['botPresets'],
+    revision: number,
+    activeConfiguredIndex: number | undefined,
+): Database['botPresets'] {
+    const catalog: PresetCatalog = {
+        revision,
+        items: presets.map((preset, configuredIndex) => ({
+            id: String(configuredIndex),
+            configuredIndex,
+            name: preset.name ?? '',
+            image: preset.image,
+        })),
+    }
+    const activeSummary = catalog.items.find(
+        (summary) => summary.configuredIndex === activeConfiguredIndex,
+    )
+    return createCatalogPresetWorkingSet(
+        catalog,
+        activeSummary ? {
+            summary: activeSummary,
+            value: { ...presets[activeSummary.configuredIndex] },
+        } : null,
+    )
+}
+
 export function getCatalogPresetMetadata(
     presets: Database['botPresets'],
 ): CatalogPresetMetadata | undefined {
@@ -480,28 +506,10 @@ export function projectCompleteScalableWorkingSet(
         creatorNotes: character.creatorNotes ?? '',
         trashTime: character.trashTime,
     }))
-    const presetCatalog: PresetCatalog = {
-        revision,
-        items: botPresets.map((preset, configuredIndex) => ({
-            id: String(configuredIndex),
-            configuredIndex,
-            name: preset.name ?? '',
-            image: preset.image,
-        })),
-    }
-    const activeSummary = presetCatalog.items.find(
-        (summary) => summary.configuredIndex === root.botPresetsId,
-    )
     const projected = projectCatalogWorkingSet(
         root,
         summaries,
-        createCatalogPresetWorkingSet(
-            presetCatalog,
-            activeSummary ? {
-                summary: activeSummary,
-                value: { ...botPresets[activeSummary.configuredIndex] },
-            } : null,
-        ),
+        createPresetCatalogWorkingSetFromValues(botPresets, revision, root.botPresetsId),
     )
     const residentIds = new Set(activeCharacterIds)
     if (selectedCharacterId) residentIds.add(selectedCharacterId)

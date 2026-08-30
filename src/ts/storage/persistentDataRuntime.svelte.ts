@@ -46,7 +46,7 @@ import type { PersistentPresetMutation } from './saveCoordinator'
 import type { PersistentReplacementOptions } from './saveCoordinator'
 import { workingSetResidency } from './workingSetResidency'
 import {
-    createCatalogPresetWorkingSet,
+    createPresetCatalogWorkingSetFromValues,
     hydrateWorkingSetCharacterDetail,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
@@ -136,24 +136,10 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
                 database.botPresets = presets
                 return
             }
-            const catalog = {
+            database.botPresets = createPresetCatalogWorkingSetFromValues(
+                presets,
                 revision,
-                items: presets.map((preset, configuredIndex) => ({
-                    id: String(configuredIndex),
-                    configuredIndex,
-                    name: preset.name ?? '',
-                    image: preset.image,
-                })),
-            }
-            const activeSummary = catalog.items.find(
-                (summary) => summary.configuredIndex === root.botPresetsId,
-            )
-            database.botPresets = createCatalogPresetWorkingSet(
-                catalog,
-                activeSummary ? {
-                    summary: activeSummary,
-                    value: presets[activeSummary.configuredIndex],
-                } : null,
+                root.botPresetsId,
             )
         },
         publishRootWorkingSet(root) {

@@ -3,7 +3,7 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { isTauriAndroid, isTauriDesktop } from '../platform'
 import type { CharacterDetail, DataRevision } from './persistentDataStore'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
-import { assertPinnedRevision, withPersistentRevisionLease } from './persistentRecordIterator'
+import { readPinnedCharacterDetail } from './persistentRecordIterator'
 import {
     runNativeCharacterCharxExport,
     type NativeCharacterCharxExportInput,
@@ -11,6 +11,7 @@ import {
     type NativeFileJobResult,
 } from './nativeFileJobs'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
+import { prepareNativeContentExportFromPicker } from './nativeContentExportPicker'
 
 interface NativeCharacterCharxPickerInput {
     characterId: string
@@ -30,7 +31,10 @@ interface NativeCharacterCharxExportRuntime {
 interface NativeCharacterCharxExportRouteDependencies {
     isDesktop(): boolean
     isAndroid(): boolean
-    chooseDestination(suggestedName: string): Promise<string | null>
+    chooseDestination(
+        suggestedName: string,
+        container: NativeCharacterCharxPickerInput['container'],
+    ): Promise<string | null>
     runtime(): NativeCharacterCharxExportRuntime
     readCharacter(characterId: string, revision: DataRevision): Promise<CharacterDetail>
     runExport(
@@ -42,20 +46,15 @@ interface NativeCharacterCharxExportRouteDependencies {
 const productionDependencies: NativeCharacterCharxExportRouteDependencies = {
     isDesktop: () => isTauriDesktop,
     isAndroid: () => isTauriAndroid,
-    chooseDestination: (suggestedName) => save({
+    chooseDestination: (suggestedName, container) => save({
         defaultPath: suggestedName,
-        filters: [{ name: 'CharX', extensions: ['charx'] }],
+        filters: [container === 'appended-charx-jpeg'
+            ? { name: 'CharX JPEG', extensions: ['jpeg'] }
+            : { name: 'CharX', extensions: ['charx'] }],
     }),
     runtime: getPersistentDataRuntime,
-    readCharacter: async (characterId, revision) => {
-        const lease = await getPersistentDataStore().acquireRevision(revision)
-        return withPersistentRevisionLease(lease, async (reader) => {
-            const found = await reader.readCharacter(characterId)
-            if (!found) throw new Error(`Character ${characterId} is missing from revision ${revision}`)
-            assertPinnedRevision(revision, found.revision, `Character ${characterId}`)
-            return found.value
-        })
-    },
+    readCharacter: (characterId, revision) =>
+        readPinnedCharacterDetail(getPersistentDataStore(), characterId, revision),
     runExport: runNativeCharacterCharxExport,
 }
 
@@ -64,24 +63,21 @@ export async function exportNativeCharacterCharxFromPicker(
     options: NativeFileJobOptions = {},
     dependencies: NativeCharacterCharxExportRouteDependencies = productionDependencies,
 ): Promise<NativeFileJobResult | null | undefined> {
-    if (!dependencies.isDesktop() && !dependencies.isAndroid()) return undefined
-    const destination = dependencies.isDesktop()
-        ? await dependencies.chooseDestination(input.suggestedName)
-        : undefined
-    if (dependencies.isDesktop() && !destination) return null
-    const runtime = dependencies.runtime()
-    await runtime.flushPendingData('native-character-charx-export')
-    if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
-    const expectedRevision = runtime.revision
-    const character = await dependencies.readCharacter(input.characterId, expectedRevision)
+    const flow = await prepareNativeContentExportFromPicker({
+        suggestedName: input.suggestedName,
+        flushReason: 'native-character-charx-export',
+        chooseDestination: () =>
+            dependencies.chooseDestination(input.suggestedName, input.container),
+    }, options, dependencies)
+    if (flow.kind === 'unsupported') return undefined
+    if (flow.kind === 'cancelled') return null
+    const character = await dependencies.readCharacter(input.characterId, flow.expectedRevision)
     const projected = input.projectCharacter(character)
     return dependencies.runExport(
         {
             characterId: input.characterId,
-            destination: destination
-                ? { type: 'desktopPath', path: destination }
-                : { type: 'androidSaf', suggestedName: input.suggestedName },
-            expectedRevision,
+            destination: flow.destination,
+            expectedRevision: flow.expectedRevision,
             ...(input.container ? { container: input.container } : {}),
             card: projected.card,
             module: projected.module,

@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import './selectedConversationEvictionNodeDom'
+import './tests/selectedConversationEvictionNodeDom.setup'
 import 'fake-indexeddb/auto'
 import { IDBKeyRange, indexedDB } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'

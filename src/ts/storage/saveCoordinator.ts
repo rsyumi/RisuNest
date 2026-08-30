@@ -14,6 +14,7 @@ import type { RisuModule } from '../process/modules'
 import { RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { isConversationSummaryStub } from './conversationResidency'
+import { removeGroupMemberReferences } from './groupMembership'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
@@ -1178,21 +1179,10 @@ export class SaveCoordinator {
         if (this.additionPromise) return this.additionPromise
         if (this.flushPromise) return this.flushPromise
         const promise = this.enqueue(() => this.flushIterations(reason, true))
-        this.flushPromise = promise
-        this.reportActivePromise()
-        void promise.then(
-            () => {
-                if (this.flushPromise === promise) {
-                    this.flushPromise = null
-                    this.reportActivePromise()
-                }
-            },
-            () => {
-                if (this.flushPromise === promise) {
-                    this.flushPromise = null
-                    this.reportActivePromise()
-                }
-            },
+        this.trackPromiseSlot(
+            promise,
+            () => this.flushPromise,
+            (value) => { this.flushPromise = value },
         )
         return promise
     }
@@ -1203,21 +1193,10 @@ export class SaveCoordinator {
         this.cancelDebounce()
         if (this.localFlushPromise) return this.localFlushPromise
         const promise = this.runLocalFlush(reason)
-        this.localFlushPromise = promise
-        this.reportActivePromise()
-        void promise.then(
-            () => {
-                if (this.localFlushPromise === promise) {
-                    this.localFlushPromise = null
-                    this.reportActivePromise()
-                }
-            },
-            () => {
-                if (this.localFlushPromise === promise) {
-                    this.localFlushPromise = null
-                    this.reportActivePromise()
-                }
-            },
+        this.trackPromiseSlot(
+            promise,
+            () => this.localFlushPromise,
+            (value) => { this.localFlushPromise = value },
         )
         return promise
     }
@@ -1410,12 +1389,7 @@ export class SaveCoordinator {
             const published = this.capture()
             this.presetsBaseline = published.presetsCanonical
             this.dependencies.onLocalRevision?.(committed.revision)
-            if (this.dependencies.officialPublisher) {
-                await this.stagePublication(committed.revision)
-                const delay = this.officialPublishDelayMs()
-                if (delay <= 0) await this.publishPendingRevision()
-                else this.armOfficialPublishRetry(delay)
-            }
+            await this.finishExplicitCommit(committed.revision)
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
         })
@@ -2275,21 +2249,10 @@ export class SaveCoordinator {
             if (this.pendingCharacterAddition?.token !== reserved.token) return
             await this.flushIterations(reason, true)
         })
-        this.additionPromise = promise
-        this.reportActivePromise()
-        void promise.then(
-            () => {
-                if (this.additionPromise === promise) {
-                    this.additionPromise = null
-                    this.reportActivePromise()
-                }
-            },
-            () => {
-                if (this.additionPromise === promise) {
-                    this.additionPromise = null
-                    this.reportActivePromise()
-                }
-            },
+        this.trackPromiseSlot(
+            promise,
+            () => this.additionPromise,
+            (value) => { this.additionPromise = value },
         )
         return promise
     }
@@ -2672,12 +2635,7 @@ export class SaveCoordinator {
         }
 
         this.dependencies.onLocalRevision?.(replaced.revision)
-        if (options.publishOfficial && this.dependencies.officialPublisher) {
-            await this.stagePublication(replaced.revision)
-            const delay = this.officialPublishDelayMs()
-            if (delay <= 0) await this.publishPendingRevision()
-            else this.armOfficialPublishRetry(delay)
-        }
+        if (options.publishOfficial) await this.finishExplicitCommit(replaced.revision)
 
         if (this.dirtyGeneration === capturedGeneration) {
             this.cancelDebounce()
@@ -2982,17 +2940,11 @@ export class SaveCoordinator {
     ): boolean {
         if (character.type !== 'group') return false
         const group = character as Omit<groupChat, 'chats'> | groupChat
-        const retainedIndices = group.characters
-            .map((id, index) => ({ id, index }))
-            .filter(({ id }) => id !== characterId)
-        if (retainedIndices.length === group.characters.length) return false
-        group.characters = retainedIndices.map(({ id }) => id)
-        group.characterTalks = retainedIndices.map(
-            ({ index }) => group.characterTalks?.[index] ?? 1 / 6 * 4,
-        )
-        group.characterActive = retainedIndices.map(
-            ({ index }) => group.characterActive?.[index] ?? true,
-        )
+        const retained = removeGroupMemberReferences(group, new Set([characterId]))
+        if (retained.characters.length === group.characters.length) return false
+        group.characters = retained.characters
+        group.characterTalks = retained.characterTalks
+        group.characterActive = retained.characterActive
         return true
     }
 
@@ -3002,6 +2954,22 @@ export class SaveCoordinator {
         const delay = this.officialPublishDelayMs()
         if (delay <= 0) await this.publishPendingRevision()
         else this.armOfficialPublishRetry(delay)
+    }
+
+    private trackPromiseSlot(
+        promise: Promise<void>,
+        get: () => Promise<void> | null,
+        set: (value: Promise<void> | null) => void,
+    ): void {
+        set(promise)
+        this.reportActivePromise()
+        const clear = () => {
+            if (get() === promise) {
+                set(null)
+                this.reportActivePromise()
+            }
+        }
+        void promise.then(clear, clear)
     }
 
     private setCharacterBaseline(captured: CapturedState): void {

@@ -41,18 +41,6 @@ export interface AssetAliasStat {
     source: AssetAliasPayloadSource
 }
 
-export interface AssetRepository {
-    read(key: string, range?: BlobReadRange): Promise<Versioned<AssetAliasRead> | null>
-    stat(key: string): Promise<Versioned<AssetAliasStat> | null>
-}
-
-export interface AssetRepositoryOptions {
-    reader: Pick<PersistentDataStore, 'readAssetAlias'>
-    cas: ImmutablePayloadCas
-    legacy: BlobStore
-    legacyFallback: boolean
-}
-
 export interface AssetAliasCatalog {
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
@@ -68,27 +56,13 @@ export interface AssetAliasLegacyReader {
     resolveUrl?(identity: AssetAliasIdentity): Promise<string | null>
 }
 
-export interface TypedAssetRepository {
+interface TypedAssetRepositoryReader {
     read(
         identity: AssetAliasIdentity,
         range?: BlobReadRange,
     ): Promise<Versioned<AssetAliasRead> | null>
     stat(identity: AssetAliasIdentity): Promise<Versioned<AssetAliasStat> | null>
-    list(query: AssetAliasListQuery): Promise<AssetAliasPage>
-    remove(
-        identity: AssetAliasIdentity,
-        expectedRevision: DataRevision,
-    ): Promise<{ revision: DataRevision }>
 }
-
-export interface TypedAssetRepositoryOptions {
-    catalog: AssetAliasCatalog
-    cas: ImmutablePayloadCas
-    legacy: AssetAliasLegacyReader
-    legacyFallback: boolean
-}
-
-type TypedAssetRepositoryReader = Pick<TypedAssetRepository, 'read' | 'stat'>
 
 interface TypedAssetRepositoryReaderOptions {
     reader: Pick<AssetAliasCatalog, 'readAssetAlias'>
@@ -269,45 +243,6 @@ function createTypedAssetRepositoryReader(
                 revision: versioned.revision,
                 value: { alias, objectSize: null, source: 'missing' },
             }
-        },
-    }
-}
-
-export function createAssetRepository(options: AssetRepositoryOptions): AssetRepository {
-    const repository = createTypedAssetRepositoryReader({
-        reader: options.reader,
-        cas: options.cas,
-        legacy: {
-            read: (identity, range) => options.legacy.read(identity.key, range),
-            stat: (identity) => options.legacy.stat(identity.key),
-        },
-        legacyFallback: options.legacyFallback,
-    })
-    return {
-        read: (key, range) => repository.read({ kind: 'asset', key }, range),
-        stat: (key) => repository.stat({ kind: 'asset', key }),
-    }
-}
-
-export function createTypedAssetRepository(
-    options: TypedAssetRepositoryOptions,
-): TypedAssetRepository {
-    const repository = createTypedAssetRepositoryReader({
-        reader: options.catalog,
-        cas: options.cas,
-        legacy: options.legacy,
-        legacyFallback: options.legacyFallback,
-    })
-    return {
-        ...repository,
-        async list(query) {
-            const page = await options.catalog.listAssetAliases(query)
-            for (const alias of page.items) validateAssetAlias(alias)
-            return page
-        },
-        async remove(identity, expectedRevision) {
-            validateAssetAliasIdentity(identity)
-            return options.catalog.deleteAssetAlias(identity, expectedRevision)
         },
     }
 }
@@ -684,69 +619,5 @@ export function createCompleteAssetRepositoryBlobStore(
         },
         remove: (key) => repository.remove(requireNamespacedBlobIdentity(key)),
         resolveUrl: (key) => repository.resolveUrl(requireNamespacedBlobIdentity(key)),
-    }
-}
-
-export interface AssetRepositoryBlobStoreOptions {
-    store: PersistentDataStore
-    cas: ImmutablePayloadCas
-    legacy: BlobStore
-    legacyFallback: boolean
-    removal: 'disabled' | 'legacy-only'
-}
-
-export type AssetRepositoryBlobStoreFacade = Pick<
-    BlobStore,
-    'put' | 'read' | 'stat' | 'remove'
->
-
-export function createAssetRepositoryBlobStore(
-    options: AssetRepositoryBlobStoreOptions,
-): AssetRepositoryBlobStoreFacade {
-    const { store, cas, legacy } = options
-    const repository = createAssetRepository({
-        reader: store,
-        cas,
-        legacy,
-        legacyFallback: options.legacyFallback,
-    })
-    return {
-        async put(key, data, metadata) {
-            const ownedData = data.slice()
-            const pendingAlias = {
-                ...metadata,
-                key,
-                objectHash: null,
-                size: ownedData.byteLength,
-            } as AssetAlias
-            validateAssetAlias(pendingAlias)
-            const prepared = await cas.prepare(ownedData)
-            const alias: AssetAlias = {
-                ...pendingAlias,
-                objectHash: prepared.contentHash,
-            }
-            validateAssetAlias(alias)
-            const { revision } = await store.readRoot()
-            await store.commitAssetAlias(alias, revision)
-            return aliasBlobMetadata(alias)
-        },
-        async read(key, range) {
-            const result = await repository.read(key, range)
-            if (result) return result.value.data
-            return options.legacyFallback ? legacy.read(key, range) : null
-        },
-        async stat(key) {
-            const result = await repository.stat(key)
-            if (result) {
-                if (result.value.source === 'missing') return null
-                return aliasBlobMetadata(result.value.alias)
-            }
-            return options.legacyFallback ? legacy.stat(key) : null
-        },
-        async remove(key) {
-            if (options.legacyFallback && options.removal === 'legacy-only') {
-                await legacy.remove(key)
-            }
-        },
     }
 }

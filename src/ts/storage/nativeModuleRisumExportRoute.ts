@@ -10,6 +10,7 @@ import {
     type NativeRisuModuleExportInput,
 } from './nativeFileJobs'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
+import { prepareNativeContentExportFromPicker } from './nativeContentExportPicker'
 
 interface NativeRisumExportRuntime {
     readonly revision: number
@@ -45,24 +46,19 @@ export async function exportNativeModuleRisumFromPicker(
     options: NativeFileJobOptions = {},
     dependencies: NativeModuleRisumExportRouteDependencies = productionDependencies,
 ): Promise<NativeFileJobResult | null | undefined> {
-    if (!dependencies.isDesktop() && !dependencies.isAndroid()) return undefined
     const suggestedName = `${module.name || 'module'}.risum`
-    const destination = dependencies.isDesktop()
-        ? await dependencies.chooseDestination(suggestedName)
-        : undefined
-    if (dependencies.isDesktop() && !destination) return null
-    const runtime = dependencies.runtime()
-    await runtime.flushPendingData('native-risum-export')
-    if (options.signal?.aborted) {
-        throw new DOMException('Native file job was cancelled', 'AbortError')
-    }
+    const flow = await prepareNativeContentExportFromPicker({
+        suggestedName,
+        flushReason: 'native-risum-export',
+        chooseDestination: () => dependencies.chooseDestination(suggestedName),
+    }, options, dependencies)
+    if (flow.kind === 'unsupported') return undefined
+    if (flow.kind === 'cancelled') return null
     const moduleIndex = dependencies.modules().findIndex((candidate) => candidate === module)
     if (moduleIndex < 0) throw new Error('Native RISUM export requires the exact root module object')
     return dependencies.runExport({
         moduleIndex,
-        expectedRevision: runtime.revision,
-        destination: destination
-            ? { type: 'desktopPath', path: destination }
-            : { type: 'androidSaf', suggestedName },
+        expectedRevision: flow.expectedRevision,
+        destination: flow.destination,
     }, options)
 }

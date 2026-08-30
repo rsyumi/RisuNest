@@ -4,9 +4,11 @@ import type {
     CharacterSummary,
     ConversationSummary,
     DataRevision,
+    PersistentDataStore,
     PersistentRevisionLease,
     PersistentRevisionReader,
 } from './persistentDataStore'
+import { RevisionConflictError } from './persistentDataStore'
 
 const PINNED_RECORD_PAGE_SIZE = 128
 
@@ -50,6 +52,21 @@ export function releasePersistentRevisionLease(
     return retryPersistentRevisionRelease(() => lease.release())
 }
 
+export async function acquireCurrentRevisionWithRetry(
+    acquireRevision: (revision: DataRevision) => Promise<PersistentRevisionLease>,
+    readCurrentRevision: () => Promise<DataRevision>,
+    attempts = 3,
+): Promise<PersistentRevisionLease> {
+    for (let attempt = 0; ; attempt++) {
+        const revision = await readCurrentRevision()
+        try {
+            return await acquireRevision(revision)
+        } catch (error) {
+            if (!(error instanceof RevisionConflictError) || attempt >= attempts - 1) throw error
+        }
+    }
+}
+
 export async function withPersistentRevisionLease<T>(
     lease: PersistentRevisionLease,
     operation: (reader: PersistentRevisionLease) => Promise<T>,
@@ -67,6 +84,20 @@ export async function withPersistentRevisionLease<T>(
             if (!operationFailed) throw error
         }
     }
+}
+
+export async function readPinnedCharacterDetail(
+    store: Pick<PersistentDataStore, 'acquireRevision'>,
+    characterId: string,
+    revision: DataRevision,
+): Promise<CharacterDetail> {
+    const lease = await store.acquireRevision(revision)
+    return withPersistentRevisionLease(lease, async (reader) => {
+        const found = await reader.readCharacter(characterId)
+        if (!found) throw new Error(`Character ${characterId} is missing from revision ${revision}`)
+        assertPinnedRevision(revision, found.revision, `Character ${characterId}`)
+        return found.value
+    })
 }
 
 async function* iterateCharacterSummaries(

@@ -4,10 +4,16 @@ import { getAndroidSafExportSourceId } from './androidSafBridge'
 import {
     acknowledgeRecoveredNativeRestores,
     reconcileNativeFileJobsBeforeBootstrap,
-    reconcileNativeRestoresBeforeBootstrap,
     shouldReconcileNativeFileJobs,
 } from './nativeFileJobRecovery'
 import type { NativeFileJobStatus } from './nativeFileJobs'
+
+async function reconcileNativeRestoresBeforeBootstrap(
+    dependencies: Parameters<typeof reconcileNativeFileJobsBeforeBootstrap>[0],
+): Promise<string[]> {
+    const result = await reconcileNativeFileJobsBeforeBootstrap(dependencies)
+    return result.pendingRestoreAcknowledgements
+}
 
 function restoreStatus(
     jobId: string,
@@ -576,6 +582,65 @@ describe('native file job bootstrap reconciliation', () => {
                     },
                 }]
                 if (command === 'native_character_charx_handoff_cleanup') {
+                    cleanupAttempts += 1
+                    if (cleanupAttempts === 1) throw new Error('handoff is still in use')
+                    return undefined
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        }
+
+        try {
+            await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+            await vi.waitFor(() => expect(cleanupAttempts).toBe(1))
+            expect(calls).not.toContain('native_file_job_forget')
+
+            await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+            await vi.waitFor(() => expect(calls).toContain('native_file_job_forget'))
+            expect(cleanupAttempts).toBe(2)
+        }
+        finally {
+            log.mockRestore()
+        }
+    })
+
+    it.each([
+        [
+            'export-lossless-backup',
+            'lossless-export',
+            'risulossless-123e4567-e89b-42d3-a456-426614174004.risulossless',
+            'native_lossless_handoff_cleanup',
+        ],
+        [
+            'export-legacy-local-backup',
+            'legacy-export',
+            'risu-backup-123e4567-e89b-42d3-a456-426614174004.bin',
+            'native_legacy_backup_handoff_cleanup',
+        ],
+    ] as const)('retries %s handoff cleanup on the next bootstrap before forgetting the job', async (
+        kind,
+        jobId,
+        fileName,
+        cleanupCommand,
+    ) => {
+        const calls: string[] = []
+        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\${fileName}`
+        let cleanupAttempts = 0
+        const log = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const dependencies = {
+            invoke: vi.fn(async (command: string) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus(jobId, 'succeeded', 'complete'),
+                    kind,
+                    result: {
+                        ...restoreStatus(jobId, 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }]
+                if (command === cleanupCommand) {
                     cleanupAttempts += 1
                     if (cleanupAttempts === 1) throw new Error('handoff is still in use')
                     return undefined

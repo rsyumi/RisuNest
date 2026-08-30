@@ -140,12 +140,12 @@ export interface AndroidSafJavascriptBridge {
     acknowledgeExport?(requestId: string): boolean
 }
 
-export interface AndroidLegacyBackupSourcePickerOptions {
+export interface AndroidSafSourcePickerOptions {
     signal?: AbortSignal
     onProgress?(progress: AndroidSafProgress): void
 }
 
-export interface AndroidLegacyBackupSourcePickerDependencies {
+export interface AndroidSafSourcePickerDependencies {
     createRequestId(): string
     bridge: AndroidSafJavascriptBridge
     addEventListener(name: string, listener: (event: Event) => void): void
@@ -153,18 +153,6 @@ export interface AndroidLegacyBackupSourcePickerDependencies {
 }
 
 export interface AndroidSafDestinationDependencies {
-    createRequestId(): string
-    bridge: AndroidSafJavascriptBridge
-    addEventListener(name: string, listener: (event: Event) => void): void
-    removeEventListener(name: string, listener: (event: Event) => void): void
-}
-
-export interface AndroidLosslessSourcePickerOptions {
-    signal?: AbortSignal
-    onProgress?(progress: AndroidSafProgress): void
-}
-
-export interface AndroidLosslessSourcePickerDependencies {
     createRequestId(): string
     bridge: AndroidSafJavascriptBridge
     addEventListener(name: string, listener: (event: Event) => void): void
@@ -215,15 +203,21 @@ export class AndroidSafSourceError extends Error {
     }
 }
 
-export function pickAndroidLosslessBackupSource(
-    options: AndroidLosslessSourcePickerOptions = {},
-    dependencies: AndroidLosslessSourcePickerDependencies = productionDependencies,
+interface AndroidSafSourcePickerConfig {
+    eventName: string
+    pickMethod: 'pickLosslessSource' | 'pickLegacyBackupSource'
+    pickerUnavailableMessage: string
+    acceptExtension: string
+    cancelMessage: string
+}
+
+function pickAndroidSpoolSource(
+    config: AndroidSafSourcePickerConfig,
+    options: AndroidSafSourcePickerOptions,
+    dependencies: AndroidSafSourcePickerDependencies,
 ): Promise<NativeFileJobSource | null> {
     if (options.signal?.aborted) {
-        return Promise.reject(new DOMException(
-            'Android lossless backup selection was cancelled',
-            'AbortError',
-        ))
+        return Promise.reject(new DOMException(config.cancelMessage, 'AbortError'))
     }
     const requestId = dependencies.createRequestId()
     return new Promise((resolve, reject) => {
@@ -231,7 +225,7 @@ export function pickAndroidLosslessBackupSource(
         let aborted = false
         const cleanup = () => {
             options.signal?.removeEventListener('abort', onAbort)
-            dependencies.removeEventListener(LOSSLESS_SOURCE_EVENT, onEvent)
+            dependencies.removeEventListener(config.eventName, onEvent)
             if (options.onProgress) {
                 dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
             }
@@ -266,10 +260,7 @@ export function pickAndroidLosslessBackupSource(
                         'cleanup-failed',
                         'Cancelled Android backup source could not be cleaned up',
                     ))
-                    : reject(new DOMException(
-                        'Android lossless backup selection was cancelled',
-                        'AbortError',
-                    )))
+                    : reject(new DOMException(config.cancelMessage, 'AbortError')))
                 return
             }
             const failure = batch.failures[0]
@@ -285,7 +276,7 @@ export function pickAndroidLosslessBackupSource(
                 finish(() => resolve(null))
                 return
             }
-            if (!source.displayName.toLocaleLowerCase('en-US').endsWith('.risulossless')) {
+            if (!source.displayName.toLocaleLowerCase('en-US').endsWith(config.acceptExtension)) {
                 finish(() => reject(new AndroidSafSourceError(
                     'unsupported-format',
                     `${source.displayName}: unsupported-format`,
@@ -300,14 +291,14 @@ export function pickAndroidLosslessBackupSource(
                 options.onProgress?.(progress)
             }
         }
-        dependencies.addEventListener(LOSSLESS_SOURCE_EVENT, onEvent)
+        dependencies.addEventListener(config.eventName, onEvent)
         if (options.onProgress) {
             dependencies.addEventListener(PROGRESS_EVENT, onProgress)
         }
         options.signal?.addEventListener('abort', onAbort, { once: true })
         try {
-            const pick = dependencies.bridge.pickLosslessSource
-            if (!pick) throw new Error('Android lossless backup picker is unavailable')
+            const pick = dependencies.bridge[config.pickMethod]
+            if (!pick) throw new Error(config.pickerUnavailableMessage)
             pick.call(dependencies.bridge, requestId)
         }
         catch (error) {
@@ -316,99 +307,30 @@ export function pickAndroidLosslessBackupSource(
     })
 }
 
-export function pickAndroidLegacyBackupSource(
-    options: AndroidLegacyBackupSourcePickerOptions = {},
-    dependencies: AndroidLegacyBackupSourcePickerDependencies = productionDependencies,
+export function pickAndroidLosslessBackupSource(
+    options: AndroidSafSourcePickerOptions = {},
+    dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
 ): Promise<NativeFileJobSource | null> {
-    if (options.signal?.aborted) {
-        return Promise.reject(new DOMException(
-            'Android legacy backup selection was cancelled',
-            'AbortError',
-        ))
-    }
-    const requestId = dependencies.createRequestId()
-    return new Promise((resolve, reject) => {
-        let settled = false
-        let aborted = false
-        const cleanup = () => {
-            options.signal?.removeEventListener('abort', onAbort)
-            dependencies.removeEventListener(LEGACY_BACKUP_SOURCE_EVENT, onEvent)
-            if (options.onProgress) dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
-        }
-        const finish = (callback: () => void) => {
-            if (settled) return
-            settled = true
-            cleanup()
-            callback()
-        }
-        const onAbort = () => {
-            if (settled) return
-            aborted = true
-            options.signal?.removeEventListener('abort', onAbort)
-            if (options.onProgress) dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
-            dependencies.bridge.cancelSource?.(requestId)
-        }
-        const onEvent = (event: Event) => {
-            const batch = (event as CustomEvent<AndroidSpoolBatch>).detail
-            if (!batch || batch.requestId !== requestId) return
-            if (aborted) {
-                let cleanupFailed = false
-                for (const source of batch.ready) {
-                    if (dependencies.bridge.discardSource?.(source.token) !== true) {
-                        cleanupFailed = true
-                    }
-                }
-                finish(() => cleanupFailed
-                    ? reject(new AndroidSafSourceError(
-                        'cleanup-failed',
-                        'Cancelled Android backup source could not be cleaned up',
-                    ))
-                    : reject(new DOMException(
-                        'Android legacy backup selection was cancelled',
-                        'AbortError',
-                    )))
-                return
-            }
-            const failure = batch.failures[0]
-            if (failure) {
-                finish(() => reject(new AndroidSafSourceError(
-                    failure.code,
-                    `${failure.displayName}: ${failure.code}`,
-                )))
-                return
-            }
-            const source = batch.ready[0]
-            if (!source) {
-                finish(() => resolve(null))
-                return
-            }
-            if (!source.displayName.toLocaleLowerCase('en-US').endsWith('.bin')) {
-                finish(() => reject(new AndroidSafSourceError(
-                    'unsupported-format',
-                    `${source.displayName}: unsupported-format`,
-                )))
-                return
-            }
-            finish(() => resolve({ type: 'androidSpool', token: source.token }))
-        }
-        const onProgress = (event: Event) => {
-            const progress = (event as CustomEvent<AndroidSafProgress>).detail
-            if (progress?.requestId === requestId && progress.operation === 'source-copy') {
-                options.onProgress?.(progress)
-            }
-        }
-        dependencies.addEventListener(LEGACY_BACKUP_SOURCE_EVENT, onEvent)
-        if (options.onProgress) dependencies.addEventListener(PROGRESS_EVENT, onProgress)
-        options.signal?.addEventListener('abort', onAbort, { once: true })
-        try {
-            const pick = dependencies.bridge.pickLegacyBackupSource
-            if (!pick) throw new Error('Android legacy backup picker is unavailable')
-            pick.call(dependencies.bridge, requestId)
-        }
-        catch (error) {
-            finish(() => reject(error))
-        }
-    })
+    return pickAndroidSpoolSource({
+        eventName: LOSSLESS_SOURCE_EVENT,
+        pickMethod: 'pickLosslessSource',
+        pickerUnavailableMessage: 'Android lossless backup picker is unavailable',
+        acceptExtension: '.risulossless',
+        cancelMessage: 'Android lossless backup selection was cancelled',
+    }, options, dependencies)
+}
+
+export function pickAndroidLegacyBackupSource(
+    options: AndroidSafSourcePickerOptions = {},
+    dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
+): Promise<NativeFileJobSource | null> {
+    return pickAndroidSpoolSource({
+        eventName: LEGACY_BACKUP_SOURCE_EVENT,
+        pickMethod: 'pickLegacyBackupSource',
+        pickerUnavailableMessage: 'Android legacy backup picker is unavailable',
+        acceptExtension: '.bin',
+        cancelMessage: 'Android legacy backup selection was cancelled',
+    }, options, dependencies)
 }
 
 function androidSafAbortError(
@@ -481,48 +403,11 @@ export function getAndroidSafExportSourceId(
         : null
 }
 
-export function cancelAndroidSafSource(
-    requestId: string,
-    bridge: AndroidSafJavascriptBridge = productionBridge(),
-): void {
-    bridge.cancelSource?.(requestId)
-}
-
 export function discardAndroidSafSource(
     token: string,
     bridge: AndroidSafJavascriptBridge = productionBridge(),
 ): boolean {
     return bridge.discardSource?.(token) === true
-}
-
-export function getActiveAndroidSafSourceRequestIds(
-    bridge: AndroidSafJavascriptBridge = productionBridge(),
-): string[] {
-    const encoded = bridge.getActiveSourceRequestIds?.()
-    if (!encoded) return []
-    try {
-        const requestIds: unknown = JSON.parse(encoded)
-        if (!Array.isArray(requestIds)) return []
-        return requestIds.filter((value): value is string =>
-            typeof value === 'string'
-            && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value))
-            .slice(0, 16)
-    }
-    catch {
-        return []
-    }
-}
-
-export function listenAndroidSafProgress(
-    listener: (progress: AndroidSafProgress) => void,
-    dependencies: Pick<AndroidSafDestinationDependencies, 'addEventListener' | 'removeEventListener'> = productionDependencies,
-): () => void {
-    const onProgress = (event: Event) => {
-        const detail = (event as CustomEvent<AndroidSafProgress>).detail
-        if (detail) listener(detail)
-    }
-    dependencies.addEventListener(PROGRESS_EVENT, onProgress)
-    return () => dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
 }
 
 export function copyNativeExportToAndroidSaf(

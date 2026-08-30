@@ -5,6 +5,7 @@ import {
     capturePersistentMutationToken,
 } from './persistentDataRuntime.svelte'
 import {
+    isTerminalJob as isTerminal,
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
     type NativeFileJobOptions,
@@ -54,12 +55,6 @@ function jpegExtension(displayName: string): 'jpg' | 'jpeg' {
         throw new TypeError('Native JPEG asset import requires a .jpg or .jpeg display name')
     }
     return extension
-}
-
-function isTerminal(status: NativeFileJobStatus): boolean {
-    return status.state === 'succeeded'
-        || status.state === 'failed'
-        || status.state === 'cancelled'
 }
 
 export async function importNativeJpegAsset(

@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import { getAndroidSafExportSourceId } from './androidSafBridge'
-import type { NativeFileJobStatus } from './nativeFileJobs'
+import { isTerminalJob as isTerminal, type NativeFileJobStatus } from './nativeFileJobs'
 
 export interface NativeFileJobRecoveryDependencies {
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
@@ -49,12 +49,6 @@ export function shouldReconcileNativeFileJobs(
     return isDesktop || isAndroid
 }
 
-function isTerminal(status: NativeFileJobStatus): boolean {
-    return status.state === 'succeeded'
-        || status.state === 'failed'
-        || status.state === 'cancelled'
-}
-
 async function reconcileRestore(
     initial: NativeFileJobStatus,
     dependencies: NativeFileJobRecoveryDependencies,
@@ -99,14 +93,18 @@ async function reconcileExportInBackground(
             return
         }
         if (status.kind === 'export-lossless-backup' && status.result?.handoffPath) {
+            retainNativeJob = true
             await dependencies.invoke('native_lossless_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
+            retainNativeJob = false
         }
         else if (status.kind === 'export-legacy-local-backup' && status.result?.handoffPath) {
+            retainNativeJob = true
             await dependencies.invoke('native_legacy_backup_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
+            retainNativeJob = false
         }
         else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
             retainNativeJob = true
@@ -210,13 +208,6 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
         pendingRestoreAcknowledgements,
         pendingOfficialPublications,
     }
-}
-
-export async function reconcileNativeRestoresBeforeBootstrap(
-    dependencies: NativeFileJobRecoveryDependencies = productionDependencies,
-): Promise<string[]> {
-    const result = await reconcileNativeFileJobsBeforeBootstrap(dependencies)
-    return result.pendingRestoreAcknowledgements
 }
 
 export async function acknowledgeRecoveredNativeRestores(
