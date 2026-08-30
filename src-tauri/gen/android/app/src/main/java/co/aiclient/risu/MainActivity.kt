@@ -332,6 +332,53 @@ internal class ColdRestartDispatcher(
   }
 }
 
+// SAF picker admission runs on the WebView JavaBridge thread, but every WebView
+// or ActivityResultLauncher touch must reach the main thread through postToMain.
+internal class SafSourcePickFlow(
+  private val postToMain: (() -> Unit) -> Unit,
+) {
+  fun begin(
+    acquireSlot: () -> Boolean,
+    registerRequest: () -> Boolean,
+    releaseSlot: () -> Unit,
+    dispatchBusy: () -> Unit,
+    startPicker: () -> Unit,
+  ) {
+    if (!acquireSlot()) {
+      postToMain(dispatchBusy)
+      return
+    }
+    if (!registerRequest()) {
+      releaseSlot()
+      postToMain(dispatchBusy)
+      return
+    }
+    postToMain(startPicker)
+  }
+}
+
+internal class PostNotificationsRequestGate(
+  private val sdkInt: Int,
+  private val requestedInProcess: AtomicBoolean,
+) {
+  fun shouldRequest(isGranted: () -> Boolean): Boolean {
+    if (sdkInt < 33 || isGranted()) return false
+    return requestedInProcess.compareAndSet(false, true)
+  }
+}
+
+internal fun requestPostNotificationsIfNeeded(
+  gate: PostNotificationsRequestGate,
+  isGranted: () -> Boolean,
+  postToMain: (() -> Unit) -> Unit,
+  launchRequest: () -> Unit,
+) {
+  if (!gate.shouldRequest(isGranted)) return
+  postToMain(launchRequest)
+}
+
+private val postNotificationsRequestedInProcess = AtomicBoolean(false)
+
 class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
@@ -340,6 +387,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
   private val mainHandler = Handler(Looper.getMainLooper())
   private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val safSourcePickFlow = SafSourcePickFlow { block -> safScope.launch { block() } }
+  private val postNotificationsGate = PostNotificationsRequestGate(
+    Build.VERSION.SDK_INT,
+    postNotificationsRequestedInProcess,
+  )
   private val safSourceCancellations = ConcurrentHashMap<String, AtomicBoolean>()
   private val safDestinationCancellations = ConcurrentHashMap<String, AtomicBoolean>()
   private val safProgressDispatchMillis = ConcurrentHashMap<String, Long>()
@@ -368,6 +420,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     ActivityResultContracts.OpenDocument(),
     ::onLegacyBackupSourceSelected,
   )
+  private val postNotificationsPermissionLauncher = registerForActivityResult(
+    ActivityResultContracts.RequestPermission(),
+  ) {
+    // The peer-sync foreground service must run whether or not the permission is
+    // granted; denial only hides the Stop notification on Android 13+.
+  }
   private val rendererRecoveryMarker by lazy {
     val preferences = getSharedPreferences(NATIVE_RESILIENCE_PREFERENCES, MODE_PRIVATE)
     OneShotRecoveryMarker(
@@ -560,11 +618,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     pendingLosslessSource = null
     pendingLegacyBackupSource = null
     safScope.cancel()
+    mainHandler.removeCallbacksAndMessages(null)
     safSourceCancellations.clear()
     safDestinationCancellations.clear()
     safProgressDispatchMillis.clear()
     lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
     lifecycleWebView?.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
+    lifecycleWebView = null
     super.onDestroy()
   }
 
@@ -642,6 +702,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     @JavascriptInterface
     fun startSource(lane: String, operationId: String, generation: Long): Boolean {
       val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
+      requestPostNotificationsForPeerSync()
       return PeerSyncForegroundService.start(this@MainActivity, identity)
     }
 
@@ -657,66 +718,85 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     sdkInt = Build.VERSION.SDK_INT,
   )
 
+  // Android 13+ suppresses the peer-sync foreground notification (the user's Stop
+  // affordance) unless POST_NOTIFICATIONS was requested at runtime. Request it at
+  // most once per process before the first foreground lane starts; the service
+  // itself never depends on the outcome.
+  private fun requestPostNotificationsForPeerSync() {
+    requestPostNotificationsIfNeeded(
+      gate = postNotificationsGate,
+      isGranted = {
+        checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+          android.content.pm.PackageManager.PERMISSION_GRANTED
+      },
+      postToMain = { block -> mainHandler.post { block() } },
+      launchRequest = {
+        runCatching {
+          postNotificationsPermissionLauncher.launch(
+            android.Manifest.permission.POST_NOTIFICATIONS,
+          )
+        }
+      },
+    )
+  }
+
   private inner class SafBridge {
     @JavascriptInterface
     fun pickLosslessSource(requestId: String) {
       if (!isCanonicalUuidV4(requestId)) return
-      if (!safPickerSlot.tryAcquire()) {
-        dispatchLosslessSourceBatch(
-          requestId,
-          SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.risulossless", "source-busy"))),
-        )
-        return
-      }
       val cancellation = AtomicBoolean(false)
-      if (safSourceCancellations.putIfAbsent(requestId, cancellation) != null) {
-        safPickerSlot.release()
-        dispatchLosslessSourceBatch(
-          requestId,
-          SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.risulossless", "source-busy"))),
-        )
-        return
-      }
-      safScope.launch {
-        pendingLosslessSource = PendingLosslessSource(requestId, cancellation)
-        losslessSourcePicker.launch(arrayOf("application/octet-stream"))
-      }
+      safSourcePickFlow.begin(
+        acquireSlot = safPickerSlot::tryAcquire,
+        registerRequest = { safSourceCancellations.putIfAbsent(requestId, cancellation) == null },
+        releaseSlot = safPickerSlot::release,
+        dispatchBusy = {
+          dispatchLosslessSourceBatch(
+            requestId,
+            SafSpoolBatch(
+              emptyList(),
+              listOf(SafSpoolFailure("backup.risulossless", "source-busy")),
+            ),
+          )
+        },
+        startPicker = {
+          pendingLosslessSource = PendingLosslessSource(requestId, cancellation)
+          losslessSourcePicker.launch(arrayOf("application/octet-stream"))
+        },
+      )
     }
 
     @JavascriptInterface
     fun pickLegacyBackupSource(requestId: String) {
       if (!isCanonicalUuidV4(requestId)) return
-      if (!safPickerSlot.tryAcquire()) {
-        dispatchLegacyBackupSourceBatch(
-          requestId,
-          SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.bin", "source-busy"))),
-        )
-        return
-      }
       val cancellation = AtomicBoolean(false)
-      if (safSourceCancellations.putIfAbsent(requestId, cancellation) != null) {
-        safPickerSlot.release()
-        dispatchLegacyBackupSourceBatch(
-          requestId,
-          SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.bin", "source-busy"))),
-        )
-        return
-      }
-      pendingLegacyBackupSource = PendingLegacyBackupSource(requestId, cancellation)
-      try {
-        legacyBackupSourcePicker.launch(arrayOf("*/*"))
-      } catch (error: Exception) {
-        pendingLegacyBackupSource = null
-        safSourceCancellations.remove(requestId, cancellation)
-        safPickerSlot.release()
-        dispatchLegacyBackupSourceBatch(
-          requestId,
-          SafSpoolBatch(
-            emptyList(),
-            listOf(SafSpoolFailure("backup.bin", "source-picker-failed")),
-          ),
-        )
-      }
+      safSourcePickFlow.begin(
+        acquireSlot = safPickerSlot::tryAcquire,
+        registerRequest = { safSourceCancellations.putIfAbsent(requestId, cancellation) == null },
+        releaseSlot = safPickerSlot::release,
+        dispatchBusy = {
+          dispatchLegacyBackupSourceBatch(
+            requestId,
+            SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.bin", "source-busy"))),
+          )
+        },
+        startPicker = {
+          pendingLegacyBackupSource = PendingLegacyBackupSource(requestId, cancellation)
+          try {
+            legacyBackupSourcePicker.launch(arrayOf("*/*"))
+          } catch (error: Exception) {
+            pendingLegacyBackupSource = null
+            safSourceCancellations.remove(requestId, cancellation)
+            safPickerSlot.release()
+            dispatchLegacyBackupSourceBatch(
+              requestId,
+              SafSpoolBatch(
+                emptyList(),
+                listOf(SafSpoolFailure("backup.bin", "source-picker-failed")),
+              ),
+            )
+          }
+        },
+      )
     }
 
     @JavascriptInterface

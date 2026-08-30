@@ -323,7 +323,8 @@ private fun isValidRecord(record: SafDestinationRecord): Boolean {
   return true
 }
 
-private fun stringField(json: String, name: String): String? =
+// Shared with SafFileBridge.kt's spool manifest parsing.
+internal fun stringField(json: String, name: String): String? =
   Regex("\\\"$name\\\":\\\"([^\\\"]*)\\\"").find(json)?.groupValues?.get(1)
 
 private fun nullableStringField(json: String, name: String): NullableString? {
@@ -331,7 +332,7 @@ private fun nullableStringField(json: String, name: String): NullableString? {
   return NullableString(if (match.groupValues[1] == "null") null else match.groupValues[2])
 }
 
-private fun numberField(json: String, name: String): Long? =
+internal fun numberField(json: String, name: String): Long? =
   Regex("\\\"$name\\\":([0-9]+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
 
 private fun booleanField(json: String, name: String): Boolean? =

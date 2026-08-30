@@ -474,35 +474,54 @@ internal suspend fun copySafDestinationOnIo(
   }
 }
 
+// Every managed handoff kind shares one acceptance rule: a regular file whose
+// canonical parent is exactly native-file-jobs/handoffs and whose full name
+// matches the kind's regex. RisuSave (lease validation under persistent/exports)
+// and screenshot (ownership/ready markers) stay special cases below.
+private class ManagedHandoffKind(
+  val nameRegex: Regex,
+  val sourceKind: SafDestinationSourceKind,
+  val fileNamesFor: (String) -> List<String>,
+)
+
+private val MANAGED_HANDOFF_KINDS = listOf(
+  ManagedHandoffKind(MANAGED_LOSSLESS_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risulossless-$id.risulossless")
+  },
+  ManagedHandoffKind(MANAGED_LEGACY_BACKUP_NAME, SafDestinationSourceKind.LEGACY_BACKUP) { id ->
+    listOf("risu-backup-$id.bin")
+  },
+  ManagedHandoffKind(MANAGED_CHARACTER_CHARX_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risu-charx-$id.charx", "risu-charx-$id.jpeg")
+  },
+  ManagedHandoffKind(MANAGED_CHARACTER_CARD_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risu-character-card-$id.json", "risu-character-card-$id.png")
+  },
+  ManagedHandoffKind(MANAGED_RISU_MODULE_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risu-module-$id.risum")
+  },
+)
+
 internal fun resolveManagedExportSource(appDataRoot: File, sourcePath: String): File? {
   resolveManagedRisuSaveSource(appDataRoot, sourcePath)?.let { return it }
-  resolveManagedLosslessBackupSource(appDataRoot, sourcePath)?.let { return it }
-  resolveManagedLegacyBackupSource(appDataRoot, sourcePath)?.let { return it }
-  resolveManagedCharacterCharxSource(appDataRoot, sourcePath)?.let { return it }
-  resolveManagedCharacterCardSource(appDataRoot, sourcePath)?.let { return it }
-  resolveManagedRisuModuleSource(appDataRoot, sourcePath)?.let { return it }
+  for (kind in MANAGED_HANDOFF_KINDS) {
+    resolveManagedHandoffSource(appDataRoot, sourcePath, kind.nameRegex)?.let { return it }
+  }
   return resolveManagedScreenshotSource(appDataRoot, sourcePath)
 }
 
-private fun resolveManagedLosslessBackupSource(appDataRoot: File, sourcePath: String): File? {
+private fun resolveManagedHandoffSource(
+  appDataRoot: File,
+  sourcePath: String,
+  nameRegex: Regex,
+): File? {
   val handoffsRoot = runCatching {
     appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
   }.getOrNull() ?: return null
   if (!handoffsRoot.isDirectory) return null
   val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
   if (!source.isFile || source.parentFile != handoffsRoot) return null
-  if (MANAGED_LOSSLESS_BACKUP_NAME.matchEntire(source.name) == null) return null
-  return source
-}
-
-private fun resolveManagedLegacyBackupSource(appDataRoot: File, sourcePath: String): File? {
-  val handoffsRoot = runCatching {
-    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
-  }.getOrNull() ?: return null
-  if (!handoffsRoot.isDirectory) return null
-  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
-  if (!source.isFile || source.parentFile != handoffsRoot) return null
-  if (MANAGED_LEGACY_BACKUP_NAME.matchEntire(source.name) == null) return null
+  if (nameRegex.matchEntire(source.name) == null) return null
   return source
 }
 
@@ -539,39 +558,6 @@ private fun resolveManagedScreenshotSource(appDataRoot: File, sourcePath: String
   return source
 }
 
-private fun resolveManagedCharacterCharxSource(appDataRoot: File, sourcePath: String): File? {
-  val handoffsRoot = runCatching {
-    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
-  }.getOrNull() ?: return null
-  if (!handoffsRoot.isDirectory) return null
-  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
-  if (!source.isFile || source.parentFile != handoffsRoot) return null
-  if (MANAGED_CHARACTER_CHARX_NAME.matchEntire(source.name) == null) return null
-  return source
-}
-
-private fun resolveManagedCharacterCardSource(appDataRoot: File, sourcePath: String): File? {
-  val handoffsRoot = runCatching {
-    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
-  }.getOrNull() ?: return null
-  if (!handoffsRoot.isDirectory) return null
-  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
-  if (!source.isFile || source.parentFile != handoffsRoot) return null
-  if (MANAGED_CHARACTER_CARD_NAME.matchEntire(source.name) == null) return null
-  return source
-}
-
-private fun resolveManagedRisuModuleSource(appDataRoot: File, sourcePath: String): File? {
-  val handoffsRoot = runCatching {
-    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
-  }.getOrNull() ?: return null
-  if (!handoffsRoot.isDirectory) return null
-  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
-  if (!source.isFile || source.parentFile != handoffsRoot) return null
-  if (MANAGED_RISU_MODULE_NAME.matchEntire(source.name) == null) return null
-  return source
-}
-
 private fun readExactOwner(marker: File): String? {
   if (!marker.isFile || marker.length() > 64) return null
   return runCatching { marker.readText(Charsets.UTF_8) }.getOrNull()
@@ -579,50 +565,30 @@ private fun readExactOwner(marker: File): String? {
 
 internal fun managedExportId(source: File): String? {
   MANAGED_EXPORT_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
-  MANAGED_LOSSLESS_BACKUP_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
-  MANAGED_LEGACY_BACKUP_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
-  MANAGED_CHARACTER_CHARX_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
-  MANAGED_CHARACTER_CARD_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
-  MANAGED_RISU_MODULE_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
+  for (kind in MANAGED_HANDOFF_KINDS) {
+    kind.nameRegex.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
+  }
   if (source.name != MANAGED_SCREENSHOT_FILE) return null
   return source.parentFile?.name?.takeIf(::isCanonicalUuidV4)
 }
 
-internal fun managedExportSourceKind(source: File): SafDestinationSourceKind =
-  when {
-    source.name == MANAGED_SCREENSHOT_FILE -> SafDestinationSourceKind.SCREENSHOT
-    MANAGED_LEGACY_BACKUP_NAME.matches(source.name) -> SafDestinationSourceKind.LEGACY_BACKUP
-    else -> SafDestinationSourceKind.RISU_SAVE
-  }
+internal fun managedExportSourceKind(source: File): SafDestinationSourceKind = when {
+  source.name == MANAGED_SCREENSHOT_FILE -> SafDestinationSourceKind.SCREENSHOT
+  else -> MANAGED_HANDOFF_KINDS.firstOrNull { it.nameRegex.matches(source.name) }?.sourceKind
+    ?: SafDestinationSourceKind.RISU_SAVE
+}
 
 internal fun resolveManagedExportById(appDataRoot: File, exportId: String): File? {
   if (!isCanonicalUuidV4(exportId)) return null
   val source = appDataRoot.resolve("persistent/exports/risusave-$exportId.risudat")
   resolveManagedRisuSaveSource(appDataRoot, source.absolutePath)?.let { return it }
-  val losslessBackup = appDataRoot.resolve(
-    "native-file-jobs/handoffs/risulossless-$exportId.risulossless",
-  )
-  resolveManagedLosslessBackupSource(appDataRoot, losslessBackup.absolutePath)?.let { return it }
-  val legacyBackup = appDataRoot.resolve("native-file-jobs/handoffs/risu-backup-$exportId.bin")
-  resolveManagedLegacyBackupSource(appDataRoot, legacyBackup.absolutePath)?.let { return it }
-  val characterCharx = appDataRoot.resolve(
-    "native-file-jobs/handoffs/risu-charx-$exportId.charx",
-  )
-  resolveManagedCharacterCharxSource(appDataRoot, characterCharx.absolutePath)?.let { return it }
-  val characterJpeg = appDataRoot.resolve(
-    "native-file-jobs/handoffs/risu-charx-$exportId.jpeg",
-  )
-  resolveManagedCharacterCharxSource(appDataRoot, characterJpeg.absolutePath)?.let { return it }
-  val characterCard = appDataRoot.resolve(
-    "native-file-jobs/handoffs/risu-character-card-$exportId.json",
-  )
-  resolveManagedCharacterCardSource(appDataRoot, characterCard.absolutePath)?.let { return it }
-  val characterPng = appDataRoot.resolve(
-    "native-file-jobs/handoffs/risu-character-card-$exportId.png",
-  )
-  resolveManagedCharacterCardSource(appDataRoot, characterPng.absolutePath)?.let { return it }
-  val risuModule = appDataRoot.resolve("native-file-jobs/handoffs/risu-module-$exportId.risum")
-  resolveManagedRisuModuleSource(appDataRoot, risuModule.absolutePath)?.let { return it }
+  for (kind in MANAGED_HANDOFF_KINDS) {
+    for (fileName in kind.fileNamesFor(exportId)) {
+      val candidate = appDataRoot.resolve("native-file-jobs/handoffs/$fileName")
+      resolveManagedHandoffSource(appDataRoot, candidate.absolutePath, kind.nameRegex)
+        ?.let { return it }
+    }
+  }
   val screenshot = appDataRoot.resolve(
     "native-file-jobs/screenshot-output/$exportId/$MANAGED_SCREENSHOT_FILE",
   )
@@ -735,17 +701,14 @@ internal fun safeSafDestinationName(name: String): String {
 private fun readSpoolOwnership(file: File): SafSpoolOwnership? {
   if (!file.isFile || file.length() > 4_096) return null
   val json = file.readText(Charsets.UTF_8)
-  val format = Regex("\\\"format\\\":\\\"([^\\\"]+)\\\"")
-    .find(json)?.groupValues?.get(1)
-  val version = Regex("\\\"version\\\":([0-9]+)")
-    .find(json)?.groupValues?.get(1)?.toIntOrNull()
-  val token = Regex("\\\"token\\\":\\\"([^\\\"]+)\\\"")
-    .find(json)?.groupValues?.get(1)
-  val createdAtMillis = Regex("\\\"createdAtMillis\\\":([0-9]+)")
-    .find(json)?.groupValues?.get(1)?.toLongOrNull()
+  val format = stringField(json, "format")
+  val version = numberField(json, "version")
+  // An empty token must stay unowned; the shared helper also matches "".
+  val token = stringField(json, "token")?.takeIf(String::isNotEmpty)
+  val createdAtMillis = numberField(json, "createdAtMillis")
   if (
     format != SPOOL_OWNERSHIP_FORMAT ||
-    version != 1 ||
+    version != 1L ||
     token == null ||
     createdAtMillis == null
   ) return null
@@ -756,14 +719,12 @@ private fun readReadySpool(directory: File, token: String): SafSpoolReady? {
   val manifest = directory.resolve("source.json")
   if (!manifest.isFile || manifest.length() > 4_096) return null
   val json = runCatching { manifest.readText(Charsets.UTF_8) }.getOrNull() ?: return null
-  val manifestToken = Regex("\\\"token\\\":\\\"([^\\\"]+)\\\"")
-    .find(json)?.groupValues?.get(1)
-  val state = Regex("\\\"state\\\":\\\"([^\\\"]+)\\\"")
-    .find(json)?.groupValues?.get(1)
-  val displayName = Regex("\\\"displayName\\\":\\\"([^\\\"]+)\\\"")
-    .find(json)?.groupValues?.get(1)
-  val bytes = Regex("\\\"bytes\\\":([0-9]+)")
-    .find(json)?.groupValues?.get(1)?.toLongOrNull()
+  val manifestToken = stringField(json, "token")
+  val state = stringField(json, "state")
+  val displayName = stringField(json, "displayName")
+  val bytes = numberField(json, "bytes")
+  // Not nullableLongField: an unparseable number keeps the batch with a null
+  // total instead of rejecting the spool.
   val totalText = Regex("\\\"totalBytes\\\":(null|[0-9]+)")
     .find(json)?.groupValues?.get(1)
   val totalBytes = totalText?.takeUnless { it == "null" }?.toLongOrNull()
@@ -781,18 +742,23 @@ private fun readReadySpool(directory: File, token: String): SafSpoolReady? {
   return SafSpoolReady(token, displayName, bytes, totalBytes)
 }
 
-internal fun androidSpoolBatchScript(requestId: String, batch: SafSpoolBatch): String {
-  val ready = batch.ready.joinToString(",") { source ->
-    "{" +
-      "\"token\":${jsonString(source.token)}," +
-      "\"displayName\":${jsonString(source.displayName)}," +
-      "\"bytes\":${source.bytes}," +
-      (source.totalBytes?.let { "\"totalBytes\":$it" } ?: "\"totalBytes\":null") +
-      "}"
-  }
-  val failures = batch.failures.joinToString(",") { failure ->
+private fun spoolReadyJson(ready: List<SafSpoolReady>): String = ready.joinToString(",") { source ->
+  "{" +
+    "\"token\":${jsonString(source.token)}," +
+    "\"displayName\":${jsonString(source.displayName)}," +
+    "\"bytes\":${source.bytes}," +
+    (source.totalBytes?.let { "\"totalBytes\":$it" } ?: "\"totalBytes\":null") +
+    "}"
+}
+
+private fun spoolFailuresJson(failures: List<SafSpoolFailure>): String =
+  failures.joinToString(",") { failure ->
     "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
   }
+
+internal fun androidSpoolBatchScript(requestId: String, batch: SafSpoolBatch): String {
+  val ready = spoolReadyJson(batch.ready)
+  val failures = spoolFailuresJson(batch.failures)
   val value = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
   val pending = "{" +
     "\"requestId\":${jsonString(requestId)}," +
@@ -802,21 +768,16 @@ internal fun androidSpoolBatchScript(requestId: String, batch: SafSpoolBatch): S
     "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$value}));"
 }
 
-internal fun androidLosslessSourcePickedScript(requestId: String, batch: SafSpoolBatch): String {
-  val ready = batch.ready.joinToString(",") { source ->
-    "{" +
-      "\"token\":${jsonString(source.token)}," +
-      "\"displayName\":${jsonString(source.displayName)}," +
-      "\"bytes\":${source.bytes}," +
-      (source.totalBytes?.let { "\"totalBytes\":$it" } ?: "\"totalBytes\":null") +
-      "}"
-  }
-  val failures = batch.failures.joinToString(",") { failure ->
-    "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
-  }
-  val detail = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
-  return "window.dispatchEvent(new CustomEvent('risu-android-lossless-source-picked',{detail:$detail}));"
+private fun sourcePickedScript(eventName: String, requestId: String, batch: SafSpoolBatch): String {
+  val detail = "{" +
+    "\"requestId\":${jsonString(requestId)}," +
+    "\"ready\":[${spoolReadyJson(batch.ready)}]," +
+    "\"failures\":[${spoolFailuresJson(batch.failures)}]}"
+  return "window.dispatchEvent(new CustomEvent('$eventName',{detail:$detail}));"
 }
+
+internal fun androidLosslessSourcePickedScript(requestId: String, batch: SafSpoolBatch): String =
+  sourcePickedScript("risu-android-lossless-source-picked", requestId, batch)
 
 internal fun androidLosslessSourceResultScript(
   requestId: String,
@@ -831,21 +792,7 @@ internal fun androidLosslessSourceResultScript(
 internal fun androidLegacyBackupSourcePickedScript(
   requestId: String,
   batch: SafSpoolBatch,
-): String {
-  val ready = batch.ready.joinToString(",") { source ->
-    "{" +
-      "\"token\":${jsonString(source.token)}," +
-      "\"displayName\":${jsonString(source.displayName)}," +
-      "\"bytes\":${source.bytes}," +
-      (source.totalBytes?.let { "\"totalBytes\":$it" } ?: "\"totalBytes\":null") +
-      "}"
-  }
-  val failures = batch.failures.joinToString(",") { failure ->
-    "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
-  }
-  val detail = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
-  return "window.dispatchEvent(new CustomEvent('risu-android-legacy-backup-source-picked',{detail:$detail}));"
-}
+): String = sourcePickedScript("risu-android-legacy-backup-source-picked", requestId, batch)
 
 internal fun androidLegacyBackupSourceResultScript(
   requestId: String,

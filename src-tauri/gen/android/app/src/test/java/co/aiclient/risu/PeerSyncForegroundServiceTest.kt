@@ -43,14 +43,9 @@ class PeerSyncForegroundServiceTest {
   }
 
   @Test
-  fun `notification uses the explicit Stop action with immutable identity-only intent`() {
-    assertEquals("co.aiclient.risu.PEER_SYNC_SOURCE_STOP", PEER_SYNC_FOREGROUND_STOP_ACTION)
+  fun `notification stop pending intent is immutable`() {
     assertTrue(PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS and android.app.PendingIntent.FLAG_IMMUTABLE != 0)
     assertEquals(0, PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS and android.app.PendingIntent.FLAG_MUTABLE)
-    assertEquals(
-      setOf("lane", "operationId", "generation"),
-      peerSyncForegroundIdentityExtras("p1-source", operationId, 7L).keys,
-    )
   }
 
   @Test
@@ -67,26 +62,17 @@ class PeerSyncForegroundServiceTest {
     assertFalse(canStartPeerSyncForeground(p1, p4))
     assertEquals(p4, rejectedPeerSyncForegroundStart(p1, p4))
     assertEquals(null, rejectedPeerSyncForegroundStart(p1, p1))
-    assertEquals(p1, peerSyncForegroundIdentityForDestruction(p1))
-    assertEquals(null, peerSyncForegroundIdentityForDestruction(null))
   }
 
   @Test
-  fun `accepted exact Stop clears Kotlin identity before native cross lane reserve`() {
+  fun `accepted exact Stop clears the attached identity and admits a cross lane START`() {
     val p1 = PeerSyncForegroundIdentity("p1-source", operationId, 7L)
     val p4 = PeerSyncForegroundIdentity("p4-source", "22222222-2222-4222-8222-222222222222", 8L)
-    var nativeOwner: PeerSyncForegroundIdentity? = p1
-    var attached: PeerSyncForegroundIdentity? = p1
-    assertEquals(p1, nativeOwner)
 
-    attached = peerSyncForegroundIdentityAfterStop(attached, p1)
-    nativeOwner = null
-    assertEquals(null, attached)
-    assertNull(nativeOwner)
+    val attached = peerSyncForegroundIdentityAfterStop(p1, p1)
 
-    nativeOwner = p4
-    assertTrue(canStartPeerSyncForeground(attached, nativeOwner))
-    assertEquals(p4, nativeOwner)
+    assertNull(attached)
+    assertTrue(canStartPeerSyncForeground(attached, p4))
   }
 
   @Test

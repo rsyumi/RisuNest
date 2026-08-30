@@ -2,6 +2,7 @@ package co.aiclient.risu
 
 import android.content.ComponentCallbacks2
 import androidx.core.view.WindowInsetsCompat
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -579,5 +580,96 @@ class MainActivityBehaviorTest {
     gate.cancel("exit-1")
 
     assertEquals(true, gate.shouldFinish("exit-2"))
+  }
+
+  @Test
+  fun `busy SAF source pick rejection reaches the WebView only through the main thread poster`() {
+    val posted = mutableListOf<() -> Unit>()
+    val flow = SafSourcePickFlow(posted::add)
+    val events = mutableListOf<String>()
+
+    flow.begin(
+      acquireSlot = { false },
+      registerRequest = { error("a busy slot must not register the request") },
+      releaseSlot = { events.add("release") },
+      dispatchBusy = { events.add("busy") },
+      startPicker = { events.add("picker") },
+    )
+
+    // Nothing WebView-bound may run synchronously on the JavaBridge thread.
+    assertEquals(emptyList<String>(), events)
+    assertEquals(1, posted.size)
+    posted.forEach { it() }
+    assertEquals(listOf("busy"), events)
+  }
+
+  @Test
+  fun `duplicate SAF source pick releases the slot and defers the busy dispatch to main`() {
+    val posted = mutableListOf<() -> Unit>()
+    val flow = SafSourcePickFlow(posted::add)
+    val events = mutableListOf<String>()
+
+    flow.begin(
+      acquireSlot = { true },
+      registerRequest = { false },
+      releaseSlot = { events.add("release") },
+      dispatchBusy = { events.add("busy") },
+      startPicker = { events.add("picker") },
+    )
+
+    assertEquals(listOf("release"), events)
+    posted.forEach { it() }
+    assertEquals(listOf("release", "busy"), events)
+  }
+
+  @Test
+  fun `admitted SAF source pick launches the picker only through the main thread poster`() {
+    val posted = mutableListOf<() -> Unit>()
+    val flow = SafSourcePickFlow(posted::add)
+    val events = mutableListOf<String>()
+
+    flow.begin(
+      acquireSlot = { true },
+      registerRequest = { true },
+      releaseSlot = { events.add("release") },
+      dispatchBusy = { events.add("busy") },
+      startPicker = { events.add("picker") },
+    )
+
+    assertEquals(emptyList<String>(), events)
+    posted.forEach { it() }
+    assertEquals(listOf("picker"), events)
+  }
+
+  @Test
+  fun `notification permission request is skipped below Android 13 and when already granted`() {
+    val belowTiramisu = PostNotificationsRequestGate(32, AtomicBoolean(false))
+    assertEquals(false, belowTiramisu.shouldRequest { false })
+
+    val granted = PostNotificationsRequestGate(33, AtomicBoolean(false))
+    assertEquals(false, granted.shouldRequest { true })
+    // A grant must not consume the once-per-process request budget.
+    assertEquals(true, granted.shouldRequest { false })
+  }
+
+  @Test
+  fun `notification permission is requested once per process through the main thread poster`() {
+    val posted = mutableListOf<() -> Unit>()
+    var launches = 0
+    val gate = PostNotificationsRequestGate(34, AtomicBoolean(false))
+
+    repeat(3) {
+      requestPostNotificationsIfNeeded(
+        gate = gate,
+        isGranted = { false },
+        postToMain = posted::add,
+        launchRequest = { launches += 1 },
+      )
+    }
+
+    assertEquals(0, launches)
+    assertEquals(1, posted.size)
+    posted.forEach { it() }
+    assertEquals(1, launches)
   }
 }

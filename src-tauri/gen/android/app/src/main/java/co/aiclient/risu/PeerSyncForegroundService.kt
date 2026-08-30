@@ -75,10 +75,6 @@ internal fun rejectedPeerSyncForegroundStart(
   requested: PeerSyncForegroundIdentity,
 ): PeerSyncForegroundIdentity? = requested.takeUnless { canStartPeerSyncForeground(attached, it) }
 
-internal fun peerSyncForegroundIdentityForDestruction(
-  attached: PeerSyncForegroundIdentity?,
-): PeerSyncForegroundIdentity? = attached
-
 internal object PeerSyncForegroundNativeBridge {
   init {
     System.loadLibrary("risuai_lib")
@@ -132,7 +128,7 @@ class PeerSyncForegroundService : Service() {
   }
 
   override fun onDestroy() {
-    peerSyncForegroundIdentityForDestruction(attached)?.let { identity ->
+    attached?.let { identity ->
       PeerSyncForegroundNativeBridge.cancel(identity.lane, identity.operationId, identity.generation)
       PeerSyncForegroundNativeBridge.detach(identity.lane, identity.operationId, identity.generation)
     }

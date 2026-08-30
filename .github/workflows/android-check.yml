@@ -39,6 +39,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+          cache: gradle
 
       - uses: android-actions/setup-android@v3
 
@@ -67,6 +68,10 @@ jobs:
       - name: Capture generated Android source baseline
         shell: bash
         run: git status --short --untracked-files=all -- src-tauri/gen/android > "$RUNNER_TEMP/android-gen.status.before"
+
+      - name: Run Android Kotlin unit tests
+        working-directory: src-tauri/gen/android
+        run: ./gradlew :app:testArmDebugUnitTest :app:testLowMemorySafCopy --no-daemon
 
       - name: Build arm64 debug APK
         run: pnpm android:build:arm64
