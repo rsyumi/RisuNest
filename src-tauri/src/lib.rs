@@ -607,6 +607,8 @@ pub fn run() {
             #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_start,
             #[cfg(desktop)]
+            peer_sync::bidirectional_commands::peer_bidirectional_tunnel_start,
+            #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_status,
             #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_stop,
@@ -718,6 +720,8 @@ pub fn run() {
             app.state::<peer_sync::commands::PeerCloneCommandState>()
                 .shutdown_for_exit();
             app.state::<peer_sync::delta_commands::PeerDeltaCommandState>()
+                .shutdown_for_exit();
+            app.state::<peer_sync::bidirectional_commands::PeerBidirectionalCommandState>()
                 .shutdown_for_exit();
         }
         #[cfg(not(desktop))]

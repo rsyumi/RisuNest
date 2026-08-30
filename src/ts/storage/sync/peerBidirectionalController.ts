@@ -351,6 +351,28 @@ export function createPeerBidirectionalController(options: {
             beginSourcePolling()
             return sourceStatus
         }, 'rehost'),
+        startQuickTunnel: (sessionId: string) => runSource(`start-quick:${sessionId}`, async () => {
+            const sourceStatus = await options.facade.startQuickTunnel(sessionId)
+            sourcePollEpoch += 1
+            update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
+            beginSourcePolling()
+            return sourceStatus
+        }, 'rehost'),
+        startNamedTunnel: (
+            sessionId: string,
+            token: string,
+            expectedPublicBaseUrl: string,
+        ) => runSource(`start-named:${sessionId}`, async () => {
+            const sourceStatus = await options.facade.startNamedTunnel(
+                sessionId,
+                token,
+                expectedPublicBaseUrl,
+            )
+            sourcePollEpoch += 1
+            update({ sourceStatus, sourcePairingUri: sourceStatus.pairingUri ?? '' })
+            beginSourcePolling()
+            return sourceStatus
+        }, 'rehost'),
         stop: (sessionId: string) => runSource(`stop:${sessionId}`, async () => {
             await options.facade.stop(sessionId)
             stopSourcePolling()

@@ -1730,7 +1730,7 @@ pub(crate) struct LanBidirectionalRemoteApplyRequest {
 impl LanBidirectionalRemoteApplyRequest {
     fn is_valid(&self) -> bool {
         is_canonical_uuid(&self.operation_id)
-            && validate_private_lan_endpoint(&self.source_endpoint).is_ok()
+            && validate_p5_desktop_endpoint(&self.source_endpoint).is_ok()
             && is_canonical_uuid(&self.source_session_id)
             && is_lower_hex_256(&self.source_manifest_id)
             && is_lower_hex_256(&self.source_claim)
@@ -1876,6 +1876,11 @@ pub(crate) fn validate_p4_logical_delta_endpoint(value: &str) -> Result<String, 
     validate_lan_endpoint(value)
 }
 
+#[cfg(desktop)]
+pub(crate) fn validate_p5_desktop_endpoint(value: &str) -> Result<String, PeerSyncError> {
+    validate_lan_endpoint(value)
+}
+
 fn has_explicit_authority_port(value: &str) -> bool {
     let Some((_, remainder)) = value.split_once("://") else {
         return false;
@@ -2004,7 +2009,30 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn bidirectional_remote_apply_rejects_public_https_source() {
+    fn desktop_p5_policy_accepts_private_lan_and_strict_public_https() {
+        assert_eq!(
+            validate_p5_desktop_endpoint("http://192.168.1.2:8080").unwrap(),
+            "http://192.168.1.2:8080"
+        );
+        assert_eq!(
+            validate_p5_desktop_endpoint("https://sync.example.com/").unwrap(),
+            "https://sync.example.com"
+        );
+        for endpoint in [
+            "https://sync.example.com:443",
+            "https://sync.example.com/path",
+            "https://localhost",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                validate_p5_desktop_endpoint(endpoint).is_err(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn bidirectional_remote_apply_accepts_strict_public_https_source() {
         let request = LanBidirectionalRemoteApplyRequest {
             operation_id: "00000000-0000-4000-8000-000000000004".to_owned(),
             source_endpoint: "https://sync.example.com".to_owned(),
@@ -2020,7 +2048,7 @@ mod endpoint_tests {
             expected_common_base_manifest_hash: "f".repeat(64),
             backup_losing_side: false,
         };
-        assert!(!request.is_valid());
+        assert!(request.is_valid());
     }
 }
 
@@ -3738,6 +3766,17 @@ pub(crate) struct LanBidirectionalLogicalCredential {
 #[cfg(desktop)]
 impl LanBidirectionalLogicalCredential {
     fn validate(&self) -> Result<String, PeerSyncError> {
+        self.validate_with(validate_private_lan_endpoint)
+    }
+
+    fn validate_p5_desktop(&self) -> Result<String, PeerSyncError> {
+        self.validate_with(validate_p5_desktop_endpoint)
+    }
+
+    fn validate_with(
+        &self,
+        validate_endpoint: fn(&str) -> Result<String, PeerSyncError>,
+    ) -> Result<String, PeerSyncError> {
         if !is_canonical_uuid(&self.session_id)
             || !is_lower_hex_256(&self.manifest_id)
             || !is_canonical_uuid(&self.device_id)
@@ -3748,7 +3787,7 @@ impl LanBidirectionalLogicalCredential {
                 "invalid bidirectional logical credential".to_owned(),
             ));
         }
-        validate_private_lan_endpoint(&self.endpoint)
+        validate_endpoint(&self.endpoint)
     }
 }
 
@@ -3789,10 +3828,38 @@ impl LanBidirectionalLogicalClient {
         })
     }
 
+    pub(crate) fn claim_p5_desktop(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        device_id: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let inner = LanLogicalDeltaClient::claim_with_timeouts_and_policy(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            Some(device_id),
+            "logical-bidirectional",
+            LogicalClientTimeouts {
+                control_request: CONTROL_REQUEST_TIMEOUT,
+                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+            },
+            validate_p5_desktop_endpoint,
+        )?;
+        Ok(Self {
+            remote_apply_client: build_bidirectional_remote_apply_client()?,
+            endpoint: validate_p5_desktop_endpoint(endpoint)?,
+            session_id: session_id.to_owned(),
+            inner,
+        })
+    }
+
     pub(crate) fn resume(
         credential: LanBidirectionalLogicalCredential,
     ) -> Result<Self, PeerSyncError> {
-        let endpoint = credential.validate()?;
+        let endpoint = credential.validate_p5_desktop()?;
         let session_url = format!("{endpoint}/v1/sessions/{}", credential.session_id);
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(

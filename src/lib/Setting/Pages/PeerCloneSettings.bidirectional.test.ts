@@ -12,6 +12,17 @@ describe('peer bidirectional settings surface', () => {
         expect(peerCloneSettingsSource).toContain('bidirectionalController.resolve')
     })
 
+    it('offers LAN, Quick, and Named desktop P5 source transports without retaining tokens', () => {
+        expect(peerCloneSettingsSource).toContain("bidirectionalSourceMode = $state<'lan' | 'quick' | 'named'>('lan')")
+        expect(peerCloneSettingsSource).toContain('bidirectionalController.startQuickTunnel')
+        expect(peerCloneSettingsSource).toContain('bidirectionalController.startNamedTunnel')
+        expect(peerCloneSettingsSource).toContain("if (bidirectionalSourceMode === 'named') bidirectionalNamedTunnelToken = ''")
+        expect(languageEnglish.peerBidirectional.sourceHelp).toContain('LAN or tunnel')
+        expect(languageKorean.peerBidirectional?.sourceHelp).toContain('LAN 또는 터널')
+        expect(languageEnglish.peerBidirectional.sourceUnavailable).toContain('fresh link')
+        expect(languageKorean.peerBidirectional?.sourceUnavailable).toContain('새 링크')
+    })
+
     it('offers an explicit whole-operation winner for same-record conflicts', () => {
         expect(peerCloneSettingsSource).toContain("bidirectionalOperationPhase === 'awaitingConflict'")
         expect(peerCloneSettingsSource).toContain("resolveBidirectional('local')")
@@ -40,7 +51,7 @@ describe('peer bidirectional settings surface', () => {
         expect(peerCloneSettingsSource).toContain("|| ['prepared', 'running'].includes(bidirectionalSourceStatus.phase)")
         expect(peerCloneSettingsSource).toContain('|| !bidirectionalPairingInput}')
         expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained || device.revoked')
-        expect(peerCloneSettingsSource).toContain("disabled={bidirectionalControlBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}")
+        expect(peerCloneSettingsSource).toContain("disabled={bidirectionalControlBusy || !['prepared', 'starting', 'running', 'stopping'].includes(bidirectionalSourceStatus.phase)}")
         expect(peerCloneSettingsSource).toContain('bidirectionalController.acknowledge()')
         expect(peerCloneSettingsSource).toContain('language.peerBidirectional.acknowledge')
         expect(peerCloneSettingsSource).toContain("bidirectionalOperationPhase === 'sourceUnavailable'")

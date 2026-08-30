@@ -81,10 +81,6 @@ describe('peer bidirectional facade', () => {
             pairingUri.replace('peer-sync', 'peer-delta'),
             pairingUri.replace('/v1', '/v2'),
             pairingUri.replace('192.168.1.20', 'example.com'),
-            pairingUri.replace(
-                'http%3A%2F%2F192.168.1.20%3A32146',
-                'https%3A%2F%2Fsync.example.com',
-            ),
             pairingUri.replace(`#claim=${'b'.repeat(64)}`, ''),
             `${pairingUri}&extra=true`,
         ]) {
@@ -142,6 +138,51 @@ describe('peer bidirectional facade', () => {
             'invoke:peer_bidirectional_status:',
             'release',
         ])
+    })
+
+    it('starts Quick and Named P5 tunnels through transient one-shot commands', async () => {
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'peer_bidirectional_tunnel_start') {
+                return { phase: 'running', sessionId: 'session-source', devices: [], tunnel: { kind: 'quick' } }
+            }
+            return undefined
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime([]),
+        })
+        await facade.prepare()
+
+        await facade.startQuickTunnel('session-source')
+        await facade.startNamedTunnel('session-source', 'transient-secret', 'https://sync.example.com')
+
+        expect(invoke).toHaveBeenCalledWith('peer_bidirectional_tunnel_start', {
+            sessionId: 'session-source',
+            tunnel: { kind: 'quick' },
+        })
+        expect(invoke).toHaveBeenCalledWith('peer_bidirectional_tunnel_start', {
+            sessionId: 'session-source',
+            tunnel: {
+                kind: 'named',
+                token: 'transient-secret',
+                expectedPublicBaseUrl: 'https://sync.example.com',
+            },
+        })
+    })
+
+    it('accepts a strict bare public HTTPS P5 link only on desktop', () => {
+        const publicPairing = pairingUri.replace(
+            'http%3A%2F%2F192.168.1.20%3A32146',
+            'https%3A%2F%2Fquick-id.trycloudflare.com',
+        )
+        expect(parsePeerBidirectionalUri(publicPairing).endpoint)
+            .toBe('https://quick-id.trycloudflare.com')
+        for (const invalid of [
+            publicPairing.replace('https%3A', 'http%3A'),
+            publicPairing.replace('trycloudflare.com', '127.0.0.1'),
+            publicPairing.replace('trycloudflare.com', 'trycloudflare.com%2Fpath'),
+        ]) expect(() => parsePeerBidirectionalUri(invalid)).toThrow('Invalid peer sync pairing URI')
     })
 
     it.each(['', 'session-source'])(

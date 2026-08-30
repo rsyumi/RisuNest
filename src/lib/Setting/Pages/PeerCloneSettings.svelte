@@ -76,6 +76,9 @@
     let bidirectionalCapabilities = $state<PeerBidirectionalCapabilities>()
     let bidirectionalSourceStatus = $state<PeerBidirectionalSourceStatus>({ phase: 'idle', devices: [] })
     let bidirectionalSourcePairingUri = $state('')
+    let bidirectionalSourceMode = $state<'lan' | 'quick' | 'named'>('lan')
+    let bidirectionalNamedTunnelToken = $state('')
+    let bidirectionalNamedTunnelPublicBaseUrl = $state('')
     let bidirectionalPairingInput = $state('')
     let bidirectionalOperationPhase = $state('idle')
     let bidirectionalResult = $state<PeerBidirectionalSyncResult>()
@@ -95,6 +98,12 @@
     $effect(() => {
         if (deltaSourceMode !== 'named' || deltaSourceStatus.phase !== 'prepared') {
             deltaNamedTunnelToken = ''
+        }
+    })
+
+    $effect(() => {
+        if (bidirectionalSourceMode !== 'named' || bidirectionalSourceStatus.phase !== 'prepared') {
+            bidirectionalNamedTunnelToken = ''
         }
     })
 
@@ -374,9 +383,27 @@
 
     async function startBidirectionalSource(): Promise<void> {
         if (!bidirectionalSourceStatus.sessionId) return
-        await withBidirectionalBusy(async () => {
-            await bidirectionalController.start(bidirectionalSourceStatus.sessionId!)
-        })
+        if (bidirectionalSourceMode === 'quick' && !await alertConfirm(language.peerClone.quickTunnelConfirm)) return
+        const sessionId = bidirectionalSourceStatus.sessionId
+        const token = bidirectionalNamedTunnelToken
+        if (bidirectionalSourceMode === 'named') bidirectionalNamedTunnelToken = ''
+        try {
+            await withBidirectionalBusy(async () => {
+                if (bidirectionalSourceMode === 'quick') {
+                    await bidirectionalController.startQuickTunnel(sessionId)
+                } else if (bidirectionalSourceMode === 'named') {
+                    await bidirectionalController.startNamedTunnel(
+                        sessionId,
+                        token,
+                        bidirectionalNamedTunnelPublicBaseUrl,
+                    )
+                } else {
+                    await bidirectionalController.start(sessionId)
+                }
+            })
+        } finally {
+            bidirectionalNamedTunnelToken = ''
+        }
     }
 
     async function stopBidirectionalSource(): Promise<void> {
@@ -445,6 +472,7 @@
         const unsubscribe = subscribePeerCloneUri(acceptPairingUri)
         return () => {
             deltaNamedTunnelToken = ''
+            bidirectionalNamedTunnelToken = ''
             unsubscribe()
             unsubscribeController()
             unsubscribeDeltaController()
@@ -752,6 +780,25 @@
     <div class="mt-4 rounded-md border border-darkborderc p-3">
         <h4 class="font-bold">{language.peerBidirectional.source}</h4>
         <p class="mt-1 text-sm text-textcolor2">{language.peerBidirectional.sourceHelp}</p>
+        {#if bidirectionalSourceStatus.phase === 'prepared'}
+            <p class="mt-3 text-sm font-bold">{language.peerClone.shareMode}</p>
+            <SelectInput bind:value={bidirectionalSourceMode} className="mt-1 w-full">
+                <option value="lan">{language.peerClone.lanMode}</option>
+                <option value="quick">{language.peerClone.quickTunnelMode}</option>
+                <option value="named">{language.peerClone.namedTunnelMode}</option>
+            </SelectInput>
+            {#if bidirectionalSourceMode === 'quick'}
+                <p class="mt-2 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">
+                    {language.peerClone.quickTunnelHelp}
+                </p>
+            {:else if bidirectionalSourceMode === 'named'}
+                <label class="mt-3 block text-sm font-bold" for="peer-bidirectional-named-token">{language.peerClone.namedTunnelToken}</label>
+                <input id="peer-bidirectional-named-token" bind:value={bidirectionalNamedTunnelToken} type="password" autocomplete="new-password" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" />
+                <label class="mt-3 block text-sm font-bold" for="peer-bidirectional-named-public-url">{language.peerClone.namedTunnelPublicUrl}</label>
+                <input id="peer-bidirectional-named-public-url" bind:value={bidirectionalNamedTunnelPublicBaseUrl} type="url" autocomplete="off" placeholder="https://sync.example.com" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" />
+                <p class="mt-2 text-sm text-textcolor2">{language.peerClone.namedTunnelHelp}</p>
+            {/if}
+        {/if}
         <div class="mt-2 flex flex-wrap gap-2">
             <Button
                 disabled={!bidirectionalEnabled
@@ -772,7 +819,7 @@
             >{language.peerBidirectional.start}</Button>
             <Button
                 styled="danger"
-                disabled={bidirectionalControlBusy || !['prepared', 'running'].includes(bidirectionalSourceStatus.phase)}
+                disabled={bidirectionalControlBusy || !['prepared', 'starting', 'running', 'stopping'].includes(bidirectionalSourceStatus.phase)}
                 onclick={stopBidirectionalSource}
             >{language.peerBidirectional.stop}</Button>
         </div>

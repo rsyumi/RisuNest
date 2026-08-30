@@ -1,8 +1,8 @@
 use super::{
     execute_logical_delta_pull,
     lan::{
-        validate_private_lan_endpoint, LanBidirectionalBackupReceipt, LanBidirectionalControl,
-        LanBidirectionalGeneration, LanBidirectionalLogicalClient,
+        validate_p5_desktop_endpoint, validate_private_lan_endpoint, LanBidirectionalBackupReceipt,
+        LanBidirectionalControl, LanBidirectionalGeneration, LanBidirectionalLogicalClient,
         LanBidirectionalLogicalCredential, LanBidirectionalRegistrationRequest,
         LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
         LanBidirectionalSession, LanCloneHostControl, LanLogicalDeltaClient,
@@ -12,6 +12,7 @@ use super::{
     logical_delta_transfer::{
         execute_logical_delta_pull_with_pre_activation, select_missing_logical_delta_objects,
     },
+    tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure},
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     LogicalDeltaStagedTarget, PeerSyncError,
 };
@@ -43,8 +44,8 @@ use std::{
     net::{Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -297,11 +298,13 @@ impl PeerBidirectionalDurableOperation {
         | Self::AwaitingConflict { context, .. }
         | Self::LocalCommitted { context, .. } = self
         {
-            validate_private_lan_endpoint(&context.credential.endpoint).map_err(|_| {
-                PeerSyncError::Storage(
-                    "bidirectional operation has an invalid private LAN endpoint".to_owned(),
-                )
-            })?;
+            if !context.credential.endpoint.is_empty() {
+                validate_p5_desktop_endpoint(&context.credential.endpoint).map_err(|_| {
+                    PeerSyncError::Storage(
+                        "bidirectional operation has an invalid desktop endpoint".to_owned(),
+                    )
+                })?;
+            }
         }
         match self {
             Self::SourcePrepared {
@@ -3274,6 +3277,60 @@ fn complete_bidirectional_local_after_remote_apply(
     Ok(result)
 }
 
+fn retain_remote_apply_receipt(
+    app_root: &Path,
+    operation_id: &str,
+    receipt: &LanBidirectionalRemoteApplyReceipt,
+) -> Result<(), PeerSyncError> {
+    let journal = PeerBidirectionalOperationJournal::new(app_root);
+    let operation = journal.load()?.ok_or_else(|| {
+        PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
+    })?;
+    let PeerBidirectionalDurableOperation::LocalCommitted {
+        schema,
+        context,
+        committed_revision,
+        shared_generation,
+        changed,
+        remote_backup_required,
+        remote_apply_receipt,
+        transferred_objects,
+        transferred_bytes,
+        backups,
+    } = operation
+    else {
+        return Err(PeerSyncError::Validation(
+            "bidirectional operation is not ready for remote completion".to_owned(),
+        ));
+    };
+    if context.operation_id != operation_id {
+        return Err(PeerSyncError::Validation(
+            "another bidirectional operation is retained".to_owned(),
+        ));
+    }
+    if let Some(retained) = remote_apply_receipt {
+        return if retained == *receipt {
+            Ok(())
+        } else {
+            Err(PeerSyncError::Validation(
+                "bidirectional remote receipt differs from retained completion".to_owned(),
+            ))
+        };
+    }
+    journal.store(&PeerBidirectionalDurableOperation::LocalCommitted {
+        schema,
+        context,
+        committed_revision,
+        shared_generation,
+        changed,
+        remote_backup_required,
+        remote_apply_receipt: Some(receipt.clone()),
+        transferred_objects,
+        transferred_bytes,
+        backups,
+    })
+}
+
 fn resume_bidirectional_local_committed_with_remote<F>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -4024,8 +4081,166 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
 pub enum PeerBidirectionalSourcePhase {
     Idle,
     Prepared,
+    Starting,
     Running,
+    Stopping,
     Stopped,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PeerBidirectionalTunnelStart {
+    Quick,
+    Named {
+        token: String,
+        #[serde(rename = "expectedPublicBaseUrl")]
+        expected_public_base_url: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PeerBidirectionalTunnelKind {
+    Quick,
+    Named,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerBidirectionalTunnelMetadata {
+    kind: PeerBidirectionalTunnelKind,
+    experimental: bool,
+    one_shot: bool,
+}
+
+impl PeerBidirectionalTunnelMetadata {
+    fn quick() -> Self {
+        Self {
+            kind: PeerBidirectionalTunnelKind::Quick,
+            experimental: true,
+            one_shot: true,
+        }
+    }
+    fn named() -> Self {
+        Self {
+            kind: PeerBidirectionalTunnelKind::Named,
+            experimental: false,
+            one_shot: false,
+        }
+    }
+}
+
+struct BidirectionalTunnel(tunnel::RunningTunnel);
+
+impl BidirectionalTunnel {
+    fn transport_url(&self) -> &url::Url {
+        self.0.transport_url()
+    }
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        self.0.stop(Duration::from_secs(2)).map_err(|_| {
+            PeerSyncError::Transport("peer bidirectional tunnel failed to stop".to_owned())
+        })
+    }
+    fn lifecycle(&mut self) -> Result<RunningTunnelLifecycle, PeerSyncError> {
+        self.0.poll_lifecycle().map_err(|_| {
+            PeerSyncError::Transport("peer bidirectional tunnel status is unavailable".to_owned())
+        })
+    }
+}
+
+type FailedBidirectionalTunnel = TunnelStartFailure<SystemTunnelProcess, LanCloneHost>;
+
+trait ReverseTunnelProcess: Send {
+    fn stop(&mut self) -> Result<(), PeerSyncError>;
+}
+
+impl ReverseTunnelProcess for BidirectionalTunnel {
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        BidirectionalTunnel::stop(self)
+    }
+}
+
+enum ReverseTunnelCleanupOwner {
+    Running(Box<dyn ReverseTunnelProcess>),
+    Failed(FailedBidirectionalTunnel),
+}
+
+impl ReverseTunnelCleanupOwner {
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        match self {
+            Self::Running(tunnel) => tunnel.stop(),
+            Self::Failed(failure) => failure.retry_cleanup().map_err(|_| {
+                PeerSyncError::Transport("reverse tunnel cleanup is pending".to_owned())
+            }),
+        }
+    }
+}
+
+static REVERSE_TUNNEL_CLEANUP: LazyLock<Mutex<BTreeMap<String, ReverseTunnelCleanupOwner>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn retry_reverse_tunnel_cleanup(operation_id: &str) -> Result<(), PeerSyncError> {
+    let mut tunnel = REVERSE_TUNNEL_CLEANUP
+        .lock()
+        .map_err(|error| {
+            PeerSyncError::Storage(format!("reverse tunnel cleanup mutex poisoned: {error}"))
+        })?
+        .remove(operation_id);
+    let Some(mut tunnel) = tunnel.take() else {
+        return Ok(());
+    };
+    let result = tunnel.stop();
+    if let Err(error) = result {
+        REVERSE_TUNNEL_CLEANUP
+            .lock()
+            .map_err(|poison| {
+                PeerSyncError::Storage(format!("reverse tunnel cleanup mutex poisoned: {poison}"))
+            })?
+            .insert(operation_id.to_owned(), tunnel);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn retain_reverse_cleanup_owner(
+    operation_id: &str,
+    mut owner: ReverseTunnelCleanupOwner,
+) -> Result<(), PeerSyncError> {
+    match owner.stop() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            REVERSE_TUNNEL_CLEANUP
+                .lock()
+                .map_err(|poison| {
+                    PeerSyncError::Storage(format!(
+                        "reverse tunnel cleanup mutex poisoned: {poison}"
+                    ))
+                })?
+                .insert(operation_id.to_owned(), owner);
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_reverse_tunnels_for_exit() {
+    let operation_ids = REVERSE_TUNNEL_CLEANUP
+        .lock()
+        .map(|owners| owners.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for operation_id in operation_ids {
+        let _ = retry_reverse_tunnel_cleanup(&operation_id);
+    }
+}
+
+fn resolve_remote_apply_result(
+    result: Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>,
+    cleanup: Result<(), PeerSyncError>,
+) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+    match (result, cleanup) {
+        (Ok(receipt), Ok(())) => Ok(receipt),
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -4050,6 +4265,8 @@ pub struct PeerBidirectionalSourceStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pairing_uri: Option<String>,
     devices: Vec<PeerBidirectionalSourceDevice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel: Option<PeerBidirectionalTunnelMetadata>,
 }
 
 impl PeerBidirectionalSourceStatus {
@@ -4060,6 +4277,7 @@ impl PeerBidirectionalSourceStatus {
             manifest_id: None,
             pairing_uri: None,
             devices: Vec::new(),
+            tunnel: None,
         }
     }
 }
@@ -4076,9 +4294,12 @@ struct BidirectionalSourceRuntime {
     session_id: String,
     manifest_id: String,
     pairing_uri: Option<String>,
-    host: LanCloneHost,
+    host: Option<LanCloneHost>,
     control: LanCloneHostControl,
     phase: PeerBidirectionalSourcePhase,
+    tunnel: Option<BidirectionalTunnel>,
+    failed_tunnel: Option<FailedBidirectionalTunnel>,
+    tunnel_metadata: Option<PeerBidirectionalTunnelMetadata>,
 }
 
 #[derive(Default)]
@@ -4089,12 +4310,29 @@ struct PeerBidirectionalRuntime {
     target_active: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct PeerBidirectionalCommandState {
     runtime: Arc<Mutex<PeerBidirectionalRuntime>>,
+    lifecycle_operation: Arc<Mutex<()>>,
+}
+
+impl Default for PeerBidirectionalCommandState {
+    fn default() -> Self {
+        Self {
+            runtime: Arc::new(Mutex::new(PeerBidirectionalRuntime::default())),
+            lifecycle_operation: Arc::new(Mutex::new(())),
+        }
+    }
 }
 
 impl PeerBidirectionalCommandState {
+    fn lock_lifecycle_operation(&self) -> Result<MutexGuard<'_, ()>, PeerSyncError> {
+        self.lifecycle_operation.lock().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "peer bidirectional lifecycle mutex poisoned: {error}"
+            ))
+        })
+    }
     fn lock(&self) -> Result<MutexGuard<'_, PeerBidirectionalRuntime>, PeerSyncError> {
         self.runtime.lock().map_err(|error| {
             PeerSyncError::Storage(format!(
@@ -4155,6 +4393,7 @@ impl PeerBidirectionalCommandState {
         session_id: &str,
         manifest_id: &str,
     ) -> Result<PeerBidirectionalSourceStatus, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
         let control = host.control();
         let mut runtime = self.lock()?;
         if runtime.source.is_some() {
@@ -4168,9 +4407,12 @@ impl PeerBidirectionalCommandState {
             session_id: session_id.to_owned(),
             manifest_id: manifest_id.to_owned(),
             pairing_uri: None,
-            host,
+            host: Some(host),
             control,
             phase: PeerBidirectionalSourcePhase::Prepared,
+            tunnel: None,
+            failed_tunnel: None,
+            tunnel_metadata: None,
         });
         Ok(source_status(&runtime, &[]))
     }
@@ -4180,17 +4422,21 @@ impl PeerBidirectionalCommandState {
         session_id: &str,
         advertised_ip: Ipv4Addr,
     ) -> Result<PeerBidirectionalSourceStatus, PeerSyncError> {
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        if source.phase != PeerBidirectionalSourcePhase::Prepared {
-            return Err(PeerSyncError::Protocol(
-                "peer bidirectional source is not prepared".to_owned(),
-            ));
-        }
-        let pairing = source.host.start()?;
-        let address = source.host.address().ok_or_else(|| {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut host = self.take_prepared_host(session_id, None)?;
+        let pairing = match host.start() {
+            Ok(pairing) => pairing,
+            Err(error) => {
+                self.restore_prepared_host(session_id, host)?;
+                return Err(error);
+            }
+        };
+        let address = host.address().ok_or_else(|| {
             PeerSyncError::Transport("peer bidirectional source address is unavailable".to_owned())
         })?;
+        let mut runtime = self.lock()?;
+        let source = require_source(&mut runtime, session_id)?;
+        source.host = Some(host);
         source.pairing_uri = Some(build_pairing_uri(
             &format!("http://{advertised_ip}:{}", address.port()),
             &pairing,
@@ -4199,10 +4445,138 @@ impl PeerBidirectionalCommandState {
         Ok(source_status(&runtime, &[]))
     }
 
-    fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
+    fn take_prepared_host(
+        &self,
+        session_id: &str,
+        tunnel_metadata: Option<PeerBidirectionalTunnelMetadata>,
+    ) -> Result<LanCloneHost, PeerSyncError> {
         let mut runtime = self.lock()?;
         let source = require_source(&mut runtime, session_id)?;
-        source.host.stop()?;
+        if source.phase != PeerBidirectionalSourcePhase::Prepared {
+            return Err(PeerSyncError::Protocol(
+                "peer bidirectional source is not prepared".to_owned(),
+            ));
+        }
+        let host = source.host.take().ok_or_else(|| {
+            PeerSyncError::Protocol("peer bidirectional source host is unavailable".to_owned())
+        })?;
+        source.phase = PeerBidirectionalSourcePhase::Starting;
+        source.tunnel_metadata = tunnel_metadata;
+        Ok(host)
+    }
+
+    fn restore_prepared_host(
+        &self,
+        session_id: &str,
+        host: LanCloneHost,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock()?;
+        let source = require_source(&mut runtime, session_id)?;
+        source.host = Some(host);
+        source.phase = PeerBidirectionalSourcePhase::Prepared;
+        source.tunnel_metadata = None;
+        Ok(())
+    }
+
+    fn start_tunnel(
+        &self,
+        session_id: &str,
+        request: PeerBidirectionalTunnelStart,
+    ) -> Result<PeerBidirectionalSourceStatus, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let metadata = match &request {
+            PeerBidirectionalTunnelStart::Quick => PeerBidirectionalTunnelMetadata::quick(),
+            PeerBidirectionalTunnelStart::Named { .. } => PeerBidirectionalTunnelMetadata::named(),
+        };
+        let mut host = self.take_prepared_host(session_id, Some(metadata))?;
+        let pairing = match metadata.kind {
+            PeerBidirectionalTunnelKind::Quick => host.start_quick_tunnel_origin(),
+            PeerBidirectionalTunnelKind::Named => host.start_named_tunnel_origin(),
+        };
+        let pairing = match pairing {
+            Ok(pairing) => pairing,
+            Err(error) => {
+                self.restore_prepared_host(session_id, host)?;
+                return Err(error);
+            }
+        };
+        let started = match request {
+            PeerBidirectionalTunnelStart::Quick => tunnel::start_quick_desktop_tunnel(host),
+            PeerBidirectionalTunnelStart::Named {
+                token,
+                expected_public_base_url,
+            } => tunnel::start_named_desktop_tunnel(host, token, &expected_public_base_url),
+        };
+        let running = match started {
+            Ok(tunnel) => BidirectionalTunnel(tunnel),
+            Err(failure) => {
+                let mut runtime = self.lock()?;
+                let source = require_source(&mut runtime, session_id)?;
+                source.failed_tunnel = Some(failure);
+                source.phase = PeerBidirectionalSourcePhase::Stopping;
+                return Err(PeerSyncError::Transport(
+                    "peer bidirectional tunnel failed to start".to_owned(),
+                ));
+            }
+        };
+        let endpoint = super::lan::validate_p5_desktop_endpoint(running.transport_url().as_str())?;
+        let pairing_uri = build_pairing_uri(&endpoint, &pairing)?;
+        let mut runtime = self.lock()?;
+        let source = require_source(&mut runtime, session_id)?;
+        source.tunnel = Some(running);
+        source.pairing_uri = Some(pairing_uri);
+        source.phase = PeerBidirectionalSourcePhase::Running;
+        Ok(source_status(&runtime, &[]))
+    }
+
+    fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let (mut host, mut tunnel, mut failed) = {
+            let mut runtime = self.lock()?;
+            let source = require_source(&mut runtime, session_id)?;
+            source.phase = PeerBidirectionalSourcePhase::Stopping;
+            source.pairing_uri = None;
+            (
+                source.host.take(),
+                source.tunnel.take(),
+                source.failed_tunnel.take(),
+            )
+        };
+        let mut primary = None;
+        if let Some(owner) = tunnel.as_mut() {
+            if let Err(error) = owner.stop() {
+                primary = Some(error);
+            } else {
+                tunnel = None;
+            }
+        }
+        if let Some(owner) = failed.as_mut() {
+            if owner.retry_cleanup().is_ok() {
+                failed = None;
+            } else if primary.is_none() {
+                primary = Some(PeerSyncError::Transport(
+                    "peer bidirectional tunnel failed to stop".to_owned(),
+                ));
+            }
+        }
+        if let Some(owner) = host.as_mut() {
+            if let Err(error) = owner.stop() {
+                if primary.is_none() {
+                    primary = Some(error);
+                }
+            } else {
+                host = None;
+            }
+        }
+        if let Some(error) = primary {
+            let mut runtime = self.lock()?;
+            let source = require_source(&mut runtime, session_id)?;
+            source.host = host;
+            source.tunnel = tunnel;
+            source.failed_tunnel = failed;
+            return Err(error);
+        }
+        let mut runtime = self.lock()?;
         runtime.source = None;
         runtime.stopped = true;
         Ok(())
@@ -4227,6 +4601,8 @@ impl PeerBidirectionalCommandState {
         app_root: &Path,
         store: &mut PersistentStore,
     ) -> Result<PeerBidirectionalStatus, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        self.poll_source_tunnel()?;
         let journal = PeerBidirectionalOperationJournal::new(app_root);
         let mut retained = journal.load()?;
         let prepared = matches!(
@@ -4292,6 +4668,82 @@ impl PeerBidirectionalCommandState {
         };
         let operation = retained.and_then(|operation| operation.status_projection());
         Ok(PeerBidirectionalStatus { source, operation })
+    }
+
+    fn poll_source_tunnel(&self) -> Result<(), PeerSyncError> {
+        let owner = {
+            let mut runtime = self.lock()?;
+            runtime.source.as_mut().and_then(|source| {
+                source
+                    .tunnel
+                    .take()
+                    .map(|tunnel| (source.session_id.clone(), tunnel))
+            })
+        };
+        let Some((session_id, mut tunnel)) = owner else {
+            return Ok(());
+        };
+        let lifecycle = tunnel.lifecycle();
+        let mut runtime = self.lock()?;
+        let source = require_source(&mut runtime, &session_id)?;
+        match lifecycle {
+            Ok(RunningTunnelLifecycle::Running) => source.tunnel = Some(tunnel),
+            Ok(RunningTunnelLifecycle::CleanupPending) | Err(_) => {
+                source.tunnel = Some(tunnel);
+                source.phase = PeerBidirectionalSourcePhase::Stopping;
+                source.pairing_uri = None;
+            }
+            Ok(RunningTunnelLifecycle::Stopped) => {
+                source.phase = PeerBidirectionalSourcePhase::Stopping;
+                source.pairing_uri = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shutdown_for_exit(&self) {
+        let Ok(_operation) = self.lock_lifecycle_operation() else {
+            return;
+        };
+        let session_id = self.runtime.lock().ok().and_then(|runtime| {
+            runtime
+                .source
+                .as_ref()
+                .map(|source| source.session_id.clone())
+        });
+        if let Some(session_id) = session_id {
+            let _ = self.stop_source_without_gate(&session_id);
+        }
+        cleanup_reverse_tunnels_for_exit();
+    }
+
+    fn stop_source_without_gate(&self, session_id: &str) -> Result<(), PeerSyncError> {
+        let (mut host, mut tunnel, mut failed) = {
+            let mut runtime = self.lock()?;
+            let source = require_source(&mut runtime, session_id)?;
+            source.phase = PeerBidirectionalSourcePhase::Stopping;
+            source.pairing_uri = None;
+            (
+                source.host.take(),
+                source.tunnel.take(),
+                source.failed_tunnel.take(),
+            )
+        };
+        if let Some(owner) = tunnel.as_mut() {
+            owner.stop()?;
+        }
+        if let Some(owner) = failed.as_mut() {
+            owner.retry_cleanup().map_err(|_| {
+                PeerSyncError::Transport("peer bidirectional tunnel failed to stop".to_owned())
+            })?;
+        }
+        if let Some(owner) = host.as_mut() {
+            owner.stop()?;
+        }
+        let mut runtime = self.lock()?;
+        runtime.source = None;
+        runtime.stopped = true;
+        Ok(())
     }
 
     fn source_is_active(&self) -> Result<bool, PeerSyncError> {
@@ -4463,6 +4915,7 @@ fn source_status(
         manifest_id: Some(source.manifest_id.clone()),
         pairing_uri: source.pairing_uri.clone(),
         devices: devices.into_values().collect(),
+        tunnel: source.tunnel_metadata,
     }
 }
 
@@ -4571,6 +5024,7 @@ fn request_remote_apply_from_shared(
     shared_manifest_bytes: &[u8],
     backup_losing_side: bool,
 ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+    retry_reverse_tunnel_cleanup(&context.operation_id)?;
     let source = LogicalDeltaSourceSession::open(
         app_root,
         app_root,
@@ -4586,12 +5040,52 @@ fn request_remote_apply_from_shared(
         source.objects().to_vec(),
         Box::new(source),
     )?;
-    let mut host = LanCloneHost::prepare_logical(prepared);
-    let pairing = host.start()?;
-    let address = host.address().ok_or_else(|| {
-        PeerSyncError::Transport("temporary shared source address is unavailable".to_owned())
-    })?;
-    let endpoint = format!("http://{}:{}", discover_lan_ipv4()?, address.port());
+    let mut host = Some(LanCloneHost::prepare_logical(prepared));
+    let public_forward = context.credential.endpoint.is_empty()
+        || context.credential.endpoint.starts_with("https://");
+    let pairing = if public_forward {
+        host.as_mut().unwrap().start_quick_tunnel_origin()?
+    } else {
+        host.as_mut().unwrap().start()?
+    };
+    let mut reverse_tunnel = if public_forward {
+        match tunnel::start_quick_desktop_tunnel(host.take().unwrap()) {
+            Ok(tunnel) => Some(BidirectionalTunnel(tunnel)),
+            Err(mut failure) => {
+                if failure.retry_cleanup().is_err() {
+                    REVERSE_TUNNEL_CLEANUP
+                        .lock()
+                        .map_err(|error| {
+                            PeerSyncError::Storage(format!(
+                                "reverse tunnel cleanup mutex poisoned: {error}"
+                            ))
+                        })?
+                        .insert(
+                            context.operation_id.clone(),
+                            ReverseTunnelCleanupOwner::Failed(failure),
+                        );
+                }
+                return Err(PeerSyncError::Transport(
+                    "reverse Quick Tunnel failed to start".to_owned(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let endpoint = if let Some(tunnel) = reverse_tunnel.as_ref() {
+        validate_p5_desktop_endpoint(tunnel.transport_url().as_str())?
+    } else {
+        let address = host
+            .as_ref()
+            .and_then(LanCloneHost::address)
+            .ok_or_else(|| {
+                PeerSyncError::Transport(
+                    "temporary shared source address is unavailable".to_owned(),
+                )
+            })?;
+        format!("http://{}:{}", discover_lan_ipv4()?, address.port())
+    };
     let result = client.request_remote_apply(LanBidirectionalRemoteApplyRequest {
         operation_id: context.operation_id.clone(),
         source_endpoint: endpoint,
@@ -4603,12 +5097,18 @@ fn request_remote_apply_from_shared(
         expected_common_base_manifest_hash: context.previous_shared.manifest_hash.clone(),
         backup_losing_side,
     });
-    let stop = host.stop();
-    match (result, stop) {
-        (Ok(receipt), Ok(())) => Ok(receipt),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    if let Ok(receipt) = &result {
+        retain_remote_apply_receipt(app_root, &context.operation_id, receipt)?;
     }
+    let cleanup = if let Some(tunnel) = reverse_tunnel.take() {
+        retain_reverse_cleanup_owner(
+            &context.operation_id,
+            ReverseTunnelCleanupOwner::Running(Box::new(tunnel)),
+        )
+    } else {
+        host.as_mut().unwrap().stop()
+    };
+    resolve_remote_apply_result(result, cleanup)
 }
 
 fn attach_local_device_at_existing_base(
@@ -4644,6 +5144,7 @@ fn run_retained_remote_completion(
     expected_revision: i64,
     client: Option<&LanBidirectionalLogicalClient>,
 ) -> Result<PeerBidirectionalSyncResult, PeerSyncError> {
+    retry_reverse_tunnel_cleanup(operation_id)?;
     let retained = PeerBidirectionalOperationJournal::new(app_root)
         .load()?
         .ok_or_else(|| {
@@ -4703,6 +5204,11 @@ fn run_retained_remote_completion(
                     backup_losing_side,
                 )
             } else {
+                if context.credential.endpoint.is_empty() {
+                    return Err(PeerSyncError::Transport(
+                        "public tunnel recovery requires a fresh pairing link".to_owned(),
+                    ));
+                }
                 let client = LanBidirectionalLogicalClient::resume(context.credential.clone())?;
                 request_remote_apply_from_shared(
                     app_root,
@@ -4844,6 +5350,19 @@ pub fn peer_bidirectional_start(
 }
 
 #[tauri::command]
+pub async fn peer_bidirectional_tunnel_start(
+    state: State<'_, PeerBidirectionalCommandState>,
+    session_id: String,
+    tunnel: PeerBidirectionalTunnelStart,
+) -> Result<PeerBidirectionalSourceStatus, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.start_tunnel(&session_id, tunnel))
+        .await
+        .map_err(|error| format!("peer bidirectional tunnel start worker failed: {error}"))?
+        .map_err(|_| "peer bidirectional tunnel failed to start".to_owned())
+}
+
+#[tauri::command]
 pub fn peer_bidirectional_status(
     app: AppHandle,
     state: State<'_, PeerBidirectionalCommandState>,
@@ -4939,7 +5458,7 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let mut client = LanBidirectionalLogicalClient::claim(
+                    let mut client = LanBidirectionalLogicalClient::claim_p5_desktop(
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -4986,7 +5505,7 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let client = LanBidirectionalLogicalClient::claim(
+                    let client = LanBidirectionalLogicalClient::claim_p5_desktop(
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -5024,7 +5543,7 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let client = LanBidirectionalLogicalClient::claim(
+                    let client = LanBidirectionalLogicalClient::claim_p5_desktop(
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -5063,7 +5582,7 @@ pub async fn peer_bidirectional_sync(
             &root.join("peer-delta").join("source-device-id"),
         )
         .map_err(|error| error.to_string())?;
-        let mut client = LanBidirectionalLogicalClient::claim(
+        let mut client = LanBidirectionalLogicalClient::claim_p5_desktop(
             &endpoint,
             &session_id,
             &manifest_id,
@@ -5503,7 +6022,18 @@ impl PeerBidirectionalOperationJournal {
         operation: &PeerBidirectionalDurableOperation,
     ) -> Result<(), PeerSyncError> {
         operation.validate()?;
-        let bytes = serde_json::to_vec(operation)
+        let mut durable = operation.clone();
+        match &mut durable {
+            PeerBidirectionalDurableOperation::TargetPrepared { context, .. }
+            | PeerBidirectionalDurableOperation::AwaitingConflict { context, .. }
+            | PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
+                if context.credential.endpoint.starts_with("https://") =>
+            {
+                context.credential.endpoint.clear();
+            }
+            _ => {}
+        }
+        let bytes = serde_json::to_vec(&durable)
             .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
         if bytes.len() as u64 > MAX_OPERATION_BYTES {
             return Err(PeerSyncError::Storage(
@@ -5724,11 +6254,41 @@ mod tests {
         collections::BTreeMap,
         io::Cursor,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc, Arc, Mutex,
         },
         thread,
     };
+
+    static REVERSE_CLEANUP_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct FakeReverseProcess {
+        attempts: Arc<AtomicUsize>,
+        fail_through_attempt: usize,
+    }
+
+    impl ReverseTunnelProcess for FakeReverseProcess {
+        fn stop(&mut self) -> Result<(), PeerSyncError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.fail_through_attempt {
+                Err(PeerSyncError::Transport(
+                    "fixture reverse cleanup failed".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn fake_reverse_owner(
+        attempts: &Arc<AtomicUsize>,
+        fail_through_attempt: usize,
+    ) -> ReverseTunnelCleanupOwner {
+        ReverseTunnelCleanupOwner::Running(Box::new(FakeReverseProcess {
+            attempts: Arc::clone(attempts),
+            fail_through_attempt,
+        }))
+    }
 
     struct FixtureSource {
         objects: BTreeMap<String, Vec<u8>>,
@@ -9379,10 +9939,10 @@ mod tests {
     }
 
     #[test]
-    fn context_bearing_durable_operations_reject_public_https_credentials() {
+    fn context_bearing_durable_operations_reject_malformed_public_https_credentials() {
         let operation_id = "123e4567-e89b-42d3-a456-426614174004";
         let mut retained_context = context(operation_id);
-        retained_context.credential.endpoint = "https://sync.example.com".to_owned();
+        retained_context.credential.endpoint = "https://sync.example.com/path".to_owned();
         retained_context.credential.manifest_id = retained_context
             .expected_remote_generation
             .manifest_hash
@@ -9428,7 +9988,7 @@ mod tests {
         for operation in operations {
             assert!(matches!(
                 operation.validate(),
-                Err(PeerSyncError::Storage(message)) if message.contains("private LAN endpoint")
+                Err(PeerSyncError::Storage(message)) if message.contains("desktop endpoint")
             ));
         }
     }
@@ -11159,7 +11719,7 @@ mod tests {
     }
 
     #[test]
-    fn target_postactivation_status_rejects_retained_public_https_without_mutation() {
+    fn target_postactivation_status_rejects_malformed_public_https_without_mutation() {
         let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
         let mut source = fixture_source(&remote);
         TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
@@ -11178,7 +11738,7 @@ mod tests {
         let mut prepared = journal.load().unwrap().unwrap();
         let job_id = match &mut prepared {
             PeerBidirectionalDurableOperation::TargetPrepared { context, .. } => {
-                context.credential.endpoint = "https://sync.example.com".to_owned();
+                context.credential.endpoint = "https://sync.example.com/path".to_owned();
                 context.durable_job_id.clone()
             }
             other => panic!("expected target-prepared activation crash, got {other:?}"),
@@ -11191,7 +11751,7 @@ mod tests {
 
         assert!(matches!(
             PeerBidirectionalCommandState::default().status(directory.path(), &mut store),
-            Err(PeerSyncError::Storage(message)) if message.contains("private LAN endpoint")
+            Err(PeerSyncError::Storage(message)) if message.contains("desktop endpoint")
         ));
         assert_eq!(store.revision().unwrap(), revision_before);
         assert_eq!(store.read_root(None).unwrap(), root_before);
@@ -14744,5 +15304,213 @@ mod tests {
             transfer.join().unwrap().unwrap(),
             LocalMergeOutcome::LocalCommitted
         );
+    }
+
+    #[test]
+    fn public_tunnel_url_is_not_persisted_and_remote_receipt_stays_local_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174180";
+        let mut context = context(operation_id);
+        context.credential.endpoint = "https://quick-id.trycloudflare.com".to_owned();
+        let shared_generation = generation("shared-public", "3", 'e');
+        let operation = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context,
+            committed_revision: 8,
+            shared_generation: shared_generation.clone(),
+            changed: true,
+            remote_backup_required: false,
+            remote_apply_receipt: None,
+            transferred_objects: 1,
+            transferred_bytes: 4,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&operation).unwrap();
+        let bytes = fs::read(
+            directory
+                .path()
+                .join("peer-bidirectional")
+                .join(OPERATION_FILE),
+        )
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("trycloudflare"));
+
+        let receipt = LanBidirectionalRemoteApplyReceipt {
+            committed_revision: 8,
+            committed_generation: LanBidirectionalGeneration {
+                generation_id: shared_generation.generation_id,
+                manifest_hash: shared_generation.manifest_hash,
+                generation_sequence: shared_generation.generation_sequence,
+            },
+            transferred_objects: 2,
+            transferred_bytes: 8,
+            backup: None,
+        };
+        retain_remote_apply_receipt(directory.path(), operation_id, &receipt).unwrap();
+        assert!(matches!(
+            journal.load().unwrap(),
+            Some(PeerBidirectionalDurableOperation::LocalCommitted {
+                remote_apply_receipt: Some(retained), ..
+            }) if retained == receipt
+        ));
+    }
+
+    #[test]
+    fn reverse_cleanup_failure_retains_exact_owner_and_retry_completes_without_remote_apply() {
+        let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
+        let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
+        let mut source = fixture_source(&remote);
+        TARGET_JOB_RELEASE_FAILPOINT.with(|enabled| enabled.set(true));
+        assert!(begin_bidirectional_local_merge(
+            &mut store,
+            &cas,
+            directory.path(),
+            credential,
+            1,
+            &remote.manifest_bytes,
+            &mut source,
+        )
+        .is_err());
+        let retained = PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .unwrap();
+        let (operation_id, remote_revision, shared) = match retained {
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                context,
+                shared_generation,
+                ..
+            } => (
+                context.operation_id,
+                context.expected_remote_revision,
+                shared_generation,
+            ),
+            other => panic!("expected local commit, got {other:?}"),
+        };
+        let receipt = LanBidirectionalRemoteApplyReceipt {
+            committed_revision: remote_revision,
+            committed_generation: LanBidirectionalGeneration {
+                generation_id: shared.generation_id,
+                manifest_hash: shared.manifest_hash,
+                generation_sequence: shared.generation_sequence,
+            },
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backup: None,
+        };
+        retain_remote_apply_receipt(directory.path(), &operation_id, &receipt).unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        assert!(
+            retain_reverse_cleanup_owner(&operation_id, fake_reverse_owner(&attempts, 1),).is_err()
+        );
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::LocalCommitted {
+                remote_apply_receipt: Some(retained), ..
+            }) if retained == receipt
+        ));
+        assert!(REVERSE_TUNNEL_CLEANUP
+            .lock()
+            .unwrap()
+            .contains_key(&operation_id));
+
+        let revision = store.revision().unwrap();
+        let result = run_retained_remote_completion(
+            &mut store,
+            directory.path(),
+            &operation_id,
+            revision,
+            None,
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            result,
+            PeerBidirectionalSyncResult::NoChanges {
+                operation_id: ref completed_operation_id,
+                ..
+            } | PeerBidirectionalSyncResult::Updated {
+                operation_id: ref completed_operation_id,
+                ..
+            } if completed_operation_id == &operation_id
+        ));
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerBidirectionalDurableOperation::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn reverse_remote_error_and_cancellation_preserve_primary_and_local_commit() {
+        let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174181";
+        let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            committed_revision: 7,
+            shared_generation: generation("shared-cleanup", "4", 'f'),
+            changed: true,
+            remote_backup_required: false,
+            remote_apply_receipt: None,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+        journal.store(&retained).unwrap();
+
+        let remote_attempts = Arc::new(AtomicUsize::new(0));
+        let cleanup =
+            retain_reverse_cleanup_owner(operation_id, fake_reverse_owner(&remote_attempts, 1));
+        let primary = PeerSyncError::Protocol("fixture remote rejection".to_owned());
+        assert!(matches!(
+            resolve_remote_apply_result(Err(primary), cleanup),
+            Err(PeerSyncError::Protocol(message)) if message == "fixture remote rejection"
+        ));
+        assert_eq!(journal.load().unwrap(), Some(retained.clone()));
+        retry_reverse_tunnel_cleanup(operation_id).unwrap();
+
+        let cancel_attempts = Arc::new(AtomicUsize::new(0));
+        let cleanup =
+            retain_reverse_cleanup_owner(operation_id, fake_reverse_owner(&cancel_attempts, 1));
+        assert!(matches!(
+            resolve_remote_apply_result(Err(PeerSyncError::Cancelled), cleanup),
+            Err(PeerSyncError::Cancelled)
+        ));
+        assert_eq!(cancel_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.load().unwrap(), Some(retained));
+        retry_reverse_tunnel_cleanup(operation_id).unwrap();
+    }
+
+    #[test]
+    fn reverse_cleanup_rejects_cross_operation_retry_and_app_exit_attempts_owner() {
+        let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174182";
+        let other_operation_id = "123e4567-e89b-42d3-a456-426614174183";
+        let attempts = Arc::new(AtomicUsize::new(0));
+        REVERSE_TUNNEL_CLEANUP
+            .lock()
+            .unwrap()
+            .insert(operation_id.to_owned(), fake_reverse_owner(&attempts, 0));
+
+        retry_reverse_tunnel_cleanup(other_operation_id).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(REVERSE_TUNNEL_CLEANUP
+            .lock()
+            .unwrap()
+            .contains_key(operation_id));
+        cleanup_reverse_tunnels_for_exit();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!REVERSE_TUNNEL_CLEANUP
+            .lock()
+            .unwrap()
+            .contains_key(operation_id));
     }
 }

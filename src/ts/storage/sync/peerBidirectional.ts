@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import {
+    parsePeerCloneEndpoint,
     parsePeerLanEndpoint,
     type PeerClonePlatform,
 } from './peerClone'
@@ -38,7 +39,7 @@ export interface PeerBidirectionalCapabilities {
 }
 
 export interface PeerBidirectionalSourceStatus {
-    phase: 'idle' | 'prepared' | 'running' | 'stopped'
+    phase: 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'stopped'
     sessionId?: string
     manifestId?: string
     pairingUri?: string
@@ -49,6 +50,7 @@ export interface PeerBidirectionalSourceStatus {
         lastSeenAt: number
         revoked: boolean
     }[]
+    tunnel?: { kind: 'quick' | 'named'; experimental: boolean; oneShot: boolean }
 }
 
 export type PeerBidirectionalConflictType = 'sameRecord' | 'deleteVsEdit'
@@ -131,6 +133,12 @@ export interface PeerBidirectionalFacade {
     capabilities(): Promise<PeerBidirectionalCapabilities>
     prepare(): Promise<PeerBidirectionalSourceStatus>
     start(sessionId: string): Promise<PeerBidirectionalSourceStatus>
+    startQuickTunnel(sessionId: string): Promise<PeerBidirectionalSourceStatus>
+    startNamedTunnel(
+        sessionId: string,
+        token: string,
+        expectedPublicBaseUrl: string,
+    ): Promise<PeerBidirectionalSourceStatus>
     status(): Promise<PeerBidirectionalStatus>
     stop(sessionId: string): Promise<void>
     revoke(sessionId: string, deviceId: string): Promise<void>
@@ -179,9 +187,13 @@ export function parsePeerBidirectionalUri(value: string): PeerBidirectionalPairi
     ) return invalidPairingUri()
     let endpoint: string
     try {
-        endpoint = parsePeerLanEndpoint(uri.searchParams.get('endpoint')!)
+        endpoint = parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!)
     } catch {
-        return invalidPairingUri()
+        try {
+            endpoint = parsePeerLanEndpoint(uri.searchParams.get('endpoint')!)
+        } catch {
+            return invalidPairingUri()
+        }
     }
     return {
         endpoint: endpoint.endsWith('/') ? endpoint.slice(0, -1) : endpoint,
@@ -500,6 +512,22 @@ export function createPeerBidirectionalFacade(options: {
             requireDesktop()
             if (!sourceFence) throw new Error('Peer sync source is not prepared')
             return nativeInvoke('peer_bidirectional_start', { sessionId })
+        },
+        async startQuickTunnel(sessionId) {
+            requireDesktop()
+            if (!sourceFence) throw new Error('Peer sync source is not prepared')
+            return nativeInvoke('peer_bidirectional_tunnel_start', {
+                sessionId,
+                tunnel: { kind: 'quick' },
+            })
+        },
+        async startNamedTunnel(sessionId, token, expectedPublicBaseUrl) {
+            requireDesktop()
+            if (!sourceFence) throw new Error('Peer sync source is not prepared')
+            return nativeInvoke('peer_bidirectional_tunnel_start', {
+                sessionId,
+                tunnel: { kind: 'named', token, expectedPublicBaseUrl },
+            })
         },
         async status() {
             requireDesktop()

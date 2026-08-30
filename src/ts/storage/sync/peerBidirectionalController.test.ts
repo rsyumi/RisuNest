@@ -29,6 +29,8 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
         }),
         prepare: async () => ({ phase: 'prepared', sessionId: 'session-1', devices: [] }),
         start: async () => ({ phase: 'running', sessionId: 'session-1', pairingUri: 'pairing', devices: [] }),
+        startQuickTunnel: async () => ({ phase: 'running', sessionId: 'session-1', pairingUri: 'quick', devices: [] }),
+        startNamedTunnel: async () => ({ phase: 'running', sessionId: 'session-1', pairingUri: 'named', devices: [] }),
         status: async () => idleStatus(),
         stop: async () => undefined,
         revoke: async () => undefined,
@@ -65,6 +67,35 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
 }
 
 describe('peer bidirectional controller', () => {
+    it('owns Quick and Named source tunnel starts through the shared source lifecycle', async () => {
+        const startQuickTunnel = vi.fn(async () => ({
+            phase: 'running' as const,
+            sessionId: 'session-source',
+            pairingUri: 'quick-link',
+            devices: [],
+        }))
+        const startNamedTunnel = vi.fn(async () => ({
+            phase: 'running' as const,
+            sessionId: 'session-source',
+            pairingUri: 'named-link',
+            devices: [],
+        }))
+        const controller = createPeerBidirectionalController({
+            facade: facade({ startQuickTunnel, startNamedTunnel }),
+        })
+        await controller.initialize()
+
+        await controller.startQuickTunnel('session-source')
+        await controller.stop('session-source')
+        await controller.startNamedTunnel('session-source', 'secret', 'https://sync.example.com')
+
+        expect(startQuickTunnel).toHaveBeenCalledWith('session-source')
+        expect(startNamedTunnel).toHaveBeenCalledWith(
+            'session-source',
+            'secret',
+            'https://sync.example.com',
+        )
+    })
     it('retains one source action and its busy state for remounted subscribers', async () => {
         let finishStart!: (status: PeerBidirectionalStatus['source']) => void
         const start = vi.fn(() => new Promise<PeerBidirectionalStatus['source']>((resolve) => {
