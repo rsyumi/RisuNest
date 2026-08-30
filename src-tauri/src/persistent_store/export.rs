@@ -1133,7 +1133,11 @@ mod tests {
             (Value::Object(actual), Value::Object(expected)) => {
                 assert_eq!(actual.len(), expected.len());
                 for (key, expected) in expected {
-                    assert_semantically_equal(&actual[key], expected);
+                    assert!(
+                        actual.contains_key(key),
+                        "semantic object keys differ: missing {key}"
+                    );
+                    assert_semantically_equal(actual.get(key).unwrap(), expected);
                 }
             }
             (Value::Array(actual), Value::Array(expected)) => {
@@ -1144,6 +1148,12 @@ mod tests {
             }
             _ => assert_eq!(actual, expected),
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "semantic object keys differ")]
+    fn semantic_comparison_rejects_same_length_objects_with_a_missing_null_key() {
+        assert_semantically_equal(&json!({"different": null}), &json!({"a": null}));
     }
 
     fn native_content_projection_fixture() -> (TempDir, PersistentStore, String) {

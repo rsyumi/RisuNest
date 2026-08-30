@@ -100,7 +100,7 @@ struct JobOwnership {
     job_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum OfficialPublicationCredential {
     RisuAuth { token: String },
@@ -173,7 +173,7 @@ pub(crate) struct OfficialPublicationRetryInput {
     pub(crate) credential: OfficialPublicationCredential,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CharacterCharxContainer {
     #[default]
@@ -181,18 +181,14 @@ pub(crate) enum CharacterCharxContainer {
     AppendedCharxJpeg,
 }
 
-fn is_plain_charx(container: &CharacterCharxContainer) -> bool {
-    *container == CharacterCharxContainer::PlainCharx
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CharacterCardExportFormat {
     JsonCard,
     PngCard,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -234,11 +230,11 @@ pub(crate) enum NativeFileJobStartRequest {
         destination: Option<String>,
         expected_revision: i64,
         character_id: String,
-        #[serde(default, skip_serializing_if = "is_plain_charx")]
+        #[serde(default)]
         container: CharacterCharxContainer,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         card: Option<Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         module: Option<Value>,
     },
     ExportCharacterCard {
@@ -5674,8 +5670,7 @@ mod tests {
             "card": {"spec": "chara_card_v3"},
             "module": {}
         });
-        let plain: NativeFileJobStartRequest = serde_json::from_value(plain_shape.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&plain).unwrap(), plain_shape);
+        let plain: NativeFileJobStartRequest = serde_json::from_value(plain_shape).unwrap();
         assert!(matches!(
             plain,
             NativeFileJobStartRequest::ExportCharacterCharx {
@@ -5715,25 +5710,59 @@ mod tests {
                 "moduleIndex": 3
             }),
         ];
-        for case in cases {
+        for case in &cases {
             assert!(case.get("assets").is_none());
             assert!(case.get("payload").is_none());
             assert!(case.get("module").is_none());
             assert!(case.get("card").is_none());
-            let request: NativeFileJobStartRequest = serde_json::from_value(case.clone()).unwrap();
-            assert_eq!(serde_json::to_value(&request).unwrap(), case);
-            match request {
-                NativeFileJobStartRequest::ExportCharacterCharx {
-                    container: CharacterCharxContainer::AppendedCharxJpeg,
-                    card: None,
-                    module: None,
-                    ..
-                }
-                | NativeFileJobStartRequest::ExportCharacterCard { .. }
-                | NativeFileJobStartRequest::ExportRisuModule { .. } => {}
-                _ => panic!("unexpected native content export selection"),
-            }
         }
+        let appended: NativeFileJobStartRequest = serde_json::from_value(cases[0].clone()).unwrap();
+        assert!(matches!(
+            appended,
+            NativeFileJobStartRequest::ExportCharacterCharx {
+                destination: None,
+                expected_revision: 8,
+                character_id,
+                container: CharacterCharxContainer::AppendedCharxJpeg,
+                card: None,
+                module: None,
+            } if character_id == "character-8"
+        ));
+        let json_card: NativeFileJobStartRequest =
+            serde_json::from_value(cases[1].clone()).unwrap();
+        assert!(matches!(
+            json_card,
+            NativeFileJobStartRequest::ExportCharacterCard {
+                destination: None,
+                expected_revision: 9,
+                character_id,
+                format: CharacterCardExportFormat::JsonCard,
+                metadata,
+            } if character_id == "character-9"
+                && metadata == json!({"spec": "chara_card_v3", "spec_version": "3.0"})
+        ));
+        let png_card: NativeFileJobStartRequest = serde_json::from_value(cases[2].clone()).unwrap();
+        assert!(matches!(
+            png_card,
+            NativeFileJobStartRequest::ExportCharacterCard {
+                destination: Some(destination),
+                expected_revision: 10,
+                character_id,
+                format: CharacterCardExportFormat::PngCard,
+                metadata,
+            } if destination == "C:\\chosen\\character.png"
+                && character_id == "character-10"
+                && metadata == json!({"spec": "chara_card_v3", "spec_version": "3.0"})
+        ));
+        let risum: NativeFileJobStartRequest = serde_json::from_value(cases[3].clone()).unwrap();
+        assert!(matches!(
+            risum,
+            NativeFileJobStartRequest::ExportRisuModule {
+                destination: None,
+                expected_revision: 11,
+                module_index: 3,
+            }
+        ));
 
         assert_eq!(
             serde_json::to_value(JobKind::ExportCharacterCharx).unwrap(),
