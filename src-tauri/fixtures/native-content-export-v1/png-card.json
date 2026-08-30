@@ -1,0 +1,11 @@
+{
+  "selection": "png-card",
+  "characterId": "corpus-character",
+  "expected": {
+    "name": "Leased Character",
+    "additionalAssets": [
+      ["first", "assets/shared.bin", "BIN"],
+      ["second", "assets/shared.bin", "bIn"]
+    ]
+  }
+}

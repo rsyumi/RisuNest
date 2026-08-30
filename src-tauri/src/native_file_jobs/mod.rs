@@ -100,7 +100,7 @@ struct JobOwnership {
     job_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum OfficialPublicationCredential {
     RisuAuth { token: String },
@@ -173,7 +173,26 @@ pub(crate) struct OfficialPublicationRetryInput {
     pub(crate) credential: OfficialPublicationCredential,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CharacterCharxContainer {
+    #[default]
+    PlainCharx,
+    AppendedCharxJpeg,
+}
+
+fn is_plain_charx(container: &CharacterCharxContainer) -> bool {
+    *container == CharacterCharxContainer::PlainCharx
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CharacterCardExportFormat {
+    JsonCard,
+    PngCard,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -215,8 +234,24 @@ pub(crate) enum NativeFileJobStartRequest {
         destination: Option<String>,
         expected_revision: i64,
         character_id: String,
-        card: Value,
-        module: Value,
+        #[serde(default, skip_serializing_if = "is_plain_charx")]
+        container: CharacterCharxContainer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<Value>,
+    },
+    ExportCharacterCard {
+        destination: Option<String>,
+        expected_revision: i64,
+        character_id: String,
+        format: CharacterCardExportFormat,
+        metadata: Value,
+    },
+    ExportRisuModule {
+        destination: Option<String>,
+        expected_revision: i64,
+        module_index: u64,
     },
     PrepareContentImport {
         source: JobSource,
@@ -1187,9 +1222,28 @@ impl NativeFileJobState {
                 destination,
                 expected_revision,
                 character_id,
+                container,
                 card,
                 module,
             } => {
+                if container == CharacterCharxContainer::AppendedCharxJpeg {
+                    return Err(NativeJobError::new(
+                        "capability-unavailable",
+                        "appended CharX JPEG export is not implemented yet",
+                    ));
+                }
+                let card = card.ok_or_else(|| {
+                    NativeJobError::new(
+                        "invalid-input",
+                        "plain CharX export requires card metadata",
+                    )
+                })?;
+                let module = module.ok_or_else(|| {
+                    NativeJobError::new(
+                        "invalid-input",
+                        "plain CharX export requires module metadata",
+                    )
+                })?;
                 let destination = destination.map(PathBuf::from);
                 if let Some(destination) = destination.as_deref() {
                     validate_desktop_destination(destination)?;
@@ -1220,6 +1274,36 @@ impl NativeFileJobState {
                     module,
                     prepared,
                 }
+            }
+            NativeFileJobStartRequest::ExportCharacterCard {
+                destination,
+                expected_revision,
+                character_id,
+                format,
+                metadata,
+            } => {
+                let _ = (
+                    destination,
+                    expected_revision,
+                    character_id,
+                    format,
+                    metadata,
+                );
+                return Err(NativeJobError::new(
+                    "capability-unavailable",
+                    "native character card export is not implemented yet",
+                ));
+            }
+            NativeFileJobStartRequest::ExportRisuModule {
+                destination,
+                expected_revision,
+                module_index,
+            } => {
+                let _ = (destination, expected_revision, module_index);
+                return Err(NativeJobError::new(
+                    "capability-unavailable",
+                    "native RISUM export is not implemented yet",
+                ));
             }
             request @ NativeFileJobStartRequest::PrepareContentImport { .. } => {
                 return self.start_content(request);
@@ -2420,6 +2504,8 @@ pub(crate) enum JobKind {
     ExportLosslessBackup,
     ExportLegacyLocalBackup,
     ExportCharacterCharx,
+    ExportCharacterCard,
+    ExportRisuModule,
     PrepareContentImport,
     ImportJpegAsset,
     KeiBackupUpload,
@@ -2759,6 +2845,8 @@ impl JobControl {
             && status.state == JobState::Succeeded
             && status.prepared_content.is_some())
             || (status.kind == JobKind::ExportCharacterCharx && status.state.is_terminal())
+            || (status.kind == JobKind::ExportCharacterCard && status.state.is_terminal())
+            || (status.kind == JobKind::ExportRisuModule && status.state.is_terminal())
             || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal()))
     }
 
@@ -3025,6 +3113,8 @@ impl JobControl {
             JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::ExportLegacyLocalBackup => JobPhase::WritingExport,
             JobKind::ExportCharacterCharx => JobPhase::WritingExport,
+            JobKind::ExportCharacterCard => JobPhase::WritingExport,
+            JobKind::ExportRisuModule => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
             JobKind::ImportJpegAsset => JobPhase::ReadingSource,
             JobKind::KeiBackupUpload => JobPhase::WritingExport,
@@ -5575,6 +5665,91 @@ mod tests {
     }
 
     #[test]
+    fn native_content_export_requests_are_descriptor_only_and_recovery_kinds_stay_exact() {
+        let plain_shape = json!({
+            "kind": "export-character-charx",
+            "destination": null,
+            "expectedRevision": 7,
+            "characterId": "character-7",
+            "card": {"spec": "chara_card_v3"},
+            "module": {}
+        });
+        let plain: NativeFileJobStartRequest = serde_json::from_value(plain_shape.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&plain).unwrap(), plain_shape);
+        assert!(matches!(
+            plain,
+            NativeFileJobStartRequest::ExportCharacterCharx {
+                container: CharacterCharxContainer::PlainCharx,
+                ..
+            }
+        ));
+
+        let cases = [
+            json!({
+                "kind": "export-character-charx",
+                "container": "appended-charx-jpeg",
+                "destination": null,
+                "expectedRevision": 8,
+                "characterId": "character-8"
+            }),
+            json!({
+                "kind": "export-character-card",
+                "format": "json-card",
+                "destination": null,
+                "expectedRevision": 9,
+                "characterId": "character-9",
+                "metadata": {"spec": "chara_card_v3", "spec_version": "3.0"}
+            }),
+            json!({
+                "kind": "export-character-card",
+                "format": "png-card",
+                "destination": "C:\\chosen\\character.png",
+                "expectedRevision": 10,
+                "characterId": "character-10",
+                "metadata": {"spec": "chara_card_v3", "spec_version": "3.0"}
+            }),
+            json!({
+                "kind": "export-risu-module",
+                "destination": null,
+                "expectedRevision": 11,
+                "moduleIndex": 3
+            }),
+        ];
+        for case in cases {
+            assert!(case.get("assets").is_none());
+            assert!(case.get("payload").is_none());
+            assert!(case.get("module").is_none());
+            assert!(case.get("card").is_none());
+            let request: NativeFileJobStartRequest = serde_json::from_value(case.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), case);
+            match request {
+                NativeFileJobStartRequest::ExportCharacterCharx {
+                    container: CharacterCharxContainer::AppendedCharxJpeg,
+                    card: None,
+                    module: None,
+                    ..
+                }
+                | NativeFileJobStartRequest::ExportCharacterCard { .. }
+                | NativeFileJobStartRequest::ExportRisuModule { .. } => {}
+                _ => panic!("unexpected native content export selection"),
+            }
+        }
+
+        assert_eq!(
+            serde_json::to_value(JobKind::ExportCharacterCharx).unwrap(),
+            json!("export-character-charx")
+        );
+        assert_eq!(
+            serde_json::to_value(JobKind::ExportCharacterCard).unwrap(),
+            json!("export-character-card")
+        );
+        assert_eq!(
+            serde_json::to_value(JobKind::ExportRisuModule).unwrap(),
+            json!("export-risu-module")
+        );
+    }
+
+    #[test]
     fn official_publication_start_request_is_always_deserializable() {
         let request: NativeFileJobStartRequest = serde_json::from_value(serde_json::json!({
             "kind": "official-publication-upload",
@@ -5758,6 +5933,21 @@ mod tests {
         );
         assert!(registry.forget(&charx_id).unwrap());
         assert!(registry.status(&charx_id).is_err());
+    }
+
+    #[test]
+    fn terminal_native_content_export_receipts_keep_exact_recovery_kinds_until_forget() {
+        let registry = JobRegistry::with_retention(0, Duration::ZERO);
+        for kind in [JobKind::ExportCharacterCard, JobKind::ExportRisuModule] {
+            let job = registry.create(kind).unwrap();
+            let id = job.id();
+            job.start(JobPhase::WritingExport).unwrap();
+            job.finish_success(result(1)).unwrap();
+
+            assert_eq!(registry.status(&id).unwrap().kind, kind);
+            assert!(registry.forget(&id).unwrap());
+            assert!(registry.status(&id).is_err());
+        }
     }
 
     #[test]

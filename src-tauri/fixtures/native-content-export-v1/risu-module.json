@@ -1,0 +1,11 @@
+{
+  "selection": "risu-module",
+  "moduleIndex": 0,
+  "expected": {
+    "name": "Leased Module",
+    "assets": [
+      ["first", "assets/shared.bin", "PNG", {"tail": 1}],
+      ["second", "assets/shared.bin", "pNg", "tuple-tail"]
+    ]
+  }
+}

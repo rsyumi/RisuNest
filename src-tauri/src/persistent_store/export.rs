@@ -23,6 +23,11 @@ pub(crate) struct ProjectedCharacter {
     pub(crate) additional_asset_entries: Option<Vec<OwnerManifestEntry>>,
 }
 
+pub(crate) struct ProjectedRootModule {
+    pub(crate) value: Value,
+    pub(crate) asset_entries: Option<Vec<OwnerManifestEntry>>,
+}
+
 pub(crate) fn projected_character(
     connection: &Connection,
     snapshots_dir: &Path,
@@ -45,6 +50,38 @@ pub(crate) fn projected_character(
     Ok(ProjectedCharacter {
         value: character,
         additional_asset_entries,
+    })
+}
+
+pub(crate) fn projected_root_module(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    target: &ReadTarget,
+    module_index: u64,
+) -> StoreResult<ProjectedRootModule> {
+    let root = super::query::read_root(connection, target)?.value;
+    let index = usize::try_from(module_index).map_err(|_| StoreError::Validation {
+        message: "pinned root module index does not fit this platform".to_owned(),
+    })?;
+    let mut module = root
+        .get("modules")
+        .and_then(Value::as_array)
+        .and_then(|modules| modules.get(index))
+        .cloned()
+        .ok_or_else(|| StoreError::Validation {
+            message: "pinned root module does not exist".to_owned(),
+        })?;
+    let object = module
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Validation {
+            message: "pinned root module must be an object".to_owned(),
+        })?;
+    let asset_entries =
+        OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?
+            .project_root_module(module_index, object)?;
+    Ok(ProjectedRootModule {
+        value: module,
+        asset_entries,
     })
 }
 
@@ -1071,7 +1108,10 @@ fn take_root_block_value(root: &mut Map<String, Value>, key: &str) -> Option<Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistent_store::PersistentStore;
+    use crate::asset_repository::{owner_manifest_codec, PayloadCas};
+    use crate::persistent_store::{
+        AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState, PersistentStore,
+    };
     use flate2::read::GzDecoder;
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -1086,6 +1126,267 @@ mod tests {
         block_type: u8,
         name: String,
         value: Value,
+    }
+
+    fn assert_semantically_equal(actual: &Value, expected: &Value) {
+        match (actual, expected) {
+            (Value::Object(actual), Value::Object(expected)) => {
+                assert_eq!(actual.len(), expected.len());
+                for (key, expected) in expected {
+                    assert_semantically_equal(&actual[key], expected);
+                }
+            }
+            (Value::Array(actual), Value::Array(expected)) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_semantically_equal(actual, expected);
+                }
+            }
+            _ => assert_eq!(actual, expected),
+        }
+    }
+
+    fn native_content_projection_fixture() -> (TempDir, PersistentStore, String) {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let first_payload = cas.prepare_bytes(b"first occurrence payload").unwrap();
+        let second_payload = cas.prepare_bytes(b"second occurrence payload").unwrap();
+        let entries = [
+            owner_manifest_codec::OwnerManifestEntry {
+                tuple: [
+                    "first".to_owned(),
+                    "assets/shared.bin".to_owned(),
+                    "PNG".to_owned(),
+                ],
+                payload_hash: Some(
+                    hex::decode(&first_payload.content_hash)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ),
+            },
+            owner_manifest_codec::OwnerManifestEntry {
+                tuple: [
+                    "second".to_owned(),
+                    "assets/shared.bin".to_owned(),
+                    "pNg".to_owned(),
+                ],
+                payload_hash: Some(
+                    hex::decode(&second_payload.content_hash)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ),
+            },
+        ];
+        let manifest = cas
+            .prepare_bytes(&owner_manifest_codec::encode_owner_manifest(&entries).unwrap())
+            .unwrap();
+        let character_manifest = cas
+            .prepare_bytes(
+                &owner_manifest_codec::encode_owner_manifest(&[
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: [
+                            "first".to_owned(),
+                            "assets/shared.bin".to_owned(),
+                            "BIN".to_owned(),
+                        ],
+                        payload_hash: entries[0].payload_hash,
+                    },
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: [
+                            "second".to_owned(),
+                            "assets/shared.bin".to_owned(),
+                            "bIn".to_owned(),
+                        ],
+                        payload_hash: entries[1].payload_hash,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(
+                &staging,
+                &json!({
+                    "modules": [
+                        {
+                            "name": "Leased Module",
+                            "assets": [
+                                ["first", "assets/shared.bin", "PNG", {"tail": 1}],
+                                ["second", "assets/shared.bin", "pNg", "tuple-tail"]
+                            ]
+                        },
+                        {"name": "Missing Assets"},
+                        {"name": "Empty Assets", "assets": []}
+                    ]
+                }),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_add_characters(
+                &staging,
+                &[json!({
+                    "type": "character",
+                    "chaId": "corpus-character",
+                    "name": "Leased Character",
+                    "additionalAssets": [
+                        ["first", "assets/shared.bin", "BIN"],
+                        ["second", "assets/shared.bin", "bIn"]
+                    ],
+                    "chats": []
+                })],
+            )
+            .unwrap();
+        store
+            .replace_put_asset_owner_heads(
+                &staging,
+                &[
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::CharacterAdditionalAssets {
+                            character_id: "corpus-character".to_owned(),
+                        },
+                        character_manifest.content_hash,
+                        2,
+                    ),
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::RootModuleAssets { index: 0 },
+                        manifest.content_hash,
+                        2,
+                    ),
+                    AssetOwnerHead::absent(AssetOwnerLocator::RootModuleAssets { index: 1 }),
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::RootModuleAssets { index: 2 },
+                        cas.prepare_bytes(
+                            &owner_manifest_codec::encode_owner_manifest(&[]).unwrap(),
+                        )
+                        .unwrap()
+                        .content_hash,
+                        0,
+                    ),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &AssetRepositoryAuthorityState::V2 {
+                    migration_id: "native-content-export-corpus".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+        let lease = store.acquire_revision(revision).unwrap().lease;
+
+        let current = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(&current, &json!({"modules": [{"name": "Current Module"}]}))
+            .unwrap();
+        store.replace_put_presets(&current, &[]).unwrap();
+        store
+            .replace_add_characters(
+                &current,
+                &[json!({
+                    "type": "character",
+                    "chaId": "corpus-character",
+                    "name": "Current Character",
+                    "chats": []
+                })],
+            )
+            .unwrap();
+        store.replace_commit(&current, Some(revision)).unwrap();
+        (directory, store, lease)
+    }
+
+    #[test]
+    fn native_content_corpus_projects_exact_leased_character_and_root_module_occurrences() {
+        let (_directory, store, lease) = native_content_projection_fixture();
+        let (connection, target) = store.read_view(Some(&lease)).unwrap();
+        for fixture in [
+            include_str!("../../fixtures/native-content-export-v1/appended-charx-jpeg.json"),
+            include_str!("../../fixtures/native-content-export-v1/json-card.json"),
+            include_str!("../../fixtures/native-content-export-v1/png-card.json"),
+        ] {
+            let fixture: Value = serde_json::from_str(fixture).unwrap();
+            let projected = projected_character(
+                connection,
+                &store.snapshots_dir,
+                &target,
+                fixture["characterId"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_semantically_equal(
+                &json!({
+                    "name": projected.value["name"],
+                    "additionalAssets": projected.value["additionalAssets"]
+                }),
+                &fixture["expected"],
+            );
+            assert_eq!(
+                projected
+                    .additional_asset_entries
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.tuple)
+                    .collect::<Vec<_>>(),
+                [
+                    [
+                        "first".to_owned(),
+                        "assets/shared.bin".to_owned(),
+                        "BIN".to_owned()
+                    ],
+                    [
+                        "second".to_owned(),
+                        "assets/shared.bin".to_owned(),
+                        "bIn".to_owned()
+                    ]
+                ]
+            );
+        }
+
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../fixtures/native-content-export-v1/risu-module.json"
+        ))
+        .unwrap();
+        let projected = projected_root_module(
+            connection,
+            &store.snapshots_dir,
+            &target,
+            fixture["moduleIndex"].as_u64().unwrap(),
+        )
+        .unwrap();
+        assert_semantically_equal(&projected.value, &fixture["expected"]);
+        let occurrences = projected.asset_entries.unwrap();
+        assert_eq!(
+            occurrences
+                .iter()
+                .map(|entry| &entry.tuple)
+                .collect::<Vec<_>>(),
+            [
+                &[
+                    "first".to_owned(),
+                    "assets/shared.bin".to_owned(),
+                    "PNG".to_owned()
+                ],
+                &[
+                    "second".to_owned(),
+                    "assets/shared.bin".to_owned(),
+                    "pNg".to_owned()
+                ]
+            ]
+        );
+        assert_ne!(occurrences[0].payload_hash, occurrences[1].payload_hash);
+
+        let missing = projected_root_module(connection, &store.snapshots_dir, &target, 1).unwrap();
+        let empty = projected_root_module(connection, &store.snapshots_dir, &target, 2).unwrap();
+        assert!(missing.value.get("assets").is_none());
+        assert_eq!(missing.asset_entries, Some(Vec::new()));
+        assert_eq!(empty.value["assets"], json!([]));
+        assert_eq!(empty.asset_entries, Some(Vec::new()));
     }
 
     fn fixture() -> (TempDir, PersistentStore, i64, String) {

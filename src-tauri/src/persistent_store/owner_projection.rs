@@ -122,6 +122,23 @@ impl OwnerManifestProjector {
         Ok(())
     }
 
+    pub(super) fn project_root_module(
+        &self,
+        index: u64,
+        module: &mut Map<String, Value>,
+    ) -> StoreResult<Option<Vec<owner_manifest_codec::OwnerManifestEntry>>> {
+        if self.cas.is_none() {
+            return Ok(None);
+        }
+        let index = i64::try_from(index)
+            .map_err(|_| validation("owner manifest root module index does not fit storage"))?;
+        let owner = AssetOwnerLocator::RootModuleAssets { index };
+        let Some(head) = self.heads.get(&owner) else {
+            return Ok(None);
+        };
+        self.apply_head(head, module, "assets").map(Some)
+    }
+
     pub(super) fn project_character(
         &self,
         character_id: &str,
