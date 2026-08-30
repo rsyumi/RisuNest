@@ -302,7 +302,10 @@ export function createPeerBidirectionalFacade(options: {
             ? operation.result.operationId
             : operation.operationId
         if (recoveredOperationId !== operationId) return false
-        if (command === 'peer_bidirectional_resolve') {
+        if (
+            command === 'peer_bidirectional_resolve'
+            || command === 'peer_bidirectional_resolve_with_link'
+        ) {
             return operation.phase === 'localCommitted' || operation.phase === 'completed'
         }
         return command === 'peer_bidirectional_resume' && operation.phase === 'completed'

@@ -6222,6 +6222,8 @@ impl PeerBidirectionalOperationJournal {
                 if context.credential.endpoint.starts_with("https://") =>
             {
                 context.credential.endpoint.clear();
+                context.credential.session_id.clear();
+                context.credential.bearer.clear();
             }
             _ => {}
         }
@@ -15162,6 +15164,8 @@ mod tests {
                 panic!("expected retained conflict");
             };
             assert!(context.credential.endpoint.is_empty());
+            assert!(context.credential.session_id.is_empty());
+            assert!(context.credential.bearer.is_empty());
             let mut fresh = original_credential;
             fresh.endpoint = "https://fresh-conflict.example".to_owned();
             fresh.session_id = "123e4567-e89b-42d3-a456-426614174198".to_owned();
@@ -15965,6 +15969,15 @@ mod tests {
         let operation_id = "123e4567-e89b-42d3-a456-426614174180";
         let mut context = context(operation_id);
         context.credential.endpoint = "https://quick-id.trycloudflare.com".to_owned();
+        context.credential.session_id = "123e4567-e89b-42d3-a456-426614174184".to_owned();
+        context.credential.bearer = "7".repeat(64);
+        let stable_device_id = context.credential.device_id.clone();
+        let stable_source_device_id = context.credential.source_device_id.clone();
+        let stable_manifest_id = context.credential.manifest_id.clone();
+        let stable_library_id = context.library_id.clone();
+        let stable_local_revision = context.expected_local_revision;
+        let stable_remote_revision = context.expected_remote_revision;
+        let stable_remote_generation = context.expected_remote_generation.clone();
         let shared_generation = generation("shared-public", "3", 'e');
         let operation = PeerBidirectionalDurableOperation::LocalCommitted {
             schema: OPERATION_SCHEMA.to_owned(),
@@ -15987,7 +16000,28 @@ mod tests {
                 .join(OPERATION_FILE),
         )
         .unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains("trycloudflare"));
+        let serialized = String::from_utf8_lossy(&bytes);
+        assert!(!serialized.contains("trycloudflare"));
+        assert!(!serialized.contains("123e4567-e89b-42d3-a456-426614174184"));
+        assert!(!serialized.contains(&"7".repeat(64)));
+        assert!(!serialized.contains("claim"));
+        assert!(!serialized.contains("token"));
+        assert!(!serialized.contains("process"));
+        let Some(PeerBidirectionalDurableOperation::LocalCommitted { context, .. }) =
+            journal.load().unwrap()
+        else {
+            panic!("expected scrubbed public local commit");
+        };
+        assert!(context.credential.endpoint.is_empty());
+        assert!(context.credential.session_id.is_empty());
+        assert!(context.credential.bearer.is_empty());
+        assert_eq!(context.credential.device_id, stable_device_id);
+        assert_eq!(context.credential.source_device_id, stable_source_device_id);
+        assert_eq!(context.credential.manifest_id, stable_manifest_id);
+        assert_eq!(context.library_id, stable_library_id);
+        assert_eq!(context.expected_local_revision, stable_local_revision);
+        assert_eq!(context.expected_remote_revision, stable_remote_revision);
+        assert_eq!(context.expected_remote_generation, stable_remote_generation);
 
         let receipt = LanBidirectionalRemoteApplyReceipt {
             committed_revision: 8,
@@ -16007,6 +16041,29 @@ mod tests {
                 remote_apply_receipt: Some(retained), ..
             }) if retained == receipt
         ));
+    }
+
+    #[test]
+    fn private_lan_durable_credential_remains_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174185";
+        let operation = PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context(operation_id),
+            committed_revision: 8,
+            shared_generation: generation("shared-private", "3", 'e'),
+            changed: true,
+            remote_backup_required: false,
+            remote_apply_receipt: None,
+            transferred_objects: 1,
+            transferred_bytes: 4,
+            backups: vec![],
+        };
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+
+        journal.store(&operation).unwrap();
+
+        assert_eq!(journal.load().unwrap(), Some(operation));
     }
 
     #[test]

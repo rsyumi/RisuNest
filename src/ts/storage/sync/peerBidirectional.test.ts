@@ -957,6 +957,114 @@ describe('peer bidirectional facade', () => {
     it.each([
         {
             phase: 'localCommitted' as const,
+            operation: {
+                phase: 'localCommitted' as const,
+                operationId: 'operation-linked-response-loss',
+                committedRevision: 8,
+            },
+            expected: {
+                kind: 'resumeRequired' as const,
+                operationId: 'operation-linked-response-loss',
+                phase: 'localCommitted' as const,
+                committedRevision: 8,
+            },
+        },
+        {
+            phase: 'completed' as const,
+            operation: {
+                phase: 'completed' as const,
+                result: {
+                    kind: 'updated' as const,
+                    operationId: 'operation-linked-response-loss',
+                    revision: 8,
+                    remoteRevision: 9,
+                    transferredObjects: 1,
+                    transferredBytes: 12,
+                    backups: [],
+                },
+            },
+            expected: {
+                kind: 'updated' as const,
+                operationId: 'operation-linked-response-loss',
+                revision: 8,
+                remoteRevision: 9,
+                transferredObjects: 1,
+                transferredBytes: 12,
+                backups: [],
+            },
+        },
+    ])('returns exact linked resolve progress after a lost $phase response', async ({ operation, expected }) => {
+        const events: string[] = []
+        const invoke = vi.fn(async (command: string) => {
+            events.push(`invoke:${command}`)
+            if (command === 'peer_bidirectional_resolve_with_link') throw new Error('linked response lost')
+            if (command === 'peer_bidirectional_status') {
+                return { source: { phase: 'idle', devices: [] }, operation }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime(events),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.resolve(
+            'operation-linked-response-loss',
+            'local',
+            publicPairingUri,
+        )).resolves.toEqual(expected)
+        expect(events).toContain('refresh:8')
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_resolve_with_link'))
+            .toHaveLength(1)
+    })
+
+    it.each([
+        {
+            name: 'mismatched operation',
+            operation: {
+                phase: 'localCommitted' as const,
+                operationId: 'another-operation',
+                committedRevision: 8,
+            },
+        },
+        {
+            name: 'unchanged conflict',
+            operation: {
+                phase: 'awaitingConflict' as const,
+                result: {
+                    kind: 'conflict' as const,
+                    operationId: 'operation-linked-rejected',
+                    conflicts: [{ key: 'r1:root', type: 'sameRecord' as const }],
+                    localManifestHash: 'c'.repeat(64),
+                    remoteManifestHash: 'd'.repeat(64),
+                },
+            },
+        },
+    ])('preserves linked resolve rejection for $name', async ({ operation }) => {
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'peer_bidirectional_resolve_with_link') throw new Error('linked resolve rejected')
+            if (command === 'peer_bidirectional_status') {
+                return { source: { phase: 'idle', devices: [] }, operation }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime([]),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.resolve(
+            'operation-linked-rejected',
+            'remote',
+            publicPairingUri,
+        )).rejects.toThrow('linked resolve rejected')
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_resolve_with_link'))
+            .toHaveLength(1)
+    })
+
+    it.each([
+        {
+            phase: 'localCommitted' as const,
             operationId: 'operation-normalized-local',
             committedRevision: 8,
         },
