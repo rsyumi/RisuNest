@@ -9,8 +9,10 @@ class PeerSyncForegroundServiceTest {
   private val operationId = "11111111-1111-4111-8111-111111111111"
 
   @Test
-  fun `only the P1 source lane is accepted`() {
+  fun `only user started peer sync lanes are accepted`() {
     assertTrue(isAllowedPeerSyncForegroundLane("p1-source"))
+    assertTrue(isAllowedPeerSyncForegroundLane("p4-source"))
+    assertTrue(isAllowedPeerSyncForegroundLane("p4-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("p3-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("quick-tunnel"))
   }
@@ -30,6 +32,11 @@ class PeerSyncForegroundServiceTest {
     assertEquals(null, peerSyncForegroundIdentity("p3-target", operationId, 7L))
     assertTrue(isExactAttachedPeerSyncStop(current, current))
     assertFalse(isExactAttachedPeerSyncStop(current, current.copy(generation = 6L)))
+    val p4Source = PeerSyncForegroundIdentity("p4-source", operationId, 8L)
+    val p4Target = PeerSyncForegroundIdentity("p4-target", operationId, 9L)
+    assertEquals(p4Source, peerSyncForegroundIdentity("p4-source", operationId, 8L))
+    assertEquals(p4Target, peerSyncForegroundIdentity("p4-target", operationId, 9L))
+    assertFalse(isExactAttachedPeerSyncStop(p4Source, p4Target))
   }
 
   @Test

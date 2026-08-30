@@ -29,7 +29,8 @@ internal data class PeerSyncForegroundIdentity(
   val generation: Long,
 )
 
-internal fun isAllowedPeerSyncForegroundLane(lane: String): Boolean = lane == "p1-source"
+internal fun isAllowedPeerSyncForegroundLane(lane: String): Boolean =
+  lane == "p1-source" || lane == "p4-source" || lane == "p4-target"
 
 internal fun peerSyncForegroundIdentity(
   lane: String?,

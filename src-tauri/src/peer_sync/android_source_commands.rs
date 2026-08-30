@@ -216,7 +216,7 @@ fn private_lan_address(candidates: impl IntoIterator<Item = IpAddr>) -> Option<I
         })
 }
 
-fn discover_private_lan_address() -> Result<Ipv4Addr, String> {
+pub(crate) fn discover_private_lan_address() -> Result<Ipv4Addr, String> {
     let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
     private_lan_address(interfaces.into_iter().map(|interface| interface.ip()))
         .ok_or_else(|| "No private IPv4 LAN address is available".to_owned())

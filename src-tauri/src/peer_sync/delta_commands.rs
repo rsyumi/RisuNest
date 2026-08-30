@@ -1,11 +1,14 @@
+#[cfg(target_os = "android")]
+use super::android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane};
+use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
+#[cfg(desktop)]
 use super::{
-    execute_logical_delta_pull,
-    lan::{
-        validate_lan_endpoint, LanCloneHostControl, LanLogicalDeltaClient,
-        PreparedLogicalLanSession, NAMED_TUNNEL_ORIGIN_UNAVAILABLE,
-    },
-    logical_delta::decode_logical_manifest,
+    lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE},
     tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure},
+};
+use super::{
+    lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
+    logical_delta::decode_logical_manifest,
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     PeerSyncError, ReadyLogicalDeltaPlan,
 };
@@ -16,6 +19,7 @@ use crate::{
         },
         PayloadCas,
     },
+    local_backup::{CancellationProbe, NeverCancelled},
     persistent_store::{
         self, establish_logical_common_base, logical_delta_source::LogicalDeltaSourceSession,
         PersistentLogicalDeltaTarget, PersistentStore, StoreError, PRODUCT_LOGICAL_LIBRARY_ID,
@@ -47,16 +51,44 @@ pub struct PeerDeltaCapabilities {
     atomic_activation_ready: bool,
     authenticated_transport_ready: bool,
     production_enabled: bool,
+    tunnel_ready: bool,
 }
 
 #[tauri::command]
 pub fn peer_delta_capabilities() -> PeerDeltaCapabilities {
     PeerDeltaCapabilities {
-        desktop: true,
+        desktop: cfg!(desktop),
         source_ready: true,
         atomic_activation_ready: true,
         authenticated_transport_ready: true,
         production_enabled: true,
+        tunnel_ready: cfg!(desktop),
+    }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn peer_delta_target_reserve() -> Result<AndroidForegroundKey, String> {
+    registry().reserve(AndroidForegroundLane::P4Target)
+}
+
+#[cfg(target_os = "android")]
+fn acquire_foreground(
+    key: &AndroidForegroundKey,
+    lane: AndroidForegroundLane,
+) -> Result<super::android_foreground::AndroidCancellationProbe, String> {
+    if key.lane != lane {
+        return Err("Android foreground lane is not allowed".to_owned());
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(cancellation) = registry().acquire_exact(key) {
+            return Ok(cancellation);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Android foreground service did not attach".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -71,6 +103,7 @@ enum PeerDeltaSourcePhase {
     Stopped,
 }
 
+#[cfg(desktop)]
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PeerDeltaTunnelStart {
@@ -82,6 +115,7 @@ pub enum PeerDeltaTunnelStart {
     },
 }
 
+#[cfg(desktop)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum PeerDeltaTunnelKind {
@@ -89,6 +123,7 @@ enum PeerDeltaTunnelKind {
     Named,
 }
 
+#[cfg(desktop)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PeerDeltaTunnelMetadata {
@@ -97,6 +132,7 @@ struct PeerDeltaTunnelMetadata {
     one_shot: bool,
 }
 
+#[cfg(desktop)]
 impl PeerDeltaTunnelMetadata {
     fn quick() -> Self {
         Self {
@@ -115,6 +151,7 @@ impl PeerDeltaTunnelMetadata {
     }
 }
 
+#[cfg(desktop)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum PeerDeltaTunnelPhase {
@@ -125,6 +162,7 @@ enum PeerDeltaTunnelPhase {
     Stopped,
 }
 
+#[cfg(desktop)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerDeltaTunnelStatus {
@@ -133,6 +171,7 @@ pub struct PeerDeltaTunnelStatus {
     tunnel: Option<PeerDeltaTunnelMetadata>,
 }
 
+#[cfg(desktop)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeltaTunnelLifecycle {
     Running,
@@ -140,17 +179,20 @@ enum DeltaTunnelLifecycle {
     Stopped,
 }
 
+#[cfg(desktop)]
 trait DeltaTunnel: Send {
     fn transport_url(&self) -> url::Url;
     fn lifecycle(&mut self) -> Result<DeltaTunnelLifecycle, String>;
     fn stop(&mut self) -> Result<(), String>;
 }
 
+#[cfg(desktop)]
 trait FailedDeltaTunnel: Send {
     fn recover_host(&mut self) -> Result<Option<LanCloneHost>, String>;
     fn stop(&mut self) -> Result<(), String>;
 }
 
+#[cfg(desktop)]
 trait DeltaTunnelLauncher: Send + Sync {
     fn start(
         &self,
@@ -159,8 +201,10 @@ trait DeltaTunnelLauncher: Send + Sync {
     ) -> Result<Box<dyn DeltaTunnel>, Box<dyn FailedDeltaTunnel>>;
 }
 
+#[cfg(desktop)]
 struct SystemDeltaTunnel(tunnel::RunningTunnel);
 
+#[cfg(desktop)]
 impl DeltaTunnel for SystemDeltaTunnel {
     fn transport_url(&self) -> url::Url {
         self.0.transport_url().clone()
@@ -184,10 +228,13 @@ impl DeltaTunnel for SystemDeltaTunnel {
     }
 }
 
+#[cfg(desktop)]
 type SystemDeltaTunnelStartFailure = TunnelStartFailure<SystemTunnelProcess, LanCloneHost>;
 
+#[cfg(desktop)]
 struct SystemFailedDeltaTunnel(Option<SystemDeltaTunnelStartFailure>);
 
+#[cfg(desktop)]
 impl FailedDeltaTunnel for SystemFailedDeltaTunnel {
     fn recover_host(&mut self) -> Result<Option<LanCloneHost>, String> {
         let Some(failure) = self.0.take() else {
@@ -214,8 +261,10 @@ impl FailedDeltaTunnel for SystemFailedDeltaTunnel {
     }
 }
 
+#[cfg(desktop)]
 struct SystemDeltaTunnelLauncher;
 
+#[cfg(desktop)]
 impl DeltaTunnelLauncher for SystemDeltaTunnelLauncher {
     fn start(
         &self,
@@ -255,6 +304,7 @@ pub struct PeerDeltaSourceStatus {
     pairing_uri: Option<String>,
     phase: PeerDeltaSourcePhase,
     devices: Vec<PeerDeltaSourceDevice>,
+    #[cfg(desktop)]
     tunnel: Option<PeerDeltaTunnelMetadata>,
 }
 
@@ -266,6 +316,7 @@ impl PeerDeltaSourceStatus {
             pairing_uri: None,
             phase,
             devices: Vec::new(),
+            #[cfg(desktop)]
             tunnel: None,
         }
     }
@@ -277,11 +328,16 @@ struct DeltaSourceRuntime {
     host: Option<LanCloneHost>,
     control: LanCloneHostControl,
     phase: PeerDeltaSourcePhase,
+    #[cfg(desktop)]
     tunnel: Option<Box<dyn DeltaTunnel>>,
+    #[cfg(desktop)]
     failed_tunnel: Option<Box<dyn FailedDeltaTunnel>>,
+    #[cfg(desktop)]
     tunnel_metadata: Option<PeerDeltaTunnelMetadata>,
     pairing_uri: Option<String>,
     stop_in_progress: bool,
+    #[cfg(target_os = "android")]
+    foreground: Option<AndroidForegroundKey>,
 }
 
 #[derive(Default)]
@@ -296,6 +352,7 @@ struct PeerDeltaRuntime {
 pub struct PeerDeltaCommandState {
     runtime: Arc<Mutex<PeerDeltaRuntime>>,
     lifecycle_operation: Arc<Mutex<()>>,
+    #[cfg(desktop)]
     tunnel_launcher: Arc<dyn DeltaTunnelLauncher>,
 }
 
@@ -304,13 +361,14 @@ impl Default for PeerDeltaCommandState {
         Self {
             runtime: Arc::new(Mutex::new(PeerDeltaRuntime::default())),
             lifecycle_operation: Arc::new(Mutex::new(())),
+            #[cfg(desktop)]
             tunnel_launcher: Arc::new(SystemDeltaTunnelLauncher),
         }
     }
 }
 
 impl PeerDeltaCommandState {
-    #[cfg(test)]
+    #[cfg(all(test, desktop))]
     fn with_tunnel_launcher(tunnel_launcher: Arc<dyn DeltaTunnelLauncher>) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(PeerDeltaRuntime::default())),
@@ -369,11 +427,16 @@ impl PeerDeltaCommandState {
             host: Some(host),
             control,
             phase: PeerDeltaSourcePhase::Prepared,
+            #[cfg(desktop)]
             tunnel: None,
+            #[cfg(desktop)]
             failed_tunnel: None,
+            #[cfg(desktop)]
             tunnel_metadata: None,
             pairing_uri: None,
             stop_in_progress: false,
+            #[cfg(target_os = "android")]
+            foreground: None,
         });
         source_status(&runtime)
     }
@@ -392,8 +455,12 @@ impl PeerDeltaCommandState {
         session_id: &str,
         advertised_ip: Ipv4Addr,
     ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let mut host = self.take_prepared_host(session_id, None)?;
-        let pairing = match host.start() {
+        let mut host = self.take_prepared_host(session_id)?;
+        #[cfg(desktop)]
+        let started = host.start();
+        #[cfg(target_os = "android")]
+        let started = host.start_private_lan(advertised_ip);
+        let pairing = match started {
             Ok(pairing) => pairing,
             Err(error) => {
                 self.restore_clean_start(session_id, host)?;
@@ -413,11 +480,7 @@ impl PeerDeltaCommandState {
         source_status(&runtime)
     }
 
-    fn take_prepared_host(
-        &self,
-        session_id: &str,
-        metadata: Option<PeerDeltaTunnelMetadata>,
-    ) -> Result<LanCloneHost, PeerSyncError> {
+    fn take_prepared_host(&self, session_id: &str) -> Result<LanCloneHost, PeerSyncError> {
         let mut runtime = self.lock()?;
         let source = require_source(&mut runtime, session_id)?;
         if source.phase != PeerDeltaSourcePhase::Prepared {
@@ -429,7 +492,6 @@ impl PeerDeltaCommandState {
             PeerSyncError::Protocol("peer delta source host is unavailable".to_owned())
         })?;
         source.phase = PeerDeltaSourcePhase::Starting;
-        source.tunnel_metadata = metadata;
         Ok(host)
     }
 
@@ -442,10 +504,14 @@ impl PeerDeltaCommandState {
         let source = require_source(&mut runtime, session_id)?;
         source.host = Some(host);
         source.phase = PeerDeltaSourcePhase::Prepared;
-        source.tunnel_metadata = None;
+        #[cfg(desktop)]
+        {
+            source.tunnel_metadata = None;
+        }
         Ok(())
     }
 
+    #[cfg(desktop)]
     fn start_tunnel(
         &self,
         session_id: &str,
@@ -455,6 +521,7 @@ impl PeerDeltaCommandState {
         self.start_tunnel_inner(session_id, request)
     }
 
+    #[cfg(desktop)]
     fn start_tunnel_inner(
         &self,
         session_id: &str,
@@ -464,7 +531,11 @@ impl PeerDeltaCommandState {
             PeerDeltaTunnelStart::Quick => PeerDeltaTunnelMetadata::quick(),
             PeerDeltaTunnelStart::Named { .. } => PeerDeltaTunnelMetadata::named(),
         };
-        let mut host = self.take_prepared_host(session_id, Some(metadata))?;
+        let mut host = self.take_prepared_host(session_id)?;
+        {
+            let mut runtime = self.lock()?;
+            require_source(&mut runtime, session_id)?.tunnel_metadata = Some(metadata);
+        }
         let origin = match metadata.kind {
             PeerDeltaTunnelKind::Quick => host.start_quick_tunnel_origin(),
             PeerDeltaTunnelKind::Named => host.start_named_tunnel_origin(),
@@ -525,6 +596,7 @@ impl PeerDeltaCommandState {
         source_status(&runtime)
     }
 
+    #[cfg(desktop)]
     fn abort_started_tunnel(
         &self,
         session_id: &str,
@@ -546,11 +618,13 @@ impl PeerDeltaCommandState {
         tunnel_start_error()
     }
 
+    #[cfg(desktop)]
     fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
         let _operation = self.lock_lifecycle_operation()?;
         self.stop_source_inner(session_id)
     }
 
+    #[cfg(desktop)]
     fn stop_source_inner(&self, session_id: &str) -> Result<(), PeerSyncError> {
         let (mut host, mut tunnel, mut failed_tunnel) = {
             let mut runtime = self.lock()?;
@@ -621,7 +695,75 @@ impl PeerDeltaCommandState {
         self.status_inner()
     }
 
+    #[cfg(target_os = "android")]
+    fn attach_source_foreground(
+        &self,
+        session_id: &str,
+        key: AndroidForegroundKey,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock()?;
+        require_source(&mut runtime, session_id)?.foreground = Some(key);
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    fn pause_source_exact(&self, key: &AndroidForegroundKey) {
+        let Ok(_operation) = self.lifecycle_operation.lock() else {
+            return;
+        };
+        let Ok(mut runtime) = self.lock() else {
+            return;
+        };
+        let Some(source) = runtime.source.as_mut() else {
+            return;
+        };
+        if source.foreground.as_ref() != Some(key) {
+            return;
+        }
+        let Some(mut host) = source.host.take() else {
+            return;
+        };
+        if host.stop().is_err() {
+            source.host = Some(host);
+            source.phase = PeerDeltaSourcePhase::Stopping;
+            return;
+        }
+        source.host = Some(host);
+        source.foreground = None;
+        source.pairing_uri = None;
+        source.phase = PeerDeltaSourcePhase::Prepared;
+    }
+
+    #[cfg(target_os = "android")]
+    fn release_source_android(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AndroidForegroundKey>, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let mut runtime = self.lock()?;
+        let source = runtime
+            .source
+            .as_ref()
+            .filter(|source| source.session_id == session_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("peer delta source session is absent".to_owned())
+            })?;
+        let foreground = source.foreground.clone();
+        let mut source = runtime.source.take().expect("checked source");
+        runtime.stopped = true;
+        drop(runtime);
+        if let Some(key) = foreground.as_ref() {
+            let _ = registry().cancel_exact(key);
+            let _ = registry().detach_if_generation(key);
+        }
+        if let Some(host) = source.host.as_mut() {
+            host.stop()?;
+        }
+        Ok(foreground)
+    }
+
     fn status_inner(&self) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
+        #[cfg(desktop)]
         let tunnel_owner = {
             let mut runtime = self.lock()?;
             runtime.source.as_mut().and_then(|source| {
@@ -631,6 +773,7 @@ impl PeerDeltaCommandState {
                     .map(|tunnel| (source.session_id.clone(), tunnel))
             })
         };
+        #[cfg(desktop)]
         if let Some((session_id, mut tunnel)) = tunnel_owner {
             let lifecycle = tunnel.lifecycle();
             let mut runtime = self.lock()?;
@@ -664,6 +807,7 @@ impl PeerDeltaCommandState {
         source_status(&runtime)
     }
 
+    #[cfg(desktop)]
     fn tunnel_status(&self) -> Result<PeerDeltaTunnelStatus, PeerSyncError> {
         let _operation = self.lock_lifecycle_operation()?;
         let _ = self.status_inner()?;
@@ -671,6 +815,7 @@ impl PeerDeltaCommandState {
         Ok(tunnel_status(&runtime))
     }
 
+    #[cfg(desktop)]
     pub(crate) fn shutdown_for_exit(&self) {
         let Ok(_operation) = self.lifecycle_operation.lock() else {
             return;
@@ -755,10 +900,12 @@ fn source_status(runtime: &PeerDeltaRuntime) -> Result<PeerDeltaSourceStatus, Pe
                 revoked: device.revoked,
             })
             .collect(),
+        #[cfg(desktop)]
         tunnel: source.tunnel_metadata,
     })
 }
 
+#[cfg(desktop)]
 fn tunnel_status(runtime: &PeerDeltaRuntime) -> PeerDeltaTunnelStatus {
     let Some(source) = runtime
         .source
@@ -888,6 +1035,32 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     remote_manifest_bytes: &[u8],
     remote_source: &mut S,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
+    pull_logical_delta_with_cancellation(
+        store,
+        cas,
+        app_root,
+        source_device_id,
+        expected_revision,
+        remote_manifest_bytes,
+        remote_source,
+        &NeverCancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    source_device_id: &str,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+    cancellation: &dyn CancellationProbe,
+) -> Result<PeerDeltaPullResult, PeerSyncError> {
+    if cancellation.is_cancelled() {
+        return Err(PeerSyncError::Cancelled);
+    }
     let actual_revision = store.revision().map_err(store_error)?;
     if actual_revision != expected_revision {
         return Ok(PeerDeltaPullResult::Conflict {
@@ -964,13 +1137,15 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
         .map(|object| (object.hash.clone(), object.size))
         .collect::<BTreeMap<_, _>>();
     let mut measured_source = MeasuredLogicalDeltaSource::new(remote_source);
-    let activation = execute_logical_delta_pull(
+    let activation = execute_logical_delta_pull_with_pre_activation(
         &plan,
         &local_hashes,
         cas,
         &remote_sizes,
         &mut measured_source,
         &mut target,
+        |_| Ok(()),
+        cancellation,
     );
     let (transferred_objects, transferred_bytes) = measured_source.totals();
     let durable_abort_succeeded = target.durable_abort_succeeded();
@@ -1168,6 +1343,13 @@ pub async fn peer_delta_prepare(
 }
 
 #[tauri::command]
+#[cfg(target_os = "android")]
+pub fn peer_delta_source_reserve() -> Result<AndroidForegroundKey, String> {
+    registry().reserve(AndroidForegroundLane::P4Source)
+}
+
+#[cfg(desktop)]
+#[tauri::command]
 pub fn peer_delta_start(
     state: State<'_, PeerDeltaCommandState>,
     session_id: String,
@@ -1178,6 +1360,41 @@ pub fn peer_delta_start(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn peer_delta_start(
+    state: State<'_, PeerDeltaCommandState>,
+    session_id: String,
+    foreground: AndroidForegroundKey,
+) -> Result<PeerDeltaSourceStatus, String> {
+    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Source)?;
+    let address = super::android_source_commands::discover_private_lan_address()?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if cancellation.is_cancelled() {
+            return Err("Android foreground service was cancelled".to_owned());
+        }
+        let status = state
+            .start_source(&session_id, address)
+            .map_err(|error| error.to_string())?;
+        state
+            .attach_source_foreground(&session_id, foreground.clone())
+            .map_err(|error| error.to_string())?;
+        let callback_state = state.clone();
+        let callback_key = foreground.clone();
+        if !registry().set_source_stop_callback_exact(&foreground, move || {
+            callback_state.pause_source_exact(&callback_key);
+        }) {
+            state.pause_source_exact(&foreground);
+            return Err("Android foreground service detached before source start".to_owned());
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|error| format!("peer delta source start worker failed: {error}"))?
+}
+
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_delta_tunnel_start(
     state: State<'_, PeerDeltaCommandState>,
@@ -1191,6 +1408,7 @@ pub async fn peer_delta_tunnel_start(
         .map_err(|_| "peer delta tunnel failed to start".to_owned())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_delta_tunnel_status(
     state: State<'_, PeerDeltaCommandState>,
@@ -1202,6 +1420,7 @@ pub async fn peer_delta_tunnel_status(
         .map_err(|_| "peer delta tunnel status is unavailable".to_owned())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_delta_tunnel_stop(
     state: State<'_, PeerDeltaCommandState>,
@@ -1221,6 +1440,7 @@ pub fn peer_delta_status(
     state.status().map_err(|error| error.to_string())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_delta_stop(
     state: State<'_, PeerDeltaCommandState>,
@@ -1228,6 +1448,19 @@ pub async fn peer_delta_stop(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || state.stop_source(&session_id))
+        .await
+        .map_err(|error| format!("peer delta source stop worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn peer_delta_stop(
+    state: State<'_, PeerDeltaCommandState>,
+    session_id: String,
+) -> Result<Option<AndroidForegroundKey>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.release_source_android(&session_id))
         .await
         .map_err(|error| format!("peer delta source stop worker failed: {error}"))?
         .map_err(|error| error.to_string())
@@ -1244,9 +1477,8 @@ pub fn peer_delta_revoke(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub async fn peer_delta_pull(
+async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static>(
     app: AppHandle,
     state: State<'_, PeerDeltaCommandState>,
     endpoint: String,
@@ -1254,6 +1486,7 @@ pub async fn peer_delta_pull(
     manifest_id: String,
     claim: String,
     expected_revision: i64,
+    cancellation: C,
 ) -> Result<PeerDeltaPullResult, String> {
     let state = state.inner().clone();
     let app_root = app_root(&app)?;
@@ -1275,7 +1508,7 @@ pub async fn peer_delta_pull(
         })
         .map_err(|error| error.to_string())?;
         let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
-        pull_logical_delta(
+        pull_logical_delta_with_cancellation(
             &mut store,
             &cas,
             &app_root,
@@ -1283,11 +1516,64 @@ pub async fn peer_delta_pull(
             expected_revision,
             &manifest,
             &mut client,
+            &cancellation,
         )
         .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("peer delta pull worker failed: {error}"))?
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn peer_delta_pull(
+    app: AppHandle,
+    state: State<'_, PeerDeltaCommandState>,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    claim: String,
+    expected_revision: i64,
+) -> Result<PeerDeltaPullResult, String> {
+    peer_delta_pull_with_cancellation(
+        app,
+        state,
+        endpoint,
+        session_id,
+        manifest_id,
+        claim,
+        expected_revision,
+        NeverCancelled,
+    )
+    .await
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn peer_delta_pull(
+    app: AppHandle,
+    state: State<'_, PeerDeltaCommandState>,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    claim: String,
+    expected_revision: i64,
+    foreground: AndroidForegroundKey,
+) -> Result<PeerDeltaPullResult, String> {
+    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target)?;
+    peer_delta_pull_with_cancellation(
+        app,
+        state,
+        endpoint,
+        session_id,
+        manifest_id,
+        claim,
+        expected_revision,
+        cancellation,
+    )
+    .await
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1390,6 +1676,7 @@ mod tests {
     use super::*;
     use crate::{
         asset_repository::job_pins::{collect_durable_cas_job_roots, CasObjectRole},
+        local_backup::AtomicCancellation,
         peer_sync::{
             logical_delta::{
                 build_logical_manifest, BuiltLogicalManifest, LogicalManifest,
@@ -1404,9 +1691,50 @@ mod tests {
     use std::{
         io::{Cursor, Read},
         net::SocketAddr,
-        sync::{mpsc, Arc, Barrier},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Barrier,
+        },
         thread,
     };
+
+    struct CancelAfterFirstReadSource {
+        objects: BTreeMap<String, Vec<u8>>,
+        cancelled: Arc<AtomicBool>,
+        reads: usize,
+    }
+
+    impl LogicalDeltaObjectSource for CancelAfterFirstReadSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            self.reads += 1;
+            let bytes = self.objects.get(&object.hash).cloned().unwrap();
+            Ok(Box::new(CancelAfterFirstReadCursor {
+                inner: Cursor::new(bytes),
+                cancelled: Arc::clone(&self.cancelled),
+                first: true,
+            }))
+        }
+    }
+
+    struct CancelAfterFirstReadCursor {
+        inner: Cursor<Vec<u8>>,
+        cancelled: Arc<AtomicBool>,
+        first: bool,
+    }
+
+    impl Read for CancelAfterFirstReadCursor {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(output)?;
+            if self.first && read > 0 {
+                self.first = false;
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+    }
 
     struct FakeDeltaTunnelLauncher(Arc<Mutex<FakeDeltaTunnelState>>);
 
@@ -2377,6 +2705,101 @@ mod tests {
             store.read_root(None).unwrap().value,
             json!({"side":"remote"})
         );
+    }
+
+    #[test]
+    fn cancelled_target_cleans_only_its_unsealed_job_and_retries_with_a_fresh_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer = "00000000-0000-4000-8000-000000000023";
+        pull_logical_delta(
+            &mut store,
+            &cas,
+            directory.path(),
+            peer,
+            0,
+            &local.manifest_bytes,
+            &mut empty_source(),
+        )
+        .unwrap();
+        let remote =
+            remote_root_manifest(&local.manifest, "remote-cancel", json!({"side":"remote"}));
+        let unowned = directory
+            .path()
+            .join("peer-delta")
+            .join("staging")
+            .join("unowned");
+        fs::create_dir_all(&unowned).unwrap();
+        fs::write(unowned.join("keep"), b"unowned").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let objects = remote
+            .record_objects
+            .iter()
+            .map(|record| (record.object.hash.clone(), record.object.bytes.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut source = CancelAfterFirstReadSource {
+            objects: objects.clone(),
+            cancelled,
+            reads: 0,
+        };
+
+        let error = pull_logical_delta_with_cancellation(
+            &mut store,
+            &cas,
+            directory.path(),
+            peer,
+            0,
+            &remote.manifest_bytes,
+            &mut source,
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(source.reads, 1);
+        assert_eq!(store.revision().unwrap(), 0);
+        assert!(unowned.join("keep").is_file());
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+
+        let mut retry = FixtureSource { objects, reads: 0 };
+        assert!(matches!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                peer,
+                0,
+                &remote.manifest_bytes,
+                &mut retry,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Updated { revision: 1, .. }
+        ));
+        assert_eq!(retry.reads, 1);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(unowned.join("keep").is_file());
+
+        assert!(matches!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                peer,
+                1,
+                &remote.manifest_bytes,
+                &mut empty_source(),
+            )
+            .unwrap(),
+            PeerDeltaPullResult::NoChanges { revision: 1, .. }
+        ));
     }
 
     #[test]

@@ -12,12 +12,16 @@ use std::{
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum AndroidForegroundLane {
     P1Source,
+    P4Source,
+    P4Target,
 }
 
 impl AndroidForegroundLane {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "p1-source" => Some(Self::P1Source),
+            "p4-source" => Some(Self::P4Source),
+            "p4-target" => Some(Self::P4Target),
             _ => None,
         }
     }
@@ -25,6 +29,8 @@ impl AndroidForegroundLane {
     pub(crate) fn wire(self) -> &'static str {
         match self {
             Self::P1Source => "p1-source",
+            Self::P4Source => "p4-source",
+            Self::P4Target => "p4-target",
         }
     }
 }
@@ -190,10 +196,18 @@ mod tests {
     };
 
     #[test]
-    fn only_p1_source_is_an_allowed_foreground_lane() {
+    fn only_user_started_peer_sync_lanes_are_allowed() {
         assert_eq!(
             AndroidForegroundLane::parse("p1-source"),
             Some(AndroidForegroundLane::P1Source)
+        );
+        assert_eq!(
+            AndroidForegroundLane::parse("p4-source"),
+            Some(AndroidForegroundLane::P4Source)
+        );
+        assert_eq!(
+            AndroidForegroundLane::parse("p4-target"),
+            Some(AndroidForegroundLane::P4Target)
         );
         assert_eq!(AndroidForegroundLane::parse("p3-target"), None);
         assert_eq!(AndroidForegroundLane::parse("quick-tunnel"), None);
@@ -234,5 +248,30 @@ mod tests {
         assert!(called.load(Ordering::SeqCst));
         assert!(registry.cancel_exact(&key));
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn p4_source_restart_and_target_cancellation_are_lane_and_generation_exact() {
+        let registry = AndroidForegroundRegistry::default();
+        let old_source = registry.reserve(AndroidForegroundLane::P4Source).unwrap();
+        assert!(registry.attach_exact(&old_source));
+        assert!(registry.cancel_exact(&old_source));
+        let source = registry.reserve(AndroidForegroundLane::P4Source).unwrap();
+        let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
+        assert!(source.generation > old_source.generation);
+        assert!(target.generation > source.generation);
+        assert!(registry.attach_exact(&source));
+        assert!(registry.attach_exact(&target));
+        let source_probe = registry.acquire_exact(&source).unwrap();
+        let target_probe = registry.acquire_exact(&target).unwrap();
+
+        assert!(!registry.cancel_exact(&old_source));
+        assert!(!source_probe.is_cancelled());
+        assert!(!target_probe.is_cancelled());
+        assert!(registry.cancel_exact(&target));
+        assert!(target_probe.is_cancelled());
+        assert!(!source_probe.is_cancelled());
+        assert!(registry.detach_if_generation(&target));
+        assert!(registry.detach_if_generation(&source));
     }
 }

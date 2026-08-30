@@ -199,6 +199,7 @@ where
     T: LogicalDeltaStagedTarget,
     F: FnOnce(&LogicalDeltaTransferSelection) -> Result<(), PeerSyncError>,
 {
+    check_cancelled(cancellation)?;
     let mut stage = target.begin(plan)?;
     let result = (|| {
         if target.can_activate_without_transfer(&stage) {
@@ -1089,6 +1090,35 @@ mod tests {
             }
             Ok(read)
         }
+    }
+
+    #[test]
+    fn entry_cancellation_starts_no_staging_or_common_base_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let cancellation = AtomicCancellation::new(Arc::new(AtomicBool::new(true)));
+        let mut target = FixtureTarget::new();
+
+        let error = execute_logical_delta_pull_with_pre_activation(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert!(target.events.is_empty());
+        assert_eq!(target.aborts, 0);
     }
 
     #[test]

@@ -493,7 +493,7 @@ pub fn run() {
             app.manage(
                 peer_sync::android_source_commands::AndroidPeerCloneSourceState::initialize(),
             );
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             app.manage(peer_sync::delta_commands::PeerDeltaCommandState::default());
             #[cfg(desktop)]
             app.manage(peer_sync::bidirectional_commands::PeerBidirectionalCommandState::default());
@@ -598,11 +598,15 @@ pub fn run() {
             peer_sync::android_source_commands::peer_clone_android_source_stop,
             #[cfg(target_os = "android")]
             peer_sync::android_source_commands::peer_clone_android_source_revoke,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_capabilities,
-            #[cfg(desktop)]
+            #[cfg(target_os = "android")]
+            peer_sync::delta_commands::peer_delta_target_reserve,
+            #[cfg(target_os = "android")]
+            peer_sync::delta_commands::peer_delta_source_reserve,
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_prepare,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_start,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_tunnel_start,
@@ -610,13 +614,13 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_tunnel_status,
             #[cfg(desktop)]
             peer_sync::delta_commands::peer_delta_tunnel_stop,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_status,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_stop,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_revoke,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_pull,
             #[cfg(desktop)]
             peer_sync::bidirectional_commands::peer_bidirectional_capabilities,

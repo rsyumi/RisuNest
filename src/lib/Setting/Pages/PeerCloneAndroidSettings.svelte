@@ -17,6 +17,8 @@
     import { createAndroidPeerCloneSourceFacade, type AndroidPeerCloneSourceCapabilities } from 'src/ts/storage/sync/peerCloneAndroidSource'
     import { createAndroidPeerCloneSourceController } from 'src/ts/storage/sync/peerCloneAndroidSourceController'
     import type { PeerCloneSourceStatus } from 'src/ts/storage/sync/peerClone'
+    import { createPeerDeltaFacade, parsePeerDeltaUri, type PeerDeltaCapabilities, type PeerDeltaPullResult, type PeerDeltaSourceStatus } from 'src/ts/storage/sync/peerDelta'
+    import { createPeerDeltaController } from 'src/ts/storage/sync/peerDeltaController'
     import {
         consumePendingPeerCloneUri,
         subscribePeerCloneUri,
@@ -32,9 +34,24 @@
     })
     const sourceFacade = createAndroidPeerCloneSourceFacade({ flushPendingData })
     const sourceController = createAndroidPeerCloneSourceController(sourceFacade)
+    const deltaController = createPeerDeltaController({
+        facade: createPeerDeltaFacade({
+            platform: 'android',
+            runtime: {
+                flushPendingData,
+                capturePersistentMutationToken,
+                acquirePersistentMutationFence: acquireDestructiveReplacementFence,
+            },
+        }),
+    })
     let capabilities = $state<AndroidPeerCloneCapabilities>()
     let sourceCapabilities = $state<AndroidPeerCloneSourceCapabilities>()
     let sourceStatus = $state<PeerCloneSourceStatus>({ phase: 'idle', devices: [] })
+    let deltaCapabilities = $state<PeerDeltaCapabilities>()
+    let deltaSourceStatus = $state<PeerDeltaSourceStatus>({ phase: 'idle', devices: [] })
+    let deltaPairingInput = $state('')
+    let deltaPairingUri = $state('')
+    let deltaResult = $state<PeerDeltaPullResult>()
     let cloneState = $state<AndroidPeerCloneState>(facade.getState())
     let pairingInput = $state('')
     let busy = $state(false)
@@ -56,6 +73,46 @@
         && sourceCapabilities.httpTransportReady
         && !sourceCapabilities.tunnelReady
     ))
+    const deltaEnabled = $derived(!!(
+        deltaCapabilities?.productionEnabled
+        && deltaCapabilities.sourceReady
+        && deltaCapabilities.atomicActivationReady
+        && deltaCapabilities.authenticatedTransportReady
+        && !deltaCapabilities.tunnelReady
+    ))
+
+    function refreshDelta(): void {
+        const snapshot = deltaController.snapshot()
+        deltaCapabilities = snapshot.capabilities
+        deltaSourceStatus = snapshot.sourceStatus
+        deltaPairingUri = snapshot.sourcePairingUri
+        deltaResult = snapshot.pullResult
+        if (snapshot.error) error = snapshot.error
+    }
+
+    async function prepareDelta(): Promise<void> {
+        await withBusy(async () => { await deltaController.prepare(); refreshDelta() })
+    }
+
+    async function startDelta(): Promise<void> {
+        if (!deltaSourceStatus.sessionId) return
+        await withBusy(async () => { await deltaController.start(deltaSourceStatus.sessionId!); refreshDelta() })
+    }
+
+    async function stopDelta(): Promise<void> {
+        if (!deltaSourceStatus.sessionId) return
+        await withBusy(async () => { await deltaController.stop(deltaSourceStatus.sessionId!); refreshDelta() })
+    }
+
+    async function pullDelta(): Promise<void> {
+        try {
+            parsePeerDeltaUri(deltaPairingInput)
+        } catch {
+            error = language.peerDelta.invalidLink
+            return
+        }
+        await withBusy(async () => { await deltaController.pull(deltaPairingInput); refreshDelta() })
+    }
 
     async function prepareSource(): Promise<void> {
         await withBusy(async () => { sourceStatus = await sourceController.prepare() })
@@ -170,7 +227,8 @@
             if (initialized) acceptPairingUri(uri)
             else pendingUri = uri
         })
-        void Promise.all([facade.capabilities(), facade.recover(), sourceFacade.capabilities(), sourceController.refresh()])
+        const unsubscribeDelta = deltaController.subscribe(() => refreshDelta())
+        void Promise.all([facade.capabilities(), facade.recover(), sourceFacade.capabilities(), sourceController.refresh(), deltaController.initialize()])
             .then(([available, , availableSource, currentSource]) => {
                 capabilities = available
                 sourceCapabilities = availableSource
@@ -188,6 +246,7 @@
             .catch(reportError)
         return () => {
             unsubscribe()
+            unsubscribeDelta()
             if (progressTimer) clearInterval(progressTimer)
             if (sourceTimer) clearInterval(sourceTimer)
         }
@@ -299,4 +358,38 @@
     {#if error}
         <p class="mt-3 text-sm text-draculared">{error}</p>
     {/if}
+</section>
+
+<section class="mt-4 rounded-md border border-darkborderc bg-darkbg p-3">
+    <h3 class="text-xl font-bold">{language.peerDelta.title}</h3>
+    <p class="mt-1 text-sm text-textcolor2">{language.peerDelta.description}</p>
+    <p class="mt-1 text-sm text-textcolor2">Trusted LAN only. Android tunnel modes are unavailable.</p>
+
+    <div class="mt-3 rounded-md border border-darkborderc p-3">
+        <h4 class="font-bold">{language.peerDelta.source}</h4>
+        <div class="mt-2 flex flex-wrap gap-2">
+            <Button disabled={!deltaEnabled || busy || deltaSourceStatus.phase !== 'idle'} onclick={prepareDelta}>{language.peerDelta.prepare}</Button>
+            <Button disabled={!deltaEnabled || busy || deltaSourceStatus.phase !== 'prepared'} onclick={startDelta}>{language.peerDelta.start}</Button>
+            <Button styled="danger" disabled={busy || !deltaSourceStatus.sessionId} onclick={stopDelta}>{language.peerDelta.stop}</Button>
+        </div>
+        {#if deltaPairingUri}
+            <textarea readonly rows="3" class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={deltaPairingUri}></textarea>
+        {/if}
+    </div>
+
+    <div class="mt-3 rounded-md border border-darkborderc p-3">
+        <h4 class="font-bold">{language.peerDelta.target}</h4>
+        <p class="mt-1 text-sm text-textcolor2">{language.peerDelta.divergenceHelp}</p>
+        <textarea bind:value={deltaPairingInput} rows="3" class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"></textarea>
+        <Button className="mt-2" disabled={!deltaEnabled || busy || !deltaPairingInput} onclick={pullDelta}>{language.peerDelta.pull}</Button>
+        {#if deltaResult?.kind === 'noChanges'}
+            <p class="mt-2 text-sm text-textcolor2">{language.peerDelta.noChanges}</p>
+        {:else if deltaResult?.kind === 'updated'}
+            <p class="mt-2 text-sm text-textcolor2">{language.peerDelta.updated(deltaResult.transferredObjects, deltaResult.transferredBytes.toLocaleString())}</p>
+        {:else if deltaResult?.kind === 'fullCloneRequired'}
+            <p class="mt-2 text-sm text-draculared">{language.peerDelta.fullCloneRequired}</p>
+        {:else if deltaResult?.kind === 'conflict'}
+            <p class="mt-2 text-sm text-draculared">{deltaResult.reason === 'localAndRemoteChanged' ? language.peerDelta.conflictLocalRemote : language.peerDelta.conflictStaleRevision}</p>
+        {/if}
+    </div>
 </section>

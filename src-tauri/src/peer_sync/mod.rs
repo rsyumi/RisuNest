@@ -13,7 +13,7 @@ pub(crate) mod bidirectional_commands;
 mod client;
 #[cfg(desktop)]
 pub(crate) mod commands;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod delta_commands;
 #[cfg(desktop)]
 mod host;

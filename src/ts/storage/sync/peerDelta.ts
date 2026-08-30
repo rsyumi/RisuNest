@@ -19,6 +19,17 @@ export interface PeerDeltaInvoke {
     <T>(command: string, args?: Record<string, unknown>): Promise<T>
 }
 
+export interface PeerDeltaForegroundBridge {
+    startSource(lane: string, operationId: string, generation: number): boolean
+    stopSource(lane: string, operationId: string, generation: number): boolean
+}
+
+interface PeerDeltaForegroundIdentity {
+    lane: 'p4-source' | 'p4-target'
+    operationId: string
+    generation: number
+}
+
 export interface PeerDeltaMutationRuntime {
     flushPendingData(reason: string): Promise<void>
     capturePersistentMutationToken(reason: string): Promise<{
@@ -35,11 +46,12 @@ export interface PeerDeltaMutationRuntime {
 }
 
 export interface PeerDeltaCapabilities {
-    desktop: true
+    desktop: boolean
     sourceReady: boolean
     atomicActivationReady: boolean
     authenticatedTransportReady: boolean
     productionEnabled: boolean
+    tunnelReady: boolean
 }
 
 export interface PeerDeltaSourceStatus {
@@ -143,6 +155,7 @@ export function createPeerDeltaFacade(options: {
     platform: PeerClonePlatform
     invoke?: PeerDeltaInvoke
     runtime?: PeerDeltaMutationRuntime
+    bridge?: PeerDeltaForegroundBridge
 }) {
     const nativeInvoke = options.invoke ?? invoke
     let pendingRefresh: {
@@ -153,18 +166,33 @@ export function createPeerDeltaFacade(options: {
     const requireDesktop = (): void => {
         if (options.platform !== 'desktop') unsupported(options.platform)
     }
-    return {
+    const requireNative = (): void => {
+        if (options.platform === 'web') unsupported(options.platform)
+    }
+    const bridge = options.bridge ?? (typeof window === 'undefined' ? undefined : window.RisuPeerCloneBridge)
+    const facade = {
         async capabilities(): Promise<PeerDeltaCapabilities> {
-            requireDesktop()
+            requireNative()
             return nativeInvoke('peer_delta_capabilities')
         },
         async prepare(): Promise<PeerDeltaSourceStatus> {
-            requireDesktop()
+            requireNative()
             return nativeInvoke('peer_delta_prepare')
         },
         async start(sessionId: string): Promise<PeerDeltaSourceStatus> {
-            requireDesktop()
-            return nativeInvoke('peer_delta_start', { sessionId })
+            requireNative()
+            if (options.platform === 'desktop') return nativeInvoke('peer_delta_start', { sessionId })
+            if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
+            const foreground = await nativeInvoke<PeerDeltaForegroundIdentity>('peer_delta_source_reserve')
+            if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
+                throw new Error('Android peer delta foreground service could not start')
+            }
+            try {
+                return await nativeInvoke('peer_delta_start', { sessionId, foreground })
+            } catch (error) {
+                bridge.stopSource(foreground.lane, foreground.operationId, foreground.generation)
+                throw error
+            }
         },
         async startQuickTunnel(sessionId: string): Promise<PeerDeltaSourceStatus> {
             requireDesktop()
@@ -193,19 +221,23 @@ export function createPeerDeltaFacade(options: {
             await nativeInvoke('peer_delta_tunnel_stop', { sessionId })
         },
         async status(): Promise<PeerDeltaSourceStatus> {
-            requireDesktop()
+            requireNative()
             return nativeInvoke('peer_delta_status')
         },
         async stop(sessionId: string): Promise<void> {
-            requireDesktop()
-            return nativeInvoke('peer_delta_stop', { sessionId })
+            requireNative()
+            if (options.platform === 'desktop') return nativeInvoke('peer_delta_stop', { sessionId })
+            const foreground = await nativeInvoke<PeerDeltaForegroundIdentity | null>('peer_delta_stop', { sessionId })
+            if (foreground && bridge) {
+                bridge.stopSource(foreground.lane, foreground.operationId, foreground.generation)
+            }
         },
         async revoke(sessionId: string, deviceId: string): Promise<void> {
-            requireDesktop()
+            requireNative()
             return nativeInvoke('peer_delta_revoke', { sessionId, deviceId })
         },
         async pull(pairingUri: string): Promise<PeerDeltaPullResult> {
-            requireDesktop()
+            requireNative()
             const runtime = options.runtime
             if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
             const pairing = parsePeerDeltaUri(pairingUri)
@@ -222,10 +254,19 @@ export function createPeerDeltaFacade(options: {
             await runtime.flushPendingData('peer-delta-pull')
             const token = await runtime.capturePersistentMutationToken('peer-delta-pull')
             const fence = await runtime.acquirePersistentMutationFence(token)
+            let foreground: PeerDeltaForegroundIdentity | undefined
             try {
+                if (options.platform === 'android') {
+                    if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
+                    foreground = await nativeInvoke<PeerDeltaForegroundIdentity>('peer_delta_target_reserve')
+                    if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
+                        throw new Error('Android peer delta foreground service could not start')
+                    }
+                }
                 const result = await nativeInvoke<PeerDeltaPullResult>('peer_delta_pull', {
                     ...pairing,
                     expectedRevision: token.revision,
+                    ...(foreground ? { foreground } : {}),
                 })
                 if (result.kind === 'updated' || result.kind === 'noChanges') {
                     pendingRefresh = { pairing, result, fence }
@@ -235,7 +276,16 @@ export function createPeerDeltaFacade(options: {
                 return result
             } finally {
                 if (pendingRefresh?.fence !== fence) fence.release()
+                if (foreground) bridge!.stopSource(foreground.lane, foreground.operationId, foreground.generation)
             }
         },
     }
+    if (options.platform === 'android') {
+        const androidFacade = facade as Partial<typeof facade>
+        delete androidFacade.startQuickTunnel
+        delete androidFacade.startNamedTunnel
+        delete androidFacade.tunnelStatus
+        delete androidFacade.stopTunnel
+    }
+    return facade
 }

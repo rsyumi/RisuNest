@@ -76,10 +76,46 @@ describe('peer logical delta product facade', () => {
         expect(parsePeerDeltaUri(loopbackPairing).endpoint).toBe(endpoint)
     })
 
-    test.each(['web', 'android'] as const)('does not expose native delta on %s', async (platform) => {
+    test('does not expose native delta on web', async () => {
+        const platform = 'web' as const
         const facade = createPeerDeltaFacade({ platform })
         await expect(facade.capabilities()).rejects.toThrow(`unsupported on ${platform}`)
         await expect(facade.pull(pairing)).rejects.toThrow(`unsupported on ${platform}`)
+    })
+
+    test('runs Android P4 target through a foreground identity with renderer ordering intact', async () => {
+        const events: string[] = []
+        const foreground = { lane: 'p4-target', operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
+        const bridge = {
+            startSource: vi.fn(() => { events.push('service-start'); return true }),
+            stopSource: vi.fn(() => { events.push('service-stop'); return true }),
+        }
+        const runtime: PeerDeltaMutationRuntime = {
+            async flushPendingData() { events.push('flush') },
+            async capturePersistentMutationToken() { events.push('capture'); return { revision: 4, mutationGeneration: 2 } },
+            async acquirePersistentMutationFence() {
+                events.push('fence')
+                return {
+                    async refreshCommittedWorkingSet(revision) { events.push(`refresh:${revision}`) },
+                    release() { events.push('release') },
+                }
+            },
+        }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            events.push(command)
+            if (command.endsWith('_reserve')) return foreground as T
+            return { kind: 'updated', revision: 5, transferredObjects: 1, transferredBytes: 8 } as T
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+
+        await facade.pull(pairing)
+
+        expect(events).toEqual([
+            'flush', 'capture', 'fence', 'peer_delta_target_reserve', 'service-start',
+            'peer_delta_pull', 'refresh:5', 'release', 'service-stop',
+        ])
+        expect('startQuickTunnel' in facade).toBe(false)
+        expect('startNamedTunnel' in facade).toBe(false)
     })
 
     test('flushes and fences the exact revision while native Rust applies and renderer refreshes', async () => {
