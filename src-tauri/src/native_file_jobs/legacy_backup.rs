@@ -1056,10 +1056,17 @@ fn invalid(message: impl Into<String>) -> LocalBackupError {
 mod tests {
     use super::*;
     use crate::asset_repository::PayloadCas;
+    use crate::import_export_jobs::{parse_json_card, JobStaging};
     use crate::local_backup::{
         parse_legacy_local_backup_v1, NeverCancelled, PayloadTarget, StagedLocalBackupEntry,
         StrictLocalBackupDatabaseRestore,
     };
+    use crate::native_file_jobs::content::content_classification_limits;
+    use crate::native_file_jobs::{
+        character_json_export::export_character_json, JobKind, JobRegistry,
+    };
+    use crate::persistent_store::AssetRepositoryAuthorityState;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::Cursor;
 
@@ -1166,6 +1173,137 @@ mod tests {
             .join("persistent/persistent.sqlite3")
             .exists());
         assert_eq!(planner.durable.pin_count(), 3);
+        planner.durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
+    fn legacy_backup_empty_mime_asset_roundtrips_through_native_json_with_exact_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"legacy-empty-mime-payload";
+        let bytes = [
+            entry(b"legacy.bin", payload),
+            entry(b"database.risudat", b"RISUSAVE\0"),
+        ]
+        .concat();
+        let mut planner = PayloadPlanner {
+            cas: &cas,
+            durable: DurableCasJob::begin(
+                directory.path(),
+                &Uuid::new_v4().to_string(),
+                CasJobKind::LocalBackupRestore,
+                now_millis(),
+            )
+            .unwrap(),
+            prepared: None,
+        };
+        parse_legacy_local_backup_v1(
+            &mut Cursor::new(bytes),
+            directory.path(),
+            PayloadTarget::JobStaging,
+            &mut planner,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let prepared_payloads = planner.prepared.take().unwrap();
+        let alias = prepared_payloads.asset_aliases[0].clone();
+        assert_eq!(alias.key, "assets/legacy.bin");
+        assert!(alias.mime.is_empty());
+
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let character = serde_json::json!({
+            "type": "character",
+            "chaId": "legacy-json-character",
+            "name": "Legacy JSON",
+            "image": "",
+            "ccAssets": [{
+                "type": "x-risu-asset",
+                "uri": alias.key,
+                "name": "legacy",
+                "ext": "bin"
+            }],
+            "additionalAssets": [],
+            "emotionImages": [],
+            "triggerscript": [],
+            "customscript": [],
+            "chats": []
+        });
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(&staging, &serde_json::json!({}))
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_add_characters(&staging, &[character])
+            .unwrap();
+        store.replace_put_asset_aliases(&staging, &[alias]).unwrap();
+        store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &AssetRepositoryAuthorityState::V2 {
+                    migration_id: "legacy-json-test".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+        let metadata = serde_json::json!({
+            "spec": "chara_card_v3",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Legacy JSON",
+                "extensions": {"risuai": {
+                    "triggerscript": [],
+                    "customScripts": []
+                }},
+                "assets": [
+                    {"type": "x-risu-asset", "uri": "assets/legacy.bin", "name": "legacy", "ext": "bin"},
+                    {"type": "icon", "uri": "ccdefault:", "name": "main", "ext": "png"}
+                ]
+            }
+        });
+        let prepared = store.prepare_risu_save_export(revision).unwrap();
+        let owned = directory.path().join("json-owned");
+        let parsed_root = directory.path().join("json-parsed");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&parsed_root).unwrap();
+        let destination = directory.path().join("legacy.json");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCard)
+            .unwrap();
+
+        export_character_json(
+            prepared,
+            "legacy-json-character",
+            metadata,
+            &owned,
+            &directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+
+        let exported = fs::read(&destination).unwrap();
+        assert!(
+            String::from_utf8_lossy(&exported).contains("data:application/octet-stream;base64,")
+        );
+        let staging = JobStaging::open(&parsed_root).unwrap();
+        let parsed = parse_json_card(
+            &mut exported.as_slice(),
+            &staging,
+            &content_classification_limits(),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(parsed.payloads[0].payload.byte_size, payload.len() as u64);
+        assert_eq!(
+            parsed.payloads[0].payload.sha256,
+            hex::encode(Sha256::digest(payload))
+        );
+        assert_eq!(
+            fs::read(parsed_root.join(&parsed.payloads[0].payload.staged_name)).unwrap(),
+            payload
+        );
         planner.durable.release(CasReleaseOutcome::Aborted).unwrap();
     }
 

@@ -11,6 +11,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
+    use std::cell::Cell;
     use std::fs;
     use tempfile::TempDir;
 
@@ -48,6 +49,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_cc_mime("application/octet-stream")
+    }
+
+    fn fixture_with_cc_mime(cc_mime: &str) -> Fixture {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
@@ -58,13 +63,7 @@ mod tests {
             "image/jpeg",
             &cas,
         );
-        let cc = alias(
-            "assets/cc.dat",
-            b"cc-payload",
-            "DAT",
-            "application/octet-stream",
-            &cas,
-        );
+        let cc = alias("assets/cc.dat", b"cc-payload", "DAT", cc_mime, &cas);
         let shared = alias(
             "assets/shared.bin",
             b"first-occurrence",
@@ -331,12 +330,121 @@ mod tests {
             hex::encode(Sha256::digest(fs::read(handoff).unwrap()))
         );
     }
+
+    #[test]
+    fn release_failure_prevents_desktop_json_publication_and_releases_exactly_once() {
+        let mut fixture = fixture();
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let chosen = fixture.directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("character.json");
+        fs::write(&destination, b"previous JSON").unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCard)
+            .unwrap();
+        let release_calls = Cell::new(0);
+
+        let error = export_character_json_with_release(
+            prepared,
+            "json-character",
+            fixture.metadata,
+            &owned,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+            JSON_CARD_MAX_METADATA_BYTES,
+            |prepared: &mut PreparedRisuSaveExport| {
+                release_calls.set(release_calls.get() + 1);
+                prepared.release_reader()?;
+                Err(StoreError::Store {
+                    message: "injected checkpoint failure".to_owned(),
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "store-error");
+        assert_eq!(release_calls.get(), 1);
+        assert_eq!(fs::read(destination).unwrap(), b"previous JSON");
+    }
+
+    #[test]
+    fn release_failure_does_not_create_a_portable_json_handoff() {
+        let mut fixture = fixture();
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let handoffs = fixture.directory.path().join("handoffs");
+        fs::create_dir(&owned).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCard)
+            .unwrap();
+        let release_calls = Cell::new(0);
+
+        let error = export_character_json_with_release(
+            prepared,
+            "json-character",
+            fixture.metadata,
+            &owned,
+            &handoffs,
+            None,
+            &job,
+            JSON_CARD_MAX_METADATA_BYTES,
+            |prepared: &mut PreparedRisuSaveExport| {
+                release_calls.set(release_calls.get() + 1);
+                prepared.release_reader()?;
+                Err(StoreError::Store {
+                    message: "injected checkpoint failure".to_owned(),
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "store-error");
+        assert_eq!(release_calls.get(), 1);
+        assert!(!handoffs.exists() || fs::read_dir(handoffs).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn native_json_export_still_rejects_malformed_nonempty_mime() {
+        let mut fixture = fixture_with_cc_mime("not a media type");
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        fs::create_dir(&owned).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCard)
+            .unwrap();
+
+        let error = export_character_json(
+            prepared,
+            "json-character",
+            fixture.metadata,
+            &owned,
+            &fixture.directory.path().join("handoffs"),
+            None,
+            &job,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "invalid-input");
+        assert!(error.message.contains("MIME"));
+    }
 }
 use super::content::JSON_CARD_MAX_METADATA_BYTES;
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
-use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError};
+use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError, StoreResult};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, write::EncoderWriter};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -361,7 +469,7 @@ enum JsonAssetSource {
 }
 
 pub(crate) fn export_character_json(
-    mut prepared: PreparedRisuSaveExport,
+    prepared: PreparedRisuSaveExport,
     character_id: &str,
     metadata: Value,
     owned_directory: &Path,
@@ -369,10 +477,8 @@ pub(crate) fn export_character_json(
     destination_path: Option<&Path>,
     job: &JobControl,
 ) -> Result<JobResultSummary, NativeJobError> {
-    let reader = prepared.take_reader().map_err(store_error)?;
-    let outcome = export_character_json_with_reader(
-        &prepared,
-        &reader,
+    export_character_json_with_release(
+        prepared,
         character_id,
         metadata,
         owned_directory,
@@ -380,14 +486,13 @@ pub(crate) fn export_character_json(
         destination_path,
         job,
         JSON_CARD_MAX_METADATA_BYTES,
-    );
-    finish_with_lease(outcome, &prepared, reader)
+        PreparedRisuSaveExport::release_reader,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn export_character_json_with_reader(
-    prepared: &PreparedRisuSaveExport,
-    reader: &RevisionReadLease,
+fn export_character_json_with_release<F>(
+    mut prepared: PreparedRisuSaveExport,
     character_id: &str,
     metadata: Value,
     owned_directory: &Path,
@@ -395,28 +500,68 @@ fn export_character_json_with_reader(
     destination_path: Option<&Path>,
     job: &JobControl,
     maximum_bytes: usize,
-) -> Result<JobResultSummary, NativeJobError> {
+    release_reader: F,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    F: FnOnce(&mut PreparedRisuSaveExport) -> StoreResult<()>,
+{
+    let mut release_reader = Some(release_reader);
+    let outcome = export_character_json_with_reader(
+        &mut prepared,
+        character_id,
+        metadata,
+        owned_directory,
+        handoff_directory,
+        destination_path,
+        job,
+        maximum_bytes,
+        &mut release_reader,
+    );
+    match release_reader.take() {
+        Some(release_reader) => finish_with_release(outcome, release_reader(&mut prepared)),
+        None => outcome,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_character_json_with_reader<F>(
+    prepared: &mut PreparedRisuSaveExport,
+    character_id: &str,
+    metadata: Value,
+    owned_directory: &Path,
+    handoff_directory: &Path,
+    destination_path: Option<&Path>,
+    job: &JobControl,
+    maximum_bytes: usize,
+    release_reader: &mut Option<F>,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    F: FnOnce(&mut PreparedRisuSaveExport) -> StoreResult<()>,
+{
     if job.is_cancel_requested() {
         return Err(cancelled("character JSON export cancelled before encoding"));
     }
     job.start(JobPhase::WritingExport).map_err(job_error)?;
-    let projected = export::projected_character(
-        &reader.connection,
-        &prepared.snapshots_dir,
-        &reader.target,
-        character_id,
-    )
-    .map_err(store_error)?;
-    validate_metadata(&projected.value, character_id, &metadata)?;
     let repository =
         PayloadCas::new(prepared.repository_root().map_err(store_error)?).map_err(io_error)?;
-    let sources = json_asset_sources(
-        &projected.value,
-        projected.additional_asset_entries.as_deref(),
-        &metadata,
-        reader,
-        &repository,
-    )?;
+    let sources = {
+        let reader = prepared.reader().map_err(store_error)?;
+        let projected = export::projected_character(
+            &reader.connection,
+            &prepared.snapshots_dir,
+            &reader.target,
+            character_id,
+        )
+        .map_err(store_error)?;
+        validate_metadata(&projected.value, character_id, &metadata)?;
+        json_asset_sources(
+            &projected.value,
+            projected.additional_asset_entries.as_deref(),
+            &metadata,
+            reader,
+            &repository,
+        )?
+    };
     let total_items = u64::try_from(sources.iter().filter(|source| source.is_some()).count())
         .map_err(|_| invalid_input("character JSON asset count is invalid"))?;
     job.set_progress(JobProgress {
@@ -460,6 +605,12 @@ fn export_character_json_with_reader(
             "character JSON export cancelled before destination publication",
         ));
     }
+    release_reader
+        .take()
+        .ok_or_else(|| NativeJobError::new("store-error", "revision release was already used"))?(
+        prepared,
+    )
+    .map_err(store_error)?;
     job.set_phase(JobPhase::PublishingDestination)
         .map_err(job_error)?;
     let (destination_root, destination_path, handoff_path) = match destination_path {
@@ -736,14 +887,18 @@ fn cas_source(
             (hash, size)
         }
     };
-    if !valid_media_type(&alias.mime) {
+    let mime = if alias.mime.is_empty() {
+        "application/octet-stream".to_owned()
+    } else if valid_media_type(&alias.mime) {
+        alias.mime
+    } else {
         return Err(invalid_input("pinned character asset MIME type is invalid"));
-    }
+    };
     Ok(JsonAssetSource::Cas {
         key: key.to_owned(),
         hash,
         size,
-        mime: alias.mime,
+        mime,
     })
 }
 
@@ -928,12 +1083,11 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
-fn finish_with_lease(
+fn finish_with_release(
     outcome: Result<JobResultSummary, NativeJobError>,
-    prepared: &PreparedRisuSaveExport,
-    reader: RevisionReadLease,
+    release: StoreResult<()>,
 ) -> Result<JobResultSummary, NativeJobError> {
-    match (outcome, prepared.release(reader)) {
+    match (outcome, release) {
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(store_error(error)),

@@ -955,6 +955,17 @@ impl PreparedRisuSaveExport {
         })
     }
 
+    pub(crate) fn reader(&self) -> StoreResult<&RevisionReadLease> {
+        self.reader.as_ref().ok_or_else(|| StoreError::Validation {
+            message: "native export reader has already been released".to_owned(),
+        })
+    }
+
+    pub(crate) fn release_reader(&mut self) -> StoreResult<()> {
+        let reader = self.take_reader()?;
+        self.release(reader)
+    }
+
     pub(crate) fn release(&self, reader: RevisionReadLease) -> StoreResult<()> {
         let active_readers = reader.active_readers();
         snapshot::close_revision(reader)?;

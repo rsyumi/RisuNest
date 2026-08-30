@@ -4,7 +4,7 @@ use super::{
 };
 use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
-use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError};
+use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError, StoreResult};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -27,6 +27,7 @@ enum EmbeddedAssetSource {
     FallbackPortrait,
 }
 
+#[cfg(test)]
 pub(crate) fn export_character_charx(
     prepared: PreparedRisuSaveExport,
     character_id: &str,
@@ -51,7 +52,7 @@ pub(crate) fn export_character_charx(
 }
 
 pub(crate) fn export_character_charx_container(
-    mut prepared: PreparedRisuSaveExport,
+    prepared: PreparedRisuSaveExport,
     character_id: &str,
     card: Value,
     module: Value,
@@ -61,10 +62,8 @@ pub(crate) fn export_character_charx_container(
     destination_path: Option<&Path>,
     job: &JobControl,
 ) -> Result<JobResultSummary, NativeJobError> {
-    let reader = prepared.take_reader().map_err(store_error)?;
-    let outcome = export_character_charx_container_with_reader(
-        &prepared,
-        &reader,
+    export_character_charx_container_with_release(
+        prepared,
         character_id,
         card,
         module,
@@ -74,41 +73,50 @@ pub(crate) fn export_character_charx_container(
         destination_path,
         job,
         CharXLimits::default(),
-    );
-    finish_with_lease(outcome, &prepared, reader)
+        PreparedRisuSaveExport::release_reader,
+    )
 }
 
-fn export_character_charx_with_reader(
-    prepared: &PreparedRisuSaveExport,
-    reader: &RevisionReadLease,
+#[allow(clippy::too_many_arguments)]
+fn export_character_charx_container_with_release<F>(
+    mut prepared: PreparedRisuSaveExport,
     character_id: &str,
     card: Value,
     module: Value,
+    container: CharacterCharxContainer,
     owned_directory: &Path,
     handoff_directory: &Path,
     destination_path: Option<&Path>,
     job: &JobControl,
     limits: CharXLimits,
-) -> Result<JobResultSummary, NativeJobError> {
-    export_character_charx_container_with_reader(
-        prepared,
-        reader,
+    release_reader: F,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    F: FnOnce(&mut PreparedRisuSaveExport) -> StoreResult<()>,
+{
+    let mut release_reader = Some(release_reader);
+    let outcome = export_character_charx_container_with_reader(
+        &mut prepared,
         character_id,
         card,
         module,
-        CharacterCharxContainer::PlainCharx,
+        container,
         owned_directory,
         handoff_directory,
         destination_path,
         job,
         limits,
-    )
+        &mut release_reader,
+    );
+    match release_reader.take() {
+        Some(release_reader) => finish_with_release(outcome, release_reader(&mut prepared)),
+        None => outcome,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn export_character_charx_container_with_reader(
-    prepared: &PreparedRisuSaveExport,
-    reader: &RevisionReadLease,
+fn export_character_charx_container_with_reader<F>(
+    prepared: &mut PreparedRisuSaveExport,
     character_id: &str,
     mut card: Value,
     module: Value,
@@ -118,13 +126,18 @@ fn export_character_charx_container_with_reader(
     destination_path: Option<&Path>,
     job: &JobControl,
     limits: CharXLimits,
-) -> Result<JobResultSummary, NativeJobError> {
+    release_reader: &mut Option<F>,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    F: FnOnce(&mut PreparedRisuSaveExport) -> StoreResult<()>,
+{
     if job.is_cancel_requested() {
         return Err(cancelled(
             "character CharX export cancelled before encoding",
         ));
     }
     job.start(JobPhase::WritingExport).map_err(job_error)?;
+    let reader = prepared.reader().map_err(store_error)?;
     let projected = export::projected_character(
         &reader.connection,
         &prepared.snapshots_dir,
@@ -344,6 +357,12 @@ fn export_character_charx_container_with_reader(
             "character CharX export cancelled before destination publication",
         ));
     }
+    release_reader
+        .take()
+        .ok_or_else(|| NativeJobError::new("store-error", "revision release was already used"))?(
+        prepared,
+    )
+    .map_err(store_error)?;
     job.set_phase(JobPhase::PublishingDestination)
         .map_err(job_error)?;
     let (destination_root, destination_path, handoff_path) = match destination_path {
@@ -977,16 +996,12 @@ fn write_card_metadata(
     Ok(())
 }
 
-fn finish_with_lease(
+fn finish_with_release(
     outcome: Result<JobResultSummary, NativeJobError>,
-    prepared: &PreparedRisuSaveExport,
-    reader: RevisionReadLease,
+    release: StoreResult<()>,
 ) -> Result<JobResultSummary, NativeJobError> {
-    match (outcome, prepared.release(reader)) {
-        (Ok(mut result), Err(_)) => {
-            result.warning_codes.push("cleanup-failed".to_owned());
-            Ok(result)
-        }
+    match (outcome, release) {
+        (Ok(_), Err(error)) => Err(store_error(error)),
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), Err(cleanup)) => Err(NativeJobError::new(
             "cleanup-failed",
@@ -1060,6 +1075,7 @@ mod tests {
         PersistentStore,
     };
     use serde_json::json;
+    use std::cell::Cell;
     use tempfile::TempDir;
     use zip::ZipArchive;
 
@@ -1440,6 +1456,62 @@ mod tests {
     }
 
     #[test]
+    fn release_failure_prevents_plain_and_appended_publication_without_orphan_handoffs() {
+        for container in [
+            CharacterCharxContainer::PlainCharx,
+            CharacterCharxContainer::AppendedCharxJpeg,
+        ] {
+            for portable in [false, true] {
+                let mut fixture = fixture();
+                let prepared = fixture
+                    .store
+                    .prepare_risu_save_export(fixture.revision)
+                    .unwrap();
+                let owned = fixture.directory.path().join("owned");
+                let chosen = fixture.directory.path().join("chosen");
+                let handoffs = fixture.directory.path().join("handoffs");
+                fs::create_dir(&owned).unwrap();
+                fs::create_dir(&chosen).unwrap();
+                let destination = chosen.join(match container {
+                    CharacterCharxContainer::PlainCharx => "character.charx",
+                    CharacterCharxContainer::AppendedCharxJpeg => "character.jpeg",
+                });
+                fs::write(&destination, b"previous character card").unwrap();
+                let job = JobRegistry::default()
+                    .create(JobKind::ExportCharacterCharx)
+                    .unwrap();
+                let release_calls = Cell::new(0);
+
+                let error = export_character_charx_container_with_release(
+                    prepared,
+                    "current-character",
+                    fixture.card,
+                    fixture.module,
+                    container,
+                    &owned,
+                    &handoffs,
+                    (!portable).then_some(destination.as_path()),
+                    &job,
+                    CharXLimits::default(),
+                    |prepared: &mut PreparedRisuSaveExport| {
+                        release_calls.set(release_calls.get() + 1);
+                        prepared.release_reader()?;
+                        Err(StoreError::Store {
+                            message: "injected checkpoint failure".to_owned(),
+                        })
+                    },
+                )
+                .unwrap_err();
+
+                assert_eq!(error.code, "store-error");
+                assert_eq!(release_calls.get(), 1);
+                assert_eq!(fs::read(&destination).unwrap(), b"previous character card");
+                assert!(!handoffs.exists() || fs::read_dir(&handoffs).unwrap().next().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn cancellation_preserves_an_existing_character_destination() {
         let mut fixture = fixture();
         let prepared = fixture
@@ -1643,11 +1715,10 @@ mod tests {
             ),
         ] {
             let mut fixture = fixture();
-            let mut prepared = fixture
+            let prepared = fixture
                 .store
                 .prepare_risu_save_export(fixture.revision)
                 .unwrap();
-            let reader = prepared.take_reader().unwrap();
             let owned = fixture.directory.path().join("owned");
             let chosen = fixture.directory.path().join("chosen");
             fs::create_dir(&owned).unwrap();
@@ -1658,17 +1729,18 @@ mod tests {
                 .create(JobKind::ExportCharacterCharx)
                 .unwrap();
 
-            let error = export_character_charx_with_reader(
-                &prepared,
-                &reader,
+            let error = export_character_charx_container_with_release(
+                prepared,
                 "current-character",
                 fixture.card,
                 fixture.module,
+                CharacterCharxContainer::PlainCharx,
                 &owned,
                 &fixture.directory.path().join("handoffs"),
                 Some(&destination),
                 &job,
                 limits,
+                PreparedRisuSaveExport::release_reader,
             )
             .unwrap_err();
 
@@ -1679,7 +1751,6 @@ mod tests {
                 error.message
             );
             assert_eq!(fs::read(destination).unwrap(), b"previous CharX");
-            prepared.release(reader).unwrap();
         }
     }
 
