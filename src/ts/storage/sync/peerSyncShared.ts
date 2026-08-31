@@ -15,6 +15,29 @@ export interface PeerSyncInvoke {
 export interface PeerSyncForegroundBridge {
     startSource(lane: string, operationId: string, generation: number): boolean
     stopSource(lane: string, operationId: string, generation: number): boolean
+    /**
+     * Whether Android can actually show the foreground notification that
+     * carries the user's Stop affordance. Absent on older bridges.
+     */
+    notificationsEnabled?(): boolean
+}
+
+/**
+ * Returns false when the Android peer-sync Stop notification is suppressed
+ * (notifications denied or the channel silenced), true when it can be shown,
+ * and null when no bridge is available to tell (non-Android or old bridge).
+ */
+export function androidPeerSyncNotificationsEnabled(
+    bridge?: PeerSyncForegroundBridge,
+): boolean | null {
+    const resolved = bridge
+        ?? (typeof window === 'undefined' ? undefined : window.RisuPeerCloneBridge)
+    if (!resolved || typeof resolved.notificationsEnabled !== 'function') return null
+    try {
+        return resolved.notificationsEnabled()
+    } catch {
+        return null
+    }
 }
 
 /**

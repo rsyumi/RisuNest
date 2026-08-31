@@ -711,6 +711,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
       return PeerSyncForegroundService.stop(this@MainActivity, identity)
     }
+
+    // Whether the peer-sync foreground notification (the user's Stop
+    // affordance) can actually be shown: app notifications on, and the
+    // peer-sync channel not silenced. The web UI warns when this is false.
+    @JavascriptInterface
+    fun notificationsEnabled(): Boolean {
+      val manager = androidx.core.app.NotificationManagerCompat.from(this@MainActivity)
+      if (!manager.areNotificationsEnabled()) return false
+      val channel = manager.getNotificationChannel(PEER_SYNC_FOREGROUND_CHANNEL)
+      return channel == null ||
+        channel.importance != android.app.NotificationManager.IMPORTANCE_NONE
+    }
   }
 
   private fun currentPeerCloneTransferMode() = peerCloneTransferMode(

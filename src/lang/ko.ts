@@ -1567,6 +1567,9 @@ export const languageKorean = {
     nanoGPTSelectFromList: "목록에서 선택",
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
+    peerClone: {
+        notificationsDisabledWarning: "이 앱의 알림이 꺼져 있어 전송 중 중지 버튼이 있는 알림이 표시되지 않습니다. 이 화면에서 공유를 중지할 수 있으며, 시스템 설정에서 알림을 허용하면 알림의 중지 버튼을 다시 사용할 수 있습니다.",
+    },
     peerDelta: {
         title: "증분 업데이트",
         description: "다른 데스크톱 기기에서 변경된 논리 레코드와 페이로드만 가져옵니다. 서로 달라진 라이브러리를 자동으로 교체하지 않습니다.",

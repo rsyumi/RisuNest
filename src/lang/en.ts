@@ -1786,6 +1786,7 @@ export const languageEnglish = {
         progress: "Progress",
         invalidLink: "The pairing link is invalid.",
         replacementConfirm: "Replace all local data with the verified clone after download? The current data remains active if download or validation fails.",
+        notificationsDisabledWarning: "Notifications are turned off for this app, so Android will not show the transfer notification with its Stop button. You can still stop sharing from this screen, or allow notifications in system settings to get the notification Stop control back.",
     },
     peerDelta: {
         title: "Incremental update",

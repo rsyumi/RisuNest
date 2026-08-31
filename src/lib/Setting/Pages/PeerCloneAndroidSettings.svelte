@@ -18,6 +18,7 @@
     import { createAndroidPeerCloneSourceController } from 'src/ts/storage/sync/peerCloneAndroidSourceController'
     import type { PeerCloneSourceStatus } from 'src/ts/storage/sync/peerClone'
     import { parsePeerDeltaUri, type PeerDeltaCapabilities, type PeerDeltaPullResult, type PeerDeltaSourceStatus } from 'src/ts/storage/sync/peerDelta'
+    import { androidPeerSyncNotificationsEnabled } from 'src/ts/storage/sync/peerSyncShared'
     import { getAndroidPeerDeltaController } from 'src/ts/storage/sync/peerDeltaController'
     import {
         consumePendingPeerCloneUri,
@@ -49,6 +50,7 @@
     let pairingInput = $state('')
     let busy = $state(false)
     let error = $state('')
+    let stopNotificationsBlocked = $state(false)
     let deltaError = $state('')
     let progressTimer: ReturnType<typeof setInterval> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
@@ -143,6 +145,10 @@
 
     function refreshState(): void {
         cloneState = facade.getState()
+    }
+
+    function refreshStopNotificationAffordance(): void {
+        stopNotificationsBlocked = androidPeerSyncNotificationsEnabled() === false
     }
 
     function reportError(cause: unknown): void {
@@ -247,7 +253,9 @@
                 if (cloneState.phase === 'downloading') {
                     beginProgressPolling()
                 }
+                refreshStopNotificationAffordance()
                 sourceTimer = setInterval(() => {
+                    refreshStopNotificationAffordance()
                     void sourceController.refresh().then((current) => { sourceStatus = current })
                 }, 1_000)
             })
@@ -264,6 +272,12 @@
 <section class="mt-4 rounded-md border border-darkborderc bg-darkbg p-3">
     <h3 class="text-xl font-bold">{language.peerClone.title}</h3>
     <p class="mt-1 text-sm text-textcolor2">{language.peerClone.description}</p>
+
+    {#if stopNotificationsBlocked}
+        <p class="mt-3 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">
+            {language.peerClone.notificationsDisabledWarning}
+        </p>
+    {/if}
 
     {#if capabilities && !targetEnabled}
         <p class="mt-3 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">

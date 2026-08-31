@@ -13,7 +13,7 @@ import androidx.core.content.ContextCompat
 import java.util.UUID
 
 internal const val PEER_SYNC_FOREGROUND_START_MODE = Service.START_NOT_STICKY
-private const val PEER_SYNC_FOREGROUND_CHANNEL = "risu-peer-sync-source"
+internal const val PEER_SYNC_FOREGROUND_CHANNEL = "risu-peer-sync-source"
 private const val PEER_SYNC_FOREGROUND_NOTIFICATION_ID = 0x52535031
 private const val PEER_SYNC_FOREGROUND_START = "co.aiclient.risu.PEER_SYNC_SOURCE_START"
 internal const val PEER_SYNC_FOREGROUND_STOP_ACTION = "co.aiclient.risu.PEER_SYNC_SOURCE_STOP"
