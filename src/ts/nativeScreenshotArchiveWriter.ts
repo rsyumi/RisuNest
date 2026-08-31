@@ -11,6 +11,7 @@ import {
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './storage/androidSafBridge'
+import { listenRecoveredPublications } from './storage/recoveredPublicationListener'
 
 export const SCREENSHOT_OUTPUT_CHUNK_BYTES = 64 * 1024
 
@@ -384,44 +385,28 @@ export function listenRecoveredAndroidScreenshotPublications(
     onError: (error: unknown) => void,
     dependencies: AndroidScreenshotRecoveryListenerDependencies = productionAndroidRecoveryListenerDependencies,
 ): () => void {
-    let disposed = false
-    let queue = Promise.resolve()
-    const handledRequestIds = new Set<string>()
-    const enqueue = (
-        recover: () => Promise<AndroidSafDestinationEvent | null>,
-        requestId?: string,
-    ) => {
-        queue = queue.then(async () => {
-            if (disposed || (requestId && handledRequestIds.has(requestId))) return
-            const terminal = await recover()
-            if (!terminal || handledRequestIds.has(terminal.requestId)) return
-            handledRequestIds.add(terminal.requestId)
-            onTerminal(terminal)
-        }).catch(onError)
-    }
-    const disposeListener = dependencies.listen((event) => {
-        if (
-            event.sourceKind !== 'screenshot'
-            || dependencies.isActive(event.requestId)
-        ) return
-        enqueue(() => recoverAndroidScreenshotPublication({
+    return listenRecoveredPublications({
+        sourceKind: 'screenshot',
+        onTerminal,
+        onError,
+        listen: dependencies.listen,
+        isActive: dependencies.isActive,
+        recoverEvent: (event) => recoverAndroidScreenshotPublication({
             ...dependencies,
             getStatus: () => JSON.stringify(event),
-        }), event.requestId)
+        }),
+        initial: {
+            recover: async () => {
+                const encoded = dependencies.getStatus()
+                const terminal = recoveredScreenshotTerminal(encoded)
+                if (!terminal || dependencies.isActive(terminal.requestId)) return null
+                return recoverAndroidScreenshotPublication({
+                    ...dependencies,
+                    getStatus: () => encoded,
+                })
+            },
+        },
     })
-    enqueue(async () => {
-        const encoded = dependencies.getStatus()
-        const terminal = recoveredScreenshotTerminal(encoded)
-        if (!terminal || dependencies.isActive(terminal.requestId)) return null
-        return recoverAndroidScreenshotPublication({
-            ...dependencies,
-            getStatus: () => encoded,
-        })
-    })
-    return () => {
-        disposed = true
-        disposeListener()
-    }
 }
 
 export async function createNativeScreenshotArchiveWriter(

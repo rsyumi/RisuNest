@@ -1,3 +1,4 @@
+import { Mutex } from '../mutex'
 import { language } from 'src/lang'
 
 import { alertConfirm, alertError, alertNormal } from '../alert'
@@ -81,21 +82,14 @@ export function createAndroidOpenedSpoolDispatcher(
     dependencies: AndroidOpenedSpoolDispatchDependencies,
 ): { enqueue(batch: AndroidSpoolBatch): Promise<void> } {
     const handledCharacterTokens = new Set<string>()
-    let tail: Promise<void> = Promise.resolve()
+    const dispatchMutex = new Mutex()
     return {
         enqueue(batch) {
-            const queued = tail.then(async () => {
-                await dispatchAndroidOpenedSpoolBatch(
-                    batch,
-                    dependencies,
-                    handledCharacterTokens,
-                )
-            })
-            tail = queued.then(
-                () => undefined,
-                () => undefined,
-            )
-            return queued
+            return dispatchMutex.runExclusive(() => dispatchAndroidOpenedSpoolBatch(
+                batch,
+                dependencies,
+                handledCharacterTokens,
+            ))
         },
     }
 }

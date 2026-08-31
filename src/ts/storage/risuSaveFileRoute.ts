@@ -6,6 +6,7 @@ import {
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
 import type { PersistentDataRuntime } from './persistentDataRuntime.svelte'
+import { listenRecoveredPublications } from './recoveredPublicationListener'
 import {
     NativeFileJobError,
     type NativeFileExportJobOptions,
@@ -273,34 +274,28 @@ export function listenRecoveredAndroidRisuSavePublications(
     onError: (error: unknown) => void,
     dependencies: AndroidRisuSaveRecoveryDependencies,
 ): () => void {
-    let disposed = false
-    let queue = Promise.resolve()
-    const handledRequestIds = new Set<string>()
-    const enqueue = (encoded: string, requestId?: string) => {
-        queue = queue.then(() => {
-            if (disposed || (requestId && handledRequestIds.has(requestId))) return
-            const terminal = recoverAndroidRisuSavePublication(
-                encoded,
-                dependencies.acknowledge,
-            )
-            if (!terminal || handledRequestIds.has(terminal.requestId)) return
-            handledRequestIds.add(terminal.requestId)
-            onTerminal(terminal)
-        }).catch(onError)
-    }
-    const disposeListener = dependencies.listen((event) => {
-        if (event.sourceKind !== 'risuSave' || dependencies.isActive(event.requestId)) return
-        enqueue(JSON.stringify(event), event.requestId)
-    })
     const encoded = dependencies.getStatus()
-    const terminal = recoveredAndroidRisuSaveTerminal(encoded)
-    if (encoded && terminal && !dependencies.isActive(terminal.requestId)) {
-        enqueue(encoded, terminal.requestId)
-    }
-    return () => {
-        disposed = true
-        disposeListener()
-    }
+    const initialTerminal = recoveredAndroidRisuSaveTerminal(encoded)
+    return listenRecoveredPublications({
+        sourceKind: 'risuSave',
+        onTerminal,
+        onError,
+        listen: dependencies.listen,
+        isActive: dependencies.isActive,
+        recoverEvent: (event) => recoverAndroidRisuSavePublication(
+            JSON.stringify(event),
+            dependencies.acknowledge,
+        ),
+        initial: encoded && initialTerminal && !dependencies.isActive(initialTerminal.requestId)
+            ? {
+                requestId: initialTerminal.requestId,
+                recover: () => recoverAndroidRisuSavePublication(
+                    encoded,
+                    dependencies.acknowledge,
+                ),
+            }
+            : null,
+    })
 }
 
 export interface RisuSaveFileRouteOptions extends NativeFileRestoreJobOptions {

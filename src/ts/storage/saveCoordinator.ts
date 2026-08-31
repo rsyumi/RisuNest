@@ -1,3 +1,4 @@
+import { Mutex } from '../mutex'
 import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
 import type {
     AssetAlias,
@@ -840,7 +841,7 @@ export class SaveCoordinator {
     private dirtyGeneration = 0
     private pendingByteCount = 0
     private debounceHandle: unknown
-    private operationTail: Promise<void> = Promise.resolve()
+    private readonly operationMutex = new Mutex()
     private flushPromise: Promise<void> | null = null
     private localFlushPromise: Promise<void> | null = null
     private localFlushDuringPublicationPromise: Promise<void> | null = null
@@ -2261,20 +2262,14 @@ export class SaveCoordinator {
         this.queuedOperationCount += 1
         this.persistenceWasBusy = true
         this.notifyOperationStateChange()
-        const run = async (): Promise<T> => {
+        return this.operationMutex.runExclusive(async () => {
             try {
                 return await operation()
             } finally {
                 this.queuedOperationCount -= 1
                 this.notifyOperationStateChange()
             }
-        }
-        const result = this.operationTail.then(run, run)
-        this.operationTail = result.then(
-            () => undefined,
-            () => undefined,
-        )
-        return result
+        })
     }
 
     private waitForOperationStateChange(): Promise<void> {

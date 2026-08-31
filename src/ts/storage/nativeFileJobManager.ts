@@ -1,3 +1,4 @@
+import { Mutex } from '../mutex'
 import { writable } from 'svelte/store'
 
 import type { NativeFileJobStatus } from './nativeFileJobs'
@@ -19,7 +20,7 @@ export const nativeFileOperation = writable<NativeFileOperationState | null>(nul
 let activeOperation: Promise<unknown> | null = null
 let activeOperationKey: string | null = null
 let activeController: AbortController | null = null
-let externalAndroidOperationTail: Promise<void> = Promise.resolve()
+const externalAndroidOperationMutex = new Mutex()
 
 export class NativeFileOperationBusyError extends Error {
     constructor() {
@@ -66,7 +67,7 @@ export function runExternalAndroidNativeFileOperation<T>(
     kind: NativeFileOperationState['kind'],
     operation: (context: SharedNativeFileOperationContext) => Promise<T>,
 ): Promise<T> {
-    const queued = externalAndroidOperationTail.then(async () => {
+    return externalAndroidOperationMutex.runExclusive(async () => {
         while (activeOperation) {
             try {
                 await activeOperation
@@ -79,11 +80,6 @@ export function runExternalAndroidNativeFileOperation<T>(
             operation,
         )
     })
-    externalAndroidOperationTail = queued.then(
-        () => undefined,
-        () => undefined,
-    )
-    return queued
 }
 
 export function cancelActiveNativeFileOperation(): void {

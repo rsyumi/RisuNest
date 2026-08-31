@@ -1,6 +1,7 @@
 export class ByteBudgetLru<K, V> {
     private readonly entries = new Map<K, V>()
     private retainedBytes = 0
+    private budgetEnforced = true
 
     constructor(
         private readonly maxBytes: number,
@@ -27,13 +28,31 @@ export class ByteBudgetLru<K, V> {
             this.entries.delete(key)
         }
 
-        if (this.maxBytes <= 0 || bytes > this.maxBytes) {
+        if (this.budgetEnforced && (this.maxBytes <= 0 || bytes > this.maxBytes)) {
             return false
         }
 
         this.entries.set(key, value)
         this.retainedBytes += bytes
+        this.trim()
 
+        return this.entries.has(key)
+    }
+
+    /**
+     * Suspends or resumes budget eviction. While suspended, entries are
+     * retained regardless of the byte budget (a caller pinning a complete
+     * working set); re-enabling trims back down to the budget.
+     */
+    setBudgetEnforcement(enforced: boolean): void {
+        this.budgetEnforced = enforced
+        this.trim()
+    }
+
+    private trim(): void {
+        if (!this.budgetEnforced) {
+            return
+        }
         while (this.retainedBytes > this.maxBytes || this.entries.size > this.maxEntries) {
             const oldest = this.entries.entries().next().value
             if (!oldest) {
@@ -43,8 +62,6 @@ export class ByteBudgetLru<K, V> {
             this.entries.delete(oldestKey)
             this.retainedBytes -= this.measure(oldestKey, oldestValue)
         }
-
-        return this.entries.has(key)
     }
 
     delete(key: K): boolean {

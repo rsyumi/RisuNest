@@ -1,3 +1,4 @@
+import { Mutex } from '../mutex'
 export type PluginCompatibilityProfile = 'scalable-v3' | 'maximum-compatibility'
 
 export interface PluginCompatibilityDescriptor {
@@ -152,7 +153,7 @@ export async function runPluginUnloadCallbacks(
 
 export function createPluginLoadOrchestrator<T>(dependencies: PluginLoadDependencies<T>) {
     let loadGeneration = 0
-    let operationTail = Promise.resolve()
+    const operationMutex = new Mutex()
 
     return (request: PluginLoadRequest<T>): Promise<void> => {
         const generation = ++loadGeneration
@@ -165,7 +166,7 @@ export function createPluginLoadOrchestrator<T>(dependencies: PluginLoadDependen
                 )
                 : null
 
-        const operation = operationTail.then(async () => {
+        const operation = operationMutex.runExclusive(async () => {
             let appliedMaximumProfile: PluginCompatibilityProfile | null = null
             if (maximumTransition) {
                 const outcome = await maximumTransition
@@ -196,10 +197,6 @@ export function createPluginLoadOrchestrator<T>(dependencies: PluginLoadDependen
             await dependencies.loadV3(request.pluginV3)
         })
 
-        operationTail = operation.then(
-            () => undefined,
-            () => undefined,
-        )
         return operation
     }
 }

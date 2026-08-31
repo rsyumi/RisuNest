@@ -4,6 +4,7 @@ import {
     type PluginStorageSummary,
 } from '../storage/persistentDataStore'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
+import { ByteBudgetLru } from '../util/byteBudgetLru'
 import {
     acquireCurrentRevisionWithRetry,
     withPersistentRevisionLease,
@@ -103,13 +104,14 @@ export function createPluginStorageStore(
     byteBudget = PLUGIN_STORAGE_CACHE_BYTE_BUDGET,
 ): PluginStorageStore {
     const index = new Map<string, PluginStorageSummary>()
-    const cache = new Map<string, CacheEntry>()
+    const cache = new ByteBudgetLru<string, CacheEntry>(
+        byteBudget,
+        (_key, entry) => entry.byteSize,
+    )
     const pendingReads = new Map<string, { generation: number; promise: Promise<unknown | null> }>()
     const keyGenerations = new Map<string, number>()
-    let cacheBytes = 0
     let initialized = false
     let initializePromise: Promise<void> | null = null
-    let evictionAllowed = true
     let lifecycleGeneration = 0
     let authorityGeneration = 0
 
@@ -151,25 +153,8 @@ export function createPluginStorageStore(
         }
     }
 
-    const removeCached = (key: string) => {
-        const cached = cache.get(key)
-        if (!cached) return
-        cache.delete(key)
-        cacheBytes -= cached.byteSize
-    }
-
-    const evict = () => {
-        if (!evictionAllowed) return
-        while (cacheBytes > byteBudget && cache.size > 0) {
-            removeCached(cache.keys().next().value as string)
-        }
-    }
-
     const putCached = (key: string, value: unknown, byteSize: number) => {
-        removeCached(key)
         cache.set(key, { value: structuredClone(value), byteSize })
-        cacheBytes += byteSize
-        evict()
     }
 
     const replaceCachedStorage = (storage: Record<string, unknown>) => {
@@ -180,7 +165,6 @@ export function createPluginStorageStore(
         initialized = true
         index.clear()
         cache.clear()
-        cacheBytes = 0
         for (const [key, value] of Object.entries(storage)) {
             const byteSize = serializedByteSize(value)
             index.set(key, { key, byteSize })
@@ -203,7 +187,6 @@ export function createPluginStorageStore(
         cache.clear()
         pendingReads.clear()
         keyGenerations.clear()
-        cacheBytes = 0
     }
 
     const invalidate = () => {
@@ -215,8 +198,6 @@ export function createPluginStorageStore(
         await initialize()
         const cached = cache.get(key)
         if (cached) {
-            cache.delete(key)
-            cache.set(key, cached)
             return structuredClone(cached.value)
         }
         if (!index.has(key)) return null
@@ -254,7 +235,7 @@ export function createPluginStorageStore(
         bumpKeyGeneration(mutation.key)
         if (mutation.type === 'delete') {
             index.delete(mutation.key)
-            removeCached(mutation.key)
+            cache.delete(mutation.key)
             return
         }
         const byteSize = serializedByteSize(mutation.value)
@@ -324,13 +305,12 @@ export function createPluginStorageStore(
             lifecycleGeneration++
             pendingReads.clear()
             keyGenerations.clear()
-            evictionAllowed = false
+            cache.setBudgetEnforcement(false)
             const lease = await acquirePinnedPluginStorageLease()
             await withPersistentRevisionLease(lease, async (reader) => {
                 const pinnedCatalog = await reader.queryPluginStorage()
                 index.clear()
                 cache.clear()
-                cacheBytes = 0
                 for (const item of pinnedCatalog.items) {
                     index.set(item.key, item)
                     const record = await reader.readPluginStorage(item.key)
@@ -339,12 +319,11 @@ export function createPluginStorageStore(
             })
         },
         preloadCompatibilityValues(storage) {
-            evictionAllowed = false
+            cache.setBudgetEnforcement(false)
             replaceCachedStorage(storage)
         },
         setEvictionAllowed(allowed) {
-            evictionAllowed = allowed
-            evict()
+            cache.setBudgetEnforcement(allowed)
         },
         synchronizeCompatibilityStorage(storage) {
             replaceCachedStorage(storage)
