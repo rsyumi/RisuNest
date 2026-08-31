@@ -1742,6 +1742,28 @@ fn seed_android_product_store(
     store.replace_commit(&staging, Some(0)).unwrap();
 }
 
+fn wait_for_no_active_connection(host: &LanCloneHost) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.has_active_connection_for_test() {
+        assert!(
+            Instant::now() < deadline,
+            "LAN server kept a finished connection registered"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_active_stalled_connection(host: &LanCloneHost) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !host.has_active_connection_for_test() {
+        assert!(
+            Instant::now() < deadline,
+            "LAN server never registered the stalled connection"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn assert_lan_stop_is_bounded(mut host: LanCloneHost, stalled: TcpStream) {
     // The product property is that stop() never waits on a stalled peer (the 120s
     // RESPONSE_WRITE_TIMEOUT hang); responsiveness itself is governed by the 250ms
@@ -1791,7 +1813,7 @@ fn lan_stop_interrupts_a_peer_stalled_in_an_incomplete_header() {
     )
     .unwrap();
     stalled.flush().unwrap();
-    thread::sleep(Duration::from_millis(50));
+    wait_for_active_stalled_connection(&host);
 
     assert_lan_stop_is_bounded(host, stalled);
 }
@@ -1811,7 +1833,7 @@ fn lan_stop_interrupts_a_peer_stalled_in_an_incomplete_body() {
     )
     .unwrap();
     stalled.flush().unwrap();
-    thread::sleep(Duration::from_millis(50));
+    wait_for_active_stalled_connection(&host);
 
     assert_lan_stop_is_bounded(host, stalled);
 }
@@ -1836,6 +1858,9 @@ fn lan_stop_interrupts_a_range_receiver_that_does_not_read() {
         .unwrap();
     let bearer = claim["bearer"].as_str().unwrap();
     let object = host.manifest().payloads[0].object.clone();
+    // The claim connection must be released before the stalled one can be
+    // observed as the registered active connection.
+    wait_for_no_active_connection(&host);
     let mut stalled = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
     write!(
         stalled,
@@ -1847,7 +1872,7 @@ fn lan_stop_interrupts_a_range_receiver_that_does_not_read() {
     )
     .unwrap();
     stalled.flush().unwrap();
-    thread::sleep(Duration::from_millis(100));
+    wait_for_active_stalled_connection(&host);
 
     assert_lan_stop_is_bounded(host, stalled);
 }

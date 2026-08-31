@@ -1030,6 +1030,15 @@ impl LanCloneHost {
         self.control().revoke(device_id)
     }
 
+    // Whether the serve loop has registered a connection it is currently
+    // handling; the stalled-peer Stop tests wait on this instead of sleeping.
+    #[cfg(test)]
+    pub(crate) fn has_active_connection_for_test(&self) -> bool {
+        self.active_connection
+            .as_ref()
+            .is_some_and(|active| recovered_lock(active).is_some())
+    }
+
     pub fn stop(&mut self) -> Result<(), PeerSyncError> {
         if let Some(stopped) = &self.stopped {
             stopped.store(true, Ordering::SeqCst);
@@ -2863,38 +2872,40 @@ mod timeout_tests {
         }
     }
 
-    struct DelayedLogicalFixtureSource {
+    // Holds the object body until the test releases it, so an open that waited
+    // for body production would provably hang instead of racing a sleep.
+    struct HeldLogicalFixtureSource {
         object_hash: String,
         bytes: Vec<u8>,
-        delay: Duration,
+        releases: std::collections::VecDeque<mpsc::Receiver<()>>,
     }
 
-    impl LogicalDeltaObjectSource for DelayedLogicalFixtureSource {
+    impl LogicalDeltaObjectSource for HeldLogicalFixtureSource {
         fn open_object(
             &mut self,
             object: &LogicalDeltaObject,
         ) -> Result<Box<dyn Read>, PeerSyncError> {
             if object.hash != self.object_hash {
                 return Err(PeerSyncError::Storage(
-                    "delayed logical fixture object is absent".to_owned(),
+                    "held logical fixture object is absent".to_owned(),
                 ));
             }
-            Ok(Box::new(DelayedFirstRead {
+            Ok(Box::new(HeldFirstRead {
                 inner: Cursor::new(self.bytes.clone()),
-                delay: Some(self.delay),
+                release: self.releases.pop_front(),
             }))
         }
     }
 
-    struct DelayedFirstRead {
+    struct HeldFirstRead {
         inner: Cursor<Vec<u8>>,
-        delay: Option<Duration>,
+        release: Option<mpsc::Receiver<()>>,
     }
 
-    impl Read for DelayedFirstRead {
+    impl Read for HeldFirstRead {
         fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            if let Some(delay) = self.delay.take() {
-                thread::sleep(delay);
+            if let Some(release) = self.release.take() {
+                let _ = release.recv();
             }
             self.inner.read(output)
         }
@@ -3440,6 +3451,8 @@ mod timeout_tests {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let (second_hold_tx, second_hold_rx) = mpsc::channel::<()>();
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
             generation: "generation-1".to_owned(),
@@ -3474,10 +3487,10 @@ mod timeout_tests {
                     size: object.size,
                 })
                 .collect(),
-            Box::new(DelayedLogicalFixtureSource {
+            Box::new(HeldLogicalFixtureSource {
                 object_hash: record_hash.clone(),
                 bytes: record_bytes.clone(),
-                delay: Duration::from_millis(1_500),
+                releases: std::collections::VecDeque::from([hold_rx, second_hold_rx]),
             }),
         )
         .unwrap();
@@ -3492,12 +3505,15 @@ mod timeout_tests {
             &pairing.claim,
             LogicalClientTimeouts {
                 control_request: control_timeout,
-                object_idle: Duration::from_secs(2),
+                object_idle: Duration::from_secs(10),
             },
         )
         .unwrap();
 
         let started = Instant::now();
+        // The body is held until after open returns, so an open that waited for
+        // body production would exhaust the object timeout and fail; a generous
+        // hang guard replaces the scheduling-sensitive control-timeout bound.
         let mut reader = client
             .open_object(&LogicalDeltaObject {
                 hash: record_hash.clone(),
@@ -3506,11 +3522,12 @@ mod timeout_tests {
             .unwrap();
         let opened_in = started.elapsed();
         let current_while_streaming = host.devices()[0].current_object.clone();
+        hold_tx.send(()).unwrap();
         let mut received = Vec::new();
         reader.read_to_end(&mut received).unwrap();
 
         assert!(
-            opened_in < control_timeout,
+            opened_in < Duration::from_secs(5),
             "logical object open waited {opened_in:?} for control progress"
         );
         assert_eq!(
@@ -3532,6 +3549,9 @@ mod timeout_tests {
             Some(record_hash.as_str())
         );
         drop(dropped_reader);
+        // Unblock the held second body so the server observes the dropped
+        // client and clears its progress.
+        drop(second_hold_tx);
         let clear_deadline = Instant::now() + Duration::from_secs(2);
         while host.devices()[0].current_object.is_some() && Instant::now() < clear_deadline {
             thread::sleep(Duration::from_millis(10));
