@@ -5714,7 +5714,9 @@ fn prepare_product_source_host(
 }
 
 #[cfg(desktop)]
+#[allow(clippy::too_many_arguments)]
 fn request_remote_apply_from_shared(
+    session_store: PersistentStore,
     app_root: &Path,
     local_device_id: &str,
     client: &LanBidirectionalLogicalClient,
@@ -5725,7 +5727,7 @@ fn request_remote_apply_from_shared(
 ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
     retry_reverse_tunnel_cleanup(&context.operation_id)?;
     let source = LogicalDeltaSourceSession::open(
-        app_root,
+        session_store,
         app_root,
         &context.library_id,
         &shared_generation.generation_id,
@@ -5814,7 +5816,9 @@ fn request_remote_apply_from_shared(
 }
 
 #[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
 fn request_remote_apply_from_shared(
+    session_store: PersistentStore,
     app_root: &Path,
     local_device_id: &str,
     client: &LanBidirectionalLogicalClient,
@@ -5824,7 +5828,7 @@ fn request_remote_apply_from_shared(
     backup_losing_side: bool,
 ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
     let source = LogicalDeltaSourceSession::open(
-        app_root,
+        session_store,
         app_root,
         &context.library_id,
         &shared_generation.generation_id,
@@ -5944,6 +5948,7 @@ fn run_retained_remote_completion(
     let local_device_id = super::delta_commands::load_or_create_source_device_id(
         &app_root.join("peer-delta").join("source-device-id"),
     )?;
+    let session_store = store.open_native_job_store().map_err(store_error)?;
     let outcome = resume_bidirectional_local_committed_with_remote(
         store,
         &cas,
@@ -5952,6 +5957,7 @@ fn run_retained_remote_completion(
         |context, _, shared, manifest, backup_losing_side| {
             if let Some(client) = client {
                 request_remote_apply_from_shared(
+                    session_store,
                     app_root,
                     &local_device_id,
                     client,
@@ -5968,6 +5974,7 @@ fn run_retained_remote_completion(
                 }
                 let client = LanBidirectionalLogicalClient::resume(context.credential.clone())?;
                 request_remote_apply_from_shared(
+                    session_store,
                     app_root,
                     &local_device_id,
                     &client,
@@ -6066,22 +6073,24 @@ pub async fn peer_bidirectional_prepare(
             return Err("a target-owned bidirectional operation is retained".to_owned());
         }
         let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
-        let (built, store) = persistent_store::commands::with_store_mut(app.state(), |store| {
-            store.reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)?;
-            let actual = store.revision()?;
-            if actual != expected_revision {
-                return Err(StoreError::RevisionConflict {
-                    expected: expected_revision,
-                    actual,
-                });
-            }
-            let built = store.seal_or_initialize_active_logical_generation(&cas)?;
-            let job_store = store.open_native_job_store()?;
-            Ok((built, job_store))
-        })
-        .map_err(|error| error.to_string())?;
+        let (built, store, session_store) =
+            persistent_store::commands::with_store_mut(app.state(), |store| {
+                store.reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)?;
+                let actual = store.revision()?;
+                if actual != expected_revision {
+                    return Err(StoreError::RevisionConflict {
+                        expected: expected_revision,
+                        actual,
+                    });
+                }
+                let built = store.seal_or_initialize_active_logical_generation(&cas)?;
+                let job_store = store.open_native_job_store()?;
+                let session_store = store.open_native_job_store()?;
+                Ok((built, job_store, session_store))
+            })
+            .map_err(|error| error.to_string())?;
         let source = LogicalDeltaSourceSession::open_owned(
-            &root,
+            session_store,
             &root,
             &built.manifest.library_id,
             &built.manifest.generation,
@@ -7334,7 +7343,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let source = LogicalDeltaSourceSession::open_owned(
-            directory.path(),
+            store.open_native_job_store().unwrap(),
             directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &active.manifest.generation,
@@ -7530,7 +7539,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let source = LogicalDeltaSourceSession::open(
-            root,
+            store.open_native_job_store().unwrap(),
             root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &active.manifest.generation,
@@ -7982,7 +7991,7 @@ mod tests {
             bearer: "a".repeat(64),
         };
         let mut source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -9976,7 +9985,7 @@ mod tests {
         drop(store);
         let start_retry_host = || {
             let source = LogicalDeltaSourceSession::open(
-                directory.path(),
+                PersistentStore::open(directory.path()).unwrap(),
                 directory.path(),
                 PRODUCT_LOGICAL_LIBRARY_ID,
                 &base.manifest.generation,
@@ -11648,7 +11657,7 @@ mod tests {
         };
 
         let mut source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -11794,7 +11803,7 @@ mod tests {
         journal.store(&retained_with_wrong_receipt).unwrap();
         let wrong_source_bytes = fs::read(&backup_path).unwrap();
         let mut wrong_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -11826,7 +11835,7 @@ mod tests {
         fs::remove_file(&backup_path).unwrap();
         fs::write(&backup_path, b"corrupt backup").unwrap();
         let mut corrupt_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -11890,7 +11899,7 @@ mod tests {
 
         fs::remove_file(&backup_path).unwrap();
         let mut missing_backup_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -11927,7 +11936,7 @@ mod tests {
         .unwrap();
         fs::write(&backup_path, b"corrupt persisted backup").unwrap();
         let mut corrupt_persisted_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -11972,7 +11981,7 @@ mod tests {
         }
         journal.store(&wrong_hash_receipt).unwrap();
         let mut wrong_hash_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -11994,7 +12003,7 @@ mod tests {
         journal.store(&retained_with_receipt).unwrap();
 
         let mut resolution_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -12135,7 +12144,7 @@ mod tests {
         journal.store(&target_prepared).unwrap();
 
         let mut resolution_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -12300,7 +12309,7 @@ mod tests {
             bearer: "f".repeat(64),
         };
         let mut remote_source = LogicalDeltaSourceSession::open(
-            &remote_root,
+            PersistentStore::open(&remote_root).unwrap(),
             &remote_root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -12352,7 +12361,7 @@ mod tests {
         drop(local_store);
         let mut local_store = PersistentStore::open(&local_root).unwrap();
         let mut resolution_source = LogicalDeltaSourceSession::open(
-            &remote_root,
+            PersistentStore::open(&remote_root).unwrap(),
             &remote_root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -12388,7 +12397,7 @@ mod tests {
         drop(local_store);
         let mut local_store = PersistentStore::open(&local_root).unwrap();
         let mut resolution_source = LogicalDeltaSourceSession::open(
-            &remote_root,
+            PersistentStore::open(&remote_root).unwrap(),
             &remote_root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -12486,7 +12495,7 @@ mod tests {
             generation_sequence: remote.manifest.generation_sequence.clone(),
         };
         let mut shared_source = LogicalDeltaSourceSession::open(
-            &local_root,
+            PersistentStore::open(&local_root).unwrap(),
             &local_root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &shared.manifest.generation,
@@ -13614,7 +13623,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&remote_cas)
             .unwrap();
         let mut remote_source = LogicalDeltaSourceSession::open(
-            &remote_root,
+            PersistentStore::open(&remote_root).unwrap(),
             &remote_root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote_generation.manifest.generation,
@@ -13665,7 +13674,7 @@ mod tests {
             generation_sequence: remote_generation.manifest.generation_sequence.clone(),
         };
         let mut shared_source = LogicalDeltaSourceSession::open(
-            &local_root,
+            PersistentStore::open(&local_root).unwrap(),
             &local_root,
             PRODUCT_LOGICAL_LIBRARY_ID,
             &shared.manifest.generation,
@@ -14186,7 +14195,7 @@ mod tests {
         );
         let temporary_session_id = "123e4567-e89b-42d3-a456-426614174095";
         let remote_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &remote.manifest.generation,
@@ -14290,7 +14299,7 @@ mod tests {
             .unwrap();
         drop(retry_remote_store);
         let retry_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14343,7 +14352,7 @@ mod tests {
 
         retry_host.stop().unwrap();
         let retry_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14391,7 +14400,7 @@ mod tests {
 
         retry_host.stop().unwrap();
         let retry_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14446,7 +14455,7 @@ mod tests {
             .all(|blocker| !blocker.starts_with("job-pin-unsealed:")));
         retry_host.stop().unwrap();
         let handoff_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14503,7 +14512,7 @@ mod tests {
         drop(retained_old_job);
         let mut sealed_retry_job = DurableCasJob::open(directory.path(), &crashed_job_id).unwrap();
         let mut sealed_retry_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14541,7 +14550,7 @@ mod tests {
             .contains(&format!("job-pin-unsealed:{crashed_job_id}")));
         retry_host.stop().unwrap();
         let observer_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14581,7 +14590,7 @@ mod tests {
             .is_sealed());
         retry_host.stop().unwrap();
         let completion_source = LogicalDeltaSourceSession::open(
-            remote_directory.path(),
+            PersistentStore::open(remote_directory.path()).unwrap(),
             remote_directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &retry_remote.manifest.generation,
@@ -14724,7 +14733,7 @@ mod tests {
             .unwrap();
         let refreshed_source_revision = source_store.revision().unwrap();
         let source = LogicalDeltaSourceSession::open(
-            directory.path(),
+            PersistentStore::open(directory.path()).unwrap(),
             directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &source_active.manifest.generation,
@@ -15987,7 +15996,7 @@ mod tests {
             )
             .unwrap();
         let source = LogicalDeltaSourceSession::open(
-            directory.path(),
+            PersistentStore::open(directory.path()).unwrap(),
             directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &active.manifest.generation,
@@ -16220,7 +16229,7 @@ mod tests {
             fresh.bearer = "b".repeat(64);
             let mut store = PersistentStore::open(local_directory.path()).unwrap();
             let mut source = LogicalDeltaSourceSession::open(
-                remote_directory.path(),
+                PersistentStore::open(remote_directory.path()).unwrap(),
                 remote_directory.path(),
                 PRODUCT_LOGICAL_LIBRARY_ID,
                 &remote.manifest.generation,
@@ -16605,7 +16614,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let source = LogicalDeltaSourceSession::open(
-            directory.path(),
+            PersistentStore::open(directory.path()).unwrap(),
             directory.path(),
             PRODUCT_LOGICAL_LIBRARY_ID,
             &built.manifest.generation,

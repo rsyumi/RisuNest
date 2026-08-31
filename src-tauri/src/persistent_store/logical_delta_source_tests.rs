@@ -108,7 +108,7 @@ impl SourceFixture {
 
     fn open_source(&self) -> LogicalDeltaSourceSession {
         LogicalDeltaSourceSession::open(
-            self.directory.path(),
+            PersistentStore::open(self.directory.path()).expect("open session store"),
             self.directory.path(),
             "library",
             "generation-0",
@@ -262,7 +262,7 @@ fn durable_logical_session_can_resume_after_store_reopen_without_duplicate_pins(
     assert_eq!(logical_source_pin_count(fixture.directory.path()), 1);
 
     let mut source = LogicalDeltaSourceSession::resume(
-        fixture.directory.path(),
+        PersistentStore::open(fixture.directory.path()).expect("open session store"),
         fixture.directory.path(),
         "library",
         "generation-0",
@@ -291,7 +291,7 @@ fn durable_logical_session_can_resume_after_store_reopen_without_duplicate_pins(
 fn owned_logical_source_uses_the_requested_session_prefix() {
     let fixture = SourceFixture::create();
     let mut source = LogicalDeltaSourceSession::open_owned(
-        fixture.directory.path(),
+        PersistentStore::open(fixture.directory.path()).expect("open session store"),
         fixture.directory.path(),
         "library",
         "generation-0",
@@ -310,7 +310,7 @@ fn owned_logical_source_uses_the_requested_session_prefix() {
 fn source_open_rejects_missing_or_incomplete_logical_generations_without_leaking_a_session() {
     let fixture = SourceFixture::create();
     let missing = match LogicalDeltaSourceSession::open(
-        fixture.directory.path(),
+        PersistentStore::open(fixture.directory.path()).expect("open session store"),
         fixture.directory.path(),
         "library",
         "missing",
@@ -337,7 +337,7 @@ fn source_open_rejects_missing_or_incomplete_logical_generations_without_leaking
         .expect("seed incomplete logical generation");
     drop(store);
     let incomplete = match LogicalDeltaSourceSession::open(
-        fixture.directory.path(),
+        PersistentStore::open(fixture.directory.path()).expect("open session store"),
         fixture.directory.path(),
         "library",
         "building",
@@ -370,7 +370,7 @@ fn source_open_releases_its_pin_when_compact_manifest_validation_fails() {
         .expect("corrupt compact logical metadata");
     drop(store);
     let corrupt_open = match LogicalDeltaSourceSession::open(
-        corrupt.directory.path(),
+        PersistentStore::open(corrupt.directory.path()).expect("open session store"),
         corrupt.directory.path(),
         "library",
         "generation-0",

@@ -25,15 +25,19 @@ pub(crate) struct LogicalDeltaSourceSession {
     object_sizes: BTreeMap<String, u64>,
 }
 
+// Sessions run against a dedicated secondary store handle supplied by the
+// caller (PersistentStore::open_native_job_store on the live store). Opening
+// a fresh PersistentStore here would rerun startup-only sweeps (pending
+// restore application, abandoned-staging cleanup, truncating checkpoints)
+// against a database that is already live.
 impl LogicalDeltaSourceSession {
     pub(crate) fn open(
-        app_data_dir: &Path,
+        mut store: PersistentStore,
         repository_root: &Path,
         library_id: &str,
         generation_id: &str,
     ) -> Result<Self, PeerSyncError> {
         let cas = PayloadCas::new(repository_root)?;
-        let mut store = PersistentStore::open(app_data_dir).map_err(map_store_error)?;
         let session_id = store
             .pin_logical_generation(library_id, generation_id)
             .map_err(map_store_error)?;
@@ -41,14 +45,13 @@ impl LogicalDeltaSourceSession {
     }
 
     pub(crate) fn open_owned(
-        app_data_dir: &Path,
+        mut store: PersistentStore,
         repository_root: &Path,
         library_id: &str,
         generation_id: &str,
         session_id_prefix: &str,
     ) -> Result<Self, PeerSyncError> {
         let cas = PayloadCas::new(repository_root)?;
-        let mut store = PersistentStore::open(app_data_dir).map_err(map_store_error)?;
         let session_id = store
             .pin_logical_generation_with_prefix(library_id, generation_id, session_id_prefix)
             .map_err(map_store_error)?;
@@ -59,14 +62,13 @@ impl LogicalDeltaSourceSession {
     // only (the live command paths re-prepare sessions).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resume(
-        app_data_dir: &Path,
+        mut store: PersistentStore,
         repository_root: &Path,
         library_id: &str,
         generation_id: &str,
         session_id: &str,
     ) -> Result<Self, PeerSyncError> {
         let cas = PayloadCas::new(repository_root)?;
-        let mut store = PersistentStore::open(app_data_dir).map_err(map_store_error)?;
         store
             .resume_logical_generation_pin(session_id, library_id, generation_id)
             .map_err(map_store_error)?;

@@ -1136,8 +1136,8 @@ mod tests {
         ] {
             let suffix = export[suffix_key].as_str().unwrap();
             let name = format!("{prefix}{uuid}{suffix}");
-            let (id, kind) = managed_file(Path::new(&name))
-                .unwrap_or_else(|| panic!("{name} is not managed"));
+            let (id, kind) =
+                managed_file(Path::new(&name)).unwrap_or_else(|| panic!("{name} is not managed"));
             assert_eq!(id, uuid);
             assert!(kind == expected_kind, "{name} kind mismatch");
         }

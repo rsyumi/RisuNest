@@ -1500,13 +1500,16 @@ pub async fn peer_delta_prepare(
         };
         let prepared = (|| {
             let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
-            let built = persistent_store::commands::with_store_mut(app.state(), |store| {
-                store.reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)?;
-                store.seal_or_initialize_active_logical_generation(&cas)
-            })
-            .map_err(|error| error.to_string())?;
+            let (built, session_store) =
+                persistent_store::commands::with_store_mut(app.state(), |store| {
+                    store.reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)?;
+                    let built = store.seal_or_initialize_active_logical_generation(&cas)?;
+                    let session_store = store.open_native_job_store()?;
+                    Ok((built, session_store))
+                })
+                .map_err(|error| error.to_string())?;
             let session = LogicalDeltaSourceSession::open_owned(
-                &app_root,
+                session_store,
                 &app_root,
                 &built.manifest.library_id,
                 &built.manifest.generation,
@@ -2106,7 +2109,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let session = LogicalDeltaSourceSession::open_owned(
-            root,
+            store.open_native_job_store().unwrap(),
             root,
             &built.manifest.library_id,
             &built.manifest.generation,
