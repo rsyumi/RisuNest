@@ -2,12 +2,11 @@
 use super::android_foreground::test_registry_guard;
 #[cfg(any(target_os = "android", test))]
 use super::android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane};
-use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
 #[cfg(desktop)]
-use super::{
-    lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE},
-    tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure},
-};
+use super::lan::discover_lan_ipv4;
+#[cfg(desktop)]
+use super::lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
+use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
 use super::{
     lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
     logical_delta::decode_logical_manifest,
@@ -27,17 +26,13 @@ use crate::{
         PersistentLogicalDeltaTarget, PersistentStore, StoreError, PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
-#[cfg(desktop)]
-use serde::Deserialize;
 use serde::Serialize;
-#[cfg(desktop)]
-use std::time::Duration;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::{Ipv4Addr, UdpSocket},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
@@ -87,63 +82,12 @@ enum PeerDeltaSourcePhase {
 }
 
 #[cfg(desktop)]
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum PeerDeltaTunnelStart {
-    Quick,
-    Named {
-        token: String,
-        #[serde(rename = "expectedPublicBaseUrl")]
-        expected_public_base_url: String,
-    },
-}
-
+pub use super::tunnel_lifecycle::PeerTunnelStart as PeerDeltaTunnelStart;
 #[cfg(desktop)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum PeerDeltaTunnelKind {
-    Quick,
-    Named,
-}
-
-#[cfg(desktop)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PeerDeltaTunnelMetadata {
-    kind: PeerDeltaTunnelKind,
-    experimental: bool,
-    one_shot: bool,
-}
-
-#[cfg(desktop)]
-impl PeerDeltaTunnelMetadata {
-    fn quick() -> Self {
-        Self {
-            kind: PeerDeltaTunnelKind::Quick,
-            experimental: true,
-            one_shot: true,
-        }
-    }
-
-    fn named() -> Self {
-        Self {
-            kind: PeerDeltaTunnelKind::Named,
-            experimental: false,
-            one_shot: false,
-        }
-    }
-}
-
-#[cfg(desktop)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum PeerDeltaTunnelPhase {
-    Idle,
-    Starting,
-    Running,
-    Stopping,
-    Stopped,
-}
+use super::tunnel_lifecycle::{
+    PeerTunnelKind as PeerDeltaTunnelKind, PeerTunnelMetadata as PeerDeltaTunnelMetadata,
+    PeerTunnelPhase as PeerDeltaTunnelPhase,
+};
 
 #[cfg(desktop)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -155,119 +99,11 @@ pub struct PeerDeltaTunnelStatus {
 }
 
 #[cfg(desktop)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeltaTunnelLifecycle {
-    Running,
-    CleanupPending,
-    Stopped,
-}
-
-#[cfg(desktop)]
-trait DeltaTunnel: Send {
-    fn transport_url(&self) -> url::Url;
-    fn lifecycle(&mut self) -> Result<DeltaTunnelLifecycle, String>;
-    fn stop(&mut self) -> Result<(), String>;
-}
-
-#[cfg(desktop)]
-trait FailedDeltaTunnel: Send {
-    fn recover_host(&mut self) -> Result<Option<LanCloneHost>, String>;
-    fn stop(&mut self) -> Result<(), String>;
-}
-
-#[cfg(desktop)]
-trait DeltaTunnelLauncher: Send + Sync {
-    fn start(
-        &self,
-        request: PeerDeltaTunnelStart,
-        host: LanCloneHost,
-    ) -> Result<Box<dyn DeltaTunnel>, Box<dyn FailedDeltaTunnel>>;
-}
-
-#[cfg(desktop)]
-struct SystemDeltaTunnel(tunnel::RunningTunnel);
-
-#[cfg(desktop)]
-impl DeltaTunnel for SystemDeltaTunnel {
-    fn transport_url(&self) -> url::Url {
-        self.0.transport_url().clone()
-    }
-
-    fn lifecycle(&mut self) -> Result<DeltaTunnelLifecycle, String> {
-        self.0
-            .poll_lifecycle()
-            .map(|lifecycle| match lifecycle {
-                RunningTunnelLifecycle::Running => DeltaTunnelLifecycle::Running,
-                RunningTunnelLifecycle::CleanupPending => DeltaTunnelLifecycle::CleanupPending,
-                RunningTunnelLifecycle::Stopped => DeltaTunnelLifecycle::Stopped,
-            })
-            .map_err(|_| "peer delta tunnel status is unavailable".to_owned())
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        self.0
-            .stop(Duration::from_secs(2))
-            .map_err(|_| "peer delta tunnel failed to stop".to_owned())
-    }
-}
-
-#[cfg(desktop)]
-type SystemDeltaTunnelStartFailure = TunnelStartFailure<SystemTunnelProcess, LanCloneHost>;
-
-#[cfg(desktop)]
-struct SystemFailedDeltaTunnel(Option<SystemDeltaTunnelStartFailure>);
-
-#[cfg(desktop)]
-impl FailedDeltaTunnel for SystemFailedDeltaTunnel {
-    fn recover_host(&mut self) -> Result<Option<LanCloneHost>, String> {
-        let Some(failure) = self.0.take() else {
-            return Ok(None);
-        };
-        match failure.retry_into_peer_session() {
-            Ok(host) => Ok(Some(host)),
-            Err(failure) => {
-                self.0 = Some(failure);
-                Err("peer delta tunnel cleanup is pending".to_owned())
-            }
-        }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        let Some(failure) = self.0.as_mut() else {
-            return Ok(());
-        };
-        failure
-            .retry_cleanup()
-            .map_err(|_| "peer delta tunnel failed to stop".to_owned())?;
-        self.0 = None;
-        Ok(())
-    }
-}
-
-#[cfg(desktop)]
-struct SystemDeltaTunnelLauncher;
-
-#[cfg(desktop)]
-impl DeltaTunnelLauncher for SystemDeltaTunnelLauncher {
-    fn start(
-        &self,
-        request: PeerDeltaTunnelStart,
-        host: LanCloneHost,
-    ) -> Result<Box<dyn DeltaTunnel>, Box<dyn FailedDeltaTunnel>> {
-        let result = match request {
-            PeerDeltaTunnelStart::Quick => tunnel::start_quick_desktop_tunnel(host),
-            PeerDeltaTunnelStart::Named {
-                token,
-                expected_public_base_url,
-            } => tunnel::start_named_desktop_tunnel(host, token, &expected_public_base_url),
-        };
-        result
-            .map(|tunnel| Box::new(SystemDeltaTunnel(tunnel)) as Box<dyn DeltaTunnel>)
-            .map_err(|failure| {
-                Box::new(SystemFailedDeltaTunnel(Some(failure))) as Box<dyn FailedDeltaTunnel>
-            })
-    }
-}
+use super::tunnel_lifecycle::{
+    FailedPeerTunnel as FailedDeltaTunnel, PeerTunnel as DeltaTunnel,
+    PeerTunnelLauncher as DeltaTunnelLauncher, PeerTunnelLifecycle as DeltaTunnelLifecycle,
+    SystemPeerTunnelLauncher,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,7 +204,7 @@ impl Default for PeerDeltaCommandState {
             runtime: Arc::new(Mutex::new(PeerDeltaRuntime::default())),
             lifecycle_operation: Arc::new(Mutex::new(())),
             #[cfg(desktop)]
-            tunnel_launcher: Arc::new(SystemDeltaTunnelLauncher),
+            tunnel_launcher: Arc::new(SystemPeerTunnelLauncher { lane: "delta" }),
         }
     }
 }
@@ -1826,28 +1662,7 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
-    let mut uri = url::Url::parse("risuailocal://peer-delta/v1")
-        .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-    uri.query_pairs_mut()
-        .append_pair("endpoint", endpoint)
-        .append_pair("session", &pairing.session_id)
-        .append_pair("manifest", &pairing.manifest_id);
-    uri.set_fragment(Some(&format!("claim={}", pairing.claim)));
-    Ok(uri.to_string())
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-    match socket.local_addr()?.ip() {
-        std::net::IpAddr::V4(address) if address.is_private() || address.is_link_local() => {
-            Ok(address)
-        }
-        _ => Err(PeerSyncError::Validation(
-            "no private IPv4 LAN address is available".to_owned(),
-        )),
-    }
+    super::tunnel_lifecycle::build_lane_pairing_uri("peer-delta", endpoint, pairing)
 }
 
 pub(crate) fn load_or_create_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
@@ -1940,6 +1755,7 @@ mod tests {
             mpsc, Arc, Barrier,
         },
         thread,
+        time::Duration,
     };
 
     struct CancelAfterFirstReadSource {

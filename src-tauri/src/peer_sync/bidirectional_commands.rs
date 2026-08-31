@@ -2,6 +2,10 @@
 use super::android_foreground::AndroidForegroundKey;
 #[cfg(any(target_os = "android", test))]
 use super::android_foreground::{registry, AndroidCancellationProbe, AndroidForegroundLane};
+#[cfg_attr(target_os = "android", allow(unused_imports))]
+use super::lan::discover_lan_ipv4;
+#[cfg(test)]
+pub(crate) use super::lan::DISCOVER_LAN_IPV4_OVERRIDE;
 #[cfg(desktop)]
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
@@ -44,7 +48,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::{Ipv4Addr, UdpSocket},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
@@ -85,7 +89,6 @@ thread_local! {
     static ABANDON_BEFORE_CLAIM_REPLACEMENT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     static ABANDON_CLAIM_REMOVE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static ABANDON_AFTER_CLAIM_FAILPOINT: Cell<bool> = const { Cell::new(false) };
-    static DISCOVER_LAN_IPV4_OVERRIDE: Cell<Option<Ipv4Addr>> = const { Cell::new(None) };
     static BACKUP_FULL_VERIFICATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -4304,51 +4307,11 @@ pub enum PeerBidirectionalSourcePhase {
 }
 
 // Desktop-only tunnel lifecycle; Android sources pair over the trusted LAN.
-#[cfg_attr(target_os = "android", allow(dead_code))]
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum PeerBidirectionalTunnelStart {
-    Quick,
-    Named {
-        token: String,
-        #[serde(rename = "expectedPublicBaseUrl")]
-        expected_public_base_url: String,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(target_os = "android", allow(dead_code))]
-enum PeerBidirectionalTunnelKind {
-    Quick,
-    Named,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PeerBidirectionalTunnelMetadata {
-    kind: PeerBidirectionalTunnelKind,
-    experimental: bool,
-    one_shot: bool,
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-impl PeerBidirectionalTunnelMetadata {
-    fn quick() -> Self {
-        Self {
-            kind: PeerBidirectionalTunnelKind::Quick,
-            experimental: true,
-            one_shot: true,
-        }
-    }
-    fn named() -> Self {
-        Self {
-            kind: PeerBidirectionalTunnelKind::Named,
-            experimental: false,
-            one_shot: false,
-        }
-    }
-}
+#[cfg_attr(target_os = "android", allow(unused_imports))]
+use super::tunnel_lifecycle::PeerTunnelKind as PeerBidirectionalTunnelKind;
+use super::tunnel_lifecycle::PeerTunnelMetadata as PeerBidirectionalTunnelMetadata;
+#[cfg_attr(target_os = "android", allow(unused_imports))]
+pub use super::tunnel_lifecycle::PeerTunnelStart as PeerBidirectionalTunnelStart;
 
 #[cfg(desktop)]
 struct BidirectionalTunnel(tunnel::RunningTunnel);
@@ -5613,32 +5576,7 @@ pub fn peer_bidirectional_target_foreground_release(
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
-    let mut uri = url::Url::parse("risuailocal://peer-sync/v1")
-        .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-    uri.query_pairs_mut()
-        .append_pair("endpoint", endpoint)
-        .append_pair("session", &pairing.session_id)
-        .append_pair("manifest", &pairing.manifest_id);
-    uri.set_fragment(Some(&format!("claim={}", pairing.claim)));
-    Ok(uri.to_string())
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
-    #[cfg(test)]
-    if let Some(address) = DISCOVER_LAN_IPV4_OVERRIDE.with(Cell::take) {
-        return Ok(address);
-    }
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-    match socket.local_addr()?.ip() {
-        std::net::IpAddr::V4(address) if address.is_private() || address.is_link_local() => {
-            Ok(address)
-        }
-        _ => Err(PeerSyncError::Validation(
-            "no private IPv4 LAN address is available".to_owned(),
-        )),
-    }
+    super::tunnel_lifecycle::build_lane_pairing_uri("peer-sync", endpoint, pairing)
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {

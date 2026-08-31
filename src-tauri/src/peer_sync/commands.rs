@@ -1,11 +1,8 @@
+use super::lan::{validate_lan_endpoint, LanCloneHostControl, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
 use super::{
     activate_downloaded_clone, prepare_lossless_clone_session, CloneTargetAdapter, LanCloneClient,
     LanCloneHost, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
     TransferCancellation,
-};
-use super::{
-    lan::{validate_lan_endpoint, LanCloneHostControl, NAMED_TUNNEL_ORIGIN_UNAVAILABLE},
-    tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure},
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -17,11 +14,10 @@ use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     thread::{self, JoinHandle},
-    time::Duration,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -92,59 +88,10 @@ pub enum PeerCloneSourcePhase {
     Stopped,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum PeerCloneTunnelStart {
-    Quick,
-    Named {
-        token: String,
-        #[serde(rename = "expectedPublicBaseUrl")]
-        expected_public_base_url: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PeerCloneTunnelKind {
-    Quick,
-    Named,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerCloneTunnelMetadata {
-    kind: PeerCloneTunnelKind,
-    experimental: bool,
-    one_shot: bool,
-}
-
-impl PeerCloneTunnelMetadata {
-    fn quick() -> Self {
-        Self {
-            kind: PeerCloneTunnelKind::Quick,
-            experimental: true,
-            one_shot: true,
-        }
-    }
-
-    fn named() -> Self {
-        Self {
-            kind: PeerCloneTunnelKind::Named,
-            experimental: false,
-            one_shot: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PeerCloneTunnelPhase {
-    Idle,
-    Starting,
-    Running,
-    Stopping,
-    Stopped,
-}
+pub use super::tunnel_lifecycle::{
+    PeerTunnelMetadata as PeerCloneTunnelMetadata, PeerTunnelPhase as PeerCloneTunnelPhase,
+    PeerTunnelStart as PeerCloneTunnelStart,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,113 +204,12 @@ impl<S> super::CloneValidator<S> for VerifiedCloneValidator {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SourceTunnelLifecycle {
-    Running,
-    CleanupPending,
-    Stopped,
-}
-
-trait SourceTunnel: Send {
-    fn transport_url(&self) -> url::Url;
-    fn lifecycle(&mut self) -> Result<SourceTunnelLifecycle, String>;
-    fn stop(&mut self) -> Result<(), String>;
-}
-
-trait FailedSourceTunnel: Send {
-    fn recover_host(&mut self) -> Result<Option<LanCloneHost>, String>;
-    fn stop(&mut self) -> Result<(), String>;
-}
-
-trait SourceTunnelLauncher: Send + Sync {
-    fn start(
-        &self,
-        tunnel: PeerCloneTunnelStart,
-        host: LanCloneHost,
-    ) -> Result<Box<dyn SourceTunnel>, Box<dyn FailedSourceTunnel>>;
-}
-
-struct SystemSourceTunnel(tunnel::RunningTunnel);
-
-impl SourceTunnel for SystemSourceTunnel {
-    fn transport_url(&self) -> url::Url {
-        self.0.transport_url().clone()
-    }
-
-    fn lifecycle(&mut self) -> Result<SourceTunnelLifecycle, String> {
-        self.0
-            .poll_lifecycle()
-            .map(|lifecycle| match lifecycle {
-                RunningTunnelLifecycle::Running => SourceTunnelLifecycle::Running,
-                RunningTunnelLifecycle::CleanupPending => SourceTunnelLifecycle::CleanupPending,
-                RunningTunnelLifecycle::Stopped => SourceTunnelLifecycle::Stopped,
-            })
-            .map_err(|_| "peer clone tunnel status is unavailable".to_owned())
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        self.0
-            .stop(Duration::from_secs(2))
-            .map_err(|_| "peer clone tunnel failed to stop".to_owned())
-    }
-}
-
-type SystemTunnelStartFailure = TunnelStartFailure<SystemTunnelProcess, LanCloneHost>;
-
-struct SystemFailedSourceTunnel {
-    failure: Option<SystemTunnelStartFailure>,
-}
-
-impl FailedSourceTunnel for SystemFailedSourceTunnel {
-    fn recover_host(&mut self) -> Result<Option<LanCloneHost>, String> {
-        let Some(failure) = self.failure.take() else {
-            return Ok(None);
-        };
-        match failure.retry_into_peer_session() {
-            Ok(host) => Ok(Some(host)),
-            Err(failure) => {
-                self.failure = Some(failure);
-                Err("peer clone tunnel cleanup is pending".to_owned())
-            }
-        }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        let Some(failure) = self.failure.as_mut() else {
-            return Ok(());
-        };
-        failure
-            .retry_cleanup()
-            .map_err(|_| "peer clone tunnel failed to stop".to_owned())?;
-        self.failure = None;
-        Ok(())
-    }
-}
-
-struct SystemSourceTunnelLauncher;
-
-impl SourceTunnelLauncher for SystemSourceTunnelLauncher {
-    fn start(
-        &self,
-        request: PeerCloneTunnelStart,
-        host: LanCloneHost,
-    ) -> Result<Box<dyn SourceTunnel>, Box<dyn FailedSourceTunnel>> {
-        let started = match request {
-            PeerCloneTunnelStart::Quick => tunnel::start_quick_desktop_tunnel(host),
-            PeerCloneTunnelStart::Named {
-                token,
-                expected_public_base_url,
-            } => tunnel::start_named_desktop_tunnel(host, token, &expected_public_base_url),
-        };
-        started
-            .map(|running| Box::new(SystemSourceTunnel(running)) as Box<dyn SourceTunnel>)
-            .map_err(|failure| {
-                Box::new(SystemFailedSourceTunnel {
-                    failure: Some(failure),
-                }) as Box<dyn FailedSourceTunnel>
-            })
-    }
-}
+use super::lan::discover_lan_ipv4;
+use super::tunnel_lifecycle::{
+    FailedPeerTunnel as FailedSourceTunnel, PeerTunnel as SourceTunnel,
+    PeerTunnelKind as PeerCloneTunnelKind, PeerTunnelLauncher as SourceTunnelLauncher,
+    PeerTunnelLifecycle as SourceTunnelLifecycle, SystemPeerTunnelLauncher,
+};
 
 const ACTIVE_SOURCE_MARKER_SCHEMA: &str = "risunest.peer-clone-active-source/v1";
 const ACTIVE_SOURCE_MARKER_FILE: &str = "active-source.json";
@@ -499,7 +345,7 @@ impl Default for PeerCloneCommandState {
     fn default() -> Self {
         Self {
             runtime: Arc::new(Mutex::new(PeerCloneRuntime::default())),
-            tunnel_launcher: Arc::new(SystemSourceTunnelLauncher),
+            tunnel_launcher: Arc::new(SystemPeerTunnelLauncher { lane: "clone" }),
         }
     }
 }
@@ -2207,14 +2053,7 @@ fn is_canonical_uuid(value: &str) -> bool {
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
-    let mut uri = url::Url::parse("risuailocal://peer-clone/v1")
-        .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-    uri.query_pairs_mut()
-        .append_pair("endpoint", endpoint)
-        .append_pair("session", &pairing.session_id)
-        .append_pair("manifest", &pairing.manifest_id);
-    uri.set_fragment(Some(&format!("claim={}", pairing.claim)));
-    Ok(uri.to_string())
+    super::tunnel_lifecycle::build_lane_pairing_uri("peer-clone", endpoint, pairing)
 }
 
 fn tunnel_start_error() -> PeerSyncError {
@@ -2229,19 +2068,6 @@ fn public_tunnel_start_error(error: PeerSyncError) -> String {
     match error {
         PeerSyncError::Transport(message) if message == NAMED_TUNNEL_ORIGIN_UNAVAILABLE => message,
         _ => "peer clone tunnel failed to start".to_owned(),
-    }
-}
-
-fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-    match socket.local_addr()?.ip() {
-        std::net::IpAddr::V4(address) if address.is_private() || address.is_link_local() => {
-            Ok(address)
-        }
-        _ => Err(PeerSyncError::Validation(
-            "no private IPv4 LAN address is available".to_owned(),
-        )),
     }
 }
 

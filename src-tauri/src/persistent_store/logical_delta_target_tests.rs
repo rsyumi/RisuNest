@@ -24,8 +24,7 @@ use crate::{
     },
     persistent_store::{
         logical_index::LogicalIndexBuildRequest, snapshot, AssetOwnerHead, AssetOwnerLocator,
-        PersistentStore, SyncGenerationIdentity, VerifiedSyncDeviceRegistration,
-        WorkingSetCommit,
+        PersistentStore, SyncGenerationIdentity, VerifiedSyncDeviceRegistration, WorkingSetCommit,
     },
 };
 use serde_json::json;
@@ -544,20 +543,19 @@ fn exact_plan_reports_delete_vs_edit_as_a_typed_merge_conflict() {
         storage_key: "shared-plugin".to_owned(),
     })
     .unwrap();
-    let manifest =
-        |generation: &str,
-         sequence: &str,
-         record: LogicalManifestRecord,
-         objects: Vec<LogicalManifestObject>| LogicalManifest {
-            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
-            library_id: "library".to_owned(),
-            generation: generation.to_owned(),
-            generation_sequence: sequence.to_owned(),
-            parent_generation: None,
-            source_revision: 1,
-            records: vec![record],
-            objects,
-        };
+    let manifest = |generation: &str,
+                    sequence: &str,
+                    record: LogicalManifestRecord,
+                    objects: Vec<LogicalManifestObject>| LogicalManifest {
+        schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+        library_id: "library".to_owned(),
+        generation: generation.to_owned(),
+        generation_sequence: sequence.to_owned(),
+        parent_generation: None,
+        source_revision: 1,
+        records: vec![record],
+        objects,
+    };
     let live = |hash: &str| {
         LogicalManifestRecord::Live(LogicalManifestLiveRecord {
             key: key.clone(),
@@ -638,13 +636,9 @@ fn policy_reject_returns_sorted_typed_conflicts_without_a_plan() {
     let local = manifest("local", vec![plugin("alpha", "b"), tombstone("beta")]);
     let remote = manifest("remote", vec![plugin("alpha", "c"), plugin("beta", "c")]);
 
-    let resolution = derive_policy_three_way_plan(
-        &base,
-        &local,
-        &remote,
-        LogicalDeltaConflictPolicy::Reject,
-    )
-    .unwrap();
+    let resolution =
+        derive_policy_three_way_plan(&base, &local, &remote, LogicalDeltaConflictPolicy::Reject)
+            .unwrap();
 
     assert_eq!(resolution.apply, vec![]);
     assert_eq!(resolution.preserve_local_keys, Vec::<String>::new());
@@ -1161,8 +1155,7 @@ fn structured_records_are_applied_to_invisible_staging_one_at_a_time() {
             },
         )
         .expect("build local logical index");
-    let (base, _bytes, base_hash) =
-        store_remote_base_manifest(&cas, &local.manifest, "remote-0");
+    let (base, _bytes, base_hash) = store_remote_base_manifest(&cas, &local.manifest, "remote-0");
     store
         .connection
         .execute(
@@ -1525,8 +1518,7 @@ fn duplicate_configured_index_aborts_without_exposing_staging() {
             },
         )
         .unwrap();
-    let (base, _bytes, base_hash) =
-        store_remote_base_manifest(&cas, &local.manifest, "remote-0");
+    let (base, _bytes, base_hash) = store_remote_base_manifest(&cas, &local.manifest, "remote-0");
     store
         .connection
         .execute(
@@ -2432,8 +2424,7 @@ fn no_op_updates_only_the_durable_common_base_at_the_same_revision() {
     remote_manifest.generation = "remote-1".to_owned();
     remote_manifest.generation_sequence = "1".to_owned();
     remote_manifest.parent_generation = Some("remote-0".to_owned());
-    let remote_bytes =
-        encode_logical_manifest(&remote_manifest).expect("encode remote manifest");
+    let remote_bytes = encode_logical_manifest(&remote_manifest).expect("encode remote manifest");
     let remote_hash = hash(&remote_bytes);
     let plan = ReadyLogicalDeltaPlan {
         expected_local_revision: 0,
@@ -2519,8 +2510,7 @@ fn no_op_updates_only_the_durable_common_base_at_the_same_revision() {
 
     drop(store);
     drop(cas);
-    let mut store =
-        PersistentStore::open(directory.path()).expect("reopen after committed no-op");
+    let mut store = PersistentStore::open(directory.path()).expect("reopen after committed no-op");
     let cas = PayloadCas::new(directory.path()).expect("reopen payload CAS");
     let mut retry_source = EmptySource { content_gets: 0 };
     let mut retry_target = PersistentLogicalDeltaTarget::new(

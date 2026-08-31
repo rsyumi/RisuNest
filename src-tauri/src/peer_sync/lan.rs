@@ -1915,6 +1915,34 @@ fn validate_object_hash(object: &str) -> Result<(), PeerSyncError> {
     }
 }
 
+#[cfg(all(test, any(desktop, target_os = "android")))]
+thread_local! {
+    pub(crate) static DISCOVER_LAN_IPV4_OVERRIDE: std::cell::Cell<Option<Ipv4Addr>> =
+        const { std::cell::Cell::new(None) };
+}
+
+// Discovers this device's private or link-local IPv4 by opening a UDP socket
+// toward a TEST-NET address; nothing is sent. Shared by every peer sync lane.
+// Android sources bind explicitly selected interfaces instead.
+#[cfg(any(desktop, target_os = "android"))]
+#[cfg_attr(target_os = "android", allow(dead_code))]
+pub(crate) fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
+    #[cfg(test)]
+    if let Some(address) = DISCOVER_LAN_IPV4_OVERRIDE.with(std::cell::Cell::take) {
+        return Ok(address);
+    }
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+    match socket.local_addr()?.ip() {
+        std::net::IpAddr::V4(address) if address.is_private() || address.is_link_local() => {
+            Ok(address)
+        }
+        _ => Err(PeerSyncError::Validation(
+            "no private IPv4 LAN address is available".to_owned(),
+        )),
+    }
+}
+
 pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
     let url = reqwest::Url::parse(value)
         .map_err(|_| PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))?;

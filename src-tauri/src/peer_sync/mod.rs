@@ -36,6 +36,8 @@ mod session;
 
 #[cfg(desktop)]
 mod tunnel;
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) mod tunnel_lifecycle;
 
 #[cfg(all(test, desktop))]
 mod tests;
