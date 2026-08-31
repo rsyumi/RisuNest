@@ -6468,6 +6468,78 @@ mod tests {
     }
 
     #[test]
+    fn handoff_cleanup_grammar_matches_the_shared_taxonomy_golden_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/ts/storage/tests/fixtures/nativeFileTaxonomyV1Golden.json"
+        ))
+        .unwrap();
+        let uuid = fixture["uuid"].as_str().unwrap();
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        let handoffs = root.join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        type Cleanup = fn(&Path, &Path) -> Result<bool, NativeJobError>;
+        let cleanup_for = |kind: &str| -> Cleanup {
+            match kind {
+                "lossless-backup" => cleanup_lossless_handoff_path,
+                "legacy-backup" => cleanup_legacy_backup_handoff_path,
+                "character-charx" => cleanup_character_charx_handoff_path,
+                "character-card" => cleanup_character_card_handoff_path,
+                "risu-module" => cleanup_risu_module_handoff_path,
+                other => panic!("fixture grammar {other} has no cleanup entry point"),
+            }
+        };
+        let grammars = fixture["managedHandoffs"].as_array().unwrap();
+        assert_eq!(grammars.len(), 5, "grammar count drifted from the fixture");
+
+        for grammar in grammars {
+            let kind = grammar["kind"].as_str().unwrap();
+            let prefix = grammar["prefix"].as_str().unwrap();
+            let cleanup = cleanup_for(kind);
+            for suffix in grammar["suffixes"].as_array().unwrap() {
+                let suffix = suffix.as_str().unwrap();
+                let owned = handoffs.join(format!("{prefix}{uuid}{suffix}"));
+                fs::write(&owned, b"owned").unwrap();
+                assert!(
+                    cleanup(&root, &owned).unwrap(),
+                    "{prefix}{uuid}{suffix} must be cleaned by {kind}"
+                );
+                assert!(!owned.exists());
+                // Every other grammar must refuse this name.
+                fs::write(&owned, b"owned").unwrap();
+                for other in grammars {
+                    let other_kind = other["kind"].as_str().unwrap();
+                    if other_kind == kind {
+                        continue;
+                    }
+                    assert_eq!(
+                        cleanup_for(other_kind)(&root, &owned).unwrap_err().code,
+                        "invalid-input",
+                        "{other_kind} accepted {prefix}{uuid}{suffix}"
+                    );
+                }
+                assert!(owned.exists());
+                fs::remove_file(&owned).unwrap();
+            }
+        }
+
+        for rejected in fixture["rejectedModuleNames"].as_array().unwrap() {
+            let rejected = rejected.as_str().unwrap();
+            let path = handoffs.join(rejected);
+            fs::write(&path, b"rejected").unwrap();
+            assert_eq!(
+                cleanup_risu_module_handoff_path(&root, &path)
+                    .unwrap_err()
+                    .code,
+                "invalid-input",
+                "{rejected} must be rejected"
+            );
+            assert!(path.exists());
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
     fn lossless_handoff_cleanup_removes_only_exact_owned_files_and_is_idempotent() {
         let directory = TempDir::new().unwrap();
         let root = directory.path().join("native-file-jobs");

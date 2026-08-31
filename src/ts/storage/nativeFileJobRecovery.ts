@@ -24,21 +24,29 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
     androidSafExportId: () => getAndroidSafExportSourceId(),
 }
 
+// Managed handoff filename grammar per export job kind. Mirrors the Kotlin
+// SafFileBridge regexes and the Rust handoff cleanup naming; the alignment is
+// pinned by the shared taxonomy golden fixture
+// (tests/fixtures/nativeFileTaxonomyV1Golden.json).
+export const ANDROID_SAF_HANDOFF_ID_PATTERNS: Partial<
+    Record<NativeFileJobStatus['kind'], RegExp>
+> = {
+    'export-lossless-backup':
+        /(?:^|[\\/])risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risulossless$/,
+    'export-legacy-local-backup':
+        /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/,
+    'export-character-charx':
+        /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:charx|jpeg)$/,
+    'export-character-card':
+        /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:json|png)$/,
+    'export-risu-module':
+        /(?:^|[\\/])risu-module-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risum$/,
+}
+
 function androidSafHandoffId(status: NativeFileJobStatus): string | null {
     const path = status.result?.handoffPath
     if (!path) return null
-    const pattern = status.kind === 'export-lossless-backup'
-        ? /(?:^|[\\/])risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risulossless$/
-        : status.kind === 'export-legacy-local-backup'
-            ? /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/
-            : status.kind === 'export-character-charx'
-                ? /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:charx|jpeg)$/
-                : status.kind === 'export-character-card'
-                    ? /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:json|png)$/
-                    : status.kind === 'export-risu-module'
-                        ? /(?:^|[\\/])risu-module-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risum$/
-                    : null
-    return pattern?.exec(path)?.[1] ?? null
+    return ANDROID_SAF_HANDOFF_ID_PATTERNS[status.kind]?.exec(path)?.[1] ?? null
 }
 
 export function shouldReconcileNativeFileJobs(

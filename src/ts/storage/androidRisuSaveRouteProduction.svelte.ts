@@ -14,6 +14,7 @@ import {
     listenAndroidSpoolBatches,
     type AndroidSpoolBatch,
     type AndroidSpoolFailure,
+    isAndroidNativeContentSpool,
     type AndroidSpoolReady,
 } from './androidSafBridge'
 import { createAndroidRisuSaveSpoolRoute } from './androidRisuSaveRoute'
@@ -43,15 +44,6 @@ export interface AndroidOpenedSpoolDispatchDependencies {
     reportDestinationRequired(source: AndroidSpoolReady): void
 }
 
-function isAndroidNativeContentSpool(source: AndroidSpoolReady): boolean {
-    const displayName = source.displayName.toLocaleLowerCase('en-US')
-    return displayName.endsWith('.json')
-        || displayName.endsWith('.charx')
-        || displayName.endsWith('.jpg')
-        || displayName.endsWith('.jpeg')
-        || displayName.endsWith('.png')
-        || displayName.endsWith('.risum')
-}
 
 export async function dispatchAndroidOpenedSpoolBatch(
     batch: AndroidSpoolBatch,

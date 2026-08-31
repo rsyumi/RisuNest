@@ -70,6 +70,20 @@ export interface AndroidSpoolConsumer {
     failed?(failure: AndroidSpoolFailure): void
 }
 
+// Content-spool suffix subset. Together with the database restore suffixes
+// checked in consumeAndroidSpoolBatch below, it forms the Kotlin
+// NATIVE_FILE_JOB_SPOOL_SUFFIXES allowlist; the alignment is pinned by the
+// shared taxonomy golden fixture (tests/fixtures/nativeFileTaxonomyV1Golden.json).
+export function isAndroidNativeContentSpool(source: AndroidSpoolReady): boolean {
+    const displayName = source.displayName.toLocaleLowerCase('en-US')
+    return displayName.endsWith('.json')
+        || displayName.endsWith('.charx')
+        || displayName.endsWith('.jpg')
+        || displayName.endsWith('.jpeg')
+        || displayName.endsWith('.png')
+        || displayName.endsWith('.risum')
+}
+
 export async function consumeAndroidSpoolBatch(
     batch: AndroidSpoolBatch,
     consumer: AndroidSpoolConsumer,

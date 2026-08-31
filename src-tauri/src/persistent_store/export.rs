@@ -1120,6 +1120,40 @@ mod tests {
 
     const HEADER: &[u8] = b"RISUSAVE\0";
 
+    #[test]
+    fn risusave_export_naming_matches_the_shared_taxonomy_golden_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../src/ts/storage/tests/fixtures/nativeFileTaxonomyV1Golden.json"
+        ))
+        .unwrap();
+        let export = &fixture["risuSaveExport"];
+        let prefix = export["prefix"].as_str().unwrap();
+        let uuid = fixture["uuid"].as_str().unwrap();
+        for (suffix_key, expected_kind) in [
+            ("dataSuffix", ManagedFileKind::Completed),
+            ("temporarySuffix", ManagedFileKind::Temporary),
+            ("leaseSuffix", ManagedFileKind::Ownership),
+        ] {
+            let suffix = export[suffix_key].as_str().unwrap();
+            let name = format!("{prefix}{uuid}{suffix}");
+            let (id, kind) = managed_file(Path::new(&name))
+                .unwrap_or_else(|| panic!("{name} is not managed"));
+            assert_eq!(id, uuid);
+            assert!(kind == expected_kind, "{name} kind mismatch");
+        }
+        for rejected in [
+            format!("{prefix}{}{}", uuid.to_uppercase(), ".risudat"),
+            format!("{prefix}not-a-uuid.risudat"),
+            format!("save-{uuid}.risudat"),
+            format!("{prefix}{uuid}.zip"),
+        ] {
+            assert!(
+                managed_file(Path::new(&rejected)).is_none(),
+                "{rejected} must not be managed"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct Block {
         block_type: u8,
