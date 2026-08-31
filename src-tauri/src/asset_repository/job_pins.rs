@@ -936,10 +936,6 @@ fn recover_incomplete_tail_already_guarded(file: &mut File, valid_length: u64) -
     journal_frame::truncate_to_valid_prefix(file, valid_length)
 }
 
-fn json_error(error: serde_json::Error) -> io::Error {
-    io::Error::new(ErrorKind::InvalidData, error)
-}
-
 fn invalid_data<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(ErrorKind::InvalidData, message.into()))
 }
