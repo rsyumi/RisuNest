@@ -1,12 +1,18 @@
+// The android_* modules are compiled on desktop only so tests can exercise
+// them; the Android build itself keeps full dead-code checking, and the
+// desktop-test mirror compile must not flag Android-only entry points.
 #[cfg(any(target_os = "android", test))]
 mod android_client;
 #[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports))]
 pub(crate) mod android_commands;
 #[cfg(any(desktop, target_os = "android", test))]
 pub(crate) mod android_foreground;
 #[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports))]
 mod android_jni;
 #[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports))]
 pub(crate) mod android_source_commands;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod bidirectional_commands;
@@ -15,7 +21,9 @@ mod client;
 pub(crate) mod commands;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod delta_commands;
-#[cfg(desktop)]
+// The loopback host is a test-only transport double; production clone hosting
+// goes through lan::LanCloneHost.
+#[cfg(all(desktop, test))]
 mod host;
 mod http_stream;
 mod lan;
@@ -32,30 +40,35 @@ mod tunnel;
 #[cfg(all(test, desktop))]
 mod tests;
 
+#[cfg(test)]
+pub use android_client::AndroidCloneJobPhase;
 #[cfg(any(target_os = "android", test))]
-pub use android_client::{AndroidCloneJobPhase, AndroidResumableCloneJob};
+pub use android_client::AndroidResumableCloneJob;
+#[cfg(any(target_os = "android", test))]
+pub use client::DownloadReport;
 pub use client::{
-    activate_downloaded_clone, CloneActivation, CloneTargetAdapter, CloneValidator, DownloadReport,
+    activate_downloaded_clone, CloneActivation, CloneTargetAdapter, CloneValidator,
     LoopbackCloneClient, TransferCancellation,
 };
-#[cfg(desktop)]
+#[cfg(all(desktop, test))]
 pub use host::LoopbackCloneHost;
 pub use lan::LanCloneClient;
 #[cfg(any(desktop, target_os = "android"))]
-pub use lan::{LanCloneHost, LanDevice, LanPairing};
+pub use lan::{LanCloneHost, LanPairing};
+#[cfg(test)]
+pub use logical_delta_transfer::execute_logical_delta_pull;
 pub use logical_delta_transfer::{
-    execute_logical_delta_pull, select_missing_logical_delta_objects, LogicalDeltaActivation,
-    LogicalDeltaApplyOperation, LogicalDeltaObject, LogicalDeltaObjectSource,
-    LogicalDeltaStagedTarget, LogicalDeltaTransferSelection, ReadyLogicalDeltaPlan,
+    LogicalDeltaActivation, LogicalDeltaApplyOperation, LogicalDeltaObject,
+    LogicalDeltaObjectSource, LogicalDeltaStagedTarget, LogicalDeltaTransferSelection,
+    ReadyLogicalDeltaPlan,
 };
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) use production::prepare_lossless_clone_session;
 #[cfg(any(desktop, target_os = "android", test))]
 pub(crate) use production::LosslessCloneTargetAdapter;
-pub use protocol::{
-    CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk,
-    CLONE_CHUNK_SIZE, CLONE_LOSSLESS_DATABASE_FORMAT,
-};
+pub use protocol::{CloneManifest, CLONE_LOSSLESS_DATABASE_FORMAT};
+#[cfg(test)]
+pub use protocol::{CloneObjectKind, CLONE_CHUNK_SIZE};
 pub use session::{
     prepare_clone_session, CloneSource, PinnedCloneRevision, PinnedSourceObject,
     PreparedCloneSession,

@@ -18,11 +18,7 @@ struct FakeState {
 }
 
 struct LaunchRecord {
-    executable: PathBuf,
     args: Vec<OsString>,
-    env_remove: Vec<&'static str>,
-    token_env_set: bool,
-    origin: String,
 }
 
 struct FakeDiscovery {
@@ -54,13 +50,12 @@ impl TunnelProcessLauncher for FakeLauncher {
         executable: &VerifiedExecutable,
         launch: LaunchSpec,
     ) -> Result<Self::Process, TunnelError> {
-        self.state.lock().unwrap().launches.push(LaunchRecord {
-            executable: executable.as_path().to_owned(),
-            args: launch.args,
-            env_remove: launch.env_remove.to_vec(),
-            token_env_set: launch.token_env.is_some(),
-            origin: launch.origin,
-        });
+        let _ = executable;
+        self.state
+            .lock()
+            .unwrap()
+            .launches
+            .push(LaunchRecord { args: launch.args });
         if let Some(error) = &self.launch_error {
             return Err(TunnelError::Launch(error.clone()));
         }

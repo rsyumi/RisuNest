@@ -195,6 +195,9 @@ impl HttpCloneTransport {
 }
 
 impl LoopbackCloneClient {
+    // The loopback clone client pairs with the test-only LoopbackCloneHost;
+    // production transports construct clients through the LAN paths.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         staging_root: impl AsRef<Path>,
         session_url: impl AsRef<str>,
@@ -277,6 +280,7 @@ impl LoopbackCloneClient {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn download(
         &mut self,
         cancellation: &TransferCancellation,
@@ -1172,6 +1176,7 @@ fn load_ledger(path: &Path) -> Result<LedgerState, PeerSyncError> {
     Ok(ledger)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_loopback_url(value: &str) -> Result<Url, PeerSyncError> {
     let url = Url::parse(value).map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
     if url.scheme() != "http"

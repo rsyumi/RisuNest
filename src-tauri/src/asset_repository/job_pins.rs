@@ -374,6 +374,9 @@ impl DurableCasJob {
         Ok(())
     }
 
+    // Used by native_file_jobs tests behind the native-official-publication
+    // feature; the default lib build cannot see that usage.
+    #[allow(dead_code)]
     pub(crate) fn journal_path(&self) -> &Path {
         &self.journal_path
     }

@@ -13,6 +13,10 @@ pub struct OwnerManifestEntry {
     pub payload_hash: Option<[u8; 32]>,
 }
 
+// The property-level codec surface mirrors the TypeScript twin and is exercised
+// by the golden parity integration test (tests/owner_manifest_codec.rs), which
+// compiles this file via #[path], so the lib build cannot see that usage.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerManifestProperty {
     Absent,
@@ -214,6 +218,8 @@ pub fn decode_owner_manifest_with_limit(
     Ok(entries)
 }
 
+// Mirrors the TypeScript twin; used by the golden parity integration test.
+#[allow(dead_code)]
 pub fn encode_owner_manifest_property(
     property: &OwnerManifestProperty,
 ) -> Result<Option<Vec<u8>>, OwnerManifestCodecError> {
@@ -223,6 +229,8 @@ pub fn encode_owner_manifest_property(
     }
 }
 
+// Mirrors the TypeScript twin; used by the golden parity integration test.
+#[allow(dead_code)]
 pub fn decode_owner_manifest_property(
     present: bool,
     bytes: Option<&[u8]>,

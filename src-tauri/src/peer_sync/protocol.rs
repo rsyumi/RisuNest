@@ -77,6 +77,8 @@ impl CloneManifest {
         Ok(bytes)
     }
 
+    // Desktop resume compares manifest identities.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn identity(&self) -> Result<String, PeerSyncError> {
         Ok(sha256_hex(&self.canonical_bytes()?))
     }

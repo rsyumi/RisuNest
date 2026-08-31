@@ -49,10 +49,13 @@ pub struct LogicalDeltaTransferSelection {
 }
 
 impl LogicalDeltaTransferSelection {
+    // Reuse accounting is asserted by the transfer-selection tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reused_from_local_manifest(&self) -> &[LogicalDeltaObject] {
         &self.reused_from_local_manifest
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reused_from_cas(&self) -> &[LogicalDeltaObject] {
         &self.reused_from_cas
     }
@@ -160,6 +163,8 @@ pub fn select_missing_logical_delta_objects(
     Ok(selection)
 }
 
+// Test-facing wrapper around the pre-activation pull entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn execute_logical_delta_pull<S, T>(
     plan: &ReadyLogicalDeltaPlan,
     local_manifest_object_hashes: &BTreeSet<String>,

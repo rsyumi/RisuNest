@@ -37,6 +37,8 @@ pub struct PinnedSourceObject {
 }
 
 impl PinnedSourceObject {
+    // Test fixtures pin objects with the default formats.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn database(path: impl Into<PathBuf>) -> Self {
         Self {
             kind: CloneObjectKind::Database,
@@ -57,6 +59,7 @@ impl PinnedSourceObject {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn payload(
         kind: CloneObjectKind,
         logical_key: impl Into<String>,
@@ -83,6 +86,8 @@ pub struct PreparedCloneSession {
 }
 
 impl PreparedCloneSession {
+    // Desktop source restart recovers a persisted lossless session.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn reopen_lossless(
         session_root: impl AsRef<Path>,
         expected_session_id: &str,
@@ -249,14 +254,17 @@ impl PreparedCloneSession {
     }
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn recovery_validation<T>(message: &str) -> Result<T, PeerSyncError> {
     Err(PeerSyncError::Validation(message.to_owned()))
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn recovery_contract_error(error: PeerSyncError) -> PeerSyncError {
     PeerSyncError::Validation(error.to_string())
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn recovery_io_error(error: std::io::Error) -> PeerSyncError {
     if matches!(
         error.kind(),

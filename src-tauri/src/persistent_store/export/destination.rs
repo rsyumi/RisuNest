@@ -30,6 +30,8 @@ pub(crate) enum DestinationWriteError {
     },
 }
 
+// Test-facing wrapper over the commit-aware writers below.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_desktop_destination(
     source_root: &Path,
     source: &Path,
@@ -182,6 +184,7 @@ impl DestinationFileSystem for RealFileSystem {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_desktop_destination_with<F: DestinationFileSystem>(
     file_system: &F,
     source_root: &Path,

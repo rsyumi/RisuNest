@@ -131,6 +131,7 @@ pub struct LanPairing {
 pub struct LanCloneClient {
     client: reqwest::blocking::Client,
     ranges: HttpRangeStream,
+    #[cfg_attr(not(test), allow(dead_code))]
     control_timeout: Duration,
     endpoint: String,
     session_id: String,
@@ -287,10 +288,13 @@ impl LanCloneClient {
         ))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn session_url(&self) -> &str {
         &self.session_url
     }
 
+    // Android clone jobs read the pinned target identity.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn target_identity(&self) -> Result<(&str, &str, &str), PeerSyncError> {
         let manifest_id = self.manifest_id.as_deref().ok_or_else(|| {
             PeerSyncError::Protocol("LAN clone manifest identity is missing".to_owned())
@@ -298,6 +302,8 @@ impl LanCloneClient {
         Ok((&self.endpoint, &self.session_id, manifest_id))
     }
 
+    // Desktop resume validation compares persisted targets.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn matches_target(
         &self,
         endpoint: &str,
@@ -309,6 +315,7 @@ impl LanCloneClient {
             && self.manifest_id.as_deref() == Some(manifest_id))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fetch_manifest(&self, expected_manifest_id: &str) -> Result<Vec<u8>, PeerSyncError> {
         if !is_lower_hex_256(expected_manifest_id) {
             return Err(PeerSyncError::Protocol(
@@ -356,6 +363,7 @@ impl LanCloneClient {
         Ok(bytes)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn head_object(&self, object: &str) -> Result<u64, PeerSyncError> {
         validate_object_hash(object)?;
         let response = self
@@ -401,6 +409,7 @@ impl LanCloneClient {
             })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fetch_chunk(
         &self,
         object: &str,
@@ -433,6 +442,7 @@ impl LanCloneClient {
         Ok(bytes)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn report_progress(
         &self,
         verified_bytes: u64,
@@ -461,6 +471,7 @@ impl LanCloneClient {
         Ok(())
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn control_request(
         &self,
         request: reqwest::blocking::RequestBuilder,
@@ -602,6 +613,7 @@ struct TunnelProbeState {
 
 #[cfg(desktop)]
 pub(crate) struct TunnelOriginProbe {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) path_prefix: String,
     pub(crate) path: String,
     pub(crate) expected_body: [u8; 32],
@@ -874,10 +886,14 @@ impl LanCloneHost {
         }
     }
 
+    // Desktop trusted-LAN hosting; Android hosts bind explicit interfaces.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn start(&mut self) -> Result<LanPairing, PeerSyncError> {
         self.start_on(Ipv4Addr::UNSPECIFIED, 0)
     }
 
+    // Android source hosting binds the selected private interface.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn start_private_lan(
         &mut self,
         address: Ipv4Addr,
@@ -952,6 +968,7 @@ impl LanCloneHost {
         self.address
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn manifest(&self) -> &super::CloneManifest {
         match &self.shared.session {
             LanSession::Clone(session) => session.manifest(),
@@ -1002,10 +1019,13 @@ impl LanCloneHost {
         *recovered_lock(&self.shared.tunnel_probe) = None;
     }
 
+    // Android source status surfaces the device list and revocation.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub fn devices(&self) -> Vec<LanDevice> {
         self.control().devices()
     }
 
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub fn revoke(&self, device_id: &str) -> bool {
         self.control().revoke(device_id)
     }
@@ -3863,10 +3883,14 @@ pub(crate) struct LanBidirectionalLogicalCredential {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalLogicalCredential {
+    // Android resume validates trusted-LAN credentials.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     fn validate(&self) -> Result<String, PeerSyncError> {
         self.validate_with(validate_private_lan_endpoint)
     }
 
+    // Desktop resume additionally accepts tunnel endpoints.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn validate_p5_desktop(&self) -> Result<String, PeerSyncError> {
         self.validate_with(validate_p5_desktop_endpoint)
     }
@@ -3899,6 +3923,8 @@ pub(crate) struct LanBidirectionalLogicalClient {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalLogicalClient {
+    // Android targets claim over trusted-LAN endpoints.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn claim(
         endpoint: &str,
         session_id: &str,
@@ -3926,6 +3952,8 @@ impl LanBidirectionalLogicalClient {
         })
     }
 
+    // Desktop targets may claim through tunnel endpoints.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn claim_p5_desktop(
         endpoint: &str,
         session_id: &str,
@@ -4011,6 +4039,7 @@ impl LanBidirectionalLogicalClient {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn device_id(&self) -> &str {
         &self.inner.device_id
     }

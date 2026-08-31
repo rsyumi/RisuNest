@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod asset_repository;
 mod cold_payload_codec;
 pub mod import_export_jobs;
@@ -11,7 +10,6 @@ mod lossless_f0;
 pub mod native_file_jobs;
 mod native_media;
 mod native_tokenizer;
-#[allow(dead_code, unused_imports)]
 mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]

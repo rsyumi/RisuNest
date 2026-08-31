@@ -139,6 +139,7 @@ impl LogicalOwnerHead {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn present(
         owner: LogicalOwnerLocator,
         manifest_hash: String,
@@ -349,6 +350,9 @@ pub struct LogicalManifest {
     pub objects: Vec<LogicalManifestObject>,
 }
 
+// The projected-record manifest builder is the test-facing twin of the
+// indexed builder; unit and timeout fixtures build manifests through it.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 enum ProjectedLogicalRecordState {
     Live {
@@ -360,12 +364,14 @@ enum ProjectedLogicalRecordState {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectedLogicalRecord {
     locator: LogicalRecordLocator,
     state: ProjectedLogicalRecordState,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ProjectedLogicalRecord {
     pub fn live(
         locator: LogicalRecordLocator,
@@ -391,6 +397,7 @@ impl ProjectedLogicalRecord {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalManifestBuilderInput {
     pub library_id: String,
@@ -453,12 +460,14 @@ pub struct IndexedLogicalManifestBuilderInput {
     pub records: Vec<IndexedLogicalRecord>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuiltLogicalRecordObject {
     pub key: String,
     pub object: EncodedLogicalObject,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltLogicalManifest {
     pub manifest: LogicalManifest,
@@ -592,6 +601,7 @@ impl LogicalRecordEnvelope {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn dependency_hashes(&self) -> Vec<String> {
         let mut hashes = match self {
             Self::Root { owner_heads, .. } | Self::Character { owner_heads, .. } => owner_heads
@@ -965,6 +975,7 @@ pub fn build_indexed_logical_manifest(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_logical_manifest(
     input: LogicalManifestBuilderInput,
 ) -> Result<BuiltLogicalManifest, LogicalDeltaError> {

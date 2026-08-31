@@ -13,7 +13,6 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[allow(dead_code)]
 pub(crate) mod destination;
 
 pub(crate) const EXPORT_CANCELLED_MESSAGE: &str = "native RisuSave export cancelled";

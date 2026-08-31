@@ -18,6 +18,8 @@ pub(crate) struct LogicalDeltaSourceSession {
     session_id: String,
     active: bool,
     manifest_hash: String,
+    // Read by the resume path below.
+    #[cfg_attr(not(test), allow(dead_code))]
     manifest_bytes: Arc<[u8]>,
     objects: Vec<LogicalDeltaObject>,
     object_sizes: BTreeMap<String, u64>,
@@ -53,6 +55,9 @@ impl LogicalDeltaSourceSession {
         Self::from_pinned(store, cas, library_id, generation_id, session_id)
     }
 
+    // Session resume across process restarts; currently exercised by tests
+    // only (the live command paths re-prepare sessions).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resume(
         app_data_dir: &Path,
         repository_root: &Path,
@@ -119,6 +124,7 @@ impl LogicalDeltaSourceSession {
         &self.manifest_hash
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn manifest_size(&self) -> u64 {
         self.manifest_bytes.len() as u64
     }
@@ -127,10 +133,12 @@ impl LogicalDeltaSourceSession {
         &self.objects
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_manifest(&self) -> Result<Box<dyn Read>, PeerSyncError> {
         self.require_active()?;
         Ok(Box::new(Cursor::new(Arc::clone(&self.manifest_bytes))))

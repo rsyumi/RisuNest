@@ -30,6 +30,10 @@ pub struct MigrationStatus {
     pub ready: bool,
 }
 
+// The staged-migration journal writer is exercised by persistent_store tests
+// as a GC-blocking fixture; the production writer arrives with native asset
+// migration (journal consolidation is queued in docs/remaining-work.md).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub struct StagedAssetMigration {
     journal_path: PathBuf,
@@ -55,6 +59,7 @@ enum MigrationJournalRecord {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl StagedAssetMigration {
     pub fn begin(
         repository_root: &Path,
@@ -294,6 +299,7 @@ pub fn collect_staged_migration_roots(repository_root: &Path) -> io::Result<Vec<
     Ok(root_sets)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn migration_journal_path(repository_root: &Path, migration_id: &str) -> io::Result<PathBuf> {
     let repository_root = fs::canonicalize(repository_root)?;
     let directory = repository_root.join("assets-v2").join("migrations");
@@ -328,6 +334,7 @@ fn validate_hash(hash: &str, context: &str) -> io::Result<()> {
     invalid_data(format!("{context} must be a lowercase SHA-256 hash"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_journal_record(file: &mut File, record: &MigrationJournalRecord) -> io::Result<()> {
     let payload = serde_json::to_vec(record).map_err(json_error)?;
     let length = u32::try_from(payload.len())

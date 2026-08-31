@@ -935,6 +935,8 @@ impl PeerCloneCommandState {
         Ok(tunnel_status(&runtime))
     }
 
+    // Test-facing status accessors.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn source_bind_address(&self) -> Result<Option<SocketAddr>, PeerSyncError> {
         Ok(self
             .lock_runtime()?
@@ -1513,6 +1515,7 @@ impl PeerCloneCommandState {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn target_status_current(&self) -> Result<PeerCloneTargetStatus, PeerSyncError> {
         Ok(self
             .lock_runtime()?

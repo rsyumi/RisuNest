@@ -1,14 +1,13 @@
 #[cfg(any(desktop, target_os = "android", test))]
-use super::android_foreground::{
-    registry, AndroidCancellationProbe, AndroidForegroundKey, AndroidForegroundLane,
-};
+use super::android_foreground::AndroidForegroundKey;
+#[cfg(any(target_os = "android", test))]
+use super::android_foreground::{registry, AndroidCancellationProbe, AndroidForegroundLane};
 #[cfg(desktop)]
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
-    execute_logical_delta_pull,
     lan::{
-        validate_p5_desktop_endpoint, validate_private_lan_endpoint, LanBidirectionalBackupReceipt,
-        LanBidirectionalControl, LanBidirectionalGeneration, LanBidirectionalLogicalClient,
+        validate_p5_desktop_endpoint, LanBidirectionalBackupReceipt, LanBidirectionalControl,
+        LanBidirectionalGeneration, LanBidirectionalLogicalClient,
         LanBidirectionalLogicalCredential, LanBidirectionalRegistrationRequest,
         LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
         LanBidirectionalSession, LanCloneHostControl, LanLogicalDeltaClient,
@@ -28,7 +27,6 @@ use crate::{
     },
     local_backup::{CancellationProbe, NeverCancelled},
     lossless_backup::{
-        create_and_verify_lossless_backup_v1_report,
         create_and_verify_peer_bidirectional_backup_v1_report,
         verify_lossless_package_v1_for_production, LosslessError, LosslessErrorCode,
         LosslessPeerSourceBinding,
@@ -49,9 +47,11 @@ use std::{
     net::{Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, LazyLock, Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(desktop)]
+use std::{sync::LazyLock, time::Duration};
 use tauri::{AppHandle, Manager, State};
 
 #[cfg(windows)]
@@ -579,6 +579,9 @@ impl SourcePreparedEvidence {
         })
     }
 
+    // Production paths compute receipts through receipt_at; tests use the
+    // next-revision convenience form.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn receipt(&self) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
         let committed_revision = self
             .expected_source_revision
@@ -1233,9 +1236,15 @@ enum ResumeLocalCommittedOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PeerBidirectionalStaleReason {
+    // Mirrors the TypeScript stale-reason union in peerBidirectional.ts; only
+    // RemoteGeneration is produced by the current Rust paths, but the wire
+    // contract keeps every declared reason representable.
+    #[allow(dead_code)]
     LocalRevision,
     RemoteGeneration,
+    #[allow(dead_code)]
     CommonBase,
+    #[allow(dead_code)]
     DeviceAcknowledgement,
 }
 
@@ -1451,6 +1460,8 @@ fn validate_fresh_awaiting_conflict_source(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Test-facing wrapper around the cancellation-aware entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_awaiting_conflict_with_fresh_source<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -1760,6 +1771,8 @@ fn retain_target_prepared_activation(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Test-facing wrapper around the cancellation-aware entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 fn retain_bidirectional_local_activation(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -1817,6 +1830,8 @@ fn retain_bidirectional_local_activation(
     Ok(LocalMergeOutcome::LocalCommitted)
 }
 
+// Test-facing wrapper around the cancellation-aware entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -2065,6 +2080,8 @@ fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource
 }
 
 #[allow(clippy::too_many_arguments)]
+// Test-facing wrapper around the cancellation-aware entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resume_bidirectional_target_prepared<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -2461,6 +2478,8 @@ fn promote_target_prepared_for_status(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Test-facing wrapper around the cancellation-aware entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -2739,6 +2758,8 @@ fn resolve_bidirectional_conflict_with_cancellation<S: LogicalDeltaObjectSource 
 }
 
 #[allow(clippy::too_many_arguments)]
+// Test-facing wrapper around the cancellation-aware entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -4286,6 +4307,8 @@ pub enum PeerBidirectionalSourcePhase {
     Stopped,
 }
 
+// Desktop-only tunnel lifecycle; Android sources pair over the trusted LAN.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PeerBidirectionalTunnelStart {
@@ -4299,6 +4322,7 @@ pub enum PeerBidirectionalTunnelStart {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(target_os = "android", allow(dead_code))]
 enum PeerBidirectionalTunnelKind {
     Quick,
     Named,
@@ -4312,6 +4336,7 @@ struct PeerBidirectionalTunnelMetadata {
     one_shot: bool,
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 impl PeerBidirectionalTunnelMetadata {
     fn quick() -> Self {
         Self {
@@ -4351,17 +4376,12 @@ impl BidirectionalTunnel {
 
 #[cfg(desktop)]
 trait SourceTunnelProcess: Send {
-    fn transport_url(&self) -> &url::Url;
     fn stop(&mut self) -> Result<(), PeerSyncError>;
     fn lifecycle(&mut self) -> Result<RunningTunnelLifecycle, PeerSyncError>;
 }
 
 #[cfg(desktop)]
 impl SourceTunnelProcess for BidirectionalTunnel {
-    fn transport_url(&self) -> &url::Url {
-        BidirectionalTunnel::transport_url(self)
-    }
-
     fn stop(&mut self) -> Result<(), PeerSyncError> {
         BidirectionalTunnel::stop(self)
     }
@@ -4481,6 +4501,7 @@ fn retain_reverse_cleanup_owner(
 }
 
 #[cfg(target_os = "android")]
+#[allow(dead_code)] // exit shutdown is a desktop lifecycle; the stub keeps call sites uniform
 fn cleanup_reverse_tunnels_for_exit() {}
 
 fn resolve_remote_apply_result(
@@ -4979,11 +5000,15 @@ impl PeerBidirectionalCommandState {
         Ok(source_status(&runtime, &[]))
     }
 
+    // Desktop stop/exit lifecycle; Android sources stop through their own
+    // command surface.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
         let _operation = self.lock_lifecycle_operation()?;
         self.stop_source_inner(session_id)
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn stop_source_inner(&self, session_id: &str) -> Result<(), PeerSyncError> {
         #[cfg(desktop)]
         let (mut host, mut tunnel, mut failed) = {
@@ -5328,6 +5353,7 @@ impl PeerBidirectionalCommandState {
         Ok(())
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn shutdown_for_exit(&self) {
         let Ok(_operation) = self.lock_lifecycle_operation() else {
             return;
@@ -5601,6 +5627,7 @@ fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<Stri
     Ok(uri.to_string())
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
     #[cfg(test)]
     if let Some(address) = DISCOVER_LAN_IPV4_OVERRIDE.with(Cell::take) {
@@ -7429,17 +7456,12 @@ mod tests {
     }
 
     struct FakeSourceTunnel {
-        url: url::Url,
         lifecycles: VecDeque<RunningTunnelLifecycle>,
         stop_attempts: Arc<AtomicUsize>,
         fail_stop_through_attempt: usize,
     }
 
     impl SourceTunnelProcess for FakeSourceTunnel {
-        fn transport_url(&self) -> &url::Url {
-            &self.url
-        }
-
         fn stop(&mut self) -> Result<(), PeerSyncError> {
             let attempt = self.stop_attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_stop_through_attempt {
@@ -7460,17 +7482,12 @@ mod tests {
     }
 
     struct BlockingSourceTunnel {
-        url: url::Url,
         lifecycle_started: mpsc::Sender<()>,
         lifecycle_release: mpsc::Receiver<()>,
         stop_attempts: Arc<AtomicUsize>,
     }
 
     impl SourceTunnelProcess for BlockingSourceTunnel {
-        fn transport_url(&self) -> &url::Url {
-            &self.url
-        }
-
         fn stop(&mut self) -> Result<(), PeerSyncError> {
             self.stop_attempts.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -16720,7 +16737,6 @@ mod tests {
             directory.path(),
             session_id,
             Box::new(FakeSourceTunnel {
-                url: url::Url::parse("https://natural-exit.example").unwrap(),
                 lifecycles: VecDeque::from([RunningTunnelLifecycle::Stopped]),
                 stop_attempts: Arc::clone(&stop_attempts),
                 fail_stop_through_attempt: 0,
@@ -16745,7 +16761,6 @@ mod tests {
             directory.path(),
             session_id,
             Box::new(FakeSourceTunnel {
-                url: url::Url::parse("https://cleanup-pending.example").unwrap(),
                 lifecycles: VecDeque::from([RunningTunnelLifecycle::CleanupPending]),
                 stop_attempts: Arc::clone(&stop_attempts),
                 fail_stop_through_attempt: 0,
@@ -16780,7 +16795,6 @@ mod tests {
             directory.path(),
             session_id,
             Box::new(BlockingSourceTunnel {
-                url: url::Url::parse("https://blocked-status.example").unwrap(),
                 lifecycle_started: started_tx,
                 lifecycle_release: release_rx,
                 stop_attempts: Arc::clone(&stop_attempts),
@@ -16821,7 +16835,6 @@ mod tests {
             directory.path(),
             session_id,
             Box::new(FakeSourceTunnel {
-                url: url::Url::parse("https://final-exit.example").unwrap(),
                 lifecycles: VecDeque::new(),
                 stop_attempts: Arc::clone(&stop_attempts),
                 fail_stop_through_attempt: 0,

@@ -299,6 +299,9 @@ impl AndroidResumableCloneJob {
         })
     }
 
+    // Production Android transfers run through the foreground JNI path; this
+    // progress-free wrapper serves the desktop test suite.
+    #[cfg(test)]
     pub fn download(
         &mut self,
         cancellation: &TransferCancellation,
@@ -655,6 +658,7 @@ impl AndroidCloneJobRegistry {
         Ok(Some(job.status()?))
     }
 
+    #[cfg(test)]
     pub(crate) fn download(
         &self,
         job_id: &str,

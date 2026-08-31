@@ -16,6 +16,9 @@ pub(crate) enum AndroidForegroundLane {
 }
 
 impl AndroidForegroundLane {
+    // Android JNI parses lane strings from the Kotlin service; desktop builds
+    // only route lanes through serde.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "p1-source" => Some(Self::P1Source),
@@ -24,16 +27,6 @@ impl AndroidForegroundLane {
             "p5-source" => Some(Self::P5Source),
             "p5-target" => Some(Self::P5Target),
             _ => None,
-        }
-    }
-
-    pub(crate) fn wire(self) -> &'static str {
-        match self {
-            Self::P1Source => "p1-source",
-            Self::P4Source => "p4-source",
-            Self::P4Target => "p4-target",
-            Self::P5Source => "p5-source",
-            Self::P5Target => "p5-target",
         }
     }
 }
@@ -61,8 +54,12 @@ impl CancellationProbe for AndroidCancellationProbe {
     }
 }
 
+// The foreground registry backs the Android service lifecycle; desktop builds
+// compile it only for tests.
+#[cfg_attr(all(desktop, not(test)), allow(dead_code))]
 type StopCallback = Box<dyn FnOnce() + Send + 'static>;
 
+#[cfg_attr(all(desktop, not(test)), allow(dead_code))]
 struct ForegroundEntry {
     key: AndroidForegroundKey,
     attached: bool,
@@ -71,12 +68,14 @@ struct ForegroundEntry {
     source_stop: Option<StopCallback>,
 }
 
+#[cfg_attr(all(desktop, not(test)), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct AndroidForegroundRegistry {
     next_generation: AtomicU64,
     entry: Mutex<Option<ForegroundEntry>>,
 }
 
+#[cfg_attr(all(desktop, not(test)), allow(dead_code))]
 impl AndroidForegroundRegistry {
     pub(crate) fn reserve(
         &self,
@@ -293,6 +292,7 @@ impl AndroidForegroundRegistry {
     }
 }
 
+#[cfg_attr(all(desktop, not(test)), allow(dead_code))]
 pub(crate) fn registry() -> &'static AndroidForegroundRegistry {
     static REGISTRY: OnceLock<AndroidForegroundRegistry> = OnceLock::new();
     REGISTRY.get_or_init(AndroidForegroundRegistry::default)
@@ -301,6 +301,7 @@ pub(crate) fn registry() -> &'static AndroidForegroundRegistry {
 // Shared attach-wait for Android foreground lanes. Async so command bodies
 // never block a tokio worker thread while polling for service attach.
 #[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) async fn acquire_foreground_lane(
     key: &AndroidForegroundKey,
     lane: AndroidForegroundLane,

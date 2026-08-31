@@ -13,7 +13,7 @@ use serde::Serialize;
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tauri::{AppHandle, Manager, State};
@@ -37,7 +37,6 @@ enum AndroidSourcePhase {
     Idle,
     Prepared,
     Running,
-    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

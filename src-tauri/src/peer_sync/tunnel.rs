@@ -247,6 +247,8 @@ struct LaunchSpec {
     args: Vec<OsString>,
     env_remove: [&'static str; 2],
     token_env: Option<String>,
+    // Asserted by the launch-spec tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     origin: String,
     readiness: ProcessReadiness,
 }
@@ -742,6 +744,7 @@ fn configure_no_window(command: &mut Command) {
 fn configure_no_window(_command: &mut Command) {}
 
 pub(crate) struct TunnelStartFailure<P: TunnelProcess, S: PeerSession> {
+    #[cfg_attr(not(test), allow(dead_code))]
     error: TunnelError,
     process: Option<P>,
     peer_session: Option<S>,
@@ -749,6 +752,8 @@ pub(crate) struct TunnelStartFailure<P: TunnelProcess, S: PeerSession> {
 }
 
 impl<P: TunnelProcess, S: PeerSession> TunnelStartFailure<P, S> {
+    // Asserted by the tunnel seam tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn error_message(&self) -> String {
         self.error.to_string()
     }
@@ -1188,6 +1193,7 @@ impl RunningTunnel {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn wait_terminal(&mut self, timeout: Duration) -> Result<TerminalReason, TunnelError> {
         let reason = self
             .terminal_rx

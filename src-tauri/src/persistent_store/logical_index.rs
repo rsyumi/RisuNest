@@ -676,6 +676,8 @@ impl PersistentStore {
             .map_err(Into::into)
     }
 
+    // Exercised by the session-resume tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resume_logical_generation_pin(
         &mut self,
         session_id: &str,
@@ -724,6 +726,7 @@ impl PersistentStore {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prune_logical_generation(
         &mut self,
         library_id: &str,

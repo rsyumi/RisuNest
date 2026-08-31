@@ -27,7 +27,11 @@ use crate::{
         PersistentLogicalDeltaTarget, PersistentStore, StoreError, PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
-use serde::{Deserialize, Serialize};
+#[cfg(desktop)]
+use serde::Deserialize;
+use serde::Serialize;
+#[cfg(desktop)]
+use std::time::Duration;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -37,7 +41,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -314,6 +318,8 @@ struct DeltaSourceRuntime {
     #[cfg(desktop)]
     tunnel_metadata: Option<PeerDeltaTunnelMetadata>,
     pairing_uri: Option<String>,
+    // Read by the desktop stop/status interlock.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     stop_in_progress: bool,
     #[cfg(any(target_os = "android", test))]
     foreground: Option<AndroidForegroundKey>,
@@ -1107,10 +1113,13 @@ fn tunnel_status(runtime: &PeerDeltaRuntime) -> PeerDeltaTunnelStatus {
     }
 }
 
+// Desktop-only tunnel lifecycle errors.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn tunnel_start_error() -> PeerSyncError {
     PeerSyncError::Transport("peer delta tunnel failed to start".to_owned())
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn tunnel_stop_error() -> PeerSyncError {
     PeerSyncError::Transport("peer delta tunnel failed to stop".to_owned())
 }
@@ -1200,6 +1209,8 @@ impl Read for MeasuredLogicalDeltaReader {
     }
 }
 
+// Test-facing wrapper around the cancellation-aware pull entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
@@ -1822,6 +1833,7 @@ fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<Stri
     Ok(uri.to_string())
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
