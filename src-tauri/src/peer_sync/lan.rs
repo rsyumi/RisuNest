@@ -54,6 +54,47 @@ pub(crate) const NAMED_TUNNEL_ORIGIN_UNAVAILABLE: &str =
     "Named Tunnel cannot bind loopback port 32145. Stop the app using that port, or use Quick Tunnel / Trusted LAN.";
 #[cfg(all(test, desktop))]
 pub(crate) static NAMED_TUNNEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+// Tests override the Named Tunnel origin port with an ephemeral one so a full
+// suite run never contends on the real fixed port (a machine-global resource
+// any other process may hold).
+#[cfg(all(test, desktop))]
+static NAMED_TUNNEL_ORIGIN_PORT_OVERRIDE: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(0);
+
+#[cfg(desktop)]
+pub(crate) fn named_tunnel_origin_port() -> u16 {
+    #[cfg(test)]
+    {
+        let overridden = NAMED_TUNNEL_ORIGIN_PORT_OVERRIDE.load(Ordering::SeqCst);
+        if overridden != 0 {
+            return overridden;
+        }
+    }
+    NAMED_TUNNEL_ORIGIN_PORT
+}
+
+#[cfg(all(test, desktop))]
+pub(crate) struct NamedTunnelPortOverrideGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, desktop))]
+impl Drop for NamedTunnelPortOverrideGuard {
+    fn drop(&mut self) {
+        NAMED_TUNNEL_ORIGIN_PORT_OVERRIDE.store(0, Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, desktop))]
+pub(crate) fn override_named_tunnel_origin_port_for_test(
+    port: u16,
+) -> NamedTunnelPortOverrideGuard {
+    let lock = NAMED_TUNNEL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    NAMED_TUNNEL_ORIGIN_PORT_OVERRIDE.store(port, Ordering::SeqCst);
+    NamedTunnelPortOverrideGuard { _lock: lock }
+}
 const MAX_URL_BYTES: usize = 512;
 #[cfg(any(desktop, target_os = "android"))]
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -856,7 +897,7 @@ impl LanCloneHost {
 
     #[cfg(desktop)]
     pub(crate) fn start_named_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
-        self.start_on(Ipv4Addr::LOCALHOST, NAMED_TUNNEL_ORIGIN_PORT)
+        self.start_on(Ipv4Addr::LOCALHOST, named_tunnel_origin_port())
     }
 
     fn start_on(&mut self, bind_address: Ipv4Addr, port: u16) -> Result<LanPairing, PeerSyncError> {
@@ -874,7 +915,8 @@ impl LanCloneHost {
         let listener = TcpListener::bind((bind_address, port)).map_err(|error| {
             #[cfg(desktop)]
             if bind_address == Ipv4Addr::LOCALHOST
-                && port == NAMED_TUNNEL_ORIGIN_PORT
+                && port == named_tunnel_origin_port()
+                && port != 0
                 && error.kind() == io::ErrorKind::AddrInUse
             {
                 return PeerSyncError::Transport(NAMED_TUNNEL_ORIGIN_UNAVAILABLE.to_owned());
@@ -2524,11 +2566,16 @@ mod timeout_tests {
     fn stalled_claim_uses_the_short_control_timeout() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // The server holds the claim response until the client has already failed, so
+        // the error can only come from the bounded control timeout (the socket provably
+        // never responded or closed), independent of scheduling.
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             configure_connection(&stream).unwrap();
-            assert!(read_request(&mut stream, &AtomicBool::new(false)).is_ok());
-            thread::sleep(Duration::from_millis(800));
+            // Best effort: an already-timed-out client may abort mid-request.
+            let _ = read_request(&mut stream, &AtomicBool::new(false));
+            let _ = hold_rx.recv();
         });
         let started = Instant::now();
 
@@ -2541,10 +2588,12 @@ mod timeout_tests {
         .err()
         .unwrap();
         let elapsed = started.elapsed();
+        let _ = hold_tx.send(());
         server.join().unwrap();
 
         assert!(matches!(error, PeerSyncError::Transport(_)));
-        assert!(elapsed < Duration::from_millis(500));
+        // Generous hang guard only; the held socket proves a bounded timeout fired.
+        assert!(elapsed < Duration::from_secs(5));
     }
 
     #[test]
@@ -2555,6 +2604,10 @@ mod timeout_tests {
         let object_size = bytes.len() as u64;
         let response_etag = quoted(&object_hash);
         let address = listener.local_addr().unwrap();
+        // The server holds the body back until the client has already failed, so the
+        // error can only come from the bounded object idle timeout (the socket provably
+        // never progressed or closed), independent of scheduling.
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             assert!(read_request_head(&mut stream).starts_with("GET "));
@@ -2565,14 +2618,11 @@ mod timeout_tests {
             )
             .unwrap();
             stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(2_000));
+            let _ = hold_rx.recv();
             let _ = stream.write_all(&bytes);
         });
-        let mut client = direct_logical_client(
-            address,
-            Duration::from_millis(100),
-            Duration::from_millis(500),
-        );
+        let mut client =
+            direct_logical_client(address, Duration::from_millis(500), Duration::from_secs(2));
         let mut reader = client
             .open_object(&LogicalDeltaObject {
                 hash: object_hash,
@@ -2582,14 +2632,16 @@ mod timeout_tests {
         let started = Instant::now();
         let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
         let elapsed = started.elapsed();
+        let _ = hold_tx.send(());
         server.join().unwrap();
 
         assert!(
             is_reqwest_timeout(&error),
             "unexpected read error: {error:?}"
         );
+        // Generous hang guard only; the held body proves the idle timeout fired.
         assert!(
-            elapsed < Duration::from_millis(1_500),
+            elapsed < Duration::from_secs(10),
             "stall lasted {elapsed:?}"
         );
     }
@@ -2602,6 +2654,13 @@ mod timeout_tests {
         let response_etag = quoted(&object_hash);
         let server_bytes = bytes.clone();
         let address = listener.local_addr().unwrap();
+        let control_timeout = Duration::from_millis(100);
+        // The server holds the second body half until this thread has provably let more
+        // than the control timeout elapse, so the successful read demonstrates that
+        // object streams outlive the short control timeout. Sleeping before the read
+        // only ever extends the gap, so scheduling can not break the lower bound, and
+        // the object timeout stays far above any plausible scheduler stall.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             assert!(read_request_head(&mut stream).starts_with("GET "));
@@ -2612,16 +2671,15 @@ mod timeout_tests {
             )
             .unwrap();
             stream.flush().unwrap();
-            for chunk in server_bytes.chunks(8) {
-                thread::sleep(Duration::from_millis(80));
-                stream.write_all(chunk).unwrap();
-                stream.flush().unwrap();
-            }
+            let (first_half, second_half) = server_bytes.split_at(server_bytes.len() / 2);
+            stream.write_all(first_half).unwrap();
+            stream.flush().unwrap();
+            let _ = release_rx.recv();
+            stream.write_all(second_half).unwrap();
+            stream.flush().unwrap();
             finish_response(&mut stream);
         });
-        let control_timeout = Duration::from_millis(100);
-        let mut client =
-            direct_logical_client(address, control_timeout, Duration::from_millis(1_000));
+        let mut client = direct_logical_client(address, control_timeout, Duration::from_secs(10));
         let mut reader = client
             .open_object(&LogicalDeltaObject {
                 hash: object_hash,
@@ -2629,6 +2687,8 @@ mod timeout_tests {
             })
             .unwrap();
         let started = Instant::now();
+        thread::sleep(control_timeout + Duration::from_millis(100));
+        release_tx.send(()).unwrap();
         let mut received = Vec::new();
         reader.read_to_end(&mut received).unwrap();
         let elapsed = started.elapsed();

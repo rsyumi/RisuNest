@@ -2688,9 +2688,12 @@ mod tests {
 
     #[test]
     fn product_named_tunnel_failure_is_sanitized_and_restores_lan_fallback() {
-        let _port = super::super::lan::NAMED_TUNNEL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Reserve an ephemeral port for the named origin so the test never binds the
+        // machine-global fixed port.
+        let reserved = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let fixed_port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let _override = super::super::lan::override_named_tunnel_origin_port_for_test(fixed_port);
         let fixture = TunnelSourceFixture::prepare("https://sync.example.com/");
         fixture.launcher_state.lock().unwrap().fail_start = true;
         let secret = "eyJ-reflected-remotely-managed-token";
@@ -2732,15 +2735,13 @@ mod tests {
 
     #[test]
     fn product_named_tunnel_reports_only_the_actionable_fixed_port_conflict() {
-        let _port = super::super::lan::NAMED_TUNNEL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The occupied ephemeral reservation stands in for the fixed port so the test
+        // never contends on the machine-global 32145.
+        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _override = super::super::lan::override_named_tunnel_origin_port_for_test(
+            occupied.local_addr().unwrap().port(),
+        );
         let fixture = TunnelSourceFixture::prepare("https://sync.example.com/");
-        let occupied = std::net::TcpListener::bind((
-            Ipv4Addr::LOCALHOST,
-            super::super::lan::NAMED_TUNNEL_ORIGIN_PORT,
-        ))
-        .unwrap();
 
         let error = fixture
             .source

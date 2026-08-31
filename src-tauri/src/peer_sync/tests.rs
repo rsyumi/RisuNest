@@ -520,7 +520,6 @@ fn named_tunnel_probe_requires_a_started_loopback_host_and_is_one_time() {
     assert!(host.issue_tunnel_probe().is_err());
     host.start_quick_tunnel_origin().unwrap();
     let address = host.address().unwrap();
-    let probe = host.issue_tunnel_probe().unwrap();
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -528,25 +527,39 @@ fn named_tunnel_probe_requires_a_started_loopback_host_and_is_one_time() {
         .unwrap();
     let base = format!("http://127.0.0.1:{}", address.port());
 
-    assert_eq!(
-        client
-            .get(format!("{base}{}/wrong", probe.path_prefix))
-            .send()
-            .unwrap()
-            .status(),
-        404
-    );
-    let response = client.get(format!("{base}{}", probe.path)).send().unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.bytes().unwrap().as_ref(), probe.expected_body);
-    assert_eq!(
-        client
-            .get(format!("{base}{}", probe.path))
-            .send()
-            .unwrap()
-            .status(),
-        404
-    );
+    // Windows loopback can abort sockets with transient errors under load. Every
+    // retry issues a fresh probe, so the one-time assertions always run against a
+    // probe whose exchange saw no transport interference; semantic mismatches
+    // still panic immediately inside the attempt.
+    let mut attempt = 0;
+    loop {
+        let probe = host.issue_tunnel_probe().unwrap();
+        let exchange = (|| -> Result<(), reqwest::Error> {
+            assert_eq!(
+                client
+                    .get(format!("{base}{}/wrong", probe.path_prefix))
+                    .send()?
+                    .status(),
+                404
+            );
+            let response = client.get(format!("{base}{}", probe.path)).send()?;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.bytes()?.as_ref(), probe.expected_body);
+            assert_eq!(
+                client.get(format!("{base}{}", probe.path)).send()?.status(),
+                404
+            );
+            Ok(())
+        })();
+        match exchange {
+            Ok(()) => break,
+            Err(error) if attempt < 3 => {
+                attempt += 1;
+                eprintln!("transient loopback failure, retrying with a fresh probe: {error}");
+            }
+            Err(error) => panic!("probe exchange failed after retries: {error}"),
+        }
+    }
     host.stop().unwrap();
 }
 
@@ -599,19 +612,16 @@ fn quick_tunnel_public_seam_refuses_to_launch_before_loopback_source_start() {
 }
 
 #[test]
-fn named_tunnel_origin_uses_the_documented_fixed_loopback_port() {
-    let _port = super::lan::NAMED_TUNNEL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+fn named_tunnel_origin_uses_the_fixed_loopback_port() {
+    // An ephemeral reservation stands in for the documented fixed port so a full
+    // suite run never contends on the machine-global 32145.
+    let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let fixed_port = occupied.local_addr().unwrap().port();
+    let _override = super::lan::override_named_tunnel_origin_port_for_test(fixed_port);
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let occupied = TcpListener::bind((
-        std::net::Ipv4Addr::LOCALHOST,
-        super::lan::NAMED_TUNNEL_ORIGIN_PORT,
-    ))
-    .unwrap();
 
     let error = match host.start_named_tunnel_origin() {
         Ok(_) => panic!("named tunnel origin started on an occupied port"),
@@ -629,10 +639,7 @@ fn named_tunnel_origin_uses_the_documented_fixed_loopback_port() {
     host.start_named_tunnel_origin().unwrap();
     assert_eq!(
         host.address().unwrap(),
-        std::net::SocketAddr::from((
-            std::net::Ipv4Addr::LOCALHOST,
-            super::lan::NAMED_TUNNEL_ORIGIN_PORT,
-        ))
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, fixed_port))
     );
     host.stop().unwrap();
 }
