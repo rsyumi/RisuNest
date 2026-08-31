@@ -19,6 +19,26 @@ pub(super) fn store_error(error: StoreError) -> NativeJobError {
     }
 }
 
+// Combines a writer's outcome with its revision/lease release, keeping the
+// fail-closed rule: a failed release turns even a successful write into a
+// cleanup-failed error. The label names what failed to release in the
+// combined message (an intentional per-writer difference).
+pub(super) fn finish_with_release(
+    outcome: Result<super::JobResultSummary, NativeJobError>,
+    release: crate::persistent_store::StoreResult<()>,
+    release_failure: &str,
+) -> Result<super::JobResultSummary, NativeJobError> {
+    match (outcome, release) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(store_error(error)),
+        (Err(error), Err(release_error)) => Err(NativeJobError::new(
+            "cleanup-failed",
+            format!("{}; {release_failure}: {release_error}", error.message),
+        )),
+    }
+}
+
 pub(super) fn io_error(error: std::io::Error) -> NativeJobError {
     NativeJobError::new("io-error", error.to_string())
 }

@@ -521,7 +521,11 @@ where
         &mut release_reader,
     );
     match release_reader.take() {
-        Some(release_reader) => finish_with_release(outcome, release_reader(&mut prepared)),
+        Some(release_reader) => super::error::finish_with_release(
+            outcome,
+            release_reader(&mut prepared),
+            "revision release failed",
+        ),
         None => outcome,
     }
 }
@@ -1083,24 +1087,6 @@ impl<W: Write> Write for LimitedWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
-    }
-}
-
-fn finish_with_release(
-    outcome: Result<JobResultSummary, NativeJobError>,
-    release: StoreResult<()>,
-) -> Result<JobResultSummary, NativeJobError> {
-    match (outcome, release) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(store_error(error)),
-        (Err(error), Err(release_error)) => Err(NativeJobError::new(
-            "cleanup-failed",
-            format!(
-                "{}; revision release failed: {release_error}",
-                error.message
-            ),
-        )),
     }
 }
 

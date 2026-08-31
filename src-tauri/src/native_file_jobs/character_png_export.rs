@@ -460,7 +460,11 @@ where
         })
     })();
     match release_reader.take() {
-        Some(release_reader) => finish_with_release(outcome, release_reader(&mut prepared)),
+        Some(release_reader) => super::error::finish_with_release(
+            outcome,
+            release_reader(&mut prepared),
+            "revision release failed",
+        ),
         None => outcome,
     }
 }
@@ -503,29 +507,18 @@ fn read_verified_object(
         .open_object(hash)
         .map_err(io_error)?
         .ok_or_else(|| invalid_input("pinned character asset payload is missing"))?;
-    let capacity = usize::try_from(size)
-        .map_err(|_| invalid_input("asset size does not fit this platform"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        if job.is_cancel_requested() {
-            return Err(cancelled("PNG export cancelled while reading an asset"));
-        }
-        let read = source.read(&mut buffer).map_err(io_error)?;
-        if read == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(read) > capacity {
-            return Err(invalid_input("pinned character asset size changed"));
-        }
-        hasher.update(&buffer[..read]);
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    if bytes.len() != capacity || hex::encode(hasher.finalize()) != hash {
-        return Err(invalid_input("pinned character asset payload hash changed"));
-    }
-    Ok(bytes)
+    super::verified_read::read_verified_bytes(
+        &mut source,
+        hash,
+        size,
+        job,
+        &super::verified_read::VerifiedReadLabels {
+            cancelled: "PNG export cancelled while reading an asset",
+            capacity: "asset size does not fit this platform",
+            size_changed: "pinned character asset size changed",
+            hash_changed: "pinned character asset payload hash changed",
+        },
+    )
 }
 
 fn write_asset_text_chunk(
@@ -627,21 +620,6 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
-    }
-}
-
-fn finish_with_release(
-    outcome: Result<JobResultSummary, NativeJobError>,
-    release: StoreResult<()>,
-) -> Result<JobResultSummary, NativeJobError> {
-    match (outcome, release) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(store_error(error)),
-        (Err(error), Err(release)) => Err(NativeJobError::new(
-            "cleanup-failed",
-            format!("{}; revision release failed: {release}", error.message),
-        )),
     }
 }
 

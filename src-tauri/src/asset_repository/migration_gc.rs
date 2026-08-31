@@ -1,3 +1,4 @@
+use super::journal_frame::{self, JournalFrameLabels};
 use super::owner_manifest_codec::{decode_owner_manifest, owner_manifest_identity};
 use super::payload_cas::{PayloadCas, PreparedPayload};
 use crate::trust_boundary::is_lower_hex_256;
@@ -6,12 +7,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
 const MIGRATION_JOURNAL_VERSION: u32 = 1;
-const MAX_JOURNAL_RECORD_BYTES: usize = 64 * 1024;
 const SNAPSHOT_ROOT_SIDECAR_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -332,20 +332,14 @@ fn validate_hash(hash: &str, context: &str) -> io::Result<()> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+const JOURNAL_LABELS: JournalFrameLabels = JournalFrameLabels {
+    record_too_large: "migration record is too large",
+    length_invalid: "migration journal record length is invalid",
+    checksum_mismatch: "migration journal checksum mismatch",
+};
+
 fn write_journal_record(file: &mut File, record: &MigrationJournalRecord) -> io::Result<()> {
-    let payload = serde_json::to_vec(record).map_err(json_error)?;
-    let length = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "migration record is too large"))?;
-    if payload.len() > MAX_JOURNAL_RECORD_BYTES {
-        return invalid_data("migration record is too large");
-    }
-    let checksum = Sha256::digest(&payload);
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&payload)?;
-    file.write_all(&checksum)?;
-    file.flush()?;
-    file.sync_data()?;
-    Ok(())
+    journal_frame::write_frame(file, record, true, &JOURNAL_LABELS)
 }
 
 fn read_migration_status(
@@ -365,43 +359,15 @@ fn scan_journal_records(
     recover_trailing_frame: bool,
     mut visitor: impl FnMut(&MigrationJournalRecord) -> io::Result<()>,
 ) -> io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut valid_length = 0_u64;
-    loop {
-        let frame_start = file.stream_position()?;
-        let mut length_bytes = [0_u8; 4];
-        match read_exact_or_eof(file, &mut length_bytes)? {
-            ExactRead::Complete => {}
-            ExactRead::CleanEof => break,
-            ExactRead::Partial => {
-                recover_tail(file, valid_length, recover_trailing_frame)?;
-                break;
-            }
+    let scan =
+        journal_frame::scan_frames(file, &JOURNAL_LABELS, |record: MigrationJournalRecord| {
+            visitor(&record)
+        })?;
+    if let Some(valid_length) = scan.incomplete_tail {
+        if !recover_trailing_frame {
+            return invalid_data("migration journal has a truncated frame");
         }
-        let length = u32::from_le_bytes(length_bytes) as usize;
-        if length > MAX_JOURNAL_RECORD_BYTES {
-            return invalid_data("migration journal record length is invalid");
-        }
-        let mut payload = vec![0; length];
-        if read_exact_or_eof(file, &mut payload)? != ExactRead::Complete {
-            recover_tail(file, valid_length, recover_trailing_frame)?;
-            break;
-        }
-        let mut checksum = [0_u8; 32];
-        if read_exact_or_eof(file, &mut checksum)? != ExactRead::Complete {
-            recover_tail(file, valid_length, recover_trailing_frame)?;
-            break;
-        }
-        if Sha256::digest(&payload).as_slice() != checksum {
-            return invalid_data("migration journal checksum mismatch");
-        }
-        let record: MigrationJournalRecord =
-            serde_json::from_slice(&payload).map_err(json_error)?;
-        visitor(&record)?;
-        valid_length = file.stream_position()?;
-        if valid_length <= frame_start {
-            return invalid_data("migration journal did not advance");
-        }
+        journal_frame::truncate_to_valid_prefix(file, valid_length)?;
     }
     Ok(())
 }
@@ -475,37 +441,6 @@ fn apply_journal_record(
             current.ready = true;
         }
     }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExactRead {
-    Complete,
-    CleanEof,
-    Partial,
-}
-
-fn read_exact_or_eof(reader: &mut impl Read, target: &mut [u8]) -> io::Result<ExactRead> {
-    let mut offset = 0;
-    while offset < target.len() {
-        match reader.read(&mut target[offset..]) {
-            Ok(0) if offset == 0 => return Ok(ExactRead::CleanEof),
-            Ok(0) => return Ok(ExactRead::Partial),
-            Ok(read) => offset += read,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(ExactRead::Complete)
-}
-
-fn recover_tail(file: &mut File, valid_length: u64, enabled: bool) -> io::Result<()> {
-    if !enabled {
-        return invalid_data("migration journal has a truncated frame");
-    }
-    file.set_len(valid_length)?;
-    file.sync_data()?;
-    file.seek(SeekFrom::Start(valid_length))?;
     Ok(())
 }
 

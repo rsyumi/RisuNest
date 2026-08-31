@@ -11,6 +11,7 @@ mod legacy_backup;
 mod lossless;
 mod official_snapshot;
 mod risum_export;
+mod verified_read;
 
 #[cfg(test)]
 mod screenshot_output_test;

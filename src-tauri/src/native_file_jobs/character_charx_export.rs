@@ -112,7 +112,11 @@ where
         &mut release_reader,
     );
     match release_reader.take() {
-        Some(release_reader) => finish_with_release(outcome, release_reader(&mut prepared)),
+        Some(release_reader) => super::error::finish_with_release(
+            outcome,
+            release_reader(&mut prepared),
+            "character export lease release failed",
+        ),
         None => outcome,
     }
 }
@@ -508,33 +512,18 @@ fn read_verified_bytes(
     expected_size: u64,
     job: &JobControl,
 ) -> Result<Vec<u8>, NativeJobError> {
-    let capacity = usize::try_from(expected_size)
-        .map_err(|_| invalid_input("character portrait size does not fit this platform"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    let mut hasher = Sha256::new();
-    loop {
-        if job.is_cancel_requested() {
-            return Err(cancelled(
-                "appended CharX JPEG export cancelled while reading the portrait",
-            ));
-        }
-        let read = source.read(&mut buffer).map_err(io_error)?;
-        if read == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(read) > capacity {
-            return Err(invalid_input("pinned character portrait size changed"));
-        }
-        hasher.update(&buffer[..read]);
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    if bytes.len() != capacity || hex::encode(hasher.finalize()) != expected_hash {
-        return Err(invalid_input(
-            "pinned character portrait payload hash changed",
-        ));
-    }
-    Ok(bytes)
+    super::verified_read::read_verified_bytes(
+        &mut source,
+        expected_hash,
+        expected_size,
+        job,
+        &super::verified_read::VerifiedReadLabels {
+            cancelled: "appended CharX JPEG export cancelled while reading the portrait",
+            capacity: "character portrait size does not fit this platform",
+            size_changed: "pinned character portrait size changed",
+            hash_changed: "pinned character portrait payload hash changed",
+        },
+    )
 }
 
 fn bounded_jpeg_portrait(
@@ -997,24 +986,6 @@ fn write_card_metadata(
         archive.write_all(chunk).map_err(io_error)?;
     }
     Ok(())
-}
-
-fn finish_with_release(
-    outcome: Result<JobResultSummary, NativeJobError>,
-    release: StoreResult<()>,
-) -> Result<JobResultSummary, NativeJobError> {
-    match (outcome, release) {
-        (Ok(_), Err(error)) => Err(store_error(error)),
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(error), Err(cleanup)) => Err(NativeJobError::new(
-            "cleanup-failed",
-            format!(
-                "{}; character export lease release failed: {cleanup}",
-                error.message
-            ),
-        )),
-        (Err(error), Ok(())) => Err(error),
-    }
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {

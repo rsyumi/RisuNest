@@ -1,3 +1,4 @@
+use super::journal_frame::{self, JournalFrameLabels};
 use super::migration_gc::AssetRootSet;
 use super::{PayloadCas, PreparedPayload};
 use crate::persistent_store::asset_object_catalog::{
@@ -6,14 +7,12 @@ use crate::persistent_store::asset_object_catalog::{
 use crate::persistent_store::PersistentStore;
 use crate::trust_boundary::{is_link_like, is_lower_hex_256, sync_directory};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 const DURABLE_CAS_JOB_VERSION: u32 = 1;
-const MAX_JOURNAL_RECORD_BYTES: usize = 64 * 1024;
 const MAX_DURABLE_CAS_JOB_JOURNALS: usize = 4_096;
 pub(crate) const MAX_DURABLE_CAS_JOB_PINS: usize = 100_000;
 
@@ -785,21 +784,14 @@ fn validate_hash(hash: &str) -> io::Result<()> {
     invalid_data("CAS job hash must be a lowercase SHA-256 hash")
 }
 
+const JOURNAL_LABELS: JournalFrameLabels = JournalFrameLabels {
+    record_too_large: "CAS job journal record is too large",
+    length_invalid: "CAS job journal record length is invalid",
+    checksum_mismatch: "CAS job journal checksum mismatch",
+};
+
 fn write_record(file: &mut File, record: &JobJournalRecord, sync: bool) -> io::Result<()> {
-    let payload = serde_json::to_vec(record).map_err(json_error)?;
-    if payload.len() > MAX_JOURNAL_RECORD_BYTES {
-        return invalid_data("CAS job journal record is too large");
-    }
-    let length = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "CAS job record is too large"))?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&payload)?;
-    file.write_all(&Sha256::digest(&payload))?;
-    if sync {
-        file.flush()?;
-        file.sync_data()?;
-    }
-    Ok(())
+    journal_frame::write_frame(file, record, sync, &JOURNAL_LABELS)
 }
 
 struct InspectedJobState {
@@ -819,46 +811,15 @@ fn inspect_job_state(
     file: &mut File,
     expected_job_id: Option<&str>,
 ) -> io::Result<InspectedJobState> {
-    file.seek(SeekFrom::Start(0))?;
     let mut state = None;
-    let mut valid_length = 0_u64;
-    let mut incomplete_tail = None;
-    loop {
-        let mut length_bytes = [0_u8; 4];
-        match read_exact_or_eof(file, &mut length_bytes)? {
-            ExactRead::CleanEof => break,
-            ExactRead::Partial => {
-                incomplete_tail = Some(valid_length);
-                break;
-            }
-            ExactRead::Complete => {}
-        }
-        let length = u32::from_le_bytes(length_bytes) as usize;
-        if length > MAX_JOURNAL_RECORD_BYTES {
-            return invalid_data("CAS job journal record length is invalid");
-        }
-        let mut payload = vec![0; length];
-        if read_exact_or_eof(file, &mut payload)? != ExactRead::Complete {
-            incomplete_tail = Some(valid_length);
-            break;
-        }
-        let mut checksum = [0_u8; 32];
-        if read_exact_or_eof(file, &mut checksum)? != ExactRead::Complete {
-            incomplete_tail = Some(valid_length);
-            break;
-        }
-        if Sha256::digest(&payload).as_slice() != checksum {
-            return invalid_data("CAS job journal checksum mismatch");
-        }
-        let record: JobJournalRecord = serde_json::from_slice(&payload).map_err(json_error)?;
-        apply_record(&mut state, record, expected_job_id)?;
-        valid_length = file.stream_position()?;
-    }
+    let scan = journal_frame::scan_frames(file, &JOURNAL_LABELS, |record: JobJournalRecord| {
+        apply_record(&mut state, record, expected_job_id)
+    })?;
     let state =
         state.ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "CAS job journal is empty"))?;
     Ok(InspectedJobState {
         state,
-        incomplete_tail,
+        incomplete_tail: scan.incomplete_tail,
     })
 }
 
@@ -971,32 +932,8 @@ fn validate_identity(expected: Option<&str>, actual: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExactRead {
-    Complete,
-    CleanEof,
-    Partial,
-}
-
-fn read_exact_or_eof(reader: &mut impl Read, target: &mut [u8]) -> io::Result<ExactRead> {
-    let mut offset = 0;
-    while offset < target.len() {
-        match reader.read(&mut target[offset..]) {
-            Ok(0) if offset == 0 => return Ok(ExactRead::CleanEof),
-            Ok(0) => return Ok(ExactRead::Partial),
-            Ok(read) => offset += read,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(ExactRead::Complete)
-}
-
 fn recover_incomplete_tail_already_guarded(file: &mut File, valid_length: u64) -> io::Result<()> {
-    file.set_len(valid_length)?;
-    file.sync_data()?;
-    file.seek(SeekFrom::Start(valid_length))?;
-    Ok(())
+    journal_frame::truncate_to_valid_prefix(file, valid_length)
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {

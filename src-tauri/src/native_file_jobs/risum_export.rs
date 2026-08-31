@@ -248,7 +248,11 @@ where
         })
     })();
     match release_reader.take() {
-        Some(release_reader) => finish_with_release(outcome, release_reader(&mut prepared)),
+        Some(release_reader) => super::error::finish_with_release(
+            outcome,
+            release_reader(&mut prepared),
+            "revision release failed",
+        ),
         None => outcome,
     }
 }
@@ -413,21 +417,6 @@ fn write_verified_rpack_object(
         return Err(invalid_input("RISUM asset payload hash changed"));
     }
     Ok(())
-}
-
-fn finish_with_release(
-    outcome: Result<JobResultSummary, NativeJobError>,
-    release: StoreResult<()>,
-) -> Result<JobResultSummary, NativeJobError> {
-    match (outcome, release) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(store_error(error)),
-        (Err(error), Err(release)) => Err(NativeJobError::new(
-            "cleanup-failed",
-            format!("{}; revision release failed: {release}", error.message),
-        )),
-    }
 }
 
 fn destination_error(error: destination::DestinationWriteError) -> NativeJobError {
