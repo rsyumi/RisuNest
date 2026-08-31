@@ -2,6 +2,7 @@ use super::{NativeFileJobStarted, NativeJobError};
 use crate::persistent_store::export::destination::{
     self, DestinationWriteError, DestinationWriteResult,
 };
+use crate::trust_boundary::sync_directory;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -576,7 +577,8 @@ fn write_owned_marker(directory: &Path, name: &str, job_id: &str) -> Result<(), 
             "sync screenshot marker directory",
             error,
         )
-    })
+    })?;
+    Ok(())
 }
 
 fn screenshot_spool_fingerprint(
@@ -617,16 +619,6 @@ pub(crate) fn screenshot_spool_fingerprint_controlled(
         hasher.update(&buffer[..read]);
     }
     Ok((bytes, hex::encode(hasher.finalize())))
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn validate_destination(destination: PathBuf) -> Result<PathBuf, NativeJobError> {

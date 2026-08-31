@@ -1,3 +1,9 @@
+// payload_cas.rs reaches its shared trust-boundary helpers through
+// crate::trust_boundary, so this standalone compilation provides the same
+// module at the test-crate root.
+#[path = "../src/trust_boundary.rs"]
+mod trust_boundary;
+
 #[path = "../src/asset_repository/payload_cas.rs"]
 mod payload_cas;
 

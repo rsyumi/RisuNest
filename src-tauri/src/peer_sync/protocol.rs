@@ -182,11 +182,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn validate_hash(hash: &str) -> Result<(), PeerSyncError> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if crate::trust_boundary::is_lower_hex_256(hash) {
         return Ok(());
     }
     protocol_error("SHA-256 must be 64 lowercase hexadecimal characters")

@@ -1,4 +1,5 @@
 use crate::asset_repository::PayloadCas;
+use crate::trust_boundary::{is_lower_hex_byte, sync_directory};
 use image::codecs::png::PngDecoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
@@ -120,21 +121,14 @@ fn valid_physical_key(key: &str) -> bool {
     else {
         return false;
     };
-    !encoded.is_empty()
-        && encoded.len() % 2 == 0
-        && encoded
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    !encoded.is_empty() && encoded.len() % 2 == 0 && encoded.bytes().all(is_lower_hex_byte)
 }
 
 fn cas_content_hash(key: &str) -> Option<String> {
     let (shard, suffix) = key.strip_prefix("assets-v2/objects/")?.split_once('/')?;
     if shard.len() != 2
         || suffix.len() != 62
-        || !shard
-            .bytes()
-            .chain(suffix.bytes())
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !shard.bytes().chain(suffix.bytes()).all(is_lower_hex_byte)
     {
         return None;
     }
@@ -243,20 +237,9 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        File::open(path)?.sync_all()
-    }
-}
-
 fn sync_parent(path: &Path) -> std::io::Result<()> {
-    sync_directory(path.parent().expect("managed media path has a parent"))
+    sync_directory(path.parent().expect("managed media path has a parent"))?;
+    Ok(())
 }
 
 fn create_directory_synced(path: &Path) -> std::io::Result<()> {
@@ -276,7 +259,9 @@ fn create_directory_synced(path: &Path) -> std::io::Result<()> {
         .expect("managed directory name is UTF-8");
     let staged = parent.join(format!(".{name}.replace-next-dir"));
     match fs::remove_dir(&staged) {
-        Ok(()) => sync_directory(parent)?,
+        Ok(()) => {
+            sync_directory(parent)?;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }

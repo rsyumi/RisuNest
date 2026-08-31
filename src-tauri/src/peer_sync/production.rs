@@ -271,7 +271,7 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
             "{manifest_id}{ACTIVATION_STAGE_SEPARATOR}{stage_id}"
         ));
         fs::create_dir(&directory)?;
-        sync_directory(&self.root)?;
+        crate::trust_boundary::sync_directory(&self.root)?;
         Ok(LosslessCloneStage {
             directory,
             package: None,
@@ -459,17 +459,6 @@ fn unix_time_ms() -> Result<i64, PeerSyncError> {
         .as_millis();
     i64::try_from(millis)
         .map_err(|_| PeerSyncError::Storage("system time exceeds durable job range".to_owned()))
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), PeerSyncError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), PeerSyncError> {
-    Ok(())
 }
 
 fn store_error(error: crate::persistent_store::StoreError) -> PeerSyncError {

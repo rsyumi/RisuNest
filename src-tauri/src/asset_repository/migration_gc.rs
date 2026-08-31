@@ -1,5 +1,6 @@
 use super::owner_manifest_codec::{decode_owner_manifest, owner_manifest_identity};
 use super::payload_cas::{PayloadCas, PreparedPayload};
+use crate::trust_boundary::is_lower_hex_256;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -324,11 +325,7 @@ fn validate_migration_id(migration_id: &str) -> io::Result<()> {
 }
 
 fn validate_hash(hash: &str, context: &str) -> io::Result<()> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_lower_hex_256(hash) {
         return Ok(());
     }
     invalid_data(format!("{context} must be a lowercase SHA-256 hash"))

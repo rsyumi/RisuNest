@@ -1,4 +1,5 @@
 use super::FormatError;
+use crate::trust_boundary::is_link_like;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, Metadata, OpenOptions},
@@ -180,17 +181,4 @@ fn ensure_plain_directory(path: &Path, metadata: &Metadata) -> Result<(), Format
         )));
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn is_link_like(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link_like(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink()
 }

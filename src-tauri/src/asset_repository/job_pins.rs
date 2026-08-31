@@ -4,13 +4,12 @@ use crate::persistent_store::asset_object_catalog::{
     AssetObjectRegistration, ASSET_OBJECT_CATALOG_MAX_PAGE,
 };
 use crate::persistent_store::PersistentStore;
+use crate::trust_boundary::{is_link_like, is_lower_hex_256, sync_directory};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const DURABLE_CAS_JOB_VERSION: u32 = 1;
@@ -780,11 +779,7 @@ fn validate_job_id(job_id: &str) -> io::Result<()> {
 }
 
 fn validate_hash(hash: &str) -> io::Result<()> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_lower_hex_256(hash) {
         return Ok(());
     }
     invalid_data("CAS job hash must be a lowercase SHA-256 hash")
@@ -1010,29 +1005,6 @@ fn json_error(error: serde_json::Error) -> io::Error {
 
 fn invalid_data<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(ErrorKind::InvalidData, message.into()))
-}
-
-#[cfg(windows)]
-fn is_link_like(metadata: &fs::Metadata) -> bool {
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link_like(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<bool> {
-    File::open(path)?.sync_all()?;
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<bool> {
-    Ok(false)
 }
 
 #[cfg(test)]

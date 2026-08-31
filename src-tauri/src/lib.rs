@@ -16,6 +16,7 @@ mod persistent_store;
 mod publication_upload;
 #[cfg(any(test, target_os = "windows", target_os = "android"))]
 mod regex_shadow;
+mod trust_boundary;
 
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};

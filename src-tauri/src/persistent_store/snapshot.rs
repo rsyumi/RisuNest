@@ -979,7 +979,7 @@ fn cas_hash_from_physical_key(value: &[u8]) -> Option<String> {
         || !suffix[..2]
             .iter()
             .chain(&suffix[3..])
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            .all(|byte| crate::trust_boundary::is_lower_hex_byte(*byte))
     {
         return None;
     }

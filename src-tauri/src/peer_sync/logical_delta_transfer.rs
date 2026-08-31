@@ -401,11 +401,7 @@ fn validate_ready_plan(plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError
 }
 
 fn validate_hash(hash: &str, description: &str) -> Result<(), PeerSyncError> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if crate::trust_boundary::is_lower_hex_256(hash) {
         return Ok(());
     }
     validation(format!(

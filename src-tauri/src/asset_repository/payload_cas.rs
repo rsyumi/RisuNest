@@ -1,3 +1,4 @@
+use crate::trust_boundary::{is_link_like, is_lower_hex_256, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
@@ -8,10 +9,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
-use std::os::windows::{
-    fs::{MetadataExt, OpenOptionsExt},
-    io::AsRawHandle,
-};
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -502,18 +500,6 @@ fn ensure_real_directory(path: &Path, metadata: &Metadata) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn is_link_like(metadata: &Metadata) -> bool {
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link_like(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
 fn invalid_owned_path<T>(path: &Path, reason: &str) -> io::Result<T> {
     Err(io::Error::new(
         ErrorKind::InvalidData,
@@ -522,11 +508,7 @@ fn invalid_owned_path<T>(path: &Path, reason: &str) -> io::Result<T> {
 }
 
 fn validate_content_hash(content_hash: &str) -> io::Result<()> {
-    if content_hash.len() == 64
-        && content_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_lower_hex_256(content_hash) {
         return Ok(());
     }
     Err(io::Error::new(
@@ -674,17 +656,6 @@ fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
         byte_size: metadata.len(),
         modified: metadata.modified().ok(),
     })
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<bool> {
-    File::open(path)?.sync_all()?;
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<bool> {
-    Ok(false)
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use crate::trust_boundary::{is_link_like, is_lower_hex_256};
 use crate::{
     asset_repository::{
         job_pins::{CasObjectRole, DurableCasJob},
@@ -25,7 +26,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, Metadata, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -3177,19 +3178,6 @@ fn prepare_staging_directory(root: &Path) -> Result<PathBuf, LosslessError> {
     Ok(staging)
 }
 
-#[cfg(windows)]
-fn is_link_like(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link_like(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
 fn normalize_logical_path(path: &str) -> Result<String, LosslessError> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES || path.contains('\0') {
         return Err(LosslessError::new(
@@ -3223,11 +3211,7 @@ fn normalize_logical_path(path: &str) -> Result<String, LosslessError> {
 }
 
 fn validate_hash(hash: &str) -> Result<(), LosslessError> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_lower_hex_256(hash) {
         return Ok(());
     }
     Err(invalid_manifest(

@@ -1573,12 +1573,7 @@ fn validate_identity(identity: &SyncGenerationIdentity) -> StoreResult<()> {
     if identity.generation_id.is_empty() {
         return validation("sync generation id must be nonempty");
     }
-    if identity.manifest_hash.len() != 64
-        || !identity
-            .manifest_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !crate::trust_boundary::is_lower_hex_256(&identity.manifest_hash) {
         return validation("sync manifest hash must be a lowercase SHA-256");
     }
     validate_sequence(&identity.generation_sequence)

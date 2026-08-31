@@ -5,6 +5,7 @@ use crate::asset_repository::owner_manifest_codec::{
 };
 use crate::native_file_jobs::NativeFileJobState;
 use crate::persistent_store::{self, PersistentStore, PersistentStoreState, StoreError};
+use crate::trust_boundary::is_lower_hex_256;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, ErrorKind};
@@ -342,11 +343,7 @@ fn finalize_content_job(
 }
 
 fn validate_content_object_hash(hash: &str) -> io::Result<()> {
-    if hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_lower_hex_256(hash) {
         return Ok(());
     }
     invalid_content_finalization("content import object hash must be lowercase SHA-256")

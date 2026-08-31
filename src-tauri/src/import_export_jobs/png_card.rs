@@ -1,16 +1,14 @@
+use crate::trust_boundary::is_link_like;
 use base64::{engine::general_purpose::STANDARD, read::DecoderReader, Engine as _};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fmt,
-    fs::{self, File, Metadata, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
-
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -717,18 +715,6 @@ fn validate_staging_directory(path: &Path) -> Result<PathBuf, PngCardError> {
         ));
     }
     Ok(fs::canonicalize(path)?)
-}
-
-#[cfg(windows)]
-fn is_link_like(metadata: &Metadata) -> bool {
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link_like(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink()
 }
 
 #[cfg(test)]

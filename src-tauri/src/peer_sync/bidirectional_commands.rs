@@ -483,11 +483,7 @@ fn is_canonical_uuid(value: &str) -> bool {
 
 fn valid_generation(generation: &SyncGenerationIdentity) -> bool {
     !generation.generation_id.is_empty()
-        && generation.manifest_hash.len() == 64
-        && generation
-            .manifest_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && crate::trust_boundary::is_lower_hex_256(&generation.manifest_hash)
         && !generation.generation_sequence.is_empty()
         && (generation.generation_sequence == "0"
             || (!generation.generation_sequence.starts_with('0')

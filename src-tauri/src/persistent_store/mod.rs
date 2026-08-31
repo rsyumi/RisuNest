@@ -617,14 +617,7 @@ impl ColdAlias {
     }
 }
 
-// The single source of truth for the lowercase SHA-256 hex shape used by
-// every hash validator in the persistent store.
-fn is_lowercase_sha256_hex(hash: &str) -> bool {
-    hash.len() == 64
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+pub(crate) use crate::trust_boundary::is_lower_hex_256 as is_lowercase_sha256_hex;
 
 fn validate_object_hash(hash: &Option<String>, subject: &str) -> StoreResult<()> {
     if hash

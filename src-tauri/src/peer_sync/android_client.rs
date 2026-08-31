@@ -1252,8 +1252,5 @@ fn sync_parent_directory(_path: &Path) -> Result<(), PeerSyncError> {
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::trust_boundary::is_lower_hex_256(value)
 }
