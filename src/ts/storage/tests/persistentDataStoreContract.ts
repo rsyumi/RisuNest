@@ -480,6 +480,57 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             }
         })
 
+        it('keeps colon-bearing character and conversation ids distinct', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const template = fixtureDatabase.characters[0]
+            const first = structuredClone(template)
+            first.chaId = 'colliding:character'
+            first.name = 'Colliding One'
+            first.chats = [{
+                ...structuredClone(template.chats[0]),
+                id: 'shared',
+                name: 'First chat',
+                message: [{ role: 'user', data: 'first payload', chatId: 'first-msg' }],
+            }]
+            const second = structuredClone(template)
+            second.chaId = 'colliding'
+            second.name = 'Colliding Two'
+            second.chats = [{
+                ...structuredClone(template.chats[0]),
+                id: 'character:shared',
+                name: 'Second chat',
+                message: [{ role: 'user', data: 'second payload', chatId: 'second-msg' }],
+            }]
+
+            const one = await store.commit({
+                expectedRevision: imported.revision,
+                addCharacter: first,
+            })
+            const two = await store.commit({
+                expectedRevision: one.revision,
+                addCharacter: second,
+            })
+
+            expect((await store.readConversation('colliding:character', 'shared'))?.value.message)
+                .toMatchObject([{ data: 'first payload' }])
+            expect((await store.readConversation('colliding', 'character:shared'))?.value.message)
+                .toMatchObject([{ data: 'second payload' }])
+
+            await store.commit({
+                expectedRevision: two.revision,
+                conversations: [{
+                    type: 'delete',
+                    characterId: 'colliding',
+                    conversationId: 'character:shared',
+                }],
+            })
+
+            expect(await store.readConversation('colliding', 'character:shared')).toBeNull()
+            expect((await store.readConversation('colliding:character', 'shared'))?.value.message)
+                .toMatchObject([{ data: 'first payload' }])
+        })
+
         it('rejects an imported alias batch without exposing its character or module', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

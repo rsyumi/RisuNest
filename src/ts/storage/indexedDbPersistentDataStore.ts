@@ -48,7 +48,7 @@ import {
 import { parseAssetRepositoryAuthorityState } from './assetRepositoryAuthority'
 import { parseColdPayloadAuthorityState } from './coldPayloadAuthority'
 
-const DATABASE_VERSION = 14
+const DATABASE_VERSION = 15
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -292,6 +292,14 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
     })
 }
 
+// Composite record keys join their components with ':'. Components carrying
+// user-controlled ids are escaped so distinct (characterId, conversationId)
+// tuples can never collide onto the same joined key; the escape alphabet is
+// colon-free, so exact lookups and fixed-prefix scans keep working.
+function encodeKeyComponent(component: string): string {
+    return component.replace(/%/g, '%25').replace(/:/g, '%3A')
+}
+
 function transactionDone(transaction: IDBTransaction): Promise<void> {
     return new Promise((resolve, reject) => {
         transaction.oncomplete = () => resolve()
@@ -507,6 +515,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             if (event.oldVersion > 0 && event.oldVersion < 14) {
                 this.backfillMessageOccurrences(transaction)
+            }
+            if (event.oldVersion > 0 && event.oldVersion < 15) {
+                this.migrateCompositeKeyEncoding(transaction)
             }
         }
         this.database = await requestResult(request)
@@ -3481,6 +3492,106 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
+    // Version 15 escapes user-controlled key components; rows written before
+    // that carry raw ids in their joined keys and can collide across distinct
+    // (characterId, conversationId) tuples. The migration scans conversations
+    // once, rewriting each affected conversation from its authoritative
+    // summary fields, and reaches the matching message rows through their
+    // byConversationPage index so clean libraries never scan the page stores.
+    // Rows with an unexpected shape are left untouched rather than dropped.
+    private migrateCompositeKeyEncoding(transaction: IDBTransaction): void {
+        const conversations = transaction.objectStore('conversations')
+        const affected: {
+            record: Record<string, unknown>
+            oldKey: string
+            generation: string
+            characterId: string
+            conversationId: string
+        }[] = []
+        const request = conversations.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) {
+                for (const entry of affected) this.applyCompositeKeyRewrite(transaction, entry)
+                return
+            }
+            const record = cursor.value as Record<string, unknown> & {
+                key: string
+                generation: string
+                value?: { summary?: { characterId?: unknown; id?: unknown } }
+            }
+            const characterId = record.value?.summary?.characterId
+            const conversationId = record.value?.summary?.id
+            if (typeof characterId === 'string' && typeof conversationId === 'string') {
+                const rebuilt = this.conversationKey(record.generation, characterId, conversationId)
+                if (rebuilt !== record.key) {
+                    affected.push({
+                        record,
+                        oldKey: record.key,
+                        generation: record.generation,
+                        characterId,
+                        conversationId,
+                    })
+                }
+            }
+            cursor.continue()
+        }
+    }
+
+    private applyCompositeKeyRewrite(
+        transaction: IDBTransaction,
+        entry: {
+            record: Record<string, unknown>
+            oldKey: string
+            generation: string
+            characterId: string
+            conversationId: string
+        },
+    ): void {
+        const conversations = transaction.objectStore('conversations')
+        conversations.delete(entry.oldKey)
+        conversations.put({
+            ...entry.record,
+            key: this.conversationKey(entry.generation, entry.characterId, entry.conversationId),
+        })
+        for (const storeName of ['messagePages', 'messageOccurrences'] as const) {
+            const store = transaction.objectStore(storeName)
+            const range = this.keyRangeFactory.bound(
+                [entry.generation, entry.characterId, entry.conversationId, 0],
+                [entry.generation, entry.characterId, entry.conversationId, MAX_INDEX_VALUE],
+            )
+            const pages = store.index('byConversationPage').openCursor(range)
+            const staleKeys: string[] = []
+            const rewritten: Record<string, unknown>[] = []
+            pages.onsuccess = () => {
+                const cursor = pages.result
+                if (!cursor) {
+                    for (const key of staleKeys) store.delete(key)
+                    for (const record of rewritten) store.put(record)
+                    return
+                }
+                const record = cursor.value as Record<string, unknown> & {
+                    key: string
+                    pageIndex?: unknown
+                }
+                if (typeof record.pageIndex === 'number') {
+                    const page = storeName === 'messagePages'
+                        ? String(record.pageIndex)
+                        : String(record.pageIndex).padStart(16, '0')
+                    const prefix = storeName === 'messagePages'
+                        ? 'message-page'
+                        : 'message-occurrence-page'
+                    const rebuilt = `${entry.generation}:${prefix}:${encodeKeyComponent(entry.characterId)}:${encodeKeyComponent(entry.conversationId)}:${page}`
+                    if (rebuilt !== record.key) {
+                        staleKeys.push(record.key)
+                        rewritten.push({ ...record, key: rebuilt })
+                    }
+                }
+                cursor.continue()
+            }
+        }
+    }
+
     private generationFor(revision: DataRevision): string {
         return `revision-${revision}`
     }
@@ -3494,7 +3605,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     }
 
     private conversationKey(generation: string, characterId: string, conversationId: string): string {
-        return `${generation}:conversation:${characterId}:${conversationId}`
+        return `${generation}:conversation:${encodeKeyComponent(characterId)}:${encodeKeyComponent(conversationId)}`
     }
 
     private messagePageKey(
@@ -3503,7 +3614,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         conversationId: string,
         pageIndex: number,
     ): string {
-        return `${generation}:message-page:${characterId}:${conversationId}:${pageIndex}`
+        return `${generation}:message-page:${encodeKeyComponent(characterId)}:${encodeKeyComponent(conversationId)}:${pageIndex}`
     }
 
     private putMessageOccurrencePage(
@@ -3519,7 +3630,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (message.chatId !== undefined) messageIds.add(message.chatId)
         }
         transaction.objectStore('messageOccurrences').put({
-            key: `${generation}:message-occurrence-page:${characterId}:${conversationId}:${String(pageIndex).padStart(16, '0')}`,
+            key: `${generation}:message-occurrence-page:${encodeKeyComponent(characterId)}:${encodeKeyComponent(conversationId)}:${String(pageIndex).padStart(16, '0')}`,
             generation,
             characterId,
             conversationId,

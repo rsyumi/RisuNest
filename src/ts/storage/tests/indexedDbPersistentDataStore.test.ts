@@ -447,6 +447,87 @@ async function createVersion11ColdlessDatabase(
     database.close()
 }
 
+async function createVersion14ColonKeyDatabase(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    const openRequest = indexedDB.open(databaseName, 14)
+    openRequest.onupgradeneeded = () => {
+        for (const storeName of [
+            'meta',
+            'root',
+            'conversations',
+            'messagePages',
+            'messageOccurrences',
+        ]) {
+            openRequest.result.createObjectStore(storeName, { keyPath: 'key' })
+        }
+    }
+    const database = await requestResultForTest(openRequest)
+    const generation = 'revision-5'
+    const transaction = database.transaction(
+        ['meta', 'root', 'conversations', 'messagePages', 'messageOccurrences'],
+        'readwrite',
+    )
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 14 })
+    transaction.objectStore('meta').put({ key: 'activeGeneration', value: generation })
+    transaction.objectStore('meta').put({ key: 'currentRevision', value: 5 })
+    transaction.objectStore('root').put({ key: generation, generation, value: {} })
+    // Written by version 14 with the raw ':'-joined key layout.
+    transaction.objectStore('conversations').put({
+        key: `${generation}:conversation:char:x:conv`,
+        generation,
+        configuredIndex: 0,
+        recentSortValue: -100,
+        value: {
+            summary: {
+                id: 'conv',
+                characterId: 'char:x',
+                name: 'Colon chat',
+                configuredIndex: 0,
+                recentAt: 100,
+                messageCount: 1,
+            },
+            detail: { id: 'conv', name: 'Colon chat', note: '', localLore: [] },
+        },
+    })
+    transaction.objectStore('conversations').put({
+        key: `${generation}:conversation:plain:conv`,
+        generation,
+        configuredIndex: 1,
+        recentSortValue: -90,
+        value: {
+            summary: {
+                id: 'conv',
+                characterId: 'plain',
+                name: 'Plain chat',
+                configuredIndex: 1,
+                recentAt: 90,
+                messageCount: 0,
+            },
+            detail: { id: 'conv', name: 'Plain chat', note: '', localLore: [] },
+        },
+    })
+    transaction.objectStore('messagePages').put({
+        key: `${generation}:message-page:char:x:conv:0`,
+        generation,
+        characterId: 'char:x',
+        conversationId: 'conv',
+        pageIndex: 0,
+        value: [{ role: 'user', data: 'colon payload', chatId: 'msg:1', time: 100 }],
+    })
+    transaction.objectStore('messageOccurrences').put({
+        key: `${generation}:message-occurrence-page:char:x:conv:0000000000000000`,
+        generation,
+        characterId: 'char:x',
+        conversationId: 'conv',
+        pageIndex: 0,
+        lookupKeys: [JSON.stringify([generation, 'char:x', 'conv', 'msg:1'])],
+    })
+    await completeTransaction(transaction)
+    database.close()
+}
+
 async function createVersion13OccurrenceDatabase(
     indexedDB: IDBFactory,
     databaseName: string,
@@ -636,7 +717,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(14)
+        expect(database.version).toBe(15)
         const transaction = database.transaction('messageOccurrences', 'readonly')
         expect(transaction.objectStore('messageOccurrences').indexNames.contains(
             'byLookupKey',
@@ -713,7 +794,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(14)
+        expect(database.version).toBe(15)
         const transaction = database.transaction('messageOccurrences', 'readonly')
         const occurrences = transaction.objectStore('messageOccurrences')
         expect(occurrences.indexNames.contains('byConversationMessageIndex')).toBe(false)
@@ -861,6 +942,50 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }))
     }, 15_000)
 
+    it('rewrites colon-bearing composite keys when upgrading to version 15', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-14-colon-keys-${databaseSequence++}`
+        await createVersion14ColonKeyDatabase(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+
+        const conversation = await store.readConversation('char:x', 'conv')
+        expect(conversation?.value.message).toMatchObject([
+            { data: 'colon payload', chatId: 'msg:1' },
+        ])
+        expect((await store.readConversation('plain', 'conv'))?.value.name).toBe('Plain chat')
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(15)
+        const transaction = database.transaction(
+            ['conversations', 'messagePages', 'messageOccurrences'],
+            'readonly',
+        )
+        const generation = 'revision-5'
+        const readKey = (storeName: string, key: string) =>
+            new Promise<unknown>((resolve, reject) => {
+                const request = transaction.objectStore(storeName).get(key)
+                request.onsuccess = () => resolve(request.result)
+                request.onerror = () => reject(request.error)
+            })
+        await expect(readKey('conversations', `${generation}:conversation:char%3Ax:conv`))
+            .resolves.toMatchObject({ generation })
+        await expect(readKey('conversations', `${generation}:conversation:char:x:conv`))
+            .resolves.toBeUndefined()
+        await expect(readKey('conversations', `${generation}:conversation:plain:conv`))
+            .resolves.toMatchObject({ generation })
+        await expect(readKey('messagePages', `${generation}:message-page:char%3Ax:conv:0`))
+            .resolves.toMatchObject({ characterId: 'char:x' })
+        await expect(readKey('messagePages', `${generation}:message-page:char:x:conv:0`))
+            .resolves.toBeUndefined()
+        await expect(readKey(
+            'messageOccurrences',
+            `${generation}:message-occurrence-page:char%3Ax:conv:0000000000000000`,
+        )).resolves.toMatchObject({ conversationId: 'conv' })
+        await completeTransaction(transaction)
+        database.close()
+    })
+
     it('upgrades version 7 with empty asset alias and owner-head stores without scans', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `version-7-asset-alias-schema-${databaseSequence++}`
@@ -871,8 +996,12 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 this: IDBObjectStore,
                 ...args: Parameters<IDBObjectStore['openCursor']>
             ) {
-                if (this.name !== 'meta' && this.name !== 'messagePages') {
-                    throw new Error('version 7 upgrade must scan only message pages for occurrences')
+                if (
+                    this.name !== 'meta' &&
+                    this.name !== 'messagePages' &&
+                    this.name !== 'conversations'
+                ) {
+                    throw new Error('version 7 upgrade must scan only message pages and conversations')
                 }
                 return originalOpenCursor.apply(this, args)
             })
@@ -885,7 +1014,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(14)
+        expect(database.version).toBe(15)
         const transaction = database.transaction(
             ['assetAliases', 'assetOwnerHeads', 'assetRepositoryAuthority'],
             'readonly',
@@ -924,7 +1053,8 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 if (
                     this.name !== 'meta' &&
                     this.name !== 'assetAliases' &&
-                    this.name !== 'messagePages'
+                    this.name !== 'messagePages' &&
+                    this.name !== 'conversations'
                 ) {
                     throw new Error('version 8 upgrade scanned an unrelated record family')
                 }
@@ -939,7 +1069,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(14)
+        expect(database.version).toBe(15)
         const transaction = database.transaction('assetOwnerHeads', 'readonly')
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)
@@ -961,7 +1091,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(14)
+        expect(database.version).toBe(15)
         const transaction = database.transaction(
             ['coldAliases', 'coldPayloadAuthority'],
             'readonly',
