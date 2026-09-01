@@ -1,13 +1,31 @@
 use super::maintenance::{
     cleanup_temp, cleanup_temp_with_predelete_hook, delete_backup,
     delete_backup_with_predelete_hook, desktop_clone_backup_job_is_active, list_backups,
-    temp_usage,
+    temp_usage, PeerBackupDeleteError,
 };
 use super::PeerSyncError;
 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
 use std::fs;
 #[cfg(any(unix, windows))]
 use std::path::Path;
+
+#[test]
+fn peer_backup_delete_error_serializes_only_a_safe_code() {
+    let in_use = serde_json::to_value(PeerBackupDeleteError::from(PeerSyncError::Validation(
+        "peer-backup-in-use".to_owned(),
+    )))
+    .expect("serialize in-use error");
+    let generic = serde_json::to_value(PeerBackupDeleteError::from(PeerSyncError::Storage(
+        "C:/private/path".to_owned(),
+    )))
+    .expect("serialize generic error");
+
+    assert_eq!(in_use, serde_json::json!({ "code": "peer-backup-in-use" }));
+    assert_eq!(
+        generic,
+        serde_json::json!({ "code": "peer-backup-delete-failed" })
+    );
+}
 
 #[cfg(unix)]
 fn create_file_link(target: &Path, link: &Path) {

@@ -22,6 +22,22 @@ pub(crate) struct PeerTempUsage {
     pub(crate) bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PeerBackupDeleteError {
+    pub(crate) code: &'static str,
+}
+
+impl From<PeerSyncError> for PeerBackupDeleteError {
+    fn from(error: PeerSyncError) -> Self {
+        eprintln!("peer backup delete failed: {error}");
+        let code =
+            matches!(error, PeerSyncError::Validation(message) if message == "peer-backup-in-use")
+                .then_some("peer-backup-in-use")
+                .unwrap_or("peer-backup-delete-failed");
+        Self { code }
+    }
+}
+
 fn link_like(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -370,8 +386,12 @@ pub(crate) fn peer_backup_list(app: AppHandle) -> Result<Vec<PeerBackupInfo>, Pe
 }
 
 #[tauri::command(async)]
-pub(crate) fn peer_backup_delete(app: AppHandle, path: String) -> Result<(), PeerSyncError> {
-    delete_backup(&app_root(&app)?, Path::new(&path))
+pub(crate) fn peer_backup_delete(
+    app: AppHandle,
+    path: String,
+) -> Result<(), PeerBackupDeleteError> {
+    let root = app_root(&app).map_err(PeerBackupDeleteError::from)?;
+    delete_backup(&root, Path::new(&path)).map_err(PeerBackupDeleteError::from)
 }
 
 #[tauri::command(async)]

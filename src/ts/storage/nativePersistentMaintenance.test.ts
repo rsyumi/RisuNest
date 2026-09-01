@@ -21,6 +21,7 @@ import {
     listPeerBackups,
     previewNativePersistentAssetGc,
     removePeerBackup,
+    isNativePeerBackupDeleteError,
     cleanupPeerTemp,
     getPeerTempUsage,
     checkpointNativePersistentStore,
@@ -95,6 +96,13 @@ describe('native persistent maintenance', () => {
             ['peer_temp_usage'],
             ['peer_temp_cleanup'],
         ])
+    })
+
+    it('recognizes only the safe serialized peer-backup delete errors', () => {
+        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-in-use' })).toEqual({ code: 'peer-backup-in-use' })
+        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-delete-failed' })).toEqual({ code: 'peer-backup-delete-failed' })
+        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-in-use', message: 'raw native text' })).toBeNull()
+        expect(isNativePeerBackupDeleteError({ code: 'other' })).toBeNull()
     })
 
     it.each([

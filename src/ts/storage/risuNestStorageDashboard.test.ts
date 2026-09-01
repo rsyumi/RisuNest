@@ -70,6 +70,26 @@ describe('RisuNest storage dashboard view model', () => {
         expect(dashboard.snapshot().tempUsage).toEqual({ count: 2, bytes: 1024 })
     })
 
+    it('excludes duplicate loads and actions until a pending load settles', async () => {
+        let resolveStats: ((value: typeof stats) => void) | undefined
+        const getStats = vi.fn(() => new Promise<typeof stats>((resolve) => { resolveStats = resolve }))
+        const getTemp = vi.fn()
+        const dashboard = createRisuNestStorageDashboard({
+            getStats, listSnapshots: vi.fn().mockResolvedValue(snapshots), listConflictBackups: vi.fn().mockResolvedValue(conflictBackups), listPeerBackups: vi.fn().mockResolvedValue(peerBackups),
+            getTemp, cleanupTemp: vi.fn(), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
+        })
+
+        const firstLoad = dashboard.load()
+        await dashboard.load()
+        await dashboard.calculateTempSize()
+        expect(getStats).toHaveBeenCalledOnce()
+        expect(getTemp).not.toHaveBeenCalled()
+
+        resolveStats?.(stats)
+        await firstLoad
+        expect(dashboard.snapshot()).toMatchObject({ loading: false, stats, loadFailed: false })
+    })
+
     it('cleans temp storage and previews then executes garbage collection one operation at a time', async () => {
         let resolveCleanup: (() => void) | undefined
         const cleanupTemp = vi.fn(() => new Promise<{ count: number; bytes: number }>((resolve) => { resolveCleanup = () => resolve({ count: 0, bytes: 0 }) }))

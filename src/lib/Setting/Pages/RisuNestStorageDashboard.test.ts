@@ -6,6 +6,11 @@ import { mount, tick, unmount } from 'svelte'
 const maintenance = vi.hoisted(() => ({
     getNativePersistentStorageStats: vi.fn(), listNativePersistentSnapshots: vi.fn(), getPeerTempUsage: vi.fn(), cleanupPeerTemp: vi.fn(), previewNativePersistentAssetGc: vi.fn(), executeNativePersistentAssetGc: vi.fn(),
     deleteNativePersistentSnapshot: vi.fn(), removePeerBackup: vi.fn(), listPeerBackups: vi.fn(), createNativePersistentSnapshot: vi.fn(),
+    isNativePeerBackupDeleteError: (error: unknown) => {
+        if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'peer-backup-in-use') return { code: 'peer-backup-in-use' as const }
+        if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'peer-backup-delete-failed') return { code: 'peer-backup-delete-failed' as const }
+        return null
+    },
 }))
 const backups = vi.hoisted(() => ({ list: vi.fn(), remove: vi.fn() }))
 const alerts = vi.hoisted(() => ({ alertConfirm: vi.fn(), alertError: vi.fn() }))
@@ -81,7 +86,7 @@ describe('RisuNestStorageDashboard', () => {
 
     it('uses localized safe errors for a backup that is in use', async () => {
         const target = setup()
-        maintenance.removePeerBackup.mockRejectedValue({ code: 'peer-backup-in-use', message: 'peer-backup-in-use' })
+        maintenance.removePeerBackup.mockRejectedValue({ code: 'peer-backup-in-use' })
         alerts.alertConfirm.mockResolvedValue(true)
         await vi.waitFor(() => expect(target.textContent).toContain('peer.risudat'))
         const peerDelete = [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.dataset.path === 'peer.risudat')

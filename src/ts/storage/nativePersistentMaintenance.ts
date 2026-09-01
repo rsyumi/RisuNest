@@ -63,6 +63,18 @@ export interface NativePeerTempUsage {
     count: number
 }
 
+export type NativePeerBackupDeleteErrorCode = 'peer-backup-in-use' | 'peer-backup-delete-failed'
+
+export interface NativePeerBackupDeleteError {
+    code: NativePeerBackupDeleteErrorCode
+}
+
+export function isNativePeerBackupDeleteError(error: unknown): NativePeerBackupDeleteError | null {
+    if (!error || typeof error !== 'object' || Object.keys(error).length !== 1) return null
+    const code = (error as { code?: unknown }).code
+    return code === 'peer-backup-in-use' || code === 'peer-backup-delete-failed' ? { code } : null
+}
+
 export interface NativeSnapshotRestoreActions {
     choose(snapshots: readonly NativeSnapshotInfo[]): Promise<string | null>
     confirm(): Promise<boolean>

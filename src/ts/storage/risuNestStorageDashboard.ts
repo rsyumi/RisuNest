@@ -101,7 +101,7 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
         publish()
     }
     const run = async <T>(busy: string, action: () => Promise<T>): Promise<T | undefined> => {
-        if (state.busy) return undefined
+        if (state.busy || state.loading) return undefined
         update({ busy })
         try {
             return await action()
@@ -131,7 +131,7 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
             return () => listeners.delete(listener)
         },
         async load(): Promise<void> {
-            if (state.busy) return
+            if (state.busy || state.loading) return
             await reload()
         },
         async calculateTempSize() {
