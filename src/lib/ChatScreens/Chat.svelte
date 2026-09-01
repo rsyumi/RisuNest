@@ -786,7 +786,8 @@
         <AutoresizeArea bind:value={editTranslationText} handleLongPress={() => {
             saveTranslationEdit()
         }} />
-    {:else if editMode}
+    {/if}
+    {#if editMode}
         <AutoresizeArea bind:value={editDraft} handleLongPress={() => {
             editIntent = null
             editTarget = null
