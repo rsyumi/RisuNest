@@ -36,14 +36,15 @@ use serde::Serialize;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read},
     net::Ipv4Addr,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(test)]
+use std::fs;
 use tauri::{AppHandle, Manager, State};
 
 const SOURCE_DEVICE_ID_FILE: &str = "source-device-id";
@@ -1650,55 +1651,14 @@ fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<Stri
 }
 
 pub(crate) fn load_or_create_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
-    if path.exists() {
-        return read_source_device_id(path);
-    }
-    let parent = path.parent().ok_or_else(|| {
+    let legacy_parent = path.parent().ok_or_else(|| {
         PeerSyncError::Storage("source device identity path has no parent".to_owned())
     })?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".source-device-{}.tmp", uuid::Uuid::new_v4()));
-    let identity = uuid::Uuid::new_v4().to_string();
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(identity.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)?;
-        Ok(identity.clone())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn read_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 {
-        return Err(PeerSyncError::Storage(
-            "source device identity file is invalid".to_owned(),
-        ));
-    }
-    let mut bytes = Vec::new();
-    File::open(path)?.take(65).read_to_end(&mut bytes)?;
-    let value = std::str::from_utf8(&bytes)
-        .map_err(|_| PeerSyncError::Storage("source device identity is not UTF-8".to_owned()))?
-        .trim_end_matches(['\r', '\n']);
-    let parsed = uuid::Uuid::parse_str(value).map_err(|_| {
-        PeerSyncError::Storage("source device identity is not a canonical UUID".to_owned())
+    let app_root = legacy_parent.parent().ok_or_else(|| {
+        PeerSyncError::Storage("source device identity path has no app root".to_owned())
     })?;
-    if parsed.to_string() != value {
-        return Err(PeerSyncError::Storage(
-            "source device identity is not canonical".to_owned(),
-        ));
-    }
-    Ok(value.to_owned())
+    super::device_registry::load_or_create_device_id(app_root)
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
 fn now_millis() -> Result<i64, PeerSyncError> {
@@ -2179,7 +2139,11 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(uuid::Uuid::parse_str(&first).unwrap().to_string(), first);
-        assert_eq!(path.parent().unwrap(), root.path().join("peer-delta"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("peer-sync").join("device-id")).unwrap(),
+            first
+        );
+        assert!(!path.exists());
     }
 
     #[test]
