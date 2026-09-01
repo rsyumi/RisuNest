@@ -370,7 +370,7 @@ interface Persona {
  * Plugins can only access these specific database properties for security.
  */
 interface DatabaseSubset {
-    /** Currently selected persona ID */
+    /** Currently selected persona index */
     selectedPersona?: number;
     /** Character ordering */
     characterOrder?: any[];
@@ -864,7 +864,8 @@ interface SafeElement {
  * 
  * @example
  * ```typescript
- * const doc = risuai.getRootDocument();
+ * const doc = await risuai.getRootDocument();
+ * if (!doc) return;
  *
  * // Create elements (whitelist only)
  * const div = await doc.createElement('div');
@@ -2215,7 +2216,7 @@ interface RisuaiPluginAPI {
     /**
      * Sends a chat message as if it were sent by the user, triggering the normal chat processing flow.
      * @param message - The chat message to send, if string is a blank message, it will trigger the send action without adding a new message.
-     * @returns Promise resolving to whether the message was sent successfully.
+     * @returns Promise resolving to true when generation starts, or false when permission is denied or the selected conversation changes during promotion.
      */
     sendChat(message: string): Promise<boolean>;
 }
