@@ -5,6 +5,7 @@ import { resolveBlobStore } from "../storage/platformBlobStore";
 import type { BlobStore } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
+    collectExactPluginStorageAssetReferences,
     createColdStorageReferenceDatabase,
     readBackupAsset,
     scanPinnedBackupRecords,
@@ -393,7 +394,11 @@ async function getDriveRestoreRequiredImages(db:Database):Promise<string[]> {
             ? selected.character
             : character)
     }
-    return getUncleanablesSync(db, 'basename', { chars })
+    const required = new Set(getUncleanablesSync(db, 'basename', { chars }))
+    for (const key of collectExactPluginStorageAssetReferences(db.pluginCustomStorage ?? {})) {
+        required.add(getBasename(key))
+    }
+    return [...required]
 }
 
 async function restoreColdStorageFromDrive(

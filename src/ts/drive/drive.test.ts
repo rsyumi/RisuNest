@@ -130,6 +130,7 @@ function metadata(key: string, size: number): BlobMetadata {
 function makeBlobStore(values: Map<string, Uint8Array>): BlobStore {
     return {
         put: vi.fn(async (key, bytes) => {
+            state.restoreEvents.push(`asset:${key}`)
             values.set(key, bytes.slice())
             return metadata(key, bytes.byteLength)
         }),
@@ -173,6 +174,17 @@ describe('Drive restore cold snapshot assets', () => {
     it('materializes the selected Drive cold asset before publishing the accepted revision', async () => {
         const coldKey = '85cc96bc-d6c5-4cee-9a7f-48ae292e58ac'
         const database = driveDatabase(coldKey)
+        const pluginAssetKey = 'assets/plugin-drive-restore.bin'
+        const missingPluginAssetKey = 'assets/plugin-drive-missing.bin'
+        const pluginAsset = Uint8Array.of(4, 5, 6)
+        const collisionAsset = Uint8Array.of(7, 7, 7)
+        database.pluginCustomStorage = {
+            nested: [{ asset: pluginAssetKey }, { missing: missingPluginAssetKey }],
+            rejectedBasenameCollision: [
+                'assets/first/shared.bin',
+                'assets/second/shared.bin',
+            ],
+        }
         const driveCold = {
             character: {
                 ...database.characters[0],
@@ -237,11 +249,15 @@ describe('Drive restore cold snapshot assets', () => {
             { id: 'database', name: '100-database.risudat', mimeType: 'application/octet-stream' },
             { id: 'cold', name: `coldstorage_${coldKey}.json`, mimeType: 'application/json' },
             { id: 'asset', name: 'drive-only.png.bin', mimeType: 'application/octet-stream' },
+            { id: 'plugin-asset', name: 'plugin-drive-restore.bin.bin', mimeType: 'application/octet-stream' },
+            { id: 'collision', name: 'shared.bin.bin', mimeType: 'application/octet-stream' },
         ]
         const fileBytes = new Map<string, Uint8Array>([
             ['database', databaseBytes],
             ['cold', new TextEncoder().encode(JSON.stringify(driveCold))],
             ['asset', driveAsset],
+            ['plugin-asset', pluginAsset],
+            ['collision', collisionAsset],
         ])
         vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
             const url = String(input)
@@ -262,16 +278,34 @@ describe('Drive restore cold snapshot assets', () => {
         await checkDriver('loadtauri')
 
         expect(localAssets.get('assets/drive-only.png')).toEqual(driveAsset)
+        expect(localAssets.get(pluginAssetKey)).toEqual(pluginAsset)
+        expect(localAssets.has(missingPluginAssetKey)).toBe(false)
+        expect(localAssets.has('assets/shared.bin')).toBe(false)
         expect(accountWrites).toContain('assets/drive-only.png')
         expect(accountWrites).not.toContain('assets/account-only.png')
         expect(accountWrites.at(-1)).toBe('database/database.bin')
-        expect(state.restoreEvents).toEqual([`cold:${coldKey}`, 'database'])
+        expect(state.restoreEvents).toEqual([
+            `cold:${coldKey}`,
+            'asset:assets/drive-only.png',
+            `asset:${pluginAssetKey}`,
+            'database',
+        ])
         expect(state.forageInit).not.toHaveBeenCalled()
         expect(state.alertError).not.toHaveBeenCalled()
     })
 
     it('uploads database and pinned cold assets without rereading mutable cold storage', async () => {
         const persisted = structuredClone(risuSaveFixtureDatabase) as Database
+        const pluginAssetKey = 'assets/plugin-drive-upload.bin'
+        const pluginAssetBytes = Uint8Array.of(8, 9)
+        persisted.pluginCustomStorage = {
+            nested: { asset: pluginAssetKey },
+            rejectedBasenameCollision: [
+                'assets/first/shared.bin',
+                'assets/second/shared.bin',
+            ],
+            prose: 'prefix assets/not-a-reference.bin',
+        }
         const store = new IndexedDbPersistentDataStore(
             `drive-backup-${crypto.randomUUID()}`,
             new IDBFactory(),
@@ -288,6 +322,9 @@ describe('Drive restore cold snapshot assets', () => {
         state.blobStore = makeBlobStore(new Map([
             ['assets/cold-pinned.png', Uint8Array.of(3)],
             ['assets/second-read.png', Uint8Array.of(4)],
+            [pluginAssetKey, pluginAssetBytes],
+            ['assets/first/shared.bin', Uint8Array.of(1)],
+            ['assets/second/shared.bin', Uint8Array.of(2)],
         ]))
         state.coldStoragePayloads = [{
             key: 'cold-char',
@@ -347,6 +384,9 @@ describe('Drive restore cold snapshot assets', () => {
         expect(materializeDatabase).not.toHaveBeenCalled()
         expect(uploads.has('cold-pinned.png.bin')).toBe(true)
         expect(uploads.has('second-read.png.bin')).toBe(false)
+        expect(uploads.get('plugin-drive-upload.bin.bin')).toEqual(pluginAssetBytes)
+        expect(uploads.has('shared.bin.bin')).toBe(false)
+        expect(uploads.has('not-a-reference.bin.bin')).toBe(false)
         expect([...uploads.entries()].filter(([name]) => name.startsWith('coldstorage_'))).toEqual(
             state.coldStoragePayloads.map((payload) => [
                 payload.backupName,
