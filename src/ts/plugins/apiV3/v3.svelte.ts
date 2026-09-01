@@ -88,7 +88,12 @@ import {
 */
 
 const pluginChannel = new Map<string, Function>();
-const documentEventListeners: Array<{type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
+const documentEventListeners: Array<{
+    target: EventTarget
+    type: string
+    listener: EventListenerOrEventListenerObject
+    options: boolean | AddEventListenerOptions
+}> = [];
 let pluginDatabaseAccess: PluginDatabaseAccess | undefined
 
 function getPluginDatabaseAccess(): PluginDatabaseAccess {
@@ -129,6 +134,7 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
 
 class SafeElement {
     #element: HTMLElement;
+    #eventTarget: EventTarget;
     __classType = 'REMOTE_REQUIRED' as const;
 
     constructor(element: HTMLElement) {
@@ -136,6 +142,11 @@ class SafeElement {
             throw new Error("This element cannot be accessed by SafeELement")
         }
         this.#element = element;
+        this.#eventTarget = element;
+    }
+
+    protected setEventTarget(target: EventTarget): void {
+        this.#eventTarget = target;
     }
 
     public appendChild(child: SafeElement) {
@@ -385,8 +396,8 @@ class SafeElement {
                 listener(trimEvent(event))
             }
             this.#eventIdMap.set(id, modifiedListener)
-            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
-            document.addEventListener(type, modifiedListener, realOptions)
+            documentEventListeners.push({target: this.#eventTarget, type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
+            this.#eventTarget.addEventListener(type, modifiedListener, realOptions)
             return id;
         }
         else if(allowedDelayedEventListeners.includes(type)){
@@ -400,8 +411,8 @@ class SafeElement {
                 }, delay);
             }
             this.#eventIdMap.set(id, modifiedListener)
-            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
-            document.addEventListener(type, modifiedListener, realOptions);
+            documentEventListeners.push({target: this.#eventTarget, type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
+            this.#eventTarget.addEventListener(type, modifiedListener, realOptions);
             return id;
         }
         else{
@@ -413,8 +424,10 @@ class SafeElement {
         const listener = this.#eventIdMap.get(id);
         if(listener){
             const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
-            document.removeEventListener(type, listener as EventListenerOrEventListenerObject, realOptions);
-            const idx = documentEventListeners.findIndex(e => e.listener === listener);
+            this.#eventTarget.removeEventListener(type, listener as EventListenerOrEventListenerObject, realOptions);
+            const idx = documentEventListeners.findIndex(e =>
+                e.target === this.#eventTarget && e.listener === listener
+            );
             if(idx !== -1) documentEventListeners.splice(idx, 1);
             this.#eventIdMap.delete(id);
         }
@@ -429,6 +442,7 @@ class SafeDocument extends SafeElement {
     __classType = 'REMOTE_REQUIRED' as const;
     constructor(document: Document) {
         super(document.documentElement);
+        this.setEventTarget(document);
     }
     createElement(tagName: string): SafeElement {
         if(!tagWhitelist.includes(tagName.toLowerCase())) {
@@ -621,6 +635,11 @@ const unloadV3Plugin = async (pluginName: string) => {
     }
 }
 
+type PluginPermission = 'fetchLogs' | 'db' | 'mainDom' | 'replacer' | 'provider' | 'sendChat' | 'inlay'
+
+const permissionCacheKey = (pluginName: string, permissionDesc: PluginPermission) =>
+    `${pluginName}\u0000${permissionDesc}`
+
 const permissionGivenPlugins: Set<string> = new Set();
 const permissionDeniedPlugins: Set<string> = new Set();
 const permissionForage = localforage.createInstance({
@@ -634,11 +653,12 @@ type PluginV3ProviderOptions = PluginV2ProviderOptions & {
 
 export const customV3ProviderMetaStore:LLMModel[] = []
 
-const getPluginPermission = async (pluginName: string, permissionDesc: 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat'|'inlay', reconfirm: boolean|'periodically' = false) => {
-    if(permissionGivenPlugins.has(pluginName)){
+const getPluginPermission = async (pluginName: string, permissionDesc: PluginPermission, reconfirm: boolean|'periodically' = false) => {
+    const cacheKey = permissionCacheKey(pluginName, permissionDesc)
+    if(permissionGivenPlugins.has(cacheKey)){
         return true;
     }
-    if(permissionDeniedPlugins.has(pluginName)){
+    if(permissionDeniedPlugins.has(cacheKey)){
         return false;
     }
 
@@ -664,7 +684,7 @@ const getPluginPermission = async (pluginName: string, permissionDesc: 'fetchLog
     ) + `_${permissionDesc}`;
 
     if(!requiresReconfirm &&await permissionForage.getItem(pluginHash)){
-        permissionGivenPlugins.add(pluginName);
+        permissionGivenPlugins.add(cacheKey);
         return true;
     }   
     
@@ -683,14 +703,14 @@ const getPluginPermission = async (pluginName: string, permissionDesc: 'fetchLog
     }
     const conf = await alertConfirm(alertTitle)
     if(conf && pluginHash){
-        permissionGivenPlugins.add(pluginName);
+        permissionGivenPlugins.add(cacheKey);
         await permissionForage.setItem(pluginHash, true);
         if(reconfirm === 'periodically'){
             await permissionForage.setItem(pluginName + '_' + permissionDesc + '_lastGrantTime', Date.now());
         }
         return true;
     }
-    permissionDeniedPlugins.add(pluginName);
+    permissionDeniedPlugins.add(cacheKey);
     return false;
 }
 
@@ -1610,12 +1630,13 @@ type V3PluginInstance = {
 const v3PluginInstances: V3PluginInstance[] = [];
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
-    await Promise.all(v3PluginInstances.map(async (instance) => {
+    const instancesToUnload = [...v3PluginInstances];
+    await Promise.all(instancesToUnload.map(async (instance) => {
         await unloadV3Plugin(instance.name);
     }));
 
     for(const entry of documentEventListeners){
-        document.removeEventListener(entry.type, entry.listener, entry.options);
+        entry.target.removeEventListener(entry.type, entry.listener, entry.options);
     }
     documentEventListeners.length = 0;
 
