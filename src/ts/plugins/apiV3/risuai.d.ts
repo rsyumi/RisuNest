@@ -370,6 +370,10 @@ interface Persona {
  * Plugins can only access these specific database properties for security.
  */
 interface DatabaseSubset {
+    /** Currently selected persona ID */
+    selectedPersona?: string;
+    /** Character ordering */
+    characterOrder?: string[];
     /** Array of characters and group chats */
     characters?: any[];
     /** Risuai modules */
@@ -883,7 +887,7 @@ interface SafeDocument extends SafeElement {
      * const custom = doc.createElement('custom-element'); // Creates <div> instead
      * ```
      */
-    createElement(tagName: string): SafeElement;
+    createElement(tagName: string): Promise<SafeElement>;
 
     /**
      * Creates an anchor element with URL validation
@@ -898,7 +902,7 @@ interface SafeDocument extends SafeElement {
      * const bad = doc.createAnchorElement('javascript:alert()'); // href becomes '#'
      * ```
      */
-    createAnchorElement(href: string): SafeElement;
+    createAnchorElement(href: string): Promise<SafeElement>;
 }
 
 // ============================================================================
@@ -1139,6 +1143,7 @@ interface SafeLocalStorage {
     removeItem(key: string): Promise<void>;
     clear(): Promise<void>;
     key(index: number): Promise<string | null>;
+    keys(): Promise<string[]>;
     length(): Promise<number>;
 }
 
@@ -1374,7 +1379,7 @@ interface RisuaiPluginAPI {
      * const element = await doc.querySelector('.chat-container');
      * ```
      */
-    getRootDocument(): Promise<SafeDocument>;
+    getRootDocument(): Promise<SafeDocument | null>;
 
     /**
      * Creates a mutation observer for monitoring DOM changes
@@ -1845,7 +1850,7 @@ interface RisuaiPluginAPI {
      * ```typescript
      * await risuai.addTTSPreprocessor(async (ctx) => {
      *   if (ctx.ttsMode !== 'openai') return;
-     *   return { text: ctx.text.replace(/\*(.*?)\*/g, '') };
+     *   return { text: ctx.text.replace(/\*(.*?)\*\//g, '') };
      * });
      * ```
      */
@@ -2208,7 +2213,7 @@ interface RisuaiPluginAPI {
      * Sends a chat message as if it were sent by the user, triggering the normal chat processing flow.
      * @param message - The chat message to send, if string is a blank message, it will trigger the send action without adding a new message.
      */
-    sendChat(message: string): Promise<void>;
+    sendChat(message: string): Promise<boolean>;
 }
 
 // ============================================================================

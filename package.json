@@ -14,6 +14,7 @@
     "tauribuild:android": "vite build --mode android",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:plugin-dts": "tsc --noEmit --skipLibCheck --target es2023 --module es2022 --moduleResolution bundler --lib es2023,dom src/ts/plugins/apiV3/risuai.d.ts",
     "test": "vitest run",
     "benchmark:phase1": "vitest bench src/ts/process/phase1Algorithms.bench.ts --run --pool=forks --maxWorkers=1 --no-file-parallelism",
     "benchmark:streaming-display": "vitest bench src/ts/process/streamingDisplayReplay.bench.ts --run --pool=forks --maxWorkers=1 --no-file-parallelism",
