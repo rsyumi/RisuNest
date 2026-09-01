@@ -33,6 +33,8 @@ use crate::{
     },
 };
 use serde::Serialize;
+#[cfg(test)]
+use std::fs;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -43,8 +45,6 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
-#[cfg(test)]
-use std::fs;
 use tauri::{AppHandle, Manager, State};
 
 const SOURCE_DEVICE_ID_FILE: &str = "source-device-id";
