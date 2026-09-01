@@ -10,9 +10,13 @@ import {
     capturePersistentPresets,
     captureSelectedPersistentCharacter,
     createPersistentDataRuntime,
+    publishPersistentCharacterMutationToWorkingSet,
+    publishPersistentConversationReplacementToWorkingSet,
     type PersistentDataRuntimeStateAdapter,
 } from '../persistentDataRuntime'
 import { createCatalogPresetWorkingSet } from '../workingSetCatalog'
+import { createPluginDatabaseAccess } from '../../plugins/pluginDatabaseAccess'
+import { WorkingSetResidencyRegistry } from '../workingSetResidency'
 import { decodeRisuSave } from '../risuSave'
 import { streamRisuSaveFromStore } from '../risuSaveStoreAdapter'
 import {
@@ -54,6 +58,8 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
     current(): Database
 } {
     let workingCopy = structuredClone(database)
+    const residency = new WorkingSetResidencyRegistry()
+    residency.setEvictionAllowed(false)
     return {
         current: () => workingCopy,
         captureRoot: () => {
@@ -64,7 +70,7 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
         captureSelectedCharacter: () => structuredClone(workingCopy.characters[0] ?? null),
         captureCharacter: (id) => {
             const character = workingCopy.characters.find((item) => item.chaId === id)
-            return character ? structuredClone(character) : null
+            return character ?? null
         },
         getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
         replaceDatabase: (replacement) => {
@@ -91,11 +97,23 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
             const index = workingCopy.characters.findIndex((item) => item.chaId === character.chaId)
             workingCopy.characters[index] = structuredClone(character)
         },
+        publishCharacterMutation: (result) => {
+            publishPersistentCharacterMutationToWorkingSet(
+                workingCopy,
+                result,
+                residency,
+                0,
+                vi.fn(),
+            )
+        },
         publishConversation: (characterId, conversation) => {
             const character = workingCopy.characters.find((item) => item.chaId === characterId)!
             const index = character.chats.findIndex((chat) => chat.id === conversation.id)
             character.chats[index] = structuredClone(conversation)
             character.chatPage = index
+        },
+        publishConversationReplacement: (result) => {
+            publishPersistentConversationReplacementToWorkingSet(workingCopy, result)
         },
     }
 }
@@ -126,6 +144,161 @@ async function concatenate(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Arra
 }
 
 describe('persistent production runtime', () => {
+    it('refreshes an owned whole-character publication even when official publish rejects', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`runtime-plugin-official-failure-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const officialError = new Error('official publish rejected')
+        const publish = vi.fn(async () => {
+            throw officialError
+        })
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            officialPublisher: {
+                pin: vi.fn(async () => ({
+                    publish,
+                    dispose: vi.fn(async () => undefined),
+                })),
+            },
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const oldSession = runtime.getActiveConversationSession()!
+        const access = createPluginDatabaseAccess({
+            store,
+            flushPendingData: (reason) => runtime.flushPendingData(reason),
+            getCompatibilityDatabase: () => adapter.current(),
+            getCompatibilityProfile: () => 'scalable-v3',
+            getSelectedCharacterId: () => adapter.current().characters[0]?.chaId ?? null,
+            captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
+            acquireCompleteConversation: (reason, target) =>
+                runtime.acquireCompleteConversation(reason, target),
+            refreshSelectedConversationAfterReplacement: (target, expectedSession) =>
+                runtime.refreshSelectedConversationAfterReplacement(target, expectedSession),
+            replacePersistentCompleteCharacter: (characterId, reason, mutate, options) =>
+                runtime.replacePersistentCompleteCharacter(characterId, reason, mutate, options),
+            replacePersistentConversation: (
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ) => runtime.replacePersistentConversation(
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ),
+            reportIdentityReplacementRejected: vi.fn(),
+            getNavigationGeneration: () => runtime.getNavigationGeneration(),
+            applyCompatibilityDatabaseLite: vi.fn(),
+            applyCompatibilityDatabase: vi.fn(),
+            readPluginStorageSnapshot: vi.fn(async () => ({})),
+            mutatePluginStorage: vi.fn(),
+            invalidatePluginStorage: vi.fn(),
+            materializeDatabaseSnapshot: vi.fn(),
+            replacePersistentDatabase: vi.fn(),
+            snapshot: structuredClone,
+        })
+        const replacement = structuredClone(adapter.current().characters[0])
+        replacement.name = 'Locally published replacement'
+
+        await expect(access.setCurrentCharacter(replacement, {
+            pluginName: 'official-failure-plugin',
+            signal: new AbortController().signal,
+        })).rejects.toBe(officialError)
+
+        const resident = adapter.current().characters[0]
+        expect(resident.name).toBe('Locally published replacement')
+        expect(runtime.revision).toBe(2)
+        const refreshedSession = runtime.getActiveConversationSession()
+        expect(refreshedSession).not.toBeNull()
+        expect(refreshedSession).not.toBe(oldSession)
+        expect(refreshedSession!.matchesConversation(
+            resident.chaId,
+            resident.chats[resident.chatPage ?? 0],
+        )).toBe(true)
+        expect(oldSession.isActive).toBe(false)
+        expect(runtime.captureSelectedConversationTarget()).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-a',
+            storeRevision: 2,
+        })
+        expect(publish).toHaveBeenCalledOnce()
+    })
+
+    it('persists selected, inactive character, and inactive chat replacements across restart', async () => {
+        const databaseName = `runtime-scoped-replacement-${crypto.randomUUID()}`
+        const database = makeDatabase()
+        database.characters[0].chats.push({
+            id: 'chat-a-2', name: 'Selected sibling', message: [],
+        } as any)
+        database.characters.push({
+            type: 'character',
+            chaId: 'char-b',
+            name: 'Beta',
+            chatPage: 0,
+            chats: [
+                { id: 'chat-b', name: 'Inactive target', note: '', localLore: [], message: [] },
+                { id: 'chat-b-2', name: 'Inactive sibling', note: '', localLore: [], message: [] },
+            ],
+        } as any)
+        const untouchedSelectedSibling = structuredClone(database.characters[0].chats[1])
+        const untouchedInactiveSibling = structuredClone(database.characters[1].chats[1])
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        await runtime.replacePersistentCompleteCharacter(
+            'char-a',
+            'plugin-setCharacter',
+            (current) => ({ ...current, name: 'Selected replaced' }),
+            { expectedRevision: runtime.revision },
+        )
+        await runtime.replacePersistentCompleteCharacter(
+            'char-b',
+            'plugin-setCharacterToIndex',
+            (current) => ({ ...current, name: 'Inactive replaced' }),
+            { expectedRevision: runtime.revision },
+        )
+        const inactiveChat = await runtime.readPersistentConversation(
+            'char-b',
+            'chat-b',
+            'plugin-chat-read',
+        )
+        await runtime.replacePersistentConversation(
+            'char-b',
+            'chat-b',
+            'plugin-setChatToIndex',
+            { ...inactiveChat!, note: 'inactive chat replaced' },
+            { expectedRevision: runtime.revision },
+        )
+
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        const persisted = await reopened.materializeDatabase(runtime.revision)
+        expect(persisted.characters.map((character) => character.chaId)).toEqual([
+            'char-a',
+            'char-b',
+        ])
+        expect(persisted.characters[0].name).toBe('Selected replaced')
+        expect(persisted.characters[1].name).toBe('Inactive replaced')
+        expect(persisted.characters[1].chats[0].note).toBe('inactive chat replaced')
+        expect(persisted.characters[0].chats[1]).toEqual(untouchedSelectedSibling)
+        expect(persisted.characters[1].chats[1]).toEqual(untouchedInactiveSibling)
+    })
+
     it('keeps coordinator and active session revisions current across cold writes before replacement', async () => {
         const databaseName = `runtime-cold-revision-${crypto.randomUUID()}`
         const database = makeDatabase()

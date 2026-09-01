@@ -17,6 +17,7 @@ import {
     linkPluginQueryAbortSignals,
     type PluginCompleteCharacter,
     type PluginFullObjectCallContext,
+    PluginIdentityReplacementRejectedError,
 } from './pluginDatabaseAccess'
 
 vi.mock('../storage/persistentDataStoreFactory', () => ({
@@ -224,12 +225,35 @@ function createHarness() {
         _mutations: readonly PluginStorageMutation[],
     ) => undefined)
     const invalidatePluginStorage = vi.fn()
+    const selectedConversationTarget = {
+        characterId: 'active',
+        conversationId: 'active-chat-a',
+    }
+    let selectedTarget: typeof selectedConversationTarget | null = selectedConversationTarget
+    const completeConversationRelease = vi.fn()
+    const completeConversationSession = {}
+    const acquireCompleteConversation = vi.fn(async () => ({
+        session: completeConversationSession,
+        target: selectedTarget!,
+        release: completeConversationRelease,
+    }))
+    const refreshSelectedConversationAfterReplacement = vi.fn(() => true)
+    const replacePersistentCompleteCharacter = vi.fn(async () => true)
+    const replacePersistentConversation = vi.fn(async () => true)
+    const reportIdentityReplacementRejected = vi.fn()
     const access = createPluginDatabaseAccess({
         store,
         flushPendingData,
         getCompatibilityDatabase: () => compatibilityDatabase,
         getCompatibilityProfile: () => compatibilityProfile,
         getSelectedCharacterId,
+        captureSelectedConversationTarget: () => selectedTarget as any,
+        acquireCompleteConversation: acquireCompleteConversation as any,
+        refreshSelectedConversationAfterReplacement:
+            refreshSelectedConversationAfterReplacement as any,
+        replacePersistentCompleteCharacter,
+        replacePersistentConversation,
+        reportIdentityReplacementRejected,
         getNavigationGeneration: () => navigationGeneration,
         applyCompatibilityDatabaseLite,
         applyCompatibilityDatabase,
@@ -257,9 +281,19 @@ function createHarness() {
         pinnedDatabases,
         releasedLeases,
         replacePersistentDatabase,
+        replacePersistentCompleteCharacter,
+        replacePersistentConversation,
+        reportIdentityReplacementRejected,
+        acquireCompleteConversation,
+        completeConversationSession,
+        completeConversationRelease,
+        refreshSelectedConversationAfterReplacement,
         getSelectedCharacterId,
         setSelectedCharacterId(id: string | null) {
             selectedCharacterId = id
+        },
+        setSelectedConversationTarget(target: typeof selectedTarget) {
+            selectedTarget = target
         },
         setCompatibilityProfile(profile: 'scalable-v3' | 'maximum-compatibility') {
             compatibilityProfile = profile
@@ -384,6 +418,259 @@ describe('plugin database access', () => {
         expect(harness.releasedLeases).toHaveLength(3)
     })
 
+    it('captures IDs and expected revision before an indexed character write', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        harness.compatibilityDatabase.characters = structuredClone(database.characters)
+        const candidate = structuredClone(database.characters[1])
+        candidate.name = 'Updated inactive character'
+
+        const mutation = harness.access.setCharacterToIndex(1, candidate, callContext())
+        harness.compatibilityDatabase.characters.reverse()
+        await mutation
+
+        expect(harness.replacePersistentCompleteCharacter).toHaveBeenCalledWith(
+            database.characters[1].chaId,
+            'plugin-setCharacterToIndex',
+            expect.any(Function),
+            { expectedRevision: 4 },
+        )
+    })
+
+    it('replaces only the captured conversation and keeps invalid indexes as no-ops', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database, database)
+        const replacement = structuredClone(database.characters[0].chats[1])
+        replacement.localLore = [{ key: 'plugin', content: 'saved' } as any]
+
+        await harness.access.setChatToIndex(0, 1, replacement, callContext())
+        expect(harness.replacePersistentConversation).toHaveBeenCalledWith(
+            'active', replacement.id, 'plugin-setChatToIndex', replacement,
+            { expectedRevision: 4 },
+        )
+
+        await harness.access.setChatToIndex(99, 99, replacement, callContext())
+        expect(harness.replacePersistentConversation).toHaveBeenCalledTimes(1)
+    })
+
+    it('fulfills invalid current and indexed setters without promotion or mutation', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database, database)
+        harness.setSelectedCharacterId(null)
+
+        await expect(harness.access.setCurrentCharacter(
+            structuredClone(database.characters[0]),
+            callContext(),
+        )).resolves.toBeUndefined()
+        await expect(harness.access.setCharacterToIndex(
+            99,
+            structuredClone(database.characters[0]),
+            callContext(),
+        )).resolves.toBeUndefined()
+        await expect(harness.access.setChatToIndex(
+            0,
+            99,
+            structuredClone(database.characters[0].chats[0]),
+            callContext(),
+        )).resolves.toBeUndefined()
+
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.replacePersistentConversation).not.toHaveBeenCalled()
+    })
+
+    it('holds a selected windowed lease until the scoped replacement settles', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const replacement = structuredClone(database.characters[0])
+        replacement.name = 'Selected replacement'
+        const persistence = deferred<boolean>()
+        harness.replacePersistentCompleteCharacter.mockReturnValueOnce(persistence.promise)
+
+        const writing = harness.access.setCurrentCharacter(replacement, callContext())
+        await vi.waitFor(() => expect(harness.acquireCompleteConversation).toHaveBeenCalledOnce())
+        expect(harness.completeConversationRelease).not.toHaveBeenCalled()
+        persistence.resolve(true)
+        await writing
+        expect(harness.completeConversationRelease).toHaveBeenCalledOnce()
+        expect(harness.refreshSelectedConversationAfterReplacement).toHaveBeenCalledWith(
+            expect.anything(),
+            harness.completeConversationSession,
+        )
+        expect(harness.completeConversationRelease.mock.invocationCallOrder[0]).toBeLessThan(
+            harness.refreshSelectedConversationAfterReplacement.mock.invocationCallOrder[0],
+        )
+    })
+
+    it.each([
+        ['stale target', false],
+        ['store failure', new Error('store failed')],
+    ] as const)('releases the selected lease once after %s', async (_name, outcome) => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const replacement = structuredClone(database.characters[0])
+        if (outcome instanceof Error) {
+            harness.replacePersistentCompleteCharacter.mockRejectedValueOnce(outcome)
+        } else {
+            harness.replacePersistentCompleteCharacter.mockResolvedValueOnce(outcome)
+        }
+
+        await expect(harness.access.setCurrentCharacter(replacement, callContext())).rejects
+            .toBeInstanceOf(Error)
+        expect(harness.completeConversationRelease).toHaveBeenCalledOnce()
+        expect(harness.refreshSelectedConversationAfterReplacement).toHaveBeenCalledOnce()
+    })
+
+    it('does not mutate or leak a lease when selected promotion becomes stale', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        harness.acquireCompleteConversation.mockRejectedValueOnce(
+            new Error('selected promotion became stale'),
+        )
+
+        await expect(harness.access.setCurrentCharacter(
+            structuredClone(database.characters[0]),
+            callContext(),
+        )).rejects.toThrow('selected promotion became stale')
+
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.completeConversationRelease).not.toHaveBeenCalled()
+        expect(harness.refreshSelectedConversationAfterReplacement).not.toHaveBeenCalled()
+    })
+
+    it('releases the selected lease without mutation when unload aborts promotion', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const promoted = deferred<any>()
+        harness.acquireCompleteConversation.mockReturnValueOnce(promoted.promise)
+        const controller = new AbortController()
+        const writing = harness.access.setCurrentCharacter(
+            structuredClone(database.characters[0]),
+            { pluginName: 'fixture-plugin', signal: controller.signal },
+        )
+        await vi.waitFor(() => expect(harness.acquireCompleteConversation).toHaveBeenCalledOnce())
+        controller.abort(new Error('plugin unloaded'))
+        promoted.resolve({
+            session: harness.completeConversationSession,
+            target: { characterId: 'active', conversationId: 'active-chat-a' },
+            release: harness.completeConversationRelease,
+        })
+
+        await expect(writing).rejects.toThrow('plugin unloaded')
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.completeConversationRelease).toHaveBeenCalledOnce()
+        expect(harness.refreshSelectedConversationAfterReplacement).toHaveBeenCalledOnce()
+    })
+
+    it('refreshes through the captured lease after navigation changes while a write is pending', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const persistence = deferred<boolean>()
+        harness.replacePersistentCompleteCharacter.mockReturnValueOnce(persistence.promise)
+
+        const writing = harness.access.setCurrentCharacter(
+            structuredClone(database.characters[0]),
+            callContext(),
+        )
+        await vi.waitFor(() => expect(harness.acquireCompleteConversation).toHaveBeenCalledOnce())
+        harness.setSelectedConversationTarget({
+            characterId: 'active',
+            conversationId: 'active-chat-b',
+        })
+        persistence.resolve(true)
+        await writing
+
+        expect(harness.refreshSelectedConversationAfterReplacement).toHaveBeenCalledWith(
+            expect.objectContaining({
+                characterId: 'active',
+                conversationId: 'active-chat-a',
+            }),
+            harness.completeConversationSession,
+        )
+    })
+
+    it.each([
+        ['setCurrentCharacter', 'chaId', 'replacement-current-character-id'],
+        ['setCharacterToIndex', 'chaId', 'replacement-character-id'],
+        ['setChatToIndex', 'id', 'replacement-chat-id'],
+    ] as const)('rejects %s ID replacement with a structured diagnostic', async (
+        operation,
+        idField,
+        attemptedId,
+    ) => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const target = operation === 'setChatToIndex'
+            ? structuredClone(database.characters[0].chats[0])
+            : structuredClone(database.characters[0])
+        ;(target as any)[idField] = attemptedId
+
+        const write = operation === 'setCurrentCharacter'
+            ? harness.access.setCurrentCharacter(target as PluginCompleteCharacter, callContext())
+            : operation === 'setCharacterToIndex'
+                ? harness.access.setCharacterToIndex(
+                    0,
+                    target as PluginCompleteCharacter,
+                    callContext(),
+                )
+                : harness.access.setChatToIndex(0, 0, target as any, callContext())
+        await expect(write).rejects.toBeInstanceOf(PluginIdentityReplacementRejectedError)
+        expect(harness.reportIdentityReplacementRejected).toHaveBeenCalledWith({
+            kind: 'plugin-identity-replacement-rejected',
+            pluginName: 'fixture-plugin',
+            operation: operation === 'setCurrentCharacter' ? 'setCharacter' : operation,
+            targetId: operation === 'setChatToIndex' ? 'active-chat-a' : 'active',
+            attemptedId,
+        })
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.replacePersistentConversation).not.toHaveBeenCalled()
+    })
+
+    it('rejects malformed scoped replacements before promotion or mutation', async () => {
+        const harness = createHarness()
+
+        await expect(harness.access.setCurrentCharacter(null as any, callContext()))
+            .rejects.toBeInstanceOf(TypeError)
+        await expect(harness.access.setCurrentCharacter({
+            type: 'character', chaId: '', chats: [],
+        } as any, callContext())).rejects.toBeInstanceOf(TypeError)
+        await expect(harness.access.setCurrentCharacter({
+            type: 'character', chaId: 'active', chats: null,
+        } as any, callContext())).rejects.toBeInstanceOf(TypeError)
+        await expect(harness.access.setChatToIndex(
+            0,
+            0,
+            null as any,
+            callContext(),
+        )).rejects.toBeInstanceOf(TypeError)
+        await expect(harness.access.setChatToIndex(
+            0,
+            0,
+            { id: '', message: [] } as any,
+            callContext(),
+        )).rejects.toBeInstanceOf(TypeError)
+        await expect(harness.access.setChatToIndex(
+            0,
+            0,
+            { id: 'active-chat-a', message: null } as any,
+            callContext(),
+        )).rejects.toBeInstanceOf(TypeError)
+        expect(harness.reportIdentityReplacementRejected).not.toHaveBeenCalled()
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.replacePersistentConversation).not.toHaveBeenCalled()
+    })
+
     it('composes scalable API v3 queries with the shared production store', async () => {
         const harness = createHarness()
         vi.mocked(getPersistentDataStore).mockReturnValue(harness.store)
@@ -397,6 +684,12 @@ describe('plugin database access', () => {
             getCompatibilityDatabase: () => harness.compatibilityDatabase,
             getCompatibilityProfile: () => 'scalable-v3',
             getSelectedCharacterId: harness.getSelectedCharacterId,
+            captureSelectedConversationTarget: () => null,
+            acquireCompleteConversation: vi.fn(),
+            refreshSelectedConversationAfterReplacement: vi.fn(),
+            replacePersistentCompleteCharacter: vi.fn(),
+            replacePersistentConversation: vi.fn(),
+            reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => 0,
             applyCompatibilityDatabaseLite: harness.applyCompatibilityDatabaseLite,
             applyCompatibilityDatabase: harness.applyCompatibilityDatabase,

@@ -805,6 +805,15 @@ const chat = await Risuai.getChatFromIndex(charIndex, chatIndex);
 await Risuai.setChatToIndex(charIndex, chatIndex, chat);
 ```
 
+Indexes are resolved to stable internal targets when each call starts. Invalid character or
+chat indexes keep the existing `null` getter and fulfilled no-op setter behavior. In the scalable
+v3 profile, setters reject changes to `chaId` or `chat.id` and emit a structured development
+diagnostic. Maximum compatibility keeps the legacy live-object replacement behavior.
+
+A full character read costs one target character plus its conversations. A full chat read costs
+one target conversation plus the configured character and conversation catalog lookup. Prefer the
+summary query APIs when a plugin does not need complete objects.
+
 ## Advanced Features
 
 ### Network Requests

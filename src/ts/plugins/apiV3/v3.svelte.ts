@@ -43,6 +43,9 @@ import {
     getPersistentNavigationGeneration,
     invalidateActiveConversationSession,
     materializePersistentDatabaseSnapshotWithRevision,
+    refreshSelectedConversationAfterReplacement,
+    replacePersistentCompleteCharacter,
+    replacePersistentConversation,
     replacePersistentDatabase,
 } from "src/ts/storage/persistentDataRuntime.svelte";
 import type { CompleteConversationLease } from "src/ts/storage/activeWorkingSet.svelte";
@@ -92,6 +95,14 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
         getCompatibilityProfile: () => pluginCompatibility.profile,
         getSelectedCharacterId: () =>
             getDatabase().characters[get(selectedCharID)]?.chaId ?? null,
+        captureSelectedConversationTarget,
+        acquireCompleteConversation,
+        refreshSelectedConversationAfterReplacement,
+        replacePersistentCompleteCharacter,
+        replacePersistentConversation,
+        reportIdentityReplacementRejected: (diagnostic) => {
+            console.warn('Plugin full-object identity replacement rejected', diagnostic)
+        },
         getNavigationGeneration: getPersistentNavigationGeneration,
         applyCompatibilityDatabaseLite: (database) =>
             applyPreparedPluginDatabaseUpdate(database, true),
@@ -711,15 +722,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         pluginCompatibility.profile === 'maximum-compatibility'
             ? oldApis.getChar()
             : getPluginDatabaseAccess().getCurrentCharacter(fullObjectContext())
-    const setCompleteCurrentCharacter = (character: unknown) => {
-        return runPluginFullObjectReplacement(
-            pluginCompatibility.profile,
-            'setCharacter',
-            true,
-            () => oldApis.setChar(character),
-            invalidateActiveConversationSession,
-        )
-    }
+    const setCompleteCurrentCharacter = (character: unknown) =>
+        pluginCompatibility.profile === 'maximum-compatibility'
+            ? runPluginFullObjectReplacement(
+                pluginCompatibility.profile,
+                'setCharacter',
+                true,
+                () => oldApis.setChar(character),
+                invalidateActiveConversationSession,
+            )
+            : getPluginDatabaseAccess().setCurrentCharacter(
+                character as any,
+                fullObjectContext(),
+            )
     addPluginUnloadCallback(plugin.name, () => pluginLifetime.abort())
     return {
 
@@ -975,6 +990,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return null;
         },
         setCharacterToIndex: (index:number, char:any) => {
+            if (pluginCompatibility.profile === 'scalable-v3') {
+                return getPluginDatabaseAccess().setCharacterToIndex(
+                    index,
+                    char,
+                    fullObjectContext(),
+                )
+            }
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
@@ -1009,6 +1031,14 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return null;
         },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
+            if (pluginCompatibility.profile === 'scalable-v3') {
+                return getPluginDatabaseAccess().setChatToIndex(
+                    characterIndex,
+                    chatIndex,
+                    chat,
+                    fullObjectContext(),
+                )
+            }
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];

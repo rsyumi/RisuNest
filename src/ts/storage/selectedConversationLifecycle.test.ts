@@ -163,6 +163,16 @@ function makeHarness(messageCount = 10_000) {
         readConversationWindow,
         workingSet,
         getResident: () => resident,
+        replaceResidentConversation: (conversation: Chat | null) => {
+            resident = {
+                ...resident,
+                chats: conversation === null ? [] : [conversation],
+                chatPage: conversation === null ? -1 : 0,
+            }
+        },
+        setSelectedCharacterId: (value: string) => {
+            selectedCharacterId = value
+        },
         setAllowWindowed: (value: boolean) => {
             allowWindowed = value
         },
@@ -201,6 +211,128 @@ async function flushScheduledDemotion(): Promise<void> {
 }
 
 describe('selected conversation lifecycle', () => {
+    it('refreshes the exact lease-owned session only after publication replaces its object', async () => {
+        const harness = makeHarness(3)
+        harness.setOperationActive(true)
+        await flushScheduledDemotion()
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const lease = await harness.workingSet.acquireCompleteConversation('plugin-setter', target)
+        const oldSession = lease.session
+        const replacement = {
+            ...structuredClone(harness.getResident().chats[0]),
+            note: 'published replacement',
+        }
+        harness.setCoordinatorRevision(8)
+        oldSession.advanceStoreRevision(8)
+        harness.replaceResidentConversation(replacement)
+
+        expect(oldSession.matchesConversation('char-a', replacement)).toBe(false)
+        lease.release()
+        expect(harness.workingSet.refreshSelectedConversationAfterReplacement(
+            lease.target,
+            oldSession,
+        )).toBe(true)
+
+        const refreshed = harness.workingSet.activeConversationSession
+        expect(refreshed).not.toBe(oldSession)
+        expect(refreshed?.matchesConversation('char-a', replacement)).toBe(true)
+        expect(refreshed?.storeRevision).toBe(8)
+        expect(oldSession.isActive).toBe(false)
+    })
+
+    it('does not refresh when precommit failure or compensation leaves ownership unchanged', async () => {
+        const harness = makeHarness(3)
+        harness.setOperationActive(true)
+        await flushScheduledDemotion()
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const lease = await harness.workingSet.acquireCompleteConversation('plugin-setter', target)
+        const oldSession = lease.session
+        oldSession.append({ role: 'user', data: 'concurrent compensation owner' })
+        const version = oldSession.version
+
+        lease.release()
+        expect(harness.workingSet.refreshSelectedConversationAfterReplacement(
+            lease.target,
+            oldSession,
+        )).toBe(false)
+        expect(harness.workingSet.activeConversationSession).toBe(oldSession)
+        expect(oldSession.isActive).toBe(true)
+        expect(oldSession.version).toBe(version)
+    })
+
+    it('leaves a newer same-ID navigation session untouched', async () => {
+        const harness = makeHarness(3)
+        harness.setOperationActive(true)
+        await flushScheduledDemotion()
+        const oldTarget = harness.workingSet.captureSelectedConversationTarget()!
+        const oldLease = await harness.workingSet.acquireCompleteConversation(
+            'plugin-setter',
+            oldTarget,
+        )
+        const replacement = {
+            ...structuredClone(harness.getResident().chats[0]),
+            note: 'newer same-ID navigation',
+        }
+        harness.replaceResidentConversation(replacement)
+        harness.setCoordinatorRevision(8)
+        harness.workingSet.installCommittedWorkingSet({
+            username: 'Newer session',
+            characters: [harness.getResident()],
+        } as unknown as Database, 8)
+        const newerSession = harness.workingSet.activeConversationSession
+        expect(newerSession).not.toBe(oldLease.session)
+        expect(newerSession?.matchesConversation('char-a', replacement)).toBe(true)
+        const newerPin = newerSession!.acquirePin('streaming')
+        newerSession!.append({ role: 'char', data: 'newer pending work' })
+        const newerToken = newerSession!.sessionToken
+        const newerVersion = newerSession!.version
+
+        oldLease.release()
+        expect(harness.workingSet.refreshSelectedConversationAfterReplacement(
+            oldLease.target,
+            oldLease.session,
+        )).toBe(false)
+        expect(harness.workingSet.activeConversationSession).toBe(newerSession)
+        expect(newerSession?.isActive).toBe(true)
+        expect(newerSession?.sessionToken).toBe(newerToken)
+        expect(newerSession?.version).toBe(newerVersion)
+        expect(newerSession?.pinCount('streaming')).toBe(1)
+        newerPin.release()
+    })
+
+    it.each(['removed', 'chatPage changed', 'deselected'] as const)(
+        'clears only the still-owned session when its chat is %s',
+        async (outcome) => {
+            const harness = makeHarness(3)
+            harness.setOperationActive(true)
+            await flushScheduledDemotion()
+            const target = harness.workingSet.captureSelectedConversationTarget()!
+            const lease = await harness.workingSet.acquireCompleteConversation(
+                'plugin-setter',
+                target,
+            )
+            if (outcome === 'removed') harness.replaceResidentConversation(null)
+            else if (outcome === 'chatPage changed') {
+                harness.getResident().chats.push({
+                    id: 'chat-b',
+                    name: 'New selected chat',
+                    note: '',
+                    localLore: [],
+                    message: [],
+                })
+                harness.getResident().chatPage = 1
+            } else harness.setSelectedCharacterId('different-character')
+
+            lease.release()
+            expect(harness.workingSet.refreshSelectedConversationAfterReplacement(
+                lease.target,
+                lease.session,
+            )).toBe(false)
+            expect(harness.workingSet.selectedConversationMode).toBeNull()
+            expect(harness.workingSet.activeConversationSession).toBeNull()
+        },
+    )
+
     it('automatically demotes a 10k complete owner after activation', async () => {
         const harness = makeHarness()
 

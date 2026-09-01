@@ -375,6 +375,13 @@ export const acquireCompleteConversation = (
 export const tryDemoteSelectedConversation = (
     target?: SelectedConversationTarget | null,
 ): boolean => getPersistentDataRuntime().tryDemoteSelectedConversation(target)
+export const refreshSelectedConversationAfterReplacement = (
+    target: SelectedConversationTarget,
+    expectedSession: ActiveConversationSession,
+): boolean => getPersistentDataRuntime().refreshSelectedConversationAfterReplacement(
+    target,
+    expectedSession,
+)
 export const invalidateActiveConversationSession = (): void =>
     getPersistentDataRuntime().invalidateActiveConversationSession()
 export const peekActiveConversationSession = (): ActiveConversationSession | null =>
@@ -433,10 +440,12 @@ export const replacePersistentCompleteCharacter = (
     characterId: string,
     reason: string,
     mutate: PersistentCompleteCharacterMutation,
+    options?: PersistentScopedReplacementOptions,
 ): Promise<boolean> => getPersistentDataRuntime().replacePersistentCompleteCharacter(
     characterId,
     reason,
     mutate,
+    options,
 )
 export const replacePersistentConversation = (
     characterId: string,

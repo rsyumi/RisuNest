@@ -1,5 +1,14 @@
 import type { Chat, Database } from '../storage/database.svelte'
-import type { PersistentReplacementOptions } from '../storage/saveCoordinator'
+import type {
+    PersistentCompleteCharacterMutation,
+    PersistentReplacementOptions,
+    PersistentScopedReplacementOptions,
+} from '../storage/saveCoordinator'
+import type {
+    CompleteConversationLease,
+    SelectedConversationTarget,
+} from '../storage/activeWorkingSet.svelte'
+import type { ActiveConversationSession } from '../storage/activeConversationSession'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { isCatalogCharacterStub } from '../storage/workingSetCatalog'
 import type {
@@ -73,12 +82,71 @@ export interface PluginResolvedConversationTarget extends PluginResolvedCharacte
     conversationId: string
 }
 
+export type PluginIdentityReplacementOperation =
+    | 'setCharacter'
+    | 'setCharacterToIndex'
+    | 'setChatToIndex'
+
+export interface PluginIdentityReplacementDiagnostic {
+    kind: 'plugin-identity-replacement-rejected'
+    pluginName: string
+    operation: PluginIdentityReplacementOperation
+    targetId: string
+    attemptedId: string
+}
+
+export class PluginIdentityReplacementRejectedError extends Error {
+    readonly diagnostic: PluginIdentityReplacementDiagnostic
+
+    constructor(diagnostic: PluginIdentityReplacementDiagnostic) {
+        super(`${diagnostic.operation} cannot replace identity ${diagnostic.targetId}`)
+        this.name = 'PluginIdentityReplacementRejectedError'
+        this.diagnostic = diagnostic
+    }
+}
+
+export class PluginFullObjectTargetStaleError extends Error {
+    constructor(characterId: string, conversationId?: string) {
+        super(
+            conversationId
+                ? `Plugin full-object target became stale: ${characterId}/${conversationId}`
+                : `Plugin full-object target became stale: ${characterId}`,
+        )
+        this.name = 'PluginFullObjectTargetStaleError'
+    }
+}
+
 export interface PluginDatabaseAccessDependencies {
     store: PersistentDataStore
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
     getCompatibilityProfile(): PluginCompatibilityProfile
     getSelectedCharacterId(): string | null
+    captureSelectedConversationTarget(): SelectedConversationTarget | null
+    acquireCompleteConversation(
+        reason: string,
+        target?: SelectedConversationTarget | null,
+    ): Promise<CompleteConversationLease>
+    refreshSelectedConversationAfterReplacement(
+        target: SelectedConversationTarget,
+        expectedSession: ActiveConversationSession,
+    ): boolean
+    replacePersistentCompleteCharacter(
+        characterId: string,
+        reason: string,
+        mutate: PersistentCompleteCharacterMutation,
+        options?: PersistentScopedReplacementOptions,
+    ): Promise<boolean>
+    replacePersistentConversation(
+        characterId: string,
+        conversationId: string,
+        reason: string,
+        replacement: Chat,
+        options?: PersistentScopedReplacementOptions,
+    ): Promise<boolean>
+    reportIdentityReplacementRejected(
+        diagnostic: PluginIdentityReplacementDiagnostic,
+    ): void
     getNavigationGeneration(): number
     applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
     applyCompatibilityDatabase(database: Record<string, unknown>): Promise<void>
@@ -114,6 +182,21 @@ export interface PluginDatabaseAccess {
         chatIndex: number,
         context: PluginFullObjectCallContext,
     ): Promise<Chat | null>
+    setCurrentCharacter(
+        character: PluginCompleteCharacter,
+        context: PluginFullObjectCallContext,
+    ): Promise<void>
+    setCharacterToIndex(
+        index: number,
+        character: PluginCompleteCharacter,
+        context: PluginFullObjectCallContext,
+    ): Promise<void>
+    setChatToIndex(
+        characterIndex: number,
+        chatIndex: number,
+        chat: Chat,
+        context: PluginFullObjectCallContext,
+    ): Promise<void>
     queryCharacters(input?: PluginCharacterQuery): Promise<CharacterPage>
     queryConversations(input: PluginConversationQuery): Promise<ConversationPage>
     queryConversationMessages(
@@ -328,38 +411,64 @@ export function validatePluginDatabaseUpdate(
     }
 }
 
+function validatePluginCompleteChat(value: unknown): asserts value is Chat {
+    if (!value || typeof value !== 'object') {
+        throw new TypeError('Plugin conversation replacement must be a complete object')
+    }
+    const record = value as Record<string, unknown>
+    if (typeof record.id !== 'string' || record.id.length === 0) {
+        throw new TypeError('Plugin conversation replacement must have a nonempty ID')
+    }
+    if (!Array.isArray(record.message)) {
+        throw new TypeError('Plugin conversation replacement messages must be an array')
+    }
+}
+
+function validatePluginCompleteCharacter(
+    value: unknown,
+): asserts value is PluginCompleteCharacter {
+    if (!value || typeof value !== 'object') {
+        throw new TypeError('Plugin character replacement must be a complete object')
+    }
+    const record = value as Record<string, unknown>
+    if (typeof record.chaId !== 'string' || record.chaId.length === 0) {
+        throw new TypeError('Plugin character replacement must have a nonempty character ID')
+    }
+    if (isCatalogCharacterStub(value as PluginCompleteCharacter)) {
+        throw new TypeError('Plugin database characters cannot contain catalog working-set stubs')
+    }
+    if (!Array.isArray(record.chats)) {
+        throw new TypeError(`Plugin database character ${record.chaId} is not fully hydrated`)
+    }
+    const conversationIds = new Set<string>()
+    for (const conversation of record.chats) {
+        if (
+            !conversation ||
+            typeof conversation !== 'object' ||
+            typeof (conversation as Record<string, unknown>).id !== 'string' ||
+            (conversation as Record<string, unknown>).id === '' ||
+            !Array.isArray((conversation as Record<string, unknown>).message)
+        ) {
+            throw new TypeError(`Plugin database character ${record.chaId} is not fully hydrated`)
+        }
+        if (conversationIds.has(conversation.id!)) {
+            throw new TypeError(`Plugin character contains duplicate conversation ID ${conversation.id}`)
+        }
+        conversationIds.add(conversation.id!)
+    }
+}
+
 function validateCompleteCharacters(value: unknown): asserts value is Database['characters'] {
     if (!Array.isArray(value)) {
         throw new TypeError('Plugin database characters must be an array')
     }
     const characterIds = new Set<string>()
     for (const character of value) {
-        if (!character || typeof character !== 'object') {
-            throw new TypeError('Plugin database characters must contain complete characters')
+        validatePluginCompleteCharacter(character)
+        if (characterIds.has(character.chaId)) {
+            throw new TypeError(`Plugin database contains duplicate character ID ${character.chaId}`)
         }
-        const record = character as Record<string, unknown>
-        if (typeof record.chaId !== 'string' || record.chaId.length === 0) {
-            throw new TypeError('Plugin database characters must have nonempty character IDs')
-        }
-        if (isCatalogCharacterStub(character as Database['characters'][number])) {
-            throw new TypeError('Plugin database characters cannot contain catalog working-set stubs')
-        }
-        if (characterIds.has(record.chaId)) {
-            throw new TypeError(`Plugin database contains duplicate character ID ${record.chaId}`)
-        }
-        characterIds.add(record.chaId)
-        if (!Array.isArray(record.chats)) {
-            throw new TypeError(`Plugin database character ${record.chaId} is not fully hydrated`)
-        }
-        for (const conversation of record.chats) {
-            if (
-                !conversation ||
-                typeof conversation !== 'object' ||
-                !Array.isArray((conversation as Record<string, unknown>).message)
-            ) {
-                throw new TypeError(`Plugin database character ${record.chaId} is not fully hydrated`)
-            }
-        }
+        characterIds.add(character.chaId)
     }
 }
 
@@ -408,6 +517,36 @@ export function createPluginDatabaseAccess(
         throwIfQueryAborted(signal)
         await openStore()
         throwIfQueryAborted(signal)
+    }
+    const rejectIdentityReplacement = (
+        context: PluginFullObjectCallContext,
+        operation: PluginIdentityReplacementOperation,
+        targetId: string,
+        attemptedId: string,
+    ): never => {
+        const diagnostic = {
+            kind: 'plugin-identity-replacement-rejected',
+            pluginName: context.pluginName,
+            operation,
+            targetId,
+            attemptedId,
+        } satisfies PluginIdentityReplacementDiagnostic
+        dependencies.reportIdentityReplacementRejected(diagnostic)
+        throw new PluginIdentityReplacementRejectedError(diagnostic)
+    }
+    const acquireSelectedLease = async (
+        selectedTarget: SelectedConversationTarget | null,
+        characterId: string,
+        conversationId?: string,
+    ): Promise<CompleteConversationLease | null> => {
+        if (!selectedTarget || selectedTarget.characterId !== characterId) return null
+        if (conversationId !== undefined && selectedTarget.conversationId !== conversationId) {
+            return null
+        }
+        return dependencies.acquireCompleteConversation(
+            'plugin-full-object-setter',
+            selectedTarget,
+        )
     }
 
     return {
@@ -487,6 +626,178 @@ export function createPluginDatabaseAccess(
                 }
                 return found === null ? null : dependencies.snapshot(found.value)
             })
+        },
+
+        async setCurrentCharacter(character, context) {
+            validatePluginCompleteCharacter(character)
+            const candidate = dependencies.snapshot(character)
+            const initialProfile = dependencies.getCompatibilityProfile()
+            const selectedTarget = dependencies.captureSelectedConversationTarget()
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-write')
+            throwIfFullObjectCallAborted(context.signal)
+            const characterId = dependencies.getSelectedCharacterId()
+            if (characterId === null) return
+            await openStore()
+            const lease = await acquireCurrentRevisionReader()
+            const target = await withPersistentRevisionLease(lease, async (reader) => {
+                const found = await reader.readCharacter(characterId)
+                if (!found) return null
+                assertPinnedRevision(reader.revision, found.revision, `Character ${characterId}`)
+                return { revision: reader.revision, characterId }
+            })
+            if (!target) throw new PluginFullObjectTargetStaleError(characterId)
+            throwIfFullObjectCallAborted(context.signal)
+            if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                throw new Error(STALE_DATABASE_SET_ERROR)
+            }
+            if (candidate.chaId !== target.characterId) {
+                rejectIdentityReplacement(
+                    context,
+                    'setCharacter',
+                    target.characterId,
+                    candidate.chaId,
+                )
+            }
+            let completeLease: CompleteConversationLease | null = null
+            try {
+                completeLease = await acquireSelectedLease(
+                    selectedTarget,
+                    target.characterId,
+                )
+                throwIfFullObjectCallAborted(context.signal)
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                const replaced = await dependencies.replacePersistentCompleteCharacter(
+                    target.characterId,
+                    'plugin-setCharacter',
+                    async () => dependencies.snapshot(candidate),
+                    { expectedRevision: target.revision },
+                )
+                if (!replaced) throw new PluginFullObjectTargetStaleError(target.characterId)
+            } finally {
+                if (completeLease) {
+                    completeLease.release()
+                    dependencies.refreshSelectedConversationAfterReplacement(
+                        completeLease.target,
+                        completeLease.session,
+                    )
+                }
+            }
+        },
+
+        async setCharacterToIndex(index, character, context) {
+            validatePluginCompleteCharacter(character)
+            const candidate = dependencies.snapshot(character)
+            const initialProfile = dependencies.getCompatibilityProfile()
+            const selectedTarget = dependencies.captureSelectedConversationTarget()
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-write')
+            throwIfFullObjectCallAborted(context.signal)
+            await openStore()
+            const lease = await acquireCurrentRevisionReader()
+            const target = await withPersistentRevisionLease(lease, async (reader) =>
+                resolvePinnedCharacterTarget(reader, index))
+            if (!target) return
+            throwIfFullObjectCallAborted(context.signal)
+            if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                throw new Error(STALE_DATABASE_SET_ERROR)
+            }
+            if (candidate.chaId !== target.characterId) {
+                rejectIdentityReplacement(
+                    context,
+                    'setCharacterToIndex',
+                    target.characterId,
+                    candidate.chaId,
+                )
+            }
+            let completeLease: CompleteConversationLease | null = null
+            try {
+                completeLease = await acquireSelectedLease(
+                    selectedTarget,
+                    target.characterId,
+                )
+                throwIfFullObjectCallAborted(context.signal)
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                const replaced = await dependencies.replacePersistentCompleteCharacter(
+                    target.characterId,
+                    'plugin-setCharacterToIndex',
+                    async () => dependencies.snapshot(candidate),
+                    { expectedRevision: target.revision },
+                )
+                if (!replaced) throw new PluginFullObjectTargetStaleError(target.characterId)
+            } finally {
+                if (completeLease) {
+                    completeLease.release()
+                    dependencies.refreshSelectedConversationAfterReplacement(
+                        completeLease.target,
+                        completeLease.session,
+                    )
+                }
+            }
+        },
+
+        async setChatToIndex(characterIndex, chatIndex, chat, context) {
+            validatePluginCompleteChat(chat)
+            const candidate = dependencies.snapshot(chat)
+            const initialProfile = dependencies.getCompatibilityProfile()
+            const selectedTarget = dependencies.captureSelectedConversationTarget()
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-write')
+            throwIfFullObjectCallAborted(context.signal)
+            await openStore()
+            const lease = await acquireCurrentRevisionReader()
+            const target = await withPersistentRevisionLease(lease, async (reader) =>
+                resolvePinnedConversationTarget(reader, characterIndex, chatIndex))
+            if (!target) return
+            throwIfFullObjectCallAborted(context.signal)
+            if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                throw new Error(STALE_DATABASE_SET_ERROR)
+            }
+            if (candidate.id !== target.conversationId) {
+                rejectIdentityReplacement(
+                    context,
+                    'setChatToIndex',
+                    target.conversationId,
+                    candidate.id!,
+                )
+            }
+            let completeLease: CompleteConversationLease | null = null
+            try {
+                completeLease = await acquireSelectedLease(
+                    selectedTarget,
+                    target.characterId,
+                    target.conversationId,
+                )
+                throwIfFullObjectCallAborted(context.signal)
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                const replaced = await dependencies.replacePersistentConversation(
+                    target.characterId,
+                    target.conversationId,
+                    'plugin-setChatToIndex',
+                    candidate,
+                    { expectedRevision: target.revision },
+                )
+                if (!replaced) {
+                    throw new PluginFullObjectTargetStaleError(
+                        target.characterId,
+                        target.conversationId,
+                    )
+                }
+            } finally {
+                if (completeLease) {
+                    completeLease.release()
+                    dependencies.refreshSelectedConversationAfterReplacement(
+                        completeLease.target,
+                        completeLease.session,
+                    )
+                }
+            }
         },
 
         async queryCharacters(input = {}) {

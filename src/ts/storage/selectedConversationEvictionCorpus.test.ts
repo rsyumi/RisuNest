@@ -23,11 +23,21 @@ import { RevisionConflictError, type WorkingSetCommit } from './persistentDataSt
 import {
     capturePersistentRoot,
     createPersistentDataRuntime,
+    publishPersistentConversationReplacementToWorkingSet,
     type PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
+import { createPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
 
 const INITIAL_MESSAGE_COUNT = 10_000
 const VIEWPORT_ROW_BUDGET = 64
+
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((resolvePromise) => {
+        resolve = resolvePromise
+    })
+    return { promise, resolve }
+}
 
 function makeMessage(index: number): Message {
     return {
@@ -174,6 +184,9 @@ describe('selected conversation eviction correctness corpus', () => {
                 if (nextCharacter) workingCopy.characters[0] = nextCharacter
                 else workingCopy.characters[0].chats[workingCopy.characters[0].chatPage ?? 0] = conversation
             },
+            publishConversationReplacement: (result) => {
+                publishPersistentConversationReplacementToWorkingSet(workingCopy, result)
+            },
             canUseWindowedSelectedConversation: () => true,
             isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
@@ -238,6 +251,79 @@ describe('selected conversation eviction correctness corpus', () => {
         }
         const assertWindowed = (stage = 'unnamed stage') =>
             assertSelectedWindowed(stage, 'chat-a', oracle)
+
+        const profile = { profile: 'scalable-v3' as const, allowsEviction: true }
+        const materializeDatabaseSnapshot = vi.fn()
+        const replacePersistentDatabase = vi.fn()
+        const pluginAccess = createPluginDatabaseAccess({
+            store,
+            flushPendingData: (reason) => runtime.flushPendingData(reason),
+            getCompatibilityDatabase: () => workingCopy,
+            getCompatibilityProfile: () => profile.profile,
+            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId ?? null,
+            captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
+            acquireCompleteConversation: (reason, target) =>
+                runtime.acquireCompleteConversation(reason, target),
+            refreshSelectedConversationAfterReplacement: (target, expectedSession) =>
+                runtime.refreshSelectedConversationAfterReplacement(target, expectedSession),
+            replacePersistentCompleteCharacter: (characterId, reason, mutate, options) =>
+                runtime.replacePersistentCompleteCharacter(characterId, reason, mutate, options),
+            replacePersistentConversation: (
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ) => runtime.replacePersistentConversation(
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ),
+            reportIdentityReplacementRejected: vi.fn(),
+            getNavigationGeneration: () => runtime.getNavigationGeneration(),
+            applyCompatibilityDatabaseLite: vi.fn(),
+            applyCompatibilityDatabase: vi.fn(),
+            readPluginStorageSnapshot: vi.fn(async () => ({})),
+            mutatePluginStorage: vi.fn(),
+            invalidatePluginStorage: vi.fn(),
+            materializeDatabaseSnapshot,
+            replacePersistentDatabase,
+            snapshot: structuredClone,
+        })
+        const detached = await pluginAccess.getChatFromIndex(0, 0, {
+            pluginName: 'corpus-plugin',
+            signal: new AbortController().signal,
+        })
+        expect(detached!.message).toHaveLength(INITIAL_MESSAGE_COUNT)
+        const pluginReplacement = {
+            ...detached!,
+            note: 'scoped plugin replacement',
+        }
+        const releaseScopedCommit = deferred<void>()
+        const originalCommit = store.commit.bind(store)
+        const scopedCommit = vi.spyOn(store, 'commit').mockImplementationOnce(async (input) => {
+            await releaseScopedCommit.promise
+            return originalCommit(input)
+        })
+        const scopedWrite = pluginAccess.setChatToIndex(0, 0, pluginReplacement, {
+            pluginName: 'corpus-plugin',
+            signal: new AbortController().signal,
+        })
+        await vi.waitFor(() => expect(scopedCommit).toHaveBeenCalledOnce())
+        expect(runtime.getSelectedConversationMode()).toBe('complete')
+        expect(runtime.getActiveConversationSession()?.pinCount('compatibility')).toBe(1)
+        releaseScopedCommit.resolve()
+        await scopedWrite
+        scopedCommit.mockRestore()
+        const persistedPluginReplacement = await store.readConversation('char-a', 'chat-a')
+        Object.assign(oracle, persistedPluginReplacement!.value)
+        expectedRevision += 1
+        await assertWindowed('scalable plugin getter and setter')
+        expect(profile).toEqual({ profile: 'scalable-v3', allowsEviction: true })
+        expect(materializeDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(replacePersistentDatabase).not.toHaveBeenCalled()
 
         const mutateComplete = async (
             reason: string,

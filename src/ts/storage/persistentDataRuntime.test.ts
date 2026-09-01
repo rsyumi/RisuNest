@@ -320,6 +320,42 @@ describe('persistent plugin storage capture', () => {
 })
 
 describe('persistent conversation replacement publication', () => {
+    it('forwards a lease-owned replacement refresh without changing selection', async () => {
+        const harness = await createActiveSessionRuntimeHarness()
+        const target = harness.runtime.captureSelectedConversationTarget()!
+        const lease = await harness.runtime.acquireCompleteConversation(
+            'plugin-full-object-setter',
+            target,
+        )
+        const replacement = {
+            ...structuredClone(harness.database.characters[0].chats[0]),
+            note: 'published through runtime',
+        }
+
+        await expect(harness.runtime.replacePersistentConversation(
+            target.characterId,
+            target.conversationId,
+            'plugin-chat-set',
+            replacement,
+            { expectedRevision: target.storeRevision },
+        )).resolves.toBe(true)
+        expect(lease.session.matchesConversation(target.characterId, replacement)).toBe(false)
+
+        lease.release()
+        expect(harness.runtime.refreshSelectedConversationAfterReplacement(
+            lease.target,
+            lease.session,
+        )).toBe(true)
+        expect(harness.runtime.getActiveConversationSession()?.matchesConversation(
+            target.characterId,
+            harness.database.characters[0].chats[0],
+        )).toBe(true)
+        expect(harness.runtime.captureSelectedConversationTarget()).toMatchObject({
+            characterId: target.characterId,
+            conversationId: target.conversationId,
+        })
+    })
+
     it('forwards inactive replacement options without changing active selection', async () => {
         const harness = await createActiveSessionRuntimeHarness()
         harness.database.characters.push({

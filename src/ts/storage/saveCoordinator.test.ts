@@ -499,6 +499,47 @@ describe('SaveCoordinator', () => {
         expect(coordinator.hasPendingPersistenceWork).toBe(false)
     })
 
+    it('fences complete character replacement with an expected revision', async () => {
+        const database = makeDatabase()
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => ({
+                revision: 7,
+                value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
+            })),
+            queryConversations: vi.fn(async () => ({ revision: 7, items: [] })),
+            commit: vi.fn(async () => ({ revision: 8 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+
+        await expect(coordinator.replacePersistentCompleteCharacter(
+            'char-a',
+            'plugin-character-set',
+            (current) => current,
+            { expectedRevision: 6 },
+        )).rejects.toBeInstanceOf(RevisionConflictError)
+        expect(store.readRoot).not.toHaveBeenCalled()
+        expect(store.commit).not.toHaveBeenCalled()
+
+        await expect(coordinator.replacePersistentCompleteCharacter(
+            'char-a',
+            'plugin-character-set',
+            (current) => ({ ...current, name: 'Updated' }),
+            { expectedRevision: 7 },
+        )).resolves.toBe(true)
+        expect(store.commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            replaceCharacter: expect.objectContaining({ chaId: 'char-a', name: 'Updated' }),
+        })
+    })
+
     function makeAdditionDatabase() {
         const database = makeDatabase()
         const added = structuredClone(database.characters[0])

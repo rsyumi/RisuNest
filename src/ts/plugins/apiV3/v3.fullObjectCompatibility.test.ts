@@ -14,6 +14,9 @@ const fixture = vi.hoisted(() => ({
         getCurrentCharacter: vi.fn(),
         getCharacterFromIndex: vi.fn(),
         getChatFromIndex: vi.fn(),
+        setCurrentCharacter: vi.fn(),
+        setCharacterToIndex: vi.fn(),
+        setChatToIndex: vi.fn(),
     },
     database: {
         characters: [
@@ -135,6 +138,9 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     getPersistentNavigationGeneration: vi.fn(() => 0),
     invalidateActiveConversationSession: vi.fn(),
     materializePersistentDatabaseSnapshotWithRevision: vi.fn(),
+    refreshSelectedConversationAfterReplacement: vi.fn(),
+    replacePersistentCompleteCharacter: vi.fn(),
+    replacePersistentConversation: vi.fn(),
     replacePersistentDatabase: vi.fn(),
 }))
 vi.mock('../pluginCompatibility', () => ({
@@ -193,6 +199,9 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         fixture.scopedAccess.getCurrentCharacter.mockReset()
         fixture.scopedAccess.getCharacterFromIndex.mockReset()
         fixture.scopedAccess.getChatFromIndex.mockReset()
+        fixture.scopedAccess.setCurrentCharacter.mockReset()
+        fixture.scopedAccess.setCharacterToIndex.mockReset()
+        fixture.scopedAccess.setChatToIndex.mockReset()
         await executePluginV3({
             name: `contract-plugin-${crypto.randomUUID()}`,
             script: '',
@@ -375,5 +384,41 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         fixture.database.characters[0].chatPage = 99
 
         expect(fixture.databaseAccessDependencies?.getSelectedCharacterId()).toBe('active')
+    })
+
+    it('routes scalable setters through scoped access while maximum ID replacement remains intact', async () => {
+        fixture.profile = 'scalable-v3'
+        const api = fixture.api!
+        const character = structuredClone(fixture.database.characters[1])
+        const chat = structuredClone(fixture.database.characters[1].chats[0])
+
+        await api.setChar(character)
+        await api.setCharacter(character)
+        await api.setCharacterToIndex(1, character)
+        await api.setChatToIndex(1, 0, chat)
+
+        expect(fixture.scopedAccess.setCurrentCharacter).toHaveBeenCalledTimes(2)
+        expect(fixture.scopedAccess.setCurrentCharacter).toHaveBeenCalledWith(
+            character,
+            expect.objectContaining({ pluginName: expect.stringContaining('contract-plugin-') }),
+        )
+        expect(fixture.scopedAccess.setCharacterToIndex).toHaveBeenCalledWith(
+            1,
+            character,
+            expect.objectContaining({ pluginName: expect.stringContaining('contract-plugin-') }),
+        )
+        expect(fixture.scopedAccess.setChatToIndex).toHaveBeenCalledWith(
+            1,
+            0,
+            chat,
+            expect.objectContaining({ pluginName: expect.stringContaining('contract-plugin-') }),
+        )
+        expect(fixture.database.characters[1].name).toBe('Trash')
+        expect(fixture.profile).toBe('scalable-v3')
+        expect(fixture.pluginPermissionReads).not.toHaveBeenCalledWith(
+            expect.stringContaining('_db'),
+        )
+        const { pluginCompatibility } = await import('../plugins.svelte')
+        expect(pluginCompatibility.allowsEviction).toBe(true)
     })
 })

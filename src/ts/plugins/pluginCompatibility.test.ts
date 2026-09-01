@@ -39,15 +39,15 @@ describe('manual plugin installation compatibility', () => {
 })
 
 describe('plugin compatibility profiles', () => {
-    it('keeps scoped setters maximum-only until their scalable adapter is installed', () => {
+    it('keeps legacy output listeners maximum-only until their projector is installed', () => {
         expect(() => assertPluginFullObjectCompatibility(
             'scalable-v3',
-            'setCharacter',
-        )).toThrow(/setCharacter.*maximum-compatibility.*queryCharacters/i)
+            'addRisuChatListener',
+        )).toThrow(/addRisuChatListener.*maximum-compatibility.*queryCharacters/i)
 
         expect(() => assertPluginFullObjectCompatibility(
             'maximum-compatibility',
-            'setCharacter',
+            'addRisuChatListener',
         )).not.toThrow()
     })
 
@@ -810,6 +810,12 @@ describe('plugin compatibility profiles', () => {
             getCompatibilityDatabase: () => liveDatabase,
             getCompatibilityProfile: () => controller.profile,
             getSelectedCharacterId: () => liveDatabase.characters[0]?.chaId ?? null,
+            captureSelectedConversationTarget: () => null,
+            acquireCompleteConversation: vi.fn(),
+            refreshSelectedConversationAfterReplacement: vi.fn(),
+            replacePersistentCompleteCharacter: vi.fn(),
+            replacePersistentConversation: vi.fn(),
+            reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => 0,
             applyCompatibilityDatabaseLite: vi.fn(),
             applyCompatibilityDatabase: applyMaximumUpdate,

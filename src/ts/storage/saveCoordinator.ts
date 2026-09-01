@@ -1836,12 +1836,17 @@ export class SaveCoordinator {
         characterId: string,
         reason: string,
         mutate: PersistentCompleteCharacterMutation,
+        options: PersistentScopedReplacementOptions = {},
     ): Promise<boolean> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
+            if (
+                options.expectedRevision !== undefined &&
+                options.expectedRevision !== this.revision
+            ) throw new RevisionConflictError(options.expectedRevision, this.revision)
             const residentBefore = this.captureResidentCharacter(characterId)
             const revision = this.revision
             const [rootValue, characterValue] = await Promise.all([

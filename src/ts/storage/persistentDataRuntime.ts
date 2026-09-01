@@ -318,6 +318,10 @@ export interface PersistentDataRuntime {
         target?: SelectedConversationTarget | null,
     ): Promise<CompleteConversationLease>
     tryDemoteSelectedConversation(target?: SelectedConversationTarget | null): boolean
+    refreshSelectedConversationAfterReplacement(
+        target: SelectedConversationTarget,
+        expectedSession: ActiveConversationSession,
+    ): boolean
     invalidateActiveConversationSession(): void
     deactivateActiveWorkingSet(): Promise<boolean>
     reconcileActiveCharacterIds(
@@ -354,6 +358,7 @@ export interface PersistentDataRuntime {
         characterId: string,
         reason: string,
         mutate: PersistentCompleteCharacterMutation,
+        options?: PersistentScopedReplacementOptions,
     ): Promise<boolean>
     replacePersistentConversation(
         characterId: string,
@@ -677,6 +682,8 @@ export function createPersistentDataRuntime(
             workingSet.acquireCompleteConversation(reason, target ?? undefined),
         tryDemoteSelectedConversation: (target) =>
             workingSet.tryDemoteSelectedConversation(target ?? undefined),
+        refreshSelectedConversationAfterReplacement: (target, expectedSession) =>
+            workingSet.refreshSelectedConversationAfterReplacement(target, expectedSession),
         invalidateActiveConversationSession: () => workingSet.invalidateActiveConversationSession(),
         deactivateActiveWorkingSet: () => workingSet.deactivate(),
         reconcileActiveCharacterIds: (database, selectedCharacterId) =>
@@ -710,8 +717,8 @@ export function createPersistentDataRuntime(
             coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
         deletePersistentCharacterWithGroupReferences: (characterId, reason) =>
             coordinator.deletePersistentCharacterWithGroupReferences(characterId, reason),
-        replacePersistentCompleteCharacter: (characterId, reason, mutate) =>
-            coordinator.replacePersistentCompleteCharacter(characterId, reason, mutate),
+        replacePersistentCompleteCharacter: (characterId, reason, mutate, options) =>
+            coordinator.replacePersistentCompleteCharacter(characterId, reason, mutate, options),
         replacePersistentConversation: (
             characterId,
             conversationId,

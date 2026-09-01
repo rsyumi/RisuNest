@@ -500,6 +500,43 @@ export class ActiveWorkingSet {
         this.clearActiveConversationSession()
     }
 
+    refreshSelectedConversationAfterReplacement(
+        target: SelectedConversationTarget,
+        expectedSession: ActiveConversationSession,
+    ): boolean {
+        const state = this.selectedConversationState
+        if (
+            state?.kind !== 'complete' ||
+            state.session !== expectedSession ||
+            this.activeSession !== expectedSession ||
+            !expectedSession.isActive ||
+            target.characterId !== state.characterId ||
+            target.conversationId !== state.conversationId ||
+            target.navigationGeneration !== state.navigationGeneration ||
+            state.navigationGeneration !== this.navigationGeneration ||
+            target[selectedConversationTargetBrand] !== state.stateToken
+        ) return false
+
+        if (this.dependencies.getSelectedCharacterId() !== target.characterId) {
+            this.clearActiveConversationSession()
+            return false
+        }
+        const resident = this.dependencies.getResidentCharacter?.(target.characterId)
+        const conversation = resident?.chats[resident.chatPage ?? 0]
+        if (!conversation || conversation.id !== target.conversationId) {
+            this.clearActiveConversationSession()
+            return false
+        }
+        if (conversation === state.conversation) return false
+
+        this.publishActiveConversationSession(
+            target.characterId,
+            conversation,
+            this.dependencies.coordinator.revision,
+        )
+        return true
+    }
+
     async deactivate(): Promise<boolean> {
         if (this.dependencies.canDeactivateWorkingSet?.() === false) return false
         const generation = ++this.navigationGeneration
