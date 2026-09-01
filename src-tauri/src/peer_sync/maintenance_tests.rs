@@ -1,6 +1,8 @@
-use super::maintenance::{cleanup_temp, delete_backup, list_backups, temp_usage};
+use super::maintenance::{
+    cleanup_temp, delete_backup, desktop_clone_backup_job_is_active, list_backups, temp_usage,
+};
 use super::PeerSyncError;
-use crate::asset_repository::job_pins::{CasJobKind, DurableCasJob};
+use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
 use std::fs;
 
 #[test]
@@ -82,7 +84,39 @@ fn desktop_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
 
     fs::write(&backup, b"backup").expect("restore backup");
     let _matching = DurableCasJob::begin(root, id, CasJobKind::PeerClone, 0).expect("matching job");
+    assert_eq!(
+        DurableCasJob::open(root, id)
+            .expect("open matching job")
+            .kind(),
+        CasJobKind::PeerClone
+    );
+    assert!(desktop_clone_backup_job_is_active(root, &backup));
     assert!(
         matches!(delete_backup(root, &backup), Err(PeerSyncError::Validation(message)) if message == "peer-backup-in-use")
     );
+}
+
+#[test]
+fn android_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let id = "00000000-0000-4000-8000-000000000003";
+    let backup = root.join(format!(
+        "peer-clone-activation/backups/pre-clone-{}-{id}.lossless",
+        "b".repeat(64)
+    ));
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(&backup, b"backup").expect("write backup");
+
+    let mut matching =
+        DurableCasJob::begin(root, id, CasJobKind::PeerClone, 0).expect("matching job");
+    assert!(matches!(
+        delete_backup(root, &backup),
+        Err(PeerSyncError::Validation(message)) if message == "peer-backup-in-use"
+    ));
+
+    matching
+        .release(CasReleaseOutcome::Aborted)
+        .expect("release matching job");
+    delete_backup(root, &backup).expect("released matching job does not block backup");
 }

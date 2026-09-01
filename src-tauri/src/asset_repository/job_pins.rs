@@ -525,7 +525,15 @@ fn collect_durable_cas_job_roots_inner_read_only(repository_root: &Path) -> Asse
             return roots;
         }
     };
-    for entry in entries.take(MAX_DURABLE_CAS_JOB_JOURNALS + 1) {
+    let mut count = 0;
+    for entry in entries {
+        count += 1;
+        if count > MAX_DURABLE_CAS_JOB_JOURNALS {
+            roots
+                .blockers
+                .insert("job-pin-journal-limit-exceeded".to_owned());
+            return roots;
+        }
         let Ok(entry) = entry else {
             roots
                 .blockers
