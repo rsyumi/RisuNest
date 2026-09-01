@@ -208,6 +208,66 @@ describe('peer bidirectional facade', () => {
         expect(events.indexOf('service-stop')).toBeLessThan(events.indexOf('peer_bidirectional_source_release'))
     })
 
+    it.each([
+        ['false', false],
+        ['throw', true],
+        ['native-start-error', true],
+    ] as const)(
+        'keeps the P5 exact source cleanup trace after %s',
+        async (failure, expectsServiceStop) => {
+            const foreground = {
+                lane: 'p5-source' as const,
+                operationId: '58585858-5858-4585-8585-585858585858',
+                generation: 25,
+            }
+            const events: string[] = []
+            const calls: string[] = []
+            const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+                calls.push(command)
+                if (command === 'peer_bidirectional_prepare') {
+                    return { phase: 'prepared', sessionId: 'source-session', devices: [] } as T
+                }
+                if (command === 'peer_sync_foreground_source_status') return null as T
+                if (command === 'peer_bidirectional_source_reserve') return foreground as T
+                if (command === 'peer_bidirectional_start' && failure === 'native-start-error') {
+                    throw new Error('native start failed')
+                }
+                if (command === 'peer_bidirectional_start') {
+                    return { phase: 'running', sessionId: 'source-session', devices: [] } as T
+                }
+                if (command === 'peer_sync_foreground_source_abandon') return true as T
+                throw new Error('Unexpected command: ' + command)
+            })
+            const bridge = {
+                startSource: vi.fn(() => {
+                    if (failure === 'throw') throw new Error('service start failed')
+                    return failure !== 'false'
+                }),
+                stopSource: vi.fn(() => true),
+            }
+            const facade = createPeerBidirectionalFacade({
+                platform: 'android',
+                invoke: invoke as PeerBidirectionalInvoke,
+                runtime: runtime(events),
+                bridge,
+            })
+
+            await facade.prepare()
+            await expect(facade.start('source-session')).rejects.toThrow()
+
+            expect(bridge.stopSource).toHaveBeenCalledTimes(expectsServiceStop ? 1 : 0)
+            expect(invoke).toHaveBeenCalledWith('peer_sync_foreground_source_abandon', { foreground })
+            const expected = [
+                'peer_bidirectional_prepare',
+                'peer_sync_foreground_source_status',
+                'peer_bidirectional_source_reserve',
+            ]
+            if (failure === 'native-start-error') expected.push('peer_bidirectional_start')
+            expected.push('peer_sync_foreground_source_abandon')
+            expect(calls).toEqual(expected)
+        },
+    )
+
     it.each(['false', 'throw'] as const)(
         'retains Android P5 source authority when exact service Stop returns %s, then releases on retry',
         async (failure) => {
