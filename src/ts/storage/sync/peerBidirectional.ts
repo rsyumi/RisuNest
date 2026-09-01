@@ -145,10 +145,16 @@ export interface PeerBidirectionalFacade {
     stop(sessionId: string): Promise<void>
     revoke(sessionId: string, deviceId: string): Promise<void>
     sync(pairingUri: string): Promise<PeerBidirectionalSyncResult>
+    syncRegistered(deviceId: string): Promise<PeerBidirectionalSyncResult>
     resolve(
         operationId: string,
         winner: 'local' | 'remote',
         pairingUri?: string,
+    ): Promise<PeerBidirectionalSyncResult>
+    resolveRegistered(
+        deviceId: string,
+        operationId: string,
+        winner: 'local' | 'remote',
     ): Promise<PeerBidirectionalSyncResult>
     resume(operationId: string): Promise<PeerBidirectionalSyncResult>
     acknowledge(operationId: string): Promise<void>
@@ -753,6 +759,14 @@ export function createPeerBidirectionalFacade(options: {
                 { ...pairing },
             )
         },
+        syncRegistered(deviceId) {
+            return runMutation(
+                'peer-bidirectional-sync',
+                `registered:${deviceId}`,
+                'peer_bidirectional_sync_registered',
+                { deviceId },
+            )
+        },
         resolve(operationId, winner, pairingUri) {
             if (pairingUri) {
                 const pairing = parsePeerBidirectionalUri(pairingUri)
@@ -768,6 +782,14 @@ export function createPeerBidirectionalFacade(options: {
                 `operation:${operationId}:resolve:${winner}`,
                 'peer_bidirectional_resolve',
                 { operationId, winner },
+            )
+        },
+        resolveRegistered(deviceId, operationId, winner) {
+            return runMutation(
+                'peer-bidirectional-resolve',
+                `registered:${deviceId}:${operationId}:${winner}`,
+                'peer_bidirectional_resolve_registered',
+                { deviceId, operationId, winner },
             )
         },
         resume(operationId) {

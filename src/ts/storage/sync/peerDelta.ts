@@ -342,6 +342,10 @@ export function createPeerDeltaFacade(options: {
                 if (!fenceReleased && pendingRefresh?.fence !== fence) fence.release()
             }
         },
+        async pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
+            requireNative()
+            return await nativeInvoke('peer_delta_pull_registered', { deviceId })
+        },
     }
     return facade
 }

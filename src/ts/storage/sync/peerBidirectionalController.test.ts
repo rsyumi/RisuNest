@@ -43,6 +43,10 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
             transferredBytes: 0,
             backups: [],
         }),
+        syncRegistered: async () => ({
+            kind: 'noChanges', operationId: 'operation-1', revision: 1, remoteRevision: 1,
+            transferredObjects: 0, transferredBytes: 0, backups: [],
+        }),
         resolve: async () => ({
             kind: 'noChanges',
             operationId: 'operation-1',
@@ -51,6 +55,10 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
             transferredObjects: 0,
             transferredBytes: 0,
             backups: [],
+        }),
+        resolveRegistered: async () => ({
+            kind: 'noChanges', operationId: 'operation-1', revision: 1, remoteRevision: 1,
+            transferredObjects: 0, transferredBytes: 0, backups: [],
         }),
         resume: async () => ({
             kind: 'noChanges',

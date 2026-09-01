@@ -76,6 +76,24 @@ describe('parsePeerCloneUri', () => {
 })
 
 describe('PeerClone facade', () => {
+    it('reuses an already claimed target without claiming again', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => (command === 'peer_clone_capabilities'
+            ? {
+                desktop: true, sourceReady: true, atomicActivationReady: true, losslessBackupReady: true,
+                httpTransportReady: true, largeFixturePassed: true, productionEnabled: true,
+            }
+            : undefined) as T)
+        const facade = createPeerCloneFacade({
+            platform: 'desktop', invoke: invoke as unknown as PeerCloneInvoke, runtime: replacementRuntime(),
+        })
+        facade.joinClaimed({ endpoint: 'http://192.168.1.4:43123/', sessionId: 'session', manifestId: 'a'.repeat(64) })
+        facade.confirmDestructiveReplace()
+        await facade.download()
+
+        expect(invoke.mock.calls.map(([command]) => command)).not.toContain('peer_clone_claim_client')
+        expect(invoke.mock.calls.map(([command]) => command)).toContain('peer_clone_download')
+    })
+
     it('keeps the claim out of join and download, and sends it only in the claim command body', async () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string, ..._args: unknown[]): Promise<T> => (command === 'peer_clone_capabilities'
             ? {

@@ -11,6 +11,12 @@ export interface PeerClonePairing {
     claim: string
 }
 
+export interface PeerCloneClaimedTarget {
+    endpoint: string
+    sessionId: string
+    manifestId: string
+}
+
 export type PeerCloneInvoke = PeerSyncInvoke
 
 export interface PeerCloneFacadeOptions {
@@ -504,6 +510,18 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             }
             warning = ''
             targetIdentityEpoch += 1
+            state = reducePeerCloneState(state, { type: 'target-joined', pairing })
+            return state
+        },
+        joinClaimed(target: PeerCloneClaimedTarget): PeerCloneState {
+            if (finalization || pendingRefresh) {
+                throw new Error('Peer clone target finalization is still active')
+            }
+            const pairing: PeerClonePairing = { ...target, claim: '' }
+            warning = ''
+            targetIdentityEpoch += 1
+            ownedTarget = { ...target }
+            claimOwned = true
             state = reducePeerCloneState(state, { type: 'target-joined', pairing })
             return state
         },

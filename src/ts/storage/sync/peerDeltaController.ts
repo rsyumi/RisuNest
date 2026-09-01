@@ -209,6 +209,26 @@ export function createPeerDeltaController(options: {
             activePull = { pairingUri, promise }
             return promise
         },
+        pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
+            if (activePull) return Promise.reject(new Error('A peer delta pull is already running'))
+            pullError = ''
+            update({ pullPhase: 'running', pullResult: undefined })
+            const promise = options.facade.pullRegistered(deviceId).then((pullResult) => {
+                update({
+                    pullResult,
+                    pullPhase: pullResult.kind === 'fullCloneRequired'
+                        ? 'fullCloneRequired'
+                        : pullResult.kind === 'conflict' ? 'conflict' : 'completed',
+                })
+                return pullResult
+            }).catch((cause) => {
+                pullError = cause instanceof Error ? cause.message : String(cause)
+                update({ pullPhase: 'failed' })
+                throw cause
+            }).finally(() => { activePull = undefined })
+            activePull = { pairingUri: `registered:${deviceId}`, promise }
+            return promise
+        },
     }
 }
 

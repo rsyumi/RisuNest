@@ -185,6 +185,10 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
             facade.join(pairingUri)
             success()
         },
+        joinClaimed(target: { endpoint: string, sessionId: string, manifestId: string }): void {
+            facade.joinClaimed(target)
+            success()
+        },
         confirmDestructiveReplace(): void {
             facade.confirmDestructiveReplace()
             success()

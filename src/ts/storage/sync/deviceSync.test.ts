@@ -18,7 +18,7 @@ describe('device sync facade', () => {
 
     it('keeps registry and status DTOs free of endpoint and bearer secrets', async () => {
         const invoke = vi.fn(async (command: string) => {
-            if (command === 'device_sync_registered_sources') {
+            if (command === 'peer_sync_incoming_sources') {
                 return [{ deviceId: 'source', name: 'Source', permissions: ['read'], endpoint: 'http://private', bearer: 'secret' }]
             }
             return { phase: 'running', endpoint: 'http://private', bearer: 'secret', pairingUri: 'risuailocal://peer-clone/v2' }
@@ -36,13 +36,15 @@ describe('device sync facade', () => {
         const invoke = vi.fn(async () => ({ endpoint: 'http://current', sessionId: 'session', manifestId: 'manifest' }))
         const facade = createDeviceSyncFacade({ invoke })
 
-        await facade.claimRegisteredClone('source')
+        await facade.claimStagedClone({
+            endpoint: 'http://192.168.1.2:32145/', sessionId: 'session', manifestId: 'manifest', claim: 'claim',
+        })
         await facade.pullRegisteredDelta('source')
         await facade.syncRegisteredBidirectional('source')
         await facade.resolveRegisteredBidirectional('source', 'operation', 'local')
 
         expect(invoke.mock.calls).toEqual([
-            ['peer_clone_claim_registered_client', { deviceId: 'source' }],
+            ['peer_clone_claim_client', { endpoint: 'http://192.168.1.2:32145/', sessionId: 'session', manifestId: 'manifest', claim: 'claim' }],
             ['peer_delta_pull_registered', { deviceId: 'source' }],
             ['peer_bidirectional_sync_registered', { deviceId: 'source' }],
             ['peer_bidirectional_resolve_registered', { deviceId: 'source', operationId: 'operation', winner: 'local' }],
@@ -57,8 +59,8 @@ describe('device sync facade', () => {
         await facade.revokeIncoming('source')
 
         expect(invoke.mock.calls).toEqual([
-            ['device_sync_revoke_device', { deviceId: 'device' }],
-            ['device_sync_revoke_source', { deviceId: 'source' }],
+            ['peer_sync_revoke_outgoing_device', { deviceId: 'device' }],
+            ['peer_sync_remove_incoming_source', { deviceId: 'source' }],
         ])
     })
 })
