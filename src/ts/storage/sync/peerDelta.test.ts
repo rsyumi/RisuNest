@@ -323,6 +323,55 @@ describe('peer logical delta product facade', () => {
         await expect(facade.stopTunnel('session')).rejects.toThrow('Peer delta is unsupported on android')
     })
 
+    test('runs a registered Android pull through the legacy mutation and foreground lifecycle', async () => {
+        const events: string[] = []
+        const foreground = { lane: 'p4-target', operationId: '22222222-2222-4222-8222-222222222222', generation: 4 }
+        const bridge = {
+            startSource: vi.fn(() => { events.push('service-start'); return true }),
+            stopSource: vi.fn(() => { events.push('service-stop'); return true }),
+        }
+        const runtime: PeerDeltaMutationRuntime = {
+            async flushPendingData(reason) { events.push(`flush:${reason}`) },
+            async capturePersistentMutationToken(reason) {
+                events.push(`capture:${reason}`)
+                return { revision: 4, mutationGeneration: 2 }
+            },
+            async acquireDestructiveReplacementFence() {
+                events.push('fence')
+                return {
+                    async refreshCommittedWorkingSet(revision) { events.push(`refresh:${revision}`) },
+                    release() { events.push('release') },
+                }
+            },
+        }
+        const invoke = vi.fn(async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+            events.push(`${command}:${JSON.stringify(args ?? {})}`)
+            if (command === 'peer_delta_target_foreground_status') return null as T
+            if (command === 'peer_delta_target_reserve') return foreground as T
+            if (command === 'peer_delta_target_foreground_release') return true as T
+            return { kind: 'updated', revision: 5, transferredObjects: 1, transferredBytes: 8 } as T
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
+
+        await facade.pullRegistered('source-device')
+
+        expect(events).toEqual([
+            'peer_delta_target_foreground_status:{}',
+            'flush:peer-delta-pull',
+            'capture:peer-delta-pull',
+            'fence',
+            'peer_delta_target_reserve:{}',
+            'service-start',
+            `peer_delta_pull_registered:${JSON.stringify({
+                deviceId: 'source-device', expectedRevision: 4, foreground,
+            })}`,
+            'refresh:5',
+            'release',
+            'service-stop',
+            `peer_delta_target_foreground_release:${JSON.stringify({ foreground })}`,
+        ])
+    })
+
     test('current renderer cleans exact Reserved target after foreground START throws', async () => {
         const foreground = { lane: 'p4-target', operationId: '22222222-2222-4222-8222-222222222222', generation: 4 } as const
         const events: string[] = []

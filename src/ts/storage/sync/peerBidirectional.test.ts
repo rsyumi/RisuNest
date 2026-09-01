@@ -1566,6 +1566,33 @@ describe('peer bidirectional facade', () => {
         ])
     })
 
+    it('returns the recovered durable local commit after a lost registered resolve response', async () => {
+        const events: string[] = []
+        const invoke = vi.fn(async (command: string) => {
+            events.push(`invoke:${command}`)
+            if (command === 'peer_bidirectional_resolve_registered') throw new Error('native response lost')
+            if (command === 'peer_bidirectional_status') {
+                return {
+                    source: { phase: 'idle', devices: [] },
+                    operation: {
+                        phase: 'localCommitted',
+                        operationId: 'operation-registered-loss',
+                        committedRevision: 8,
+                    },
+                }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop', runtime: runtime(events),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.resolveRegistered('source', 'operation-registered-loss', 'local'))
+            .resolves.toMatchObject({
+                kind: 'resumeRequired', operationId: 'operation-registered-loss', committedRevision: 8,
+            })
+    })
+
     it.each([
         {
             phase: 'localCommitted' as const,

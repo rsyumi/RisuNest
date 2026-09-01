@@ -12,6 +12,7 @@ import { get } from "svelte/store";
 import { setDatabase, getDatabase, type Database } from "./storage/database.svelte";
 import { getDeviceSettings } from "./storage/deviceSettings";
 import { startDeviceSyncAutoListen } from './storage/sync/deviceSyncController'
+import { getProductionDeviceSyncController } from './storage/sync/deviceSyncProduction'
 import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
@@ -274,11 +275,6 @@ export async function loadData() {
             },
         })
         installPersistentWorkingSet(local.database)
-        if (isTauri && deviceSettings.syncAutoListen) {
-            void startDeviceSyncAutoListen(deviceSettings, {
-                report: (error) => console.error('Device sync auto-listen failed', error),
-            })
-        }
         performance.mark('boot:local-data-ready')
         const uncachedNativeAccountStorage: AccountStorageCache = {
             getItem: async () => null,
@@ -539,6 +535,18 @@ export async function loadData() {
             configureNativeOfficialAccountFlow(null)
         }
         performance.mark('boot:account-ready')
+        if (isTauri) {
+            const deviceSyncController = getProductionDeviceSyncController()
+            try {
+                await deviceSyncController.initialize()
+            } catch (error) {
+                console.error('Device sync target recovery failed', error)
+            }
+            await startDeviceSyncAutoListen(deviceSettings, {
+                controller: deviceSyncController,
+                report: (error) => console.error('Device sync auto-listen failed', error),
+            })
+        }
         if (officialReconcilePublish && accountBootstrap.officialEnabled) {
             publishCurrentOfficialRevision().catch((error) => {
                 console.error('Official reconcile publish failed', error)

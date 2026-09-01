@@ -75,6 +75,31 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
 }
 
 describe('peer bidirectional controller', () => {
+    it('initializes durable target state without starting the legacy source poller', async () => {
+        vi.useFakeTimers()
+        const status = vi.fn(async () => ({
+            source: { phase: 'running' as const, sessionId: 'legacy-source', devices: [] },
+            operation: {
+                phase: 'targetPrepared' as const,
+                operationId: 'operation-target',
+            },
+        }))
+        const controller = createPeerBidirectionalController({
+            facade: facade({ status }),
+            sourcePollMilliseconds: 10,
+        })
+
+        await controller.initializeTarget()
+        await vi.advanceTimersByTimeAsync(20)
+
+        expect(controller.snapshot()).toMatchObject({
+            operationPhase: 'targetPrepared',
+            operationId: 'operation-target',
+        })
+        expect(status).toHaveBeenCalledTimes(1)
+        vi.useRealTimers()
+    })
+
     it('owns Quick and Named source tunnel starts through the shared source lifecycle', async () => {
         const startQuickTunnel = vi.fn(async () => ({
             phase: 'running' as const,

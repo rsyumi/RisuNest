@@ -281,6 +281,7 @@ export function createPeerBidirectionalFacade(options: {
         if (
             command === 'peer_bidirectional_resolve'
             || command === 'peer_bidirectional_resolve_with_link'
+            || command === 'peer_bidirectional_resolve_registered'
         ) {
             return operation.phase === 'localCommitted' || operation.phase === 'completed'
         }

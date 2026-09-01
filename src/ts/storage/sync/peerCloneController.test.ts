@@ -15,6 +15,26 @@ afterEach(() => {
 })
 
 describe('peer clone controller lifecycle', () => {
+    it('initializes only target capabilities for the unified controller', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_status') return { phase: 'running', devices: [] } as T
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async () => undefined), vi.fn()),
+            }),
+        })
+
+        await controller.initializeTarget()
+
+        expect(controller.snapshot().capabilities).toMatchObject({ productionEnabled: true })
+        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_status')).toBe(false)
+    })
+
     it('keeps retrying a committed renderer refresh after every view unsubscribes', async () => {
         vi.useFakeTimers()
         let finalized = false

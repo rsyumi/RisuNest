@@ -34,6 +34,8 @@ export function createPeerDeltaController(options: {
     }
     let initialized = false
     let initialization: Promise<void> | undefined
+    let targetInitialized = false
+    let targetInitialization: Promise<void> | undefined
     let sourceError = ''
     let pullError = ''
     let activePull: { pairingUri: string, promise: Promise<PeerDeltaPullResult> } | undefined
@@ -144,6 +146,22 @@ export function createPeerDeltaController(options: {
                 publish()
             })
             return initialization
+        },
+        initializeTarget(): Promise<void> {
+            if (targetInitialized) return targetInitialization ?? Promise.resolve()
+            targetInitialized = true
+            targetInitialization = options.facade.recoverTargetForeground().then(
+                () => options.facade.capabilities(),
+            ).then((capabilities) => {
+                sourceError = ''
+                update({ capabilities })
+            }).catch((cause) => {
+                sourceError = cause instanceof Error ? cause.message : String(cause)
+                targetInitialized = false
+                targetInitialization = undefined
+                publish()
+            })
+            return targetInitialization
         },
         prepare: () => run(async () => {
             const sourceStatus = await options.facade.prepare()

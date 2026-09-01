@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
+import { dispatchRisuLocalUrl } from '../../deepLinkDispatcher'
 
 import {
     consumePendingPeerCloneUri,
     consumePendingDeviceSyncUri,
     publishPeerCloneUri,
     publishDeviceSyncUri,
+    receiveDeviceSyncUri,
     subscribeDeviceSyncUri,
     subscribePeerCloneUri,
 } from './peerCloneDeepLink'
@@ -29,6 +31,20 @@ describe('peer clone deep link bridge', () => {
 })
 
 describe('device sync registration bridge', () => {
+    it('carries a canonical Tauri v2 URL from the dispatcher into pending controller state', () => {
+        consumePendingDeviceSyncUri()
+        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2'
+        const openSettings = vi.fn()
+
+        expect(dispatchRisuLocalUrl(uri, {
+            onRealm: vi.fn(),
+            onPeerClone: vi.fn(),
+            onDeviceSync: (value) => receiveDeviceSyncUri(value, openSettings),
+        })).toBe(true)
+        expect(consumePendingDeviceSyncUri()).toBe(uri)
+        expect(openSettings).toHaveBeenCalledWith(18)
+    })
+
     it('stages a v2 link independently without notifying legacy clone listeners', () => {
         const legacy = vi.fn()
         const unregisterLegacy = subscribePeerCloneUri(legacy)

@@ -30,6 +30,14 @@ describe('dispatchRisuLocalUrl', () => {
         expect(handlers.onPeerClone).not.toHaveBeenCalled()
     })
 
+    it('never falls back to the legacy clone handler for v2 links', () => {
+        const handlers = { onRealm: vi.fn(), onPeerClone: vi.fn() }
+        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145'
+
+        expect(dispatchRisuLocalUrl(uri, handlers)).toBe(false)
+        expect(handlers.onPeerClone).not.toHaveBeenCalled()
+    })
+
     it('ignores unknown and malformed links', () => {
         const handlers = { onRealm: vi.fn(), onPeerClone: vi.fn(), onDeviceSync: vi.fn() }
 

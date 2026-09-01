@@ -40,6 +40,8 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
     }
     let initialized = false
     let initialization: Promise<void> | undefined
+    let targetInitialized = false
+    let targetInitialization: Promise<void> | undefined
     let targetTimer: ReturnType<typeof setInterval> | undefined
     let targetPolling = false
 
@@ -177,6 +179,19 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
                 failure(cause)
             })
             return initialization
+        },
+        initializeTarget(): Promise<void> {
+            if (targetInitialized) return targetInitialization ?? Promise.resolve()
+            targetInitialized = true
+            targetInitialization = facade.capabilities().then((capabilities) => {
+                snapshot = { ...snapshot, capabilities }
+                success()
+            }).catch((cause) => {
+                targetInitialized = false
+                targetInitialization = undefined
+                failure(cause)
+            })
+            return targetInitialization
         },
         clearError(): void {
             success()

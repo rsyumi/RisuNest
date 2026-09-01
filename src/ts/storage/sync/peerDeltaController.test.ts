@@ -54,6 +54,17 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
 }
 
 describe('peer delta controller', () => {
+    test('initializes target recovery without reading or polling legacy source status', async () => {
+        const targetFacade = facadeFixture()
+        const controller = createPeerDeltaController({ facade: targetFacade })
+
+        await controller.initializeTarget()
+
+        expect(targetFacade.recoverTargetForeground).toHaveBeenCalledTimes(1)
+        expect(targetFacade.capabilities).toHaveBeenCalledTimes(1)
+        expect(targetFacade.status).not.toHaveBeenCalled()
+    })
+
     test('caches one module-level Android controller so retained pull fences survive settings remounts', () => {
         const runtime = (): PeerDeltaMutationRuntime => ({
             flushPendingData: vi.fn(async () => undefined),

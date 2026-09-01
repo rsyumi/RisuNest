@@ -2,13 +2,35 @@ import type {
     DeviceSyncSettingsInput,
     DeviceSyncLinkPermissions,
     DeviceSyncStatus,
+    RegisteredCloneSession,
     RegisteredDevice,
     StagedDeviceSyncLink,
     DeviceSyncErrorCode,
 } from './deviceSync'
-import { createDeviceSyncFacade, DeviceSyncError, parseDeviceSyncUri } from './deviceSync'
+import { classifyDeviceSyncFailure, DeviceSyncError, parseDeviceSyncUri } from './deviceSync'
 import type { RisuNestDeviceSettings } from '../deviceSettings'
 import { createPeerSourcePolling } from './peerSourcePolling'
+import type { PeerCloneControllerSnapshot } from './peerCloneController'
+import type { PeerDeltaControllerSnapshot } from './peerDeltaController'
+import type { PeerBidirectionalControllerSnapshot } from './peerBidirectionalController'
+import { consumePendingDeviceSyncUri, subscribeDeviceSyncUri } from './peerCloneDeepLink'
+
+export type SafePeerCloneControllerSnapshot = Omit<PeerCloneControllerSnapshot, 'error' | 'warning'> & {
+    error: DeviceSyncErrorCode | null
+    warning: DeviceSyncErrorCode | null
+    platform?: 'desktop' | 'android'
+    resumeAvailable?: boolean
+}
+export type SafePeerDeltaControllerSnapshot = Omit<PeerDeltaControllerSnapshot, 'error'> & {
+    error: DeviceSyncErrorCode | null
+}
+export type SafePeerBidirectionalControllerSnapshot = Omit<
+    PeerBidirectionalControllerSnapshot,
+    'sourceError' | 'operationError'
+> & {
+    sourceError: DeviceSyncErrorCode | null
+    operationError: DeviceSyncErrorCode | null
+}
 
 type SourceFacade = {
     status(): Promise<DeviceSyncStatus>
@@ -20,12 +42,40 @@ type SourceFacade = {
     outgoingDevices(): Promise<RegisteredDevice[]>
     revokeIncoming(deviceId: string): Promise<void>
     revokeOutgoing(deviceId: string): Promise<void>
-    claimStagedClone?(link: StagedDeviceSyncLink): Promise<{ sourceDeviceId: string, endpoint: string, sessionId: string, manifestId: string }>
+    claimStagedClone?(link: StagedDeviceSyncLink): Promise<RegisteredCloneSession>
+    reconnectRegisteredClone?(deviceId: string): Promise<RegisteredCloneSession>
 }
 
-type TargetController = {
-    snapshot(): unknown
-    subscribe(listener: (snapshot: unknown) => void): () => void
+export type DeviceSyncCloneTarget = {
+    snapshot(): PeerCloneControllerSnapshot & { platform?: 'desktop' | 'android'; resumeAvailable?: boolean }
+    subscribe(listener: (snapshot: PeerCloneControllerSnapshot & {
+        platform?: 'desktop' | 'android'
+        resumeAvailable?: boolean
+    }) => void): () => void
+    initialize(): Promise<void>
+    joinClaimed(target: Omit<RegisteredCloneSession, 'sourceDeviceId'>): void
+    joinRegistered?(deviceId: string): Promise<void>
+    confirmDestructiveReplace(): void
+    download(): Promise<void>
+    resume(): Promise<void>
+    cancel(): Promise<void>
+    dispose?(): void
+}
+export type DeviceSyncDeltaTarget = {
+    snapshot(): PeerDeltaControllerSnapshot
+    subscribe(listener: (snapshot: PeerDeltaControllerSnapshot) => void): () => void
+    initialize(): Promise<void>
+    pullRegistered(deviceId: string): Promise<unknown>
+}
+export type DeviceSyncBidirectionalTarget = {
+    snapshot(): PeerBidirectionalControllerSnapshot
+    subscribe(listener: (snapshot: PeerBidirectionalControllerSnapshot) => void): () => void
+    initialize(): Promise<void>
+    syncRegistered(deviceId: string): Promise<unknown>
+    resolveRegistered(deviceId: string, winner: 'local' | 'remote'): Promise<unknown>
+    resume(): Promise<unknown>
+    acknowledge(): Promise<void>
+    abandon(): Promise<void>
 }
 
 export interface DeviceSyncControllerSnapshot {
@@ -34,64 +84,89 @@ export interface DeviceSyncControllerSnapshot {
     devices: RegisteredDevice[]
     error: DeviceSyncErrorCode | null
     stagedLink: StagedDeviceSyncLink | null
+    stagedSourceDeviceId: string | null
     expiredSourceIds: readonly string[]
-    targets: { clone?: unknown, delta?: unknown, bidirectional?: unknown }
+    targets: {
+        clone?: SafePeerCloneControllerSnapshot
+        delta?: SafePeerDeltaControllerSnapshot
+        bidirectional?: SafePeerBidirectionalControllerSnapshot
+    }
 }
 
-const initialSnapshot: DeviceSyncControllerSnapshot = {
-    source: { phase: 'idle' },
-    sources: [],
-    devices: [],
-    error: null,
-    stagedLink: null,
-    expiredSourceIds: [],
-    targets: {},
+function createInitialSnapshot(): DeviceSyncControllerSnapshot {
+    return {
+        source: { phase: 'idle' }, sources: [], devices: [], error: null,
+        stagedLink: null, stagedSourceDeviceId: null, expiredSourceIds: [], targets: {},
+    }
 }
 
-function safeError(error: unknown): DeviceSyncErrorCode {
-    return error instanceof DeviceSyncError ? error.code : 'unavailable'
+function safeCode(value: unknown): DeviceSyncErrorCode | null {
+    if (value === undefined || value === null || value === '') return null
+    return classifyDeviceSyncFailure(value).code
 }
-
-function sourceIsOff(status: DeviceSyncStatus): boolean {
-    return status.phase === 'idle'
+function safeClone(value: PeerCloneControllerSnapshot): SafePeerCloneControllerSnapshot {
+    return { ...value, error: safeCode(value.error), warning: safeCode(value.warning) }
+}
+function safeDelta(value: PeerDeltaControllerSnapshot): SafePeerDeltaControllerSnapshot {
+    return { ...value, error: safeCode(value.error) }
+}
+function safeBidirectional(value: PeerBidirectionalControllerSnapshot): SafePeerBidirectionalControllerSnapshot {
+    return { ...value, sourceError: safeCode(value.sourceError), operationError: safeCode(value.operationError) }
 }
 
 export function createDeviceSyncController(options: {
     facade: SourceFacade
     sourcePollMilliseconds?: number
     targets?: {
-        clone?: TargetController & { joinClaimed(target: { endpoint: string, sessionId: string, manifestId: string }): void }
-        delta?: TargetController & { pullRegistered(deviceId: string): Promise<unknown> }
-        bidirectional?: TargetController & {
-            syncRegistered(deviceId: string): Promise<unknown>
-            resolveRegistered(deviceId: string, winner: 'local' | 'remote'): Promise<unknown>
-        }
+        clone?: DeviceSyncCloneTarget
+        delta?: DeviceSyncDeltaTarget
+        bidirectional?: DeviceSyncBidirectionalTarget
+    }
+    deepLinks?: {
+        consumePending(): string | null
+        subscribe(listener: (uri: string) => void): () => void
     }
 }) {
     const listeners = new Set<(snapshot: DeviceSyncControllerSnapshot) => void>()
-    let snapshot = initialSnapshot
+    let snapshot = createInitialSnapshot()
     let initialized = false
     let initialization: Promise<void> | undefined
-    let sourceWork: Promise<unknown> | undefined
-    let targetUnsubscribers: Array<(() => void) | undefined> = []
+    let activeWork: Promise<unknown> | undefined
+    let disposed = false
 
     const publish = (): void => {
-        snapshot = { ...snapshot }
+        snapshot = { ...snapshot, targets: { ...snapshot.targets } }
         for (const listener of listeners) listener(snapshot)
     }
     const update = (next: Partial<DeviceSyncControllerSnapshot>): void => {
         snapshot = { ...snapshot, ...next }
         publish()
     }
-    targetUnsubscribers = [
-        options.targets?.clone && options.targets.clone.subscribe((clone) => update({ targets: { ...snapshot.targets, clone } })),
-        options.targets?.delta && options.targets.delta.subscribe((delta) => update({ targets: { ...snapshot.targets, delta } })),
-        options.targets?.bidirectional && options.targets.bidirectional.subscribe((bidirectional) => update({ targets: { ...snapshot.targets, bidirectional } })),
-    ]
+    const fail = (error: unknown, deviceId?: string): DeviceSyncError => {
+        const safe = classifyDeviceSyncFailure(error)
+        update({
+            error: safe.code,
+            expiredSourceIds: safe.code === 'registration-expired' && deviceId
+                ? [...new Set([...snapshot.expiredSourceIds, deviceId])]
+                : snapshot.expiredSourceIds,
+        })
+        return safe
+    }
+    const clearExpired = (deviceId: string): void => update({
+        error: null,
+        expiredSourceIds: snapshot.expiredSourceIds.filter((candidate) => candidate !== deviceId),
+    })
+    const runExclusive = <T>(operation: () => Promise<T>): Promise<T> => {
+        if (activeWork) return Promise.reject(new DeviceSyncError('unavailable'))
+        const work = Promise.resolve().then(operation).finally(() => {
+            if (activeWork === work) activeWork = undefined
+        })
+        activeWork = work
+        return work
+    }
     const refreshRegistries = async (): Promise<void> => {
         const [sources, devices] = await Promise.all([
-            options.facade.incomingSources(),
-            options.facade.outgoingDevices(),
+            options.facade.incomingSources(), options.facade.outgoingDevices(),
         ])
         update({ sources, devices })
     }
@@ -100,65 +175,117 @@ export function createDeviceSyncController(options: {
         poll: async () => {
             try {
                 const source = await options.facade.status()
-                update({ source, error: source.error ?? null })
-                if (!['prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.stop()
+                update({ source, error: source.latestError ?? null })
+                if (!['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.stop()
             } catch (error) {
-                update({ error: safeError(error) })
+                fail(error)
                 polling.stop()
             }
         },
     })
     const observeSource = (source: DeviceSyncStatus): void => {
-        if (['prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.start()
+        if (['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.start()
         else polling.stop()
-    }
-    const runSource = <T>(operation: () => Promise<T>): Promise<T> => {
-        if (sourceWork) return Promise.reject(new Error('Another sharing action is already running'))
-        const work = operation().finally(() => { sourceWork = undefined })
-        sourceWork = work
-        return work
     }
     const updateSource = async (operation: () => Promise<DeviceSyncStatus>): Promise<DeviceSyncStatus> => {
         try {
             const source = await operation()
-            update({ source, error: source.error ?? null })
+            update({ source, error: source.latestError ?? null })
             observeSource(source)
             return source
         } catch (error) {
-            update({ error: safeError(error) })
-            throw new Error(snapshot.error)
+            throw fail(error)
         }
     }
-    const completeReceive = async <T>(operation: () => Promise<T>): Promise<T> => {
-        if (!sourceIsOff(snapshot.source)) throw new Error('Sharing is active. Stop sharing before receiving.')
+    const ensureReceiveAllowed = (): void => {
+        if (snapshot.source.phase !== 'idle') throw new DeviceSyncError('unavailable')
+    }
+    const receive = async <T>(operation: () => Promise<T>, deviceId?: string): Promise<T> => {
+        ensureReceiveAllowed()
         try {
             const result = await operation()
             await refreshRegistries()
+            update({ error: null })
             return result
         } catch (error) {
-            update({ error: safeError(error) })
-            throw new Error(snapshot.error ?? 'unavailable')
+            throw fail(error, deviceId)
         }
     }
     const requireSource = (deviceId: string, permission: 'read' | 'bidirectional'): void => {
         const source = snapshot.sources.find((candidate) => candidate.deviceId === deviceId)
-        if (!source || !source.permissions.includes(permission)) throw new Error('unavailable')
+        if (!source?.permissions.includes(permission)) throw new DeviceSyncError('unavailable')
     }
-    const registeredReceive = async <T>(deviceId: string, permission: 'read' | 'bidirectional', operation: () => Promise<T>): Promise<T> => {
+    const registeredReceive = <T>(
+        deviceId: string,
+        permission: 'read' | 'bidirectional',
+        operation: () => Promise<T>,
+    ): Promise<T> => {
         requireSource(deviceId, permission)
+        return receive(operation, deviceId)
+    }
+    const claimStaged = async (): Promise<string> => {
+        if (snapshot.stagedSourceDeviceId) return snapshot.stagedSourceDeviceId
+        const link = snapshot.stagedLink
+        if (!link || !options.facade.claimStagedClone) throw new DeviceSyncError('unavailable')
+        let claimed: RegisteredCloneSession
         try {
-            return await completeReceive(operation)
+            claimed = await options.facade.claimStagedClone(link)
         } catch (error) {
-            if (error instanceof Error && error.message === 'registration-expired') {
-                update({ expiredSourceIds: [...new Set([...snapshot.expiredSourceIds, deviceId])] })
-            }
-            throw error
+            throw fail(error)
+        }
+        update({
+            stagedLink: null,
+            stagedSourceDeviceId: claimed.sourceDeviceId,
+            error: null,
+            expiredSourceIds: snapshot.expiredSourceIds.filter(
+                (candidate) => candidate !== claimed.sourceDeviceId,
+            ),
+        })
+        await refreshRegistries()
+        return claimed.sourceDeviceId
+    }
+    const joinRegisteredClone = async (deviceId: string): Promise<void> => {
+        const target = options.targets?.clone
+        if (!target) throw new DeviceSyncError('unavailable')
+        requireSource(deviceId, 'read')
+        if (target.joinRegistered) {
+            await target.joinRegistered(deviceId)
+            return
+        }
+        if (!options.facade.reconnectRegisteredClone) throw new DeviceSyncError('unavailable')
+        const descriptor = await options.facade.reconnectRegisteredClone(deviceId)
+        target.joinClaimed({
+            endpoint: descriptor.endpoint,
+            sessionId: descriptor.sessionId,
+            manifestId: descriptor.manifestId,
+        })
+    }
+    const stageLink = (uri: string): void => {
+        try {
+            update({ stagedLink: parseDeviceSyncUri(uri), stagedSourceDeviceId: null, error: null })
+        } catch (error) {
+            fail(error)
         }
     }
-    const claimStaged = async (): Promise<{ sourceDeviceId: string, endpoint: string, sessionId: string, manifestId: string }> => {
-        if (!snapshot.stagedLink || !options.facade.claimStagedClone) throw new Error('unavailable')
-        return completeReceive(() => options.facade.claimStagedClone!(snapshot.stagedLink!))
+
+    const targetUnsubscribers = [
+        options.targets?.clone?.subscribe((value) => update({
+            targets: { ...snapshot.targets, clone: safeClone(value) },
+        })),
+        options.targets?.delta?.subscribe((value) => update({
+            targets: { ...snapshot.targets, delta: safeDelta(value) },
+        })),
+        options.targets?.bidirectional?.subscribe((value) => update({
+            targets: { ...snapshot.targets, bidirectional: safeBidirectional(value) },
+        })),
+    ]
+    const deepLinks = options.deepLinks ?? {
+        consumePending: consumePendingDeviceSyncUri,
+        subscribe: subscribeDeviceSyncUri,
     }
+    const pendingLink = deepLinks.consumePending()
+    if (pendingLink) stageLink(pendingLink)
+    const unsubscribeDeepLink = deepLinks.subscribe(stageLink)
 
     return {
         snapshot: (): DeviceSyncControllerSnapshot => snapshot,
@@ -170,114 +297,194 @@ export function createDeviceSyncController(options: {
         initialize(): Promise<void> {
             if (initialized) return initialization ?? Promise.resolve()
             initialized = true
-            initialization = Promise.all([options.facade.status(), refreshRegistries()]).then(([source]) => {
-                update({ source, error: source.error ?? null })
+            initialization = Promise.all([
+                options.targets?.clone?.initialize(),
+                options.targets?.delta?.initialize(),
+                options.targets?.bidirectional?.initialize(),
+                options.facade.status(),
+                refreshRegistries(),
+            ]).then(([, , , source]) => {
+                update({ source, error: source.latestError ?? null })
                 observeSource(source)
             }).catch((error) => {
                 initialized = false
                 initialization = undefined
-                update({ error: safeError(error) })
+                throw fail(error)
             })
             return initialization
         },
         prepare(settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> {
-            return runSource(() => updateSource(() => options.facade.prepare(settings)))
+            return runExclusive(() => updateSource(() => options.facade.prepare(settings)))
         },
         start(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
-            return runSource(() => updateSource(() => options.facade.start(permissions)))
+            return runExclusive(() => updateSource(() => options.facade.start(permissions)))
         },
         stop(): Promise<DeviceSyncStatus> {
-            return runSource(async () => {
-                await options.facade.stop()
+            return runExclusive(async () => {
+                try { await options.facade.stop() } catch (error) { throw fail(error) }
                 return updateSource(() => options.facade.status())
             })
         },
         rotateLink(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
-            return runSource(() => updateSource(() => options.facade.rotateLink(permissions)))
+            return runExclusive(() => updateSource(() => options.facade.rotateLink(permissions)))
         },
-        async revokeIncoming(deviceId: string): Promise<void> {
-            await options.facade.revokeIncoming(deviceId)
-            await refreshRegistries()
-        },
-        async revokeOutgoing(deviceId: string): Promise<void> {
-            await options.facade.revokeOutgoing(deviceId)
-            await refreshRegistries()
-        },
-        async completeReceive<T>(operation: () => Promise<T>): Promise<T> {
-            return completeReceive(operation)
-        },
-        stageLink(uri: string): void {
-            update({ stagedLink: parseDeviceSyncUri(uri), error: null })
-        },
-        clearStagedLink(): void {
-            update({ stagedLink: null })
-        },
-        async claimStagedClone(): Promise<void> {
-            if (!options.targets?.clone) throw new Error('unavailable')
-            await completeReceive(async () => {
-                const target = await claimStaged()
-                options.targets!.clone!.joinClaimed(target)
+        revokeIncoming(deviceId: string): Promise<void> {
+            return runExclusive(async () => {
+                try {
+                    await options.facade.revokeIncoming(deviceId)
+                    await refreshRegistries()
+                    clearExpired(deviceId)
+                } catch (error) { throw fail(error) }
             })
-            update({ stagedLink: null })
         },
-        async pullStagedDelta(): Promise<unknown> {
-            if (!options.targets?.delta) throw new Error('unavailable')
-            const target = await claimStaged()
-            const result = await registeredReceive(target.sourceDeviceId, 'read', () => options.targets!.delta!.pullRegistered(target.sourceDeviceId))
-            update({ stagedLink: null })
-            return result
+        revokeOutgoing(deviceId: string): Promise<void> {
+            return runExclusive(async () => {
+                try {
+                    await options.facade.revokeOutgoing(deviceId)
+                    await refreshRegistries()
+                } catch (error) { throw fail(error) }
+            })
         },
-        async syncStagedBidirectional(): Promise<unknown> {
-            if (!options.targets?.bidirectional) throw new Error('unavailable')
-            const target = await claimStaged()
-            const result = await registeredReceive(target.sourceDeviceId, 'bidirectional', () => options.targets!.bidirectional!.syncRegistered(target.sourceDeviceId))
-            update({ stagedLink: null })
-            return result
+        completeReceive<T>(operation: () => Promise<T>): Promise<T> {
+            return runExclusive(() => receive(operation))
+        },
+        stageLink,
+        clearStagedLink(): void { update({ stagedLink: null, stagedSourceDeviceId: null }) },
+        claimStagedClone(): Promise<void> {
+            return runExclusive(async () => {
+                ensureReceiveAllowed()
+                const deviceId = await claimStaged()
+                try {
+                    await joinRegisteredClone(deviceId)
+                    clearExpired(deviceId)
+                } catch (error) { throw fail(error, deviceId) }
+            })
+        },
+        selectRegisteredClone(deviceId: string): Promise<void> {
+            return runExclusive(async () => {
+                ensureReceiveAllowed()
+                try {
+                    await joinRegisteredClone(deviceId)
+                    clearExpired(deviceId)
+                } catch (error) { throw fail(error, deviceId) }
+            })
+        },
+        confirmCloneReplace(): Promise<void> {
+            return runExclusive(async () => {
+                ensureReceiveAllowed()
+                try {
+                    if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
+                    options.targets.clone.confirmDestructiveReplace()
+                } catch (error) { throw fail(error) }
+            })
+        },
+        downloadClone(): Promise<void> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
+                await options.targets.clone.download()
+            }, snapshot.stagedSourceDeviceId ?? undefined))
+        },
+        resumeClone(): Promise<void> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
+                await options.targets.clone.resume()
+            }, snapshot.stagedSourceDeviceId ?? undefined))
+        },
+        cancelClone(): Promise<void> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
+                await options.targets.clone.cancel()
+            }, snapshot.stagedSourceDeviceId ?? undefined))
+        },
+        pullStagedDelta(): Promise<unknown> {
+            return runExclusive(async () => {
+                ensureReceiveAllowed()
+                const deviceId = await claimStaged()
+                if (!options.targets?.delta) throw new DeviceSyncError('unavailable')
+                return registeredReceive(deviceId, 'read', () => options.targets!.delta!.pullRegistered(deviceId))
+            })
+        },
+        syncStagedBidirectional(): Promise<unknown> {
+            return runExclusive(async () => {
+                ensureReceiveAllowed()
+                const deviceId = await claimStaged()
+                if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                return registeredReceive(deviceId, 'bidirectional', () => (
+                    options.targets!.bidirectional!.syncRegistered(deviceId)
+                ))
+            })
         },
         pullRegisteredDelta(deviceId: string): Promise<unknown> {
-            if (!options.targets?.delta) return Promise.reject(new Error('Delta target is unavailable'))
-            return registeredReceive(deviceId, 'read', () => options.targets!.delta!.pullRegistered(deviceId))
+            return runExclusive(async () => {
+                if (!options.targets?.delta) throw new DeviceSyncError('unavailable')
+                return registeredReceive(deviceId, 'read', () => options.targets!.delta!.pullRegistered(deviceId))
+            })
         },
         syncRegisteredBidirectional(deviceId: string): Promise<unknown> {
-            if (!options.targets?.bidirectional) return Promise.reject(new Error('Bidirectional target is unavailable'))
-            return registeredReceive(deviceId, 'bidirectional', () => options.targets!.bidirectional!.syncRegistered(deviceId))
+            return runExclusive(async () => {
+                if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                return registeredReceive(deviceId, 'bidirectional', () => (
+                    options.targets!.bidirectional!.syncRegistered(deviceId)
+                ))
+            })
         },
         resolveRegisteredBidirectional(deviceId: string, winner: 'local' | 'remote'): Promise<unknown> {
-            if (!options.targets?.bidirectional) return Promise.reject(new Error('Bidirectional target is unavailable'))
-            return registeredReceive(deviceId, 'bidirectional', () => options.targets!.bidirectional!.resolveRegistered(deviceId, winner))
+            return runExclusive(async () => {
+                if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                return registeredReceive(deviceId, 'bidirectional', () => (
+                    options.targets!.bidirectional!.resolveRegistered(deviceId, winner)
+                ))
+            })
+        },
+        resumeBidirectional(): Promise<unknown> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                return options.targets.bidirectional.resume()
+            }))
+        },
+        acknowledgeBidirectional(): Promise<void> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                await options.targets.bidirectional.acknowledge()
+            }))
+        },
+        abandonBidirectional(): Promise<void> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                await options.targets.bidirectional.abandon()
+            }))
         },
         dispose(): void {
+            if (disposed) return
+            disposed = true
             polling.stop()
+            unsubscribeDeepLink()
             for (const unsubscribe of targetUnsubscribers) unsubscribe?.()
+            options.targets?.clone?.dispose?.()
+            listeners.clear()
         },
     }
 }
 
-let singleton: ReturnType<typeof createDeviceSyncController> | undefined
-
-export function getDeviceSyncController(options: Parameters<typeof createDeviceSyncController>[0]) {
-    singleton ??= createDeviceSyncController(options)
-    return singleton
-}
+export type DeviceSyncController = ReturnType<typeof createDeviceSyncController>
 
 export async function startDeviceSyncAutoListen(
     settings: Pick<RisuNestDeviceSettings, 'syncAutoListen' | 'syncListenMethod' | 'syncFixedPort' | 'syncPublicBaseUrl'>,
     options: {
-        controller?: Pick<ReturnType<typeof createDeviceSyncController>, 'initialize' | 'prepare' | 'start'>
+        controller: Pick<DeviceSyncController, 'initialize' | 'prepare' | 'start'>
         report?: (error: unknown) => void
-    } = {},
+    },
 ): Promise<void> {
     if (!settings.syncAutoListen) return
-    const controller = options.controller ?? getDeviceSyncController({ facade: createDeviceSyncFacade() })
     try {
-        await controller.initialize()
-        await controller.prepare({
+        await options.controller.initialize()
+        await options.controller.prepare({
             method: settings.syncListenMethod,
             fixedPort: settings.syncFixedPort,
             publicBaseUrl: settings.syncPublicBaseUrl,
         })
-        await controller.start({ read: true, bidirectional: false })
+        await options.controller.start({ read: true, bidirectional: false })
     } catch (error) {
-        options.report?.(error)
+        options.report?.(classifyDeviceSyncFailure(error))
     }
 }

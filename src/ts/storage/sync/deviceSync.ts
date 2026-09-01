@@ -4,9 +4,19 @@ import { parsePeerPairingUri } from './peerClone'
 type DeviceSyncInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
 export type DeviceSyncMethod = 'lan' | 'quick' | 'fixed-url'
-export type DeviceSyncPhase = 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'error'
+export type DeviceSyncPhase = 'idle' | 'preparing' | 'prepared' | 'starting' | 'running' | 'stopping' | 'error'
 export type DeviceSyncPermission = 'read' | 'bidirectional'
-export type DeviceSyncErrorCode = 'port-unavailable' | 'registration-expired' | 'transport-changed' | 'unavailable'
+export type DeviceSyncErrorCode =
+    | 'invalid-configuration'
+    | 'port-unavailable'
+    | 'preparation-failed'
+    | 'transport-unavailable'
+    | 'cleanup-failed'
+    | 'state-unavailable'
+    | 'registration-expired'
+    | 'transport-changed'
+    | 'operation-failed'
+    | 'unavailable'
 
 export class DeviceSyncError extends Error {
     constructor(readonly code: DeviceSyncErrorCode) {
@@ -14,19 +24,32 @@ export class DeviceSyncError extends Error {
     }
 }
 
-function safeFailure(error: unknown): DeviceSyncError {
+export function classifyDeviceSyncFailure(error: unknown): DeviceSyncError {
+    if (error instanceof DeviceSyncError) return error
     const message = error instanceof Error ? error.message : String(error)
-    if (message.includes('401') || message.includes('expired')) return new DeviceSyncError('registration-expired')
-    if (message.includes('port')) return new DeviceSyncError('port-unavailable')
-    if (message.includes('transport') || message.includes('endpoint')) return new DeviceSyncError('transport-changed')
-    return new DeviceSyncError('unavailable')
+    if (message === 'authorizationExpired' || message === 'sourceMissing' || message === 'identityMismatch') {
+        return new DeviceSyncError('registration-expired')
+    }
+    if (message === 'transportUnavailable') return new DeviceSyncError('transport-changed')
+    if (message === 'permissionDenied' || message === 'laneUnavailable') {
+        return new DeviceSyncError('operation-failed')
+    }
+    if (
+        message === 'invalid-configuration'
+        || message === 'port-unavailable'
+        || message === 'preparation-failed'
+        || message === 'transport-unavailable'
+        || message === 'cleanup-failed'
+        || message === 'state-unavailable'
+    ) return new DeviceSyncError(message)
+    return new DeviceSyncError('operation-failed')
 }
 
 async function safeInvoke<T>(invoke: DeviceSyncInvoke, command: string, args?: Record<string, unknown>): Promise<T> {
     try {
         return await invoke(command, args) as T
     } catch (error) {
-        throw safeFailure(error)
+        throw classifyDeviceSyncFailure(error)
     }
 }
 
@@ -43,9 +66,10 @@ export interface DeviceSyncLinkPermissions {
 
 export interface DeviceSyncStatus {
     phase: DeviceSyncPhase
+    endpoint?: string
     pairingUri?: string
     expiresAtMs?: number
-    error?: DeviceSyncErrorCode
+    latestError?: DeviceSyncErrorCode
 }
 
 export interface RegisteredDevice {
@@ -61,6 +85,42 @@ export interface RegisteredCloneSession {
     endpoint: string
     sessionId: string
     manifestId: string
+}
+
+function safeRegisteredCloneSession(value: unknown): RegisteredCloneSession {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new DeviceSyncError('unavailable')
+    }
+    const source = value as Record<string, unknown>
+    const keys = Object.keys(source).sort()
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    const sha256 = /^[0-9a-f]{64}$/i
+    let endpoint: URL | undefined
+    try {
+        endpoint = typeof source.endpoint === 'string' ? new URL(source.endpoint) : undefined
+    } catch {
+        endpoint = undefined
+    }
+    if (
+        keys.join(',') !== 'endpoint,manifestId,sessionId,sourceDeviceId'
+        || typeof source.sourceDeviceId !== 'string'
+        || !uuid.test(source.sourceDeviceId)
+        || typeof source.endpoint !== 'string'
+        || !endpoint
+        || (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:')
+        || endpoint.username !== ''
+        || endpoint.password !== ''
+        || typeof source.sessionId !== 'string'
+        || !uuid.test(source.sessionId)
+        || typeof source.manifestId !== 'string'
+        || !sha256.test(source.manifestId)
+    ) throw new DeviceSyncError('unavailable')
+    return {
+        sourceDeviceId: source.sourceDeviceId,
+        endpoint: source.endpoint,
+        sessionId: source.sessionId,
+        manifestId: source.manifestId,
+    }
 }
 
 export interface StagedDeviceSyncLink {
@@ -94,13 +154,21 @@ function safeStatus(value: unknown): DeviceSyncStatus {
     const source = value && typeof value === 'object' ? value as Record<string, unknown> : {}
     const phase = source.phase
     return {
-        phase: phase === 'prepared' || phase === 'starting' || phase === 'running' || phase === 'stopping' || phase === 'error'
+        phase: phase === 'preparing' || phase === 'prepared' || phase === 'starting' || phase === 'running' || phase === 'stopping' || phase === 'error'
             ? phase
             : 'idle',
+        ...(typeof source.endpoint === 'string' ? { endpoint: source.endpoint } : {}),
         ...(typeof source.pairingUri === 'string' ? { pairingUri: source.pairingUri } : {}),
-        ...(typeof source.expiresAtMs === 'number' ? { expiresAtMs: source.expiresAtMs } : {}),
-        ...(source.error === 'port-unavailable' || source.error === 'transport-changed' || source.error === 'registration-expired' || source.error === 'unavailable'
-            ? { error: source.error as DeviceSyncErrorCode }
+        ...(typeof source.expiresAtMs === 'number' && Number.isFinite(source.expiresAtMs) && source.expiresAtMs >= 0
+            ? { expiresAtMs: source.expiresAtMs }
+            : {}),
+        ...(source.latestError === 'invalid-configuration'
+            || source.latestError === 'port-unavailable'
+            || source.latestError === 'preparation-failed'
+            || source.latestError === 'transport-unavailable'
+            || source.latestError === 'cleanup-failed'
+            || source.latestError === 'state-unavailable'
+            ? { latestError: source.latestError as DeviceSyncErrorCode }
             : {}),
     }
 }
@@ -118,8 +186,12 @@ function safeDevices(value: unknown): RegisteredDevice[] {
             deviceId: source.deviceId,
             name: source.name,
             permissions,
-            ...(typeof source.lastSeenMs === 'number' ? { lastSeenMs: source.lastSeenMs } : {}),
-            ...(typeof source.totalBytes === 'number' ? { totalBytes: source.totalBytes } : {}),
+            ...(typeof source.lastSeenMs === 'number' && Number.isFinite(source.lastSeenMs) && source.lastSeenMs >= 0
+                ? { lastSeenMs: source.lastSeenMs }
+                : {}),
+            ...(typeof source.totalBytes === 'number' && Number.isFinite(source.totalBytes) && source.totalBytes >= 0
+                ? { totalBytes: source.totalBytes }
+                : {}),
         }]
     })
 }
@@ -134,7 +206,7 @@ export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = 
     const status = async (): Promise<DeviceSyncStatus> => safeStatus(await safeInvoke(nativeInvoke, 'device_sync_status'))
     const source = async (command: string, settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> => {
         validate(settings)
-        return safeStatus(await safeInvoke(nativeInvoke, command, { ...settings }))
+        return safeStatus(await safeInvoke(nativeInvoke, command, { request: { ...settings } }))
     }
     return {
         prepare: (settings: DeviceSyncSettingsInput) => source('device_sync_prepare', settings),
@@ -159,19 +231,9 @@ export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = 
         revokeIncoming: async (deviceId: string): Promise<void> => {
             await safeInvoke(nativeInvoke, 'peer_sync_remove_incoming_source', { deviceId })
         },
-        helloRegistered: async (deviceId: string): Promise<void> => {
-            await safeInvoke(nativeInvoke, 'peer_sync_registered_hello', { deviceId })
-        },
         claimStagedClone: async (link: StagedDeviceSyncLink): Promise<RegisteredCloneSession> =>
-            await safeInvoke<RegisteredCloneSession>(nativeInvoke, 'peer_clone_claim_client', { ...link }),
-        pullRegisteredDelta: async <T>(deviceId: string): Promise<T> =>
-            await safeInvoke<T>(nativeInvoke, 'peer_delta_pull_registered', { deviceId }),
-        syncRegisteredBidirectional: async <T>(deviceId: string): Promise<T> =>
-            await safeInvoke<T>(nativeInvoke, 'peer_bidirectional_sync_registered', { deviceId }),
-        resolveRegisteredBidirectional: async <T>(
-            deviceId: string,
-            operationId: string,
-            winner: 'local' | 'remote',
-        ): Promise<T> => await safeInvoke<T>(nativeInvoke, 'peer_bidirectional_resolve_registered', { deviceId, operationId, winner }),
+            safeRegisteredCloneSession(await safeInvoke(nativeInvoke, 'peer_clone_claim_client', { ...link })),
+        reconnectRegisteredClone: async (deviceId: string): Promise<RegisteredCloneSession> =>
+            safeRegisteredCloneSession(await safeInvoke(nativeInvoke, 'peer_clone_claim_registered_client', { deviceId })),
     }
 }

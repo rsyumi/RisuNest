@@ -140,7 +140,7 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
                 : status.phase
         state = {
             phase,
-            destructiveConfirmed: true,
+            destructiveConfirmed: state.destructiveConfirmed,
             activationCommitted: status.committedRevision !== undefined,
             completedBytes: status.completedBytes,
             totalBytes: status.totalBytes,
@@ -250,6 +250,19 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             state = { ...initialState, phase: 'joined' }
             return state
         },
+        async joinRegistered(deviceId: string): Promise<AndroidPeerCloneState> {
+            if (jobId && state.phase !== 'cancelled' && state.phase !== 'completed') {
+                throw new Error('Android peer clone already owns a clone job')
+            }
+            await requireReady()
+            const claimed = await nativeInvoke<AndroidPeerCloneTargetStatus>(
+                'peer_clone_claim_registered_client',
+                { deviceId },
+            )
+            adoptStatus(claimed)
+            state = { ...state, destructiveConfirmed: false }
+            return state
+        },
         confirmDestructiveReplace(): AndroidPeerCloneState {
             if (!pairing) throw new Error('Android peer clone target has not joined a pairing')
             state = { ...state, phase: 'confirmed', destructiveConfirmed: true }
@@ -262,11 +275,13 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             const request = pairing
             const mode = await requireReady()
             if (mode === 'disabled') throw new Error('Android peer clone is not enabled by native production gates')
+            if (jobId) {
+                await beginTransfer(jobId, mode)
+                return
+            }
             const claimed = await nativeInvoke<AndroidPeerCloneTargetStatus>('peer_clone_android_claim', {
-                endpoint: request.endpoint,
-                sessionId: request.sessionId,
-                manifestId: request.manifestId,
-                claim: request.claim,
+                endpoint: request.endpoint, sessionId: request.sessionId,
+                manifestId: request.manifestId, claim: request.claim,
             })
             adoptStatus(claimed)
             await beginTransfer(claimed.jobId, mode)
@@ -278,6 +293,9 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
         async resume(): Promise<void> {
             if (!jobId) throw new Error('Android peer clone job is unavailable')
             if (state.phase !== 'paused') throw new Error('Android peer clone job is not paused')
+            if (!state.destructiveConfirmed) {
+                throw new Error('Android peer clone target requires destructive replacement confirmation')
+            }
             const id = jobId
             const mode = await requireReady()
             if (mode === 'disabled') throw new Error('Android peer clone is not enabled by native production gates')

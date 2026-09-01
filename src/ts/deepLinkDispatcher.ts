@@ -31,8 +31,8 @@ export function dispatchRisuLocalUrl(value: string, handlers: RisuLocalUrlHandle
         return true
     }
     if (url.hostname === 'peer-clone' && url.pathname === '/v2') {
-        if (handlers.onDeviceSync) handlers.onDeviceSync(value)
-        else handlers.onPeerClone(value)
+        if (!handlers.onDeviceSync) return false
+        handlers.onDeviceSync(value)
         return true
     }
     return false

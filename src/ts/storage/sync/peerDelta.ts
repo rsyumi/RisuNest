@@ -98,13 +98,6 @@ function unsupported(platform: Exclude<PeerClonePlatform, 'desktop'>): never {
     throw new Error(`Peer delta is unsupported on ${platform}`)
 }
 
-function samePairing(left: PeerDeltaPairing, right: PeerDeltaPairing): boolean {
-    return left.endpoint === right.endpoint
-        && left.sessionId === right.sessionId
-        && left.manifestId === right.manifestId
-        && left.claim === right.claim
-}
-
 export function createPeerDeltaFacade(options: {
     platform: PeerClonePlatform
     invoke?: PeerDeltaInvoke
@@ -113,7 +106,7 @@ export function createPeerDeltaFacade(options: {
 }) {
     const nativeInvoke = options.invoke ?? invoke
     let pendingRefresh: {
-        pairing: PeerDeltaPairing
+        key: string
         result: CommittedPeerDeltaPullResult
         fence: Awaited<ReturnType<PeerDeltaMutationRuntime['acquireDestructiveReplacementFence']>>
         foreground?: PeerDeltaForegroundIdentity
@@ -201,6 +194,85 @@ export function createPeerDeltaFacade(options: {
         }
         await releaseAndroidTargetForeground(pending.foreground)
     }
+    const runPull = async (
+        key: string,
+        command: 'peer_delta_pull' | 'peer_delta_pull_registered',
+        args: Record<string, unknown>,
+    ): Promise<PeerDeltaPullResult> => {
+        requireNative()
+        const runtime = options.runtime
+        if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
+        if (pendingRefresh) {
+            const pending = pendingRefresh
+            if (pending.key !== key) {
+                throw new Error('Another peer delta pull is awaiting renderer refresh')
+            }
+            await pending.fence.refreshCommittedWorkingSet(pending.result.revision)
+            pendingRefresh = undefined
+            pending.fence.release()
+            if (pending.foreground) await releaseAndroidTargetForeground(pending.foreground)
+            return pending.result
+        }
+        await recoverTargetForeground()
+        await runtime.flushPendingData('peer-delta-pull')
+        const token = await runtime.capturePersistentMutationToken('peer-delta-pull')
+        const fence = await runtime.acquireDestructiveReplacementFence(token)
+        let foreground: PeerDeltaForegroundIdentity | undefined
+        let fenceReleased = false
+        try {
+            if (options.platform === 'android') {
+                if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
+                foreground = await nativeInvoke<PeerDeltaForegroundIdentity>('peer_delta_target_reserve')
+                if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
+                    const released = await nativeInvoke<boolean>('peer_delta_target_foreground_release', {
+                        foreground,
+                    })
+                    if (released) foreground = undefined
+                    throw new Error('Android peer delta foreground service could not start')
+                }
+            }
+            const result = await nativeInvoke<PeerDeltaPullResult>(command, {
+                ...args,
+                expectedRevision: token.revision,
+                ...(foreground ? { foreground } : {}),
+            })
+            if (result.kind === 'updated' || result.kind === 'noChanges') {
+                pendingRefresh = { key, result, fence, foreground }
+                await fence.refreshCommittedWorkingSet(result.revision)
+                pendingRefresh = undefined
+            }
+            fence.release()
+            fenceReleased = true
+            if (foreground) await releaseAndroidTargetForeground(foreground)
+            return result
+        } catch (error) {
+            if (pendingRefresh?.fence === fence) throw error
+            if (!foreground) throw error
+            try {
+                const pending = await settleTargetForeground(foreground)
+                if (!fenceReleased) {
+                    if (pending?.result?.kind === 'updated' || pending?.result?.kind === 'noChanges') {
+                        await fence.refreshCommittedWorkingSet(pending.result.revision)
+                    }
+                    fence.release()
+                    fenceReleased = true
+                }
+                await releaseAndroidTargetForeground(foreground)
+            } catch (cleanupError) {
+                if (!fenceReleased) {
+                    fence.release()
+                    fenceReleased = true
+                }
+                throw new AggregateError(
+                    [error, cleanupError],
+                    'Android peer delta pull and foreground cleanup both failed',
+                )
+            }
+            throw error
+        } finally {
+            if (!fenceReleased && pendingRefresh?.fence !== fence) fence.release()
+        }
+    }
     const facade = {
         recoverTargetForeground,
         async capabilities(): Promise<PeerDeltaCapabilities> {
@@ -267,84 +339,11 @@ export function createPeerDeltaFacade(options: {
             return nativeInvoke('peer_delta_revoke', { sessionId, deviceId })
         },
         async pull(pairingUri: string): Promise<PeerDeltaPullResult> {
-            requireNative()
-            const runtime = options.runtime
-            if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
             const pairing = parsePeerDeltaUri(pairingUri)
-            if (pendingRefresh) {
-                const pending = pendingRefresh
-                if (!samePairing(pending.pairing, pairing)) {
-                    throw new Error('Another peer delta pull is awaiting renderer refresh')
-                }
-                await pending.fence.refreshCommittedWorkingSet(pending.result.revision)
-                pendingRefresh = undefined
-                pending.fence.release()
-                if (pending.foreground) await releaseAndroidTargetForeground(pending.foreground)
-                return pending.result
-            }
-            await recoverTargetForeground()
-            await runtime.flushPendingData('peer-delta-pull')
-            const token = await runtime.capturePersistentMutationToken('peer-delta-pull')
-            const fence = await runtime.acquireDestructiveReplacementFence(token)
-            let foreground: PeerDeltaForegroundIdentity | undefined
-            let fenceReleased = false
-            try {
-                if (options.platform === 'android') {
-                    if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
-                    foreground = await nativeInvoke<PeerDeltaForegroundIdentity>('peer_delta_target_reserve')
-                    if (!bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)) {
-                        const released = await nativeInvoke<boolean>('peer_delta_target_foreground_release', {
-                            foreground,
-                        })
-                        if (released) foreground = undefined
-                        throw new Error('Android peer delta foreground service could not start')
-                    }
-                }
-                const result = await nativeInvoke<PeerDeltaPullResult>('peer_delta_pull', {
-                    ...pairing,
-                    expectedRevision: token.revision,
-                    ...(foreground ? { foreground } : {}),
-                })
-                if (result.kind === 'updated' || result.kind === 'noChanges') {
-                    pendingRefresh = { pairing, result, fence, foreground }
-                    await fence.refreshCommittedWorkingSet(result.revision)
-                    pendingRefresh = undefined
-                }
-                fence.release()
-                fenceReleased = true
-                if (foreground) await releaseAndroidTargetForeground(foreground)
-                return result
-            } catch (error) {
-                if (pendingRefresh?.fence === fence) throw error
-                if (!foreground) throw error
-                try {
-                    const pending = await settleTargetForeground(foreground)
-                    if (!fenceReleased) {
-                        if (pending?.result?.kind === 'updated' || pending?.result?.kind === 'noChanges') {
-                            await fence.refreshCommittedWorkingSet(pending.result.revision)
-                        }
-                        fence.release()
-                        fenceReleased = true
-                    }
-                    await releaseAndroidTargetForeground(foreground)
-                } catch (cleanupError) {
-                    if (!fenceReleased) {
-                        fence.release()
-                        fenceReleased = true
-                    }
-                    throw new AggregateError(
-                        [error, cleanupError],
-                        'Android peer delta pull and foreground cleanup both failed',
-                    )
-                }
-                throw error
-            } finally {
-                if (!fenceReleased && pendingRefresh?.fence !== fence) fence.release()
-            }
+            return runPull(`pairing:${pairingUri}`, 'peer_delta_pull', { ...pairing })
         },
         async pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
-            requireNative()
-            return await nativeInvoke('peer_delta_pull_registered', { deviceId })
+            return runPull(`registered:${deviceId}`, 'peer_delta_pull_registered', { deviceId })
         },
     }
     return facade

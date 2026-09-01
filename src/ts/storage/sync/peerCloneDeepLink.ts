@@ -45,6 +45,14 @@ export function publishDeviceSyncUri(uri: string): void {
     for (const listener of deviceSyncListeners) listener(uri)
 }
 
+export function receiveDeviceSyncUri(
+    uri: string,
+    openSettings: (menuIndex: number) => void,
+): void {
+    publishDeviceSyncUri(uri)
+    openSettings(18)
+}
+
 export function consumePendingDeviceSyncUri(): string | null {
     const uri = pendingDeviceSyncUri
     pendingDeviceSyncUri = null

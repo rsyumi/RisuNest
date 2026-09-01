@@ -92,6 +92,8 @@ export function createPeerBidirectionalController(options: {
     }
     let initialized = false
     let initialization: Promise<void> | undefined
+    let targetInitialized = false
+    let targetInitialization: Promise<void> | undefined
     let sourcePollEpoch = 0
     let operationErrorOwner = 0
     let sourceRefreshErrorOwner: number | undefined
@@ -335,6 +337,24 @@ export function createPeerBidirectionalController(options: {
                 update({ sourceError: cause instanceof Error ? cause.message : String(cause) })
             })
             return initialization
+        },
+        initializeTarget(): Promise<void> {
+            if (targetInitialized) return targetInitialization ?? Promise.resolve()
+            targetInitialized = true
+            targetInitialization = (options.facade.recoverTargetForeground?.() ?? Promise.resolve()).then(
+                () => Promise.all([options.facade.capabilities(), options.facade.status()]),
+            ).then(([capabilities, status]) => {
+                update({
+                    capabilities,
+                    ...operationSnapshot(status.operation),
+                    operationError: '',
+                })
+            }).catch((cause) => {
+                targetInitialized = false
+                targetInitialization = undefined
+                update({ operationError: cause instanceof Error ? cause.message : String(cause) })
+            })
+            return targetInitialization
         },
         prepare: () => runSource('prepare', async () => {
             const sourceStatus = await options.facade.prepare()

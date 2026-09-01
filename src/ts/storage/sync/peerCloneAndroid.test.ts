@@ -81,6 +81,44 @@ describe('Android peer clone facade', () => {
         expect(JSON.stringify(nativeBridge)).not.toContain('bbbbbbbb')
     })
 
+    it('creates a registered job and starts it without reusing the staged claim', async () => {
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_capabilities') {
+                return {
+                    androidClient: true, atomicActivationReady: true, losslessBackupReady: true,
+                    httpTransportReady: true, productionEnabled: true,
+                } as T
+            }
+            if (command === 'peer_clone_claim_registered_client') {
+                return {
+                    jobId: '11111111-1111-4111-8111-111111111111',
+                    endpoint: 'http://192.168.1.4:43123/',
+                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
+                    manifestId: 'a'.repeat(64),
+                    phase: 'ready',
+                    completedBytes: 0,
+                } as T
+            }
+            throw new Error(`unexpected command ${command}`)
+        })
+        const nativeBridge = bridge('uidt')
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: nativeBridge,
+            runtime: runtime().replacement,
+        })
+
+        await facade.joinRegistered('source-device')
+        expect(facade.getState().destructiveConfirmed).toBe(false)
+        await expect(facade.download()).rejects.toThrow('destructive replacement confirmation')
+        facade.confirmDestructiveReplace()
+        await facade.download()
+
+        expect(invoke).toHaveBeenCalledWith('peer_clone_claim_registered_client', { deviceId: 'source-device' })
+        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_claim')).toBe(false)
+        expect(nativeBridge.schedule).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111')
+    })
+
     it('captures the confirmed pairing before the capability await', async () => {
         type Capabilities = {
             androidClient: boolean
@@ -298,9 +336,11 @@ describe('Android peer clone facade', () => {
 
         expect(facade.getState()).toMatchObject({
             phase: 'paused',
+            destructiveConfirmed: false,
             completedBytes: 1,
             totalBytes: 42,
         })
+        await expect(facade.resume()).rejects.toThrow('destructive replacement confirmation')
     })
 
     it('clears a pre-commit finalization failure so activation can retry', async () => {
