@@ -19,6 +19,25 @@ const mocks = vi.hoisted(() => ({
     activeCompleteLeases: 0,
     completeLeaseReleases: 0,
     lastCharPunctuation: true,
+    acknowledge: vi.fn(async () => undefined),
+    processScriptFull: vi.fn(async (
+        _char: unknown,
+        data: string,
+        mode: string,
+        _messageIndex?: number,
+        _conditions?: Record<string, unknown>,
+        _processing?: {
+            cache?: 'normal' | 'bypass'
+            signal?: AbortSignal
+            regexWorker?: boolean
+        },
+    ) => {
+        if (mode === 'editoutput') mocks.events.push('output-script')
+        return { data, emoChanged: false }
+    }),
+    sayTTS: vi.fn(async (_char: unknown, _data: string) => undefined),
+    addRerolls: vi.fn((_generationId: string, _values: string[]) => undefined),
+    trimUntilPunctuation: vi.fn((value: string) => value),
 }))
 
 vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')).tokenizerModule({
@@ -35,6 +54,7 @@ vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarn
 vi.mock('../util', async () => (await import('./tests/sendChatTestHarness')).utilModule({
     findCharacterbyId: () => mocks.currentCharacter,
     isLastCharPunctuation: () => mocks.lastCharPunctuation,
+    trimUntilPunctuation: mocks.trimUntilPunctuation,
 }))
 vi.mock('./request/request', () => ({
     requestChatData: vi.fn(async (request: unknown, purpose: string) => {
@@ -51,18 +71,13 @@ vi.mock('./request/request', () => ({
 }))
 vi.mock('./stableDiff', async () => (await import('./tests/sendChatTestHarness')).stableDiffModule())
 vi.mock('./scripts', async () => (await import('./tests/sendChatTestHarness')).scriptsModule({
-    processScriptFull: vi.fn(async (
-        _char: unknown,
-        data: string,
-        mode: string,
-    ) => {
-        if (mode === 'editoutput') mocks.events.push('output-script')
-        return { data, emoChanged: false }
-    }),
+    processScriptFull: mocks.processScriptFull,
 }))
 vi.mock('./templates/templates', async () => (await import('./tests/sendChatTestHarness')).templatesModule())
 vi.mock('./exampleMessages', async () => (await import('./tests/sendChatTestHarness')).exampleMessagesModule())
-vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsModule())
+vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsModule({
+    sayTTS: mocks.sayTTS,
+}))
 vi.mock('./memory/supaMemory', async () => (await import('./tests/sendChatTestHarness')).supaMemoryModule())
 vi.mock('./group', async () => (await import('./tests/sendChatTestHarness')).groupModule())
 vi.mock('./triggers', () => ({
@@ -84,7 +99,9 @@ vi.mock('./inlayScreen', () => ({
         return mocks.inlay ? mocks.inlay(data) : { text: data }
     },
 }))
-vi.mock('./prereroll', async () => (await import('./tests/sendChatTestHarness')).prerollModule())
+vi.mock('./prereroll', async () => (await import('./tests/sendChatTestHarness')).prerollModule({
+    addRerolls: mocks.addRerolls,
+}))
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
 vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
 vi.mock('./memory/hypav2', async () => (await import('./tests/sendChatTestHarness')).hypav2Module())
@@ -101,7 +118,7 @@ vi.mock('./presetChain', () => ({
     }),
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
-    acknowledgeGenerationCompletion: vi.fn(async () => undefined),
+    acknowledgeGenerationCompletion: mocks.acknowledge,
     captureSelectedConversationTarget: () => mocks.selectedTarget,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     getActiveConversationSession: () => mocks.session,
@@ -246,6 +263,18 @@ function streamingResponse(value: string) {
     }
 }
 
+function streamingSnapshots(...values: string[]) {
+    return {
+        type: 'streaming',
+        result: new ReadableStream<Record<string, string>>({
+            start(controller) {
+                for (const value of values) controller.enqueue({ response: value })
+                controller.close()
+            },
+        }),
+    }
+}
+
 describe('sendChat generation session integration', () => {
     beforeEach(() => {
         vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -266,6 +295,25 @@ describe('sendChat generation session integration', () => {
         mocks.activeCompleteLeases = 0
         mocks.completeLeaseReleases = 0
         mocks.lastCharPunctuation = true
+        mocks.acknowledge.mockReset().mockResolvedValue(undefined)
+        mocks.processScriptFull.mockReset().mockImplementation(async (
+            _char: unknown,
+            data: string,
+            mode: string,
+            _messageIndex?: number,
+            _conditions?: Record<string, unknown>,
+            _processing?: {
+                cache?: 'normal' | 'bypass'
+                signal?: AbortSignal
+                regexWorker?: boolean
+            },
+        ) => {
+            if (mode === 'editoutput') mocks.events.push('output-script')
+            return { data, emoChanged: false }
+        })
+        mocks.sayTTS.mockReset().mockResolvedValue(undefined)
+        mocks.addRerolls.mockReset()
+        mocks.trimUntilPunctuation.mockReset().mockImplementation((value: string) => value)
         mocks.acquireCompleteConversation.mockReset()
         mocks.acquireCompleteConversation.mockImplementation(async (_reason, target) => {
             const session = mocks.session
@@ -801,6 +849,216 @@ describe('sendChat generation session integration', () => {
 
         await expect(sending).resolves.toBe(false)
         expect(currentCharacter.chats[0].message[0].data).toBe('replacement')
+    })
+
+    it('preserves complete successful non-empty multiline response behavior', async () => {
+        const { currentCharacter, session } = installDatabase()
+        DBState.db.ttsAutoSpeech = true
+        mocks.modelResponse = {
+            type: 'multiline',
+            result: [
+                ['char', 'First choice'],
+                ['char', 'Second choice'],
+            ],
+        }
+        mocks.processScriptFull.mockImplementation(async (
+            _char: unknown,
+            data: string,
+            mode: string,
+        ) => {
+            if (mode === 'editoutput') mocks.events.push(`output-script:${data}`)
+            return { data: `${data}|script`, emoChanged: false }
+        })
+        mocks.inlay = (data) => ({ text: `${data}|inlay` })
+        mocks.sayTTS.mockImplementation(async (_char, data: string) => {
+            mocks.events.push(`tts:${data}`)
+        })
+        mocks.addRerolls.mockImplementation((_generationId, values: string[]) => {
+            mocks.events.push(`rerolls:${values.join(',')}`)
+        })
+        mocks.listeners.add(async () => {
+            mocks.events.push('output-listener')
+        })
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        const publishedChat = DBState.db.characters[0].chats[0]
+        expect(publishedChat.message).toHaveLength(2)
+        expect(publishedChat.message.at(-1)).toMatchObject({
+            role: 'char',
+            data: 'First choice|script|inlay',
+            saying: currentCharacter.chaId,
+            generationInfo: expect.objectContaining({ generationId: expect.any(String) }),
+        })
+        expect(mocks.addRerolls).toHaveBeenCalledWith(expect.any(String), [
+            'First choice|script|inlay',
+            'Second choice|script|inlay',
+        ])
+        expect(mocks.sayTTS.mock.calls.map((call) => call[1])).toEqual([
+            'First choice|script|inlay',
+            'Second choice|script|inlay',
+        ])
+        expect(mocks.events.filter((event) =>
+            event.startsWith('output-script:')
+            || event === 'inlay-sync'
+            || event.startsWith('tts:')
+            || event.startsWith('rerolls:')
+            || event === 'output-trigger'
+            || event === 'output-listener'
+            || event === 'tokenize-result'
+        )).toEqual([
+            'output-script:First choice',
+            'inlay-sync',
+            'tts:First choice|script|inlay',
+            'output-script:Second choice',
+            'inlay-sync',
+            'tts:Second choice|script|inlay',
+            'rerolls:First choice|script|inlay,Second choice|script|inlay',
+            'output-trigger',
+            'output-listener',
+            'tokenize-result',
+        ])
+        expect(mocks.acknowledge).toHaveBeenCalledOnce()
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it.each([
+        {
+            mode: 'balanced' as const,
+            expectedCommits: ['semantic:First snapshot', 'semantic:Latest snapshot'],
+            expectedOutputPasses: [
+                ['First snapshot', 'bypass'],
+                ['Latest snapshot', 'bypass'],
+            ],
+        },
+        {
+            mode: 'strong' as const,
+            expectedCommits: [
+                'First snapshot',
+                'Latest snapshot',
+                'semantic:Latest snapshot',
+            ],
+            expectedOutputPasses: [['Latest snapshot', 'normal']],
+        },
+    ])('wires $mode streaming mode through the production preview and semantic sequence', async ({
+        mode,
+        expectedCommits,
+        expectedOutputPasses,
+    }) => {
+        const { session } = installDatabase()
+        const edit = vi.spyOn(session, 'edit')
+        DBState.db.streamingDisplayOptimizationMode = mode
+        mocks.modelResponse = streamingSnapshots('First snapshot', 'Latest snapshot')
+        mocks.processScriptFull.mockImplementation(async (
+            _char: unknown,
+            data: string,
+            _mode: string,
+        ) => ({ data: `semantic:${data}`, emoChanged: false }))
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        const outputPasses = mocks.processScriptFull.mock.calls
+            .filter((call) => call[2] === 'editoutput')
+            .map((call) => [call[1], call[5]?.cache])
+        expect(outputPasses).toEqual(expectedOutputPasses)
+        expect(edit.mock.calls.map((call) => call[1].data)).toEqual(expectedCommits)
+        expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe(
+            'semantic:Latest snapshot',
+        )
+        expect(mocks.acknowledge).toHaveBeenCalledOnce()
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it('fails closed when multiline ownership becomes stale during async inlay processing', async () => {
+        const { chat, session } = installDatabase()
+        const enteredInlay = deferred<void>()
+        const finishInlay = deferred<string>()
+        mocks.modelResponse = {
+            type: 'multiline',
+            result: [['char', 'Owned response']],
+        }
+        mocks.inlay = (data) => {
+            enteredInlay.resolve()
+            return {
+                text: `${data}|sync-inlay`,
+                promise: finishInlay.promise,
+            }
+        }
+
+        const sending = sendChat()
+        await enteredInlay.promise
+        session.append({
+            role: 'user',
+            data: 'Concurrent mutation',
+            chatId: 'concurrent-message',
+        })
+        finishInlay.resolve('Late inlay result')
+
+        await expect(sending).resolves.toBe(false)
+        expect(chat.message.map((message) => [message.chatId, message.data])).toEqual([
+            ['user-message', 'hello'],
+            [expect.any(String), 'Owned response|sync-inlay'],
+            ['concurrent-message', 'Concurrent mutation'],
+        ])
+        expect(chat.message.some((message) => message.data === 'Late inlay result')).toBe(false)
+        expect(mocks.addRerolls).not.toHaveBeenCalled()
+        expect(mocks.sayTTS).not.toHaveBeenCalled()
+        expect(mocks.events).not.toContain('output-trigger')
+        expect(mocks.acknowledge).toHaveBeenCalledOnce()
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it.each([
+        {
+            name: 'streaming',
+            response: () => streamingSnapshots('First raw', 'Second raw'),
+            expectedStored: 'script:trim:Second raw',
+            expectedOutputInputs: ['trim:First raw', 'trim:Second raw'],
+            expectedTrimInputs: ['First raw', 'Second raw'],
+            expectedRerolls: ['Second raw'],
+        },
+        {
+            name: 'multiline',
+            response: () => ({
+                type: 'multiline' as const,
+                result: [
+                    ['char', 'First raw'],
+                    ['char', 'Second raw'],
+                ] as ['char', string][],
+            }),
+            expectedStored: 'trim:script:First raw',
+            expectedOutputInputs: ['First raw', 'Second raw'],
+            expectedTrimInputs: ['script:First raw', 'script:Second raw'],
+            expectedRerolls: ['trim:script:First raw', 'trim:script:Second raw'],
+        },
+    ])('preserves removeIncompleteResponse trimming for $name response application', async ({
+        response,
+        expectedStored,
+        expectedOutputInputs,
+        expectedTrimInputs,
+        expectedRerolls,
+    }) => {
+        const { session } = installDatabase()
+        DBState.db.removeIncompleteResponse = true
+        mocks.trimUntilPunctuation.mockImplementation((value: string) => `trim:${value}`)
+        mocks.processScriptFull.mockImplementation(async (
+            _char: unknown,
+            data: string,
+        ) => ({ data: `script:${data}`, emoChanged: false }))
+        mocks.modelResponse = response()
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        expect(mocks.processScriptFull.mock.calls
+            .filter((call) => call[2] === 'editoutput')
+            .map((call) => call[1])).toEqual(expectedOutputInputs)
+        expect(mocks.trimUntilPunctuation.mock.calls.map((call) => call[0])).toEqual(
+            expectedTrimInputs,
+        )
+        expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe(expectedStored)
+        expect(mocks.addRerolls).toHaveBeenCalledWith(expect.any(String), expectedRerolls)
+        expect(mocks.acknowledge).toHaveBeenCalledOnce()
+        expect(session.pinCount('transaction')).toBe(0)
     })
 
     it('keeps an empty multiline response bound to the existing session tail', async () => {
