@@ -1,5 +1,5 @@
 import { get, writable } from "svelte/store";
-import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
+import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -39,21 +39,12 @@ import {
     type GenerationReservation,
 } from './generationState'
 import {
-    consumeStreamingDisplayStream,
-} from './streamingDisplayStream'
-import {
     acknowledgeGenerationCompletion,
     acquireCompleteConversation,
     captureSelectedConversationTarget,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
-import {
-    captureGenerationConversationOperation,
-    captureGenerationTailFallbackOperation,
-    recaptureGenerationConversationOperation,
-    type GenerationConversationOperation,
-} from './generationConversationOperation'
 import { ensureCurrentConversationMessageIds } from '../conversationMutations'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
@@ -72,6 +63,7 @@ import {
 } from './promptHistory'
 import { runCurrentChatParserPass } from './currentChatParserPass'
 import { applyGenerationErrorResponse } from './generationErrorResponse'
+import { applyGenerationResponse } from './generationResponseApplication'
 import {
     SelectedConversationPromotionStaleError,
     type CompleteConversationLease,
@@ -1776,40 +1768,6 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         return true
     }
 
-    let outputTarget: GenerationConversationOperation | null = null
-    let generationHadOperation = false
-    const generationCharacter = requestSourceCharacter
-    const getGenerationChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
-    const isGenerationOwnerCurrent = () => get(selectedCharID) === selectedChar
-        && DBState.db.characters[selectedChar] === generationCharacter
-        && generationCharacter.chatPage === selectedChat
-    const generationChat = getGenerationChat()
-    const legacyFallbackTarget = req.type === 'multiline'
-        && req.result.length === 0
-        && generationChat
-        ? captureGenerationTailFallbackOperation({
-            session: getActiveConversationSession(),
-            getCurrentSession: getActiveConversationSession,
-            chat: generationChat,
-            getCurrentChat: getGenerationChat,
-            isOwnerCurrent: isGenerationOwnerCurrent,
-        })
-        : null
-    const getGeneratedOutputTarget = () => outputTarget ?? legacyFallbackTarget
-    const readGeneratedOutput = (): Message | null => getGeneratedOutputTarget()?.snapshot() ?? null
-    const updateGeneratedOutput = (update: (message: Message) => Message): boolean => {
-        const target = getGeneratedOutputTarget()
-        if (!target) return false
-        const message = target.snapshot()
-        return message !== null && target.commitMessage(update(message))
-    }
-    const hasGeneratedOutputOwnership = () => getGeneratedOutputTarget()?.isOwned() ?? false
-    const releaseOutputTarget = () => {
-        outputTarget?.release()
-        legacyFallbackTarget?.release()
-        outputTarget = null
-    }
-    try {
     let result = ''
     let emoChanged = false
     let resendChat = false
@@ -1838,417 +1796,80 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         await acknowledgeGenerationCompletion()
     }
     
-    if(abortSignal.aborted === true){
-        return false
-    }
-    if(req.type === 'fail'){
-        throwError(req.result)
-        return false
-    }
-    else if(req.type === 'streaming'){
-        const reader = req.result.getReader()
-        const targetCharacter = nowChatroom
-        const targetChat = targetCharacter.chats[selectedChat]
-        const getTargetChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
-        outputTarget = captureGenerationConversationOperation({
-            session: getActiveConversationSession(),
+    const responseApplication = await applyGenerationResponse({
+        response: req,
+        abortSignal,
+        continueGeneration: arg.continue === true,
+        sayingCharacterId: currentChar.chaId,
+        generationId,
+        generationInfo,
+        promptInfo,
+        removeIncompleteResponse: () => DBState.db.removeIncompleteResponse,
+        streamingDisplayOptimizationMode: () =>
+            DBState.db.streamingDisplayOptimizationMode ?? 'off',
+        ttsAutoSpeech: () => DBState.db.ttsAutoSpeech,
+        operation: {
             getCurrentSession: getActiveConversationSession,
-            chat: targetChat,
-            getCurrentChat: getTargetChat,
-            isOwnerCurrent: isGenerationOwnerCurrent,
-            ...(arg.continue ? { continueLast: true } : {
-                append: {
-                role: 'char',
-                data: "",
-                saying: currentChar.chaId,
-                time: Date.now(),
-                generationInfo,
-                promptInfo,
-                chatId: generationId,
-                },
-            }),
-        })
-        generationHadOperation = true
-        const initialOutput = outputTarget.snapshot()
-        if(initialOutput === null){
-            return false
-        }
-        const msgIndex = outputTarget.absoluteIndex
-        const prefix = arg.continue ? initialOutput.data : ''
-        const outputMessageId = outputTarget.messageId
-        const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'off'
-        targetChat.isStreaming = true
-        targetChat.activeStreamingDisplayOptimizationMode = performanceMode
-        targetCharacter.reloadKeys += 1
-        let lastResponseChunk:{[key:string]:string} = {}
-        const processStreamingSnapshot = async (snapshot:string, cache:'normal'|'bypass', signal:AbortSignal) => {
-            try {
-                return await processScriptFull(nowChatroom, reformatContent(prefix + snapshot), 'editoutput', msgIndex, {}, { cache, signal, regexWorker: true })
-            }
-            catch(error){
-                if(signal.aborted){
-                    return null
-                }
-                if(outputTarget?.commitData(reformatContent(prefix + snapshot))){
-                    lifecycle.responseApplied = true
-                    targetCharacter.reloadKeys += 1
-                }
-                throw error
-            }
-        }
-        let streamCompleted = false
-        try {
-            const streamResult = await consumeStreamingDisplayStream({
-                mode: performanceMode,
-                reader,
-                abortSignal,
-                isOwned: outputTarget.isOwned,
-                getSnapshot: (value) => {
-                    const firstChunkKey = Object.keys(value)[0]
-                    const snapshot = value[firstChunkKey] || ''
-                    return DBState.db.removeIncompleteResponse
-                        ? trimUntilPunctuation(snapshot)
-                        : snapshot
-                },
-                onValue: (value, snapshot) => {
-                    lastResponseChunk = value
-                    result = snapshot
-                },
-                processSemantic: async ({ value }, context) => {
-                    const cache = performanceMode === 'strong' ? 'normal' : 'bypass'
-                    const result2 = await processStreamingSnapshot(value, cache, context.signal)
-                    if(result2 === null || !context.canCommit()) return
-                    if(!outputTarget?.commitData(result2.data)) return
-                    lifecycle.responseApplied = true
-                    emoChanged = result2.emoChanged
-                    targetCharacter.reloadKeys += 1
-                },
-                processPreview: async ({ value }, context) => {
-                    if(!context.canCommit()) return
-                    if(!outputTarget?.commitData(reformatContent(prefix + value))) return
-                    lifecycle.responseApplied = true
-                    targetCharacter.reloadKeys += 1
-                },
-            })
-            streamCompleted = streamResult.completed
-        }
-        finally {
-            targetChat.isStreaming = false
-            targetChat.activeStreamingDisplayOptimizationMode = undefined
-            targetCharacter.reloadKeys += 1
-        }
-
-        if(!streamCompleted){
-            return false
-        }
-
-        addRerolls(generationId, Object.values(lastResponseChunk))
-
-        if(!outputTarget.isOwned()){
-            return false
-        }
-        targetCharacter.chats[selectedChat] = runCurrentChatFunction(targetChat)
-        currentChat = targetCharacter.chats[selectedChat]
-        if(!outputTarget.refresh()){
-            return false
-        }
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
-        if(!outputTarget.isOwned()){
-            return false
-        }
-        if(triggerResult && triggerResult.chat){
-            currentChat = triggerResult.chat
-        }
-        if(triggerResult && triggerResult.sendAIprompt){
-            resendChat = true
-        }
-        outputTarget.release()
-        if(!outputMessageId){
-            return false
-        }
-        const previousChat = targetChat
-        if(currentChat !== previousChat){
-            invalidateActiveConversationSession()
-        }
-        targetCharacter.chats[selectedChat] = currentChat
-        const publishedChat = getTargetChat()
-        if(!publishedChat || !isGenerationOwnerCurrent()){
-            return false
-        }
-        currentChat = publishedChat
-        outputTarget = recaptureGenerationConversationOperation({
-            session: getActiveConversationSession(),
-            getCurrentSession: getActiveConversationSession,
-            chat: currentChat,
-            getCurrentChat: getTargetChat,
-            isOwnerCurrent: isGenerationOwnerCurrent,
-            messageId: outputMessageId,
-        })
-        if(!outputTarget || !outputTarget.isOwned()){
-            return false
-        }
-        const outputMessage = outputTarget?.snapshot()
-        if(outputMessage){
-            const inlayr = runInlayScreen(currentChar, outputMessage.data)
-            if(!outputTarget?.commitData(inlayr.text)){
-                return false
-            }
-            if(inlayr.promise){
-                const t = await inlayr.promise
-                if(!outputTarget?.commitData(t)){
-                    return false
-                }
-            }
-        }
-        currentChat = targetCharacter.chats[selectedChat]
-        if(!outputTarget.isOwned()){
-            return false
-        }
-        await runChatOutputListeners(
-            currentChar,
-            currentChat,
-            selectedChar,
-            selectedChat,
-            outputTarget.absoluteIndex,
-        )
-        if(!outputTarget.isOwned()){
-            return false
-        }
-        if(DBState.db.ttsAutoSpeech){
-            await sayTTS(currentChar, result)
-        }
-    }
-    else{
-        const msgs = (req.type === 'success') ? [['char',req.result]] as const 
-                    : (req.type === 'multiline') ? req.result
-                    : []
-        let mrerolls:string[] = []
-        let outputMessageId: string | undefined
-        const targetCharacter = nowChatroom
-        const getTargetChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
-        for(let i=0;i<msgs.length;i++){
-            let msg = msgs[i]
-            let mess = msg[1]
-            const operationChat = getTargetChat()
-            if(!operationChat || !isGenerationOwnerCurrent()){
-                return false
-            }
-            let msgIndex = operationChat.message.length
-            const continuingFirstMessage = i === 0 && arg.continue
-            let continueBaseData = ''
-            if(continuingFirstMessage){
-                outputTarget = captureGenerationConversationOperation({
-                    session: getActiveConversationSession(),
-                    getCurrentSession: getActiveConversationSession,
-                    chat: operationChat,
-                    getCurrentChat: getTargetChat,
-                    isOwnerCurrent: isGenerationOwnerCurrent,
-                    continueLast: true,
-                })
-                generationHadOperation = true
-                const beforeChat = outputTarget.snapshot()
-                if(!beforeChat){
-                    return false
-                }
-                continueBaseData = beforeChat.data
-            }
-            let result2: Awaited<ReturnType<typeof processScriptFull>>
-            try {
-                result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
-                if(continuingFirstMessage){
-                    msgIndex = outputTarget!.absoluteIndex
-                    result2 = await processScriptFull(nowChatroom, reformatContent(continueBaseData + mess), 'editoutput', msgIndex)
-                }
-            }
-            catch(error){
-                const fallbackData = reformatContent(continueBaseData + mess)
-                let applied = false
-                try {
-                    if(continuingFirstMessage){
-                        applied = outputTarget?.commitMessage({
-                            role: 'char',
-                            data: fallbackData,
-                            saying: currentChar.chaId,
-                            time: Date.now(),
-                            generationInfo,
-                            promptInfo,
-                            chatId: generationId,
-                        }) ?? false
-                        outputMessageId = outputTarget?.messageId
-                    }
-                    else if(i === 0 && getTargetChat() === operationChat && isGenerationOwnerCurrent()){
-                        outputTarget = captureGenerationConversationOperation({
-                            session: getActiveConversationSession(),
-                            getCurrentSession: getActiveConversationSession,
-                            chat: operationChat,
-                            getCurrentChat: getTargetChat,
-                            isOwnerCurrent: isGenerationOwnerCurrent,
-                            append: {
-                                role: msg[0],
-                                data: fallbackData,
-                                saying: currentChar.chaId,
-                                time: Date.now(),
-                                generationInfo,
-                                promptInfo,
-                                chatId: generationId,
-                            },
-                        })
-                        generationHadOperation = true
-                        applied = outputTarget.isOwned()
-                        outputMessageId = outputTarget.messageId
-                    }
-                    else{
-                        applied = outputTarget?.commitData(fallbackData) ?? false
-                    }
-                    if(applied){
-                        result = fallbackData
-                        lifecycle.responseApplied = true
-                        targetCharacter.reloadKeys += 1
-                    }
-                }
-                catch {}
-                throw error
-            }
-            if(DBState.db.removeIncompleteResponse){
-                result2.data = trimUntilPunctuation(result2.data)
-            }
-            result = result2.data
-            const inlayResult = runInlayScreen(currentChar, result)
-            result = inlayResult.text
-            emoChanged = result2.emoChanged
-            if(i === 0 && arg.continue){
-                if(!outputTarget?.commitMessage({
-                    role: 'char',
-                    data: result,
-                    saying: currentChar.chaId,
-                    time: Date.now(),
-                    generationInfo,
-                    promptInfo,
-                    chatId: generationId,
-                })){
-                    return false
-                }
-                lifecycle.responseApplied = true
-                if(inlayResult.promise){
-                    const p = await inlayResult.promise
-                    if(!outputTarget.commitData(p)){
-                        return false
-                    }
-                }
-                outputMessageId = outputTarget.messageId
-            }
-            else if(i===0){
-                if(getTargetChat() !== operationChat || !isGenerationOwnerCurrent()){
-                    return false
-                }
-                outputTarget = captureGenerationConversationOperation({
-                    session: getActiveConversationSession(),
-                    getCurrentSession: getActiveConversationSession,
-                    chat: operationChat,
-                    getCurrentChat: getTargetChat,
-                    isOwnerCurrent: isGenerationOwnerCurrent,
-                    append: {
-                        role: msg[0],
-                        data: result,
-                        saying: currentChar.chaId,
-                        time: Date.now(),
-                        generationInfo,
-                        promptInfo,
-                        chatId: generationId,
-                    },
-                })
-                generationHadOperation = true
-                if(!outputTarget.isOwned()){
-                    return false
-                }
-                lifecycle.responseApplied = true
-                if(inlayResult.promise){
-                    const p = await inlayResult.promise
-                    if(!outputTarget.commitData(p)){
-                        return false
-                    }
-                }
-                mrerolls.push(result)
-                outputMessageId = outputTarget.messageId
-            }
-            else{
-                mrerolls.push(result)
-            }
-            DBState.db.characters[selectedChar].reloadKeys += 1
-            if(DBState.db.ttsAutoSpeech){
-                await sayTTS(currentChar, result)
-            }
-        }
-
-        if(mrerolls.length >1){
-            addRerolls(generationId, mrerolls)
-        }
-
-        const outputChat = getTargetChat()
-        if(!outputChat || !isGenerationOwnerCurrent()){
-            return false
-        }
-        if(outputTarget && !outputTarget.isOwned()){
-            return false
-        }
-        targetCharacter.chats[selectedChat] = runCurrentChatFunction(outputChat)
-        currentChat = targetCharacter.chats[selectedChat]
-        if(!getGeneratedOutputTarget()?.refresh()){
-            return false
-        }
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
-        if(!hasGeneratedOutputOwnership()){
-            return false
-        }
-        if(triggerResult && triggerResult.sendAIprompt){
-            resendChat = true
-        }
-        const previousChat = currentChat
-        const nextChat = triggerResult?.chat ?? currentChat
-        outputTarget?.release()
-        if(nextChat !== previousChat){
-            invalidateActiveConversationSession()
-        }
-        targetCharacter.chats[selectedChat] = nextChat
-        const publishedChat = getTargetChat()
-        if(!publishedChat || !isGenerationOwnerCurrent()){
-            return false
-        }
-        currentChat = publishedChat
-        if(generationHadOperation){
-            if(!outputMessageId){
-                return false
-            }
-            outputTarget = recaptureGenerationConversationOperation({
-                session: getActiveConversationSession(),
-                getCurrentSession: getActiveConversationSession,
-                chat: currentChat,
-                getCurrentChat: getTargetChat,
-                isOwnerCurrent: isGenerationOwnerCurrent,
-                messageId: outputMessageId,
-            })
-            if(!outputTarget || !outputTarget.isOwned()){
-                return false
-            }
-            await runChatOutputListeners(
+            getTargetChat: () => DBState.db.characters[selectedChar]?.chats[selectedChat],
+            isOwnerCurrent: () => get(selectedCharID) === selectedChar
+                && DBState.db.characters[selectedChar] === requestSourceCharacter
+                && requestSourceCharacter.chatPage === selectedChat,
+            publishTargetChat: (chat) => {
+                requestSourceCharacter.chats[selectedChat] = chat
+            },
+            invalidateSession: invalidateActiveConversationSession,
+            incrementReloadKeys: () => {
+                requestSourceCharacter.reloadKeys += 1
+            },
+        },
+        callbacks: {
+            reformatContent,
+            processOutput: (data, messageIndex, processing) => processing
+                ? processScriptFull(
+                    nowChatroom,
+                    reformatContent(data),
+                    'editoutput',
+                    messageIndex,
+                    {},
+                    processing,
+                )
+                : processScriptFull(
+                    nowChatroom,
+                    reformatContent(data),
+                    'editoutput',
+                    messageIndex,
+                ),
+            runCurrentChatParser: runCurrentChatFunction,
+            runInlay: (data) => runInlayScreen(currentChar, data),
+            runOutputTrigger: (chat) => runTrigger(currentChar, 'output', { chat }),
+            runOutputListeners: (chat, messageIndex) => runChatOutputListeners(
                 currentChar,
-                currentChat,
+                chat,
                 selectedChar,
                 selectedChat,
-                outputTarget.absoluteIndex,
-            )
-            if(!outputTarget.isOwned()){
-                return false
-            }
-        }
-    }
+                messageIndex,
+            ),
+            speak: (data) => sayTTS(currentChar, data),
+            addRerolls,
+            trimIncompleteResponse: trimUntilPunctuation,
+            markResponseApplied: () => {
+                lifecycle.responseApplied = true
+            },
+            onProviderFailure: throwError,
+        },
+    })
+    if (!responseApplication) return false
+    result = responseApplication.result
+    emoChanged = responseApplication.emoChanged
+    resendChat = responseApplication.resendChat
 
-    if(!hasGeneratedOutputOwnership()){
+    try {
+    if(!responseApplication.hasOutputOwnership()){
         return false
     }
     let needsAutoContinue = false
     const resultTokens = await tokenize(result) + (arg.usedContinueTokens || 0)
-    if(!hasGeneratedOutputOwnership()){
+    if(!responseApplication.hasOutputOwnership()){
         return false
     }
     if(DBState.db.autoContinueMinTokens > 0 && resultTokens < DBState.db.autoContinueMinTokens){
@@ -2262,7 +1883,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
 
     if(needsAutoContinue){
         await acknowledgeCompletedGeneration()
-        releaseOutputTarget()
+        responseApplication.release()
         return await sendChat(chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -2280,7 +1901,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             bias: {}
         },'emotion', abortSignal)
 
-        if(!updateGeneratedOutput((message) => ({
+        if(!responseApplication.updateOutput((message) => ({
             ...message,
             data: message.data + rq,
         }))){
@@ -2297,7 +1918,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     stageTimings.stage4Start = Date.now()
 
     if(resendChat){
-        if(!hasGeneratedOutputOwnership()){
+        if(!responseApplication.hasOutputOwnership()){
             return false
         }
         stageTimings.stage4Duration = Date.now() - stageTimings.stage4Start
@@ -2309,8 +1930,8 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
         }
         
-        const currentOutput = readGeneratedOutput()
-        if(currentOutput?.generationInfo && !updateGeneratedOutput((message) => ({
+        const currentOutput = responseApplication.readOutput()
+        if(currentOutput?.generationInfo && !responseApplication.updateOutput((message) => ({
             ...message,
             generationInfo,
         }))) {
@@ -2318,7 +1939,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         }
 
         await acknowledgeCompletedGeneration()
-        releaseOutputTarget()
+        responseApplication.release()
         return await sendChat(chatProcessIndex, {
             signal: abortSignal
         }, reservation)
@@ -2561,11 +2182,11 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
     }
     
-    if(!hasGeneratedOutputOwnership()){
+    if(!responseApplication.hasOutputOwnership()){
         return false
     }
-    const currentOutput = readGeneratedOutput()
-    if(currentOutput?.generationInfo && !updateGeneratedOutput((message) => ({
+    const currentOutput = responseApplication.readOutput()
+    if(currentOutput?.generationInfo && !responseApplication.updateOutput((message) => ({
         ...message,
         generationInfo,
     }))) {
@@ -2575,7 +2196,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     return await completeGeneration()
     }
     finally {
-        releaseOutputTarget()
+        responseApplication.release()
     }
 }
 
