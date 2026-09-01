@@ -56,6 +56,29 @@ describe('peer logical delta product facade', () => {
         },
     )
 
+    test('keeps the P4 source start command vector exact', async () => {
+        const foreground = { lane: 'p4-source', operationId: '45454545-4545-4545-8545-454545454545', generation: 10 } as const
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_sync_foreground_source_status') return null as T
+            if (command === 'peer_delta_source_reserve') return foreground as T
+            if (command === 'peer_delta_start') return { phase: 'running', devices: [] } as T
+            throw new Error(`Unexpected command: ${command}`)
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({
+            platform: 'android',
+            invoke,
+            bridge: { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) },
+        })
+
+        await facade.start('session')
+
+        expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'peer_sync_foreground_source_status',
+            'peer_delta_source_reserve',
+            'peer_delta_start',
+        ])
+    })
+
     test.each(['false', 'throw'] as const)(
         'retains uncertain P4 source ownership when exact Stop returns %s and recovers before reserve',
         async (stopFailure) => {
