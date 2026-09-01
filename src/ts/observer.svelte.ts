@@ -1,6 +1,5 @@
 import { sleep } from "./util";
-import { globalFetch } from "./globalApi.svelte";
-import { downloadBlobWithObjectUrl } from "./objectUrl";
+import { downloadFile, globalFetch } from "./globalApi.svelte";
 
 let bgmElement:HTMLAudioElement|null = null;
 
@@ -32,11 +31,9 @@ function nodeObserve(node:HTMLElement){
             const downloadOption = document.createElement('div');
             downloadOption.textContent = 'Download';
             downloadOption.setAttribute('class', 'px-4 py-2 text-sm text-gray-300 hover:bg-gray-700 cursor-pointer')
-            downloadOption.addEventListener('click', ()=>{
-                downloadBlobWithObjectUrl(
-                    new Blob([node.textContent], {type: 'text/plain'}),
-                    'code.' + hlLang,
-                )
+            downloadOption.addEventListener('click', async ()=>{
+                const blob = new Blob([node.textContent], {type: 'text/plain'})
+                await downloadFile('code.' + hlLang, new Uint8Array(await blob.arrayBuffer()))
                 menu.remove()
             })
 

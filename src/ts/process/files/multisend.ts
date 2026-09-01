@@ -7,6 +7,8 @@ import { isTauri } from "src/ts/platform"
 import { HypaProcesser } from '../memory/hypamemory';
 import { BufferToText as BufferToText, selectMultipleFile } from 'src/ts/util';
 import { postInlayAsset } from './inlays';
+import { alertError } from 'src/ts/alert';
+import { language } from 'src/lang';
 import {
     acquireCompleteConversation,
     captureSelectedConversationTarget,
@@ -338,7 +340,13 @@ export async function postChatFile(query:string|{
             case 'webm':
             case 'mpeg':
             case 'avi':{
-                const postData = await postInlayAsset(file)
+                let postData: Awaited<ReturnType<typeof postInlayAsset>>
+                try {
+                    postData = await postInlayAsset(file)
+                } catch {
+                    alertError(language.risuNest.inlay.unsupportedAnimated)
+                    continue
+                }
                 if(!postData){
                     continue
                 }

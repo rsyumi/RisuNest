@@ -13,7 +13,7 @@
     import { onDestroy, onMount } from "svelte";
     import { DBState } from "src/ts/stores.svelte";
     import { RISU_EFFECT_DRAG_TYPE, RISU_TRIGGER_DRAG_TYPE } from "src/ts/dragTypes";
-    import { downloadBlobWithObjectUrl } from "src/ts/objectUrl";
+    import { downloadFile } from "src/ts/globalApi.svelte";
 
     interface Props {
         value?: triggerscript[];
@@ -2592,7 +2592,7 @@
                         </div>
                     </div>
                     <div class="flex gap-2">
-                        <button class="p-2 border-t-darkborderc text-start text-textcolor2 hover:text-textcolor focus:bg-bgcolor" onclick={() => {
+                        <button class="p-2 border-t-darkborderc text-start text-textcolor2 hover:text-textcolor focus:bg-bgcolor" onclick={async () => {
                             value.push({
                                 comment: "",
                                 type: "manual",
@@ -2607,7 +2607,7 @@
                             const triggersToExport = value.slice(1);
                             const jsonData = JSON.stringify(triggersToExport, null, 2);
                             const blob = new Blob([jsonData], { type: 'application/json' });
-                            downloadBlobWithObjectUrl(blob, `triggers-${new Date().getTime()}.json`);
+                            void (async () => downloadFile(`triggers-${new Date().getTime()}.json`, new Uint8Array(await blob.arrayBuffer())))()
                         }}>
                             <DownloadIcon />
                         </button>

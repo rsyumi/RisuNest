@@ -5,21 +5,16 @@
     
     import { DBState } from 'src/ts/stores.svelte';
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
-    import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
+    import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
-    import { isTauri, isNodeServer, isTauriAndroid, isTauriDesktop } from "src/ts/platform"
+    import { isTauri, isNodeServer } from "src/ts/platform"
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
-    import { LoadLocalBackup, SavePartialLocalBackup } from "src/ts/drive/backuplocal";
-    import { openSyncConflictBackups } from "src/ts/storage/sync/syncConflictRestore";
+    import { SavePartialLocalBackup } from "src/ts/drive/backuplocal";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
     import { cleanColdStorage } from "src/ts/process/coldstorage.svelte";
-    import {
-        restartNativeApp,
-        restoreNativePersistentSnapshot,
-    } from "src/ts/storage/nativePersistentMaintenance";
     import { getNativeOfficialAccountFlow } from "src/ts/storage/sync/nativeOfficialAccountFlow";
     import {
         createHubPopupController,
@@ -27,35 +22,19 @@
         resolveExpectedOfficialAccountMessageUrl,
     } from "src/ts/storage/officialAccountMessage";
     import {
-        NativeFileJobActivationCommittedError,
-        NativeFileJobError,
-        type NativeFileJobStatus,
-    } from "src/ts/storage/nativeFileJobs";
-    import {
-        exportRisuSaveFromSystemPicker,
-        importRisuSaveFromSystemPicker,
-        nativeFileOperation,
-    } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
-    import {
-        alertPartialDestinationWarning,
-        hasPartialDestinationWarning,
-    } from "src/ts/storage/risuSaveFileRoute";
-    import {
         exportLocalBackupFromSystemPicker,
         restoreLocalBackupFromSystemPicker,
     } from "src/ts/storage/losslessBackupFileRouteProduction.svelte";
-    import { cancelActiveNativeFileOperation } from "src/ts/storage/nativeFileJobManager";
     import { onDestroy } from "svelte";
-    import PeerCloneSettings from "./PeerCloneSettings.svelte";
-    import PeerCloneAndroidSettings from "./PeerCloneAndroidSettings.svelte";
+    import { nativeFileOperation } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
+    import { alertPartialDestinationWarning, hasPartialDestinationWarning } from "src/ts/storage/risuSaveFileRoute";
+    import { NativeFileJobActivationCommittedError, NativeFileJobError } from "src/ts/storage/nativeFileJobs";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     const drivePopup = createHubPopupController()
     let accountIframe = $state<HTMLIFrameElement>()
     let nativeAccountBusy = $state(false)
-    let nativePublishController = $state<AbortController | null>(null)
     let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null)
-    let risuSaveStatus = $derived($nativeFileOperation?.status)
 
     async function runNativeAccountOperation<T>(operation: () => Promise<T>): Promise<T | undefined> {
         if (nativeAccountBusy) return undefined
@@ -67,25 +46,10 @@
         }
     }
 
-    function risuSaveProgressText(status: NativeFileJobStatus | undefined): string {
-        if(!status) return ''
-        const total = status.progress.totalBytes
-        if(total && total > 0) {
-            const percent = Math.min(100, Math.round(status.progress.completedBytes * 100 / total))
-            return `${status.phase}: ${percent}%`
-        }
-        const bytes = status.progress.completedBytes
-        return bytes > 0 ? `${status.phase}: ${(bytes / (1024 * 1024)).toFixed(1)} MiB` : status.phase
-    }
-
     function showRisuSaveError(error: unknown): void {
         const partialDestinationMayRemain = hasPartialDestinationWarning(error)
         if(error instanceof DOMException && error.name === 'AbortError') {
-            alertPartialDestinationWarning(
-                error,
-                language.screenshotPartialDestinationMayRemain,
-                alertError,
-            )
+            alertPartialDestinationWarning(error, language.screenshotPartialDestinationMayRemain, alertError)
             return
         }
         if(error instanceof NativeFileJobActivationCommittedError) {
@@ -97,34 +61,8 @@
             return
         }
         const detail = error instanceof Error ? error.message : String(error)
-        alertError(partialDestinationMayRemain
-            ? `${detail} ${language.screenshotPartialDestinationMayRemain}`
-            : detail)
+        alertError(partialDestinationMayRemain ? `${detail} ${language.screenshotPartialDestinationMayRemain}` : detail)
     }
-
-    async function runRisuSaveOperation(kind: 'import' | 'export'): Promise<void> {
-        if(risuSaveOperation) return
-        if(kind === 'import') {
-            if(!await alertConfirm(language.risuSaveImportConfirm)) return
-            if(!await alertConfirm(language.backupLoadConfirm2)) return
-        }
-        try {
-            const result = kind === 'import'
-                ? await importRisuSaveFromSystemPicker()
-                : await exportRisuSaveFromSystemPicker()
-            if(!result) return
-            alertNormal(
-                result.warningCodes.includes('cleanup-failed')
-                    ? language.risuSaveCleanupWarning
-                    : kind === 'import'
-                        ? language.risuSaveImportComplete
-                        : language.risuSaveExportComplete,
-            )
-        } catch(error) {
-            showRisuSaveError(error)
-        }
-    }
-
     async function runLocalBackupOperation(kind: 'import' | 'export'): Promise<void> {
         if(risuSaveOperation) return
         try {
@@ -143,7 +81,6 @@
     }
 
     onDestroy(() => {
-        nativePublishController?.abort()
         drivePopup.close()
     })
 </script>
@@ -210,91 +147,6 @@
         }
     }} className="mt-2">
     {language.loadBackupLocal}
-</Button>
-
-{#if !isTauri || isTauriDesktop}
-    <Button
-        disabled={risuSaveOperation !== null}
-        onclick={() => runRisuSaveOperation('import')}
-        className="mt-2">
-        {language.importRisuSave}
-    </Button>
-
-{/if}
-
-{#if !isTauri || isTauriDesktop || isTauriAndroid}
-    <Button
-        disabled={risuSaveOperation !== null}
-        onclick={() => runRisuSaveOperation('export')}
-        className="mt-2">
-        {language.exportRisuSave}
-    </Button>
-{/if}
-
-{#if risuSaveOperation}
-    <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2">
-        <span>{risuSaveProgressText(risuSaveStatus)}</span>
-        <Button
-            styled="outlined"
-            size="sm"
-            onclick={cancelActiveNativeFileOperation}>
-            {language.cancelRisuSaveOperation}
-        </Button>
-    </div>
-{/if}
-
-{#if isTauri}
-    <Button
-        onclick={async () => {
-            try {
-                await restoreNativePersistentSnapshot({
-                    choose: async (snapshots) => {
-                        const labels = snapshots.map((snapshot) => {
-                            const date = new Date(snapshot.modifiedAt).toLocaleString()
-                            const mib = snapshot.bytes / (1024 * 1024)
-                            const size = mib >= 1
-                                ? `${mib.toFixed(1)} MiB`
-                                : `${Math.max(1, Math.round(snapshot.bytes / 1024))} KiB`
-                            return `${date} (${size})`
-                        })
-                        const selected = Number(await alertSelect(
-                            [...labels, language.cancel],
-                            language.chooseLocalSnapshot,
-                        ))
-                        return snapshots[selected]?.path ?? null
-                    },
-                    confirm: () => alertConfirm(language.restoreLocalSnapshotConfirm),
-                    restart: restartNativeApp,
-                    onEmpty: () => alertNormal(language.noLocalSnapshots),
-                })
-            } catch (error) {
-                alertError(error instanceof Error ? error : String(error))
-            }
-        }} className="mt-2">
-        {language.restoreLocalSnapshot}
-    </Button>
-{/if}
-
-{#if isTauriDesktop}
-    <PeerCloneSettings />
-{:else if isTauriAndroid}
-    <PeerCloneAndroidSettings />
-{/if}
-
-<Button
-    onclick={async () => {
-        if((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))){
-            LoadLocalBackup()
-        }
-    }} className="mt-2">
-    {language.loadPocketRisuBackup}
-</Button>
-
-<Button
-    onclick={() => {
-        openSyncConflictBackups()
-    }} className="mt-2">
-    {language.syncConflictBackups}
 </Button>
 
 {#if forageStorage.isAccount}
@@ -376,54 +228,6 @@
     </div>
     {#if DBState.db.account}
         <span class="mb-4 text-textcolor2">ID: {DBState.db.account.id}</span>
-        {#if isTauri}
-            <Button
-                disabled={nativeAccountBusy}
-                onclick={async () => {
-                    await runNativeAccountOperation(async () => {
-                        if(!await alertConfirm('Replace local data with the official account backup?')) return
-                        if(!await alertConfirm('Official snapshots do not include separate inlay payloads. Referenced image, audio, video, and signature inlays may not be restored. The app will restart after restoring the official account backup. Continue?')) return
-                        try {
-                            const result = await getNativeOfficialAccountFlow().restore()
-                            if(result.kind === 'missing') {
-                                alertNormal('No official account backup was found. Local data was not changed.')
-                            }
-                        } catch (error) {
-                            alertError(error instanceof Error ? error : String(error))
-                        }
-                    })
-                }} className="mt-2">
-                Restore official account backup
-            </Button>
-            <Button
-                disabled={nativeAccountBusy}
-                onclick={async () => {
-                    await runNativeAccountOperation(async () => {
-                        if(!await alertConfirm('Overwrite the official account backup with current local data?')) return
-                        const controller = new AbortController()
-                        nativePublishController = controller
-                        try {
-                            await getNativeOfficialAccountFlow().publish(controller.signal)
-                            alertNormal('Official account backup published.')
-                        } catch (error) {
-                            if(!(error instanceof DOMException && error.name === 'AbortError')) {
-                                alertError(error instanceof Error ? error : String(error))
-                            }
-                        } finally {
-                            if(nativePublishController === controller) nativePublishController = null
-                        }
-                    })
-                }} className="mt-2">
-                Publish official account backup
-            </Button>
-            {#if nativePublishController}
-                <Button
-                    onclick={() => nativePublishController?.abort()}
-                    className="mt-2">
-                    Cancel official account backup
-                </Button>
-            {/if}
-        {/if}
         {#if !isTauri}
             <h1 class="text-xl font-bold mt-2">{language.googleDriveConnection}</h1>
             {#if !DBState.db.account.data.refresh_token}

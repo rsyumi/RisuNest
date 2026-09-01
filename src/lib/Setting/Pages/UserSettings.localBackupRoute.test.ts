@@ -10,8 +10,26 @@ describe('UserSettings local backup route', () => {
         expect(source).toContain('await runLocalBackupOperation(\'import\')')
     })
 
-    it('keeps partial and PocketRisu backup compatibility on their legacy callers', () => {
+    it('keeps upstream local backup, account, and Drive controls on this page', () => {
         expect(source).toContain('SavePartialLocalBackup()')
-        expect(source).toContain('LoadLocalBackup()')
+        expect(source).toContain('loadRisuAccountData')
+        expect(source).toContain('checkDriver')
+    })
+
+    it('moves RisuNest backup and sync controls to the dedicated page', async () => {
+        const backupSource = await import('./RisuNestBackupRestore.svelte?raw')
+
+        for (const control of [
+            'runRisuSaveOperation',
+            'LoadLocalBackup()',
+            'restoreNativePersistentSnapshot',
+            'openSyncConflictBackups()',
+            'getNativeOfficialAccountFlow().publish',
+            'getNativeOfficialAccountFlow().restore',
+            'nativePublishController?.abort()',
+        ]) {
+            expect(backupSource.default).toContain(control)
+            expect(source).not.toContain(control)
+        }
     })
 })

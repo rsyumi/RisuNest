@@ -288,7 +288,7 @@
     <div class="mt-3 rounded-md border border-darkborderc p-3">
         <h4 class="font-bold">{language.peerClone.source}</h4>
         <p class="mt-1 text-sm text-textcolor2">{language.peerClone.sourceHelp}</p>
-        <p class="mt-1 text-sm text-textcolor2">Trusted LAN only. Android tunnel modes are unavailable.</p>
+        <p class="mt-1 text-sm text-textcolor2">{language.risuNest.sync.androidLanOnly}</p>
         <div class="mt-2 flex flex-wrap gap-2">
             <Button disabled={!sourceEnabled || busy || sourceStatus.phase !== 'idle'} onclick={prepareSource}>
                 {language.peerClone.prepare}
@@ -385,7 +385,7 @@
 <section class="mt-4 rounded-md border border-darkborderc bg-darkbg p-3">
     <h3 class="text-xl font-bold">{language.peerDelta.title}</h3>
     <p class="mt-1 text-sm text-textcolor2">{language.peerDelta.description}</p>
-    <p class="mt-1 text-sm text-textcolor2">Trusted LAN only. Android tunnel modes are unavailable.</p>
+    <p class="mt-1 text-sm text-textcolor2">{language.risuNest.sync.androidLanOnly}</p>
 
     <div class="mt-3 rounded-md border border-darkborderc p-3">
         <h4 class="font-bold">{language.peerDelta.source}</h4>

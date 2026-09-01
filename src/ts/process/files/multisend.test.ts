@@ -31,6 +31,9 @@ vi.mock('../index.svelte', async () => {
     }
 })
 vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: mocks.downloadFile }))
+vi.mock('src/lang', () => ({
+    language: { risuNest: { inlay: { unsupportedAnimated: 'unsupported' } } },
+}))
 vi.mock('src/ts/platform', () => ({ isTauri: false }))
 vi.mock('../memory/hypamemory', () => ({
     HypaProcesser: class {
@@ -47,6 +50,8 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     captureSelectedConversationTarget: () => mocks.selectedTarget,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     getActiveConversationSession: () => mocks.session,
+    capturePersistentMutationToken: () => undefined,
+    acquireDestructiveReplacementFence: () => undefined,
 }))
 
 import { postChatFile } from './multisend'
@@ -224,5 +229,13 @@ describe('postChatFile PO append', () => {
         } finally {
             providerGeneration?.release()
         }
+    })
+})
+
+describe('postChatFile attachment errors', () => {
+    it('keeps rejected animated attachments out of results', async () => {
+        const source = await import('./multisend.ts?raw')
+        expect(source.default).toContain('alertError(language.risuNest.inlay.unsupportedAnimated)')
+        expect(source.default).toContain('postData = await postInlayAsset(file)')
     })
 })

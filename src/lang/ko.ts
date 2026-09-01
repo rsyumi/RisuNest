@@ -1567,6 +1567,16 @@ export const languageKorean = {
     nanoGPTSelectFromList: "목록에서 선택",
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
+    risuNest: {
+        menuTitle: 'RisuNest',
+        perf: { title: '성능', profile: '성능 프로파일', profileNormal: '표준', profileLowSpec: '저사양', profileHelp: '저사양 기기에서 메모리 사용량을 줄입니다. 캐시가 줄어 긴 대화에서 스크롤이 약간 느려질 수 있습니다. 즉시 적용됩니다.' },
+        inlay: { title: '채팅 첨부 이미지', format: '저장 형식', formatWebp: 'WebP (권장)', formatPng: 'PNG (무손실)', formatOriginal: '원본 유지', formatHelp: '채팅에 첨부한 이미지를 저장할 때 사용할 형식입니다. WebP는 용량이 작고, 원본 유지는 변환 없이 그대로 저장합니다.', quality: 'WebP 품질', qualityHelp: '낮출수록 용량이 줄지만 화질이 떨어집니다.', maxDimension: '최대 해상도 (픽셀)', maxDimensionHelp: '긴 변이 이 값을 넘는 이미지는 저장할 때 축소됩니다. 0이면 제한하지 않습니다.', skipReencode: '이미 WebP인 이미지는 다시 변환하지 않기', skipReencodeHelp: '변환을 반복하며 화질이 조금씩 나빠지는 것을 막습니다.', unsupportedAnimated: 'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.' },
+        storage: { title: '저장 공간', total: '전체 데이터', media: '이미지·미디어', inlays: '채팅 첨부', plugins: '플러그인 데이터', snapshots: '스냅샷', conflictBackups: '충돌 백업', counts: '캐릭터 {0}개 · 대화 {1}개 · 메시지 {2}개', createSnapshot: '스냅샷 지금 만들기', cleanSyncTemp: '동기화 임시 파일 정리', calculateSize: '크기 계산', gcRun: '사용하지 않는 이미지 정리', gcResult: '삭제 가능: {0}개 ({1})', gcConfirm: '어디에서도 사용하지 않는 이미지 {0}개({1})를 삭제합니다. 계속할까요?', deleteSnapshotConfirm: '이 스냅샷을 삭제할까요? 삭제하면 이 시점으로 되돌릴 수 없습니다.', syncBackups: '동기화 백업', deleteSyncBackupConfirm: '이 동기화 백업을 삭제할까요? 해당 작업 이전 상태로 되돌릴 수 없게 됩니다.', syncBackupInUse: '진행 중인 동기화가 사용하는 백업이라 삭제할 수 없습니다.', cleanSyncTempNote: '남은 임시 파일만 정리합니다. 백업과 진행 중인 작업은 건드리지 않습니다.', trashedCount: '(휴지통 {0}개)', loadFailed: '저장 공간 정보를 불러오지 못했습니다.', retry: '다시 시도', actionFailed: '정리하지 못했습니다. 데이터는 변경되지 않았습니다.' },
+        backup: { title: '백업·복구', officialPublish: '공식 계정 백업 만들기', officialRestore: '공식 계정 백업 복원', officialCancel: '백업 업로드 취소' },
+        platform: { title: '플랫폼', notifications: '알림', notificationsOn: '허용됨', notificationsOff: '꺼짐', openSettings: '시스템 설정 열기', keepAlive: '응답 생성 중 앱 유지', keepAliveHelp: 'AI 응답을 받는 동안 알림을 표시해 앱이 백그라운드에서 종료되지 않게 합니다.', keepAliveNeedsNotifications: '알림이 꺼져 있으면 이 기능이 동작하지 않습니다.', transferMode: '전송 방식' },
+        diag: { title: '진단', viewLog: '오류 로그 보기', copyLog: '오류 로그 복사', fileLog: '오류 로그를 파일로 저장', fileLogHelp: '문제를 신고할 때 이 파일을 함께 보내면 도움이 됩니다. API 키 같은 비밀 정보는 가려서 기록합니다.', logEmpty: '기록된 오류가 없습니다.' },
+        sync: { menuTitle: '기기 동기화', intro: '다른 기기와 데이터를 복사하거나 동기화합니다.', androidLanOnly: 'Android에서는 같은 네트워크(LAN) 연결만 지원합니다.', registrationExpired: '등록이 만료되었습니다. 새 등록 링크로 다시 등록하세요.' },
+    },
     peerClone: {
         notificationsDisabledWarning: "이 앱의 알림이 꺼져 있어 전송 중 중지 버튼이 있는 알림이 표시되지 않습니다. 이 화면에서 공유를 중지할 수 있으며, 시스템 설정에서 알림을 허용하면 알림의 중지 버튼을 다시 사용할 수 있습니다.",
     },
