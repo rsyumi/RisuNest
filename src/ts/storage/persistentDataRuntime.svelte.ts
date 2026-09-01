@@ -23,6 +23,7 @@ import type {
     PersistentCompleteCharacterMutation,
     PersistentCompleteCharacterUpsert,
     PersistentCompleteCharacterUpsertOptions,
+    PersistentScopedReplacementOptions,
     PersistentDatabaseSnapshot,
     PersistentMutationToken,
     PersistentSelectedConversation,
@@ -36,6 +37,7 @@ import {
     captureSelectedPersistentCharacter,
     createPersistentDataRuntime,
     publishPersistentCharacterMutationToWorkingSet,
+    publishPersistentConversationReplacementToWorkingSet,
     restoreStableWorkingSetSelection,
     type PersistentDestructiveReplacementFence,
     type PersistentDataRuntime,
@@ -156,6 +158,9 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             )
             const selectedCharacterId = database.characters[get(selectedCharID)]?.chaId ?? null
             productionRuntime?.reconcileActiveCharacterIds(database, selectedCharacterId)
+        },
+        publishConversationReplacement(result) {
+            publishPersistentConversationReplacementToWorkingSet(getDatabase(), result)
         },
         installCompleteDatabase(database) {
             workingSetResidency.clear()
@@ -432,6 +437,19 @@ export const replacePersistentCompleteCharacter = (
     characterId,
     reason,
     mutate,
+)
+export const replacePersistentConversation = (
+    characterId: string,
+    conversationId: string,
+    reason: string,
+    replacement: Chat,
+    options?: PersistentScopedReplacementOptions,
+): Promise<boolean> => getPersistentDataRuntime().replacePersistentConversation(
+    characterId,
+    conversationId,
+    reason,
+    replacement,
+    options,
 )
 export const upsertPersistentCompleteCharacter = (
     characterId: string,

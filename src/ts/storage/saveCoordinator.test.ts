@@ -3,6 +3,7 @@ import {
     PersistentRootModuleAppendRejectedError,
     SaveCoordinator as ProductionSaveCoordinator,
     canonicalJson,
+    type PersistentConversationReplacementResult,
     type SaveCoordinatorDependencies,
     type WindowedConversationPersistenceAuthority,
 } from './saveCoordinator'
@@ -137,6 +138,167 @@ class SaveCoordinator extends ProductionSaveCoordinator {
 }
 
 describe('SaveCoordinator', () => {
+    function makeConversationReplacementHarness() {
+        const database = makeDatabase()
+        database.characters[0].chats = [
+            { id: 'chat-a', name: 'A', message: [{ role: 'user', data: 'a' }] },
+            {
+                id: 'chat-b', name: 'B',
+                message: [{ role: 'user', data: 'b1' }, { role: 'char', data: 'b2' }],
+            },
+        ] as Chat[]
+        const publishConversationReplacement = vi.fn(
+            (result: PersistentConversationReplacementResult) => {
+                const owner = database.characters.find(
+                    (character) => character.chaId === result.characterId,
+                )!
+                const index = owner.chats.findIndex(
+                    (chat) => chat.id === result.conversationId,
+                )
+                owner.chats[index] = structuredClone(result.conversation)
+            },
+        )
+        const store = {
+            readConversation: vi.fn(async (characterId: string, conversationId: string) => {
+                const chat = database.characters
+                    .find((character) => character.chaId === characterId)
+                    ?.chats.find((candidate) => candidate.id === conversationId)
+                return chat ? { revision: 7, value: structuredClone(chat) } : null
+            }),
+            commit: vi.fn(async () => ({ revision: 8 })),
+        } as unknown as PersistentDataStore
+        const onLocalRevision = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) =>
+                database.characters.find((character) => character.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+            publishConversationReplacement,
+            onLocalRevision,
+        })
+        coordinator.initialize(7, database)
+        return {
+            coordinator,
+            database,
+            onLocalRevision,
+            publishConversationReplacement,
+            store,
+        }
+    }
+
+    it('replaces one existing conversation without assigning configuredIndex', async () => {
+        const { coordinator, store, database, publishConversationReplacement, onLocalRevision } =
+            makeConversationReplacementHarness()
+        const replacement = {
+            ...structuredClone(database.characters[0].chats[1]),
+            name: 'Updated metadata',
+            localLore: [{ key: 'memory', content: 'retained' }],
+            message: [{ role: 'char', data: 'replacement body' }],
+        } as Chat
+
+        await expect(coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set', replacement, { expectedRevision: 7 },
+        )).resolves.toBe(true)
+
+        expect(store.commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            conversations: [{
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'chat-b',
+                start: 0,
+                deleteCount: 2,
+                messages: replacement.message,
+                conversation: expect.objectContaining({
+                    id: 'chat-b',
+                    name: 'Updated metadata',
+                    localLore: replacement.localLore,
+                }),
+            }],
+        })
+        expect((vi.mocked(store.commit).mock.calls[0][0] as WorkingSetCommit)
+            .conversations![0]).not.toHaveProperty('configuredIndex')
+        expect(publishConversationReplacement).toHaveBeenCalledWith({
+            revision: 8,
+            characterId: 'char-a',
+            conversationId: 'chat-b',
+            conversation: replacement,
+        })
+        expect(onLocalRevision).toHaveBeenCalledWith(8)
+    })
+
+    it('rejects stale and malformed conversation replacements before commit', async () => {
+        const { coordinator, store, database, publishConversationReplacement } =
+            makeConversationReplacementHarness()
+        const replacement = structuredClone(database.characters[0].chats[1])
+
+        await expect(coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set', replacement, { expectedRevision: 6 },
+        )).rejects.toBeInstanceOf(RevisionConflictError)
+        await expect(coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set', { ...replacement, id: 'other' } as Chat,
+        )).rejects.toThrow(/ID must remain chat-b/)
+        await expect(coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set', { ...replacement, message: null } as any,
+        )).rejects.toBeInstanceOf(TypeError)
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(publishConversationReplacement).not.toHaveBeenCalled()
+    })
+
+    it('returns false for a missing conversation and does not publish commit failures', async () => {
+        const missing = makeConversationReplacementHarness()
+        await expect(missing.coordinator.replacePersistentConversation(
+            'missing', 'chat-b', 'plugin-chat-set',
+            structuredClone(missing.database.characters[0].chats[1]),
+        )).resolves.toBe(false)
+        expect(missing.store.commit).not.toHaveBeenCalled()
+
+        const failing = makeConversationReplacementHarness()
+        const error = new Error('commit failed')
+        vi.mocked(failing.store.commit).mockRejectedValueOnce(error)
+        await expect(failing.coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set',
+            structuredClone(failing.database.characters[0].chats[1]),
+        )).rejects.toBe(error)
+        expect(failing.publishConversationReplacement).not.toHaveBeenCalled()
+    })
+
+    it('compensates only a concurrent resident conversation and rejects the original write', async () => {
+        const { coordinator, store, database } = makeConversationReplacementHarness()
+        const firstCommit = deferred<{ revision: number }>()
+        vi.mocked(store.commit)
+            .mockReturnValueOnce(firstCommit.promise)
+            .mockResolvedValueOnce({ revision: 9 })
+        const replacement = {
+            ...structuredClone(database.characters[0].chats[1]),
+            name: 'Plugin replacement',
+        } as Chat
+
+        const mutation = coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set', replacement,
+        )
+        await vi.waitFor(() => expect(store.commit).toHaveBeenCalledOnce())
+        database.characters[0].chats[1].name = 'Resident won'
+        firstCommit.resolve({ revision: 8 })
+
+        await expect(mutation).rejects.toThrow(
+            'Resident conversation changed during persistent mutation: char-a/chat-b',
+        )
+        expect(store.commit).toHaveBeenCalledTimes(2)
+        for (const [commit] of vi.mocked(store.commit).mock.calls) {
+            expect(commit).not.toHaveProperty('replaceCharacter')
+            expect(commit.conversations).toHaveLength(1)
+            expect(commit.conversations![0]).toMatchObject({
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'chat-b',
+            })
+        }
+        expect(database.characters[0].chats[0].name).toBe('A')
+    })
+
     function makeAdditionDatabase() {
         const database = makeDatabase()
         const added = structuredClone(database.characters[0])

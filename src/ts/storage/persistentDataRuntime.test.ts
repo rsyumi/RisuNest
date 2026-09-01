@@ -7,6 +7,7 @@ import {
     captureResidentPersistentCharacter,
     createPersistentDataRuntime,
     publishPersistentCharacterMutationToWorkingSet,
+    publishPersistentConversationReplacementToWorkingSet,
     restoreStableWorkingSetSelection,
 } from './persistentDataRuntime'
 import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
@@ -18,6 +19,10 @@ import {
     projectCompleteScalableWorkingSet,
 } from './workingSetCatalog'
 import { WorkingSetResidencyRegistry } from './workingSetResidency'
+import {
+    createConversationSummaryStubFromChat,
+    isConversationSummaryStub,
+} from './conversationResidency'
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -296,6 +301,71 @@ describe('persistent plugin storage capture', () => {
         database.pluginCustomStorage = { memory: { entries: [1, 2, 3] } }
 
         expect(capturePersistentPluginStorage(database)).toBe(database.pluginCustomStorage)
+    })
+})
+
+describe('persistent conversation replacement publication', () => {
+    it('updates complete targets while keeping inactive catalog and summary targets bounded', () => {
+        const selected = makeConversationDatabase('Selected').characters[0]
+        selected.chaId = 'selected-char'
+        selected.chats[0].id = 'selected-chat'
+        const inactive = createCatalogCharacterStub({
+            id: 'inactive-char',
+            configuredIndex: 1,
+            name: 'Inactive',
+            recentAt: 0,
+            trashed: false,
+            conversationCount: 1,
+            type: 'character',
+        })
+        const database = {
+            username: 'Fixture',
+            botPresets: [],
+            characters: [selected, inactive],
+        } as unknown as Database
+        const replacement = {
+            ...structuredClone(selected.chats[0]),
+            name: 'Updated selected chat',
+        }
+
+        publishPersistentConversationReplacementToWorkingSet(database, {
+            revision: 2,
+            characterId: 'inactive-char',
+            conversationId: 'inactive-chat',
+            conversation: {
+                id: 'inactive-chat',
+                name: 'Updated inactive',
+                note: '',
+                localLore: [],
+                message: [],
+            },
+        })
+        expect(isCatalogCharacterStub(database.characters[1])).toBe(true)
+        expect(database.characters[1].chats).toEqual([])
+
+        publishPersistentConversationReplacementToWorkingSet(database, {
+            revision: 3,
+            characterId: 'selected-char',
+            conversationId: 'selected-chat',
+            conversation: replacement,
+        })
+        expect(database.characters[0].chats[0]).toEqual(replacement)
+
+        database.characters[0].chats[0] = createConversationSummaryStubFromChat(
+            'selected-char',
+            replacement,
+            0,
+        )
+        publishPersistentConversationReplacementToWorkingSet(database, {
+            revision: 4,
+            characterId: 'selected-char',
+            conversationId: 'selected-chat',
+            conversation: { ...replacement, name: 'Summary metadata' },
+        })
+        expect(isConversationSummaryStub(database.characters[0].chats[0])).toBe(true)
+        expect(database.characters[0].chats[0].name).toBe('Summary metadata')
+        expect(database.characters[0].chats[0].message).toEqual([])
+        expect(database.characters[0].chaId).toBe('selected-char')
     })
 })
 

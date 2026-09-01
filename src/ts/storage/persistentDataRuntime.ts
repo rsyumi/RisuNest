@@ -33,7 +33,9 @@ import {
     type PersistentCompleteCharacterMutation,
     type PersistentCompleteCharacterUpsert,
     type PersistentCompleteCharacterUpsertOptions,
+    type PersistentConversationReplacementResult,
     type PersistentReplacementOptions,
+    type PersistentScopedReplacementOptions,
     type SaveCoordinatorClock,
     type WindowedConversationPersistenceAuthority,
 } from './saveCoordinator'
@@ -52,6 +54,10 @@ import {
     projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
 import { releasePersistentRevisionLease } from './persistentRecordIterator'
+import {
+    createConversationSummaryStubFromChat,
+    isConversationSummaryStub,
+} from './conversationResidency'
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
@@ -79,6 +85,27 @@ export function capturePersistentPresets(database: Database): botPreset[] | null
     const presets = database.botPresets ?? []
     if (isCatalogPresetWorkingSet(presets)) return null
     return presets
+}
+
+export function publishPersistentConversationReplacementToWorkingSet(
+    database: Database,
+    result: PersistentConversationReplacementResult,
+): void {
+    const character = database.characters.find(
+        (candidate) => candidate.chaId === result.characterId,
+    )
+    if (!character || isCatalogCharacterStub(character)) return
+    const index = character.chats.findIndex(
+        (candidate) => candidate.id === result.conversationId,
+    )
+    if (index < 0) return
+    character.chats[index] = isConversationSummaryStub(character.chats[index])
+        ? createConversationSummaryStubFromChat(
+            result.characterId,
+            result.conversation,
+            index,
+        )
+        : structuredClone(result.conversation)
 }
 
 export function captureSelectedPersistentCharacter(
@@ -222,6 +249,7 @@ export interface PersistentDataRuntimeStateAdapter {
     publishPresetWorkingSet?(state: PersistentPresetMutationResult): void
     publishRootWorkingSet?(root: RootDatabase): void
     publishCharacterMutation?(state: PersistentCharacterMutationResult): void
+    publishConversationReplacement?(result: PersistentConversationReplacementResult): void
     installCompleteDatabase?(database: Database): void
     restoreSelection?(characterId: string | null, conversationId: string | null): void
     publishCharacter(character: CompleteCharacter): void
@@ -326,6 +354,13 @@ export interface PersistentDataRuntime {
         characterId: string,
         reason: string,
         mutate: PersistentCompleteCharacterMutation,
+    ): Promise<boolean>
+    replacePersistentConversation(
+        characterId: string,
+        conversationId: string,
+        reason: string,
+        replacement: Chat,
+        options?: PersistentScopedReplacementOptions,
     ): Promise<boolean>
     upsertPersistentCompleteCharacter(
         characterId: string,
@@ -493,6 +528,7 @@ export function createPersistentDataRuntime(
         publishPresetWorkingSet: dependencies.state.publishPresetWorkingSet,
         publishRootWorkingSet: dependencies.state.publishRootWorkingSet,
         publishCharacterMutation: dependencies.state.publishCharacterMutation,
+        publishConversationReplacement: dependencies.state.publishConversationReplacement,
         isIncompleteWorkingSet: (database) =>
             hasIncompletePersistentWorkingSet(database, workingSetResidency),
         getNavigationGeneration: () => workingSet.navigationGenerationToken,
@@ -676,6 +712,19 @@ export function createPersistentDataRuntime(
             coordinator.deletePersistentCharacterWithGroupReferences(characterId, reason),
         replacePersistentCompleteCharacter: (characterId, reason, mutate) =>
             coordinator.replacePersistentCompleteCharacter(characterId, reason, mutate),
+        replacePersistentConversation: (
+            characterId,
+            conversationId,
+            reason,
+            replacement,
+            options,
+        ) => coordinator.replacePersistentConversation(
+            characterId,
+            conversationId,
+            reason,
+            replacement,
+            options,
+        ),
         upsertPersistentCompleteCharacter: (characterId, reason, createOrMutate, options) =>
             coordinator.upsertPersistentCompleteCharacter(
                 characterId,
