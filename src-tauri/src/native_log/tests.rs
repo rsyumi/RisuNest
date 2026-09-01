@@ -34,6 +34,19 @@ fn serializes_timestamp_and_masks_sensitive_values_before_every_sink() {
 }
 
 #[test]
+fn masks_sk_secrets_only_at_token_boundaries() {
+    let state = NativeLogState::for_tests();
+    let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+    state.record("info", "test", format!("token {secret}"));
+    let entry = state.tail(None).pop().unwrap();
+    assert!(!entry.message.contains(secret));
+
+    let ordinary = "ask-me-later desk-chair prefixsk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+    state.record("info", "test", ordinary);
+    assert_eq!(state.tail(None).pop().unwrap().message, ordinary);
+}
+
+#[test]
 fn marker_absence_enables_file_logging_and_toggling_reverses_that() {
     let temp = tempfile::tempdir().unwrap();
     let state = NativeLogState::initialize(temp.path());
@@ -59,7 +72,17 @@ fn marker_absence_enables_file_logging_and_toggling_reverses_that() {
 }
 
 #[test]
-fn rotates_the_file_above_two_mib_and_ignores_file_write_failures() {
+fn does_not_rotate_at_the_exact_two_mib_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    fs::write(state.file_path(), vec![b'x'; FILE_ROTATE_BYTES]).unwrap();
+    state.record("info", "test", "at boundary");
+    assert!(!temp.path().join("logs").join("risunest.log.1").exists());
+    assert!(fs::metadata(state.file_path()).unwrap().len() > FILE_ROTATE_BYTES as u64);
+}
+
+#[test]
+fn rotates_the_file_only_above_two_mib() {
     let temp = tempfile::tempdir().unwrap();
     let state = NativeLogState::initialize(temp.path());
     fs::write(state.file_path(), vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
@@ -72,9 +95,17 @@ fn rotates_the_file_above_two_mib_and_ignores_file_write_failures() {
     assert!(fs::read_to_string(state.file_path())
         .unwrap()
         .contains("after rotation"));
-    let unwritable = NativeLogState::initialize(temp.path().join("not-a-directory"));
-    unwritable.record("info", "test", "still nonfatal");
-    assert_eq!(unwritable.tail(None).len(), 1);
+}
+
+#[test]
+fn file_write_failure_is_nonfatal_when_log_root_is_a_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let invalid_root = temp.path().join("not-a-directory");
+    fs::write(&invalid_root, b"file").unwrap();
+    let state = NativeLogState::initialize(&invalid_root);
+    state.record("info", "test", "still nonfatal");
+    assert_eq!(state.tail(None).len(), 1);
+    assert!(!state.file_path().exists());
 }
 
 #[test]

@@ -161,10 +161,46 @@ fn write_file(inner: &Inner, entry: &LogEntry) {
 
 fn mask(message: &str) -> String {
     let mut masked = message.to_owned();
-    for label in ["bearer ", "authorization:", "x-api-key:", "sk-"] {
+    for label in ["bearer ", "authorization:", "x-api-key:"] {
         masked = redact_after(&masked, label);
     }
-    redact_long_runs(&masked)
+    redact_long_runs(&redact_sk_tokens(&masked))
+}
+
+fn redact_sk_tokens(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(found) = input[cursor..].find("sk-") {
+        let start = cursor + found;
+        let value_start = start + "sk-".len();
+        let previous_is_token_character = input[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_secret_token_character);
+        let next_is_token_character = input[value_start..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric());
+        if previous_is_token_character || !next_is_token_character {
+            output.push_str(&input[cursor..value_start]);
+            cursor = value_start;
+            continue;
+        }
+
+        output.push_str(&input[cursor..value_start]);
+        output.push_str("[REDACTED]");
+        let end = value_start
+            + input[value_start..]
+                .find(|character: char| !is_secret_token_character(character))
+                .unwrap_or(input[value_start..].len());
+        cursor = end;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn is_secret_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
 }
 
 fn redact_after(input: &str, label: &str) -> String {
