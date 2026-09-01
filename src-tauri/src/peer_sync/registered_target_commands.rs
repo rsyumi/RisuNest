@@ -1,6 +1,8 @@
 use super::{
     device_registry::{incoming_source_by_id, DevicePermissions, IncomingSource},
-    lan::{authenticated_peer_hello, PeerHello, PeerHelloLane},
+    lan::{
+        authenticated_peer_hello_status, AuthenticatedPeerHelloOutcome, PeerHello, PeerHelloLane,
+    },
     PeerSyncError,
 };
 use serde::Serialize;
@@ -145,7 +147,7 @@ fn resolve_registered_source(
     device_id: &str,
     lane: RegisteredLane,
 ) -> Result<RegisteredSourceConnection, RegisteredTargetError> {
-    resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello)
+    resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello_status)
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -166,8 +168,10 @@ fn registered_hello(
     let source = incoming_source_by_id(app_root, device_id)
         .map_err(|error| safe_failure("registered source lookup", error))?
         .ok_or(RegisteredTargetError::SourceMissing)?;
-    let current = authenticated_peer_hello(&source.endpoint, &source.bearer)
-        .map_err(|error| safe_failure("registered source hello", error))?;
+    let current = registered_hello_outcome(
+        "registered source hello",
+        authenticated_peer_hello_status(&source.endpoint, &source.bearer),
+    )?;
     if current.device_id != source.device_id {
         crate::nlog!(
             "warn",
@@ -329,13 +333,15 @@ fn resolve_registered_source_with(
     app_root: &Path,
     device_id: &str,
     lane: RegisteredLane,
-    hello: impl FnOnce(&str, &str) -> Result<PeerHello, PeerSyncError>,
+    hello: impl FnOnce(&str, &str) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
 ) -> Result<RegisteredSourceConnection, RegisteredTargetError> {
     let source = incoming_source_by_id(app_root, device_id)
         .map_err(|error| safe_failure("registered source lookup", error))?
         .ok_or(RegisteredTargetError::SourceMissing)?;
-    let current = hello(&source.endpoint, &source.bearer)
-        .map_err(|error| safe_failure("registered source hello", error))?;
+    let current = registered_hello_outcome(
+        "registered source hello",
+        hello(&source.endpoint, &source.bearer),
+    )?;
     if current.device_id != source.device_id {
         crate::nlog!(
             "warn",
@@ -365,11 +371,20 @@ fn resolve_registered_source_with(
 
 fn safe_failure(context: &str, error: PeerSyncError) -> RegisteredTargetError {
     crate::nlog!("warn", "{context} failed: {error}");
-    match error {
-        PeerSyncError::Transport(message) if message.starts_with("HTTP 401") => {
-            RegisteredTargetError::AuthorizationExpired
+    RegisteredTargetError::TransportUnavailable
+}
+
+fn registered_hello_outcome(
+    context: &str,
+    outcome: Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
+) -> Result<PeerHello, RegisteredTargetError> {
+    match outcome {
+        Ok(AuthenticatedPeerHelloOutcome::Hello(hello)) => Ok(hello),
+        Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired) => {
+            crate::nlog!("warn", "{context} failed: HTTP 401 Unauthorized");
+            Err(RegisteredTargetError::AuthorizationExpired)
         }
-        _ => RegisteredTargetError::TransportUnavailable,
+        Err(error) => Err(safe_failure(context, error)),
     }
 }
 
@@ -435,7 +450,10 @@ mod tests {
             RegisteredLane::Clone,
             |_, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(hello(SOURCE_ID, DevicePermissions::read()))
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
             },
         )
         .unwrap_err();
@@ -450,7 +468,10 @@ mod tests {
             RegisteredLane::Clone,
             |_, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(hello(SOURCE_ID, DevicePermissions::read()))
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
             },
         )
         .unwrap_err();
@@ -471,7 +492,10 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(endpoint, "http://127.0.0.1:32145");
                 assert_eq!(bearer, BEARER);
-                Ok(hello(SOURCE_ID, DevicePermissions::read()))
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
             },
         )
         .unwrap();
@@ -488,7 +512,12 @@ mod tests {
             root.path(),
             SOURCE_ID,
             RegisteredLane::Clone,
-            |_, _| Ok(hello(OTHER_SOURCE_ID, DevicePermissions::read())),
+            |_, _| {
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    OTHER_SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
+            },
         )
         .unwrap_err();
         assert_eq!(mismatch.code(), "identityMismatch");
@@ -497,7 +526,12 @@ mod tests {
             root.path(),
             SOURCE_ID,
             RegisteredLane::Bidirectional,
-            |_, _| Ok(hello(SOURCE_ID, DevicePermissions::read())),
+            |_, _| {
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
+            },
         )
         .unwrap_err();
         assert_eq!(permission.code(), "permissionDenied");
@@ -508,7 +542,7 @@ mod tests {
             root.path(),
             SOURCE_ID,
             RegisteredLane::Delta,
-            |_, _| Ok(no_delta),
+            |_, _| Ok(AuthenticatedPeerHelloOutcome::Hello(no_delta)),
         )
         .unwrap_err();
         assert_eq!(lane.code(), "laneUnavailable");
@@ -522,10 +556,19 @@ mod tests {
             root.path(),
             SOURCE_ID,
             RegisteredLane::Clone,
-            |_, _| Err(PeerSyncError::Transport("HTTP 401 Unauthorized".to_owned())),
+            |_, _| Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired),
         )
         .unwrap_err();
         assert_eq!(unauthorized.code(), "authorizationExpired");
+
+        let string_unauthorized = resolve_registered_source_with(
+            root.path(),
+            SOURCE_ID,
+            RegisteredLane::Clone,
+            |_, _| Err(PeerSyncError::Transport("HTTP 401 Unauthorized".to_owned())),
+        )
+        .unwrap_err();
+        assert_eq!(string_unauthorized.code(), "transportUnavailable");
 
         let transport = resolve_registered_source_with(
             root.path(),
@@ -536,6 +579,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(transport.code(), "transportUnavailable");
         assert!(!transport.to_string().contains("socket detail secret"));
+
+        let false_unauthorized = resolve_registered_source_with(
+            root.path(),
+            SOURCE_ID,
+            RegisteredLane::Clone,
+            |_, _| Err(PeerSyncError::Transport("HTTP 4010".to_owned())),
+        )
+        .unwrap_err();
+        assert_eq!(false_unauthorized.code(), "transportUnavailable");
     }
 
     #[test]
@@ -546,7 +598,12 @@ mod tests {
             root.path(),
             SOURCE_ID,
             RegisteredLane::Clone,
-            |_, _| Ok(hello(SOURCE_ID, DevicePermissions::read())),
+            |_, _| {
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
+            },
         )
         .unwrap();
         let hello_json = serde_json::to_string(&connection.safe_hello()).unwrap();

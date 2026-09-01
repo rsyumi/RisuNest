@@ -2604,6 +2604,12 @@ pub(crate) struct PeerHello {
     pub(crate) lanes: PeerHelloLanes,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthenticatedPeerHelloOutcome {
+    Hello(PeerHello),
+    AuthorizationExpired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerHelloLane {
@@ -2632,6 +2638,18 @@ pub(crate) fn authenticated_peer_hello(
     endpoint: &str,
     bearer: &str,
 ) -> Result<PeerHello, PeerSyncError> {
+    match authenticated_peer_hello_status(endpoint, bearer)? {
+        AuthenticatedPeerHelloOutcome::Hello(hello) => Ok(hello),
+        AuthenticatedPeerHelloOutcome::AuthorizationExpired => {
+            Err(PeerSyncError::Transport("HTTP 401 Unauthorized".to_owned()))
+        }
+    }
+}
+
+pub(crate) fn authenticated_peer_hello_status(
+    endpoint: &str,
+    bearer: &str,
+) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError> {
     let endpoint = validate_lan_endpoint(endpoint)?;
     if !is_lower_hex_256(bearer) {
         return Err(PeerSyncError::Protocol(
@@ -2643,6 +2661,9 @@ pub(crate) fn authenticated_peer_hello(
         .bearer_auth(bearer)
         .send()
         .map_err(transport)?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired);
+    }
     if response.status() != reqwest::StatusCode::OK {
         return Err(PeerSyncError::Transport(format!(
             "HTTP {}",
@@ -2670,12 +2691,12 @@ pub(crate) fn authenticated_peer_hello(
             "invalid peer hello response".to_owned(),
         ));
     }
-    Ok(PeerHello {
+    Ok(AuthenticatedPeerHelloOutcome::Hello(PeerHello {
         device_id: response.device_id,
         name: response.name,
         permissions,
         lanes: response.lanes,
-    })
+    }))
 }
 
 fn valid_hello_lanes(lanes: &PeerHelloLanes) -> bool {
@@ -4370,6 +4391,15 @@ mod timeout_tests {
         assert_eq!(hello["lanes"]["delta"]["sessionId"], pairing.session_id);
         assert!(hello["lanes"]["clone"].is_null());
         assert!(hello["lanes"]["bidirectional"].is_null());
+        let unknown_bearer = if client.bearer == "f".repeat(64) {
+            "e".repeat(64)
+        } else {
+            "f".repeat(64)
+        };
+        assert_eq!(
+            authenticated_peer_hello_status(&endpoint, &unknown_bearer).unwrap(),
+            AuthenticatedPeerHelloOutcome::AuthorizationExpired
+        );
 
         let bearer = client.bearer.clone();
         host.stop().unwrap();

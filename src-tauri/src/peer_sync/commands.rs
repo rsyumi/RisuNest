@@ -1267,10 +1267,25 @@ impl PeerCloneCommandState {
                     "peer clone target claim is already in progress".to_owned(),
                 ));
             }
-            if runtime.target.is_some() {
-                return Err(PeerSyncError::Protocol(
-                    "another peer clone target job is already owned".to_owned(),
-                ));
+            if let Some(target) = runtime.target.as_mut() {
+                if !matches!(
+                    target.status.phase,
+                    PeerCloneTargetPhase::Failed | PeerCloneTargetPhase::Cancelled
+                ) || target.worker.is_some()
+                    || target.cancellation.is_some()
+                {
+                    return Err(PeerSyncError::Protocol(
+                        "another peer clone target job is already owned".to_owned(),
+                    ));
+                }
+                #[cfg(test)]
+                if std::mem::take(&mut target.fail_release_cleanup_once) {
+                    return Err(PeerSyncError::Storage(
+                        "injected peer clone target release cleanup failure".to_owned(),
+                    ));
+                }
+                remove_directory_if_exists(&target.job_root)?;
+                runtime.target = None;
             }
             runtime.target_claiming = true;
         }
@@ -3680,6 +3695,168 @@ mod tests {
             .unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
         reopened.stop_source(&repaired_request.session_id).unwrap();
+    }
+
+    #[test]
+    fn registered_target_reconnect_replaces_only_a_terminal_owner_after_source_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let state = PeerCloneCommandState::default();
+        let first = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000201".to_owned(),
+            manifest_id: "a".repeat(64),
+        };
+        let restarted = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32146".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000202".to_owned(),
+            manifest_id: "c".repeat(64),
+        };
+        let source_device_id = "00000000-0000-4000-8000-000000000203";
+        let bearer = "b".repeat(64);
+
+        state
+            .connect_registered_target(
+                &peer_root,
+                &first.endpoint,
+                &first.session_id,
+                &first.manifest_id,
+                source_device_id,
+                &bearer,
+            )
+            .unwrap();
+        assert!(state
+            .connect_registered_target(
+                &peer_root,
+                &restarted.endpoint,
+                &restarted.session_id,
+                &restarted.manifest_id,
+                source_device_id,
+                &bearer,
+            )
+            .is_err());
+        let first_root = target_paths(&peer_root, &first).unwrap().job_root;
+        let restarted_root = target_paths(&peer_root, &restarted).unwrap().job_root;
+        state
+            .lock_runtime()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .status
+            .phase = PeerCloneTargetPhase::AwaitingActivation;
+        assert!(state
+            .connect_registered_target(
+                &peer_root,
+                &restarted.endpoint,
+                &restarted.session_id,
+                &restarted.manifest_id,
+                source_device_id,
+                &bearer,
+            )
+            .is_err());
+        state
+            .lock_runtime()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .status
+            .phase = PeerCloneTargetPhase::Failed;
+
+        let result = state
+            .connect_registered_target(
+                &peer_root,
+                &restarted.endpoint,
+                &restarted.session_id,
+                &restarted.manifest_id,
+                source_device_id,
+                &bearer,
+            )
+            .unwrap();
+
+        assert_eq!(result.source_device_id.as_deref(), Some(source_device_id));
+        assert!(!first_root.try_exists().unwrap());
+        assert!(restarted_root.try_exists().unwrap());
+        let runtime = state.lock_runtime().unwrap();
+        let target = runtime.target.as_ref().unwrap();
+        assert_eq!(target.request, restarted);
+        assert_eq!(target.status.phase, PeerCloneTargetPhase::Idle);
+    }
+
+    #[test]
+    fn registered_target_reconnect_cleanup_failure_preserves_terminal_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let state = PeerCloneCommandState::default();
+        let first = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000211".to_owned(),
+            manifest_id: "d".repeat(64),
+        };
+        let restarted = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32146".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000212".to_owned(),
+            manifest_id: "e".repeat(64),
+        };
+        let source_device_id = "00000000-0000-4000-8000-000000000213";
+        let bearer = "f".repeat(64);
+        state
+            .connect_registered_target(
+                &peer_root,
+                &first.endpoint,
+                &first.session_id,
+                &first.manifest_id,
+                source_device_id,
+                &bearer,
+            )
+            .unwrap();
+        state
+            .lock_runtime()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .status
+            .phase = PeerCloneTargetPhase::Cancelled;
+        state.fail_target_release_cleanup_once_for_test().unwrap();
+        let first_root = target_paths(&peer_root, &first).unwrap().job_root;
+        let restarted_root = target_paths(&peer_root, &restarted).unwrap().job_root;
+
+        assert!(matches!(
+            state.connect_registered_target(
+                &peer_root,
+                &restarted.endpoint,
+                &restarted.session_id,
+                &restarted.manifest_id,
+                source_device_id,
+                &bearer,
+            ),
+            Err(PeerSyncError::Storage(message))
+                if message == "injected peer clone target release cleanup failure"
+        ));
+        assert!(first_root.try_exists().unwrap());
+        assert!(!restarted_root.try_exists().unwrap());
+        {
+            let runtime = state.lock_runtime().unwrap();
+            let target = runtime.target.as_ref().unwrap();
+            assert_eq!(target.request, first);
+            assert_eq!(target.status.phase, PeerCloneTargetPhase::Cancelled);
+            assert!(!runtime.target_claiming);
+        }
+
+        state
+            .connect_registered_target(
+                &peer_root,
+                &restarted.endpoint,
+                &restarted.session_id,
+                &restarted.manifest_id,
+                source_device_id,
+                &bearer,
+            )
+            .unwrap();
+        assert!(!first_root.try_exists().unwrap());
+        assert!(restarted_root.try_exists().unwrap());
     }
 
     #[test]
