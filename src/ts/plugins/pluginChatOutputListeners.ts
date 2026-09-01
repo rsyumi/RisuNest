@@ -59,17 +59,28 @@ export async function dispatchChatOutputListeners(
     const needsProjection = input.profile === 'scalable-v3' && captured.some(
         (listener) => input.provenance.get(listener) === 'v3-legacy',
     )
-    const event = needsProjection
-        ? await input.projectScalable({
-            characterId: input.char.chaId,
-            conversationId: input.chat.id!,
-            liveCharacter: input.char,
-            liveConversation: input.chat,
-        })
-        : {
+    let event: {
+        char: PluginCompleteCharacter
+        chat: PluginCompleteCharacter['chats'][number]
+    }
+    if (needsProjection) {
+        try {
+            event = await input.projectScalable({
+                characterId: input.char.chaId,
+                conversationId: input.chat.id!,
+                liveCharacter: input.char,
+                liveConversation: input.chat,
+            })
+        } catch (error) {
+            input.onError(error)
+            return
+        }
+    } else {
+        event = {
             char: input.snapshot(input.char),
             chat: input.snapshot(input.chat),
         }
+    }
 
     for (const listener of captured) {
         if (!input.listeners.has(listener)) continue

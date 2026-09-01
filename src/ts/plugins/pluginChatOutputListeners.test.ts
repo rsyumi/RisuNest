@@ -69,6 +69,32 @@ describe('plugin chat output listeners', () => {
         expect(first.mock.calls[0][0].chat).toBe(second.mock.calls[0][0].chat)
     })
 
+    it('isolates scalable projection errors from the generation flow', async () => {
+        const { listeners, provenance } = registry()
+        const listener = vi.fn()
+        const projectionError = new Error('projection failed')
+        const onError = vi.fn()
+        registerChatOutputListener(listeners, provenance, listener, 'v3-legacy')
+
+        await expect(dispatchChatOutputListeners({
+            listeners,
+            provenance,
+            profile: 'scalable-v3',
+            char: liveChar,
+            chat: liveChat,
+            characterIndex: 0,
+            chatIndex: 0,
+            messageIndex: 1,
+            snapshot: structuredClone,
+            projectScalable: vi.fn().mockRejectedValue(projectionError),
+            onError,
+        })).resolves.toBeUndefined()
+
+        expect(onError).toHaveBeenCalledOnce()
+        expect(onError).toHaveBeenCalledWith(projectionError)
+        expect(listener).not.toHaveBeenCalled()
+    })
+
     it('awaits sequentially and isolates listener errors', async () => {
         const { listeners, provenance } = registry()
         const order: string[] = []
