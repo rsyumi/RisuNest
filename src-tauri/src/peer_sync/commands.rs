@@ -211,6 +211,8 @@ impl PeerCloneTargetStatus {
 pub struct PeerCloneFinalizeResult {
     revision: i64,
     warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_path: Option<PathBuf>,
 }
 
 struct VerifiedCloneValidator;
@@ -1702,11 +1704,13 @@ impl PeerCloneCommandState {
                     ))),
                 },
             };
+            let backup_path = target.committed_backup_path().map(Path::to_path_buf);
             drop(target);
             match outcome {
                 Ok(warning) => Ok(PeerCloneFinalizeResult {
                     revision: store.revision().map_err(store_error)?,
                     warning,
+                    backup_path,
                 }),
                 Err(error) => Err(error),
             }
@@ -3125,6 +3129,16 @@ mod tests {
 
         assert_eq!(finalized.revision, 2);
         assert!(finalized.warning.is_some());
+        let backup_path = finalized.backup_path.as_ref().unwrap();
+        assert!(backup_path.is_file());
+        assert_eq!(
+            backup_path.parent(),
+            Some(
+                fs::canonicalize(target_root.path().join("peer-sync/activation/backups"))
+                    .unwrap()
+                    .as_path()
+            )
+        );
         assert_eq!(
             target.target_status(&request).unwrap().phase,
             PeerCloneTargetPhase::Completed
@@ -3251,6 +3265,16 @@ mod tests {
 
         assert_eq!(finalized.revision, 2);
         assert!(finalized.warning.is_some());
+        let backup_path = finalized.backup_path.as_ref().unwrap();
+        assert!(backup_path.is_file());
+        assert_eq!(
+            backup_path.parent(),
+            Some(
+                fs::canonicalize(peer_root.join("activation/backups"))
+                    .unwrap()
+                    .as_path()
+            )
+        );
         assert_eq!(
             target.target_status(&request).unwrap().phase,
             PeerCloneTargetPhase::Completed

@@ -3339,7 +3339,7 @@ mod tests {
     use crate::local_backup::NeverCancelled;
     use crate::peer_sync::{
         prepare_lossless_clone_session, CloneActivation, CloneObjectKind, CloneTargetAdapter,
-        LosslessCloneTargetAdapter, CLONE_LOSSLESS_DATABASE_FORMAT,
+        LosslessCloneTargetAdapter, PeerSyncError, CLONE_LOSSLESS_DATABASE_FORMAT,
     };
     use crate::persistent_store::WorkingSetCommit;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -4668,6 +4668,133 @@ mod tests {
         assert_eq!(store.revision().unwrap(), 2);
         assert_eq!(store.materialize(None).unwrap()["username"], "New");
         assert_eq!(fs::read_dir(&target_root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn production_target_reports_the_exact_pre_replacement_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let target_root = directory.path().join("peer-target");
+        let manifest_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let mut observed = Vec::new();
+        let mut observer = |path: &Path| {
+            observed.push(path.to_owned());
+            Ok(())
+        };
+        let mut target = LosslessCloneTargetAdapter::new_with_backup_observer(
+            &mut store,
+            &cas,
+            &target_root,
+            1,
+            &NeverCancelled,
+            &mut observer,
+        )
+        .unwrap();
+        let mut stage = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut stage,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming),
+            )
+            .unwrap();
+
+        assert_eq!(
+            target
+                .activate_if_current(&mut stage, None, manifest_id)
+                .unwrap(),
+            CloneActivation::Activated
+        );
+        let expected = target.committed_backup_path().unwrap().to_owned();
+        let backups = fs::canonicalize(target_root.join("backups")).unwrap();
+        assert_eq!(expected.parent(), Some(backups.as_path()));
+        drop(target);
+        assert_eq!(observed, vec![expected.clone()]);
+        assert!(expected.is_file());
+    }
+
+    #[test]
+    fn production_target_retries_backup_observation_before_cleaning_a_committed_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let target_root = directory.path().join("peer-target");
+        let manifest_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mut rejecting_observer = |_path: &Path| {
+            Err(PeerSyncError::Storage(
+                "backup receipt unavailable".to_owned(),
+            ))
+        };
+        let mut target = LosslessCloneTargetAdapter::new_with_backup_observer(
+            &mut store,
+            &cas,
+            &target_root,
+            1,
+            &NeverCancelled,
+            &mut rejecting_observer,
+        )
+        .unwrap();
+        let mut stage = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut stage,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming),
+            )
+            .unwrap();
+
+        assert_eq!(
+            target
+                .activate_if_current(&mut stage, None, manifest_id)
+                .unwrap_err(),
+            PeerSyncError::Storage("backup receipt unavailable".to_owned())
+        );
+        drop(target);
+        assert_eq!(store.revision().unwrap(), 2);
+        let expected = fs::canonicalize(
+            fs::read_dir(target_root.join("backups"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        let retained_stage = fs::read_dir(&target_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir() && path.file_name().unwrap() != "backups")
+            .unwrap();
+        assert!(expected.is_file());
+        assert!(retained_stage.is_dir());
+
+        let mut observed = Vec::new();
+        let mut observer = |path: &Path| {
+            observed.push(path.to_owned());
+            Ok(())
+        };
+        let target = LosslessCloneTargetAdapter::new_with_backup_observer(
+            &mut store,
+            &cas,
+            &target_root,
+            2,
+            &NeverCancelled,
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(target.committed_backup_path(), Some(expected.as_path()));
+        drop(target);
+        assert_eq!(observed, vec![expected.clone()]);
+        assert!(!retained_stage.exists());
     }
 
     #[test]

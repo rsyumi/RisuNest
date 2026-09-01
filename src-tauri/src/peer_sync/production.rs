@@ -462,6 +462,8 @@ pub(crate) struct LosslessCloneTargetAdapter<'a> {
     root: PathBuf,
     expected_revision: i64,
     cancellation: &'a dyn CancellationProbe,
+    backup_observer: Option<&'a mut dyn FnMut(&Path) -> Result<(), PeerSyncError>>,
+    committed_backup_path: Option<PathBuf>,
     #[cfg(test)]
     fail_cleanup_after_commit: bool,
     #[cfg(test)]
@@ -478,6 +480,35 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         expected_revision: i64,
         cancellation: &'a dyn CancellationProbe,
     ) -> Result<Self, PeerSyncError> {
+        Self::initialize(store, cas, root, expected_revision, cancellation, None)
+    }
+
+    pub(crate) fn new_with_backup_observer(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        root: &Path,
+        expected_revision: i64,
+        cancellation: &'a dyn CancellationProbe,
+        backup_observer: &'a mut dyn FnMut(&Path) -> Result<(), PeerSyncError>,
+    ) -> Result<Self, PeerSyncError> {
+        Self::initialize(
+            store,
+            cas,
+            root,
+            expected_revision,
+            cancellation,
+            Some(backup_observer),
+        )
+    }
+
+    fn initialize(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        root: &Path,
+        expected_revision: i64,
+        cancellation: &'a dyn CancellationProbe,
+        backup_observer: Option<&'a mut dyn FnMut(&Path) -> Result<(), PeerSyncError>>,
+    ) -> Result<Self, PeerSyncError> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
         fs::create_dir_all(root.join("backups"))?;
@@ -487,6 +518,8 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
             root,
             expected_revision,
             cancellation,
+            backup_observer,
+            committed_backup_path: None,
             #[cfg(test)]
             fail_cleanup_after_commit: false,
             #[cfg(test)]
@@ -496,6 +529,10 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         };
         adapter.reconcile_abandoned_jobs()?;
         Ok(adapter)
+    }
+
+    pub(crate) fn committed_backup_path(&self) -> Option<&Path> {
+        self.committed_backup_path.as_deref()
     }
 
     #[cfg(test)]
@@ -584,6 +621,8 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
             ));
         }
         let outcome = if job.is_sealed() && self.marker_committed(manifest_id)? {
+            let backup_path = self.expected_backup_path(manifest_id, durable_job_id);
+            self.observe_committed_backup(&backup_path)?;
             CasReleaseOutcome::Committed
         } else {
             CasReleaseOutcome::Aborted
@@ -591,6 +630,29 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         job.release(outcome)?;
         self.remove_owned_directory(directory)?;
         Ok(true)
+    }
+
+    fn expected_backup_path(&self, manifest_id: &str, durable_job_id: &str) -> PathBuf {
+        self.root
+            .join("backups")
+            .join(format!("pre-clone-{manifest_id}-{durable_job_id}.lossless"))
+    }
+
+    fn observe_committed_backup(&mut self, path: &Path) -> Result<(), PeerSyncError> {
+        if self.committed_backup_path.as_deref() == Some(path) {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(PeerSyncError::Storage(
+                "peer clone pre-replacement backup is not a regular file".to_owned(),
+            ));
+        }
+        if let Some(observer) = self.backup_observer.as_deref_mut() {
+            observer(path)?;
+        }
+        self.committed_backup_path = Some(path.to_owned());
+        Ok(())
     }
 
     fn marker_committed(&self, manifest_id: &str) -> Result<bool, PeerSyncError> {
@@ -750,6 +812,7 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
         );
         match restore {
             Ok(_) => {
+                self.observe_committed_backup(&stage.pre_replacement_backup)?;
                 #[cfg(test)]
                 if std::mem::take(&mut self.leave_durable_after_commit) {
                     return Err(PeerSyncError::Storage(
