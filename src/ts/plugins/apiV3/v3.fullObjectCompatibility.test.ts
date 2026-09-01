@@ -211,6 +211,26 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         expect(await api.getCharacter()).toBeUndefined()
     })
 
+    it('deeply detaches current and indexed character and chat getters', async () => {
+        const api = fixture.api!
+        const current = await api.getCharacter()
+        const indexed = await api.getCharacterFromIndex(1)
+        const indexedChat = await api.getChatFromIndex(1, 0)
+
+        current.chats[0].name = 'mutated current chat'
+        current.chats[0].message[0].data = 'mutated current message'
+        indexed.chats[0].message[0].data = 'mutated indexed message'
+        indexedChat.message[0].data = 'mutated direct chat message'
+
+        expect(fixture.database.characters[0].chats[0]).toMatchObject({
+            name: 'Live',
+            message: [{ role: 'char', data: 'a' }],
+        })
+        expect(fixture.database.characters[1].chats[0].message).toEqual([
+            { role: 'user', data: 'b' },
+        ])
+    })
+
     it('keeps maximum ID replacement and invalid-index no-op behavior', async () => {
         const api = fixture.api!
         const replacementCharacter = structuredClone(fixture.database.characters[1])
@@ -248,6 +268,58 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         fixture.selectedIndex = 1
         await api.setCharacterToIndex(1, structuredClone(fixture.database.characters[1]))
         expect(fixture.invalidations).toBe(2)
+    })
+
+    it('fully replaces ordinary and nested fields through current and indexed setters', async () => {
+        const api = fixture.api!
+        const currentReplacement = structuredClone(fixture.database.characters[0])
+        currentReplacement.name = 'Current replacement'
+        currentReplacement.chats[0].name = 'Current nested replacement'
+        currentReplacement.chats[0].message = [{ role: 'user', data: 'current body' }]
+
+        await api.setCharacter(currentReplacement)
+        expect(fixture.database.characters[0]).toEqual(currentReplacement)
+
+        const indexedReplacement = structuredClone(fixture.database.characters[1])
+        indexedReplacement.name = 'Indexed replacement'
+        indexedReplacement.chats[0].name = 'Indexed nested replacement'
+        indexedReplacement.chats[0].message = [{ role: 'char', data: 'indexed body' }]
+        await api.setCharacterToIndex(1, indexedReplacement)
+        expect(fixture.database.characters[1]).toEqual(indexedReplacement)
+
+        const chatReplacement = structuredClone(fixture.database.characters[0].chats[0])
+        chatReplacement.name = 'Chat replacement'
+        chatReplacement.message = [{ role: 'char', data: 'chat body' }]
+        await api.setChatToIndex(0, 0, chatReplacement)
+        expect(fixture.database.characters[0].chats[0]).toEqual(chatReplacement)
+    })
+
+    it('keeps valid-character invalid-chat access fulfilled and unchanged', async () => {
+        const api = fixture.api!
+        const before = structuredClone(fixture.database)
+        const replacement = structuredClone(fixture.database.characters[0].chats[0])
+        replacement.name = 'must not be installed'
+
+        expect(await api.getChatFromIndex(0, 99)).toBeNull()
+        expect(await api.setChatToIndex(0, 99, replacement)).toBeUndefined()
+        expect(fixture.database).toEqual(before)
+    })
+
+    it('keeps getChar/setChar aliases aligned with getCharacter/setCharacter', async () => {
+        const api = fixture.api!
+        expect(await api.getChar()).toEqual(await api.getCharacter())
+
+        const legacyReplacement = structuredClone(fixture.database.characters[0])
+        legacyReplacement.name = 'Legacy alias replacement'
+        legacyReplacement.chats[0].message[0].data = 'legacy nested replacement'
+        await api.setChar(legacyReplacement)
+        expect(fixture.database.characters[0]).toEqual(legacyReplacement)
+
+        const namedReplacement = structuredClone(fixture.database.characters[0])
+        namedReplacement.name = 'Named alias replacement'
+        namedReplacement.chats[0].message[0].data = 'named nested replacement'
+        await api.setCharacter(namedReplacement)
+        expect(fixture.database.characters[0]).toEqual(namedReplacement)
     })
 
     it('routes scalable getters through scoped access without changing the maximum oracle', async () => {
