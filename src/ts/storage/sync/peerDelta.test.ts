@@ -63,10 +63,10 @@ describe('peer logical delta product facade', () => {
             if (command === 'peer_delta_source_reserve') return foreground as T
             if (command === 'peer_delta_start') return { phase: 'running', devices: [] } as T
             throw new Error(`Unexpected command: ${command}`)
-        }) as PeerDeltaInvoke
+        })
         const facade = createPeerDeltaFacade({
             platform: 'android',
-            invoke,
+            invoke: invoke as PeerDeltaInvoke,
             bridge: { startSource: vi.fn(() => true), stopSource: vi.fn(() => true) },
         })
 
