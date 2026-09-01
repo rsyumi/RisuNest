@@ -279,7 +279,10 @@ fn create_controlled_inner(
     let loadouts = take_root_block_value(&mut root, "loadouts");
     let plugins = take_root_block_value(&mut root, "plugins");
     root.shift_remove("pluginCustomStorage");
-    let plugin_storage = plugin_storage_value(connection, &target.generation)?;
+    let mut plugin_storage = plugin_storage_value(connection, &target.generation)?;
+    if let Some(replacements) = replacements {
+        project_plugin_storage_resources(&mut plugin_storage, replacements);
+    }
     if omit_account {
         root.shift_remove("account");
     }
@@ -1020,6 +1023,34 @@ fn project_root_resources(root: &mut Map<String, Value>, replacements: &HashMap<
     }
 }
 
+fn project_plugin_storage_resources(value: &mut Value, replacements: &HashMap<String, String>) {
+    match value {
+        Value::String(source) => {
+            let normalized = source.replace('\\', "/");
+            if !normalized.starts_with("assets/") || normalized.len() == "assets/".len() {
+                return;
+            }
+            if let Some(replacement) = replacements
+                .get(source.as_str())
+                .or_else(|| replacements.get(normalized.as_str()))
+            {
+                source.clone_from(replacement);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                project_plugin_storage_resources(value, replacements);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                project_plugin_storage_resources(value, replacements);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 fn project_character_resources(
     character: &mut Map<String, Value>,
     replacements: &HashMap<String, String>,
@@ -1496,6 +1527,11 @@ mod tests {
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let staging = store.replace_begin().unwrap().staging_id;
         let resource = if projected { "new" } else { "old" };
+        let plugin_resource = if projected {
+            "remote/assets/plugin.bin"
+        } else {
+            "assets/plugin.bin"
+        };
         store
             .replace_put_root(
                 &staging,
@@ -1519,7 +1555,10 @@ mod tests {
                     "characterOrder": [{ "imgFile": resource, "unrelated": "old" }],
                     "loadouts": [{ "resource": "old" }],
                     "plugins": [{ "resource": "old" }],
-                    "pluginCustomStorage": { "resource": "old" }
+                    "pluginCustomStorage": {
+                        "resource": plugin_resource,
+                        "prose": "prefix assets/plugin.bin"
+                    }
                 }),
             )
             .unwrap();
@@ -1683,6 +1722,50 @@ mod tests {
     }
 
     #[test]
+    fn projects_only_exact_plugin_storage_asset_values_once() {
+        let replacements = HashMap::from([
+            (
+                "assets/direct.bin".to_owned(),
+                "remote/direct.bin".to_owned(),
+            ),
+            (
+                "assets/chain.bin".to_owned(),
+                "assets/chain-step.bin".to_owned(),
+            ),
+            (
+                "assets/chain-step.bin".to_owned(),
+                "remote/chain-final.bin".to_owned(),
+            ),
+            ("assets/proto.bin".to_owned(), "remote/proto.bin".to_owned()),
+            (
+                "assets/windows.bin".to_owned(),
+                "remote/windows.bin".to_owned(),
+            ),
+        ]);
+        let mut storage = json!({
+            "direct": "assets/direct.bin",
+            "nested": ["assets/chain.bin", "prefix assets/direct.bin"],
+            "windows": "assets\\windows.bin",
+            "assets/direct.bin": "object-key",
+            "__proto__": "assets/proto.bin",
+            "serialized": "{\"path\":\"assets/direct.bin\"}"
+        });
+
+        project_plugin_storage_resources(&mut storage, &replacements);
+
+        assert_eq!(storage["direct"], json!("remote/direct.bin"));
+        assert_eq!(storage["nested"][0], json!("assets/chain-step.bin"));
+        assert_eq!(storage["nested"][1], json!("prefix assets/direct.bin"));
+        assert_eq!(storage["assets/direct.bin"], json!("object-key"));
+        assert_eq!(storage["windows"], json!("remote/windows.bin"));
+        assert_eq!(storage["__proto__"], json!("remote/proto.bin"));
+        assert_eq!(
+            storage["serialized"],
+            json!("{\"path\":\"assets/direct.bin\"}")
+        );
+    }
+
+    #[test]
     fn projects_non_group_character_resources_without_touching_unrelated_values() {
         let replacements = HashMap::from([
             ("old".to_owned(), "new".to_owned()),
@@ -1754,7 +1837,13 @@ mod tests {
             projection_fixture(false);
         let (_expected_directory, expected_store, _expected_revision, expected_lease) =
             projection_fixture(true);
-        let replacements = HashMap::from([("old".to_owned(), "new".to_owned())]);
+        let replacements = HashMap::from([
+            ("old".to_owned(), "new".to_owned()),
+            (
+                "assets/plugin.bin".to_owned(),
+                "remote/assets/plugin.bin".to_owned(),
+            ),
+        ]);
         let (source_connection, source_target) =
             source_store.read_view(Some(&source_lease)).unwrap();
 
@@ -1782,13 +1871,28 @@ mod tests {
         assert_eq!(blocks[0].value["unrelated"], json!("old"));
         assert_eq!(blocks[2].value[0]["assets"][0][1], json!("new"));
         assert_eq!(blocks[4].value[0]["resource"], json!("old"));
-        assert_eq!(blocks[5].value["resource"], json!("old"));
+        assert_eq!(
+            blocks[5].value["resource"],
+            json!("remote/assets/plugin.bin")
+        );
+        assert_eq!(blocks[5].value["prose"], json!("prefix assets/plugin.bin"));
         assert_eq!(blocks[6].value["image"], json!("new"));
         assert_eq!(blocks[6].value["unrelated"], json!("old"));
         assert_eq!(blocks[6].value["chats"][0]["name"], json!("old"));
         assert_eq!(
             blocks[6].value["chats"][0]["message"][0]["data"],
             json!("old")
+        );
+
+        let source_after_projection = source_store.export_risu_save(&source_lease, false).unwrap();
+        let source_blocks = read_blocks(Path::new(&source_after_projection.path));
+        assert_eq!(
+            source_blocks[5].value["resource"],
+            json!("assets/plugin.bin")
+        );
+        assert_eq!(
+            source_blocks[5].value["prose"],
+            json!("prefix assets/plugin.bin")
         );
     }
 
