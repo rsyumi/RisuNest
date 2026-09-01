@@ -63,6 +63,31 @@ fn snapshots_create_list_and_restore_on_reopen() {
 }
 
 #[test]
+fn snapshot_delete_requires_a_listed_top_level_snapshot_and_removes_its_sidecar() {
+    let (directory, store, _) = open_fixture();
+    let created = store
+        .snapshot_create("delete-test")
+        .expect("create snapshot");
+    let snapshot = std::path::PathBuf::from(&created.path);
+    let sidecar =
+        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(&snapshot);
+    assert!(sidecar.is_file());
+
+    store
+        .snapshot_delete(&snapshot)
+        .expect("delete listed snapshot");
+    assert!(!snapshot.exists());
+    assert!(!sidecar.exists());
+
+    let nested = directory
+        .path()
+        .join("persistent/snapshots/nested/not-a-snapshot.db");
+    std::fs::create_dir_all(nested.parent().expect("nested parent")).expect("create nested parent");
+    std::fs::write(&nested, b"not a snapshot").expect("write nested file");
+    assert!(store.snapshot_delete(&nested).is_err());
+}
+
+#[test]
 fn snapshot_creation_persists_asset_roots_before_returning() {
     let (directory, store, _) = open_fixture();
     let generation = super::active_generation(&store.connection).expect("read active generation");

@@ -89,19 +89,63 @@ pub(crate) fn list_backups(app_root: &Path) -> Result<Vec<PeerBackupInfo>, PeerS
     Ok(backups)
 }
 
-fn operation_references(app_root: &Path, candidate: &Path) -> bool {
-    let wanted = candidate.to_string_lossy();
-    [
-        app_root.join("peer-bidirectional/operation.json"),
-        app_root.join("peer-clone/operation.json"),
-    ]
-    .iter()
-    .any(|path| {
-        regular_file(path).is_some_and(|metadata| metadata.len() <= 1_048_576)
-            && fs::read_to_string(path)
-                .map(|body| body.contains(wanted.as_ref()))
-                .unwrap_or(true)
-    })
+fn normalize_operation_path(app_root: &Path, path: &str) -> Result<PathBuf, PeerSyncError> {
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        app_root.join(path)
+    };
+    fs::canonicalize(candidate).map_err(|error| PeerSyncError::Storage(error.to_string()))
+}
+
+fn operation_references(app_root: &Path, candidate: &Path) -> Result<bool, PeerSyncError> {
+    let journal = super::bidirectional_commands::PeerBidirectionalOperationJournal::new(app_root);
+    let Some(operation) = journal.load()? else {
+        return Ok(false);
+    };
+    let candidate =
+        fs::canonicalize(candidate).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    for path in operation.backup_paths() {
+        if normalize_operation_path(app_root, path)? == candidate {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validated_direct_child(
+    root: &Path,
+    target: &Path,
+    file: bool,
+) -> Result<PathBuf, PeerSyncError> {
+    if ordinary_directory(root).is_none() {
+        return Err(PeerSyncError::Validation(
+            "maintenance root is not a plain directory".to_owned(),
+        ));
+    }
+    let root = fs::canonicalize(root).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    let metadata =
+        fs::symlink_metadata(target).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    if link_like(&metadata)
+        || if file {
+            !metadata.is_file()
+        } else {
+            !metadata.is_dir()
+        }
+    {
+        return Err(PeerSyncError::Validation(
+            "maintenance target is not a plain direct child".to_owned(),
+        ));
+    }
+    let target =
+        fs::canonicalize(target).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    if target.parent() != Some(root.as_path()) {
+        return Err(PeerSyncError::Validation(
+            "maintenance target escapes its root".to_owned(),
+        ));
+    }
+    Ok(target)
 }
 
 fn clone_job_exists(app_root: &Path) -> bool {
@@ -129,18 +173,22 @@ pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), Pee
         .ok_or_else(|| {
             PeerSyncError::Validation("peer backup is not currently listed".to_owned())
         })?;
-    if operation_references(app_root, &selected)
+    if operation_references(app_root, &selected)?
         || (selected.starts_with(app_root.join("peer-clone")) && clone_job_exists(app_root))
     {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
-    // Recheck after all validation, so a replacement cannot turn the target into a link.
-    let metadata = regular_file(&selected).ok_or_else(|| {
-        PeerSyncError::Validation("peer backup changed before deletion".to_owned())
-    })?;
-    if metadata.len() == 0 && !selected.exists() {
-        return Ok(());
+    let root = backup_roots(app_root)
+        .into_iter()
+        .find(|root| validated_direct_child(root, &selected, true).is_ok())
+        .ok_or_else(|| {
+            PeerSyncError::Validation("peer backup root is no longer allowed".to_owned())
+        })?;
+    let selected = validated_direct_child(&root, &selected, true)?;
+    if operation_references(app_root, &selected)? {
+        return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
+    let selected = validated_direct_child(&root, &selected, true)?;
     fs::remove_file(selected)?;
     Ok(())
 }
@@ -154,7 +202,7 @@ fn temp_roots(app_root: &Path) -> Vec<(PathBuf, bool)> {
     ]
 }
 
-fn temp_candidates(app_root: &Path) -> Result<Vec<PathBuf>, PeerSyncError> {
+fn temp_candidates(app_root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, PeerSyncError> {
     let mut candidates = Vec::new();
     for (root, clone_activation) in temp_roots(app_root) {
         if ordinary_directory(&root).is_none() {
@@ -169,11 +217,11 @@ fn temp_candidates(app_root: &Path) -> Result<Vec<PathBuf>, PeerSyncError> {
             }
             if ordinary_directory(&path).is_none()
                 || path.join("operation.json").exists()
-                || operation_references(app_root, &path)
+                || operation_references(app_root, &path)?
             {
                 continue;
             }
-            candidates.push(path);
+            candidates.push((root.clone(), path));
         }
     }
     Ok(candidates)
@@ -203,7 +251,7 @@ fn tree_usage(path: &Path) -> Result<PeerTempUsage, PeerSyncError> {
 pub(crate) fn temp_usage(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError> {
     temp_candidates(app_root)?
         .iter()
-        .try_fold(PeerTempUsage::default(), |mut total, path| {
+        .try_fold(PeerTempUsage::default(), |mut total, (_, path)| {
             let usage = tree_usage(path)?;
             total.count += usage.count;
             total.bytes = total.bytes.saturating_add(usage.bytes);
@@ -214,11 +262,13 @@ pub(crate) fn temp_usage(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError
 pub(crate) fn cleanup_temp(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError> {
     let candidates = temp_candidates(app_root)?;
     let mut removed = PeerTempUsage::default();
-    for path in candidates {
+    for (root, path) in candidates {
         let usage = tree_usage(&path)?;
-        if ordinary_directory(&path).is_none() || operation_references(app_root, &path) {
+        let path = validated_direct_child(&root, &path, false)?;
+        if operation_references(app_root, &path)? {
             continue;
         }
+        let path = validated_direct_child(&root, &path, false)?;
         fs::remove_dir_all(&path)?;
         removed.count += usage.count;
         removed.bytes = removed.bytes.saturating_add(usage.bytes);

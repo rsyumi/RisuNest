@@ -796,9 +796,28 @@ pub(crate) fn pds_asset_gc_preview(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     with_store(state, |store| {
-        let page =
-            store.asset_gc_dry_run(128, None, current_time_ms()?, 7 * 24 * 60 * 60 * 1_000)?;
-        Ok(asset_gc_result(page.report))
+        let now = current_time_ms()?;
+        let mut cursor = None;
+        let mut result = AssetGcMaintenanceResult {
+            candidate_count: 0,
+            candidate_bytes: 0,
+            deleted_count: 0,
+            deleted_bytes: 0,
+            blockers: Vec::new(),
+        };
+        loop {
+            let page =
+                store.asset_gc_dry_run(128, cursor.as_deref(), now, 7 * 24 * 60 * 60 * 1_000)?;
+            let page_result = asset_gc_result(page.report);
+            result.candidate_count += page_result.candidate_count;
+            result.candidate_bytes += page_result.candidate_bytes;
+            result.blockers.extend(page_result.blockers);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(result)
     })
 }
 

@@ -46,3 +46,20 @@ fn temporary_cleanup_keeps_backup_and_active_operation_directories() {
     assert!(active.exists());
     assert!(backup.exists());
 }
+
+#[test]
+fn relative_bidirectional_journal_backup_blocks_deletion() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let backup = root.join("peer-bidirectional/backups/referenced.risulossless");
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(&backup, b"backup").expect("write backup");
+    let operation = root.join("peer-bidirectional/operation.json");
+    let id = "00000000-0000-4000-8000-000000000001";
+    fs::write(&operation, format!(r#"{{"phase":"completed","schema":"risunest.peer-bidirectional-operation/v1","result":{{"kind":"done","operationId":"{id}","revision":0,"remoteRevision":0,"transferredObjects":0,"transferredBytes":0,"backups":[{{"packageId":"package","side":"local","path":"peer-bidirectional/backups/referenced.risulossless"}}]}}}}"#)).expect("write operation");
+
+    assert!(
+        matches!(delete_backup(root, &backup), Err(PeerSyncError::Validation(message)) if message == "peer-backup-in-use")
+    );
+    assert!(backup.exists());
+}

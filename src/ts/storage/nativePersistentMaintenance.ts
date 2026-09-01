@@ -27,12 +27,21 @@ export interface NativeStorageBytes {
 export interface NativePersistentStorageStats {
     databaseBytes: number
     assetObjects: NativeStorageBytes
-    assetAliases: Record<string, NativeStorageBytes>
+    assetAliases: NativeStorageAliasStats[]
     coldAliases: NativeStorageBytes
     pluginStorage: NativeStorageBytes
     characters: { active: NativeStorageBytes; trashedCount: number }
     conversations: { count: number; messageCount: number }
-    assetObjectDeletions: Record<string, NativeStorageBytes>
+    assetObjectDeletions: NativeStorageDeletionStats[]
+}
+
+export interface NativeStorageAliasStats extends NativeStorageBytes {
+    kind: string
+    inlayType: string | null
+}
+
+export interface NativeStorageDeletionStats extends NativeStorageBytes {
+    state: string
 }
 
 export interface NativeAssetGcResult {
