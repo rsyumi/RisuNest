@@ -852,12 +852,16 @@ where
     ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
         let _operation = self.lock_operation()?;
         if !permissions.read {
-            return self.fail(
-                DeviceSyncErrorCategory::InvalidConfiguration,
-                PeerSyncError::Validation(
-                    "device sync sharing requires read permission".to_owned(),
-                ),
+            let error = PeerSyncError::Validation(
+                "device sync sharing requires read permission".to_owned(),
             );
+            let mut runtime = self.lock_runtime()?;
+            if runtime.phase == DeviceSyncSourcePhase::Running {
+                runtime.latest_error = Some(DeviceSyncErrorCategory::InvalidConfiguration);
+                return Err(error);
+            }
+            drop(runtime);
+            return self.fail(DeviceSyncErrorCategory::InvalidConfiguration, error);
         }
         if self.lock_runtime()?.phase != DeviceSyncSourcePhase::Running {
             return self.fail(

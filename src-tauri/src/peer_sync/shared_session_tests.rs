@@ -1055,7 +1055,7 @@ fn invalid_fixed_url_records_only_the_safe_configuration_category() {
 }
 
 #[test]
-fn unified_transport_rotation_keeps_the_endpoint_and_replaces_only_the_pairing_link() {
+fn invalid_rotation_preserves_the_running_session_and_next_rotation_succeeds() {
     let (root, host) = host();
     let state = DeviceSyncSourceState::new_for_test(
         TransportPreparation {
@@ -1081,6 +1081,38 @@ fn unified_transport_rotation_keeps_the_endpoint_and_replaces_only_the_pairing_l
             bidirectional: false,
         })
         .unwrap();
+    let initial_pairing = state.pairing_for_test().unwrap();
+    let bearer = claim(&initial_pairing, "00000000-0000-4000-8000-000000000032")
+        .json::<serde_json::Value>()
+        .unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let client = reqwest::blocking::Client::new();
+
+    assert!(state
+        .rotate_link(DeviceSyncLinkPermissions {
+            read: false,
+            bidirectional: false,
+        })
+        .is_err());
+    let after_invalid = state.status().unwrap();
+    assert_eq!(after_invalid.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(after_invalid.endpoint, initial.endpoint);
+    assert_eq!(after_invalid.pairing_uri, initial.pairing_uri);
+    assert_eq!(
+        after_invalid.latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/v1/peer/hello", initial_pairing.endpoint))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
 
     let rotated = state
         .rotate_link(DeviceSyncLinkPermissions {
@@ -1093,6 +1125,15 @@ fn unified_transport_rotation_keeps_the_endpoint_and_replaces_only_the_pairing_l
     assert_eq!(rotated.endpoint, initial.endpoint);
     assert_ne!(rotated.pairing_uri, initial.pairing_uri);
     assert!(rotated.expires_at_ms.unwrap() >= initial.expires_at_ms.unwrap());
+    assert_eq!(
+        client
+            .get(format!("{}/v1/peer/hello", initial_pairing.endpoint))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
     state.stop().unwrap();
 }
 
@@ -1403,9 +1444,10 @@ fn unified_stop_retries_tunnel_after_attempting_host_and_all_prepared_cleanup() 
 
 #[test]
 fn device_sync_wire_names_match_the_settings_contract() {
+    let port = available_port();
     let request: DeviceSyncPrepareRequest = serde_json::from_value(serde_json::json!({
         "method": "fixed-url",
-        "fixedPort": 32145,
+        "fixedPort": port,
         "publicBaseUrl": "https://sync.example.com/"
     }))
     .unwrap();
@@ -1414,7 +1456,7 @@ fn device_sync_wire_names_match_the_settings_contract() {
         serde_json::to_value(&request).unwrap(),
         serde_json::json!({
             "method": "fixed-url",
-            "fixedPort": 32145,
+            "fixedPort": port,
             "publicBaseUrl": "https://sync.example.com/"
         })
     );
@@ -1518,8 +1560,9 @@ fn unified_source_revoke_hook_invalidates_an_established_live_bearer() {
 
 #[test]
 fn canonical_registration_uri_has_exact_clone_fields_and_no_bearer() {
+    let port = available_port();
     let pairing = SharedPairingData {
-        endpoint: "http://127.0.0.1:32145".to_owned(),
+        endpoint: format!("http://127.0.0.1:{port}"),
         session_id: "00000000-0000-4000-8000-000000000001".to_owned(),
         manifest_id: "a".repeat(64),
         claim: "b".repeat(64),
@@ -1529,7 +1572,7 @@ fn canonical_registration_uri_has_exact_clone_fields_and_no_bearer() {
     let uri = pairing.canonical_uri();
 
     assert!(uri.starts_with("risuailocal://peer-clone/v2?"));
-    assert!(uri.contains("endpoint=http%3A%2F%2F127.0.0.1%3A32145"));
+    assert!(uri.contains(&format!("endpoint=http%3A%2F%2F127.0.0.1%3A{port}")));
     assert!(uri.contains("session=00000000-0000-4000-8000-000000000001"));
     assert!(uri.contains(&format!("manifest={}", "a".repeat(64))));
     assert!(uri.ends_with(&format!("#claim={}", "b".repeat(64))));
@@ -1539,7 +1582,7 @@ fn canonical_registration_uri_has_exact_clone_fields_and_no_bearer() {
 #[test]
 fn one_listener_routes_all_lanes_and_hello_returns_exact_descriptors() {
     let (_root, mut host) = host();
-    let pairing = host.start_fixed_loopback(32145).unwrap();
+    let pairing = host.start_fixed_loopback(available_port()).unwrap();
     assert!(pairing.expires_at_ms > 0);
     let response = claim(&pairing, "00000000-0000-4000-8000-000000000020");
     assert!(response.status().is_success());
@@ -1627,15 +1670,16 @@ fn fixed_port_rejects_zero_and_rotation_invalidates_only_pending_claim() {
     assert!(shared
         .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 0)
         .is_err());
+    let port = available_port();
     let pairing = shared
-        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 32146)
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, port)
         .unwrap();
     let advertised = validate_lan_endpoint(&pairing.endpoint).unwrap();
     assert_eq!(advertised, pairing.endpoint);
     assert!(!advertised.contains("0.0.0.0"));
     let (_other_root, mut other) = host();
     assert!(other
-        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 32146)
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, port)
         .is_err());
     let established = claim(&pairing, "00000000-0000-4000-8000-000000000021");
     let bearer = established.json::<serde_json::Value>().unwrap()["bearer"]
@@ -1682,7 +1726,7 @@ fn fixed_port_rejects_zero_and_rotation_invalidates_only_pending_claim() {
 #[test]
 fn expired_link_is_rejected_by_monotonic_enforcement() {
     let (_root, mut host) = host();
-    let pairing = host.start_fixed_loopback(32147).unwrap();
+    let pairing = host.start_fixed_loopback(available_port()).unwrap();
     host.expire_link_for_test();
     assert_eq!(
         claim(&pairing, "00000000-0000-4000-8000-000000000023").status(),
@@ -1695,7 +1739,7 @@ fn expired_link_is_rejected_by_monotonic_enforcement() {
 fn fixed_lan_advertises_the_reachable_address_not_wildcard() {
     let (_root, mut host) = host();
     let pairing = host
-        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 32149)
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, available_port())
         .unwrap();
     assert_eq!(
         validate_lan_endpoint(&pairing.endpoint).unwrap(),
@@ -1716,7 +1760,7 @@ fn permitted_bidirectional_registration_reaches_existing_control() {
         DevicePermissions::read_and_bidirectional(),
     )
     .unwrap();
-    let pairing = host.start_fixed_loopback(32150).unwrap();
+    let pairing = host.start_fixed_loopback(available_port()).unwrap();
     let bearer = claim(&pairing, "00000000-0000-4000-8000-000000000026")
         .json::<serde_json::Value>()
         .unwrap()["bearer"]
@@ -1740,7 +1784,7 @@ fn permitted_bidirectional_registration_reaches_existing_control() {
 #[test]
 fn delta_object_body_uses_the_shared_listener() {
     let (_root, mut host) = host();
-    let pairing = host.start_fixed_loopback(32151).unwrap();
+    let pairing = host.start_fixed_loopback(available_port()).unwrap();
     let bearer = claim(&pairing, "00000000-0000-4000-8000-000000000027")
         .json::<serde_json::Value>()
         .unwrap()["bearer"]
@@ -1777,7 +1821,8 @@ fn delta_object_body_uses_the_shared_listener() {
 #[test]
 fn stop_clears_runtime_and_restart_rehydrates_persisted_bearer() {
     let (_root, mut host) = host();
-    let pairing = host.start_fixed_loopback(32148).unwrap();
+    let port = available_port();
+    let pairing = host.start_fixed_loopback(port).unwrap();
     let bearer = claim(&pairing, "00000000-0000-4000-8000-000000000024")
         .json::<serde_json::Value>()
         .unwrap()["bearer"]
@@ -1785,7 +1830,7 @@ fn stop_clears_runtime_and_restart_rehydrates_persisted_bearer() {
         .unwrap()
         .to_owned();
     host.stop().unwrap();
-    let restarted = host.start_fixed_loopback(32148).unwrap();
+    let restarted = host.start_fixed_loopback(port).unwrap();
     assert_eq!(
         reqwest::blocking::Client::new()
             .get(format!("{}/v1/peer/hello", restarted.endpoint))
