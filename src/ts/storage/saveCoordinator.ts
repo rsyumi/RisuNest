@@ -3266,8 +3266,27 @@ export class SaveCoordinator {
     private advanceCharacterSummaryBaselineForConversation(
         result: PersistentConversationReplacementResult,
     ): void {
+        if (this.windowedCharacterBaseline !== null) {
+            const baseline = this.windowedCharacterBaseline
+            if (
+                baseline.authority.characterId !== result.characterId ||
+                baseline.authority.conversationId === result.conversationId
+            ) return
+            const matches = baseline.shell.chats
+                .map((conversation, index) => ({ conversation, index }))
+                .filter(({ conversation }) => conversation.id === result.conversationId)
+            if (matches.length !== 1) return
+            const summary = canonicalClone(createConversationSummaryStubFromChat(
+                result.characterId,
+                result.conversation,
+                matches[0].index,
+            ))
+            const { message: _message, ...shell } = summary
+            baseline.shell.chats[matches[0].index] = shell
+            baseline.shellCanonical = canonicalJson(baseline.shell)
+            return
+        }
         if (
-            this.windowedCharacterBaseline !== null ||
             this.characterBaselineId !== result.characterId ||
             this.characterBaseline === null
         ) return

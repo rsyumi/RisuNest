@@ -16,8 +16,10 @@ import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import {
     capturePersistentRoot,
     createPersistentDataRuntime,
+    publishPersistentConversationReplacementToWorkingSet,
     type PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
+import { createConversationSummaryStubFromChat } from './conversationResidency'
 
 function makeChat(messageCount: number): Chat {
     return {
@@ -937,6 +939,92 @@ describe('selected conversation lifecycle', () => {
             expect.objectContaining({ id: 'module-a', name: 'Imported module' }),
         ])
         expect((await store.readRoot()).value.modules).toEqual(workingCopy.modules)
+    })
+
+    it('keeps an exact sibling summary replacement aligned through a root flush and restart', async () => {
+        const selectedChat = makeChat(10_000)
+        const siblingChat = {
+            ...makeChat(2),
+            id: 'chat-b',
+            name: 'Sibling',
+        }
+        const selected = makeCharacter(selectedChat)
+        selected.chats.push(siblingChat)
+        const database = {
+            username: 'Windowed sibling fixture',
+            characters: [selected],
+        } as unknown as Database
+        const databaseName = 'selected-windowed-sibling-' + crypto.randomUUID()
+        const store = new IndexedDbPersistentDataStore(
+            databaseName,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(database)
+        let workingCopy = structuredClone(database)
+        workingCopy.characters[0].chats[1] = createConversationSummaryStubFromChat(
+            'char-a',
+            siblingChat,
+            1,
+        )
+        const state: PersistentDataRuntimeStateAdapter = {
+            captureRoot: () => capturePersistentRoot(workingCopy),
+            captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
+            captureCharacter: (id) =>
+                workingCopy.characters.find((character) => character.chaId === id) ?? null,
+            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
+            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
+            replaceDatabase: (next) => {
+                workingCopy = next
+            },
+            publishCharacter: (next) => {
+                workingCopy.characters[0] = next
+            },
+            publishConversation: (_characterId, conversation, nextCharacter) => {
+                if (nextCharacter) workingCopy.characters[0] = nextCharacter
+                else workingCopy.characters[0].chats[0] = conversation
+            },
+            publishConversationReplacement: (result) => {
+                publishPersistentConversationReplacementToWorkingSet(workingCopy, result)
+            },
+            canUseWindowedSelectedConversation: () => true,
+            isMaximumCompatibilityMode: () => false,
+            isConversationOperationActive: () => false,
+        }
+        const runtime = createPersistentDataRuntime({
+            store,
+            state,
+            prepareDatabase: async (candidate) => candidate,
+        })
+        await runtime.initializeActiveWorkingSet(workingCopy)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        const replacement = {
+            ...structuredClone(siblingChat),
+            name: 'Updated sibling',
+            note: 'exact sibling replacement',
+        }
+
+        await runtime.replacePersistentConversation(
+            'char-a',
+            'chat-b',
+            'windowed-sibling-replacement',
+            replacement,
+        )
+        workingCopy.username = 'Unrelated root after sibling'
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingData('windowed-sibling-root')
+
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        const reopened = new IndexedDbPersistentDataStore(
+            databaseName,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await reopened.open()
+        const persisted = await reopened.materializeDatabase()
+        expect(persisted.username).toBe('Unrelated root after sibling')
+        expect(persisted.characters[0].chats[1]).toEqual(replacement)
     })
 
     it('fails persistence closed after both demotion publication and rollback diverge', async () => {
