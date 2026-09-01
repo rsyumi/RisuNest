@@ -14,7 +14,10 @@ import type {
 import type { RisuModule } from '../process/modules'
 import { RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
-import { isConversationSummaryStub } from './conversationResidency'
+import {
+    createConversationSummaryStubFromChat,
+    isConversationSummaryStub,
+} from './conversationResidency'
 import { removeGroupMemberReferences } from './groupMembership'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
@@ -1909,6 +1912,8 @@ export class SaveCoordinator {
 
             const mutationGeneration = this.dirtyGeneration
             const residentBefore = this.captureResidentConversation(characterId, conversationId)
+            const summaryBefore = residentBefore === null &&
+                this.isResidentConversationSummary(characterId, conversationId)
             const current = await this.dependencies.store.readConversation(
                 characterId,
                 conversationId,
@@ -1957,6 +1962,7 @@ export class SaveCoordinator {
             }, {
                 preservePendingWork: this.dirtyGeneration !== mutationGeneration,
                 residentBefore,
+                summaryBefore,
             })
             return true
         })
@@ -2453,7 +2459,7 @@ export class SaveCoordinator {
             } else if (
                 captured.character &&
                 (
-                    !this.completeSelectedCaptureMatchesBaseline(captured) ||
+                    captured.characterCanonical !== this.characterBaseline ||
                     recordedConversations !== null
                 )
             ) {
@@ -2856,6 +2862,15 @@ export class SaveCoordinator {
         }
     }
 
+    private isResidentConversationSummary(
+        characterId: string,
+        conversationId: string,
+    ): boolean {
+        return this.dependencies.captureCharacter(characterId)?.chats.some((candidate) =>
+            candidate.id === conversationId && isConversationSummaryStub(candidate),
+        ) === true
+    }
+
     private residentConversationsMatch(
         left: { canonical: string } | null,
         right: { canonical: string } | null,
@@ -2868,12 +2883,16 @@ export class SaveCoordinator {
         options: {
             preservePendingWork?: boolean
             residentBefore?: { conversation: Chat; canonical: string } | null
+            summaryBefore?: boolean
         } = {},
     ): Promise<void> {
         this.currentRevision = result.revision
         this.dirtyGeneration++
         this.dependencies.publishConversationReplacement?.(result)
         this.advanceCharacterBaselineForConversation(result, options.residentBefore ?? null)
+        if (options.summaryBefore === true) {
+            this.advanceCharacterSummaryBaselineForConversation(result)
+        }
         if (!options.preservePendingWork) this.pendingByteCount = 0
         this.lastBackgroundErrorMessage = null
         this.dependencies.onLocalRevision?.(result.revision)
@@ -3244,6 +3263,27 @@ export class SaveCoordinator {
         this.characterBaseline = canonicalJson(baseline)
     }
 
+    private advanceCharacterSummaryBaselineForConversation(
+        result: PersistentConversationReplacementResult,
+    ): void {
+        if (
+            this.windowedCharacterBaseline !== null ||
+            this.characterBaselineId !== result.characterId ||
+            this.characterBaseline === null
+        ) return
+        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+        const index = baseline.chats.findIndex(
+            (conversation) => conversation.id === result.conversationId,
+        )
+        if (index < 0) return
+        baseline.chats[index] = canonicalClone(createConversationSummaryStubFromChat(
+            result.characterId,
+            result.conversation,
+            index,
+        ))
+        this.characterBaseline = canonicalJson(baseline)
+    }
+
     private removeGroupCharacterReference(
         character: CharacterDetail | CompleteCharacter,
         characterId: string,
@@ -3485,26 +3525,7 @@ export class SaveCoordinator {
                 )
         }
         return captured.windowedCharacter === null
-            && this.completeSelectedCaptureMatchesBaseline(captured)
-    }
-
-    private completeSelectedCaptureMatchesBaseline(captured: CapturedState): boolean {
-        if (captured.characterCanonical === this.characterBaseline) return true
-        if (
-            captured.character === null ||
-            this.characterBaseline === null ||
-            captured.character.chaId !== this.characterBaselineId
-        ) return false
-        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
-        if (captured.character.chats.length !== baseline.chats.length) return false
-        const projected = canonicalClone(captured.character)
-        for (let index = 0; index < projected.chats.length; index++) {
-            const conversationId = projected.chats[index]?.id
-            if (!conversationId || !captured.conversationStubIds.has(conversationId)) continue
-            if (baseline.chats[index]?.id !== conversationId) return false
-            projected.chats[index] = baseline.chats[index]
-        }
-        return canonicalJson(projected) === this.characterBaseline
+            && captured.characterCanonical === this.characterBaseline
     }
 
     private projectConversationMutations(

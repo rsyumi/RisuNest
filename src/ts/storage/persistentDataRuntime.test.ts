@@ -337,6 +337,10 @@ describe('persistent conversation replacement publication', () => {
         } as any)
         const selectedCharacterId = harness.database.characters[0].chaId
         const selectedConversationId = harness.database.characters[0].chats[0].id
+        expect(harness.runtime.captureSelectedConversationTarget()).toMatchObject({
+            characterId: selectedCharacterId,
+            conversationId: selectedConversationId,
+        })
         const replacement = {
             ...structuredClone(harness.database.characters[1].chats[0]),
             name: 'Runtime replacement',
@@ -352,6 +356,10 @@ describe('persistent conversation replacement publication', () => {
 
         expect(harness.database.characters[0].chaId).toBe(selectedCharacterId)
         expect(harness.database.characters[0].chats[0].id).toBe(selectedConversationId)
+        expect(harness.runtime.captureSelectedConversationTarget()).toMatchObject({
+            characterId: selectedCharacterId,
+            conversationId: selectedConversationId,
+        })
         expect(harness.database.characters[1].chats[0]).toEqual(replacement)
         expect(harness.store.commit).toHaveBeenCalledWith(expect.objectContaining({
             expectedRevision: 1,
