@@ -654,6 +654,38 @@ impl PeerDeltaCommandState {
         Ok(())
     }
 
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
+        if let Ok(runtime) = self.lock() {
+            if let Some(source) = runtime.source.as_ref() {
+                let _ = source.control.revoke(device_id);
+            }
+        }
+    }
+
+    pub(crate) fn configure_v2_registry(
+        &self,
+        app_root: &Path,
+        name: &str,
+        permissions: super::device_registry::DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock()?;
+        let source = runtime.source.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer delta source is not prepared".to_owned())
+        })?;
+        if source.phase != PeerDeltaSourcePhase::Prepared {
+            return Err(PeerSyncError::Protocol(
+                "peer delta source is not prepared".to_owned(),
+            ));
+        }
+        source
+            .host
+            .as_mut()
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("peer delta source host is unavailable".to_owned())
+            })?
+            .enable_v2_registry(app_root, name, permissions)
+    }
+
     fn status(&self) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
         let _operation = self.lock_lifecycle_operation()?;
         self.status_inner()
@@ -1350,7 +1382,15 @@ pub async fn peer_delta_prepare(
             // prepared source.
             guard.disarm();
         }
-        prepared
+        let status = prepared?;
+        state
+            .configure_v2_registry(
+                &app_root,
+                super::device_registry::platform_device_name(),
+                super::device_registry::DevicePermissions::read(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(status)
     })
     .await
     .map_err(|error| format!("peer delta source preparation worker failed: {error}"))?

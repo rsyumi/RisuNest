@@ -1,6 +1,7 @@
 use super::device_registry::{
-    DevicePermissions, IncomingSource, IncomingSourceRegistry, OutgoingDevice,
-    OutgoingDeviceRegistry,
+    incoming_source_summaries, outgoing_device_summaries, remove_incoming_source,
+    revoke_outgoing_device, DevicePermissions, IncomingSource, IncomingSourceRegistry,
+    OutgoingDevice, OutgoingDeviceRegistry,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -256,6 +257,68 @@ fn concurrent_registry_saves_do_not_collide_on_a_temp_name() {
         handle.join().unwrap().unwrap();
     }
     OutgoingDeviceRegistry::load(root.path()).unwrap();
+}
+
+#[test]
+fn registry_command_views_are_directional_and_never_serialize_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let mut outgoing = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    outgoing
+        .upsert(OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Target".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 1,
+            last_seen_ms: 2,
+            total_bytes: 3,
+        })
+        .unwrap();
+    outgoing.save().unwrap();
+    let mut incoming = IncomingSourceRegistry::load(root.path()).unwrap();
+    incoming
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Source".into(),
+            endpoint: "http://127.0.0.1:32145".into(),
+            bearer: "b".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 4,
+            total_bytes: 5,
+        })
+        .unwrap();
+    incoming.save().unwrap();
+
+    let outgoing = outgoing_device_summaries(root.path()).unwrap();
+    let incoming = incoming_source_summaries(root.path()).unwrap();
+
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].device_id, TARGET_ID);
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].device_id, SOURCE_ID);
+    let outgoing_json = serde_json::to_string(&outgoing).unwrap();
+    let incoming_json = serde_json::to_string(&incoming).unwrap();
+    assert!(!outgoing_json.contains("bearer"));
+    assert!(!incoming_json.contains("bearer"));
+    assert!(!incoming_json.contains("127.0.0.1"));
+
+    let mut revoked_live = Vec::new();
+    revoke_outgoing_device(root.path(), TARGET_ID, |device_id| {
+        revoked_live.push(device_id.to_owned())
+    })
+    .unwrap();
+    remove_incoming_source(root.path(), SOURCE_ID).unwrap();
+
+    assert_eq!(revoked_live, vec![TARGET_ID]);
+    assert!(OutgoingDeviceRegistry::load(root.path())
+        .unwrap()
+        .devices()
+        .is_empty());
+    assert!(IncomingSourceRegistry::load(root.path())
+        .unwrap()
+        .sources()
+        .is_empty());
+    assert!(root.path().join("peer-sync/sources.json").is_file());
 }
 
 #[cfg(unix)]

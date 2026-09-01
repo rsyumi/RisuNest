@@ -1,8 +1,16 @@
-use super::lan::{validate_lan_endpoint, LanCloneHostControl, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
 use super::{
     activate_downloaded_clone, prepare_lossless_clone_session, CloneTargetAdapter, LanCloneClient,
     LanCloneHost, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
     TransferCancellation,
+};
+use super::{
+    bidirectional_commands::PeerBidirectionalCommandState,
+    delta_commands::PeerDeltaCommandState,
+    device_registry::{
+        incoming_source_summaries, outgoing_device_summaries, remove_incoming_source,
+        revoke_outgoing_device, IncomingSourceSummary, OutgoingDeviceSummary,
+    },
+    lan::{validate_lan_endpoint, LanCloneHostControl, NAMED_TUNNEL_ORIGIN_UNAVAILABLE},
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -463,6 +471,38 @@ impl PeerCloneCommandState {
         if let Some(host) = host.as_mut() {
             let _ = host.stop();
         }
+    }
+
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
+        if let Ok(runtime) = self.lock_runtime() {
+            if let Some(source) = runtime.source.as_ref() {
+                let _ = source.control.revoke(device_id);
+            }
+        }
+    }
+
+    pub(crate) fn configure_v2_registry(
+        &self,
+        app_root: &Path,
+        name: &str,
+        permissions: super::device_registry::DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let source = runtime.source.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone source is not prepared".to_owned())
+        })?;
+        if source.phase != PeerCloneSourcePhase::Prepared {
+            return Err(PeerSyncError::Protocol(
+                "peer clone source is not prepared".to_owned(),
+            ));
+        }
+        source
+            .host
+            .as_mut()
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("peer clone source host is unavailable".to_owned())
+            })?
+            .enable_v2_registry(app_root, name, permissions)
     }
 
     pub fn prepare_source(
@@ -2108,6 +2148,48 @@ fn target_request(
     }
 }
 
+// Task 12 registers these commands. Keeping them callable here lets the
+// settings controller list registrations even while every source is stopped.
+#[tauri::command]
+pub fn peer_sync_outgoing_devices(app: AppHandle) -> Result<Vec<OutgoingDeviceSummary>, String> {
+    let (app_root, _) = app_peer_root(&app)?;
+    outgoing_device_summaries(&app_root).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn peer_sync_revoke_outgoing_device(
+    app: AppHandle,
+    clone_state: State<'_, PeerCloneCommandState>,
+    delta_state: State<'_, PeerDeltaCommandState>,
+    bidirectional_state: State<'_, PeerBidirectionalCommandState>,
+    device_id: String,
+) -> Result<(), String> {
+    let (app_root, _) = app_peer_root(&app)?;
+    let clone_state = clone_state.inner().clone();
+    let delta_state = delta_state.inner().clone();
+    let bidirectional_state = bidirectional_state.inner().clone();
+    revoke_outgoing_device(&app_root, &device_id, move |device_id| {
+        clone_state.revoke_registered_device(device_id);
+        delta_state.revoke_registered_device(device_id);
+        bidirectional_state.revoke_registered_device(device_id);
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn peer_sync_incoming_sources(app: AppHandle) -> Result<Vec<IncomingSourceSummary>, String> {
+    let (app_root, _) = app_peer_root(&app)?;
+    incoming_source_summaries(&app_root).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn peer_sync_remove_incoming_source(app: AppHandle, device_id: String) -> Result<(), String> {
+    let (app_root, _) = app_peer_root(&app)?;
+    // Only the global registry is changed. Resumable v1 job credentials are
+    // deliberately left untouched until their successful v2 hello migration.
+    remove_incoming_source(&app_root, &device_id).map_err(|error| error.to_string())
+}
+
 #[tauri::command(async)]
 pub async fn peer_clone_prepare(
     app: AppHandle,
@@ -2122,7 +2204,15 @@ pub async fn peer_clone_prepare(
                 .prepare_source(store, &cas, &peer_root, &NeverCancelled)
                 .map_err(as_store_error)
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        state
+            .configure_v2_registry(
+                &app_root,
+                super::device_registry::platform_device_name(),
+                super::device_registry::DevicePermissions::read(),
+            )
+            .map_err(|error| error.to_string())?;
+        state.source_status().map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("peer clone source preparation worker failed: {error}"))?

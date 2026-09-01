@@ -5044,6 +5044,38 @@ impl PeerBidirectionalCommandState {
         Ok(())
     }
 
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
+        if let Ok(runtime) = self.lock() {
+            if let Some(source) = runtime.source.as_ref() {
+                let _ = source.control.revoke(device_id);
+            }
+        }
+    }
+
+    pub(crate) fn configure_v2_registry(
+        &self,
+        app_root: &Path,
+        name: &str,
+        permissions: super::device_registry::DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock()?;
+        let source = runtime.source.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer bidirectional source is not prepared".to_owned())
+        })?;
+        if source.phase != PeerBidirectionalSourcePhase::Prepared {
+            return Err(PeerSyncError::Protocol(
+                "peer bidirectional source is not prepared".to_owned(),
+            ));
+        }
+        source
+            .host
+            .as_mut()
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("peer bidirectional source host is unavailable".to_owned())
+            })?
+            .enable_v2_registry(app_root, name, permissions)
+    }
+
     #[cfg(any(target_os = "android", test))]
     fn attach_source_foreground(
         &self,
@@ -6039,9 +6071,17 @@ pub async fn peer_bidirectional_prepare(
             built.manifest_bytes,
         )
         .map_err(|error| error.to_string())?;
-        state
+        let status = state
             .install_source(host, &session_id, &manifest_id)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        state
+            .configure_v2_registry(
+                &root,
+                super::device_registry::platform_device_name(),
+                super::device_registry::DevicePermissions::read_and_bidirectional(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(status)
     })
     .await
     .map_err(|error| format!("peer bidirectional source preparation worker failed: {error}"))?

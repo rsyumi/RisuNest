@@ -91,6 +91,30 @@ pub(crate) struct IncomingSource {
     pub(crate) total_bytes: u64,
 }
 
+// These are the only registry records that cross the native command boundary.
+// Credentials and endpoints remain native-only so a future controller can use
+// them without exposing them to the WebView.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutgoingDeviceSummary {
+    pub(crate) device_id: String,
+    pub(crate) name: String,
+    pub(crate) permissions: DevicePermissions,
+    pub(crate) created_at_ms: u64,
+    pub(crate) last_seen_ms: u64,
+    pub(crate) total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingSourceSummary {
+    pub(crate) device_id: String,
+    pub(crate) name: String,
+    pub(crate) permissions: DevicePermissions,
+    pub(crate) last_seen_ms: u64,
+    pub(crate) total_bytes: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OutgoingFile {
@@ -167,6 +191,7 @@ impl OutgoingDeviceRegistry {
     }
 
     pub(crate) fn remove(&mut self, device_id: &str) -> Result<(), PeerSyncError> {
+        validate_id(device_id)?;
         self.devices.retain(|item| item.device_id != device_id);
         Ok(())
     }
@@ -243,6 +268,7 @@ impl IncomingSourceRegistry {
     }
 
     pub(crate) fn remove(&mut self, device_id: &str) -> Result<(), PeerSyncError> {
+        validate_id(device_id)?;
         self.sources.retain(|item| item.device_id != device_id);
         Ok(())
     }
@@ -256,6 +282,62 @@ impl IncomingSourceRegistry {
             },
         )
     }
+}
+
+pub(crate) fn outgoing_device_summaries(
+    app_root: &Path,
+) -> Result<Vec<OutgoingDeviceSummary>, PeerSyncError> {
+    Ok(OutgoingDeviceRegistry::load(app_root)?
+        .devices()
+        .iter()
+        .map(|device| OutgoingDeviceSummary {
+            device_id: device.device_id.clone(),
+            name: device.name.clone(),
+            permissions: device.permissions.clone(),
+            created_at_ms: device.created_at_ms,
+            last_seen_ms: device.last_seen_ms,
+            total_bytes: device.total_bytes,
+        })
+        .collect())
+}
+
+pub(crate) fn incoming_source_summaries(
+    app_root: &Path,
+) -> Result<Vec<IncomingSourceSummary>, PeerSyncError> {
+    Ok(IncomingSourceRegistry::load(app_root)?
+        .sources()
+        .iter()
+        .map(|source| IncomingSourceSummary {
+            device_id: source.device_id.clone(),
+            name: source.name.clone(),
+            permissions: source.permissions.clone(),
+            last_seen_ms: source.last_seen_ms,
+            total_bytes: source.total_bytes,
+        })
+        .collect())
+}
+
+pub(crate) fn revoke_outgoing_device(
+    app_root: &Path,
+    device_id: &str,
+    revoke_live: impl FnOnce(&str),
+) -> Result<(), PeerSyncError> {
+    validate_id(device_id)?;
+    let mut registry = OutgoingDeviceRegistry::load(app_root)?;
+    registry.remove(device_id)?;
+    registry.save()?;
+    revoke_live(device_id);
+    Ok(())
+}
+
+pub(crate) fn remove_incoming_source(
+    app_root: &Path,
+    device_id: &str,
+) -> Result<(), PeerSyncError> {
+    validate_id(device_id)?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    registry.remove(device_id)?;
+    registry.save()
 }
 
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
@@ -276,6 +358,16 @@ pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSy
         fs::remove_file(legacy)?;
     }
     Ok(device_id)
+}
+
+pub(crate) fn platform_device_name() -> &'static str {
+    match std::env::consts::OS {
+        "android" => "Android",
+        "windows" => "Windows",
+        "macos" => "macOS",
+        "linux" => "Linux",
+        _ => "Desktop",
+    }
 }
 
 fn peer_root(app_root: &Path) -> PathBuf {
