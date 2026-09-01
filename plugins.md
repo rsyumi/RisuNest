@@ -645,10 +645,10 @@ await Risuai.setArgument('max_retries', 5);
 
 ### Plugin Storage (Recommended)
 
-`pluginStorage` is **save-file specific** and **syncs between devices**:
+`pluginStorage` is a **save-file shared keyspace**. Its values are included in save snapshots and sync with the same save file on another device, so large values increase snapshot and sync work. It is not automatically namespaced by plugin name, so new plugins should use a stable key prefix such as `my-plugin:`.
 
 ```javascript
-// All operations are synchronous (wrapper around sync storage)
+// All operations are asynchronous across the plugin iframe boundary
 await Risuai.pluginStorage.setItem('user_preference', 'dark_mode');
 await Risuai.pluginStorage.setItem('last_sync', Date.now().toString());
 
@@ -660,6 +660,8 @@ await Risuai.pluginStorage.removeItem('last_sync');
 await Risuai.pluginStorage.clear(); // Remove all items
 ```
 
+`clear()` removes every key in the save-file shared keyspace, including keys written by other plugins. Prefer `removeItem()` for keys your plugin owns.
+
 **Use `pluginStorage` when:**
 - You want data to sync across devices
 - Data is specific to a save file
@@ -667,7 +669,7 @@ await Risuai.pluginStorage.clear(); // Remove all items
 
 ### Safe Local Storage
 
-`safeLocalStorage` is **device-specific** and **shared between plugins**:
+`safeLocalStorage` is **device-local**, shared between plugins, and string-only. It is not included in save snapshots and does not sync to another device, making it suitable for device-specific cache or settings data. Use a stable key prefix when data may coexist with another plugin.
 
 ```javascript
 // Same API as pluginStorage
@@ -681,6 +683,8 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 - Sharing data between plugins
 
 ### Local Plugin Storage
+
+`getLocalPluginStorage()` is also device-local and is not included in save snapshots or cross-device sync. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. Its keys are shared under the safe local plugin-storage prefix, so use a stable plugin prefix and do not call `clear()` unless deleting every value in that local shared keyspace is intended.
 
 `getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
@@ -730,6 +734,10 @@ await Risuai.setDatabaseLite(db);
 ```
 
 `getDatabase()` returns `null` if the user has not granted database access consent.
+
+`getDatabase()` is the explicit full compatibility snapshot boundary. The default `'all'` request includes `characters`; requesting `characters` can temporarily materialize the complete library and use memory proportional to it. All requested fields come from one detached snapshot. In scalable mode that snapshot is one authoritative committed revision; in maximum compatibility mode it includes the current live database, including API v2.1 edits that are not yet persisted. Prefer `queryCharacters`, `queryConversations`, and `queryConversationMessages` for bounded reads.
+
+While maximum compatibility remains active, synchronous API v2.1 writes through the live database Proxy update the in-memory compatibility database first. They are persisted at the existing persistence boundary before maximum compatibility is released, not synchronously at each Proxy assignment. A process crash before that boundary can lose unpersisted edits.
 
 **Allowed database keys:**
 - `characters`
@@ -1141,6 +1149,25 @@ if (interceptor) {
 }
 ```
 
+### Legacy Chat Output Listeners
+
+`addRisuChatListener('output', callback)` is the full-object compatibility listener. It runs after the model output and host-side output transformations. Listeners run sequentially, so a slow callback delays later chat flow. The callback receives the event snapshot supplied for that output event. To remove it, pass the same callback reference to `removeRisuChatListener`.
+
+```javascript
+const onOutput = async ({ chat, messageIndex, characterIndex, chatIndex }) => {
+  const message = chat.message[messageIndex];
+  if (!message) return;
+  console.log('Model said:', message.data);
+  // Persist a replacement through the documented index API when needed.
+  await Risuai.setChatToIndex(characterIndex, chatIndex, chat);
+};
+
+await Risuai.addRisuChatListener('output', onOutput);
+
+// Use the same function object when the listener is no longer needed.
+await Risuai.removeRisuChatListener('output', onOutput);
+```
+
 ### Plugin Lifecycle
 
 #### Cleanup on Unload
@@ -1148,11 +1175,26 @@ if (interceptor) {
 Register a function to run when the plugin is unloaded (e.g., when the user disables it or reloads plugins):
 
 ```javascript
-await Risuai.onUnload(async () => {
-  // Clean up resources, remove event listeners, etc.
-  console.log('Plugin unloading...');
+const root = await Risuai.getRootDocument();
+if (!root) return;
+const button = await root.querySelector('#my-plugin-button');
+const observer = await Risuai.createMutationObserver(async () => {});
+
+await Risuai.onUnload(() => {
+  // Stop host resources before releasing their proxy references.
+  void observer.disconnect();
+
+  // Release host-side remote references after they are no longer needed.
+  button?.release();
+  observer.release();
+  root.release();
+
+  // Release does not remove nodes, styles, or listener registrations that this
+  // plugin created. Remove those resources here too when applicable.
 });
 ```
+
+Calling `release()` makes that proxy unusable and releases its host registry entry. It does not remove a DOM node, unregister an event listener, or disconnect an observer.
 
 #### Reload All Plugins
 

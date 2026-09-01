@@ -461,6 +461,14 @@ interface CustomTextTheme {
 // SafeElement API
 // ============================================================================
 
+interface SafeRemoteRef {
+    /**
+     * Releases the host-side remote reference. The proxy must not be used after release.
+     * This does not remove DOM nodes, listeners, or observers.
+     */
+    release(): void;
+}
+
 /**
  * SafeElement provides secure DOM manipulation with restricted access.
  * All methods are asynchronous.
@@ -484,7 +492,7 @@ interface CustomTextTheme {
  * });
  * ```
  */
-interface SafeElement {
+interface SafeElement extends SafeRemoteRef {
     // ========== Element Manipulation ==========
 
     /**
@@ -937,7 +945,7 @@ interface SafeDocument extends SafeElement {
  * 
  * ```
  */
-interface SafeClassArray<T> {
+interface SafeClassArray<T> extends SafeRemoteRef {
     /**
      * Gets an item at a specific index
      * @param index - Array index (supports negative indexing)
@@ -965,7 +973,7 @@ interface SafeClassArray<T> {
 /**
  * Mutation record from SafeMutationObserver
  */
-interface SafeMutationRecord {
+interface SafeMutationRecord extends SafeRemoteRef {
     /** Type of mutation */
     getType(): Promise<string>;
     /** Target element of mutation */
@@ -982,7 +990,7 @@ type SafeMutationCallback = (mutations: SafeClassArray<SafeMutationRecord>) => v
 /**
  * SafeMutationObserver watches for DOM changes in the main document
  */
-interface SafeMutationObserver {
+interface SafeMutationObserver extends SafeRemoteRef {
     /**
      * Starts observing an element for changes
      * @param element - SafeElement to observe
@@ -1002,7 +1010,9 @@ interface SafeMutationObserver {
 // ============================================================================
 
 /**
- * Plugin-specific storage that syncs with save files
+ * Save-file shared storage that participates in save snapshots and cross-device sync.
+ * It is one keyspace for all plugins in the save file. Use a stable plugin prefix for new keys.
+ * `clear()` removes every key in that shared keyspace.
  *
  * **All methods return Promises** due to iframe message passing.
  *
@@ -1129,8 +1139,8 @@ interface SafeLocalPluginStorage {
 }
 
 /**
- * Device-specific storage shared between plugins
- * Same API as PluginStorage but only supports string values
+ * Device-local string storage shared between plugins. It is not stored in a save file
+ * and does not sync to another device. `clear()` removes every key in this safe-local keyspace.
  *
  * **All methods return Promises** due to iframe message passing.
  *

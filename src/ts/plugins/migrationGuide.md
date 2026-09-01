@@ -79,13 +79,13 @@ If your plugin relies on any of the above APIs, you will need to modify your cod
 - `addEventListener` (proxied to the main window)
 - `removeEventListener` (proxied to the main window)
 
-`safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. still it can be shared between plugins. can also be accessed using `localStorage`.
+`safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. still it can be shared between plugins. can also be accessed using `localStorage`. It is device-local, is not included in save snapshots, and does not sync between devices.
 
 `safeIdbFactory`: A secure wrapper around IndexedDB that restricts access to internal databases. still it can be shared between plugins. can also be accessed using `indexedDB`.
 
 `safeDocument`: A secure wrapper around the Document object that restricts access to sensitive data and methods. still it can be used to create elements, query elements, and manipulate the DOM. can also be accessed using `document`.
 
-`pluginStorage`: A storage object specific to the plugin, which is shared plugins. unlike `safeLocalStorage`, its data is safed safe file wise, not device wise, making it syncable between devices using the same save file.
+`pluginStorage`: A save-file shared keyspace for all plugins. Its values participate in save snapshots and sync with the same save file on another device. It is not automatically namespaced, so use a stable plugin prefix, and remember that `clear()` removes keys written by every plugin.
 - `getItem(key: string): any | null`
 - `setItem(key: string, value: any): void`
 - `removeItem(key: string): void`
@@ -160,7 +160,7 @@ The following APIs from v2.1 are still available in v3.0:
 - `removeRisuReplacer`: Remove a text replacer
 - `safeLocalStorage`: Secure localStorage wrapper (device-specific)
 - `getDatabase`: Get database with limited access
-- `pluginStorage`: Plugin-specific storage (save file-specific, syncable)
+- `pluginStorage`: Save-file shared storage for all plugins (included in snapshots and syncable)
 - `setDatabaseLite`: Set database (lightweight)
 - `setDatabase`: Set database (full)
 - `loadPlugins`: Load additional plugins
@@ -249,12 +249,20 @@ CSS, but cannot guarantee memory independent of library size. The scalable profi
 remove V3 root DOM access, visual APIs, or global CSS compatibility.
 Before leaving maximum compatibility, RisuAI persists a detached complete database snapshot so
 changes made through the live Proxy are durable before compatibility data can be evicted.
+While maximum compatibility remains active, synchronous API v2.1 writes through the live database
+Proxy update the in-memory compatibility database first. They are persisted at the existing
+persistence boundary before maximum compatibility is released, not synchronously at each Proxy
+assignment. A process crash before that boundary can lose unpersisted edits.
 
 `getDatabase()` remains supported as the explicit compatibility snapshot. Requesting
 `characters`, including its default `'all'`, can temporarily materialize the complete library.
 Every requested key comes from the same detached snapshot. Scalable mode uses one authoritative
 committed revision. Maximum compatibility snapshots the current live database, including API v2.1
 edits that have not yet been persisted.
+The default `'all'` request includes `characters`, so `getDatabase(['characters'])` and the default
+`getDatabase()` are explicit full-snapshot cost boundaries and can use memory proportional to the
+complete library. Prefer `queryCharacters`, `queryConversations`, and `queryConversationMessages`
+for bounded reads.
 The bounded query methods flush pending compatibility changes before exposing committed data
 and return cloned values rather than mutable live references. Existing index-based APIs remain
 compatible, but stable IDs and opaque cursors are the scalable path. A denied permission returns
@@ -702,8 +710,9 @@ API v3.0 implements multiple security layers:
    const element = document.querySelector('.my-class')
 
    // New (v3.0)
-   const doc = risuai.getRootDocument()
-   const element = doc.querySelector('.my-class')
+   const doc = await risuai.getRootDocument()
+   if (!doc) return
+   const element = await doc.querySelector('.my-class')
    ```
 
 4. **Handle SafeElement instead of HTMLElement:**
@@ -734,6 +743,20 @@ API v3.0 implements multiple security layers:
    // Store id for later removal
    ```
 
+#### Legacy Chat Output Listeners
+
+`addRisuChatListener('output', callback)` remains available as a legacy full-object listener. Its callbacks run sequentially after host-side output transformations, so a slow callback delays later chat flow. Remove it by passing the same function reference to `removeRisuChatListener`.
+
+```javascript
+const onOutput = async ({ chat, messageIndex }) => {
+    const message = chat.message[messageIndex]
+    if (message) console.log(message.data)
+}
+
+await risuai.addRisuChatListener('output', onOutput)
+await risuai.removeRisuChatListener('output', onOutput)
+```
+
 ### Best Practices
 
 1. **Use new naming conventions**: Prefer `getCharacter`/`setCharacter` over `getChar`/`setChar`
@@ -742,7 +765,7 @@ API v3.0 implements multiple security layers:
 4. **Use pluginStorage for persistence**: Prefer `pluginStorage` over `safeLocalStorage` for syncable data
 5. **Sanitize all user input**: Even though HTML is auto-sanitized, validate data before processing
 6. **Handle async errors**: Wrap async calls in try-catch blocks
-7. **Clean up resources**: Remove event listeners when no longer needed
+7. **Clean up resources**: Disconnect observers and remove event listeners or DOM nodes when no longer needed. Then call `release()` on each remote Safe DOM proxy to release its host registry entry. A released proxy is unusable, and `release()` does not disconnect, unregister, or remove the underlying host resource.
 
 ### Example: Complete v3.0 Plugin
 
