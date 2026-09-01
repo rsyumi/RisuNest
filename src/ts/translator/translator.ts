@@ -536,9 +536,18 @@ function needSuperChunkedTranslate(database: Database = getDatabase()){
     return database.translatorType === 'deeplX'
 }
 
+// Deferred inlay slot markers embed a per-render counter, so two parses of
+// the same message can differ only by slot numbers. Strip them so cache keys
+// stay stable across renders and match key computations that parse without
+// a marker registry (e.g. translation edit in Chat.svelte).
+const inlaySlotMarkerRegex = /\sdata-risu-inlay-slot="[0-9a-z]+"/g
+function normalizeLLMCacheKey(key:string):string{
+    return key.replace(inlaySlotMarkerRegex, '')
+}
+
 async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext):Promise<string>{
     if(!arg.regenerate){
-        const cacheMatch = await LLMCacheStorage.getItem(text)
+        const cacheMatch = await LLMCacheStorage.getItem(normalizeLLMCacheKey(text))
         if(cacheMatch !== null){
             return cacheMatch as string
         }
@@ -609,12 +618,12 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
     const result = rq.result.replace(/<style-data style-index="(\d+)" ?\/?>/g, (match, p1) => {
         return styleDecodes[parseInt(p1)] ?? ''
     }).replace(/<\/style-data>/g, '')
-    await LLMCacheStorage.setItem(text, result)
+    await LLMCacheStorage.setItem(normalizeLLMCacheKey(text), result)
     return result
 }
 
 export async function getLLMCache(text:string):Promise<string | null>{
-    return await LLMCacheStorage.getItem(text)
+    return await LLMCacheStorage.getItem(normalizeLLMCacheKey(text))
 }
 
 export async function searchLLMCache(partialKey:string):Promise<{key: string, value: string}[]>{
@@ -628,7 +637,7 @@ export async function searchLLMCache(partialKey:string):Promise<{key: string, va
 }
 
 export async function setLLMCache(key:string, value:string):Promise<void>{
-    await LLMCacheStorage.setItem(key, value)
+    await LLMCacheStorage.setItem(normalizeLLMCacheKey(key), value)
 }
 
 export async function exportLLMCacheAsJSON():Promise<Record<string, string>>{
@@ -644,7 +653,7 @@ export async function importLLMCacheFromJSON(data:Record<string, string>):Promis
     let failed = 0
     for(const [key, value] of Object.entries(data)){
         try{
-            await LLMCacheStorage.setItem(key, value)
+            await LLMCacheStorage.setItem(normalizeLLMCacheKey(key), value)
             count++
         }catch{
             failed++
