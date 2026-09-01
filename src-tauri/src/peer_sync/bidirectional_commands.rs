@@ -5674,13 +5674,31 @@ fn claim_bidirectional_client(
     }
 }
 
-fn prepare_product_source_host(
+pub(crate) struct PreparedSharedBidirectionalSource {
+    session: Option<PreparedBidirectionalLogicalLanSession>,
+}
+
+impl PreparedSharedBidirectionalSource {
+    pub(crate) fn take_session(
+        &mut self,
+    ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+        self.session.take().ok_or_else(|| {
+            PeerSyncError::Protocol("shared bidirectional source session is unavailable".to_owned())
+        })
+    }
+
+    pub(crate) fn cleanup(&mut self) {
+        self.session.take();
+    }
+}
+
+fn prepare_product_source_session(
     app_root: &Path,
     store: PersistentStore,
     source: LogicalDeltaSourceSession,
     source_device_id: &str,
     manifest_bytes: Vec<u8>,
-) -> Result<(LanCloneHost, String, String), PeerSyncError> {
+) -> Result<(PreparedBidirectionalLogicalLanSession, String, String), PeerSyncError> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let manifest_id = source.manifest_hash().to_owned();
     let objects = source.objects().to_vec();
@@ -5699,11 +5717,73 @@ fn prepare_product_source_host(
         Box::new(source),
         control,
     )?;
+    Ok((prepared, session_id, manifest_id))
+}
+
+fn prepare_product_source_host(
+    app_root: &Path,
+    store: PersistentStore,
+    source: LogicalDeltaSourceSession,
+    source_device_id: &str,
+    manifest_bytes: Vec<u8>,
+) -> Result<(LanCloneHost, String, String), PeerSyncError> {
+    let (prepared, session_id, manifest_id) =
+        prepare_product_source_session(app_root, store, source, source_device_id, manifest_bytes)?;
     Ok((
         LanCloneHost::prepare_bidirectional_logical(prepared),
         session_id,
         manifest_id,
     ))
+}
+
+pub(crate) fn prepare_shared_bidirectional_source(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    expected_revision: i64,
+) -> Result<PreparedSharedBidirectionalSource, PeerSyncError> {
+    let retained = PeerBidirectionalOperationJournal::new(app_root).load()?;
+    let source_device_id = super::delta_commands::canonical_source_device_id(app_root)?;
+    if retained
+        .as_ref()
+        .is_some_and(|operation| !retained_allows_source_prepare(operation, &source_device_id))
+    {
+        return Err(PeerSyncError::Protocol(
+            "a target-owned bidirectional operation is retained".to_owned(),
+        ));
+    }
+    store
+        .reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)
+        .map_err(store_error)?;
+    let actual = store.revision().map_err(store_error)?;
+    if actual != expected_revision {
+        return Err(store_error(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual,
+        }));
+    }
+    let built = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    let control_store = store.open_native_job_store().map_err(store_error)?;
+    let session_store = store.open_native_job_store().map_err(store_error)?;
+    let source = LogicalDeltaSourceSession::open_owned(
+        session_store,
+        app_root,
+        &built.manifest.library_id,
+        &built.manifest.generation,
+        P5_SOURCE_PIN_PREFIX,
+    )?;
+    let (session, _, _) = prepare_product_source_session(
+        app_root,
+        control_store,
+        source,
+        &source_device_id,
+        built.manifest_bytes,
+    )?;
+    Ok(PreparedSharedBidirectionalSource {
+        session: Some(session),
+    })
 }
 
 #[cfg(desktop)]

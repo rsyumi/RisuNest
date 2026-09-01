@@ -9,6 +9,319 @@ use super::{
     PeerSyncError, PreparedCloneSession,
 };
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Mutex;
+
+#[cfg(desktop)]
+use super::{
+    bidirectional_commands::{
+        prepare_shared_bidirectional_source, PreparedSharedBidirectionalSource,
+    },
+    commands::{prepare_shared_clone_source, PreparedSharedCloneSource},
+    delta_commands::{prepare_shared_delta_source, PreparedSharedDeltaSource},
+};
+#[cfg(desktop)]
+use crate::{
+    asset_repository::PayloadCas, local_backup::CancellationProbe,
+    persistent_store::PersistentStore,
+};
+
+/// The three source preparations have a fixed dependency order.  A source
+/// lane owns its preparation artifacts until the shared host has been torn
+/// down, so cleanup is always attempted in reverse order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedSourceLane {
+    Clone,
+    Delta,
+    Bidirectional,
+}
+
+impl SharedSourceLane {
+    const PREPARATION_ORDER: [Self; 3] = [Self::Clone, Self::Delta, Self::Bidirectional];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedSessionPhase {
+    Idle,
+    Preparing,
+    Prepared,
+    Stopping,
+}
+
+/// Adapter seam for the real source-preparation engines.  It deliberately
+/// models no listener or tunnel operation: building a host is the last
+/// preparation step, and starting it belongs to the next slice.
+pub(crate) trait SharedSourcePreparation<C> {
+    type Host;
+
+    fn prepare(&mut self, lane: SharedSourceLane, context: &mut C) -> Result<(), PeerSyncError>;
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError>;
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError>;
+    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError>;
+}
+
+struct SharedSessionRuntime<H> {
+    phase: SharedSessionPhase,
+    host: Option<H>,
+}
+
+/// Serialized, idempotent lifecycle around a shared source preparation.
+///
+/// The operation mutex covers preparation and cleanup rather than merely the
+/// visible phase transition.  A concurrent caller therefore observes the
+/// finished result of the first operation instead of a half-owned source.
+pub(crate) struct SharedSessionLifecycle<P, C>
+where
+    P: SharedSourcePreparation<C>,
+{
+    operation: Mutex<()>,
+    runtime: Mutex<SharedSessionRuntime<P::Host>>,
+    preparation: Mutex<P>,
+    context: std::marker::PhantomData<fn(&mut C)>,
+}
+
+impl<P, C> SharedSessionLifecycle<P, C>
+where
+    P: SharedSourcePreparation<C>,
+{
+    pub(crate) fn new(preparation: P) -> Self {
+        Self {
+            operation: Mutex::new(()),
+            runtime: Mutex::new(SharedSessionRuntime {
+                phase: SharedSessionPhase::Idle,
+                host: None,
+            }),
+            preparation: Mutex::new(preparation),
+            context: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn phase(&self) -> Result<SharedSessionPhase, PeerSyncError> {
+        Ok(self.runtime()?.phase)
+    }
+
+    pub(crate) fn prepare(&self, context: &mut C) -> Result<(), PeerSyncError> {
+        let _operation = self.operation()?;
+        if self.phase()? == SharedSessionPhase::Prepared {
+            return Ok(());
+        }
+        self.set_phase(SharedSessionPhase::Preparing)?;
+
+        let mut acquired = Vec::new();
+        let result = {
+            let mut preparation = self.preparation()?;
+            let mut result = Ok(());
+            for lane in SharedSourceLane::PREPARATION_ORDER {
+                if let Err(error) = preparation.prepare(lane, context) {
+                    result = Err(error);
+                    break;
+                }
+                acquired.push(lane);
+            }
+            if result.is_ok() {
+                match preparation.build_host() {
+                    Ok(host) => self.runtime()?.host = Some(host),
+                    Err(error) => result = Err(error),
+                }
+            }
+            if let Err(primary) = result {
+                Self::cleanup_lanes(&mut *preparation, &acquired);
+                Err(primary)
+            } else {
+                Ok(())
+            }
+        };
+
+        self.set_phase(if result.is_ok() {
+            SharedSessionPhase::Prepared
+        } else {
+            SharedSessionPhase::Idle
+        })?;
+        result
+    }
+
+    pub(crate) fn stop(&self) -> Result<(), PeerSyncError> {
+        let _operation = self.operation()?;
+        if self.phase()? == SharedSessionPhase::Idle {
+            return Ok(());
+        }
+        self.set_phase(SharedSessionPhase::Stopping)?;
+
+        let mut primary = None;
+        let mut host = self.runtime()?.host.take();
+        if let Some(host) = host.as_mut() {
+            if let Err(error) = self.preparation()?.stop_host(host) {
+                primary = Some(error);
+            }
+        }
+        // Prepared sessions can own open package and generation resources.
+        // Drop the common host before lane cleanup removes their artifacts.
+        drop(host);
+        {
+            let mut preparation = self.preparation()?;
+            for lane in SharedSourceLane::PREPARATION_ORDER.into_iter().rev() {
+                if let Err(error) = preparation.cleanup(lane) {
+                    if primary.is_none() {
+                        primary = Some(error);
+                    }
+                }
+            }
+        }
+        self.set_phase(SharedSessionPhase::Idle)?;
+        primary.map_or(Ok(()), Err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_preparation<T>(
+        &self,
+        operation: impl FnOnce(&P) -> T,
+    ) -> Result<T, PeerSyncError> {
+        let preparation = self.preparation()?;
+        Ok(operation(&preparation))
+    }
+
+    fn cleanup_lanes(preparation: &mut P, acquired: &[SharedSourceLane]) {
+        for lane in acquired.iter().rev().copied() {
+            let _ = preparation.cleanup(lane);
+        }
+    }
+
+    fn operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, PeerSyncError> {
+        self.operation.lock().map_err(|error| {
+            PeerSyncError::Storage(format!("shared session operation mutex poisoned: {error}"))
+        })
+    }
+
+    fn runtime(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, SharedSessionRuntime<P::Host>>, PeerSyncError> {
+        self.runtime.lock().map_err(|error| {
+            PeerSyncError::Storage(format!("shared session runtime mutex poisoned: {error}"))
+        })
+    }
+
+    fn preparation(&self) -> Result<std::sync::MutexGuard<'_, P>, PeerSyncError> {
+        self.preparation.lock().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "shared session preparation mutex poisoned: {error}"
+            ))
+        })
+    }
+
+    fn set_phase(&self, phase: SharedSessionPhase) -> Result<(), PeerSyncError> {
+        self.runtime()?.phase = phase;
+        Ok(())
+    }
+}
+
+/// Concrete desktop adapter around the existing source preparation engines.
+/// It deliberately has no listener, tunnel, foreground-service, or Tauri
+/// command responsibility.  Those are layered above this preparation slice.
+#[cfg(desktop)]
+pub(crate) struct SharedSourceEngines {
+    clone: Option<PreparedSharedCloneSource>,
+    delta: Option<PreparedSharedDeltaSource>,
+    bidirectional: Option<PreparedSharedBidirectionalSource>,
+}
+
+#[cfg(desktop)]
+impl SharedSourceEngines {
+    pub(crate) fn new() -> Self {
+        Self {
+            clone: None,
+            delta: None,
+            bidirectional: None,
+        }
+    }
+}
+
+#[cfg(desktop)]
+pub(crate) struct SharedSourcePreparationContext<'a> {
+    pub(crate) store: &'a mut PersistentStore,
+    pub(crate) cas: &'a PayloadCas,
+    pub(crate) app_root: &'a std::path::Path,
+    pub(crate) cancellation: &'a dyn CancellationProbe,
+    pub(crate) expected_bidirectional_revision: i64,
+}
+
+#[cfg(desktop)]
+impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedSourceEngines {
+    type Host = SharedSessionHost;
+
+    fn prepare(
+        &mut self,
+        lane: SharedSourceLane,
+        context: &mut SharedSourcePreparationContext<'a>,
+    ) -> Result<(), PeerSyncError> {
+        match lane {
+            SharedSourceLane::Clone => {
+                self.clone = Some(prepare_shared_clone_source(
+                    context.store,
+                    context.cas,
+                    &context.app_root.join("peer-clone"),
+                    context.cancellation,
+                )?);
+            }
+            SharedSourceLane::Delta => {
+                self.delta = Some(prepare_shared_delta_source(
+                    context.store,
+                    context.cas,
+                    context.app_root,
+                )?);
+            }
+            SharedSourceLane::Bidirectional => {
+                self.bidirectional = Some(prepare_shared_bidirectional_source(
+                    context.store,
+                    context.cas,
+                    context.app_root,
+                    context.expected_bidirectional_revision,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        let clone = self.clone.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
+        })?;
+        let delta = self.delta.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared delta source is not prepared".to_owned())
+        })?;
+        let bidirectional = self.bidirectional.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared bidirectional source is not prepared".to_owned())
+        })?;
+        SharedSessionHost::new(
+            clone.take_session()?,
+            delta.take_session()?,
+            bidirectional.take_session()?,
+        )
+    }
+
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
+        match lane {
+            SharedSourceLane::Clone => {
+                if let Some(mut clone) = self.clone.take() {
+                    clone.cleanup()?;
+                }
+            }
+            SharedSourceLane::Delta => {
+                if let Some(mut delta) = self.delta.take() {
+                    delta.cleanup();
+                }
+            }
+            SharedSourceLane::Bidirectional => {
+                if let Some(mut bidirectional) = self.bidirectional.take() {
+                    bidirectional.cleanup();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError> {
+        host.stop()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SharedPairingData {

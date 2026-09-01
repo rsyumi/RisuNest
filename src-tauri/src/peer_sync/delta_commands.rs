@@ -179,6 +179,61 @@ struct PeerDeltaRuntime {
     target_foreground: Option<AndroidTargetForegroundStatus>,
 }
 
+/// Hostless P4 source preparation.  Keeping the logical session inside the
+/// prepared transport makes its generation pin live exactly until shared
+/// source cleanup drops the transport.
+pub(crate) struct PreparedSharedDeltaSource {
+    session: Option<PreparedLogicalLanSession>,
+}
+
+impl PreparedSharedDeltaSource {
+    pub(crate) fn take_session(&mut self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
+        self.session.take().ok_or_else(|| {
+            PeerSyncError::Protocol("shared delta source session is unavailable".to_owned())
+        })
+    }
+
+    pub(crate) fn cleanup(&mut self) {
+        self.session.take();
+    }
+}
+
+pub(crate) fn prepare_shared_delta_source(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+) -> Result<PreparedSharedDeltaSource, PeerSyncError> {
+    store
+        .reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)
+        .map_err(store_error)?;
+    let built = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    let session_store = store.open_native_job_store().map_err(store_error)?;
+    let session = LogicalDeltaSourceSession::open_owned(
+        session_store,
+        app_root,
+        &built.manifest.library_id,
+        &built.manifest.generation,
+        P4_SOURCE_PIN_PREFIX,
+    )?;
+    let source_device_id = canonical_source_device_id(app_root)?;
+    let transport_session_id = uuid::Uuid::new_v4().to_string();
+    let manifest_id = session.manifest_hash().to_owned();
+    let objects = session.objects().to_vec();
+    let prepared = PreparedLogicalLanSession::new(
+        &transport_session_id,
+        &source_device_id,
+        manifest_id,
+        built.manifest_bytes,
+        objects,
+        Box::new(session),
+    )?;
+    Ok(PreparedSharedDeltaSource {
+        session: Some(prepared),
+    })
+}
+
 #[cfg(any(target_os = "android", test))]
 type AndroidTargetForegroundStatus = AndroidTargetForegroundTransition<PeerDeltaPullResult>;
 
