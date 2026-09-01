@@ -45,6 +45,7 @@ import {
     replaceCharacterResources,
     replaceDatabaseRootResources,
 } from "./process/coldstorageData";
+import { collectExactPluginStorageAssetReferences } from "./drive/backupAssets";
 import { isTauri, isTauriMobile, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
@@ -923,6 +924,11 @@ export function getUncleanablesSync(db: Database, uptype: 'basename' | 'pure' = 
         for (const resource of listCharacterResources(cha)) {
             addUncleanable(resource)
         }
+    }
+    // Assets referenced only from plugin storage are backed up as required
+    // data; cleanup must not treat them as orphans.
+    for (const resource of collectExactPluginStorageAssetReferences(db.pluginCustomStorage ?? {})) {
+        addUncleanable(resource)
     }
     return Array.from(uncleanable);
 }
