@@ -180,6 +180,23 @@ fn clone_backup_root(app_root: &Path, root: &Path) -> bool {
 }
 
 pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), PeerSyncError> {
+    delete_backup_with_predelete_hook_inner(app_root, requested, || Ok(()))
+}
+
+#[cfg(test)]
+pub(crate) fn delete_backup_with_predelete_hook(
+    app_root: &Path,
+    requested: &Path,
+    hook: impl FnMut() -> Result<(), PeerSyncError>,
+) -> Result<(), PeerSyncError> {
+    delete_backup_with_predelete_hook_inner(app_root, requested, hook)
+}
+
+fn delete_backup_with_predelete_hook_inner(
+    app_root: &Path,
+    requested: &Path,
+    mut hook: impl FnMut() -> Result<(), PeerSyncError>,
+) -> Result<(), PeerSyncError> {
     let requested = fs::canonicalize(requested)
         .map_err(|_| PeerSyncError::Validation("peer backup is not currently listed".to_owned()))?;
     let listed = list_backups(app_root)?;
@@ -207,6 +224,15 @@ pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), Pee
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
     let selected = validated_direct_child(&root, &selected, true)?;
+    if clone_backup_root(app_root, &root) && desktop_clone_backup_job_is_active(app_root, &selected)
+    {
+        return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
+    }
+    hook()?;
+    let selected = validated_direct_child(&root, &selected, true)?;
+    if operation_references(app_root, &selected)? {
+        return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
+    }
     if clone_backup_root(app_root, &root) && desktop_clone_backup_job_is_active(app_root, &selected)
     {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));

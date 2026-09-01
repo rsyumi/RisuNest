@@ -88,6 +88,87 @@ fn snapshot_delete_requires_a_listed_top_level_snapshot_and_removes_its_sidecar(
 }
 
 #[test]
+fn snapshot_delete_rejects_a_pending_restore_target_without_removing_it() {
+    let (directory, store, _) = open_fixture();
+    let created = store
+        .snapshot_create("pending-delete")
+        .expect("create snapshot");
+    let snapshot = std::path::PathBuf::from(&created.path);
+    store
+        .snapshot_restore_request(&snapshot)
+        .expect("request pending restore");
+
+    let error = store
+        .snapshot_delete(&snapshot)
+        .expect_err("pending restore target must not be deleted");
+
+    assert!(error.to_string().contains("pending restore"));
+    assert!(snapshot.is_file());
+    assert!(directory
+        .path()
+        .join("persistent/snapshots/pending-restore.json")
+        .is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_list_and_restore_reject_linked_candidates() {
+    let (directory, store, _) = open_fixture();
+    let external = directory.path().join("external-snapshot.db");
+    std::fs::write(&external, b"external snapshot").expect("write external candidate");
+    let linked = directory
+        .path()
+        .join("persistent/snapshots/linked-snapshot.db");
+    std::os::unix::fs::symlink(&external, &linked).expect("create snapshot symlink");
+
+    assert!(store
+        .snapshot_list()
+        .expect("list snapshots")
+        .iter()
+        .all(|snapshot| snapshot.path != linked.to_string_lossy()));
+    assert!(store.snapshot_restore_request(&linked).is_err());
+    assert_eq!(
+        std::fs::read(&external).expect("read external candidate"),
+        b"external snapshot"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn snapshot_list_and_restore_reject_reparse_candidates() {
+    let (directory, store, _) = open_fixture();
+    let external = directory.path().join("external-snapshot");
+    std::fs::create_dir(&external).expect("create external candidate directory");
+    std::fs::write(external.join("sentinel"), b"external snapshot")
+        .expect("write external candidate");
+    let linked = directory
+        .path()
+        .join("persistent/snapshots/linked-snapshot.db");
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(linked.to_string_lossy().replace('/', "\\"))
+        .arg(external.to_string_lossy().replace('/', "\\"))
+        .output()
+        .expect("invoke junction creation");
+    assert!(
+        output.status.success(),
+        "create snapshot junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(store
+        .snapshot_list()
+        .expect("list snapshots")
+        .iter()
+        .all(|snapshot| snapshot.path != linked.to_string_lossy()));
+    assert!(store.snapshot_restore_request(&linked).is_err());
+    assert_eq!(
+        std::fs::read(external.join("sentinel")).expect("read external candidate"),
+        b"external snapshot"
+    );
+}
+
+#[test]
 fn snapshot_creation_persists_asset_roots_before_returning() {
     let (directory, store, _) = open_fixture();
     let generation = super::active_generation(&store.connection).expect("read active generation");
