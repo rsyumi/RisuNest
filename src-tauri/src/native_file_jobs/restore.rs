@@ -2406,6 +2406,10 @@ mod tests {
         let mut plugins = valid_blocks();
         plugins[4] = block(9, false, "plugins", &json!(null));
         assert_failed_restore_preserves_active(&save_bytes(plugins), "plugins block");
+
+        let mut plugin_storage = valid_blocks();
+        plugin_storage[5] = block(11, false, "pluginStorage", &json!([]));
+        assert_failed_restore_preserves_active(&save_bytes(plugin_storage), "pluginStorage block");
     }
 
     #[test]
