@@ -7,8 +7,8 @@ use super::{
         LanBidirectionalSession, PreparedBidirectionalLogicalLanSession, PreparedLogicalLanSession,
     },
     logical_delta::{
-        build_logical_manifest, LogicalManifestBuilderInput, LogicalRecordEnvelope,
-        LogicalRecordLocator, ProjectedLogicalRecord,
+        build_logical_manifest, LogicalManifestBuilderInput, LogicalManifestObject,
+        LogicalRecordEnvelope, LogicalRecordLocator, ProjectedLogicalRecord,
     },
     prepare_clone_session,
     shared_session::{SharedPairingData, SharedSessionHost},
@@ -16,7 +16,9 @@ use super::{
     PinnedSourceObject,
 };
 use crate::local_backup::CancellationProbe;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     io::{Cursor, Read},
     path::PathBuf,
     sync::Arc,
@@ -38,10 +40,12 @@ impl PinnedCloneRevision for CloneLease {
         Ok(vec![PinnedSourceObject::database(&self.0)])
     }
 }
-struct Empty;
+struct Empty(BTreeMap<String, Vec<u8>>);
 impl LogicalDeltaObjectSource for Empty {
-    fn open_object(&mut self, _: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
+        Ok(Box::new(Cursor::new(
+            self.0.get(&object.hash).cloned().unwrap_or_default(),
+        )))
     }
 }
 struct Control;
@@ -62,7 +66,14 @@ impl LanBidirectionalControl for Control {
         Err(PeerSyncError::Protocol("fixture".to_owned()))
     }
 }
-fn logical() -> (String, Vec<u8>, Vec<LogicalDeltaObject>) {
+fn logical() -> (
+    String,
+    Vec<u8>,
+    Vec<LogicalDeltaObject>,
+    BTreeMap<String, Vec<u8>>,
+) {
+    let object_bytes = b"shared logical object".to_vec();
+    let object_hash = hex::encode(Sha256::digest(&object_bytes));
     let built = build_logical_manifest(LogicalManifestBuilderInput {
         library_id: "library".to_owned(),
         generation: "g".to_owned(),
@@ -75,7 +86,10 @@ fn logical() -> (String, Vec<u8>, Vec<LogicalDeltaObject>) {
                 value: serde_json::json!({}),
                 owner_heads: vec![],
             },
-            vec![],
+            vec![LogicalManifestObject {
+                hash: object_hash.clone(),
+                size: object_bytes.len() as u64,
+            }],
         )],
     })
     .unwrap();
@@ -91,6 +105,7 @@ fn logical() -> (String, Vec<u8>, Vec<LogicalDeltaObject>) {
                 size: o.size,
             })
             .collect(),
+        BTreeMap::from([(object_hash, object_bytes)]),
     )
 }
 fn host() -> (tempfile::TempDir, SharedSessionHost) {
@@ -99,24 +114,24 @@ fn host() -> (tempfile::TempDir, SharedSessionHost) {
     std::fs::write(&db, b"{}").unwrap();
     let clone = prepare_clone_session(&CloneFixture(db), root.path().join("clone")).unwrap();
     let source = "00000000-0000-4000-8000-000000000010";
-    let (hash, bytes, objects) = logical();
+    let (hash, bytes, objects, delta_objects) = logical();
     let delta = PreparedLogicalLanSession::new(
         "00000000-0000-4000-8000-000000000011",
         source,
         hash,
         bytes,
         objects,
-        Box::new(Empty),
+        Box::new(Empty(delta_objects)),
     )
     .unwrap();
-    let (hash, bytes, objects) = logical();
+    let (hash, bytes, objects, bidi_objects) = logical();
     let bidi = PreparedBidirectionalLogicalLanSession::new(
         "00000000-0000-4000-8000-000000000012",
         source,
         hash,
         bytes,
         objects,
-        Box::new(Empty),
+        Box::new(Empty(bidi_objects)),
         Arc::new(Control),
     )
     .unwrap();
@@ -333,6 +348,43 @@ fn permitted_bidirectional_registration_reaches_existing_control() {
         .unwrap()
         .to_owned();
     assert_eq!(reqwest::blocking::Client::new().post(format!("{}/v1/sessions/00000000-0000-4000-8000-000000000012/registration", pairing.endpoint)).bearer_auth(&bearer).json(&serde_json::json!({"libraryId":"library","generation":{"generationId":"g","manifestHash":manifest,"generationSequence":"1"},"expectedRevision":0})).send().unwrap().status(), reqwest::StatusCode::NO_CONTENT);
+    host.stop().unwrap();
+}
+
+#[test]
+fn delta_object_body_uses_the_shared_listener() {
+    let (_root, mut host) = host();
+    let pairing = host.start_fixed_loopback(32151).unwrap();
+    let bearer = claim(&pairing, "00000000-0000-4000-8000-000000000027")
+        .json::<serde_json::Value>()
+        .unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let delta = "00000000-0000-4000-8000-000000000011";
+    let manifest: serde_json::Value = reqwest::blocking::Client::new()
+        .get(format!("{}/v1/sessions/{delta}/manifest", pairing.endpoint))
+        .bearer_auth(&bearer)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let object = hex::encode(Sha256::digest(b"shared logical object"));
+    assert!(manifest["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["hash"] == object));
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{delta}/objects/{object}",
+            pairing.endpoint
+        ))
+        .bearer_auth(&bearer)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().unwrap().as_ref(), b"shared logical object");
     host.stop().unwrap();
 }
 
