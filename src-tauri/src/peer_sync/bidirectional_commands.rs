@@ -7,10 +7,9 @@ use super::lan::discover_lan_ipv4;
 #[cfg(test)]
 pub(crate) use super::lan::DISCOVER_LAN_IPV4_OVERRIDE;
 #[cfg(any(target_os = "android", test))]
-use super::target_foreground_transition::{
-    AndroidTargetForegroundTransition,
-    AndroidTargetForegroundTransitionPhase as AndroidBidirectionalTargetPhase,
-};
+use super::target_foreground_transition::AndroidTargetForegroundTransition;
+#[cfg(test)]
+use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase as AndroidBidirectionalTargetPhase;
 #[cfg(desktop)]
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{

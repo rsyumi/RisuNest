@@ -7,10 +7,11 @@ use super::lan::discover_lan_ipv4;
 #[cfg(desktop)]
 use super::lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
 use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
+#[cfg(test)]
+use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase as AndroidTargetForegroundPhase;
 #[cfg(any(target_os = "android", test))]
 use super::target_foreground_transition::{
     AndroidTargetForegroundTransition, AndroidTargetForegroundTransitionError,
-    AndroidTargetForegroundTransitionPhase as AndroidTargetForegroundPhase,
 };
 use super::{
     lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
