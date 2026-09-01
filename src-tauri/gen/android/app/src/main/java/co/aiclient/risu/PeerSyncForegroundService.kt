@@ -30,7 +30,7 @@ internal data class PeerSyncForegroundIdentity(
 )
 
 internal fun isAllowedPeerSyncForegroundLane(lane: String): Boolean =
-  lane == "p1-source" || lane == "p4-source" || lane == "p4-target" ||
+  lane == "device-sync-source" || lane == "p1-source" || lane == "p4-source" || lane == "p4-target" ||
     lane == "p5-source" || lane == "p5-target"
 
 internal fun peerSyncForegroundIdentity(

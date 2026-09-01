@@ -1,8 +1,8 @@
 use super::lan::{validate_lan_endpoint, LanCloneHostControl, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
+use super::production::prepare_unified_clone_source;
 use super::{
-    activate_downloaded_clone, prepare_lossless_clone_session, CloneTargetAdapter, LanCloneClient,
-    LanCloneHost, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
-    TransferCancellation,
+    activate_downloaded_clone, CloneTargetAdapter, LanCloneClient, LanCloneHost,
+    LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError, TransferCancellation,
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -335,45 +335,17 @@ pub(crate) fn prepare_shared_clone_source(
     peer_root: &Path,
     cancellation: &dyn crate::local_backup::CancellationProbe,
 ) -> Result<PreparedSharedCloneSource, PeerSyncError> {
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    let preparation_parent = peer_root.join("source-preparation");
-    let sessions_parent = peer_root.join("source-sessions");
-    let preparation_root = preparation_parent.join(&operation_id);
-    let session_root = sessions_parent.join(&operation_id);
-    fs::create_dir_all(&preparation_parent)?;
-    fs::create_dir_all(&sessions_parent)?;
-    let expected_revision = store.revision().map_err(store_error)?;
-    let prepared = prepare_lossless_clone_session(
-        store,
-        cas,
-        expected_revision,
-        &preparation_root,
-        &session_root,
-        cancellation,
-    )
-    .map_err(|error| match remove_directory_if_exists(&session_root) {
-        Ok(()) => error,
-        Err(cleanup) => PeerSyncError::Storage(format!(
-            "{error}; peer clone source session cleanup failed: {cleanup}"
-        )),
-    })?;
+    let mut unified = prepare_unified_clone_source(store, cas, peer_root, cancellation)?;
+    let operation_id = unified.directory_id()?.to_owned();
+    let session_root = unified.session_root().to_path_buf();
     let marker = ActiveSourceMarker::new(
         operation_id,
-        prepared.manifest().session_id.clone(),
-        prepared.manifest_id().to_owned(),
+        unified.session_id()?.to_owned(),
+        unified.manifest_id()?.to_owned(),
     );
     let marker_path = peer_root.join(ACTIVE_SOURCE_MARKER_FILE);
-    if let Err(error) = write_active_source_marker(&marker_path, &marker) {
-        let cleanup = remove_directory_if_exists(&session_root);
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(PeerSyncError::Storage(format!(
-                "{error}; peer clone source session cleanup failed: {cleanup}"
-            ))),
-        };
-    }
     Ok(PreparedSharedCloneSource {
-        prepared: Some(prepared),
+        prepared: Some(unified.take_session()?),
         session_root,
         marker_path,
         marker,

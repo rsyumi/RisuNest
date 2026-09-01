@@ -1,10 +1,19 @@
 use super::lan::validate_lan_endpoint;
-#[cfg(desktop)]
-use super::shared_session::{
-    run_device_sync_rotate_link, SharedSourceEngines, SharedSourcePreparationContext,
-};
 use super::{
+    android_foreground::{
+        registry as android_foreground_registry, test_registry_guard, AndroidForegroundLane,
+    },
     device_registry::{DevicePermissions, OutgoingDeviceRegistry},
+    shared_session::{
+        AndroidDeviceSyncHost, AndroidDeviceSyncSourceState, DeviceSyncLinkPermissions,
+        DeviceSyncListenMethod, DeviceSyncPrepareRequest, DeviceSyncSourcePhase, SharedPairingData,
+        SharedSessionLifecycle, SharedSessionPhase, SharedSourceLane, SharedSourceOwnership,
+        SharedSourcePreparation,
+    },
+    PeerSyncError,
+};
+#[cfg(desktop)]
+use super::{
     lan::{
         LanBidirectionalControl, LanBidirectionalRegistrationRequest,
         LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
@@ -17,29 +26,334 @@ use super::{
     prepare_clone_session,
     protocol::CloneManifest,
     shared_session::{
-        DeviceSyncLinkPermissions, DeviceSyncListenMethod, DeviceSyncPrepareRequest,
-        DeviceSyncSourcePhase, DeviceSyncSourceState, SharedPairingData, SharedPeerTunnel,
+        run_device_sync_rotate_link, DeviceSyncSourceState, SharedPeerTunnel,
         SharedPeerTunnelCleanup, SharedPeerTunnelLauncher, SharedPeerTunnelLifecycle,
-        SharedPublicOriginVerifier, SharedSessionHost, SharedSessionLifecycle, SharedSessionPhase,
-        SharedSourceLane, SharedSourceOwnership, SharedSourcePreparation,
+        SharedPublicOriginVerifier, SharedSessionHost, SharedSourceEngines,
+        SharedSourcePreparationContext,
     },
-    CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError, PinnedCloneRevision,
+    CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PinnedCloneRevision,
     PinnedSourceObject,
 };
-use crate::local_backup::CancellationProbe;
 #[cfg(desktop)]
 use crate::{
-    asset_repository::PayloadCas, local_backup::NeverCancelled, persistent_store::PersistentStore,
+    asset_repository::PayloadCas,
+    local_backup::{CancellationProbe, NeverCancelled},
+    persistent_store::PersistentStore,
 };
+#[cfg(desktop)]
 use sha2::{Digest, Sha256};
+#[cfg(desktop)]
 use std::{
     collections::BTreeMap,
     fs,
     io::{Cursor, Read},
-    net::{Ipv4Addr, TcpListener},
+    net::TcpListener,
     path::PathBuf,
+};
+use std::{
+    net::Ipv4Addr,
     sync::{Arc, Mutex},
 };
+
+#[derive(Default)]
+struct AndroidHostEvents {
+    starts: usize,
+    stops: usize,
+    cleanups: Vec<SharedSourceLane>,
+    fail_start_once: bool,
+    fail_stop_once: bool,
+}
+
+struct AndroidHostFixture {
+    events: Arc<Mutex<AndroidHostEvents>>,
+}
+
+impl AndroidDeviceSyncHost for AndroidHostFixture {
+    fn enable_registry(
+        &mut self,
+        _: &std::path::Path,
+        _: &str,
+        _: DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        Ok(())
+    }
+
+    fn start_private_lan(
+        &mut self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Result<SharedPairingData, PeerSyncError> {
+        let mut events = self.events.lock().unwrap();
+        events.starts += 1;
+        if std::mem::take(&mut events.fail_start_once) {
+            return Err(PeerSyncError::Transport(
+                "injected listener failure".to_owned(),
+            ));
+        }
+        Ok(SharedPairingData {
+            endpoint: format!("http://{address}:{port}"),
+            session_id: "00000000-0000-4000-8000-000000000061".to_owned(),
+            manifest_id: "61".repeat(32),
+            claim: "claim".to_owned(),
+            expires_at_ms: 9_999,
+        })
+    }
+
+    fn stop_listener(&mut self) -> Result<(), PeerSyncError> {
+        let mut events = self.events.lock().unwrap();
+        events.stops += 1;
+        if std::mem::take(&mut events.fail_stop_once) {
+            return Err(PeerSyncError::Transport(
+                "injected listener cleanup failure".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct AndroidPreparationFixture {
+    events: Arc<Mutex<AndroidHostEvents>>,
+}
+
+impl SharedSourceOwnership for AndroidPreparationFixture {
+    type Host = AndroidHostFixture;
+
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        Ok(AndroidHostFixture {
+            events: Arc::clone(&self.events),
+        })
+    }
+
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
+        self.events.lock().unwrap().cleanups.push(lane);
+        Ok(())
+    }
+
+    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError> {
+        host.stop_listener()
+    }
+}
+
+impl SharedSourcePreparation<()> for AndroidPreparationFixture {
+    fn prepare(&mut self, _: SharedSourceLane, _: &mut ()) -> Result<(), PeerSyncError> {
+        Ok(())
+    }
+}
+
+fn android_state(
+    events: Arc<Mutex<AndroidHostEvents>>,
+) -> AndroidDeviceSyncSourceState<AndroidPreparationFixture> {
+    AndroidDeviceSyncSourceState::new_for_test(
+        AndroidPreparationFixture { events },
+        Ipv4Addr::new(192, 168, 4, 8),
+    )
+}
+
+fn android_lan_request(port: u16) -> DeviceSyncPrepareRequest {
+    DeviceSyncPrepareRequest {
+        method: DeviceSyncListenMethod::Lan,
+        fixed_port: port,
+        public_base_url: None,
+    }
+}
+
+#[test]
+fn android_unified_source_accepts_only_explicit_nonzero_lan_ports() {
+    let events = Arc::new(Mutex::new(AndroidHostEvents::default()));
+    let state = android_state(events);
+    let root = tempfile::tempdir().unwrap();
+
+    assert!(state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(0))
+        .is_err());
+    assert!(state
+        .prepare_for_test(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: 32145,
+                public_base_url: None,
+            },
+        )
+        .is_err());
+    assert!(state
+        .prepare_for_test(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::FixedUrl,
+                fixed_port: 32145,
+                public_base_url: Some("https://sync.example.com".to_owned()),
+            },
+        )
+        .is_err());
+    assert_eq!(
+        state
+            .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+            .unwrap()
+            .phase,
+        DeviceSyncSourcePhase::Prepared
+    );
+}
+
+#[test]
+fn android_notification_stop_keeps_all_prepared_lanes_restartable() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents::default()));
+    let state = android_state(Arc::clone(&events));
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let first = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&first));
+
+    let running = state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: true,
+            },
+            first.clone(),
+        )
+        .unwrap();
+    assert_eq!(running.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(
+        running.endpoint.as_deref(),
+        Some("http://192.168.4.8:32145")
+    );
+    assert!(android_foreground_registry().cancel_exact(&first));
+    assert!(android_foreground_registry().detach_if_generation(&first));
+    assert_eq!(
+        state.status().unwrap().phase,
+        DeviceSyncSourcePhase::Prepared
+    );
+    assert!(events.lock().unwrap().cleanups.is_empty());
+
+    let restarted = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&restarted));
+    assert_eq!(
+        state
+            .start_attached_for_test(
+                DeviceSyncLinkPermissions {
+                    read: true,
+                    bidirectional: false,
+                },
+                restarted.clone(),
+            )
+            .unwrap()
+            .phase,
+        DeviceSyncSourcePhase::Running
+    );
+    assert_eq!(events.lock().unwrap().starts, 2);
+
+    let released = state.stop_for_test().unwrap();
+    assert_eq!(released, Some(restarted));
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(
+        events.lock().unwrap().cleanups,
+        [
+            SharedSourceLane::Bidirectional,
+            SharedSourceLane::Delta,
+            SharedSourceLane::Clone,
+        ]
+    );
+}
+
+#[test]
+fn android_start_failure_releases_only_its_exact_foreground_generation() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents {
+        fail_start_once: true,
+        ..Default::default()
+    }));
+    let state = android_state(Arc::clone(&events));
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let failed = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&failed));
+    assert!(state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            },
+            failed.clone(),
+        )
+        .is_err());
+    assert_eq!(
+        state.status().unwrap().phase,
+        DeviceSyncSourcePhase::Prepared
+    );
+
+    let current = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&current));
+    assert!(!android_foreground_registry().cancel_exact(&failed));
+    assert_eq!(
+        state
+            .start_attached_for_test(
+                DeviceSyncLinkPermissions {
+                    read: true,
+                    bidirectional: false,
+                },
+                current.clone(),
+            )
+            .unwrap()
+            .phase,
+        DeviceSyncSourcePhase::Running
+    );
+    assert_eq!(state.stop_for_test().unwrap(), Some(current));
+}
+
+#[test]
+fn android_start_cleanup_failure_requires_explicit_stop_before_reprepare() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents {
+        fail_start_once: true,
+        fail_stop_once: true,
+        ..Default::default()
+    }));
+    let state = android_state(Arc::clone(&events));
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let failed = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&failed));
+
+    assert!(state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            },
+            failed,
+        )
+        .is_err());
+    let failed_status = state.status().unwrap();
+    assert_eq!(failed_status.phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(
+        failed_status.latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::CleanupFailed)
+    );
+
+    assert_eq!(state.stop_for_test().unwrap(), None);
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(events.lock().unwrap().stops, 2);
+}
 
 #[derive(Default)]
 struct LifecycleFixture {
@@ -454,6 +768,11 @@ fn seed_shared_source_store(store: &mut PersistentStore) {
     store.replace_commit(&staging, Some(0)).unwrap();
 }
 
+#[cfg(desktop)]
+#[rustfmt::skip]
+mod desktop_transport {
+    use super::*;
+
 struct CloneFixture(PathBuf);
 struct CloneLease(PathBuf);
 impl CloneSource for CloneFixture {
@@ -472,7 +791,10 @@ impl PinnedCloneRevision for CloneLease {
 }
 struct Empty(BTreeMap<String, Vec<u8>>);
 impl LogicalDeltaObjectSource for Empty {
-    fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
+    fn open_object(
+        &mut self,
+        object: &LogicalDeltaObject,
+    ) -> Result<Box<dyn Read>, PeerSyncError> {
         Ok(Box::new(Cursor::new(
             self.0.get(&object.hash).cloned().unwrap_or_default(),
         )))
@@ -744,7 +1066,10 @@ struct FakeSharedTunnelLauncher {
 }
 
 impl SharedPeerTunnelLauncher for FakeSharedTunnelLauncher {
-    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+    fn start(
+        &self,
+        host: SharedSessionHost,
+    ) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
         *self.seen_origin.lock().unwrap() = host.address();
         Ok(Box::new(FakeSharedTunnel {
             _host: host,
@@ -825,7 +1150,10 @@ struct LifecycleTunnelLauncher {
 }
 
 impl SharedPeerTunnelLauncher for LifecycleTunnelLauncher {
-    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+    fn start(
+        &self,
+        host: SharedSessionHost,
+    ) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
         self.starts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Box::new(LifecycleTunnel {
@@ -900,7 +1228,7 @@ fn unified_quick_status_reports_a_naturally_stopped_tunnel() {
     assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
     assert_eq!(
         status.latest_error,
-        Some(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
+        Some(super::super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
     );
     assert_eq!(status.endpoint, None);
     assert_eq!(status.pairing_uri, None);
@@ -963,7 +1291,11 @@ struct FakePublicOriginVerifier {
 }
 
 impl SharedPublicOriginVerifier for FakePublicOriginVerifier {
-    fn verify(&self, host: &SharedSessionHost, public_url: &url::Url) -> Result<(), PeerSyncError> {
+    fn verify(
+        &self,
+        host: &SharedSessionHost,
+        public_url: &url::Url,
+    ) -> Result<(), PeerSyncError> {
         self.seen
             .lock()
             .unwrap()
@@ -1052,7 +1384,7 @@ fn invalid_fixed_url_records_only_the_safe_configuration_category() {
     assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
     assert_eq!(
         status.latest_error,
-        Some(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+        Some(super::super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
     );
     assert_eq!(status.endpoint, None);
     assert_eq!(status.pairing_uri, None);
@@ -1111,7 +1443,7 @@ fn command_invalid_rotation_preserves_status_and_allows_corrected_rotation() {
     assert_eq!(after_invalid.pairing_uri, initial.pairing_uri);
     assert_eq!(
         after_invalid.latest_error,
-        Some(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+        Some(super::super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
     );
     assert_eq!(
         client
@@ -1398,7 +1730,7 @@ fn transport_failures_are_not_misreported_as_port_conflicts() {
         assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
         assert_eq!(
             status.latest_error,
-            Some(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
+            Some(super::super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
         );
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
         state.stop().unwrap();
@@ -1483,7 +1815,7 @@ fn fixed_port_conflict_has_its_own_safe_error_category() {
         .is_err());
     assert_eq!(
         state.status().unwrap().latest_error,
-        Some(super::shared_session::DeviceSyncErrorCategory::PortUnavailable)
+        Some(super::super::shared_session::DeviceSyncErrorCategory::PortUnavailable)
     );
     state.stop().unwrap();
 }
@@ -1494,7 +1826,10 @@ struct RetryableTunnelLauncher {
 }
 
 impl SharedPeerTunnelLauncher for RetryableTunnelLauncher {
-    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+    fn start(
+        &self,
+        host: SharedSessionHost,
+    ) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
         Ok(Box::new(RetryableTunnel {
             _host: host,
             public_url: self.public_url.clone(),
@@ -1563,7 +1898,7 @@ fn unified_stop_retries_tunnel_after_attempting_host_and_all_prepared_cleanup() 
     assert!(state.stop().is_err());
     assert_eq!(
         state.status().unwrap().latest_error,
-        Some(super::shared_session::DeviceSyncErrorCategory::CleanupFailed)
+        Some(super::super::shared_session::DeviceSyncErrorCategory::CleanupFailed)
     );
     assert_eq!(state.status().unwrap().endpoint, None);
     assert_eq!(state.status().unwrap().pairing_uri, None);
@@ -1615,16 +1950,20 @@ fn device_sync_wire_names_match_the_settings_contract() {
         serde_json::json!({"read": true, "bidirectional": false})
     );
     assert_eq!(
-        serde_json::to_value(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
-            .unwrap(),
+        serde_json::to_value(
+            super::super::shared_session::DeviceSyncErrorCategory::TransportUnavailable
+        )
+        .unwrap(),
         "transport-unavailable"
     );
-    let status = super::shared_session::DeviceSyncSourceStatus {
+    let status = super::super::shared_session::DeviceSyncSourceStatus {
         phase: DeviceSyncSourcePhase::Error,
         endpoint: None,
         pairing_uri: None,
         expires_at_ms: None,
-        latest_error: Some(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable),
+        latest_error: Some(
+            super::super::shared_session::DeviceSyncErrorCategory::TransportUnavailable,
+        ),
     };
     let serialized = serde_json::to_value(status).unwrap();
     assert_eq!(
@@ -2067,4 +2406,5 @@ fn stop_clears_runtime_and_restart_rehydrates_persisted_bearer() {
         reqwest::StatusCode::OK
     );
     host.stop().unwrap();
+}
 }

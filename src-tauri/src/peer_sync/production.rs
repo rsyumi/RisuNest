@@ -26,6 +26,38 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const UNIFIED_ACTIVE_SOURCE_MARKER_SCHEMA: &str = "risunest.peer-clone-active-source/v1";
+const UNIFIED_ACTIVE_SOURCE_MARKER_FILE: &str = "active-source.json";
+const MAX_UNIFIED_ACTIVE_SOURCE_MARKER_BYTES: u64 = 4 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnifiedActiveSourceMarker {
+    schema: String,
+    directory_id: String,
+    session_id: String,
+    manifest_id: String,
+}
+
+impl UnifiedActiveSourceMarker {
+    fn validate(&self) -> Result<(), PeerSyncError> {
+        if self.schema != UNIFIED_ACTIVE_SOURCE_MARKER_SCHEMA
+            || uuid::Uuid::parse_str(&self.directory_id)
+                .map(|parsed| parsed.to_string() != self.directory_id)
+                .unwrap_or(true)
+            || uuid::Uuid::parse_str(&self.session_id)
+                .map(|parsed| parsed.to_string() != self.session_id)
+                .unwrap_or(true)
+            || super::protocol::validate_hash(&self.manifest_id).is_err()
+        {
+            return Err(PeerSyncError::Validation(
+                "invalid prepared clone source marker".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const ACTIVE_MANIFEST_KEY: &str = "peerCloneActiveManifest";
 pub(crate) const ACTIVATION_STAGE_SEPARATOR: char = '_';
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -98,6 +130,270 @@ pub(crate) fn prepare_lossless_clone_session(
             "{error}; lossless source preparation cleanup failed: {cleanup}"
         ))),
     }
+}
+
+/// Hostless clone preparation shared by the unified desktop and Android
+/// listeners. The listener takes the session, while this owner retains the
+/// exact generated directory for deterministic lane cleanup.
+pub(crate) struct PreparedUnifiedCloneSource {
+    prepared: Option<PreparedCloneSession>,
+    session_root: PathBuf,
+    marker_path: PathBuf,
+    marker: UnifiedActiveSourceMarker,
+}
+
+impl PreparedUnifiedCloneSource {
+    pub(crate) fn directory_id(&self) -> Result<&str, PeerSyncError> {
+        self.session_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                PeerSyncError::Storage(
+                    "shared clone source directory identity is unavailable".to_owned(),
+                )
+            })
+    }
+
+    pub(crate) fn session_root(&self) -> &Path {
+        &self.session_root
+    }
+
+    pub(crate) fn session_id(&self) -> Result<&str, PeerSyncError> {
+        self.prepared
+            .as_ref()
+            .map(|prepared| prepared.manifest().session_id.as_str())
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())
+            })
+    }
+
+    pub(crate) fn manifest_id(&self) -> Result<&str, PeerSyncError> {
+        self.prepared
+            .as_ref()
+            .map(PreparedCloneSession::manifest_id)
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())
+            })
+    }
+
+    pub(crate) fn take_session(&mut self) -> Result<PreparedCloneSession, PeerSyncError> {
+        self.prepared.take().ok_or_else(|| {
+            PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())
+        })
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), PeerSyncError> {
+        self.prepared.take();
+        remove_unified_directory(&self.session_root)?;
+        match read_unified_source_marker(&self.marker_path)? {
+            None => Ok(()),
+            Some(marker) if marker == self.marker => {
+                fs::remove_file(&self.marker_path)?;
+                Ok(())
+            }
+            Some(_) => Err(PeerSyncError::Validation(
+                "prepared clone source marker belongs to another session".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) fn prepare_unified_clone_source(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    peer_root: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<PreparedUnifiedCloneSource, PeerSyncError> {
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let preparation_parent = peer_root.join("source-preparation");
+    let sessions_parent = peer_root.join("source-sessions");
+    let preparation_root = preparation_parent.join(&operation_id);
+    let session_root = sessions_parent.join(&operation_id);
+    fs::create_dir_all(&preparation_parent)?;
+    fs::create_dir_all(&sessions_parent)?;
+    let expected_revision = store.revision().map_err(store_error)?;
+    let prepared = prepare_lossless_clone_session(
+        store,
+        cas,
+        expected_revision,
+        &preparation_root,
+        &session_root,
+        cancellation,
+    )
+    .map_err(|error| match fs::remove_dir_all(&session_root) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => PeerSyncError::Storage(format!(
+            "{error}; peer clone source session cleanup failed: {cleanup}"
+        )),
+    })?;
+    let marker = UnifiedActiveSourceMarker {
+        schema: UNIFIED_ACTIVE_SOURCE_MARKER_SCHEMA.to_owned(),
+        directory_id: operation_id,
+        session_id: prepared.manifest().session_id.clone(),
+        manifest_id: prepared.manifest_id().to_owned(),
+    };
+    let marker_path = peer_root.join(UNIFIED_ACTIVE_SOURCE_MARKER_FILE);
+    if let Err(error) = write_unified_source_marker(&marker_path, &marker) {
+        let cleanup = remove_unified_directory(&session_root);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(PeerSyncError::Storage(format!(
+                "{error}; peer clone source session cleanup failed: {cleanup}"
+            ))),
+        };
+    }
+    Ok(PreparedUnifiedCloneSource {
+        prepared: Some(prepared),
+        session_root,
+        marker_path,
+        marker,
+    })
+}
+
+fn unified_metadata_is_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn remove_unified_directory(path: &Path) -> Result<(), PeerSyncError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || unified_metadata_is_link(&metadata) {
+        return Err(PeerSyncError::Validation(
+            "peer clone cleanup target is not an ordinary directory".to_owned(),
+        ));
+    }
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn read_unified_source_marker(
+    path: &Path,
+) -> Result<Option<UnifiedActiveSourceMarker>, PeerSyncError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || unified_metadata_is_link(&metadata)
+        || metadata.len() > MAX_UNIFIED_ACTIVE_SOURCE_MARKER_BYTES
+    {
+        return Err(PeerSyncError::Validation(
+            "invalid prepared clone source marker file".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(MAX_UNIFIED_ACTIVE_SOURCE_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_UNIFIED_ACTIVE_SOURCE_MARKER_BYTES {
+        return Err(PeerSyncError::Validation(
+            "prepared clone source marker exceeds its bound".to_owned(),
+        ));
+    }
+    let marker: UnifiedActiveSourceMarker = serde_json::from_slice(&bytes)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    marker.validate()?;
+    Ok(Some(marker))
+}
+
+fn write_unified_source_marker(
+    path: &Path,
+    marker: &UnifiedActiveSourceMarker,
+) -> Result<(), PeerSyncError> {
+    marker.validate()?;
+    let bytes =
+        serde_json::to_vec(marker).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    if bytes.len() as u64 > MAX_UNIFIED_ACTIVE_SOURCE_MARKER_BYTES {
+        return Err(PeerSyncError::Storage(
+            "prepared clone source marker exceeds its bound".to_owned(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        PeerSyncError::Storage("prepared clone source marker has no parent".to_owned())
+    })?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".active-source-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        replace_unified_marker(&temporary, path)?;
+        sync_unified_marker_parent(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_unified_marker(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_unified_marker(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_unified_marker_parent(path: &Path) -> Result<(), PeerSyncError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_unified_marker_parent(_path: &Path) -> Result<(), PeerSyncError> {
+    Ok(())
 }
 
 pub(crate) struct LosslessCloneStage {

@@ -9,25 +9,27 @@ use super::{
     PeerSyncError, PreparedCloneSession,
 };
 use std::net::{Ipv4Addr, SocketAddr};
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 use super::{
     bidirectional_commands::{
         prepare_shared_bidirectional_source, PreparedSharedBidirectionalSource,
     },
-    commands::{prepare_shared_clone_source, PreparedSharedCloneSource},
     delta_commands::{prepare_shared_delta_source, PreparedSharedDeltaSource},
+    production::{prepare_unified_clone_source, PreparedUnifiedCloneSource},
 };
 #[cfg(desktop)]
+use crate::local_backup::NeverCancelled;
+#[cfg(any(desktop, target_os = "android", test))]
 use crate::{
     asset_repository::PayloadCas,
-    local_backup::{CancellationProbe, NeverCancelled},
+    local_backup::CancellationProbe,
     persistent_store::{self, PersistentStore, StoreError},
 };
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 use tauri::{AppHandle, Manager, State};
 
 /// The three source preparations have a fixed dependency order.  A source
@@ -269,14 +271,14 @@ impl<P: SharedSourceOwnership> SharedSessionLifecycle<P> {
 /// Concrete desktop adapter around the existing source preparation engines.
 /// It deliberately has no listener, tunnel, foreground-service, or Tauri
 /// command responsibility.  Those are layered above this preparation slice.
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 pub(crate) struct SharedSourceEngines {
-    clone: Option<PreparedSharedCloneSource>,
+    clone: Option<PreparedUnifiedCloneSource>,
     delta: Option<PreparedSharedDeltaSource>,
     bidirectional: Option<PreparedSharedBidirectionalSource>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 impl SharedSourceEngines {
     pub(crate) fn new() -> Self {
         Self {
@@ -287,7 +289,7 @@ impl SharedSourceEngines {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 pub(crate) struct SharedSourcePreparationContext<'a> {
     pub(crate) store: &'a mut PersistentStore,
     pub(crate) cas: &'a PayloadCas,
@@ -296,7 +298,7 @@ pub(crate) struct SharedSourcePreparationContext<'a> {
     pub(crate) expected_bidirectional_revision: i64,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 impl SharedSourceOwnership for SharedSourceEngines {
     type Host = SharedSessionHost;
 
@@ -346,7 +348,7 @@ impl SharedSourceOwnership for SharedSourceEngines {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedSourceEngines {
     fn prepare(
         &mut self,
@@ -355,7 +357,7 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
     ) -> Result<(), PeerSyncError> {
         match lane {
             SharedSourceLane::Clone => {
-                self.clone = Some(prepare_shared_clone_source(
+                self.clone = Some(prepare_unified_clone_source(
                     context.store,
                     context.cas,
                     &context.app_root.join("peer-clone"),
@@ -382,7 +384,7 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
     }
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceSyncListenMethod {
@@ -392,7 +394,7 @@ pub enum DeviceSyncListenMethod {
     FixedUrl,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSyncPrepareRequest {
@@ -401,7 +403,7 @@ pub struct DeviceSyncPrepareRequest {
     pub public_base_url: Option<String>,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSyncLinkPermissions {
@@ -409,7 +411,7 @@ pub struct DeviceSyncLinkPermissions {
     pub bidirectional: bool,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceSyncSourcePhase {
@@ -422,7 +424,7 @@ pub enum DeviceSyncSourcePhase {
     Error,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeviceSyncErrorCategory {
@@ -434,7 +436,7 @@ pub enum DeviceSyncErrorCategory {
     StateUnavailable,
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSyncSourceStatus {
@@ -443,6 +445,452 @@ pub struct DeviceSyncSourceStatus {
     pub pairing_uri: Option<String>,
     pub expires_at_ms: Option<u64>,
     pub latest_error: Option<DeviceSyncErrorCategory>,
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) trait AndroidDeviceSyncHost {
+    fn enable_registry(
+        &mut self,
+        app_root: &Path,
+        source_name: &str,
+        permissions: DevicePermissions,
+    ) -> Result<(), PeerSyncError>;
+    fn start_private_lan(
+        &mut self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Result<SharedPairingData, PeerSyncError>;
+    fn stop_listener(&mut self) -> Result<(), PeerSyncError>;
+    fn revoke_registered_device(&mut self, _device_id: &str) {}
+}
+
+#[cfg(any(target_os = "android", test))]
+impl AndroidDeviceSyncHost for SharedSessionHost {
+    fn enable_registry(
+        &mut self,
+        app_root: &Path,
+        source_name: &str,
+        permissions: DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        self.enable_v2_registry(app_root, source_name, permissions)
+    }
+
+    fn start_private_lan(
+        &mut self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Result<SharedPairingData, PeerSyncError> {
+        SharedSessionHost::start_private_lan(self, address, port)
+    }
+
+    fn stop_listener(&mut self) -> Result<(), PeerSyncError> {
+        self.stop()
+    }
+
+    fn revoke_registered_device(&mut self, device_id: &str) {
+        SharedSessionHost::revoke_registered_device(self, device_id);
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone)]
+struct AndroidDeviceSyncConfiguration {
+    app_root: PathBuf,
+    fixed_port: u16,
+}
+
+#[cfg(any(target_os = "android", test))]
+struct AndroidDeviceSyncRuntime {
+    phase: DeviceSyncSourcePhase,
+    configuration: Option<AndroidDeviceSyncConfiguration>,
+    pairing: Option<SharedPairingData>,
+    foreground: Option<super::android_foreground::AndroidForegroundKey>,
+    latest_error: Option<DeviceSyncErrorCategory>,
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) struct AndroidDeviceSyncSourceState<P = SharedSourceEngines>
+where
+    P: SharedSourceOwnership,
+    P::Host: AndroidDeviceSyncHost,
+{
+    operation: Arc<Mutex<()>>,
+    runtime: Arc<Mutex<AndroidDeviceSyncRuntime>>,
+    lifecycle: Arc<SharedSessionLifecycle<P>>,
+    lan_address_override: Option<Ipv4Addr>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl<P> Clone for AndroidDeviceSyncSourceState<P>
+where
+    P: SharedSourceOwnership,
+    P::Host: AndroidDeviceSyncHost,
+{
+    fn clone(&self) -> Self {
+        Self {
+            operation: Arc::clone(&self.operation),
+            runtime: Arc::clone(&self.runtime),
+            lifecycle: Arc::clone(&self.lifecycle),
+            lan_address_override: self.lan_address_override,
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Default for AndroidDeviceSyncSourceState<SharedSourceEngines> {
+    fn default() -> Self {
+        Self::new(SharedSourceEngines::new(), None)
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+impl<P> AndroidDeviceSyncSourceState<P>
+where
+    P: SharedSourceOwnership + Send + 'static,
+    P::Host: AndroidDeviceSyncHost + Send + 'static,
+{
+    fn new(preparation: P, lan_address_override: Option<Ipv4Addr>) -> Self {
+        Self {
+            operation: Arc::new(Mutex::new(())),
+            runtime: Arc::new(Mutex::new(AndroidDeviceSyncRuntime {
+                phase: DeviceSyncSourcePhase::Idle,
+                configuration: None,
+                pairing: None,
+                foreground: None,
+                latest_error: None,
+            })),
+            lifecycle: Arc::new(SharedSessionLifecycle::new(preparation)),
+            lan_address_override,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(preparation: P, lan_address: Ipv4Addr) -> Self {
+        Self::new(preparation, Some(lan_address))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_for_test<C>(
+        &self,
+        context: &mut C,
+        app_root: &Path,
+        request: DeviceSyncPrepareRequest,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError>
+    where
+        P: SharedSourcePreparation<C>,
+    {
+        self.prepare(context, app_root, request)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_attached_for_test(
+        &self,
+        permissions: DeviceSyncLinkPermissions,
+        foreground: super::android_foreground::AndroidForegroundKey,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        self.start_attached(permissions, foreground)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(
+        &self,
+    ) -> Result<Option<super::android_foreground::AndroidForegroundKey>, PeerSyncError> {
+        self.stop()
+    }
+
+    pub(crate) fn prepare<C>(
+        &self,
+        context: &mut C,
+        app_root: &Path,
+        request: DeviceSyncPrepareRequest,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError>
+    where
+        P: SharedSourcePreparation<C>,
+    {
+        let _operation = self.operation()?;
+        if request.method != DeviceSyncListenMethod::Lan || request.fixed_port == 0 {
+            return self.fail(
+                DeviceSyncErrorCategory::InvalidConfiguration,
+                PeerSyncError::Validation(
+                    "Android device sync requires Trusted LAN with a nonzero fixed port".to_owned(),
+                ),
+            );
+        }
+        if self.runtime()?.phase == DeviceSyncSourcePhase::Prepared {
+            return self.status();
+        }
+        self.set_phase(DeviceSyncSourcePhase::Preparing)?;
+        if let Err(error) = self.lifecycle.prepare(context) {
+            return self.fail(DeviceSyncErrorCategory::PreparationFailed, error);
+        }
+        let mut runtime = self.runtime()?;
+        runtime.configuration = Some(AndroidDeviceSyncConfiguration {
+            app_root: app_root.to_path_buf(),
+            fixed_port: request.fixed_port,
+        });
+        runtime.pairing = None;
+        runtime.foreground = None;
+        runtime.latest_error = None;
+        runtime.phase = DeviceSyncSourcePhase::Prepared;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn start_attached(
+        &self,
+        permissions: DeviceSyncLinkPermissions,
+        foreground: super::android_foreground::AndroidForegroundKey,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        use super::android_foreground::{registry, AndroidForegroundLane};
+
+        let _operation = self.operation()?;
+        if foreground.lane != AndroidForegroundLane::DeviceSyncSource
+            || registry().acquire_exact(&foreground).is_none()
+        {
+            return Err(PeerSyncError::Validation(
+                "Android device sync foreground identity is not attached".to_owned(),
+            ));
+        }
+        if !permissions.read {
+            let error = PeerSyncError::Validation(
+                "device sync sharing requires read permission".to_owned(),
+            );
+            self.release_failed_foreground(&foreground);
+            return self.fail(DeviceSyncErrorCategory::InvalidConfiguration, error);
+        }
+        let configuration = match self.runtime()?.configuration.clone() {
+            Some(configuration) => configuration,
+            None => {
+                self.release_failed_foreground(&foreground);
+                return Err(PeerSyncError::Protocol(
+                    "device sync source is not prepared".to_owned(),
+                ));
+            }
+        };
+        if self.runtime()?.phase != DeviceSyncSourcePhase::Prepared {
+            self.release_failed_foreground(&foreground);
+            return Err(PeerSyncError::Protocol(
+                "device sync source is not prepared".to_owned(),
+            ));
+        }
+        let address = match self.lan_address_override {
+            Some(address) => address,
+            None => match super::lan::discover_lan_ipv4() {
+                Ok(address) => address,
+                Err(error) => {
+                    self.release_failed_foreground(&foreground);
+                    return self.fail(DeviceSyncErrorCategory::TransportUnavailable, error);
+                }
+            },
+        };
+        self.set_phase(DeviceSyncSourcePhase::Starting)?;
+        let host_permissions = if permissions.bidirectional {
+            DevicePermissions::read_and_bidirectional()
+        } else {
+            DevicePermissions::read()
+        };
+        let start = self.lifecycle.with_host_mut(|host| {
+            host.enable_registry(
+                &configuration.app_root,
+                super::device_registry::platform_device_name(),
+                host_permissions,
+            )?;
+            host.start_private_lan(address, configuration.fixed_port)
+        });
+        let pairing = match start.and_then(|result| result) {
+            Ok(pairing) => pairing,
+            Err(error) => {
+                let cleanup = self
+                    .lifecycle
+                    .with_host_mut(AndroidDeviceSyncHost::stop_listener)
+                    .and_then(|result| result);
+                self.release_failed_foreground(&foreground);
+                let mut runtime = self.runtime()?;
+                runtime.pairing = None;
+                runtime.foreground = None;
+                if let Err(cleanup_error) = cleanup {
+                    crate::nlog!(
+                        "error",
+                        "Android shared listener start cleanup failed: {cleanup_error}"
+                    );
+                    runtime.phase = DeviceSyncSourcePhase::Error;
+                    runtime.latest_error = Some(DeviceSyncErrorCategory::CleanupFailed);
+                } else {
+                    runtime.phase = DeviceSyncSourcePhase::Prepared;
+                    runtime.latest_error = Some(DeviceSyncErrorCategory::TransportUnavailable);
+                }
+                return Err(error);
+            }
+        };
+        {
+            let mut runtime = self.runtime()?;
+            runtime.phase = DeviceSyncSourcePhase::Running;
+            runtime.pairing = Some(pairing);
+            runtime.foreground = Some(foreground.clone());
+            runtime.latest_error = None;
+        }
+        let callback_state = self.clone();
+        let callback_key = foreground.clone();
+        if !registry().set_source_stop_callback_exact(&foreground, move || {
+            callback_state.notification_stop_exact(&callback_key);
+        }) {
+            self.notification_stop_exact(&foreground);
+            self.release_failed_foreground(&foreground);
+            return Err(PeerSyncError::Protocol(
+                "Android foreground service detached before source start".to_owned(),
+            ));
+        }
+        self.status()
+    }
+
+    pub(crate) fn status(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        let runtime = self.runtime()?;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn stop(
+        &self,
+    ) -> Result<Option<super::android_foreground::AndroidForegroundKey>, PeerSyncError> {
+        use super::android_foreground::registry;
+
+        let foreground;
+        let cleanup;
+        {
+            let _operation = self.operation()?;
+            foreground = {
+                let mut runtime = self.runtime()?;
+                runtime.phase = DeviceSyncSourcePhase::Stopping;
+                runtime.pairing = None;
+                runtime.foreground.take()
+            };
+            cleanup = self.lifecycle.stop();
+            let mut runtime = self.runtime()?;
+            runtime.configuration = None;
+            runtime.pairing = None;
+            runtime.latest_error = cleanup
+                .as_ref()
+                .err()
+                .map(|_| DeviceSyncErrorCategory::CleanupFailed);
+            runtime.phase = if cleanup.is_ok() {
+                DeviceSyncSourcePhase::Idle
+            } else {
+                DeviceSyncSourcePhase::Error
+            };
+        }
+        if let Some(key) = foreground.as_ref() {
+            let _ = registry().cancel_exact(key);
+            let _ = registry().detach_if_generation(key);
+        }
+        cleanup.map(|()| foreground)
+    }
+
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
+        let result = self
+            .lifecycle
+            .with_host_mut(|host| host.revoke_registered_device(device_id));
+        if let Err(error) = result {
+            crate::nlog!(
+                "warn",
+                "Android shared source live bearer revoke skipped: {error}"
+            );
+        }
+    }
+
+    fn notification_stop_exact(&self, key: &super::android_foreground::AndroidForegroundKey) {
+        let Ok(_operation) = self.operation() else {
+            return;
+        };
+        if self
+            .runtime()
+            .ok()
+            .and_then(|runtime| runtime.foreground.clone())
+            .as_ref()
+            != Some(key)
+        {
+            return;
+        }
+        if self
+            .lifecycle
+            .with_host_mut(AndroidDeviceSyncHost::stop_listener)
+            .and_then(|result| result)
+            .is_err()
+        {
+            if let Ok(mut runtime) = self.runtime() {
+                runtime.phase = DeviceSyncSourcePhase::Error;
+                runtime.latest_error = Some(DeviceSyncErrorCategory::CleanupFailed);
+            }
+            return;
+        }
+        if let Ok(mut runtime) = self.runtime() {
+            if runtime.foreground.as_ref() == Some(key) {
+                runtime.foreground = None;
+                runtime.pairing = None;
+                runtime.latest_error = None;
+                runtime.phase = DeviceSyncSourcePhase::Prepared;
+            }
+        }
+    }
+
+    fn release_failed_foreground(
+        &self,
+        foreground: &super::android_foreground::AndroidForegroundKey,
+    ) {
+        let registry = super::android_foreground::registry();
+        let _ = registry.cancel_exact(foreground);
+        let _ = registry.detach_if_generation(foreground);
+    }
+
+    fn fail<T>(
+        &self,
+        category: DeviceSyncErrorCategory,
+        error: PeerSyncError,
+    ) -> Result<T, PeerSyncError> {
+        if let Ok(mut runtime) = self.runtime() {
+            runtime.latest_error = Some(category);
+        }
+        Err(error)
+    }
+
+    fn status_from_runtime(runtime: &AndroidDeviceSyncRuntime) -> DeviceSyncSourceStatus {
+        DeviceSyncSourceStatus {
+            phase: runtime.phase,
+            endpoint: runtime
+                .pairing
+                .as_ref()
+                .map(|pairing| pairing.endpoint.clone()),
+            pairing_uri: runtime
+                .pairing
+                .as_ref()
+                .map(SharedPairingData::canonical_uri),
+            expires_at_ms: runtime
+                .pairing
+                .as_ref()
+                .and_then(|pairing| u64::try_from(pairing.expires_at_ms).ok()),
+            latest_error: runtime.latest_error,
+        }
+    }
+
+    fn set_phase(&self, phase: DeviceSyncSourcePhase) -> Result<(), PeerSyncError> {
+        self.runtime()?.phase = phase;
+        Ok(())
+    }
+
+    fn operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, PeerSyncError> {
+        self.operation.lock().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "Android device sync operation mutex poisoned: {error}"
+            ))
+        })
+    }
+
+    fn runtime(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, AndroidDeviceSyncRuntime>, PeerSyncError> {
+        self.runtime.lock().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "Android device sync runtime mutex poisoned: {error}"
+            ))
+        })
+    }
 }
 
 #[cfg(desktop)]
@@ -1261,6 +1709,168 @@ pub async fn device_sync_rotate_link(
     permissions: DeviceSyncLinkPermissions,
 ) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
     run_device_sync_rotate_link(state.inner().clone(), permissions).await
+}
+
+#[cfg(target_os = "android")]
+fn android_device_sync_failure(
+    state: &AndroidDeviceSyncSourceState,
+    operation: &str,
+    fallback: DeviceSyncErrorCategory,
+    error: impl std::fmt::Display,
+) -> DeviceSyncErrorCategory {
+    crate::nlog!("error", "Android device sync {operation} failed: {error}");
+    state
+        .status()
+        .ok()
+        .and_then(|status| status.latest_error)
+        .unwrap_or(fallback)
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub(crate) fn device_sync_source_reserve(
+) -> Result<super::android_foreground::AndroidForegroundKey, String> {
+    super::android_foreground::registry()
+        .reserve(super::android_foreground::AndroidForegroundLane::DeviceSyncSource)
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub(crate) async fn device_sync_prepare(
+    app: AppHandle,
+    state: State<'_, AndroidDeviceSyncSourceState>,
+    request: DeviceSyncPrepareRequest,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let app_root = app.path().app_data_dir().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "device sync application data directory is unavailable: {error}"
+            ))
+        })?;
+        let cas = PayloadCas::new(&app_root)?;
+        persistent_store::commands::with_store_mut(app.state(), |store| {
+            let expected_bidirectional_revision = store.revision()?;
+            let mut context = SharedSourcePreparationContext {
+                store,
+                cas: &cas,
+                app_root: &app_root,
+                cancellation: &crate::local_backup::NeverCancelled,
+                expected_bidirectional_revision,
+            };
+            worker_state
+                .prepare(&mut context, &app_root, request)
+                .map_err(|error| StoreError::Store {
+                    message: error.to_string(),
+                })
+        })
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
+    })
+    .await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(android_device_sync_failure(
+            &state,
+            "prepare",
+            DeviceSyncErrorCategory::PreparationFailed,
+            error,
+        )),
+        Err(error) => Err(android_device_sync_failure(
+            &state,
+            "prepare worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub(crate) async fn device_sync_start(
+    state: State<'_, AndroidDeviceSyncSourceState>,
+    permissions: DeviceSyncLinkPermissions,
+    foreground: super::android_foreground::AndroidForegroundKey,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    let cancellation = match super::android_foreground::acquire_foreground_lane(
+        &foreground,
+        super::android_foreground::AndroidForegroundLane::DeviceSyncSource,
+    )
+    .await
+    {
+        Ok(cancellation) => cancellation,
+        Err(error) => {
+            return Err(android_device_sync_failure(
+                state.inner(),
+                "foreground attach",
+                DeviceSyncErrorCategory::StateUnavailable,
+                error,
+            ))
+        }
+    };
+    let state = state.inner().clone();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        if cancellation.is_cancelled() {
+            return Err(PeerSyncError::Cancelled);
+        }
+        worker_state.start_attached(permissions, foreground)
+    })
+    .await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(android_device_sync_failure(
+            &state,
+            "start",
+            DeviceSyncErrorCategory::TransportUnavailable,
+            error,
+        )),
+        Err(error) => Err(android_device_sync_failure(
+            &state,
+            "start worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub(crate) fn device_sync_status(
+    state: State<'_, AndroidDeviceSyncSourceState>,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    state.status().map_err(|error| {
+        android_device_sync_failure(
+            state.inner(),
+            "status",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )
+    })
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub(crate) async fn device_sync_stop(
+    state: State<'_, AndroidDeviceSyncSourceState>,
+) -> Result<Option<super::android_foreground::AndroidForegroundKey>, DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || worker_state.stop()).await {
+        Ok(Ok(foreground)) => Ok(foreground),
+        Ok(Err(error)) => Err(android_device_sync_failure(
+            &state,
+            "stop",
+            DeviceSyncErrorCategory::CleanupFailed,
+            error,
+        )),
+        Err(error) => Err(android_device_sync_failure(
+            &state,
+            "stop worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

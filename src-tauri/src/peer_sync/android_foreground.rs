@@ -8,6 +8,7 @@ use std::sync::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum AndroidForegroundLane {
+    DeviceSyncSource,
     P1Source,
     P4Source,
     P4Target,
@@ -21,6 +22,7 @@ impl AndroidForegroundLane {
     #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
+            "device-sync-source" => Some(Self::DeviceSyncSource),
             "p1-source" => Some(Self::P1Source),
             "p4-source" => Some(Self::P4Source),
             "p4-target" => Some(Self::P4Target),
@@ -140,7 +142,8 @@ impl AndroidForegroundRegistry {
         // impossible.
         if !matches!(
             key.lane,
-            AndroidForegroundLane::P1Source
+            AndroidForegroundLane::DeviceSyncSource
+                | AndroidForegroundLane::P1Source
                 | AndroidForegroundLane::P4Source
                 | AndroidForegroundLane::P5Source
         ) {
@@ -182,7 +185,8 @@ impl AndroidForegroundRegistry {
     pub(crate) fn abandon_source_exact(&self, key: &AndroidForegroundKey) -> bool {
         if !matches!(
             key.lane,
-            AndroidForegroundLane::P1Source
+            AndroidForegroundLane::DeviceSyncSource
+                | AndroidForegroundLane::P1Source
                 | AndroidForegroundLane::P4Source
                 | AndroidForegroundLane::P5Source
         ) {
@@ -215,7 +219,8 @@ impl AndroidForegroundRegistry {
     ) -> Option<AndroidForegroundKey> {
         if !matches!(
             lane,
-            AndroidForegroundLane::P1Source
+            AndroidForegroundLane::DeviceSyncSource
+                | AndroidForegroundLane::P1Source
                 | AndroidForegroundLane::P4Source
                 | AndroidForegroundLane::P5Source
         ) {
@@ -338,7 +343,8 @@ pub(crate) fn peer_sync_foreground_source_abandon(
 ) -> Result<bool, String> {
     if !matches!(
         foreground.lane,
-        AndroidForegroundLane::P1Source
+        AndroidForegroundLane::DeviceSyncSource
+            | AndroidForegroundLane::P1Source
             | AndroidForegroundLane::P4Source
             | AndroidForegroundLane::P5Source
     ) {
@@ -354,7 +360,8 @@ pub(crate) fn peer_sync_foreground_source_status(
 ) -> Result<Option<AndroidForegroundKey>, String> {
     if !matches!(
         lane,
-        AndroidForegroundLane::P1Source
+        AndroidForegroundLane::DeviceSyncSource
+            | AndroidForegroundLane::P1Source
             | AndroidForegroundLane::P4Source
             | AndroidForegroundLane::P5Source
     ) {
@@ -373,6 +380,10 @@ mod tests {
 
     #[test]
     fn only_user_started_peer_sync_lanes_are_allowed() {
+        assert_eq!(
+            AndroidForegroundLane::parse("device-sync-source"),
+            Some(AndroidForegroundLane::DeviceSyncSource)
+        );
         assert_eq!(
             AndroidForegroundLane::parse("p1-source"),
             Some(AndroidForegroundLane::P1Source)
@@ -466,8 +477,10 @@ mod tests {
     fn source_abandon_is_exact_idempotent_and_allows_a_different_lane() {
         let registry = AndroidForegroundRegistry::default();
         for lane in [
+            AndroidForegroundLane::DeviceSyncSource,
             AndroidForegroundLane::P1Source,
             AndroidForegroundLane::P4Source,
+            AndroidForegroundLane::P5Source,
         ] {
             let source = registry.reserve(lane).unwrap();
             let mut stale = source.clone();
@@ -484,13 +497,15 @@ mod tests {
     #[test]
     fn source_status_returns_only_the_requested_source_lane() {
         let registry = AndroidForegroundRegistry::default();
-        let source = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        let source = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
         assert_eq!(
-            registry.source_status(AndroidForegroundLane::P1Source),
+            registry.source_status(AndroidForegroundLane::DeviceSyncSource),
             Some(source.clone())
         );
         assert_eq!(
-            registry.source_status(AndroidForegroundLane::P4Source),
+            registry.source_status(AndroidForegroundLane::P1Source),
             None
         );
         assert_eq!(
@@ -499,7 +514,7 @@ mod tests {
         );
         assert!(registry.abandon_source_exact(&source));
         assert_eq!(
-            registry.source_status(AndroidForegroundLane::P1Source),
+            registry.source_status(AndroidForegroundLane::DeviceSyncSource),
             None
         );
     }

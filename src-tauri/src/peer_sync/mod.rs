@@ -79,7 +79,7 @@ pub use logical_delta_transfer::{
     LogicalDeltaObjectSource, LogicalDeltaStagedTarget, LogicalDeltaTransferSelection,
     ReadyLogicalDeltaPlan,
 };
-#[cfg(any(desktop, target_os = "android"))]
+#[cfg(any(target_os = "android", test))]
 pub(crate) use production::prepare_lossless_clone_session;
 #[cfg(any(desktop, target_os = "android", test))]
 pub(crate) use production::LosslessCloneTargetAdapter;
