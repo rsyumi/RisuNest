@@ -11,6 +11,7 @@ import {
     restoreStableWorkingSetSelection,
 } from './persistentDataRuntime'
 import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
+import { RevisionConflictError } from './persistentDataStore'
 import {
     createCatalogCharacterStub,
     createCatalogPresetWorkingSet,
@@ -60,12 +61,22 @@ function makeConversationDatabase(username: string): Database {
 
 async function createActiveSessionRuntimeHarness() {
     let database = makeConversationDatabase('Initial')
+    let revision = 1
     const store = {
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => ({
-            revision: 1,
+            revision,
             value: capturePersistentRoot(database),
         })),
+        readConversation: vi.fn(async (characterId: string, conversationId: string) => {
+            const conversation = database.characters
+                .find((character) => character.chaId === characterId)
+                ?.chats.find((chat) => chat.id === conversationId)
+            return conversation
+                ? { revision, value: structuredClone(conversation) }
+                : null
+        }),
+        commit: vi.fn(async () => ({ revision: ++revision })),
         replaceFromDatabase: vi.fn(async () => ({ revision: 2 })),
         acquireRevision: vi.fn(async (revision: number) =>
             makeDatabaseLease(structuredClone(database), revision)),
@@ -89,12 +100,16 @@ async function createActiveSessionRuntimeHarness() {
             restoreSelection: vi.fn(),
             publishCharacter: vi.fn(),
             publishConversation: vi.fn(),
+            publishConversationReplacement: (result) => {
+                publishPersistentConversationReplacementToWorkingSet(database, result)
+            },
         },
         prepareDatabase: async (value) => value,
     })
     await runtime.initializeActiveWorkingSet(database)
     return {
         runtime,
+        store,
         get database() {
             return database
         },
@@ -305,6 +320,40 @@ describe('persistent plugin storage capture', () => {
 })
 
 describe('persistent conversation replacement publication', () => {
+    it('forwards replacement options without changing the selected character', async () => {
+        const harness = await createActiveSessionRuntimeHarness()
+        const selectedCharacterId = harness.database.characters[0].chaId
+        const replacement = {
+            ...structuredClone(harness.database.characters[0].chats[0]),
+            name: 'Runtime replacement',
+        }
+
+        await expect(harness.runtime.replacePersistentConversation(
+            'char-a',
+            'chat-a',
+            'plugin-chat-set',
+            replacement,
+            { expectedRevision: 1 },
+        )).resolves.toBe(true)
+
+        expect(harness.database.characters[0].chaId).toBe(selectedCharacterId)
+        expect(harness.database.characters[0].chats[0]).toEqual(replacement)
+        expect(harness.store.commit).toHaveBeenCalledWith(expect.objectContaining({
+            expectedRevision: 1,
+            conversations: [expect.objectContaining({
+                characterId: 'char-a',
+                conversationId: 'chat-a',
+            })],
+        }))
+        await expect(harness.runtime.replacePersistentConversation(
+            'char-a',
+            'chat-a',
+            'plugin-chat-set',
+            replacement,
+            { expectedRevision: 1 },
+        )).rejects.toBeInstanceOf(RevisionConflictError)
+    })
+
     it('updates complete targets while keeping inactive catalog and summary targets bounded', () => {
         const selected = makeConversationDatabase('Selected').characters[0]
         selected.chaId = 'selected-char'

@@ -2869,10 +2869,7 @@ export class SaveCoordinator {
         this.currentRevision = result.revision
         this.dirtyGeneration++
         this.dependencies.publishConversationReplacement?.(result)
-        const selected = this.capture()
-        if (selected.character?.chaId === result.characterId) {
-            this.setCharacterBaseline(selected)
-        }
+        this.advanceCharacterBaselineForConversation(result)
         if (!options.preservePendingWork) this.pendingByteCount = 0
         this.lastBackgroundErrorMessage = null
         this.dependencies.onLocalRevision?.(result.revision)
@@ -2887,6 +2884,10 @@ export class SaveCoordinator {
         reason: string
         replacementMessageCount: number
     }): Promise<never> {
+        this.enqueueResidentConversationCompensation(
+            options.characterId,
+            options.conversationId,
+        )
         this.currentRevision = options.committedRevision
         this.dirtyGeneration++
         this.dependencies.onLocalRevision?.(options.committedRevision)
@@ -2921,9 +2922,12 @@ export class SaveCoordinator {
             )
             if (this.residentConversationsMatch(resident, next)) {
                 targetSettled = true
-                if (this.capture().character?.chaId === options.characterId) {
-                    this.setCharacterBaseline(this.capture())
-                }
+                this.advanceCharacterBaselineForConversation({
+                    revision: compensated.revision,
+                    characterId: options.characterId,
+                    conversationId: options.conversationId,
+                    conversation: resident.conversation,
+                })
                 break
             }
             deleteCount = candidate.message.length
@@ -2931,11 +2935,12 @@ export class SaveCoordinator {
             targetSettled = resident === null
         }
 
-        if (!targetSettled) {
-            this.enqueueResidentConversationCompensation(
+        if (targetSettled) {
+            this.removeResidentConversationCompensation(
                 options.characterId,
                 options.conversationId,
             )
+        } else {
             this.armDebounce()
         }
         await this.finishExplicitCommit(this.revision)
@@ -3153,9 +3158,12 @@ export class SaveCoordinator {
                 )
             }
             this.pendingResidentConversationCompensations.shift()
-            if (this.capture().character?.chaId === pending.characterId) {
-                this.setCharacterBaseline(this.capture())
-            }
+            this.advanceCharacterBaselineForConversation({
+                revision: committed.revision,
+                characterId: pending.characterId,
+                conversationId: pending.conversationId,
+                conversation: resident.conversation,
+            })
         }
     }
 
@@ -3200,6 +3208,34 @@ export class SaveCoordinator {
             pending.conversationId === conversationId,
         )) return
         this.pendingResidentConversationCompensations.push({ characterId, conversationId })
+    }
+
+    private removeResidentConversationCompensation(
+        characterId: string,
+        conversationId: string,
+    ): void {
+        const index = this.pendingResidentConversationCompensations.findIndex((pending) =>
+            pending.characterId === characterId &&
+            pending.conversationId === conversationId,
+        )
+        if (index >= 0) this.pendingResidentConversationCompensations.splice(index, 1)
+    }
+
+    private advanceCharacterBaselineForConversation(
+        result: PersistentConversationReplacementResult,
+    ): void {
+        if (
+            this.windowedCharacterBaseline !== null ||
+            this.characterBaselineId !== result.characterId ||
+            this.characterBaseline === null
+        ) return
+        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+        const index = baseline.chats.findIndex(
+            (conversation) => conversation.id === result.conversationId,
+        )
+        if (index < 0) return
+        baseline.chats[index] = canonicalClone(result.conversation)
+        this.characterBaseline = canonicalJson(baseline)
     }
 
     private removeGroupCharacterReference(
