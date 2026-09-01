@@ -11,6 +11,7 @@ class PeerSyncForegroundServiceTest {
 
   @Test
   fun `only user started peer sync lanes are accepted`() {
+    assertTrue(isAllowedPeerSyncForegroundLane("device-sync-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p1-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p4-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p4-target"))
@@ -18,6 +19,16 @@ class PeerSyncForegroundServiceTest {
     assertTrue(isAllowedPeerSyncForegroundLane("p5-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("p3-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("quick-tunnel"))
+  }
+
+  @Test
+  fun `unified source identity carries no endpoint or credential`() {
+    val extras = peerSyncForegroundIdentityExtras("device-sync-source", operationId, 12L)
+    assertEquals(setOf("lane", "operationId", "generation"), extras.keys)
+    assertFalse(extras.keys.any {
+      it.contains("endpoint", true) || it.contains("bearer", true) ||
+        it.contains("claim", true) || it.contains("token", true)
+    })
   }
 
   @Test
@@ -89,5 +100,28 @@ class PeerSyncForegroundServiceTest {
 
     assertEquals(p5, attached)
     assertFalse(canStartPeerSyncForeground(attached, fresh))
+  }
+
+  @Test
+  fun `stale unified source Stop cannot detach a restarted generation`() {
+    val current = PeerSyncForegroundIdentity("device-sync-source", operationId, 12L)
+    val stale = current.copy(generation = 11L)
+
+    assertEquals(current, peerSyncForegroundIdentityAfterStop(current, stale))
+    assertTrue(canStartPeerSyncForeground(current, current))
+    assertFalse(canStartPeerSyncForeground(current, current.copy(generation = 13L)))
+  }
+
+  @Test
+  fun `unified and legacy source identities remain mutually exclusive`() {
+    val unified = PeerSyncForegroundIdentity("device-sync-source", operationId, 12L)
+    val legacy = PeerSyncForegroundIdentity(
+      "p1-source",
+      "22222222-2222-4222-8222-222222222222",
+      13L,
+    )
+
+    assertFalse(canStartPeerSyncForeground(unified, legacy))
+    assertFalse(canStartPeerSyncForeground(legacy, unified))
   }
 }
