@@ -16,10 +16,6 @@ private const val GENERATION_FOREGROUND_BEGIN = "co.aiclient.risu.GENERATION_FOR
 private const val GENERATION_FOREGROUND_END = "co.aiclient.risu.GENERATION_FOREGROUND_END"
 
 internal enum class GenerationForegroundCommand { START, STOP, NONE }
-internal enum class GenerationForegroundTermination { NONE, CONDITIONAL, UNCONDITIONAL }
-
-internal fun generationForegroundTimeoutTermination(): GenerationForegroundTermination =
-  GenerationForegroundTermination.UNCONDITIONAL
 
 internal class GenerationForegroundController {
   private var count = 0
