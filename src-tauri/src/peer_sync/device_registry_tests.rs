@@ -1,7 +1,8 @@
 use super::device_registry::{
     incoming_source_summaries, outgoing_device_summaries, record_incoming_completed_operation,
-    remove_incoming_source, revoke_outgoing_device, DevicePermissions, IncomingSource,
-    IncomingSourceRegistry, OutgoingDevice, OutgoingDeviceRegistry,
+    record_incoming_completed_operation_best_effort, register_incoming_source,
+    register_outgoing_claim, remove_incoming_source, revoke_outgoing_device, DevicePermissions,
+    IncomingSource, IncomingSourceRegistry, OutgoingDevice, OutgoingDeviceRegistry,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -344,6 +345,124 @@ fn concurrent_registry_saves_do_not_collide_on_a_temp_name() {
         handle.join().unwrap().unwrap();
     }
     OutgoingDeviceRegistry::load(root.path()).unwrap();
+}
+
+#[test]
+fn concurrent_outgoing_claims_preserve_both_devices() {
+    let root = tempfile::tempdir().unwrap();
+    let app_root = root.path().to_owned();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for device_id in [SOURCE_ID, TARGET_ID] {
+        let app_root = app_root.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            register_outgoing_claim(
+                &app_root,
+                OutgoingDevice {
+                    device_id: device_id.to_owned(),
+                    name: "Windows desktop".to_owned(),
+                    bearer_digest: "a".repeat(64),
+                    permissions: DevicePermissions::read(),
+                    created_at_ms: 0,
+                    last_seen_ms: 0,
+                    total_bytes: 0,
+                },
+            )
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    let registered = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    assert_eq!(registered.devices().len(), 2);
+    assert!(registered
+        .devices()
+        .iter()
+        .any(|device| device.device_id == SOURCE_ID));
+    assert!(registered
+        .devices()
+        .iter()
+        .any(|device| device.device_id == TARGET_ID));
+}
+
+#[test]
+fn concurrent_incoming_registrations_preserve_both_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let app_root = root.path().to_owned();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for device_id in [SOURCE_ID, TARGET_ID] {
+        let app_root = app_root.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            register_incoming_source(
+                &app_root,
+                IncomingSource {
+                    device_id: device_id.to_owned(),
+                    name: "Android".to_owned(),
+                    endpoint: "http://192.168.0.5:32145".to_owned(),
+                    bearer: "c".repeat(64),
+                    permissions: DevicePermissions::read(),
+                    last_seen_ms: 0,
+                    total_bytes: 0,
+                },
+            )
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    let registered = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(registered.sources().len(), 2);
+    assert!(registered
+        .sources()
+        .iter()
+        .any(|source| source.device_id == SOURCE_ID));
+    assert!(registered
+        .sources()
+        .iter()
+        .any(|source| source.device_id == TARGET_ID));
+}
+
+#[test]
+fn best_effort_incoming_completion_leaves_overflowed_registry_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: u64::MAX,
+        })
+        .unwrap();
+    registry.save().unwrap();
+    let before = fs::read(root.path().join("peer-sync/sources.json")).unwrap();
+
+    record_incoming_completed_operation_best_effort(root.path(), SOURCE_ID, 1);
+
+    assert_eq!(
+        fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn best_effort_incoming_completion_ignores_a_malformed_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = root.path().join("peer-sync");
+    fs::create_dir_all(&peer_root).unwrap();
+    fs::write(peer_root.join("sources.json"), b"{").unwrap();
+
+    record_incoming_completed_operation_best_effort(root.path(), SOURCE_ID, 1);
+
+    assert_eq!(fs::read(peer_root.join("sources.json")).unwrap(), b"{");
 }
 
 #[test]

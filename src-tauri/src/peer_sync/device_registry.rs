@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,6 +13,16 @@ const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 const MAX_DEVICE_ID_BYTES: usize = 64;
 const OUTGOING_SCHEMA: &str = "risunest.peer-device-registry/v1";
 const INCOMING_SCHEMA: &str = "risunest.peer-source-registry/v1";
+
+fn outgoing_registry_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn incoming_registry_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -332,6 +343,63 @@ pub(crate) fn outgoing_device_summaries(
         .collect())
 }
 
+// Registry mutations must keep their read-modify-write sequence within one
+// process-wide directional critical section. The guard is deliberately scoped
+// to disk work only, so callers never hold it while touching live host state.
+fn with_outgoing_registry<T>(
+    app_root: &Path,
+    mutate: impl FnOnce(&mut OutgoingDeviceRegistry) -> Result<T, PeerSyncError>,
+) -> Result<T, PeerSyncError> {
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    let mut registry = OutgoingDeviceRegistry::load(app_root)?;
+    let result = mutate(&mut registry)?;
+    registry.save()?;
+    Ok(result)
+}
+
+fn with_incoming_registry<T>(
+    app_root: &Path,
+    mutate: impl FnOnce(&mut IncomingSourceRegistry) -> Result<T, PeerSyncError>,
+) -> Result<T, PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    let result = mutate(&mut registry)?;
+    registry.save()?;
+    Ok(result)
+}
+
+pub(crate) fn register_outgoing_claim(
+    app_root: &Path,
+    device: OutgoingDevice,
+) -> Result<(), PeerSyncError> {
+    with_outgoing_registry(app_root, |registry| registry.register_claim(device))
+}
+
+pub(crate) fn register_incoming_source(
+    app_root: &Path,
+    source: IncomingSource,
+) -> Result<(), PeerSyncError> {
+    with_incoming_registry(app_root, |registry| registry.upsert(source))
+}
+
+pub(crate) fn outgoing_device_is_registered(
+    app_root: &Path,
+    device_id: &str,
+) -> Result<bool, PeerSyncError> {
+    validate_id(device_id)?;
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    Ok(OutgoingDeviceRegistry::load(app_root)?
+        .devices()
+        .iter()
+        .any(|device| device.device_id == device_id))
+}
+
 pub(crate) fn incoming_source_summaries(
     app_root: &Path,
 ) -> Result<Vec<IncomingSourceSummary>, PeerSyncError> {
@@ -354,9 +422,7 @@ pub(crate) fn revoke_outgoing_device(
     revoke_live: impl FnOnce(&str),
 ) -> Result<(), PeerSyncError> {
     validate_id(device_id)?;
-    let mut registry = OutgoingDeviceRegistry::load(app_root)?;
-    registry.remove(device_id)?;
-    registry.save()?;
+    with_outgoing_registry(app_root, |registry| registry.remove(device_id))?;
     revoke_live(device_id);
     Ok(())
 }
@@ -366,9 +432,7 @@ pub(crate) fn remove_incoming_source(
     device_id: &str,
 ) -> Result<(), PeerSyncError> {
     validate_id(device_id)?;
-    let mut registry = IncomingSourceRegistry::load(app_root)?;
-    registry.remove(device_id)?;
-    registry.save()
+    with_incoming_registry(app_root, |registry| registry.remove(device_id))
 }
 
 pub(crate) fn record_incoming_completed_operation(
@@ -382,15 +446,26 @@ pub(crate) fn record_incoming_completed_operation(
         .as_millis()
         .try_into()
         .map_err(|_| PeerSyncError::Storage("peer completion timestamp overflow".to_owned()))?;
-    let mut registry = IncomingSourceRegistry::load(app_root)?;
-    if !registry
-        .sources()
-        .iter()
-        .any(|source| source.device_id == source_id)
-    {
-        return Ok(());
+    with_incoming_registry(app_root, |registry| {
+        if !registry
+            .sources()
+            .iter()
+            .any(|source| source.device_id == source_id)
+        {
+            return Ok(());
+        }
+        registry.record_completed_operation(source_id, bytes, seen_at_ms)
+    })
+}
+
+pub(crate) fn record_incoming_completed_operation_best_effort(
+    app_root: &Path,
+    source_id: &str,
+    bytes: u64,
+) {
+    if let Err(error) = record_incoming_completed_operation(app_root, source_id, bytes) {
+        crate::nlog!("warn", "peer sync completion accounting failed: {error}");
     }
-    registry.record_completed_operation(source_id, bytes, seen_at_ms)
 }
 
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {

@@ -1631,8 +1631,7 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
             &source_device_id,
             client.is_v2_registered(),
             &result,
-        )
-        .map_err(|error| error.to_string())?;
+        );
         Ok(result)
     })
     .await
@@ -1704,9 +1703,9 @@ fn record_delta_completion(
     source_device_id: &str,
     registered_v2: bool,
     result: &PeerDeltaPullResult,
-) -> Result<(), PeerSyncError> {
+) {
     if !registered_v2 {
-        return Ok(());
+        return;
     }
     let transferred_bytes = match result {
         PeerDeltaPullResult::NoChanges {
@@ -1716,14 +1715,14 @@ fn record_delta_completion(
             transferred_bytes, ..
         } => *transferred_bytes,
         PeerDeltaPullResult::Conflict { .. } | PeerDeltaPullResult::FullCloneRequired { .. } => {
-            return Ok(())
+            return
         }
     };
-    super::device_registry::record_incoming_completed_operation(
+    super::device_registry::record_incoming_completed_operation_best_effort(
         app_root,
         source_device_id,
         transferred_bytes,
-    )
+    );
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -3096,8 +3095,7 @@ mod tests {
                 transferred_objects: 1,
                 transferred_bytes: 12,
             },
-        )
-        .unwrap();
+        );
         let after_updated = accounting_source(directory.path());
         assert_eq!(after_updated.total_bytes, 52);
         assert!(after_updated.last_seen_ms > 7);
@@ -3111,8 +3109,7 @@ mod tests {
                 transferred_objects: 0,
                 transferred_bytes: 0,
             },
-        )
-        .unwrap();
+        );
         let after_no_changes = accounting_source(directory.path());
         assert_eq!(after_no_changes.total_bytes, 52);
         assert!(after_no_changes.last_seen_ms >= after_updated.last_seen_ms);
@@ -3125,8 +3122,7 @@ mod tests {
                 reason: "missing common base",
             },
         ] {
-            record_delta_completion(directory.path(), ACCOUNTING_SOURCE_ID, true, &non_success)
-                .unwrap();
+            record_delta_completion(directory.path(), ACCOUNTING_SOURCE_ID, true, &non_success);
         }
         assert_eq!(accounting_source(directory.path()), after_no_changes);
 
@@ -3139,9 +3135,28 @@ mod tests {
                 transferred_objects: 1,
                 transferred_bytes: 99,
             },
-        )
-        .unwrap();
+        );
         assert_eq!(accounting_source(directory.path()), after_no_changes);
+    }
+
+    #[test]
+    fn delta_completion_accounting_overflow_preserves_the_successful_pull_result() {
+        let directory = tempfile::tempdir().unwrap();
+        register_accounting_source(directory.path(), u64::MAX, 7);
+        let completed = PeerDeltaPullResult::Updated {
+            revision: 1,
+            transferred_objects: 1,
+            transferred_bytes: 1,
+        };
+        let before = fs::read(directory.path().join("peer-sync/sources.json")).unwrap();
+
+        record_delta_completion(directory.path(), ACCOUNTING_SOURCE_ID, true, &completed);
+
+        assert!(matches!(completed, PeerDeltaPullResult::Updated { .. }));
+        assert_eq!(
+            fs::read(directory.path().join("peer-sync/sources.json")).unwrap(),
+            before
+        );
     }
 
     #[test]

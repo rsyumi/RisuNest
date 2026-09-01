@@ -1954,8 +1954,7 @@ fn bidirectional_durable_completion_accounts_once_and_retained_retry_does_not() 
         directory.path(),
         BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
         &result,
-    )
-    .unwrap();
+    );
     let after_completed = bidirectional_accounting_source(directory.path());
     assert_eq!(after_completed.total_bytes, 67);
     assert!(after_completed.last_seen_ms > 7);
@@ -1971,6 +1970,59 @@ fn bidirectional_durable_completion_accounts_once_and_retained_retry_does_not() 
     assert_eq!(
         bidirectional_accounting_source(directory.path()),
         after_completed
+    );
+}
+
+#[test]
+fn bidirectional_completion_accounting_overflow_preserves_the_terminal_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    register_bidirectional_accounting_source(directory.path(), u64::MAX, 7);
+    let result = PeerBidirectionalCompletedResult {
+        kind: "updated".to_owned(),
+        operation_id: "123e4567-e89b-42d3-a456-426614174099".to_owned(),
+        revision: 8,
+        remote_revision: 4,
+        transferred_objects: 3,
+        transferred_bytes: 1,
+        backups: Vec::new(),
+    };
+    let completed = PeerBidirectionalDurableOperation::Completed {
+        schema: OPERATION_SCHEMA.to_owned(),
+        remote_apply_receipt: None,
+        source_binding: None,
+        result: result.clone(),
+    };
+    PeerBidirectionalOperationJournal::new(directory.path())
+        .store(&completed)
+        .unwrap();
+    let before = std::fs::read(directory.path().join("peer-sync/sources.json")).unwrap();
+
+    record_bidirectional_completion(
+        directory.path(),
+        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+        &result,
+    );
+
+    assert_eq!(
+        retained_result(
+            &PeerBidirectionalOperationJournal::new(directory.path())
+                .load()
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        PeerBidirectionalSyncResult::Updated {
+            operation_id: result.operation_id,
+            revision: result.revision,
+            remote_revision: result.remote_revision,
+            transferred_objects: result.transferred_objects,
+            transferred_bytes: result.transferred_bytes,
+            backups: result.backups,
+        }
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("peer-sync/sources.json")).unwrap(),
+        before
     );
 }
 

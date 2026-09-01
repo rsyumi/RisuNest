@@ -3509,7 +3509,7 @@ fn complete_bidirectional_local_after_remote_apply(
         source_binding: None,
         result: result.clone(),
     })?;
-    record_bidirectional_completion(app_root, &context.credential.source_device_id, &result)?;
+    record_bidirectional_completion(app_root, &context.credential.source_device_id, &result);
     Ok(result)
 }
 
@@ -3517,12 +3517,12 @@ fn record_bidirectional_completion(
     app_root: &Path,
     source_device_id: &str,
     result: &PeerBidirectionalCompletedResult,
-) -> Result<(), PeerSyncError> {
-    super::device_registry::record_incoming_completed_operation(
+) {
+    super::device_registry::record_incoming_completed_operation_best_effort(
         app_root,
         source_device_id,
         result.transferred_bytes,
-    )
+    );
 }
 
 fn retain_remote_apply_receipt(

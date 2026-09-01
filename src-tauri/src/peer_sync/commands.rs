@@ -1611,11 +1611,11 @@ impl PeerCloneCommandState {
             let app_root = peer_root.parent().ok_or_else(|| {
                 PeerSyncError::Storage("peer clone target root has no app root".to_owned())
             })?;
-            super::device_registry::record_incoming_completed_operation(
+            super::device_registry::record_incoming_completed_operation_best_effort(
                 app_root,
                 &source_id,
                 verified_bytes,
-            )?;
+            );
         }
         result
     }
@@ -2956,6 +2956,15 @@ mod tests {
             .unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
         target.fail_target_finalize_cleanup_once_for_test().unwrap();
+        let mut accounting =
+            super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
+                .unwrap();
+        let mut source_accounting = accounting.sources()[0].clone();
+        source_accounting.total_bytes = u64::MAX;
+        accounting.upsert(source_accounting).unwrap();
+        accounting.save().unwrap();
+        let accounting_before =
+            fs::read(target_root.path().join("peer-sync/sources.json")).unwrap();
 
         let finalized = target
             .finalize_target(
@@ -2976,11 +2985,14 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Source"
         );
-        let completed_bytes = downloaded.total_bytes.unwrap();
         let accounted =
             super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
                 .unwrap();
-        assert_eq!(accounted.sources()[0].total_bytes, completed_bytes);
+        assert_eq!(accounted.sources()[0].total_bytes, u64::MAX);
+        assert_eq!(
+            fs::read(target_root.path().join("peer-sync/sources.json")).unwrap(),
+            accounting_before
+        );
         assert!(target
             .finalize_target(
                 &mut target_store,
@@ -2994,7 +3006,7 @@ mod tests {
                 .unwrap()
                 .sources()[0]
                 .total_bytes,
-            completed_bytes
+            u64::MAX
         );
         let target_job_root = target_root
             .path()
