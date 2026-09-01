@@ -252,7 +252,17 @@
             ? { extendToEOL: false, snapStartToPrevEOL: false }
             : { extendToEOL: true, snapStartToPrevEOL: true };
 
-        const translationContext = await getTranslationContextIfNeeded();
+        let translationContext: Awaited<ReturnType<typeof getTranslationContextIfNeeded>> = null;
+        try {
+            translationContext = await getTranslationContextIfNeeded();
+        } catch (error) {
+            // A failed context fetch must not leave the click silently dead
+            // with an unhandled rejection; abandon this request instead.
+            console.error('Partial edit translation context failed', error);
+            hideBlockButton();
+            hideDragButton();
+            return;
+        }
         const sourceChanged =
             requestId !== matchingRequestId ||
             translatedView !== sourceIdentity.translatedView ||
@@ -532,7 +542,12 @@
                 const elementAtPoint = document.elementFromPoint(lastMouseX, lastMouseY);
                 if (elementAtPoint) {
                     const block = elementAtPoint.closest(SELECTOR) as HTMLElement | null;
-                    if (block && block !== bodyRoot && bodyRoot.contains(block) && hasTextContent(block)) {
+                    // The rendered body is wrapped in a display:contents span;
+                    // offering it as a block would target the entire message,
+                    // which the bodyRoot exclusion is meant to prevent.
+                    if (block && block !== bodyRoot && bodyRoot.contains(block)
+                        && getComputedStyle(block).display !== 'contents'
+                        && hasTextContent(block)) {
                         showBlockButton(block);
                         return;
                     }
