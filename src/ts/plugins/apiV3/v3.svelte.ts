@@ -90,7 +90,8 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
         flushPendingData,
         getCompatibilityDatabase: () => DBState.db,
         getCompatibilityProfile: () => pluginCompatibility.profile,
-        getSelectedCharacterId: () => captureSelectedConversationTarget()?.characterId ?? null,
+        getSelectedCharacterId: () =>
+            getDatabase().characters[get(selectedCharID)]?.chaId ?? null,
         getNavigationGeneration: getPersistentNavigationGeneration,
         applyCompatibilityDatabaseLite: (database) =>
             applyPreparedPluginDatabaseUpdate(database, true),
