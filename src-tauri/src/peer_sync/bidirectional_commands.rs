@@ -6338,6 +6338,64 @@ pub async fn peer_bidirectional_sync(
     expected_revision: i64,
     foreground: Option<AndroidForegroundKey>,
 ) -> Result<PeerBidirectionalSyncResult, String> {
+    peer_bidirectional_sync_with_factory(
+        app,
+        state,
+        expected_revision,
+        foreground,
+        move |root, local_device_id| {
+            claim_bidirectional_client(
+                root,
+                &endpoint,
+                &session_id,
+                &manifest_id,
+                &claim,
+                local_device_id,
+            )
+        },
+    )
+    .await
+}
+
+pub(crate) async fn peer_bidirectional_sync_registered_client(
+    app: AppHandle,
+    state: State<'_, PeerBidirectionalCommandState>,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    source_device_id: String,
+    bearer: String,
+    expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
+) -> Result<PeerBidirectionalSyncResult, String> {
+    peer_bidirectional_sync_with_factory(
+        app,
+        state,
+        expected_revision,
+        foreground,
+        move |_, local_device_id| {
+            LanBidirectionalLogicalClient::from_registered(
+                &endpoint,
+                &session_id,
+                &manifest_id,
+                local_device_id,
+                &source_device_id,
+                &bearer,
+            )
+        },
+    )
+    .await
+}
+
+async fn peer_bidirectional_sync_with_factory<
+    F: Fn(&Path, &str) -> Result<LanBidirectionalLogicalClient, PeerSyncError> + Send + Sync + 'static,
+>(
+    app: AppHandle,
+    state: State<'_, PeerBidirectionalCommandState>,
+    expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
+    client_factory: F,
+) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
     #[cfg(target_os = "android")]
     let foreground = foreground
@@ -6375,15 +6433,8 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let mut client = claim_bidirectional_client(
-                        &root,
-                        &endpoint,
-                        &session_id,
-                        &manifest_id,
-                        &claim,
-                        &local_device_id,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let mut client = client_factory(&root, &local_device_id)
+                        .map_err(|error| error.to_string())?;
                     if client.source_device_id() != context.credential.source_device_id {
                         return Err(
                             "fresh bidirectional source belongs to another device".to_owned()
@@ -6424,15 +6475,8 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let client = claim_bidirectional_client(
-                        &root,
-                        &endpoint,
-                        &session_id,
-                        &manifest_id,
-                        &claim,
-                        &local_device_id,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let client = client_factory(&root, &local_device_id)
+                        .map_err(|error| error.to_string())?;
                     if client.source_device_id() != context.credential.source_device_id {
                         return Err(
                             "fresh bidirectional source belongs to another device".to_owned()
@@ -6463,15 +6507,8 @@ pub async fn peer_bidirectional_sync(
                                 .to_owned(),
                         );
                     }
-                    let client = claim_bidirectional_client(
-                        &root,
-                        &endpoint,
-                        &session_id,
-                        &manifest_id,
-                        &claim,
-                        &local_device_id,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let client = client_factory(&root, &local_device_id)
+                        .map_err(|error| error.to_string())?;
                     let manifest_bytes =
                         client.fetch_manifest().map_err(|error| error.to_string())?;
                     let manifest = decode_logical_manifest(&manifest_bytes)
@@ -6501,15 +6538,8 @@ pub async fn peer_bidirectional_sync(
         }
         let local_device_id = super::delta_commands::canonical_source_device_id(&root)
             .map_err(|error| error.to_string())?;
-        let mut client = claim_bidirectional_client(
-            &root,
-            &endpoint,
-            &session_id,
-            &manifest_id,
-            &claim,
-            &local_device_id,
-        )
-        .map_err(|error| error.to_string())?;
+        let mut client =
+            client_factory(&root, &local_device_id).map_err(|error| error.to_string())?;
         let remote_manifest_bytes = client.fetch_manifest().map_err(|error| error.to_string())?;
         let remote_manifest =
             decode_logical_manifest(&remote_manifest_bytes).map_err(|error| error.to_string())?;
@@ -6690,6 +6720,73 @@ pub async fn peer_bidirectional_resolve_with_link(
     expected_revision: i64,
     foreground: Option<AndroidForegroundKey>,
 ) -> Result<PeerBidirectionalSyncResult, String> {
+    peer_bidirectional_resolve_with_factory(
+        app,
+        state,
+        operation_id,
+        winner,
+        expected_revision,
+        foreground,
+        move |root, local_device_id| {
+            claim_bidirectional_client(
+                root,
+                &endpoint,
+                &session_id,
+                &manifest_id,
+                &claim,
+                local_device_id,
+            )
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn peer_bidirectional_resolve_registered_client(
+    app: AppHandle,
+    state: State<'_, PeerBidirectionalCommandState>,
+    operation_id: String,
+    winner: PeerBidirectionalConflictWinner,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    source_device_id: String,
+    bearer: String,
+    expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
+) -> Result<PeerBidirectionalSyncResult, String> {
+    peer_bidirectional_resolve_with_factory(
+        app,
+        state,
+        operation_id,
+        winner,
+        expected_revision,
+        foreground,
+        move |_, local_device_id| {
+            LanBidirectionalLogicalClient::from_registered(
+                &endpoint,
+                &session_id,
+                &manifest_id,
+                local_device_id,
+                &source_device_id,
+                &bearer,
+            )
+        },
+    )
+    .await
+}
+
+async fn peer_bidirectional_resolve_with_factory<
+    F: Fn(&Path, &str) -> Result<LanBidirectionalLogicalClient, PeerSyncError> + Send + Sync + 'static,
+>(
+    app: AppHandle,
+    state: State<'_, PeerBidirectionalCommandState>,
+    operation_id: String,
+    winner: PeerBidirectionalConflictWinner,
+    expected_revision: i64,
+    foreground: Option<AndroidForegroundKey>,
+    client_factory: F,
+) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
     #[cfg(target_os = "android")]
     let foreground = foreground
@@ -6730,15 +6827,8 @@ pub async fn peer_bidirectional_resolve_with_link(
                 "retained bidirectional operation belongs to another target device".to_owned(),
             );
         }
-        let mut client = claim_bidirectional_client(
-            &root,
-            &endpoint,
-            &session_id,
-            &manifest_id,
-            &claim,
-            &local_device_id,
-        )
-        .map_err(|error| error.to_string())?;
+        let mut client =
+            client_factory(&root, &local_device_id).map_err(|error| error.to_string())?;
         let remote_manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
         let outcome = resolve_awaiting_conflict_with_fresh_source_and_cancellation(

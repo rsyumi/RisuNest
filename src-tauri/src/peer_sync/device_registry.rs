@@ -416,6 +416,21 @@ pub(crate) fn incoming_source_summaries(
         .collect())
 }
 
+pub(crate) fn incoming_source_by_id(
+    app_root: &Path,
+    device_id: &str,
+) -> Result<Option<IncomingSource>, PeerSyncError> {
+    validate_id(device_id)?;
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    Ok(IncomingSourceRegistry::load(app_root)?
+        .sources()
+        .iter()
+        .find(|source| source.device_id == device_id)
+        .cloned())
+}
+
 pub(crate) fn revoke_outgoing_device(
     app_root: &Path,
     device_id: &str,

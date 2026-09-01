@@ -1667,6 +1667,52 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
     cancellation: C,
 ) -> Result<PeerDeltaPullResult, String> {
     let state = state.inner().clone();
+    peer_delta_pull_with_client_factory(
+        app,
+        state,
+        expected_revision,
+        cancellation,
+        move |app_root| match LanLogicalDeltaClient::claim_v2_and_register(
+            app_root,
+            super::device_registry::platform_device_name(),
+            &endpoint,
+            &session_id,
+            &manifest_id,
+            &claim,
+        ) {
+            Ok(client) => Ok(client),
+            Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
+                LanLogicalDeltaClient::claim_p4(&endpoint, &session_id, &manifest_id, &claim)
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        },
+    )
+    .await
+}
+
+pub(crate) async fn peer_delta_pull_registered_client(
+    app: AppHandle,
+    state: PeerDeltaCommandState,
+    client: LanLogicalDeltaClient,
+    expected_revision: i64,
+) -> Result<PeerDeltaPullResult, String> {
+    peer_delta_pull_with_client_factory(app, state, expected_revision, NeverCancelled, move |_| {
+        Ok(client)
+    })
+    .await
+}
+
+async fn peer_delta_pull_with_client_factory<
+    C: CancellationProbe + Send + 'static,
+    F: FnOnce(&Path) -> Result<LanLogicalDeltaClient, String> + Send + 'static,
+>(
+    app: AppHandle,
+    state: PeerDeltaCommandState,
+    expected_revision: i64,
+    cancellation: C,
+    client_factory: F,
+) -> Result<PeerDeltaPullResult, String> {
     let app_root = app_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = state.begin_pull().map_err(|error| error.to_string())?;
@@ -1676,21 +1722,7 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
             CasJobKind::LogicalDeltaTarget,
         )
         .map_err(|error| error.to_string())?;
-        let mut client = match LanLogicalDeltaClient::claim_v2_and_register(
-            &app_root,
-            super::device_registry::platform_device_name(),
-            &endpoint,
-            &session_id,
-            &manifest_id,
-            &claim,
-        ) {
-            Ok(client) => client,
-            Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
-                LanLogicalDeltaClient::claim_p4(&endpoint, &session_id, &manifest_id, &claim)
-                    .map_err(|error| error.to_string())?
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+        let mut client = client_factory(&app_root)?;
         let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let source_device_id = client.source_device_id().to_owned();
         let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {

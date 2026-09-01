@@ -278,6 +278,48 @@ impl LanCloneClient {
         Ok(client)
     }
 
+    pub(crate) fn from_registered_and_persist(
+        credential_path: &Path,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        target_device_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let endpoint = validate_lan_endpoint(endpoint)?;
+        if !is_canonical_uuid(session_id)
+            || !is_lower_hex_256(manifest_id)
+            || !is_canonical_uuid(target_device_id)
+            || !is_canonical_uuid(source_device_id)
+            || !is_lower_hex_256(bearer)
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid registered clone credential".to_owned(),
+            ));
+        }
+        let session_url = format!("{endpoint}/v1/sessions/{session_id}");
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "LAN session URL is too long".to_owned(),
+            ));
+        }
+        let client = Self {
+            client: build_clone_http_client(CONTROL_REQUEST_TIMEOUT)?,
+            ranges: HttpRangeStream::new(Duration::from_secs(3))?,
+            control_timeout: CONTROL_REQUEST_TIMEOUT,
+            endpoint,
+            session_id: session_id.to_owned(),
+            session_url,
+            device_id: target_device_id.to_owned(),
+            bearer: bearer.to_owned(),
+            source_device_id: Some(source_device_id.to_owned()),
+            manifest_id: Some(manifest_id.to_owned()),
+        };
+        client.persist(credential_path)?;
+        Ok(client)
+    }
+
     pub fn open_persisted(credential_path: &Path) -> Result<Self, PeerSyncError> {
         let metadata = fs::symlink_metadata(credential_path)?;
         if !metadata.is_file()
@@ -5025,6 +5067,49 @@ fn build_bidirectional_remote_apply_client() -> Result<reqwest::Client, PeerSync
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanLogicalDeltaClient {
+    pub(crate) fn from_registered(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        target_device_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let endpoint = validate_p4_logical_delta_endpoint(endpoint)?;
+        if !is_canonical_uuid(session_id)
+            || !is_lower_hex_256(manifest_id)
+            || !is_canonical_uuid(target_device_id)
+            || !is_canonical_uuid(source_device_id)
+            || !is_lower_hex_256(bearer)
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid registered logical credential".to_owned(),
+            ));
+        }
+        let session_url = format!("{endpoint}/v1/sessions/{session_id}");
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "logical delta session URL is too long".to_owned(),
+            ));
+        }
+        let timeouts = LogicalClientTimeouts {
+            control_request: CONTROL_REQUEST_TIMEOUT,
+            object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+        };
+        Ok(Self {
+            control_client: build_logical_http_client(LogicalRequestKind::Control, timeouts)?,
+            object_client: build_logical_http_client(LogicalRequestKind::Object, timeouts)?,
+            control_timeout: timeouts.control_request,
+            session_url,
+            device_id: target_device_id.to_owned(),
+            bearer: bearer.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            manifest_id: manifest_id.to_owned(),
+            registered_v2: true,
+            verified_bytes: Arc::new(Mutex::new(0)),
+        })
+    }
+
     pub(crate) fn claim_v2_and_register(
         app_root: &Path,
         target_name: &str,
@@ -5552,6 +5637,24 @@ pub(crate) struct LanBidirectionalLogicalClient {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalLogicalClient {
+    pub(crate) fn from_registered(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        target_device_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<Self, PeerSyncError> {
+        Self::resume(LanBidirectionalLogicalCredential {
+            endpoint: endpoint.to_owned(),
+            session_id: session_id.to_owned(),
+            manifest_id: manifest_id.to_owned(),
+            device_id: target_device_id.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            bearer: bearer.to_owned(),
+        })
+    }
+
     pub(crate) fn claim_v2_and_register(
         app_root: &Path,
         target_name: &str,

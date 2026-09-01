@@ -152,6 +152,27 @@ pub struct PeerCloneTargetRequest {
     manifest_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerCloneClaimResult {
+    pub(crate) source_device_id: Option<String>,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+}
+
+fn clone_claim_result(
+    request: &PeerCloneTargetRequest,
+    client: &LoopbackCloneClient,
+) -> PeerCloneClaimResult {
+    PeerCloneClaimResult {
+        source_device_id: client.source_device_id().map(str::to_owned),
+        endpoint: request.endpoint.clone(),
+        session_id: request.session_id.clone(),
+        manifest_id: request.manifest_id.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PeerCloneTargetPhase {
@@ -1041,7 +1062,7 @@ impl PeerCloneCommandState {
         session_id: &str,
         manifest_id: &str,
         claim: &str,
-    ) -> Result<(), PeerSyncError> {
+    ) -> Result<PeerCloneClaimResult, PeerSyncError> {
         self.reap_finished_target_worker()?;
         let request = PeerCloneTargetRequest {
             endpoint: endpoint.to_owned(),
@@ -1077,7 +1098,15 @@ impl PeerCloneCommandState {
                     PeerCloneTargetPhase::Failed | PeerCloneTargetPhase::Cancelled
                 ) {
                     return if target.request == request {
-                        Ok(())
+                        target
+                            .client
+                            .as_ref()
+                            .map(|client| clone_claim_result(&target.request, client))
+                            .ok_or_else(|| {
+                                PeerSyncError::Protocol(
+                                    "peer clone target client is unavailable".to_owned(),
+                                )
+                            })
                     } else {
                         Err(PeerSyncError::Protocol(
                             "peer clone target is not ready to repair its pairing".to_owned(),
@@ -1189,12 +1218,14 @@ impl PeerCloneCommandState {
                     "peer clone target changed while repairing its pairing".to_owned(),
                 ));
             }
+            let result = clone_claim_result(&request, &client);
             target.request = request;
             target.client = Some(client);
             target.cancellation = None;
             target.status = PeerCloneTargetStatus::idle();
-            return Ok(());
+            return Ok(result);
         }
+        let result = clone_claim_result(&request, &client);
         runtime.target = Some(TargetRuntime {
             request,
             job_root: paths.job_root,
@@ -1207,7 +1238,72 @@ impl PeerCloneCommandState {
             #[cfg(test)]
             fail_release_cleanup_once: false,
         });
-        Ok(())
+        Ok(result)
+    }
+
+    pub(crate) fn connect_registered_target(
+        &self,
+        peer_root: &Path,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<PeerCloneClaimResult, PeerSyncError> {
+        self.reap_finished_target_worker()?;
+        let request = PeerCloneTargetRequest {
+            endpoint: endpoint.to_owned(),
+            session_id: session_id.to_owned(),
+            manifest_id: manifest_id.to_owned(),
+        };
+        let app_root = peer_root.parent().ok_or_else(|| {
+            PeerSyncError::Storage("peer clone target root has no app root".to_owned())
+        })?;
+        let paths = target_paths(peer_root, &request)?;
+        {
+            let mut runtime = self.lock_runtime()?;
+            if runtime.target_claiming {
+                return Err(PeerSyncError::Protocol(
+                    "peer clone target claim is already in progress".to_owned(),
+                ));
+            }
+            if runtime.target.is_some() {
+                return Err(PeerSyncError::Protocol(
+                    "another peer clone target job is already owned".to_owned(),
+                ));
+            }
+            runtime.target_claiming = true;
+        }
+        let connected = (|| {
+            let local_device_id = super::device_registry::load_or_create_device_id(app_root)?;
+            let lan = LanCloneClient::from_registered_and_persist(
+                &paths.credential,
+                endpoint,
+                session_id,
+                manifest_id,
+                &local_device_id,
+                source_device_id,
+                bearer,
+            )?;
+            LoopbackCloneClient::from_lan(&paths.transfer, lan, manifest_id)
+        })();
+        let mut runtime = self.lock_runtime()?;
+        runtime.target_claiming = false;
+        let client = connected?;
+        let result = clone_claim_result(&request, &client);
+        runtime.target = Some(TargetRuntime {
+            request,
+            job_root: paths.job_root,
+            client: Some(client),
+            cancellation: None,
+            worker: None,
+            status: PeerCloneTargetStatus::idle(),
+            #[cfg(test)]
+            fail_finalize_cleanup_once: false,
+            #[cfg(test)]
+            fail_release_cleanup_once: false,
+        });
+        Ok(result)
     }
 
     pub fn start_target_download(
@@ -2369,7 +2465,7 @@ pub async fn peer_clone_claim_client(
     session_id: String,
     manifest_id: String,
     claim: String,
-) -> Result<(), String> {
+) -> Result<PeerCloneClaimResult, String> {
     let state = state.inner().clone();
     let (_, peer_root) = app_peer_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -2951,7 +3047,7 @@ mod tests {
             manifest_id: pairing.manifest_id.clone(),
         };
         let target = PeerCloneCommandState::default();
-        target
+        let claim_result = target
             .claim_target(
                 &target_root.path().join("peer-sync"),
                 &request.endpoint,
@@ -2960,9 +3056,18 @@ mod tests {
                 &pairing.claim,
             )
             .unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        assert_eq!(
+            claim_result.source_device_id.as_deref(),
+            Some(source_device_id.as_str())
+        );
+        let serialized = serde_json::to_string(&claim_result).unwrap();
+        assert!(!serialized.contains("bearer"));
         let incoming =
             super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
                 .unwrap();
+        assert!(!serialized.contains(&incoming.sources()[0].bearer));
         assert_eq!(incoming.sources().len(), 1);
         assert_eq!(incoming.sources()[0].name, "Windows");
         assert_eq!(
@@ -3132,7 +3237,7 @@ mod tests {
         };
         let peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
-        target
+        let claim_result = target
             .claim_target(
                 &peer_root,
                 &request.endpoint,
@@ -3141,6 +3246,7 @@ mod tests {
                 &pairing.claim,
             )
             .unwrap();
+        assert!(claim_result.source_device_id.is_none());
         target
             .start_target_download(&peer_root, request.clone())
             .unwrap();
