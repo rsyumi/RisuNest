@@ -161,6 +161,10 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         blobStore,
         references.assetKeys,
     )
+    // Archive entry names are basename-flattened by writeBackup, so distinct
+    // keys (e.g. a flat plugin asset and a nested legacy asset) can collide.
+    // Skip duplicates so restore cannot silently overwrite one with the other.
+    const writtenAssetNames = new Set<string>()
     for(let i=0;i<backupAssetKeys.length;i++){
         const key = backupAssetKeys[i]
         let message = `Saving local Backup... (${i + 1} / ${backupAssetKeys.length})`
@@ -183,7 +187,13 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
             readRemotely = true
         }
         if (data) {
-            await writer.writeBackup(isTauri ? key.slice('assets/'.length) : key, data)
+            const entryBasename = getBasename(key)
+            if (!writtenAssetNames.has(entryBasename)) {
+                writtenAssetNames.add(entryBasename)
+                await writer.writeBackup(isTauri ? key.slice('assets/'.length) : key, data)
+            } else {
+                console.warn(`Skipping backup asset ${key}: entry name ${entryBasename} already written`)
+            }
         } else {
             missingAssets.push(key)
         }

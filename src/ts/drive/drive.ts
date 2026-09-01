@@ -165,6 +165,11 @@ async function backupDriveSnapshot(
         blobStore,
         references.assetKeys,
     )
+    // Drive names are basename-flattened, so two distinct keys (e.g. a flat
+    // plugin asset and a nested legacy asset) can map to the same name. Track
+    // names written this run so a collision cannot create duplicate Drive
+    // files that would silently overwrite each other on restore.
+    const uploadedNames = new Set(fileNames)
     for(let i=0;i<assetKeys.length;i++){
         alertStore.set({
             type: "wait",
@@ -172,9 +177,12 @@ async function backupDriveSnapshot(
         })
         const key = assetKeys[i]
         const formatedKey = newFormatKeys(key)
-        if(!fileNames.includes(formatedKey)){
+        if(!uploadedNames.has(formatedKey)){
             const data = await readBackupAsset(blobStore, key, forageStorage.isAccount)
-            if (data) await createFileInFolder(ACCESS_TOKEN, formatedKey, data)
+            if (data) {
+                await createFileInFolder(ACCESS_TOKEN, formatedKey, data)
+                uploadedNames.add(formatedKey)
+            }
         }
     }
 
@@ -341,6 +349,9 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                                     const fData = await getFileData(ACCESS_TOKEN, file.id)
                                     await writeBackupAsset(blobStore, `assets/${images}`, fData)
                                     tries = 3
+                                    // Older backups could hold duplicate names;
+                                    // take the first match deterministically.
+                                    break
                                 }
                             }
                         }

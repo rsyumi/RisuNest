@@ -27,7 +27,10 @@ function normalizeExactLegacyAssetReference(value: string): string | null {
 
 function normalizeExactPluginStorageBackupAssetReference(value: string): string | null {
     const normalized = normalizeExactLegacyAssetReference(value)
-    return normalized && !normalized.slice('assets/'.length).includes('/') ? normalized : null
+    if (!normalized) return null
+    const segment = normalized.slice('assets/'.length)
+    if (segment.includes('/') || segment === '.' || segment === '..') return null
+    return normalized
 }
 
 export function collectExactPluginStorageAssetReferences(value: unknown): string[] {
