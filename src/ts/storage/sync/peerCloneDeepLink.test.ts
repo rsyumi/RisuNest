@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
     consumePendingPeerCloneUri,
+    consumePendingDeviceSyncUri,
     publishPeerCloneUri,
+    publishDeviceSyncUri,
+    subscribeDeviceSyncUri,
     subscribePeerCloneUri,
 } from './peerCloneDeepLink'
 
@@ -22,5 +25,23 @@ describe('peer clone deep link bridge', () => {
         expect(listener).toHaveBeenCalledOnce()
         expect(listener).toHaveBeenCalledWith('third')
         expect(consumePendingPeerCloneUri()).toBe('fourth')
+    })
+})
+
+describe('device sync registration bridge', () => {
+    it('stages a v2 link independently without notifying legacy clone listeners', () => {
+        const legacy = vi.fn()
+        const unregisterLegacy = subscribePeerCloneUri(legacy)
+        const listener = vi.fn()
+        const unregister = subscribeDeviceSyncUri(listener)
+
+        publishDeviceSyncUri('risuailocal://peer-clone/v2?endpoint=x')
+
+        expect(listener).toHaveBeenCalledWith('risuailocal://peer-clone/v2?endpoint=x')
+        expect(legacy).not.toHaveBeenCalled()
+        unregister()
+        unregisterLegacy()
+        publishDeviceSyncUri('later')
+        expect(consumePendingDeviceSyncUri()).toBe('later')
     })
 })

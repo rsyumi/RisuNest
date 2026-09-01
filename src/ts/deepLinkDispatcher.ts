@@ -1,6 +1,7 @@
 export interface RisuLocalUrlHandlers {
     onRealm(id: string): void
     onPeerClone(uri: string): void
+    onDeviceSync?(uri: string): void
 }
 
 export function dispatchRisuLocalUrl(value: string, handlers: RisuLocalUrlHandlers): boolean {
@@ -27,6 +28,11 @@ export function dispatchRisuLocalUrl(value: string, handlers: RisuLocalUrlHandle
     }
     if (url.hostname === 'peer-clone' && url.pathname === '/v1') {
         handlers.onPeerClone(value)
+        return true
+    }
+    if (url.hostname === 'peer-clone' && url.pathname === '/v2') {
+        if (handlers.onDeviceSync) handlers.onDeviceSync(value)
+        else handlers.onPeerClone(value)
         return true
     }
     return false
