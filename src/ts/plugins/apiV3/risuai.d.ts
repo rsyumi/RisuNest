@@ -469,7 +469,8 @@ interface CustomTextTheme {
  * ```typescript
  * const doc = await risuai.getRootDocument();
  * if (!doc) return;
- * const element = doc.querySelector('.my-element');
+ * const element = await doc.querySelector('.my-element');
+ * if (!element) return;
  *
  * // Set text content
  * await element.setTextContent('Hello World');
