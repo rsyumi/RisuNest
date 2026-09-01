@@ -548,6 +548,28 @@ export function createPluginDatabaseAccess(
             selectedTarget,
         )
     }
+    const captureSelectedCallBoundary = () => ({
+        characterId: dependencies.getSelectedCharacterId(),
+        navigationGeneration: dependencies.getNavigationGeneration(),
+        target: dependencies.captureSelectedConversationTarget(),
+    })
+    const recaptureSelectedTarget = (boundary: ReturnType<
+        typeof captureSelectedCallBoundary
+    >): SelectedConversationTarget | null => {
+        const target = dependencies.captureSelectedConversationTarget()
+        if (
+            !boundary.target ||
+            !target ||
+            boundary.characterId !== boundary.target.characterId ||
+            boundary.navigationGeneration !== boundary.target.navigationGeneration ||
+            dependencies.getSelectedCharacterId() !== boundary.characterId ||
+            dependencies.getNavigationGeneration() !== boundary.navigationGeneration ||
+            target.navigationGeneration !== boundary.navigationGeneration ||
+            target.characterId !== boundary.target.characterId ||
+            target.conversationId !== boundary.target.conversationId
+        ) return null
+        return target
+    }
 
     return {
         async getCurrentCharacter(context) {
@@ -632,11 +654,11 @@ export function createPluginDatabaseAccess(
             validatePluginCompleteCharacter(character)
             const candidate = dependencies.snapshot(character)
             const initialProfile = dependencies.getCompatibilityProfile()
-            const selectedTarget = dependencies.captureSelectedConversationTarget()
+            const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
-            const characterId = dependencies.getSelectedCharacterId()
+            const characterId = selectedBoundary.characterId
             if (characterId === null) return
             await openStore()
             const lease = await acquireCurrentRevisionReader()
@@ -662,7 +684,7 @@ export function createPluginDatabaseAccess(
             let completeLease: CompleteConversationLease | null = null
             try {
                 completeLease = await acquireSelectedLease(
-                    selectedTarget,
+                    recaptureSelectedTarget(selectedBoundary),
                     target.characterId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
@@ -691,7 +713,7 @@ export function createPluginDatabaseAccess(
             validatePluginCompleteCharacter(character)
             const candidate = dependencies.snapshot(character)
             const initialProfile = dependencies.getCompatibilityProfile()
-            const selectedTarget = dependencies.captureSelectedConversationTarget()
+            const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
@@ -715,7 +737,7 @@ export function createPluginDatabaseAccess(
             let completeLease: CompleteConversationLease | null = null
             try {
                 completeLease = await acquireSelectedLease(
-                    selectedTarget,
+                    recaptureSelectedTarget(selectedBoundary),
                     target.characterId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
@@ -744,7 +766,7 @@ export function createPluginDatabaseAccess(
             validatePluginCompleteChat(chat)
             const candidate = dependencies.snapshot(chat)
             const initialProfile = dependencies.getCompatibilityProfile()
-            const selectedTarget = dependencies.captureSelectedConversationTarget()
+            const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
@@ -768,7 +790,7 @@ export function createPluginDatabaseAccess(
             let completeLease: CompleteConversationLease | null = null
             try {
                 completeLease = await acquireSelectedLease(
-                    selectedTarget,
+                    recaptureSelectedTarget(selectedBoundary),
                     target.characterId,
                     target.conversationId,
                 )

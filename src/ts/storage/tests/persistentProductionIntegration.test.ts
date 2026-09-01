@@ -252,6 +252,8 @@ describe('persistent production runtime', () => {
         const store = makeStore(databaseName)
         await store.open()
         await store.replaceFromDatabase(database)
+        const materializeDatabase = vi.spyOn(store, 'materializeDatabase')
+        const replaceFromDatabase = vi.spyOn(store, 'replaceFromDatabase')
         const adapter = makeAdapter(database)
         const runtime = createPersistentDataRuntime({
             store,
@@ -259,31 +261,63 @@ describe('persistent production runtime', () => {
             prepareDatabase: async (candidate) => structuredClone(candidate),
         })
         await runtime.initializeActiveWorkingSet(database)
+        const materializeDatabaseSnapshot = vi.fn()
+        const replacePersistentDatabase = vi.fn()
+        const access = createPluginDatabaseAccess({
+            store,
+            flushPendingData: (reason) => runtime.flushPendingData(reason),
+            getCompatibilityDatabase: () => adapter.current(),
+            getCompatibilityProfile: () => 'scalable-v3',
+            getSelectedCharacterId: () => adapter.current().characters[0]?.chaId ?? null,
+            captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
+            acquireCompleteConversation: (reason, target) =>
+                runtime.acquireCompleteConversation(reason, target),
+            refreshSelectedConversationAfterReplacement: (target, expectedSession) =>
+                runtime.refreshSelectedConversationAfterReplacement(target, expectedSession),
+            replacePersistentCompleteCharacter: (characterId, reason, mutate, options) =>
+                runtime.replacePersistentCompleteCharacter(characterId, reason, mutate, options),
+            replacePersistentConversation: (
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ) => runtime.replacePersistentConversation(
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ),
+            reportIdentityReplacementRejected: vi.fn(),
+            getNavigationGeneration: () => runtime.getNavigationGeneration(),
+            applyCompatibilityDatabaseLite: vi.fn(),
+            applyCompatibilityDatabase: vi.fn(),
+            readPluginStorageSnapshot: vi.fn(async () => ({})),
+            mutatePluginStorage: vi.fn(),
+            invalidatePluginStorage: vi.fn(),
+            materializeDatabaseSnapshot,
+            replacePersistentDatabase,
+            snapshot: structuredClone,
+        })
+        const context = {
+            pluginName: 'restart-plugin',
+            signal: new AbortController().signal,
+        }
+        const selectedReplacement = structuredClone(adapter.current().characters[0])
+        selectedReplacement.name = 'Selected replaced'
+        await access.setCurrentCharacter(selectedReplacement, context)
+        const inactiveReplacement = structuredClone(adapter.current().characters[1])
+        inactiveReplacement.name = 'Inactive replaced'
+        await access.setCharacterToIndex(1, inactiveReplacement, context)
+        const inactiveChat = structuredClone(adapter.current().characters[1].chats[0])
+        inactiveChat.note = 'inactive chat replaced'
+        await access.setChatToIndex(1, 0, inactiveChat, context)
 
-        await runtime.replacePersistentCompleteCharacter(
-            'char-a',
-            'plugin-setCharacter',
-            (current) => ({ ...current, name: 'Selected replaced' }),
-            { expectedRevision: runtime.revision },
-        )
-        await runtime.replacePersistentCompleteCharacter(
-            'char-b',
-            'plugin-setCharacterToIndex',
-            (current) => ({ ...current, name: 'Inactive replaced' }),
-            { expectedRevision: runtime.revision },
-        )
-        const inactiveChat = await runtime.readPersistentConversation(
-            'char-b',
-            'chat-b',
-            'plugin-chat-read',
-        )
-        await runtime.replacePersistentConversation(
-            'char-b',
-            'chat-b',
-            'plugin-setChatToIndex',
-            { ...inactiveChat!, note: 'inactive chat replaced' },
-            { expectedRevision: runtime.revision },
-        )
+        expect(materializeDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(materializeDatabase).not.toHaveBeenCalled()
+        expect(replaceFromDatabase).not.toHaveBeenCalled()
 
         const reopened = makeStore(databaseName)
         await reopened.open()

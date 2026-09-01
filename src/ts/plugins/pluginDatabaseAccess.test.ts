@@ -228,6 +228,8 @@ function createHarness() {
     const selectedConversationTarget = {
         characterId: 'active',
         conversationId: 'active-chat-a',
+        navigationGeneration: 0,
+        storeRevision: 4,
     }
     let selectedTarget: typeof selectedConversationTarget | null = selectedConversationTarget
     const completeConversationRelease = vi.fn()
@@ -455,6 +457,114 @@ describe('plugin database access', () => {
         expect(harness.replacePersistentConversation).toHaveBeenCalledTimes(1)
     })
 
+    it('keeps the call-boundary current character when navigation changes during flush', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const flushed = deferred<void>()
+        harness.flushPendingData.mockReturnValueOnce(flushed.promise)
+        const candidate = structuredClone(database.characters[0])
+        candidate.name = 'Call-boundary current replacement'
+
+        const writing = harness.access.setCurrentCharacter(candidate, callContext())
+        await vi.waitFor(() => expect(harness.flushPendingData).toHaveBeenCalledOnce())
+        harness.setSelectedCharacterId('trashed')
+        harness.setNavigationGeneration(1)
+        harness.setSelectedConversationTarget({
+            characterId: 'trashed',
+            conversationId: 'trashed-chat-a',
+            navigationGeneration: 1,
+            storeRevision: 4,
+        })
+        flushed.resolve(undefined)
+        await writing
+
+        expect(harness.replacePersistentCompleteCharacter).toHaveBeenCalledWith(
+            'active',
+            'plugin-setCharacter',
+            expect.any(Function),
+            { expectedRevision: 4 },
+        )
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(harness.refreshSelectedConversationAfterReplacement).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        'setCurrentCharacter',
+        'setCharacterToIndex',
+        'setChatToIndex',
+    ] as const)('recaptures a revision-advanced selected target for %s', async (operation) => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const flushed = deferred<void>()
+        harness.flushPendingData.mockReturnValueOnce(flushed.promise)
+        const nextTarget = {
+            characterId: 'active',
+            conversationId: 'active-chat-a',
+            navigationGeneration: 0,
+            storeRevision: 5,
+        }
+        const writing = operation === 'setCurrentCharacter'
+            ? harness.access.setCurrentCharacter(
+                structuredClone(database.characters[0]),
+                callContext(),
+            )
+            : operation === 'setCharacterToIndex'
+                ? harness.access.setCharacterToIndex(
+                    0,
+                    structuredClone(database.characters[0]),
+                    callContext(),
+                )
+                : harness.access.setChatToIndex(
+                    0,
+                    0,
+                    structuredClone(database.characters[0].chats[0]),
+                    callContext(),
+                )
+        await vi.waitFor(() => expect(harness.flushPendingData).toHaveBeenCalledOnce())
+        harness.setSelectedConversationTarget(nextTarget)
+        flushed.resolve(undefined)
+        await writing
+
+        expect(harness.acquireCompleteConversation).toHaveBeenCalledWith(
+            'plugin-full-object-setter',
+            nextTarget,
+        )
+    })
+
+    it('does not acquire a newer same-ID session after navigation away and back', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const flushed = deferred<void>()
+        harness.flushPendingData.mockReturnValueOnce(flushed.promise)
+        const replacement = structuredClone(database.characters[0].chats[0])
+        replacement.note = 'stable call-boundary chat write'
+
+        const writing = harness.access.setChatToIndex(0, 0, replacement, callContext())
+        await vi.waitFor(() => expect(harness.flushPendingData).toHaveBeenCalledOnce())
+        harness.setNavigationGeneration(2)
+        harness.setSelectedConversationTarget({
+            characterId: 'active',
+            conversationId: 'active-chat-a',
+            navigationGeneration: 2,
+            storeRevision: 4,
+        })
+        flushed.resolve(undefined)
+        await writing
+
+        expect(harness.replacePersistentConversation).toHaveBeenCalledWith(
+            'active',
+            'active-chat-a',
+            'plugin-setChatToIndex',
+            replacement,
+            { expectedRevision: 4 },
+        )
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(harness.refreshSelectedConversationAfterReplacement).not.toHaveBeenCalled()
+    })
+
     it('fulfills invalid current and indexed setters without promotion or mutation', async () => {
         const harness = createHarness()
         const database = makeFullObjectDatabase()
@@ -581,9 +691,12 @@ describe('plugin database access', () => {
             callContext(),
         )
         await vi.waitFor(() => expect(harness.acquireCompleteConversation).toHaveBeenCalledOnce())
+        harness.setNavigationGeneration(1)
         harness.setSelectedConversationTarget({
             characterId: 'active',
             conversationId: 'active-chat-b',
+            navigationGeneration: 1,
+            storeRevision: 4,
         })
         persistence.resolve(true)
         await writing

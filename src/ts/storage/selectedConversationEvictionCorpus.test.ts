@@ -156,6 +156,19 @@ describe('selected conversation eviction correctness corpus', () => {
         const initialConversation = makeConversation()
         const oracle = structuredClone(initialConversation)
         let workingCopy = structuredClone(makeDatabase(initialConversation))
+        workingCopy.characters.push({
+            type: 'character',
+            chaId: 'char-b',
+            name: 'Non-target owner',
+            chatPage: 0,
+            chats: [{
+                id: 'chat-b',
+                name: 'Non-target conversation',
+                note: '',
+                localLore: [],
+                message: [{ role: 'user', data: 'must remain unread' }],
+            }],
+        } as character)
         const store = new IndexedDbPersistentDataStore(
             `selected-eviction-corpus-${crypto.randomUUID()}`,
             indexedDB,
@@ -163,6 +176,9 @@ describe('selected conversation eviction correctness corpus', () => {
         )
         await store.open()
         const initial = await store.replaceFromDatabase(workingCopy)
+        const storeMaterializeDatabase = vi.spyOn(store, 'materializeDatabase')
+        const storeReplaceFromDatabase = vi.spyOn(store, 'replaceFromDatabase')
+        const storeReadCharacter = vi.spyOn(store, 'readCharacter')
         const selectedConversation = () => {
             const owner = workingCopy.characters[0]
             return owner.chats[owner.chatPage ?? 0]
@@ -324,6 +340,9 @@ describe('selected conversation eviction correctness corpus', () => {
         expect(profile).toEqual({ profile: 'scalable-v3', allowsEviction: true })
         expect(materializeDatabaseSnapshot).not.toHaveBeenCalled()
         expect(replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(storeMaterializeDatabase).not.toHaveBeenCalled()
+        expect(storeReplaceFromDatabase).not.toHaveBeenCalled()
+        expect(storeReadCharacter.mock.calls.some(([id]) => id === 'char-b')).toBe(false)
 
         const mutateComplete = async (
             reason: string,
