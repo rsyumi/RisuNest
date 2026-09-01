@@ -431,7 +431,7 @@ describe('Android peer clone facade', () => {
             }
             if (command === 'peer_clone_android_finalize') {
                 order.push(`finalize:${args?.expectedRevision}`)
-                return { revision: 8 } as T
+                return { revision: 8, backupPath: '/data/user/0/app/peer-clone-activation/backups/pre-clone.lossless' } as T
             }
             if (command === 'peer_clone_android_release') {
                 order.push('native-release')
@@ -449,6 +449,10 @@ describe('Android peer clone facade', () => {
         const status = await facade.targetStatus()
 
         expect(status.phase).toBe('completed')
+        expect(status.backupPath).toBe('/data/user/0/app/peer-clone-activation/backups/pre-clone.lossless')
+        expect(facade.getState().backupPaths).toEqual([
+            '/data/user/0/app/peer-clone-activation/backups/pre-clone.lossless',
+        ])
         expect(order).toEqual(['token', 'fence', 'finalize:7', 'refresh:8', 'plugins', 'native-release', 'release'])
         expect(invoke).toHaveBeenCalledWith('peer_clone_android_finalize', {
             jobId: '11111111-1111-4111-8111-111111111111',
@@ -541,7 +545,9 @@ describe('Android peer clone facade', () => {
                     totalBytes: 42,
                 } as T
             }
-            if (command === 'peer_clone_android_finalize') return { revision: 8 } as T
+            if (command === 'peer_clone_android_finalize') {
+                return { revision: 8, backupPath: '/data/user/0/app/retry.lossless' } as T
+            }
             if (command === 'peer_clone_android_release') return undefined as T
             throw new Error(`unexpected command ${command}`)
         })
@@ -554,6 +560,7 @@ describe('Android peer clone facade', () => {
         await facade.recover()
         await expect(facade.targetStatus()).rejects.toThrow('temporary fence failure')
         await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+        expect(facade.getState().backupPaths).toEqual(['/data/user/0/app/retry.lossless'])
         expect(replacement.capturePersistentMutationToken).toHaveBeenCalledTimes(2)
     })
 
@@ -707,6 +714,7 @@ describe('Android peer clone facade', () => {
                     completedBytes: 42,
                     totalBytes: 42,
                     committedRevision: 8,
+                    backupPath: '/data/user/0/app/recovered.lossless',
                 } as T
             }
             if (command === 'peer_clone_android_release') return undefined as T
@@ -719,7 +727,11 @@ describe('Android peer clone facade', () => {
         })
 
         await facade.recover()
-        await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+        await expect(facade.targetStatus()).resolves.toMatchObject({
+            phase: 'completed',
+            backupPath: '/data/user/0/app/recovered.lossless',
+        })
+        expect(facade.getState().backupPaths).toEqual(['/data/user/0/app/recovered.lossless'])
 
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_finalize')).toBe(false)
         expect(invoke).toHaveBeenCalledWith('peer_clone_android_release', {

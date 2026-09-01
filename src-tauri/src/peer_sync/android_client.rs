@@ -98,6 +98,8 @@ pub(crate) struct AndroidCloneJobStatus {
     pub(crate) error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) committed_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -139,6 +141,8 @@ struct AndroidClonePersistedStatus {
     total_bytes: Option<u64>,
     error: Option<String>,
     committed_revision: Option<u64>,
+    #[serde(default)]
+    backup_path: Option<PathBuf>,
 }
 
 impl AndroidClonePersistedStatus {
@@ -150,6 +154,7 @@ impl AndroidClonePersistedStatus {
             total_bytes: None,
             error: None,
             committed_revision: None,
+            backup_path: None,
         }
     }
 
@@ -359,6 +364,7 @@ impl AndroidResumableCloneJob {
             total_bytes: status.total_bytes,
             error: status.error,
             committed_revision: status.committed_revision,
+            backup_path: status.backup_path,
         })
     }
 
@@ -401,6 +407,7 @@ impl AndroidResumableCloneJob {
                 total_bytes: Some(total_bytes),
                 error: None,
                 committed_revision: None,
+                backup_path: None,
             })?;
             return Ok(DownloadReport::default());
         }
@@ -412,6 +419,7 @@ impl AndroidResumableCloneJob {
             total_bytes: Some(total_bytes),
             error: None,
             committed_revision: None,
+            backup_path: None,
         })?;
         let status_error = RefCell::new(None);
         let last_persisted = Cell::new(completed_before);
@@ -438,6 +446,7 @@ impl AndroidResumableCloneJob {
                         total_bytes: Some(total_bytes),
                         error: None,
                         committed_revision: None,
+                        backup_path: None,
                     };
                     if let Err(error) = write_json_atomic(&status_path, &status) {
                         *status_error.borrow_mut() = Some(error);
@@ -466,6 +475,7 @@ impl AndroidResumableCloneJob {
                     total_bytes: Some(total_bytes),
                     error: None,
                     committed_revision: None,
+                    backup_path: None,
                 })?;
                 Ok(report)
             }
@@ -562,6 +572,25 @@ impl AndroidResumableCloneJob {
         self.status()
     }
 
+    pub(crate) fn record_backup_path(
+        &self,
+        backup_path: &Path,
+    ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
+        let mut status = self.reconciled_status()?;
+        match status.backup_path.as_deref() {
+            Some(existing) if existing == backup_path => return self.status(),
+            Some(_) => {
+                return Err(PeerSyncError::Validation(
+                    "Android clone job backup path changed".to_owned(),
+                ))
+            }
+            None => {}
+        }
+        status.backup_path = Some(backup_path.to_owned());
+        self.write_status(&status)?;
+        self.status()
+    }
+
     pub fn discard_at(job_root: impl AsRef<Path>) -> Result<(), PeerSyncError> {
         let job_root = job_root.as_ref();
         if !job_root.exists() {
@@ -645,6 +674,12 @@ impl AndroidResumableCloneJob {
 pub(crate) struct AndroidCloneJobRegistry {
     jobs_root: PathBuf,
     state: Mutex<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AndroidCloneFinalizeReceipt {
+    pub(crate) revision: u64,
+    pub(crate) backup_path: Option<PathBuf>,
 }
 
 impl AndroidCloneJobRegistry {
@@ -828,13 +863,16 @@ impl AndroidCloneJobRegistry {
         activation_root: &Path,
         expected_revision: i64,
         cancellation: &dyn CancellationProbe,
-    ) -> Result<u64, PeerSyncError> {
+    ) -> Result<AndroidCloneFinalizeReceipt, PeerSyncError> {
         let state = self.lock()?;
         let root = self.owned_job_root_locked(job_id, &state)?;
         let job = AndroidResumableCloneJob::open(&root)?;
         let status = job.status()?;
         if let Some(committed_revision) = status.committed_revision {
-            return Ok(committed_revision);
+            return Ok(AndroidCloneFinalizeReceipt {
+                revision: committed_revision,
+                backup_path: status.backup_path,
+            });
         }
         if status.phase != AndroidCloneJobPhase::VerifiedAwaitingActivation {
             return Err(PeerSyncError::Validation(
@@ -843,12 +881,19 @@ impl AndroidCloneJobRegistry {
         }
         let manifest_id = status.manifest_id;
         let mut client = job.into_activation_client()?;
-        let mut target = LosslessCloneTargetAdapter::new(
+        let observer_root = root.clone();
+        let mut backup_observer = |backup_path: &Path| {
+            AndroidResumableCloneJob::open(&observer_root)?
+                .record_backup_path(backup_path)
+                .map(|_| ())
+        };
+        let mut target = LosslessCloneTargetAdapter::new_with_backup_observer(
             store,
             cas,
             activation_root,
             expected_revision,
             cancellation,
+            &mut backup_observer,
         )?;
         let mut validator = AndroidVerifiedCloneValidator;
         let activation = activate_downloaded_clone(&mut client, &mut target, &mut validator);
@@ -869,8 +914,12 @@ impl AndroidCloneJobRegistry {
             u64::try_from(store.revision().map_err(store_error)?).map_err(|_| {
                 PeerSyncError::Storage("Android clone committed revision is negative".to_owned())
             })?;
-        AndroidResumableCloneJob::open(root)?.mark_committed(committed_revision)?;
-        Ok(committed_revision)
+        AndroidResumableCloneJob::open(&root)?.mark_committed(committed_revision)?;
+        let status = AndroidResumableCloneJob::open(&root)?.status()?;
+        Ok(AndroidCloneFinalizeReceipt {
+            revision: committed_revision,
+            backup_path: status.backup_path,
+        })
     }
 
     pub(crate) fn release(&self, job_id: &str) -> Result<(), PeerSyncError> {

@@ -83,6 +83,7 @@ export function createAndroidDeviceSyncCloneTarget(
                     destructiveConfirmed: state.destructiveConfirmed,
                     completedBytes: state.completedBytes,
                     ...(state.totalBytes === undefined ? {} : { totalBytes: state.totalBytes }),
+                    ...(state.backupPaths === undefined ? {} : { backupPaths: state.backupPaths }),
                 },
             },
             sourcePairingUri: '',

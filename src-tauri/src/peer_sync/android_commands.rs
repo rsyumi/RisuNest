@@ -52,9 +52,12 @@ pub(crate) struct AndroidPeerCloneCapabilities {
     production_enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct AndroidPeerCloneFinalizeResult {
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_path: Option<PathBuf>,
 }
 
 #[tauri::command]
@@ -170,7 +173,10 @@ pub(crate) async fn peer_clone_android_finalize(
                     expected_revision,
                     &NeverCancelled,
                 )
-                .map(|revision| AndroidPeerCloneFinalizeResult { revision })
+                .map(|receipt| AndroidPeerCloneFinalizeResult {
+                    revision: receipt.revision,
+                    backup_path: receipt.backup_path,
+                })
                 .map_err(as_store_error)
         })
         .map_err(|error| error.to_string())
@@ -221,6 +227,30 @@ mod tests {
                 http_transport_ready: true,
                 production_enabled: true,
             }
+        );
+    }
+
+    #[test]
+    fn finalize_result_serializes_the_optional_backup_path_in_camel_case() {
+        let result = AndroidPeerCloneFinalizeResult {
+            revision: 8,
+            backup_path: Some(PathBuf::from("/data/user/0/app/pre-clone.lossless")),
+        };
+
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({
+                "revision": 8,
+                "backupPath": "/data/user/0/app/pre-clone.lossless",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AndroidPeerCloneFinalizeResult {
+                revision: 8,
+                backup_path: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "revision": 8 })
         );
     }
 }

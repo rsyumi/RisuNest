@@ -1558,10 +1558,9 @@ fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery(
     )
     .unwrap();
 
-    assert_eq!(
-        registry.current().unwrap().unwrap().phase,
-        AndroidCloneJobPhase::Downloading
-    );
+    let current = registry.current().unwrap().unwrap();
+    assert_eq!(current.phase, AndroidCloneJobPhase::Downloading);
+    assert_eq!(current.backup_path, None);
     drop(registry);
 
     let reopened =
@@ -1821,7 +1820,7 @@ fn android_clone_registry_waits_for_explicit_lossless_activation_and_cleans_afte
         "Target"
     );
 
-    let revision = registry
+    let receipt = registry
         .finalize(
             &claimed.job_id,
             &mut target_store,
@@ -1832,13 +1831,34 @@ fn android_clone_registry_waits_for_explicit_lossless_activation_and_cleans_afte
         )
         .unwrap();
 
-    assert_eq!(revision, 2);
+    assert_eq!(receipt.revision, 2);
+    let backup_path = receipt.backup_path.as_ref().unwrap();
+    assert!(backup_path.is_file());
+    assert_eq!(
+        fs::read_dir(target_root.path().join("peer-clone-activation/backups"))
+            .unwrap()
+            .count(),
+        1
+    );
     assert_eq!(
         target_store.read_root(None).unwrap().value["username"],
         "Source"
     );
     let committed = registry.current().unwrap().unwrap();
     assert_eq!(committed.committed_revision, Some(2));
+    assert_eq!(committed.backup_path.as_ref(), Some(backup_path));
+    let committed_job = AndroidResumableCloneJob::open(&verified_job_root).unwrap();
+    assert_eq!(
+        committed_job
+            .record_backup_path(backup_path)
+            .unwrap()
+            .backup_path
+            .as_ref(),
+        Some(backup_path)
+    );
+    assert!(committed_job
+        .record_backup_path(&target_root.path().join("different.lossless"))
+        .is_err());
     assert!(target_root
         .path()
         .join("peer-clone-jobs")
@@ -1847,6 +1867,62 @@ fn android_clone_registry_waits_for_explicit_lossless_activation_and_cleans_afte
     assert_eq!(
         registry.request_cancel(&claimed.job_id).unwrap_err(),
         PeerSyncError::AlreadyActivated
+    );
+
+    let status_path = verified_job_root.join("status.json");
+    let mut interrupted_status: Value =
+        serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    interrupted_status["committedRevision"] = Value::Null;
+    fs::write(
+        &status_path,
+        serde_json::to_vec(&interrupted_status).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        registry
+            .finalize(
+                &claimed.job_id,
+                &mut target_store,
+                &target_cas,
+                &target_root.path().join("peer-clone-activation"),
+                2,
+                &crate::local_backup::NeverCancelled,
+            )
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        fs::read_dir(target_root.path().join("peer-clone-activation/backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    drop(registry);
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    assert_eq!(
+        registry.current().unwrap().unwrap().backup_path.as_ref(),
+        Some(backup_path)
+    );
+    assert_eq!(
+        registry
+            .finalize(
+                &claimed.job_id,
+                &mut target_store,
+                &target_cas,
+                &target_root.path().join("peer-clone-activation"),
+                2,
+                &crate::local_backup::NeverCancelled,
+            )
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        fs::read_dir(target_root.path().join("peer-clone-activation/backups"))
+            .unwrap()
+            .count(),
+        1
     );
 
     registry.release(&claimed.job_id).unwrap();

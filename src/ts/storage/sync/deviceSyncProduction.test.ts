@@ -146,10 +146,11 @@ describe('production device sync composition', () => {
     it('adapts the Android registered clone job to the unified target API', async () => {
         const listeners: Array<() => void> = []
         let state: {
-            phase: 'idle' | 'paused' | 'downloading' | 'cancelled'
+            phase: 'idle' | 'paused' | 'downloading' | 'cancelled' | 'completed'
             destructiveConfirmed: boolean
             activationCommitted: boolean
             completedBytes: number
+            backupPaths?: string[]
         } = {
             phase: 'idle', destructiveConfirmed: false, activationCommitted: false,
             completedBytes: 0,
@@ -191,6 +192,14 @@ describe('production device sync composition', () => {
         expect(facade.joinRegistered).toHaveBeenCalledWith('source')
         expect(facade.download).toHaveBeenCalledOnce()
         expect(listeners).toHaveLength(1)
+        state = {
+            ...state,
+            phase: 'completed',
+            backupPaths: ['/data/user/0/app/pre-clone.lossless'],
+        }
+        listeners[0]()
+        expect(target.snapshot().state.target.backupPaths)
+            .toEqual(['/data/user/0/app/pre-clone.lossless'])
         target.dispose()
     })
 })

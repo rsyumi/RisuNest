@@ -33,6 +33,7 @@ export interface AndroidPeerCloneTargetStatus {
     completedBytes: number
     totalBytes?: number
     committedRevision?: number
+    backupPath?: string
     error?: string
 }
 
@@ -54,6 +55,7 @@ export interface AndroidPeerCloneState {
     activationCommitted: boolean
     completedBytes: number
     totalBytes?: number
+    backupPaths?: string[]
     error?: string
 }
 
@@ -261,6 +263,7 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             activationCommitted: status.committedRevision !== undefined,
             completedBytes: status.completedBytes,
             totalBytes: status.totalBytes,
+            backupPaths: status.backupPath === undefined ? undefined : [status.backupPath],
             error: status.error,
         }
         return status
@@ -292,7 +295,12 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             phase: 'completed' as const,
             committedRevision: recovery.committedRevision,
         }
-        state = { ...state, phase: 'completed', error: undefined }
+        state = {
+            ...state,
+            phase: 'completed',
+            backupPaths: completed.backupPath === undefined ? undefined : [completed.backupPath],
+            error: undefined,
+        }
         recovery.fence.release()
         committedRecovery = undefined
         return completed
@@ -331,12 +339,16 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
 
                 const token = await options.runtime.capturePersistentMutationToken('peer-clone-target-finalize')
                 uncommittedFence = await options.runtime.acquireDestructiveReplacementFence(token)
-                const result = await nativeInvoke<{ revision: number }>('peer_clone_android_finalize', {
+                const result = await nativeInvoke<{ revision: number; backupPath?: string }>('peer_clone_android_finalize', {
                     jobId: id,
                     expectedRevision: token.revision,
                 })
                 committedRecovery = {
-                    status: { ...status, committedRevision: result.revision },
+                    status: {
+                        ...status,
+                        committedRevision: result.revision,
+                        backupPath: result.backupPath,
+                    },
                     committedRevision: result.revision,
                     refreshRevision: result.revision,
                     fence: uncommittedFence,
@@ -344,7 +356,11 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
                     pluginsRefreshed: false,
                     nativeReleased: false,
                 }
-                state = { ...state, activationCommitted: true }
+                state = {
+                    ...state,
+                    activationCommitted: true,
+                    backupPaths: result.backupPath === undefined ? undefined : [result.backupPath],
+                }
                 uncommittedFence = undefined
                 return await finishCommittedRecovery()
             } finally {
