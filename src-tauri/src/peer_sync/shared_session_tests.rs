@@ -252,10 +252,19 @@ fn one_listener_routes_all_lanes_and_hello_returns_exact_descriptors() {
 #[test]
 fn fixed_port_rejects_zero_and_rotation_invalidates_only_pending_claim() {
     let (_root, mut shared) = host();
-    assert!(shared.start_fixed_loopback(0).is_err());
-    let pairing = shared.start_fixed_loopback(32146).unwrap();
+    assert!(shared
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 0)
+        .is_err());
+    let pairing = shared
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 32146)
+        .unwrap();
+    let advertised = validate_lan_endpoint(&pairing.endpoint).unwrap();
+    assert_eq!(advertised, pairing.endpoint);
+    assert!(!advertised.contains("0.0.0.0"));
     let (_other_root, mut other) = host();
-    assert!(other.start_fixed_loopback(32146).is_err());
+    assert!(other
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 32146)
+        .is_err());
     let established = claim(&pairing, "00000000-0000-4000-8000-000000000021");
     let bearer = established.json::<serde_json::Value>().unwrap()["bearer"]
         .as_str()
@@ -264,6 +273,11 @@ fn fixed_port_rejects_zero_and_rotation_invalidates_only_pending_claim() {
     let old = pairing.claim.clone();
     let replacement = shared.rotate_link().unwrap();
     assert_eq!(pairing.endpoint, replacement.endpoint);
+    assert_eq!(
+        validate_lan_endpoint(&replacement.endpoint).unwrap(),
+        advertised
+    );
+    assert!(!replacement.endpoint.contains("0.0.0.0"));
     assert_eq!(
         reqwest::blocking::Client::new()
             .get(format!(
