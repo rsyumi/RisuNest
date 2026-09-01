@@ -245,6 +245,7 @@
         if (!elementOrText || !messageData) return;
 
         const requestId = ++matchingRequestId;
+        const sourceIdentity = { translatedView, messageData, chatIndex, bodyRoot };
 
         // Set matching options based on mode
         const options = mode === 'edit' 
@@ -252,7 +253,13 @@
             : { extendToEOL: true, snapStartToPrevEOL: true };
 
         const translationContext = await getTranslationContextIfNeeded();
-        if (requestId !== matchingRequestId) return;
+        if (
+            requestId !== matchingRequestId ||
+            translatedView !== sourceIdentity.translatedView ||
+            messageData !== sourceIdentity.messageData ||
+            chatIndex !== sourceIdentity.chatIndex ||
+            bodyRoot !== sourceIdentity.bodyRoot
+        ) return;
 
         const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
         const sourceData = translationContext?.data ?? messageData;
