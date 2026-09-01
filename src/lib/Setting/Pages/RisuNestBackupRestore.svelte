@@ -84,7 +84,7 @@
     </div>
 {/if}
 <Button onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
-{#if isTauri && DBState.db.account}
+{#if isTauri}
     <Button onclick={async () => {
         try {
             await restoreNativePersistentSnapshot({
@@ -101,7 +101,7 @@
     }} className="mt-2">{language.restoreLocalSnapshot}</Button>
 {/if}
 <Button onclick={() => openSyncConflictBackups()} className="mt-2">{language.syncConflictBackups}</Button>
-{#if isTauri}
+{#if isTauri && DBState.db.account}
     <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {
         if (!await alertConfirm('Replace local data with the official account backup?')) return
         if (!await alertConfirm('Official snapshots do not include separate inlay payloads. Referenced image, audio, video, and signature inlays may not be restored. The app will restart after restoring the official account backup. Continue?')) return

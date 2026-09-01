@@ -35,6 +35,11 @@ describe('UserSettings local backup route', () => {
 
     it('keeps official account actions behind the existing account gate', async () => {
         const backupSource = await import('./RisuNestBackupRestore.svelte?raw')
-        expect(backupSource.default).toContain('{#if isTauri && DBState.db.account}')
+        const snapshot = backupSource.default.indexOf('{language.restoreLocalSnapshot}')
+        const accountGate = backupSource.default.indexOf('{#if isTauri && DBState.db.account}')
+        const officialRestore = backupSource.default.indexOf('{language.risuNest.backup.officialRestore}')
+        expect(snapshot).toBeGreaterThan(-1)
+        expect(accountGate).toBeGreaterThan(snapshot)
+        expect(officialRestore).toBeGreaterThan(accountGate)
     })
 })
