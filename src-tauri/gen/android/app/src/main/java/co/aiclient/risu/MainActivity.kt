@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.ViewGroup
@@ -47,6 +48,7 @@ private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
 private const val SAF_BRIDGE_NAME = "RisuSafBridge"
 private const val PEER_CLONE_BRIDGE_NAME = "RisuPeerCloneBridge"
+private const val GENERATION_KEEP_ALIVE_BRIDGE_NAME = "RisuGenerationKeepAlive"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
@@ -499,6 +501,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME)
         webView.removeJavascriptInterface(SAF_BRIDGE_NAME)
         webView.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
+        webView.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
       },
       destroyView = webView::destroy,
       clearReference = {
@@ -516,6 +519,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     lifecycleWebView = webView
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
     webView.addJavascriptInterface(PeerCloneBridge(), PEER_CLONE_BRIDGE_NAME)
+    webView.addJavascriptInterface(GenerationKeepAliveBridge(), GENERATION_KEEP_ALIVE_BRIDGE_NAME)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       deliveredSpoolTokens.clear()
       webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
@@ -624,6 +628,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safProgressDispatchMillis.clear()
     lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
     lifecycleWebView?.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
+    lifecycleWebView?.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
     lifecycleWebView = null
     super.onDestroy()
   }
@@ -723,6 +728,34 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       return channel == null ||
         channel.importance != android.app.NotificationManager.IMPORTANCE_NONE
     }
+  }
+
+  private inner class GenerationKeepAliveBridge {
+    @JavascriptInterface
+    fun begin(): Boolean {
+      if (!GenerationForegroundService.notificationsEnabled(this@MainActivity)) return false
+      return GenerationForegroundService.start(this@MainActivity)
+    }
+
+    @JavascriptInterface
+    fun end(): Boolean = GenerationForegroundService.stop(this@MainActivity)
+
+    @JavascriptInterface
+    fun notificationsEnabled(): Boolean = GenerationForegroundService.notificationsEnabled(this@MainActivity)
+
+    @JavascriptInterface
+    fun openNotificationSettings(): Boolean = runCatching {
+      startActivity(
+        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
+      )
+      true
+    }.getOrDefault(false)
+
+    @JavascriptInterface
+    fun webViewVersion(): String = WebViewCompat.getCurrentWebViewPackage(this@MainActivity)?.versionName ?: ""
+
+    @JavascriptInterface
+    fun transferMode(): String = peerCloneTransferModeWire(currentPeerCloneTransferMode())
   }
 
   private fun currentPeerCloneTransferMode() = peerCloneTransferMode(

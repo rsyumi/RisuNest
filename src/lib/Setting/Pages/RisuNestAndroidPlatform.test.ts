@@ -1,0 +1,100 @@
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mount, tick, unmount } from 'svelte'
+
+const mocks = vi.hoisted(() => {
+    let listener: ((settings: { androidKeepAliveDuringGeneration: boolean }) => void) | undefined
+    const settings = { androidKeepAliveDuringGeneration: false }
+    return {
+        notificationStatus: null as boolean | null,
+        getDetailedOSLabel: vi.fn(async () => 'Android 16'),
+        openNotificationSettings: vi.fn(),
+        getDeviceSettings: vi.fn(() => ({ ...settings })),
+        updateDeviceSettings: vi.fn((partial: Partial<typeof settings>) => {
+            Object.assign(settings, partial)
+            listener?.({ ...settings })
+        }),
+        subscribeDeviceSettings: vi.fn((nextListener) => {
+            listener = nextListener
+            return () => { listener = undefined }
+        }),
+        androidGenerationNotificationsEnabled: vi.fn(() => mocks.notificationStatus),
+    }
+})
+
+vi.mock('src/ts/platform', () => ({ getDetailedOSLabel: mocks.getDetailedOSLabel }))
+vi.mock('src/ts/storage/deviceSettings', () => ({
+    getDeviceSettings: mocks.getDeviceSettings,
+    updateDeviceSettings: mocks.updateDeviceSettings,
+    subscribeDeviceSettings: mocks.subscribeDeviceSettings,
+}))
+vi.mock('src/ts/androidGenerationKeepAlive', () => ({
+    androidGenerationNotificationsEnabled: mocks.androidGenerationNotificationsEnabled,
+}))
+
+import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
+
+describe('RisuNest Android platform settings', () => {
+    let mounted: ReturnType<typeof mount> | null = null
+
+    afterEach(async () => {
+        if (mounted) await unmount(mounted)
+        mounted = null
+        mocks.notificationStatus = null
+        vi.clearAllMocks()
+        document.body.replaceChildren()
+        delete window.RisuGenerationKeepAlive
+    })
+
+    function mountPlatform(status: boolean | null): HTMLDivElement {
+        mocks.notificationStatus = status
+        window.RisuGenerationKeepAlive = {
+            begin: () => false,
+            end: () => undefined,
+            notificationsEnabled: () => status === true,
+            openNotificationSettings: mocks.openNotificationSettings,
+            webViewVersion: () => '140.0.1',
+            transferMode: () => 'foreground',
+        }
+        const target = document.createElement('div')
+        document.body.append(target)
+        mounted = mount(RisuNestAndroidPlatform, { target })
+        return target
+    }
+
+    it('hides when Android notification status is unavailable', async () => {
+        const target = mountPlatform(null)
+        await tick()
+        expect(target.textContent).toBe('')
+    })
+
+    it('renders notification state, diagnostics, settings action, and persisted keep-alive toggle', async () => {
+        const target = mountPlatform(true)
+        await tick()
+        await Promise.resolve()
+        await tick()
+
+        expect(target.textContent).toContain('Allowed')
+        expect(target.textContent).toContain('Android 16')
+        expect(target.textContent).toContain('140.0.1')
+        expect(target.textContent).toContain('foreground')
+        target.querySelector('button')?.click()
+        expect(mocks.openNotificationSettings).toHaveBeenCalledOnce()
+        mocks.updateDeviceSettings.mockClear()
+        ;(target.querySelector('input[type="checkbox"]') as HTMLInputElement).click()
+        await tick()
+        expect(mocks.updateDeviceSettings).toHaveBeenCalledWith({ androidKeepAliveDuringGeneration: true })
+    })
+
+    it('warns while notifications are off and refreshes when focus returns from settings', async () => {
+        const target = mountPlatform(false)
+        await tick()
+        expect(target.textContent).toContain("This feature doesn't work while notifications are off.")
+
+        mocks.notificationStatus = true
+        window.dispatchEvent(new Event('focus'))
+        await tick()
+        expect(target.textContent).toContain('Allowed')
+        expect(target.textContent).not.toContain("This feature doesn't work while notifications are off.")
+    })
+})

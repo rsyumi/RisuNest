@@ -68,6 +68,8 @@ const harness = vi.hoisted(() => {
     }))
     const setChatToIndex = vi.fn(async (chat: any) => structuredClone(chat))
     const flushPendingData = vi.fn(async () => undefined)
+    const generationKeepAliveBegin = vi.fn(() => true)
+    const generationKeepAliveEnd = vi.fn()
 
     return {
         store,
@@ -98,6 +100,8 @@ const harness = vi.hoisted(() => {
         projectChatOutput,
         setChatToIndex,
         flushPendingData,
+        generationKeepAliveBegin,
+        generationKeepAliveEnd,
         isLastCharPunctuation: vi.fn(() => true),
     }
 })
@@ -202,6 +206,10 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => null,
     invalidateActiveConversationSession: vi.fn(),
     flushPendingData: harness.flushPendingData,
+}))
+vi.mock('../androidGenerationKeepAlive', () => ({
+    beginAndroidGenerationKeepAlive: harness.generationKeepAliveBegin,
+    endAndroidGenerationKeepAlive: harness.generationKeepAliveEnd,
 }))
 
 import { sendChat } from './index.svelte'
@@ -353,6 +361,7 @@ beforeEach(() => {
     harness.stableDiff.mockResolvedValue(undefined)
     harness.embeddingAddText.mockResolvedValue(undefined)
     harness.embeddingSearch.mockResolvedValue([['happy', 1]])
+    harness.generationKeepAliveBegin.mockReturnValue(true)
     harness.notificationRequest.mockResolvedValue('granted')
     harness.projectChatOutput.mockImplementation(async (input: any) => ({
         char: structuredClone(input.liveCharacter),
@@ -778,5 +787,20 @@ describe('sendChat generation durability control flow', () => {
         expect(harness.acknowledge).toHaveBeenCalledOnce()
         expect(harness.notificationConstruct).not.toHaveBeenCalled()
         expect(harness.peerSync).not.toHaveBeenCalled()
+    })
+
+    it('releases the generation keep-alive token after success, exception, and early return', async () => {
+        harness.requests.push(success('Kept alive'))
+        await expect(sendChat()).resolves.toBe(true)
+
+        harness.requests.push(new Error('request failed'))
+        await expect(sendChat()).rejects.toThrow('request failed')
+
+        harness.doingChat.set(false)
+        await expect(sendChat(-1, { preview: true })).resolves.toBe(true)
+
+        expect(harness.generationKeepAliveBegin).toHaveBeenCalledTimes(3)
+        expect(harness.generationKeepAliveEnd).toHaveBeenCalledWith(true)
+        expect(harness.generationKeepAliveEnd).toHaveBeenCalledTimes(3)
     })
 })

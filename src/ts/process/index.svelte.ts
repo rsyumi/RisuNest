@@ -74,6 +74,7 @@ import {
     SelectedConversationPromotionStaleError,
     type CompleteConversationLease,
 } from '../storage/activeWorkingSet.svelte'
+import { beginAndroidGenerationKeepAlive, endAndroidGenerationKeepAlive } from '../androidGenerationKeepAlive'
 
 export { doingChat } from './generationState'
 
@@ -180,6 +181,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
     let enteredGeneration = false
     let generationReturned = false
+    let generationKeepAliveAcquired = false
     try {
         const target = captureSelectedConversationTarget()
         if (target) {
@@ -191,6 +193,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
         }
         enteredGeneration = true
+        generationKeepAliveAcquired = beginAndroidGenerationKeepAlive()
         const result = await sendChatInternal(chatProcessIndex, arg, lifecycle, reservation)
         generationReturned = true
         return result
@@ -205,6 +208,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
         }
         completeLease?.release()
+        endAndroidGenerationKeepAlive(generationKeepAliveAcquired)
         ownedReservation?.release({
             preserveBusy: enteredGeneration && !generationReturned,
         })
