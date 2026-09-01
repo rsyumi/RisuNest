@@ -4851,6 +4851,19 @@ impl PeerBidirectionalCommandState {
         Ok(source_status(&runtime, &[]))
     }
 
+    fn install_prepared_shared_source(
+        &self,
+        mut prepared: PreparedSharedBidirectionalSource,
+    ) -> Result<PeerBidirectionalSourceStatus, PeerSyncError> {
+        let session_id = prepared.session_id().to_owned();
+        let manifest_id = prepared.manifest_id().to_owned();
+        self.install_source(
+            LanCloneHost::prepare_bidirectional_logical(prepared.take_session()?),
+            &session_id,
+            &manifest_id,
+        )
+    }
+
     fn start_source(
         &self,
         session_id: &str,
@@ -5676,9 +5689,19 @@ fn claim_bidirectional_client(
 
 pub(crate) struct PreparedSharedBidirectionalSource {
     session: Option<PreparedBidirectionalLogicalLanSession>,
+    session_id: String,
+    manifest_id: String,
 }
 
 impl PreparedSharedBidirectionalSource {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+
     pub(crate) fn take_session(
         &mut self,
     ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
@@ -5774,7 +5797,7 @@ pub(crate) fn prepare_shared_bidirectional_source(
         &built.manifest.generation,
         P5_SOURCE_PIN_PREFIX,
     )?;
-    let (session, _, _) = prepare_product_source_session(
+    let (session, session_id, manifest_id) = prepare_product_source_session(
         app_root,
         control_store,
         source,
@@ -5783,6 +5806,8 @@ pub(crate) fn prepare_shared_bidirectional_source(
     )?;
     Ok(PreparedSharedBidirectionalSource {
         session: Some(session),
+        session_id,
+        manifest_id,
     })
 }
 
@@ -6130,52 +6155,17 @@ pub async fn peer_bidirectional_prepare(
         let _guard = state
             .begin_source_prepare()
             .map_err(|error| error.to_string())?;
-        let retained = PeerBidirectionalOperationJournal::new(&root)
-            .load()
-            .map_err(|error| error.to_string())?;
-        let source_device_id = super::delta_commands::canonical_source_device_id(&root)
-            .map_err(|error| error.to_string())?;
-        if retained
-            .as_ref()
-            .is_some_and(|operation| !retained_allows_source_prepare(operation, &source_device_id))
-        {
-            return Err("a target-owned bidirectional operation is retained".to_owned());
-        }
         let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
-        let (built, store, session_store) =
-            persistent_store::commands::with_store_mut(app.state(), |store| {
-                store.reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)?;
-                let actual = store.revision()?;
-                if actual != expected_revision {
-                    return Err(StoreError::RevisionConflict {
-                        expected: expected_revision,
-                        actual,
-                    });
-                }
-                let built = store.seal_or_initialize_active_logical_generation(&cas)?;
-                let job_store = store.open_native_job_store()?;
-                let session_store = store.open_native_job_store()?;
-                Ok((built, job_store, session_store))
-            })
-            .map_err(|error| error.to_string())?;
-        let source = LogicalDeltaSourceSession::open_owned(
-            session_store,
-            &root,
-            &built.manifest.library_id,
-            &built.manifest.generation,
-            P5_SOURCE_PIN_PREFIX,
-        )
-        .map_err(|error| error.to_string())?;
-        let (host, session_id, manifest_id) = prepare_product_source_host(
-            &root,
-            store,
-            source,
-            &source_device_id,
-            built.manifest_bytes,
-        )
+        let prepared = persistent_store::commands::with_store_mut(app.state(), |store| {
+            prepare_shared_bidirectional_source(store, &cas, &root, expected_revision).map_err(
+                |error| StoreError::Store {
+                    message: error.to_string(),
+                },
+            )
+        })
         .map_err(|error| error.to_string())?;
         let status = state
-            .install_source(host, &session_id, &manifest_id)
+            .install_prepared_shared_source(prepared)
             .map_err(|error| error.to_string())?;
         state
             .configure_v2_registry(

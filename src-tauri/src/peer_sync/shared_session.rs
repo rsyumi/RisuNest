@@ -50,18 +50,22 @@ pub(crate) enum SharedSessionPhase {
 /// Adapter seam for the real source-preparation engines.  It deliberately
 /// models no listener or tunnel operation: building a host is the last
 /// preparation step, and starting it belongs to the next slice.
-pub(crate) trait SharedSourcePreparation<C> {
+pub(crate) trait SharedSourceOwnership {
     type Host;
 
-    fn prepare(&mut self, lane: SharedSourceLane, context: &mut C) -> Result<(), PeerSyncError>;
     fn build_host(&mut self) -> Result<Self::Host, PeerSyncError>;
     fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError>;
     fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError>;
 }
 
+pub(crate) trait SharedSourcePreparation<C>: SharedSourceOwnership {
+    fn prepare(&mut self, lane: SharedSourceLane, context: &mut C) -> Result<(), PeerSyncError>;
+}
+
 struct SharedSessionRuntime<H> {
     phase: SharedSessionPhase,
     host: Option<H>,
+    acquired: Vec<SharedSourceLane>,
 }
 
 /// Serialized, idempotent lifecycle around a shared source preparation.
@@ -69,29 +73,22 @@ struct SharedSessionRuntime<H> {
 /// The operation mutex covers preparation and cleanup rather than merely the
 /// visible phase transition.  A concurrent caller therefore observes the
 /// finished result of the first operation instead of a half-owned source.
-pub(crate) struct SharedSessionLifecycle<P, C>
-where
-    P: SharedSourcePreparation<C>,
-{
+pub(crate) struct SharedSessionLifecycle<P: SharedSourceOwnership> {
     operation: Mutex<()>,
     runtime: Mutex<SharedSessionRuntime<P::Host>>,
     preparation: Mutex<P>,
-    context: std::marker::PhantomData<fn(&mut C)>,
 }
 
-impl<P, C> SharedSessionLifecycle<P, C>
-where
-    P: SharedSourcePreparation<C>,
-{
+impl<P: SharedSourceOwnership> SharedSessionLifecycle<P> {
     pub(crate) fn new(preparation: P) -> Self {
         Self {
             operation: Mutex::new(()),
             runtime: Mutex::new(SharedSessionRuntime {
                 phase: SharedSessionPhase::Idle,
                 host: None,
+                acquired: Vec::new(),
             }),
             preparation: Mutex::new(preparation),
-            context: std::marker::PhantomData,
         }
     }
 
@@ -99,10 +96,19 @@ where
         Ok(self.runtime()?.phase)
     }
 
-    pub(crate) fn prepare(&self, context: &mut C) -> Result<(), PeerSyncError> {
+    pub(crate) fn prepare<C>(&self, context: &mut C) -> Result<(), PeerSyncError>
+    where
+        P: SharedSourcePreparation<C>,
+    {
         let _operation = self.operation()?;
-        if self.phase()? == SharedSessionPhase::Prepared {
-            return Ok(());
+        match self.phase()? {
+            SharedSessionPhase::Prepared => return Ok(()),
+            SharedSessionPhase::Stopping => {
+                return Err(PeerSyncError::Protocol(
+                    "shared source cleanup is pending; retry stop before preparing".to_owned(),
+                ));
+            }
+            SharedSessionPhase::Idle | SharedSessionPhase::Preparing => {}
         }
         self.set_phase(SharedSessionPhase::Preparing)?;
 
@@ -111,7 +117,9 @@ where
             let mut preparation = self.preparation()?;
             let mut result = Ok(());
             for lane in SharedSourceLane::PREPARATION_ORDER {
-                if let Err(error) = preparation.prepare(lane, context) {
+                if let Err(error) =
+                    SharedSourcePreparation::prepare(&mut *preparation, lane, context)
+                {
                     result = Err(error);
                     break;
                 }
@@ -119,12 +127,17 @@ where
             }
             if result.is_ok() {
                 match preparation.build_host() {
-                    Ok(host) => self.runtime()?.host = Some(host),
+                    Ok(host) => {
+                        let mut runtime = self.runtime()?;
+                        runtime.host = Some(host);
+                        runtime.acquired = acquired.clone();
+                    }
                     Err(error) => result = Err(error),
                 }
             }
             if let Err(primary) = result {
-                Self::cleanup_lanes(&mut *preparation, &acquired);
+                let (remaining, _) = Self::cleanup_lanes(&mut *preparation, &acquired);
+                self.runtime()?.acquired = remaining;
                 Err(primary)
             } else {
                 Ok(())
@@ -133,8 +146,10 @@ where
 
         self.set_phase(if result.is_ok() {
             SharedSessionPhase::Prepared
-        } else {
+        } else if self.runtime()?.acquired.is_empty() {
             SharedSessionPhase::Idle
+        } else {
+            SharedSessionPhase::Stopping
         })?;
         result
     }
@@ -158,15 +173,19 @@ where
         drop(host);
         {
             let mut preparation = self.preparation()?;
-            for lane in SharedSourceLane::PREPARATION_ORDER.into_iter().rev() {
-                if let Err(error) = preparation.cleanup(lane) {
-                    if primary.is_none() {
-                        primary = Some(error);
-                    }
-                }
+            let acquired = self.runtime()?.acquired.clone();
+            let (remaining, cleanup_error) = Self::cleanup_lanes(&mut *preparation, &acquired);
+            self.runtime()?.acquired = remaining;
+            if primary.is_none() {
+                primary = cleanup_error;
             }
         }
-        self.set_phase(SharedSessionPhase::Idle)?;
+        let has_remaining = !self.runtime()?.acquired.is_empty();
+        self.set_phase(if has_remaining {
+            SharedSessionPhase::Stopping
+        } else {
+            SharedSessionPhase::Idle
+        })?;
         primary.map_or(Ok(()), Err)
     }
 
@@ -179,10 +198,22 @@ where
         Ok(operation(&preparation))
     }
 
-    fn cleanup_lanes(preparation: &mut P, acquired: &[SharedSourceLane]) {
+    fn cleanup_lanes(
+        preparation: &mut P,
+        acquired: &[SharedSourceLane],
+    ) -> (Vec<SharedSourceLane>, Option<PeerSyncError>) {
+        let mut remaining = Vec::new();
+        let mut primary = None;
         for lane in acquired.iter().rev().copied() {
-            let _ = preparation.cleanup(lane);
+            if let Err(error) = preparation.cleanup(lane) {
+                if primary.is_none() {
+                    primary = Some(error);
+                }
+                remaining.push(lane);
+            }
         }
+        remaining.reverse();
+        (remaining, primary)
     }
 
     fn operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, PeerSyncError> {
@@ -244,9 +275,57 @@ pub(crate) struct SharedSourcePreparationContext<'a> {
 }
 
 #[cfg(desktop)]
-impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedSourceEngines {
+impl SharedSourceOwnership for SharedSourceEngines {
     type Host = SharedSessionHost;
 
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        let clone = self.clone.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
+        })?;
+        let delta = self.delta.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared delta source is not prepared".to_owned())
+        })?;
+        let bidirectional = self.bidirectional.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared bidirectional source is not prepared".to_owned())
+        })?;
+        SharedSessionHost::new(
+            clone.take_session()?,
+            delta.take_session()?,
+            bidirectional.take_session()?,
+        )
+    }
+
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
+        match lane {
+            SharedSourceLane::Clone => {
+                if let Some(clone) = self.clone.as_mut() {
+                    clone.cleanup()?;
+                    self.clone = None;
+                }
+            }
+            SharedSourceLane::Delta => {
+                if let Some(delta) = self.delta.as_mut() {
+                    delta.cleanup();
+                    self.delta = None;
+                }
+            }
+            SharedSourceLane::Bidirectional => {
+                if let Some(bidirectional) = self.bidirectional.as_mut() {
+                    bidirectional.cleanup();
+                    self.bidirectional = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError> {
+        host.stop()
+    }
+}
+
+#[cfg(desktop)]
+impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedSourceEngines {
     fn prepare(
         &mut self,
         lane: SharedSourceLane,
@@ -278,48 +357,6 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
             }
         }
         Ok(())
-    }
-
-    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
-        let clone = self.clone.as_mut().ok_or_else(|| {
-            PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
-        })?;
-        let delta = self.delta.as_mut().ok_or_else(|| {
-            PeerSyncError::Protocol("shared delta source is not prepared".to_owned())
-        })?;
-        let bidirectional = self.bidirectional.as_mut().ok_or_else(|| {
-            PeerSyncError::Protocol("shared bidirectional source is not prepared".to_owned())
-        })?;
-        SharedSessionHost::new(
-            clone.take_session()?,
-            delta.take_session()?,
-            bidirectional.take_session()?,
-        )
-    }
-
-    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
-        match lane {
-            SharedSourceLane::Clone => {
-                if let Some(mut clone) = self.clone.take() {
-                    clone.cleanup()?;
-                }
-            }
-            SharedSourceLane::Delta => {
-                if let Some(mut delta) = self.delta.take() {
-                    delta.cleanup();
-                }
-            }
-            SharedSourceLane::Bidirectional => {
-                if let Some(mut bidirectional) = self.bidirectional.take() {
-                    bidirectional.cleanup();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError> {
-        host.stop()
     }
 }
 

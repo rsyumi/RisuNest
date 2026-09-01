@@ -184,9 +184,19 @@ struct PeerDeltaRuntime {
 /// source cleanup drops the transport.
 pub(crate) struct PreparedSharedDeltaSource {
     session: Option<PreparedLogicalLanSession>,
+    session_id: String,
+    manifest_id: String,
 }
 
 impl PreparedSharedDeltaSource {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+
     pub(crate) fn take_session(&mut self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
         self.session.take().ok_or_else(|| {
             PeerSyncError::Protocol("shared delta source session is unavailable".to_owned())
@@ -224,13 +234,15 @@ pub(crate) fn prepare_shared_delta_source(
     let prepared = PreparedLogicalLanSession::new(
         &transport_session_id,
         &source_device_id,
-        manifest_id,
+        manifest_id.clone(),
         built.manifest_bytes,
         objects,
         Box::new(session),
     )?;
     Ok(PreparedSharedDeltaSource {
         session: Some(prepared),
+        session_id: transport_session_id,
+        manifest_id,
     })
 }
 
@@ -436,13 +448,39 @@ impl PeerDeltaCommandState {
             objects,
             Box::new(session),
         )?;
-        let host = LanCloneHost::prepare_logical(prepared);
+        self.install_prepared_source_inner(
+            LanCloneHost::prepare_logical(prepared),
+            transport_session_id,
+            manifest_id,
+        )
+    }
+
+    fn install_prepared_shared_source(
+        &self,
+        mut prepared: PreparedSharedDeltaSource,
+    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
+        let _operation = self.lock_lifecycle_operation()?;
+        let session_id = prepared.session_id().to_owned();
+        let manifest_id = prepared.manifest_id().to_owned();
+        self.install_prepared_source_inner(
+            LanCloneHost::prepare_logical(prepared.take_session()?),
+            session_id,
+            manifest_id,
+        )
+    }
+
+    fn install_prepared_source_inner(
+        &self,
+        host: LanCloneHost,
+        session_id: String,
+        manifest_id: String,
+    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
         let control = host.control();
         let mut runtime = self.lock()?;
         runtime.source_preparing = false;
         runtime.stopped = false;
         runtime.source = Some(DeltaSourceRuntime {
-            session_id: transport_session_id,
+            session_id,
             manifest_id,
             host: Some(host),
             control,
@@ -1409,26 +1447,16 @@ pub async fn peer_delta_prepare(
         };
         let prepared = (|| {
             let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
-            let (built, session_store) =
-                persistent_store::commands::with_store_mut(app.state(), |store| {
-                    store.reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)?;
-                    let built = store.seal_or_initialize_active_logical_generation(&cas)?;
-                    let session_store = store.open_native_job_store()?;
-                    Ok((built, session_store))
+            let prepared = persistent_store::commands::with_store_mut(app.state(), |store| {
+                prepare_shared_delta_source(store, &cas, &app_root).map_err(|error| {
+                    StoreError::Store {
+                        message: error.to_string(),
+                    }
                 })
-                .map_err(|error| error.to_string())?;
-            let session = LogicalDeltaSourceSession::open_owned(
-                session_store,
-                &app_root,
-                &built.manifest.library_id,
-                &built.manifest.generation,
-                P4_SOURCE_PIN_PREFIX,
-            )
+            })
             .map_err(|error| error.to_string())?;
-            let source_device_id =
-                canonical_source_device_id(&app_root).map_err(|error| error.to_string())?;
             state
-                .install_source(session, &source_device_id, built.manifest_bytes)
+                .install_prepared_shared_source(prepared)
                 .map_err(|error| error.to_string())
         })();
         if prepared.is_ok() {

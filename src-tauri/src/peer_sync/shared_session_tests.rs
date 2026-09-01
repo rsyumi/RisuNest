@@ -1,4 +1,6 @@
 use super::lan::validate_lan_endpoint;
+#[cfg(desktop)]
+use super::shared_session::{SharedSourceEngines, SharedSourcePreparationContext};
 use super::{
     device_registry::DevicePermissions,
     lan::{
@@ -13,12 +15,16 @@ use super::{
     prepare_clone_session,
     shared_session::{
         SharedPairingData, SharedSessionHost, SharedSessionLifecycle, SharedSessionPhase,
-        SharedSourceLane, SharedSourcePreparation,
+        SharedSourceLane, SharedSourceOwnership, SharedSourcePreparation,
     },
     CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError, PinnedCloneRevision,
     PinnedSourceObject,
 };
 use crate::local_backup::CancellationProbe;
+#[cfg(desktop)]
+use crate::{
+    asset_repository::PayloadCas, local_backup::NeverCancelled, persistent_store::PersistentStore,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -31,12 +37,47 @@ use std::{
 struct LifecycleFixture {
     events: Vec<&'static str>,
     fail_prepare: Option<SharedSourceLane>,
+    fail_build: bool,
     cleanup_failures: Vec<SharedSourceLane>,
 }
 
-impl SharedSourcePreparation<()> for LifecycleFixture {
+impl SharedSourceOwnership for LifecycleFixture {
     type Host = ();
 
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        self.events.push("build-host");
+        if self.fail_build {
+            return Err(PeerSyncError::Storage(
+                "host construction failed after move".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
+        self.events.push(match lane {
+            SharedSourceLane::Clone => "cleanup-clone",
+            SharedSourceLane::Delta => "cleanup-delta",
+            SharedSourceLane::Bidirectional => "cleanup-bidirectional",
+        });
+        if let Some(index) = self
+            .cleanup_failures
+            .iter()
+            .position(|failed| *failed == lane)
+        {
+            self.cleanup_failures.remove(index);
+            return Err(PeerSyncError::Storage(format!("{lane:?} cleanup failed")));
+        }
+        Ok(())
+    }
+
+    fn stop_host(&mut self, _: &mut Self::Host) -> Result<(), PeerSyncError> {
+        self.events.push("stop-host");
+        Ok(())
+    }
+}
+
+impl SharedSourcePreparation<()> for LifecycleFixture {
     fn prepare(&mut self, lane: SharedSourceLane, _: &mut ()) -> Result<(), PeerSyncError> {
         self.events.push(match lane {
             SharedSourceLane::Clone => "prepare-clone",
@@ -50,33 +91,11 @@ impl SharedSourcePreparation<()> for LifecycleFixture {
         }
         Ok(())
     }
-
-    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
-        self.events.push("build-host");
-        Ok(())
-    }
-
-    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
-        self.events.push(match lane {
-            SharedSourceLane::Clone => "cleanup-clone",
-            SharedSourceLane::Delta => "cleanup-delta",
-            SharedSourceLane::Bidirectional => "cleanup-bidirectional",
-        });
-        if self.cleanup_failures.contains(&lane) {
-            return Err(PeerSyncError::Storage(format!("{lane:?} cleanup failed")));
-        }
-        Ok(())
-    }
-
-    fn stop_host(&mut self, _: &mut Self::Host) -> Result<(), PeerSyncError> {
-        self.events.push("stop-host");
-        Ok(())
-    }
 }
 
 #[test]
 fn unified_preparation_builds_the_host_only_after_all_sources_prepare() {
-    let lifecycle = SharedSessionLifecycle::<_, ()>::new(LifecycleFixture::default());
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture::default());
     let mut context = ();
 
     lifecycle.prepare(&mut context).unwrap();
@@ -97,7 +116,7 @@ fn unified_preparation_builds_the_host_only_after_all_sources_prepare() {
 
 #[test]
 fn unified_preparation_rolls_back_every_acquired_source_in_reverse_order() {
-    let lifecycle = SharedSessionLifecycle::<_, ()>::new(LifecycleFixture {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture {
         fail_prepare: Some(SharedSourceLane::Bidirectional),
         cleanup_failures: vec![SharedSourceLane::Delta],
         ..Default::default()
@@ -108,7 +127,7 @@ fn unified_preparation_rolls_back_every_acquired_source_in_reverse_order() {
     assert!(error
         .to_string()
         .contains("Bidirectional preparation failed"));
-    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Idle);
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Stopping);
     assert_eq!(
         lifecycle
             .with_preparation(|fixture| fixture.events.clone())
@@ -124,8 +143,37 @@ fn unified_preparation_rolls_back_every_acquired_source_in_reverse_order() {
 }
 
 #[test]
+fn build_host_failure_cleans_every_prepared_lane_after_a_partial_move() {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture {
+        fail_build: true,
+        ..Default::default()
+    });
+
+    let error = lifecycle.prepare(&mut ()).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("host construction failed after move"));
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Idle);
+    assert_eq!(
+        lifecycle
+            .with_preparation(|fixture| fixture.events.clone())
+            .unwrap(),
+        [
+            "prepare-clone",
+            "prepare-delta",
+            "prepare-bidirectional",
+            "build-host",
+            "cleanup-bidirectional",
+            "cleanup-delta",
+            "cleanup-clone",
+        ]
+    );
+}
+
+#[test]
 fn unified_stop_attempts_every_cleanup_after_a_failure() {
-    let lifecycle = SharedSessionLifecycle::<_, ()>::new(LifecycleFixture {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture {
         cleanup_failures: vec![SharedSourceLane::Bidirectional],
         ..Default::default()
     });
@@ -134,7 +182,7 @@ fn unified_stop_attempts_every_cleanup_after_a_failure() {
     let error = lifecycle.stop().unwrap_err();
 
     assert!(error.to_string().contains("Bidirectional cleanup failed"));
-    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Idle);
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Stopping);
     assert_eq!(
         lifecycle
             .with_preparation(|fixture| fixture.events.clone())
@@ -153,8 +201,70 @@ fn unified_stop_attempts_every_cleanup_after_a_failure() {
 }
 
 #[test]
+fn cleanup_failure_retains_the_lane_for_a_retry() {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture {
+        cleanup_failures: vec![SharedSourceLane::Bidirectional],
+        ..Default::default()
+    });
+    lifecycle.prepare(&mut ()).unwrap();
+
+    assert!(lifecycle.stop().is_err());
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Stopping);
+    lifecycle.stop().unwrap();
+
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Idle);
+    assert_eq!(
+        lifecycle
+            .with_preparation(|fixture| fixture.events.clone())
+            .unwrap(),
+        [
+            "prepare-clone",
+            "prepare-delta",
+            "prepare-bidirectional",
+            "build-host",
+            "stop-host",
+            "cleanup-bidirectional",
+            "cleanup-delta",
+            "cleanup-clone",
+            "cleanup-bidirectional",
+        ]
+    );
+}
+
+#[test]
+fn prepare_does_not_replace_a_retryable_cleanup_owner() {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture {
+        cleanup_failures: vec![SharedSourceLane::Clone],
+        ..Default::default()
+    });
+    lifecycle.prepare(&mut ()).unwrap();
+    assert!(lifecycle.stop().is_err());
+
+    let error = lifecycle.prepare(&mut ()).unwrap_err();
+
+    assert!(error.to_string().contains("cleanup is pending"));
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Stopping);
+    assert_eq!(
+        lifecycle
+            .with_preparation(|fixture| fixture.events.clone())
+            .unwrap(),
+        [
+            "prepare-clone",
+            "prepare-delta",
+            "prepare-bidirectional",
+            "build-host",
+            "stop-host",
+            "cleanup-bidirectional",
+            "cleanup-delta",
+            "cleanup-clone",
+        ]
+    );
+    lifecycle.stop().unwrap();
+}
+
+#[test]
 fn repeated_prepare_and_stop_are_idempotent() {
-    let lifecycle = SharedSessionLifecycle::<_, ()>::new(LifecycleFixture::default());
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture::default());
 
     lifecycle.prepare(&mut ()).unwrap();
     lifecycle.prepare(&mut ()).unwrap();
@@ -180,9 +290,7 @@ fn repeated_prepare_and_stop_are_idempotent() {
 
 #[test]
 fn concurrent_prepare_calls_share_one_serialized_preparation() {
-    let lifecycle = Arc::new(SharedSessionLifecycle::<_, ()>::new(
-        LifecycleFixture::default(),
-    ));
+    let lifecycle = Arc::new(SharedSessionLifecycle::new(LifecycleFixture::default()));
     let first = {
         let lifecycle = Arc::clone(&lifecycle);
         std::thread::spawn(move || lifecycle.prepare(&mut ()))
@@ -206,6 +314,86 @@ fn concurrent_prepare_calls_share_one_serialized_preparation() {
             "build-host",
         ]
     );
+}
+
+#[cfg(desktop)]
+#[test]
+fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let cas = PayloadCas::new(root.path()).unwrap();
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    seed_shared_source_store(&mut store);
+    let expected_revision = store.revision().unwrap();
+    let lifecycle = SharedSessionLifecycle::new(SharedSourceEngines::new());
+
+    {
+        let mut context = SharedSourcePreparationContext {
+            store: &mut store,
+            cas: &cas,
+            app_root: root.path(),
+            cancellation: &NeverCancelled,
+            expected_bidirectional_revision: expected_revision,
+        };
+        lifecycle.prepare(&mut context).unwrap();
+    }
+    assert!(root
+        .path()
+        .join("peer-clone")
+        .join("active-source.json")
+        .exists());
+
+    lifecycle.stop().unwrap();
+
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Idle);
+    assert!(!root
+        .path()
+        .join("peer-clone")
+        .join("active-source.json")
+        .exists());
+}
+
+#[cfg(desktop)]
+fn seed_shared_source_store(store: &mut PersistentStore) {
+    let staging = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(
+            &staging,
+            &serde_json::json!({
+                "username": "shared-source",
+                "botPresetsId": 0,
+                "personas": [{ "id": "persona" }],
+                "selectedPersona": 0,
+                "enabledModules": [],
+                "characterOrder": [],
+                "modules": [],
+                "loadouts": [],
+                "plugins": [],
+                "pluginCustomStorage": {},
+            }),
+        )
+        .unwrap();
+    store
+        .replace_put_presets(&staging, &[serde_json::json!({ "name": "preset" })])
+        .unwrap();
+    store
+        .replace_put_asset_repository_authority(
+            &staging,
+            &crate::persistent_store::AssetRepositoryAuthorityState::V2 {
+                migration_id: "shared-source-assets".to_owned(),
+                compatibility_hash: "ab".repeat(32),
+            },
+        )
+        .unwrap();
+    store
+        .replace_put_cold_payload_authority(
+            &staging,
+            &crate::persistent_store::ColdPayloadAuthorityState::V2 {
+                migration_id: "shared-source-cold".to_owned(),
+                compatibility_hash: "cd".repeat(32),
+            },
+        )
+        .unwrap();
+    store.replace_commit(&staging, Some(0)).unwrap();
 }
 
 struct CloneFixture(PathBuf);
