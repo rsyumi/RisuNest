@@ -106,6 +106,7 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
         captureSelectedConversationTarget,
         acquireCompleteConversation,
         refreshSelectedConversationAfterReplacement,
+        invalidateActiveConversationSession,
         replacePersistentCompleteCharacter,
         replacePersistentConversation,
         reportIdentityReplacementRejected: (diagnostic) => {
@@ -847,13 +848,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         addRisuChatListener: async (mode:'output', func:Function) => {
+            if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
             //permission check, lets use same as replacer
             const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
             if(!conf){
                 return;
             }
             if (pluginLifetime.signal.aborted) return
-            if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
             const listener = func as ChatOutputListener
             registerChatOutputListener(
                 pluginV2.chatOutput,

@@ -242,6 +242,7 @@ function createHarness() {
         release: completeConversationRelease,
     }))
     const refreshSelectedConversationAfterReplacement = vi.fn(() => true)
+    const invalidateActiveConversationSession = vi.fn()
     const replacePersistentCompleteCharacter = vi.fn(async () => true)
     const replacePersistentConversation = vi.fn(async () => true)
     const reportIdentityReplacementRejected = vi.fn()
@@ -255,6 +256,7 @@ function createHarness() {
         acquireCompleteConversation: acquireCompleteConversation as any,
         refreshSelectedConversationAfterReplacement:
             refreshSelectedConversationAfterReplacement as any,
+        invalidateActiveConversationSession,
         replacePersistentCompleteCharacter,
         replacePersistentConversation,
         reportIdentityReplacementRejected,
@@ -292,6 +294,7 @@ function createHarness() {
         completeConversationSession,
         completeConversationRelease,
         refreshSelectedConversationAfterReplacement,
+        invalidateActiveConversationSession,
         getSelectedCharacterId,
         setSelectedCharacterId(id: string | null) {
             selectedCharacterId = id
@@ -622,6 +625,32 @@ describe('plugin database access', () => {
         )
         expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
         expect(harness.refreshSelectedConversationAfterReplacement).not.toHaveBeenCalled()
+        expect(harness.invalidateActiveConversationSession).toHaveBeenCalledOnce()
+    })
+
+    it('does not invalidate the session for a leaseless write to an unselected conversation', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database)
+        const flushed = deferred<void>()
+        harness.flushPendingData.mockReturnValueOnce(flushed.promise)
+        const replacement = structuredClone(database.characters[0].chats[1])
+
+        const writing = harness.access.setChatToIndex(0, 1, replacement, callContext())
+        await vi.waitFor(() => expect(harness.flushPendingData).toHaveBeenCalledOnce())
+        harness.setNavigationGeneration(2)
+        harness.setSelectedConversationTarget({
+            characterId: 'active',
+            conversationId: 'active-chat-a',
+            navigationGeneration: 2,
+            storeRevision: 4,
+        })
+        flushed.resolve(undefined)
+        await writing
+
+        expect(harness.replacePersistentConversation).toHaveBeenCalledOnce()
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(harness.invalidateActiveConversationSession).not.toHaveBeenCalled()
     })
 
     it('fulfills invalid current and indexed setters without promotion or mutation', async () => {

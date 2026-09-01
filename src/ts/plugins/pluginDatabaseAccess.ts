@@ -148,6 +148,7 @@ export interface PluginDatabaseAccessDependencies {
         target: SelectedConversationTarget,
         expectedSession: ActiveConversationSession,
     ): boolean
+    invalidateActiveConversationSession?(): void
     replacePersistentCompleteCharacter(
         characterId: string,
         reason: string,
@@ -587,6 +588,22 @@ export function createPluginDatabaseAccess(
         ) return null
         return target
     }
+    // A leaseless scoped write is durably fenced by expectedRevision, but if
+    // it lands on the currently selected conversation (stale call boundary
+    // after navigating away and back), the published working-set replacement
+    // detaches any live session from its conversation object. Invalidate the
+    // session so it re-establishes against the replaced object.
+    const invalidateLeaselessSelectedWrite = (
+        characterId: string,
+        conversationId?: string,
+    ): void => {
+        if (dependencies.getSelectedCharacterId() !== characterId) return
+        if (conversationId !== undefined) {
+            const current = dependencies.captureSelectedConversationTarget()
+            if (!current || current.conversationId !== conversationId) return
+        }
+        dependencies.invalidateActiveConversationSession?.()
+    }
 
     return {
         async getCurrentCharacter(context) {
@@ -715,6 +732,7 @@ export function createPluginDatabaseAccess(
                     { expectedRevision: target.revision },
                 )
                 if (!replaced) throw new PluginFullObjectTargetStaleError(target.characterId)
+                if (!completeLease) invalidateLeaselessSelectedWrite(target.characterId)
             } finally {
                 if (completeLease) {
                     completeLease.release()
@@ -768,6 +786,7 @@ export function createPluginDatabaseAccess(
                     { expectedRevision: target.revision },
                 )
                 if (!replaced) throw new PluginFullObjectTargetStaleError(target.characterId)
+                if (!completeLease) invalidateLeaselessSelectedWrite(target.characterId)
             } finally {
                 if (completeLease) {
                     completeLease.release()
@@ -824,6 +843,12 @@ export function createPluginDatabaseAccess(
                 )
                 if (!replaced) {
                     throw new PluginFullObjectTargetStaleError(
+                        target.characterId,
+                        target.conversationId,
+                    )
+                }
+                if (!completeLease) {
+                    invalidateLeaselessSelectedWrite(
                         target.characterId,
                         target.conversationId,
                     )
