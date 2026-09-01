@@ -279,6 +279,10 @@ export async function translateHTML(
     regenerate = false,
     captureContext?: TranslateHTMLContext,
 ): Promise<string> {
+    if (!html) {
+        return html
+    }
+
     const db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     let alwaysExistChar: character | groupChat | simpleCharacterArgument;
     if(charArg){
@@ -535,7 +539,7 @@ function needSuperChunkedTranslate(database: Database = getDatabase()){
 async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(text)
-        if(cacheMatch){
+        if(cacheMatch !== null){
             return cacheMatch as string
         }
     }

@@ -25,6 +25,7 @@
         translated: boolean
         translating: boolean
         retranslate: boolean
+        renderRevision?: number
         bodyRoot?: HTMLElement|null
         modelShortName: string
         renderRawStreaming?: boolean
@@ -46,6 +47,7 @@
         translated = $bindable(false),
         translating = $bindable(false),
         retranslate = $bindable(false),
+        renderRevision = 0,
         bodyRoot,
         modelShortName = '',
         renderRawStreaming = false,
@@ -69,6 +71,8 @@
         deferredInlays: DeferredInlayMarkerRegistry
         disposed: boolean
         generation: number
+        requestedRevision: number
+        preservePendingContent: boolean
         settledNotified: boolean
         errorNotified: boolean
         transitional: boolean
@@ -77,6 +81,7 @@
 
     let activeParseJob: ChatBodyParseJob|null = null
     let parseGeneration = 0
+    let lastRenderedRevision: number | null = null
 
     function parserChara(): string | CharacterRecord | GroupChatRecord {
         const parserCharacter = captureContext?.parserContext.character
@@ -154,7 +159,6 @@
             ? addMetadataToElement(trimmed, modelShortName, captureContext.settings.aiLawApplies ?? false)
             : addMetadataToElement(trimmed, modelShortName)
     }
-
     function getCbsCondition(){
         try{
             const cbsConditions:CbsConditions = {
@@ -242,7 +246,7 @@
             }
             if(retranslate || translated){
                 const settings = captureContext?.settings ?? DBState.db
-                if (settings.showTranslationLoading) {
+                if (settings.showTranslationLoading && !job.preservePendingContent) {
                     lastParsed = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
                 }
 
@@ -411,12 +415,14 @@
         }
     }
 
-    function startParsing():ChatBodyParseJob {
+    function startParsing(requestedRevision: number):ChatBodyParseJob {
         const job:ChatBodyParseJob = {
             promise: Promise.resolve(''),
             deferredInlays: new DeferredInlayMarkerRegistry(),
             disposed: false,
             generation: ++parseGeneration,
+            requestedRevision,
+            preservePendingContent: lastRenderedRevision !== null && requestedRevision !== lastRenderedRevision,
             settledNotified: false,
             errorNotified: false,
             transitional: false,
@@ -434,7 +440,7 @@
         job.deferredInlays.clear()
     }
 
-    let markParsingResult = $derived.by(() => shouldRenderRawStreaming ? null : startParsing())
+    let markParsingResult = $derived.by(() => shouldRenderRawStreaming ? null : startParsing(renderRevision))
 
     async function syncObjectUrls(job: ChatBodyParseJob) {
         try {
@@ -449,6 +455,7 @@
                 disposeParseJob(job)
                 return
             }
+            lastRenderedRevision = job.requestedRevision
             let releaseObjectUrls = () => {}
             if (renderRoot) {
                 releaseObjectUrls = onCaptureSettled

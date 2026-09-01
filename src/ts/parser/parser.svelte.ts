@@ -791,6 +791,10 @@ export function trimMarkdown(
     data:string,
     options: boolean | TrimMarkdownRenderContext = {},
 ){
+    if (!data) {
+        return ''
+    }
+
     const renderContext = typeof options === 'boolean'
         ? { hideAllImages: options }
         : options
