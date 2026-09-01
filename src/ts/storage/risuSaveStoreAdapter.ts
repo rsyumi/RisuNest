@@ -23,6 +23,7 @@ import {
     replaceCharacterResources,
     replaceDatabaseRootResources,
 } from '../process/coldstorageData'
+import { replaceExactPluginStorageAssetReferences } from '../drive/backupAssets'
 import {
     decodeRisuSave,
     encodeRisuSaveBlock,
@@ -122,6 +123,12 @@ export async function* streamRisuSaveFromLease(
     const root = options?.replaceResources
         ? replaceDatabaseRootResources(rootWithPresets, options.replaceResources)
         : rootWithPresets
+    if (options?.replaceResources) {
+        root.pluginCustomStorage = replaceExactPluginStorageAssetReferences(
+            root.pluginCustomStorage,
+            options.replaceResources,
+        )
+    }
     const directory: string[] = [
         'preset',
         'modules',

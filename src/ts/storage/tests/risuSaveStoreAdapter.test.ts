@@ -237,6 +237,14 @@ describe('RisuSave persistent store adapter', () => {
 
     it('projects root and character resources while streaming from a lease', async () => {
         const database = structuredClone(risuSaveFixtureDatabase) as any
+        database.pluginCustomStorage = JSON.parse(
+            '{"projection":{' +
+            '"direct":"assets/plugin.bin",' +
+            '"nested":["assets/plugin-chain.bin","prefix assets/plugin.bin"],' +
+            '"legacyNested":"assets/folder/plugin-legacy.bin",' +
+            '"assets/plugin.bin":"object-key",' +
+            '"__proto__":"assets/plugin-proto.bin"}}',
+        )
         database.customBackground = 'assets/background.png'
         database.userIcon = 'assets/user.png'
         database.modules = [{
@@ -276,6 +284,13 @@ describe('RisuSave persistent store adapter', () => {
         const replacements = Object.fromEntries(
             resources.map((resource) => [resource, `remote/${resource}`]),
         )
+        Object.assign(replacements, {
+            'assets/plugin.bin': 'remote/assets/plugin.bin',
+            'assets/plugin-chain.bin': 'assets/plugin-chain-step.bin',
+            'assets/plugin-chain-step.bin': 'remote/assets/plugin-chain-final.bin',
+            'assets/folder/plugin-legacy.bin': 'remote/assets/folder/plugin-legacy.bin',
+            'assets/plugin-proto.bin': 'remote/assets/plugin-proto.bin',
+        })
         const store = new IndexedDbPersistentDataStore(
             'risu-save-resource-projection',
             new IDBFactory(),
@@ -304,9 +319,46 @@ describe('RisuSave persistent store adapter', () => {
         expect(projected.characters[0].additionalAssets[0][1]).toBe('remote/assets/prop.png')
         expect(projected.characters[0].vits.files.model).toBe('remote/assets/model.onnx')
         expect(projected.characters[0].ccAssets[0].uri).toBe('remote/assets/card.png')
+        expect(projected.pluginCustomStorage.projection.direct).toBe('remote/assets/plugin.bin')
+        expect(projected.pluginCustomStorage.projection.nested).toEqual([
+            'assets/plugin-chain-step.bin',
+            'prefix assets/plugin.bin',
+        ])
+        expect(projected.pluginCustomStorage.projection.legacyNested).toBe(
+            'remote/assets/folder/plugin-legacy.bin',
+        )
+        expect(projected.pluginCustomStorage.projection['assets/plugin.bin']).toBe('object-key')
+        expect(Object.hasOwn(projected.pluginCustomStorage.projection, '__proto__')).toBe(true)
+        expect(projected.pluginCustomStorage.projection.__proto__).toBe(
+            'remote/assets/plugin-proto.bin',
+        )
         expect(database.customBackground).toBe('assets/background.png')
         expect(database.characters[0].image).toBe('assets/character.png')
+        expect(database.pluginCustomStorage.projection.direct).toBe('assets/plugin.bin')
+        expect(database.pluginCustomStorage.projection.nested[0]).toBe('assets/plugin-chain.bin')
+        expect(database.pluginCustomStorage.projection.legacyNested).toBe(
+            'assets/folder/plugin-legacy.bin',
+        )
         expect(release).not.toHaveBeenCalled()
+        await lease.release()
+    })
+
+    it('keeps an empty resource projection byte-identical', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            'risu-save-empty-resource-projection',
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        const lease = await store.acquireRevision(imported.revision)
+
+        const ordinary = await concatenate(streamRisuSaveFromLease(lease))
+        const projected = await concatenate(streamRisuSaveFromLease(lease, {
+            replaceResources: {},
+        }))
+
+        expect(projected).toEqual(ordinary)
         await lease.release()
     })
 
