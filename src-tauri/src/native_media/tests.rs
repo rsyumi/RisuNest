@@ -607,6 +607,50 @@ fn configurable_inlay_encoding_resizes_before_webp_encoding() {
 }
 
 #[test]
+fn configured_png_converts_jpeg_and_webp_sources() {
+    for (name, source) in [
+        ("jpeg", encoded_fixture(ImageFormat::Jpeg, 9, 4)),
+        ("webp", encoded_fixture(ImageFormat::WebP, 5, 8)),
+    ] {
+        let result = encode_inlay_image(
+            name,
+            &source,
+            "source",
+            Some(InlayEncodeOptions {
+                format: InlayEncodeFormat::Png,
+                quality: 1,
+                max_dimension: 0,
+                skip_reencode: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(&result.data[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(result.metadata.mime, "image/png");
+        assert_eq!(result.metadata.ext, "png");
+    }
+}
+
+#[test]
+fn skipped_webp_reencodes_when_max_dimension_requires_resize() {
+    let source = encoded_fixture(ImageFormat::WebP, 20, 10);
+    let result = encode_inlay_image(
+        "resized-skip",
+        &source,
+        "source.webp",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Webp,
+            quality: 70,
+            max_dimension: 5,
+            skip_reencode: true,
+        }),
+    )
+    .unwrap();
+    assert_ne!(result.data, source);
+    assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
+    assert_eq!(result.metadata.mime, "image/webp");
+}
+
+#[test]
 fn original_inlay_ignores_max_dimension_and_preserves_oriented_jpeg_bytes() {
     let source = with_exif_orientation(encoded_fixture(ImageFormat::Jpeg, 8, 3), 6);
     let result = encode_inlay_image(
