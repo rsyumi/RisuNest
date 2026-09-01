@@ -1153,6 +1153,8 @@ if (interceptor) {
 
 `addRisuChatListener('output', callback)` is the full-object compatibility listener. It runs after the model output and host-side output transformations. Listeners run sequentially, so a slow callback delays later chat flow. The callback receives the event snapshot supplied for that output event. To remove it, pass the same callback reference to `removeRisuChatListener`.
 
+Registration asks the user for the same consent as `addRisuReplacer` (the "replacer" permission). If the user declines, `addRisuChatListener` still resolves normally, but the listener is never registered and will not fire. In scalable mode, every output event with a registered listener materializes the full character (including all conversation histories) for the event snapshot, so registering a listener has a per-message cost proportional to the character's stored history.
+
 ```javascript
 const onOutput = async ({ chat, messageIndex, characterIndex, chatIndex }) => {
   const message = chat.message[messageIndex];

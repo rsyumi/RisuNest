@@ -2010,6 +2010,11 @@ interface RisuaiPluginAPI {
      * Modes:
      * - 'output': fires after an AI message is appended to or updated in the chat
      *
+     * Registration asks the user for the same consent as `addRisuReplacer`
+     * (the "replacer" permission). If the user declines, the returned promise
+     * still resolves normally but the listener is never registered and will
+     * not fire.
+     *
      * @param mode - Listener mode
      * @param func - Listener function. Receives the current character, chat, and generated message index.
      *
@@ -2227,7 +2232,7 @@ interface RisuaiPluginAPI {
     /**
      * Sends a chat message as if it were sent by the user, triggering the normal chat processing flow.
      * @param message - The chat message to send, if string is a blank message, it will trigger the send action without adding a new message.
-     * @returns Promise resolving to true when generation starts, or false when permission is denied or the selected conversation changes during promotion.
+     * @returns Promise resolving to true when generation starts, or false when permission is denied or the promoted conversation no longer matches the selection. Rejects when the selected conversation becomes stale mid-promotion.
      */
     sendChat(message: string): Promise<boolean>;
 }

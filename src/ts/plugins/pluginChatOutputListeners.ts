@@ -72,6 +72,10 @@ export async function dispatchChatOutputListeners(
                 liveConversation: input.chat,
             })
         } catch (error) {
+            // All listeners of one output event share a single consistent
+            // event object, so a projection failure skips the whole event,
+            // including live-profile listeners that would not have needed
+            // the projection themselves.
             input.onError(error)
             return
         }

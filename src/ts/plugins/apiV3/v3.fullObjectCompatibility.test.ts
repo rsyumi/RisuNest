@@ -145,7 +145,6 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
 }))
 vi.mock('../pluginCompatibility', () => ({
     assertPluginFullObjectCompatibility: vi.fn(),
-    preparePluginFullObjectCallbackRegistration: vi.fn(() => true),
     runPluginFullObjectReplacement: vi.fn((
         _profile: string,
         _operation: string,
