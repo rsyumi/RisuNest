@@ -7549,7 +7549,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
         &source_active.manifest.generation,
     )
     .unwrap();
-    let (mut source_host, fresh_session_id, fresh_manifest_id) = prepare_product_source_host(
+    let (prepared, fresh_session_id, fresh_manifest_id) = prepare_product_source_session(
         directory.path(),
         source_store,
         source,
@@ -7557,6 +7557,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
         source_active.manifest_bytes,
     )
     .unwrap();
+    let mut source_host = LanCloneHost::prepare_bidirectional_logical(prepared);
     let pairing = source_host.start().unwrap();
     assert_eq!(pairing.session_id, fresh_session_id);
     assert_eq!(pairing.manifest_id, fresh_manifest_id);

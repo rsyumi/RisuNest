@@ -5743,22 +5743,6 @@ fn prepare_product_source_session(
     Ok((prepared, session_id, manifest_id))
 }
 
-fn prepare_product_source_host(
-    app_root: &Path,
-    store: PersistentStore,
-    source: LogicalDeltaSourceSession,
-    source_device_id: &str,
-    manifest_bytes: Vec<u8>,
-) -> Result<(LanCloneHost, String, String), PeerSyncError> {
-    let (prepared, session_id, manifest_id) =
-        prepare_product_source_session(app_root, store, source, source_device_id, manifest_bytes)?;
-    Ok((
-        LanCloneHost::prepare_bidirectional_logical(prepared),
-        session_id,
-        manifest_id,
-    ))
-}
-
 pub(crate) fn prepare_shared_bidirectional_source(
     store: &mut PersistentStore,
     cas: &PayloadCas,
