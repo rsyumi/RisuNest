@@ -2113,7 +2113,7 @@ impl PersistentStore {
             message: "persistent directory has no repository root".to_owned(),
         })?;
         let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
-        let roots = self.collect_asset_gc_roots(&cas, false)?;
+        let roots = self.collect_asset_gc_roots(&cas, false, true)?;
         let candidates = self.query_asset_object_catalog(limit, cursor)?;
         let report =
             dry_run_mark_and_sweep(&cas, candidates.items, roots, now_ms, minimum_grace_ms)
@@ -2239,7 +2239,7 @@ impl PersistentStore {
         let initial_report = dry_run_mark_and_sweep(
             &cas,
             initial_candidates.items.clone(),
-            self.collect_asset_gc_roots(&cas, false)?,
+            self.collect_asset_gc_roots(&cas, false, false)?,
             now_ms,
             minimum_grace_ms,
         )?;
@@ -2269,7 +2269,7 @@ impl PersistentStore {
         let mut report = dry_run_mark_and_sweep(
             &cas,
             final_candidates.items.clone(),
-            self.collect_asset_gc_roots(&cas, true)?,
+            self.collect_asset_gc_roots(&cas, true, false)?,
             now_ms,
             minimum_grace_ms,
         )?;
@@ -2371,9 +2371,11 @@ impl PersistentStore {
         &self,
         cas: &crate::asset_repository::PayloadCas,
         repository_guard_held: bool,
+        read_only: bool,
     ) -> StoreResult<Vec<crate::asset_repository::migration_gc::AssetRootSet>> {
         use crate::asset_repository::job_pins::{
             collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
+            collect_durable_cas_job_roots_read_only,
         };
         use crate::asset_repository::migration_gc::{
             collect_staged_migration_roots, read_snapshot_asset_root_sidecar,
@@ -2388,7 +2390,9 @@ impl PersistentStore {
             roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
         }
         roots.extend(collect_staged_migration_roots(&self.repository_root)?);
-        roots.push(if repository_guard_held {
+        roots.push(if read_only {
+            collect_durable_cas_job_roots_read_only(&self.repository_root)
+        } else if repository_guard_held {
             collect_durable_cas_job_roots_already_guarded(&self.repository_root)
         } else {
             collect_durable_cas_job_roots(&self.repository_root)

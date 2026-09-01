@@ -148,15 +148,21 @@ fn validated_direct_child(
     Ok(target)
 }
 
-fn clone_job_exists(app_root: &Path) -> bool {
-    let root = app_root.join("assets-v2/job-pins");
-    ordinary_directory(&root).is_some_and(|_| {
-        fs::read_dir(root).ok().is_some_and(|entries| {
-            entries
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().starts_with("job-"))
-        })
-    })
+fn desktop_clone_backup_job_is_active(app_root: &Path, backup: &Path) -> bool {
+    let Some(name) = backup.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(job_id) = name
+        .strip_suffix(".lossless")
+        .and_then(|name| name.rsplit_once('-'))
+        .map(|(_, id)| id)
+    else {
+        return false;
+    };
+    let Ok(job) = crate::asset_repository::job_pins::DurableCasJob::open(app_root, job_id) else {
+        return false;
+    };
+    job.kind() == crate::asset_repository::job_pins::CasJobKind::PeerClone && !job.is_released()
 }
 
 pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), PeerSyncError> {
@@ -174,7 +180,8 @@ pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), Pee
             PeerSyncError::Validation("peer backup is not currently listed".to_owned())
         })?;
     if operation_references(app_root, &selected)?
-        || (selected.starts_with(app_root.join("peer-clone")) && clone_job_exists(app_root))
+        || (selected.starts_with(app_root.join("peer-clone/activation/backups"))
+            && desktop_clone_backup_job_is_active(app_root, &selected))
     {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }

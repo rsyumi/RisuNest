@@ -500,6 +500,74 @@ pub(crate) fn collect_durable_cas_job_roots(repository_root: &Path) -> AssetRoot
     collect_durable_cas_job_roots_inner(repository_root, false)
 }
 
+pub(crate) fn collect_durable_cas_job_roots_read_only(repository_root: &Path) -> AssetRootSet {
+    collect_durable_cas_job_roots_inner_read_only(repository_root)
+}
+
+fn collect_durable_cas_job_roots_inner_read_only(repository_root: &Path) -> AssetRootSet {
+    let mut roots = AssetRootSet::default();
+    let directory = match job_pin_directory(repository_root, false) {
+        Ok(Some((_, directory))) => directory,
+        Ok(None) => return roots,
+        Err(_) => {
+            roots
+                .blockers
+                .insert("job-pin-directory-invalid".to_owned());
+            return roots;
+        }
+    };
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            roots
+                .blockers
+                .insert("job-pin-directory-unreadable".to_owned());
+            return roots;
+        }
+    };
+    for entry in entries.take(MAX_DURABLE_CAS_JOB_JOURNALS + 1) {
+        let Ok(entry) = entry else {
+            roots
+                .blockers
+                .insert("job-pin-directory-unreadable".to_owned());
+            continue;
+        };
+        let path = entry.path();
+        let Some(job_id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("job-"))
+            .and_then(|n| n.strip_suffix(".journal"))
+        else {
+            roots.blockers.insert("job-pin-unknown-entry".to_owned());
+            continue;
+        };
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            roots.blockers.insert("job-pin-unknown-entry".to_owned());
+            continue;
+        };
+        if !metadata.is_file() || is_link_like(&metadata) || validate_job_id(job_id).is_err() {
+            roots.blockers.insert("job-pin-unknown-entry".to_owned());
+            continue;
+        }
+        match File::open(&path).and_then(|mut file| read_job_state(&mut file, Some(job_id))) {
+            Ok(state) if !state.released => {
+                let job_roots = root_set_from_state(&state);
+                roots.manifest_hashes.extend(job_roots.manifest_hashes);
+                roots.object_hashes.extend(job_roots.object_hashes);
+                if !state.sealed {
+                    roots.blockers.insert(format!("job-pin-unsealed:{job_id}"));
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                roots.blockers.insert(format!("job-pin-corrupt:{job_id}"));
+            }
+        }
+    }
+    roots
+}
+
 pub(crate) fn collect_durable_cas_job_roots_already_guarded(
     repository_root: &Path,
 ) -> AssetRootSet {
