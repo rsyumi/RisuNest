@@ -73,6 +73,7 @@ export function createTauriBlobStore(
                 id: key,
                 data: Array.from(data),
                 name: input.name,
+                ...(input.options === undefined ? {} : { options: input.options }),
             }) as InlayBlobMetadata
         },
     }

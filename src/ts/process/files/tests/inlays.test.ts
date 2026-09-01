@@ -4,6 +4,7 @@ import type { InlayAsset } from '../inlays'
 import {
     getInlayAsset,
     getInlayAssetBlob,
+    getInlayEncodeOptions,
     getInlayAssetRenderUrl,
     listInlayAssets,
     listInlayAssetMetadata,
@@ -17,6 +18,7 @@ import {
     writeInlayImage,
 } from '../inlays'
 import { createBackedBlobStore } from 'src/ts/storage/platformBlobStore'
+import { getDatabase } from 'src/ts/storage/database.svelte'
 
 //#region module mocks
 
@@ -25,6 +27,7 @@ const fakeCtx = {
     drawImage: vi.fn(),
 }
 let canvasOutputMime = 'image/webp'
+let canvasEncodeArgs: [string, number | undefined] | undefined
 let loadedImageWidth = 100
 let loadedImageHeight = 100
 const origCreateElement = document.createElement.bind(document)
@@ -32,7 +35,8 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
     const el = origCreateElement(tag, options)
     if (tag === 'canvas') {
         ;(el as HTMLCanvasElement).getContext = (() => fakeCtx) as any
-        ;(el as HTMLCanvasElement).toBlob = ((cb: BlobCallback) => {
+        ;(el as HTMLCanvasElement).toBlob = ((cb: BlobCallback, mime?: string, quality?: number) => {
+            canvasEncodeArgs = [mime ?? '', quality]
             cb(new Blob(['fake-image'], { type: canvasOutputMime }))
         }) as any
     }
@@ -161,6 +165,7 @@ beforeEach(() => {
     legacyReads = 0
     legacyKeyLists = 0
     canvasOutputMime = 'image/webp'
+    canvasEncodeArgs = undefined
     loadedImageWidth = 100
     loadedImageHeight = 100
     vi.stubGlobal('fetch', vi.fn(async () => new Response(
@@ -176,9 +181,121 @@ beforeEach(() => {
         onerror: (() => void) | null = null
         set src(_value: string) { queueMicrotask(() => this.onload?.()) }
     })
+    vi.mocked(getDatabase).mockReturnValue({} as any)
 })
 
 describe('setInlayAsset', () => {
+    test('normalizes absent and malformed configured options at the encoding boundary', () => {
+        expect(getInlayEncodeOptions()).toEqual({
+            format: 'webp', quality: 85, maxDimension: 0, skipReencode: false,
+        })
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'invalid', risunestInlayWebpQuality: 140.6,
+            risunestInlayMaxDimension: -4.4, risunestInlaySkipReencode: 'yes',
+        } as any)
+        expect(getInlayEncodeOptions()).toEqual({
+            format: 'webp', quality: 100, maxDimension: 0, skipReencode: false,
+        })
+    })
+
+    test('encodes configured browser PNG with PNG metadata', async () => {
+        canvasOutputMime = 'image/png'
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'png', risunestInlayWebpQuality: 17,
+            risunestInlayMaxDimension: 0, risunestInlaySkipReencode: false,
+        } as any)
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:configured-png')
+
+        await setInlayAsset('configured-png', {
+            data: new Blob([Uint8Array.of(1)], { type: 'image/png' }),
+            ext: 'png', name: 'source.png', type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob('configured-png')
+        expect(stored).toMatchObject({ ext: 'png', height: 100, width: 100 })
+        expect(stored!.data.type).toBe('image/png')
+        expect(canvasEncodeArgs).toEqual(['image/png', 0.17])
+    })
+
+    test.each([
+        ['png', Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a), 'image/png', 'png'],
+        ['jpeg', Uint8Array.of(0xff, 0xd8, 0xff, 0xe0), 'image/jpeg', 'jpg'],
+        ['webp', new TextEncoder().encode('RIFF\x04\0\0\0WEBPVP8 '), 'image/webp', 'webp'],
+    ] as const)('preserves configured browser original %s bytes and canonical metadata', async (label, source, mime, ext) => {
+        vi.mocked(getDatabase).mockReturnValue({ risunestInlayFormat: 'original' } as any)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(source, { headers: { 'Content-Type': mime } })))
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue(`blob:original-${label}`)
+
+        await setInlayAsset(`original-${label}`, {
+            data: new Blob([source], { type: mime }), ext, name: `source.${ext}`, type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob(`original-${label}`)
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(source)
+        expect(stored).toMatchObject({ ext, height: 100, width: 100 })
+        expect(stored!.data.type).toBe(mime)
+        expect(canvasEncodeArgs).toBeUndefined()
+    })
+
+    test('forwards configured WebP quality to canvas encoding', async () => {
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'webp', risunestInlayWebpQuality: 42,
+            risunestInlayMaxDimension: 0, risunestInlaySkipReencode: false,
+        } as any)
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:quality-webp')
+
+        await setInlayAsset('quality-webp', {
+            data: new Blob([Uint8Array.of(1)], { type: 'image/png' }),
+            ext: 'png', name: 'source.png', type: 'image',
+        })
+
+        expect(canvasEncodeArgs).toEqual(['image/webp', 0.42])
+    })
+
+    test('preserves static WebP bytes when skip re-encode is enabled without a resize', async () => {
+        const source = new TextEncoder().encode('RIFF\x04\0\0\0WEBPVP8 ')
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'webp', risunestInlayWebpQuality: 85,
+            risunestInlayMaxDimension: 0, risunestInlaySkipReencode: true,
+        } as any)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(source, {
+            headers: { 'Content-Type': 'image/webp' },
+        })))
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:source-webp')
+
+        await setInlayAsset('source-webp', {
+            data: new Blob([source], { type: 'image/webp' }),
+            ext: 'webp', name: 'source.webp', type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob('source-webp')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(source)
+        expect(stored).toMatchObject({ ext: 'webp', height: 100, width: 100 })
+        expect(stored!.data.type).toBe('image/webp')
+    })
+
+    test('re-encodes skipped WebP when the configured long side requires resizing', async () => {
+        const source = new TextEncoder().encode('RIFF\x04\0\0\0WEBPVP8 ')
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'webp', risunestInlayWebpQuality: 42,
+            risunestInlayMaxDimension: 50, risunestInlaySkipReencode: true,
+        } as any)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(source, {
+            headers: { 'Content-Type': 'image/webp' },
+        })))
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:resized-webp')
+
+        await setInlayAsset('resized-webp', {
+            data: new Blob([source], { type: 'image/webp' }),
+            ext: 'webp', name: 'source.webp', type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob('resized-webp')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).not.toEqual(source)
+        expect(stored).toMatchObject({ ext: 'webp', height: 50, width: 50 })
+        expect(fakeCtx.drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 50, 50)
+    })
+
     test('optimizes direct browser image writes at decoded natural dimensions', async () => {
         vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:direct-image')
         const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')

@@ -1,6 +1,7 @@
 use crate::asset_repository::PayloadCas;
 use crate::trust_boundary::{is_lower_hex_byte, sync_directory};
 use image::codecs::png::PngDecoder;
+use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,34 @@ pub(crate) struct InlayImageMetadata {
 pub(crate) struct EncodedInlayImage {
     data: Vec<u8>,
     metadata: InlayImageMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InlayEncodeOptions {
+    format: InlayEncodeFormat,
+    quality: u8,
+    max_dimension: u32,
+    skip_reencode: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InlayEncodeFormat {
+    Webp,
+    Png,
+    Original,
+}
+
+impl Default for InlayEncodeOptions {
+    fn default() -> Self {
+        Self {
+            format: InlayEncodeFormat::Webp,
+            quality: 85,
+            max_dimension: 0,
+            skip_reencode: false,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -782,7 +811,24 @@ pub(crate) fn write_inlay_image(
     data: &[u8],
     name: &str,
 ) -> Result<InlayImageMetadata, String> {
-    write_inlay_image_with_suffix(root, id, data, name, uuid::Uuid::new_v4().to_string())
+    write_inlay_image_with_options(root, id, data, name, None)
+}
+
+fn write_inlay_image_with_options(
+    root: &Path,
+    id: &str,
+    data: &[u8],
+    name: &str,
+    options: Option<InlayEncodeOptions>,
+) -> Result<InlayImageMetadata, String> {
+    write_inlay_image_with_suffix(
+        root,
+        id,
+        data,
+        name,
+        options,
+        uuid::Uuid::new_v4().to_string(),
+    )
 }
 
 fn write_inlay_image_with_suffix(
@@ -790,12 +836,13 @@ fn write_inlay_image_with_suffix(
     id: &str,
     data: &[u8],
     name: &str,
+    options: Option<InlayEncodeOptions>,
     suffix: String,
 ) -> Result<InlayImageMetadata, String> {
     let EncodedInlayImage {
         data: encoded,
         metadata,
-    } = encode_inlay_image(id, data, name)?;
+    } = encode_inlay_image(id, data, name, options)?;
     let metadata_bytes = serde_json::to_vec(&metadata)
         .map_err(|error| format!("failed to encode Inlay metadata: {error}"))?;
     let encoded_id = hex::encode(id.as_bytes());
@@ -886,7 +933,12 @@ fn write_inlay_image_with_suffix(
     Ok(metadata)
 }
 
-fn encode_inlay_image(id: &str, data: &[u8], name: &str) -> Result<EncodedInlayImage, String> {
+fn encode_inlay_image(
+    id: &str,
+    data: &[u8],
+    name: &str,
+    options: Option<InlayEncodeOptions>,
+) -> Result<EncodedInlayImage, String> {
     if id.is_empty() || id.starts_with("assets/") {
         return Err("invalid Inlay image id".to_owned());
     }
@@ -922,17 +974,70 @@ fn encode_inlay_image(id: &str, data: &[u8], name: &str) -> Result<EncodedInlayI
     let mut decoded = DynamicImage::from_decoder(decoder)
         .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
     decoded.apply_orientation(orientation);
+    let options = options.unwrap_or_default();
+    let width = decoded.width();
+    let height = decoded.height();
+    if options.format == InlayEncodeFormat::Original {
+        let (mime, ext) = match format {
+            ImageFormat::Png => ("image/png", "png"),
+            ImageFormat::Jpeg => ("image/jpeg", "jpg"),
+            ImageFormat::WebP => ("image/webp", "webp"),
+            _ => unreachable!(),
+        };
+        return Ok(EncodedInlayImage {
+            data: data.to_vec(),
+            metadata: InlayImageMetadata {
+                key: id.to_owned(),
+                kind: "inlay".to_owned(),
+                size: data.len() as u64,
+                mime: mime.to_owned(),
+                name: name.to_owned(),
+                ext: ext.to_owned(),
+                inlay_type: "image".to_owned(),
+                width,
+                height,
+            },
+        });
+    }
+    let needs_resize = options.max_dimension > 0 && width.max(height) > options.max_dimension;
+    if needs_resize {
+        let scale = options.max_dimension as f64 / width.max(height) as f64;
+        decoded = decoded.resize(
+            (width as f64 * scale).round().max(1.0) as u32,
+            (height as f64 * scale).round().max(1.0) as u32,
+            FilterType::Lanczos3,
+        );
+    }
     let rgba = decoded.to_rgba8();
-    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-        .encode(85.0)
-        .to_vec();
+    let (encoded, mime, ext) = match options.format {
+        InlayEncodeFormat::Original => unreachable!(),
+        InlayEncodeFormat::Png => {
+            let mut value = Vec::new();
+            DynamicImage::ImageRgba8(rgba.clone())
+                .write_to(&mut Cursor::new(&mut value), ImageFormat::Png)
+                .map_err(|error| format!("failed to encode PNG Inlay image: {error}"))?;
+            (value, "image/png", "png")
+        }
+        InlayEncodeFormat::Webp
+            if options.skip_reencode && format == ImageFormat::WebP && !needs_resize =>
+        {
+            (data.to_vec(), "image/webp", "webp")
+        }
+        InlayEncodeFormat::Webp => (
+            webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                .encode(options.quality as f32)
+                .to_vec(),
+            "image/webp",
+            "webp",
+        ),
+    };
     let metadata = InlayImageMetadata {
         key: id.to_owned(),
         kind: "inlay".to_owned(),
         size: encoded.len() as u64,
-        mime: "image/webp".to_owned(),
+        mime: mime.to_owned(),
         name: name.to_owned(),
-        ext: "webp".to_owned(),
+        ext: ext.to_owned(),
         inlay_type: "image".to_owned(),
         width: rgba.width(),
         height: rgba.height(),
@@ -948,8 +1053,9 @@ pub(crate) async fn native_media_encode_inlay_image(
     id: String,
     data: Vec<u8>,
     name: String,
+    options: Option<InlayEncodeOptions>,
 ) -> Result<EncodedInlayImage, String> {
-    tauri::async_runtime::spawn_blocking(move || encode_inlay_image(&id, &data, &name))
+    tauri::async_runtime::spawn_blocking(move || encode_inlay_image(&id, &data, &name, options))
         .await
         .map_err(|error| format!("failed to join native Inlay image encoder: {error}"))?
 }
@@ -960,14 +1066,17 @@ pub(crate) async fn native_media_write_inlay_image(
     id: String,
     data: Vec<u8>,
     name: String,
+    options: Option<InlayEncodeOptions>,
 ) -> Result<InlayImageMetadata, String> {
     let root = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("failed to resolve application data directory: {error}"))?;
-    tauri::async_runtime::spawn_blocking(move || write_inlay_image(&root, &id, &data, &name))
-        .await
-        .map_err(|error| format!("failed to join native Inlay image writer: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        write_inlay_image_with_options(&root, &id, &data, &name, options)
+    })
+    .await
+    .map_err(|error| format!("failed to join native Inlay image writer: {error}"))?
 }
 
 fn parse_range(value: Option<&HeaderValue>, size: u64) -> Option<RequestedRange> {

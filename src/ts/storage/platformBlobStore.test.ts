@@ -95,7 +95,7 @@ describe('platform BlobStore', () => {
         ])
     })
 
-    test('Tauri new Inlay image writes invoke the native encoder with owned bytes', async () => {
+    test('Tauri new Inlay image writes invoke the native encoder with owned bytes and options', async () => {
         const { backend } = memoryBackend()
         const metadata = {
             key: 'image-id', kind: 'inlay' as const, size: 7, mime: 'image/webp',
@@ -105,12 +105,15 @@ describe('platform BlobStore', () => {
         const store = createTauriBlobStore(backend, invoke)
         const source = Uint8Array.of(1, 2, 3)
 
-        const pending = store.putNewInlayImage!('image-id', source, { name: 'source.png' })
+        const pending = store.putNewInlayImage!('image-id', source, {
+            name: 'source.png', options: { format: 'original', quality: 85, maxDimension: 0, skipReencode: false },
+        })
         source[0] = 9
 
         await expect(pending).resolves.toEqual(metadata)
         expect(invoke).toHaveBeenCalledWith('native_media_write_inlay_image', {
             id: 'image-id', data: [1, 2, 3], name: 'source.png',
+            options: { format: 'original', quality: 85, maxDimension: 0, skipReencode: false },
         })
     })
 
