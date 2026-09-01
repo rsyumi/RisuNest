@@ -1594,9 +1594,21 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
             CasJobKind::LogicalDeltaTarget,
         )
         .map_err(|error| error.to_string())?;
-        let mut client =
-            LanLogicalDeltaClient::claim_p4(&endpoint, &session_id, &manifest_id, &claim)
-                .map_err(|error| error.to_string())?;
+        let mut client = match LanLogicalDeltaClient::claim_v2_and_register(
+            &app_root,
+            super::device_registry::platform_device_name(),
+            &endpoint,
+            &session_id,
+            &manifest_id,
+            &claim,
+        ) {
+            Ok(client) => client,
+            Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
+                LanLogicalDeltaClient::claim_p4(&endpoint, &session_id, &manifest_id, &claim)
+                    .map_err(|error| error.to_string())?
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let source_device_id = client.source_device_id().to_owned();
         let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {

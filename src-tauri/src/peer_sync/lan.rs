@@ -248,6 +248,31 @@ impl LanCloneClient {
         Ok(client)
     }
 
+    pub(crate) fn claim_v2_and_persist_and_register(
+        app_root: &Path,
+        target_name: &str,
+        credential_path: &Path,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        validate_object_hash(manifest_id)?;
+        validate_device_name(target_name)?;
+        let target_device_id = load_or_create_device_id(app_root)?;
+        let mut client = Self::claim_v2_with_device(
+            endpoint,
+            session_id,
+            claim,
+            &target_device_id,
+            target_name,
+        )?;
+        client.manifest_id = Some(manifest_id.to_owned());
+        client.persist(credential_path)?;
+        client.register_incoming_source(app_root)?;
+        Ok(client)
+    }
+
     pub fn open_persisted(credential_path: &Path) -> Result<Self, PeerSyncError> {
         let metadata = fs::symlink_metadata(credential_path)?;
         if !metadata.is_file()
@@ -271,6 +296,107 @@ impl LanCloneClient {
             .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
         persisted.validate()?;
         Self::from_persisted(persisted)
+    }
+
+    pub(crate) fn try_migrate_persisted_credential(
+        &self,
+        app_root: &Path,
+    ) -> Result<bool, PeerSyncError> {
+        match self.register_incoming_source(app_root) {
+            Ok(()) => Ok(true),
+            Err(PeerSyncError::Transport(_) | PeerSyncError::Protocol(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn claim_v2_with_device(
+        endpoint: &str,
+        session_id: &str,
+        claim: &str,
+        device_id: &str,
+        device_name: &str,
+    ) -> Result<Self, PeerSyncError> {
+        if endpoint.len() > MAX_URL_BYTES
+            || !is_canonical_uuid(session_id)
+            || !is_lower_hex_256(claim)
+            || !is_canonical_uuid(device_id)
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid LAN pairing data".to_owned(),
+            ));
+        }
+        validate_device_name(device_name)?;
+        let endpoint = validate_lan_endpoint(endpoint)?;
+        let session_url = format!("{endpoint}/v1/sessions/{session_id}");
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "LAN session URL is too long".to_owned(),
+            ));
+        }
+        let client = build_clone_http_client(CONTROL_REQUEST_TIMEOUT)?;
+        let response = client
+            .post(format!("{session_url}/claim"))
+            .json(&ClaimRequest {
+                claim: claim.to_owned(),
+                device_id: Some(device_id.to_owned()),
+                protocol_version: Some(2),
+                device_name: Some(device_name.to_owned()),
+                permissions: None,
+            })
+            .timeout(CONTROL_REQUEST_TIMEOUT)
+            .send()
+            .map_err(transport)?;
+        let response = read_claim_response(response, "LAN")?;
+        let source_device_id = response.source_device_id.ok_or_else(|| {
+            PeerSyncError::Protocol("v2 source device identity is missing".to_owned())
+        })?;
+        let source_name = response.source_device_name.ok_or_else(|| {
+            PeerSyncError::Protocol("v2 source device name is missing".to_owned())
+        })?;
+        let _permissions =
+            DevicePermissions::from_values(response.permissions.ok_or_else(|| {
+                PeerSyncError::Protocol("v2 permissions are missing".to_owned())
+            })?)?;
+        if response.device_id != device_id
+            || !is_canonical_uuid(&source_device_id)
+            || validate_device_name(&source_name).is_err()
+            || !is_lower_hex_256(&response.bearer)
+            || response.permission != "clone-read"
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid LAN v2 claim response".to_owned(),
+            ));
+        }
+        Ok(Self {
+            client,
+            ranges: HttpRangeStream::new(Duration::from_secs(3))?,
+            control_timeout: CONTROL_REQUEST_TIMEOUT,
+            endpoint,
+            session_id: session_id.to_owned(),
+            session_url,
+            device_id: response.device_id,
+            bearer: response.bearer,
+            manifest_id: None,
+        })
+    }
+
+    fn register_incoming_source(&self, app_root: &Path) -> Result<(), PeerSyncError> {
+        let hello = self.hello()?;
+        let mut registry = IncomingSourceRegistry::load(app_root)?;
+        registry.upsert(IncomingSource {
+            device_id: hello.device_id,
+            name: hello.name,
+            endpoint: self.endpoint.clone(),
+            bearer: self.bearer.clone(),
+            permissions: hello.permissions,
+            last_seen_ms: now_ms() as u64,
+            total_bytes: 0,
+        })?;
+        registry.save()
+    }
+
+    pub(crate) fn hello(&self) -> Result<PeerHello, PeerSyncError> {
+        authenticated_peer_hello(&self.endpoint, &self.bearer)
     }
 
     pub(super) fn into_resumable_parts(
@@ -2190,6 +2316,128 @@ struct ClaimResponseOwned {
     permissions: Option<Vec<String>>,
 }
 
+fn build_clone_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, PeerSyncError> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(transport)
+}
+
+fn read_claim_response(
+    response: reqwest::blocking::Response,
+    lane: &str,
+) -> Result<ClaimResponseOwned, PeerSyncError> {
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(PeerSyncError::Transport(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(transport)?;
+    if body.len() > MAX_CLAIM_RESPONSE_BYTES {
+        return Err(PeerSyncError::Protocol(format!(
+            "{lane} claim response is too large"
+        )));
+    }
+    serde_json::from_slice(&body).map_err(|error| PeerSyncError::Protocol(error.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerHello {
+    pub(crate) device_id: String,
+    pub(crate) name: String,
+    pub(crate) permissions: DevicePermissions,
+    pub(crate) lanes: PeerHelloLanes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PeerHelloLane {
+    pub(crate) session_id: String,
+    pub(crate) manifest_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PeerHelloLanes {
+    pub(crate) clone: Option<PeerHelloLane>,
+    pub(crate) delta: Option<PeerHelloLane>,
+    pub(crate) bidirectional: Option<PeerHelloLane>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerHelloResponse {
+    device_id: String,
+    name: String,
+    permissions: Vec<String>,
+    lanes: PeerHelloLanes,
+}
+
+pub(crate) fn authenticated_peer_hello(
+    endpoint: &str,
+    bearer: &str,
+) -> Result<PeerHello, PeerSyncError> {
+    let endpoint = validate_lan_endpoint(endpoint)?;
+    if !is_lower_hex_256(bearer) {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer hello credential".to_owned(),
+        ));
+    }
+    let response = build_clone_http_client(CONTROL_REQUEST_TIMEOUT)?
+        .get(format!("{endpoint}/v1/peer/hello"))
+        .bearer_auth(bearer)
+        .send()
+        .map_err(transport)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(PeerSyncError::Transport(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(transport)?;
+    if body.len() > MAX_CLAIM_RESPONSE_BYTES {
+        return Err(PeerSyncError::Protocol(
+            "peer hello response is too large".to_owned(),
+        ));
+    }
+    let response: PeerHelloResponse = serde_json::from_slice(&body)
+        .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+    let permissions = DevicePermissions::from_values(response.permissions)?;
+    if !is_canonical_uuid(&response.device_id)
+        || validate_device_name(&response.name).is_err()
+        || !valid_hello_lanes(&response.lanes)
+    {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer hello response".to_owned(),
+        ));
+    }
+    Ok(PeerHello {
+        device_id: response.device_id,
+        name: response.name,
+        permissions,
+        lanes: response.lanes,
+    })
+}
+
+fn valid_hello_lanes(lanes: &PeerHelloLanes) -> bool {
+    [&lanes.clone, &lanes.delta, &lanes.bidirectional]
+        .into_iter()
+        .flatten()
+        .all(|lane| is_canonical_uuid(&lane.session_id) && is_lower_hex_256(&lane.manifest_id))
+}
+
 #[cfg(any(desktop, target_os = "android"))]
 fn validate_device_name(value: &str) -> Result<(), PeerSyncError> {
     if value.is_empty() || value.len() > 256 {
@@ -2624,6 +2872,22 @@ fn quoted(value: &str) -> String {
 }
 fn transport(error: impl std::fmt::Display) -> PeerSyncError {
     PeerSyncError::Transport(error.to_string())
+}
+
+pub(crate) fn v2_claim_is_unsupported(error: &PeerSyncError) -> bool {
+    matches!(
+        error,
+        PeerSyncError::Transport(status) if status == "HTTP 400"
+    ) || matches!(
+        error,
+        PeerSyncError::Protocol(message)
+            if matches!(
+                message.as_str(),
+                "v2 source device identity is missing"
+                    | "v2 source device name is missing"
+                    | "v2 permissions are missing"
+            )
+    )
 }
 #[cfg(any(desktop, target_os = "android"))]
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -3660,6 +3924,127 @@ mod timeout_tests {
     }
 
     #[test]
+    fn v2_bidirectional_claim_registers_the_stable_source_and_granted_permissions() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000095",
+                &source_id,
+                control,
+            ));
+        host.enable_v2_registry(
+            source_root.path(),
+            "Windows",
+            DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+        assert_eq!(client.source_device_id(), source_id);
+        let hello = client.hello().unwrap();
+        assert_eq!(hello.device_id, source_id);
+        assert!(hello.permissions.allows_bidirectional());
+        assert_eq!(
+            hello.lanes.bidirectional.as_ref().unwrap().session_id,
+            pairing.session_id
+        );
+        assert!(!format!("{hello:?}").contains(&client.credential().bearer));
+        let incoming = IncomingSourceRegistry::load(target_root.path()).unwrap();
+        assert_eq!(incoming.sources().len(), 1);
+        assert_eq!(incoming.sources()[0].name, "Windows");
+        assert!(incoming.sources()[0].permissions.allows_bidirectional());
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn legacy_clone_credential_migrates_only_after_authenticated_hello_and_keeps_bytes() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000096",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let claimed = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        fs::remove_file(target_root.path().join("peer-sync/sources.json")).unwrap();
+        let credential_path = target_root.path().join("legacy-credential.json");
+        let credential_bytes = b"legacy credential bytes";
+        fs::write(&credential_path, credential_bytes).unwrap();
+        let legacy = LanCloneClient {
+            client: build_clone_http_client(CONTROL_REQUEST_TIMEOUT).unwrap(),
+            ranges: HttpRangeStream::new(Duration::from_secs(1)).unwrap(),
+            control_timeout: CONTROL_REQUEST_TIMEOUT,
+            endpoint,
+            session_id: pairing.session_id,
+            session_url: String::new(),
+            device_id: claimed.device_id,
+            bearer: claimed.bearer,
+            manifest_id: None,
+        };
+
+        assert!(legacy
+            .try_migrate_persisted_credential(target_root.path())
+            .unwrap());
+        assert_eq!(fs::read(&credential_path).unwrap(), credential_bytes);
+        let incoming = IncomingSourceRegistry::load(target_root.path()).unwrap();
+        assert_eq!(incoming.sources().len(), 1);
+        assert_eq!(incoming.sources()[0].device_id, source_id);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn failed_legacy_credential_migration_leaves_credential_and_registry_unchanged() {
+        let target_root = tempfile::tempdir().unwrap();
+        let credential_path = target_root.path().join("legacy-credential.json");
+        let credential_bytes = b"legacy credential bytes";
+        fs::write(&credential_path, credential_bytes).unwrap();
+        let legacy = direct_client(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+
+        assert!(!legacy
+            .try_migrate_persisted_credential(target_root.path())
+            .unwrap());
+        assert_eq!(fs::read(&credential_path).unwrap(), credential_bytes);
+        assert!(IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()
+            .is_empty());
+    }
+
+    #[test]
     fn invalid_v2_claim_fields_do_not_consume_the_one_use_claim() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -4156,6 +4541,35 @@ impl LanLogicalDeltaClient {
         manifest_id: &str,
         claim: &str,
     ) -> Result<Self, PeerSyncError> {
+        Self::claim_v2_and_register_with_permission(
+            app_root,
+            target_name,
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            "logical-read",
+        )
+    }
+
+    pub(crate) fn hello(&self) -> Result<PeerHello, PeerSyncError> {
+        let endpoint = self
+            .session_url
+            .split("/v1/sessions/")
+            .next()
+            .ok_or_else(|| PeerSyncError::Protocol("invalid logical session URL".to_owned()))?;
+        authenticated_peer_hello(endpoint, &self.bearer)
+    }
+
+    fn claim_v2_and_register_with_permission(
+        app_root: &Path,
+        target_name: &str,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        expected_permission: &str,
+    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
@@ -4166,7 +4580,7 @@ impl LanLogicalDeltaClient {
             ));
         }
         validate_device_name(target_name)?;
-        let endpoint = validate_private_lan_endpoint(endpoint)?;
+        let endpoint = validate_p4_logical_delta_endpoint(endpoint)?;
         let target_device_id = load_or_create_device_id(app_root)?;
         let session_url = format!("{endpoint}/v1/sessions/{session_id}");
         if session_url.len() > MAX_URL_BYTES {
@@ -4224,7 +4638,7 @@ impl LanLogicalDeltaClient {
             || !is_canonical_uuid(&source_device_id)
             || validate_device_name(&source_name).is_err()
             || !is_lower_hex_256(&response.bearer)
-            || response.permission != "logical-read"
+            || response.permission != expected_permission
         {
             return Err(PeerSyncError::Protocol(
                 "invalid logical delta v2 claim response".to_owned(),
@@ -4586,6 +5000,35 @@ pub(crate) struct LanBidirectionalLogicalClient {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanBidirectionalLogicalClient {
+    pub(crate) fn claim_v2_and_register(
+        app_root: &Path,
+        target_name: &str,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let inner = LanLogicalDeltaClient::claim_v2_and_register_with_permission(
+            app_root,
+            target_name,
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            "logical-bidirectional",
+        )?;
+        Ok(Self {
+            remote_apply_client: build_bidirectional_remote_apply_client()?,
+            endpoint: validate_p5_desktop_endpoint(endpoint)?,
+            session_id: session_id.to_owned(),
+            inner,
+        })
+    }
+
+    pub(crate) fn hello(&self) -> Result<PeerHello, PeerSyncError> {
+        authenticated_peer_hello(&self.endpoint, &self.inner.bearer)
+    }
+
     // Android targets claim over trusted-LAN endpoints.
     #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn claim(

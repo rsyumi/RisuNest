@@ -1003,6 +1003,9 @@ impl PeerCloneCommandState {
             session_id: session_id.to_owned(),
             manifest_id: manifest_id.to_owned(),
         };
+        let app_root = peer_root.parent().ok_or_else(|| {
+            PeerSyncError::Storage("peer clone target root has no app root".to_owned())
+        })?;
         let paths = target_paths(peer_root, &request)?;
         let rotate_credential = {
             let mut runtime = self.lock_runtime()?;
@@ -1060,17 +1063,17 @@ impl PeerCloneCommandState {
 
         let claimed = (|| {
             let lan = if rotate_credential {
-                LanCloneClient::claim_and_persist(
+                match LanCloneClient::claim_v2_and_persist_and_register(
+                    app_root,
+                    super::device_registry::platform_device_name(),
                     &paths.credential,
                     endpoint,
                     session_id,
                     manifest_id,
                     claim,
-                )?
-            } else {
-                match fs::symlink_metadata(&paths.credential) {
-                    Ok(_) => LanCloneClient::open_persisted(&paths.credential)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ) {
+                    Ok(client) => client,
+                    Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
                         LanCloneClient::claim_and_persist(
                             &paths.credential,
                             endpoint,
@@ -1078,6 +1081,38 @@ impl PeerCloneCommandState {
                             manifest_id,
                             claim,
                         )?
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                match fs::symlink_metadata(&paths.credential) {
+                    Ok(_) => {
+                        let lan = LanCloneClient::open_persisted(&paths.credential)?;
+                        let _ = lan.try_migrate_persisted_credential(app_root)?;
+                        lan
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match LanCloneClient::claim_v2_and_persist_and_register(
+                            app_root,
+                            super::device_registry::platform_device_name(),
+                            &paths.credential,
+                            endpoint,
+                            session_id,
+                            manifest_id,
+                            claim,
+                        ) {
+                            Ok(client) => client,
+                            Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
+                                LanCloneClient::claim_and_persist(
+                                    &paths.credential,
+                                    endpoint,
+                                    session_id,
+                                    manifest_id,
+                                    claim,
+                                )?
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -2860,6 +2895,13 @@ mod tests {
         assert_eq!(prepared.phase, PeerCloneSourcePhase::Prepared);
         assert!(prepared.pairing_uri.is_none());
         assert!(source.source_bind_address().unwrap().is_none());
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
 
         let running = source
             .start_source(
@@ -2891,6 +2933,15 @@ mod tests {
                 &pairing.claim,
             )
             .unwrap();
+        let incoming =
+            super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
+                .unwrap();
+        assert_eq!(incoming.sources().len(), 1);
+        assert_eq!(incoming.sources()[0].name, "Windows");
+        assert_eq!(
+            incoming.sources()[0].device_id,
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap()
+        );
         PeerCloneCommandState::default()
             .claim_target(
                 &target_root.path().join("peer-sync"),

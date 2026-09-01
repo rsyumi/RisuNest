@@ -5619,31 +5619,45 @@ fn open_command_store(app: &AppHandle) -> Result<PersistentStore, PeerSyncError>
 }
 
 fn claim_bidirectional_client(
+    app_root: &Path,
     endpoint: &str,
     session_id: &str,
     manifest_id: &str,
     claim: &str,
     device_id: &str,
 ) -> Result<LanBidirectionalLogicalClient, PeerSyncError> {
-    #[cfg(desktop)]
-    {
-        LanBidirectionalLogicalClient::claim_p5_desktop(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            device_id,
-        )
-    }
-    #[cfg(target_os = "android")]
-    {
-        LanBidirectionalLogicalClient::claim_p5_android(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            device_id,
-        )
+    match LanBidirectionalLogicalClient::claim_v2_and_register(
+        app_root,
+        super::device_registry::platform_device_name(),
+        endpoint,
+        session_id,
+        manifest_id,
+        claim,
+    ) {
+        Ok(client) => Ok(client),
+        Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
+            #[cfg(desktop)]
+            {
+                LanBidirectionalLogicalClient::claim_p5_desktop(
+                    endpoint,
+                    session_id,
+                    manifest_id,
+                    claim,
+                    device_id,
+                )
+            }
+            #[cfg(target_os = "android")]
+            {
+                LanBidirectionalLogicalClient::claim_p5_android(
+                    endpoint,
+                    session_id,
+                    manifest_id,
+                    claim,
+                    device_id,
+                )
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -6301,6 +6315,7 @@ pub async fn peer_bidirectional_sync(
                         );
                     }
                     let mut client = claim_bidirectional_client(
+                        &root,
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -6349,6 +6364,7 @@ pub async fn peer_bidirectional_sync(
                         );
                     }
                     let client = claim_bidirectional_client(
+                        &root,
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -6387,6 +6403,7 @@ pub async fn peer_bidirectional_sync(
                         );
                     }
                     let client = claim_bidirectional_client(
+                        &root,
                         &endpoint,
                         &session_id,
                         &manifest_id,
@@ -6426,6 +6443,7 @@ pub async fn peer_bidirectional_sync(
         )
         .map_err(|error| error.to_string())?;
         let mut client = claim_bidirectional_client(
+            &root,
             &endpoint,
             &session_id,
             &manifest_id,
@@ -6656,6 +6674,7 @@ pub async fn peer_bidirectional_resolve_with_link(
             );
         }
         let mut client = claim_bidirectional_client(
+            &root,
             &endpoint,
             &session_id,
             &manifest_id,
