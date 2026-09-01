@@ -58,6 +58,7 @@ import {
     createConversationSummaryStubFromChat,
     isConversationSummaryStub,
 } from './conversationResidency'
+import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
@@ -99,6 +100,11 @@ export function publishPersistentConversationReplacementToWorkingSet(
         (candidate) => candidate.id === result.conversationId,
     )
     if (index < 0) return
+    // A metadata-only selected-conversation shell is owned by the windowed
+    // authority; swapping it for a full clone would defeat eviction and
+    // desynchronize the windowed baseline. Rehydration picks up the durable
+    // replacement instead.
+    if (isMetadataOnlySelectedConversation(character.chats[index])) return
     character.chats[index] = isConversationSummaryStub(character.chats[index])
         ? createConversationSummaryStubFromChat(
             result.characterId,

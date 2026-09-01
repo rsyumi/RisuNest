@@ -20,6 +20,7 @@ import {
 } from './conversationResidency'
 import { removeGroupMemberReferences } from './groupMembership'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
+import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
     ActiveConversationMutationEvent,
@@ -1476,6 +1477,16 @@ export class SaveCoordinator {
                 options.expectedRevision !== this.revision
             ) throw new RevisionConflictError(options.expectedRevision, this.revision)
 
+            const authority = this.dependencies.captureSelectedConversationAuthority?.() ?? null
+            if (
+                authority !== null &&
+                authority.characterId === characterId &&
+                authority.conversationId === conversationId
+            ) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'windowed selected conversation replacement requires session coordination',
+                )
+            }
             const mutationGeneration = this.dirtyGeneration
             const residentBefore = this.captureResidentConversation(characterId, conversationId)
             const summaryBefore = residentBefore === null &&
@@ -2420,7 +2431,9 @@ export class SaveCoordinator {
         const conversation = character?.chats.find((candidate) =>
             candidate.id === conversationId && !isConversationSummaryStub(candidate),
         )
-        if (!conversation || isConversationSummaryStub(conversation)) return null
+        // Metadata-only shells hold no messages (their message getter throws),
+        // so they must not be treated as a resident complete conversation.
+        if (!conversation || isMetadataOnlySelectedConversation(conversation)) return null
         const canonical = canonicalJson(conversation)
         return {
             conversation: JSON.parse(canonical) as Chat,
@@ -2707,29 +2720,35 @@ export class SaveCoordinator {
                 this.pendingResidentConversationCompensations.shift()
                 continue
             }
-            const durable = await this.dependencies.store.readConversation(
-                pending.characterId,
-                pending.conversationId,
-            )
-            if (!durable) {
-                this.pendingResidentConversationCompensations.shift()
-                continue
+            let committed: { revision: DataRevision }
+            try {
+                const durable = await this.dependencies.store.readConversation(
+                    pending.characterId,
+                    pending.conversationId,
+                )
+                if (!durable) {
+                    this.pendingResidentConversationCompensations.shift()
+                    continue
+                }
+                this.assertReadRevision(this.revision, durable.revision)
+                const candidate = canonicalClone(resident.conversation)
+                const { message, ...conversation } = candidate
+                committed = await this.dependencies.store.commit({
+                    expectedRevision: this.revision,
+                    conversations: [{
+                        type: 'replace-range',
+                        characterId: pending.characterId,
+                        conversationId: pending.conversationId,
+                        start: 0,
+                        deleteCount: durable.value.message.length,
+                        messages: message,
+                        conversation,
+                    }],
+                })
+            } catch (error) {
+                this.armDebounce()
+                throw error
             }
-            this.assertReadRevision(this.revision, durable.revision)
-            const candidate = canonicalClone(resident.conversation)
-            const { message, ...conversation } = candidate
-            const committed = await this.dependencies.store.commit({
-                expectedRevision: this.revision,
-                conversations: [{
-                    type: 'replace-range',
-                    characterId: pending.characterId,
-                    conversationId: pending.conversationId,
-                    start: 0,
-                    deleteCount: durable.value.message.length,
-                    messages: message,
-                    conversation,
-                }],
-            })
             this.currentRevision = committed.revision
             this.dependencies.onLocalRevision?.(committed.revision)
             if (this.dependencies.officialPublisher) {
