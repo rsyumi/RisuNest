@@ -191,6 +191,34 @@ fn one_listener_routes_all_lanes_and_hello_returns_exact_descriptors() {
             reqwest::StatusCode::OK
         );
     }
+    let manifest: serde_json::Value = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}/manifest",
+            pairing.endpoint, pairing.session_id
+        ))
+        .bearer_auth(&bearer)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let object = manifest["objects"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    assert_eq!(
+        reqwest::blocking::Client::new()
+            .head(format!(
+                "{}/v1/sessions/{}/objects/{object}",
+                pairing.endpoint, pairing.session_id
+            ))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
     assert_eq!(
         reqwest::blocking::Client::new()
             .post(format!(
@@ -208,17 +236,18 @@ fn one_listener_routes_all_lanes_and_hello_returns_exact_descriptors() {
 
 #[test]
 fn fixed_port_rejects_zero_and_rotation_invalidates_only_pending_claim() {
-    let (_root, mut host) = host();
-    assert!(host.start_fixed_loopback(0).is_err());
-    let pairing = host.start_fixed_loopback(32146).unwrap();
-    assert!(host.start_fixed_loopback(32146).is_err());
+    let (_root, mut shared) = host();
+    assert!(shared.start_fixed_loopback(0).is_err());
+    let pairing = shared.start_fixed_loopback(32146).unwrap();
+    let (_other_root, mut other) = host();
+    assert!(other.start_fixed_loopback(32146).is_err());
     let established = claim(&pairing, "00000000-0000-4000-8000-000000000021");
     let bearer = established.json::<serde_json::Value>().unwrap()["bearer"]
         .as_str()
         .unwrap()
         .to_owned();
     let old = pairing.claim.clone();
-    let replacement = host.rotate_link().unwrap();
+    let replacement = shared.rotate_link().unwrap();
     assert_eq!(pairing.endpoint, replacement.endpoint);
     assert_eq!(
         reqwest::blocking::Client::new()
@@ -246,7 +275,7 @@ fn fixed_port_rejects_zero_and_rotation_invalidates_only_pending_claim() {
     assert!(claim(&replacement, "00000000-0000-4000-8000-000000000022")
         .status()
         .is_success());
-    host.stop().unwrap();
+    shared.stop().unwrap();
 }
 
 #[test]
@@ -274,6 +303,36 @@ fn fixed_lan_advertises_the_reachable_address_not_wildcard() {
     assert!(claim(&pairing, "00000000-0000-4000-8000-000000000025")
         .status()
         .is_success());
+    host.stop().unwrap();
+}
+
+#[test]
+fn permitted_bidirectional_registration_reaches_existing_control() {
+    let (root, mut host) = host();
+    host.enable_v2_registry(
+        root.path(),
+        "test",
+        DevicePermissions::read_and_bidirectional(),
+    )
+    .unwrap();
+    let pairing = host.start_fixed_loopback(32150).unwrap();
+    let bearer = claim(&pairing, "00000000-0000-4000-8000-000000000026")
+        .json::<serde_json::Value>()
+        .unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let manifest = reqwest::blocking::Client::new()
+        .get(format!("{}/v1/peer/hello", pairing.endpoint))
+        .bearer_auth(&bearer)
+        .send()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .unwrap()["lanes"]["bidirectional"]["manifestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(reqwest::blocking::Client::new().post(format!("{}/v1/sessions/00000000-0000-4000-8000-000000000012/registration", pairing.endpoint)).bearer_auth(&bearer).json(&serde_json::json!({"libraryId":"library","generation":{"generationId":"g","manifestHash":manifest,"generationSequence":"1"},"expectedRevision":0})).send().unwrap().status(), reqwest::StatusCode::NO_CONTENT);
     host.stop().unwrap();
 }
 
