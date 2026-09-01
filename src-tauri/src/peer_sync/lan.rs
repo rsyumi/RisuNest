@@ -817,6 +817,7 @@ impl HostV2Registration {
 struct ClaimState {
     digest: [u8; 32],
     expires_at: Instant,
+    expires_at_ms: u128,
     consumed: bool,
     v2_permissions: Option<DevicePermissions>,
 }
@@ -837,8 +838,7 @@ pub(crate) struct TunnelOriginProbe {
 
 #[cfg(any(desktop, target_os = "android"))]
 struct LanShared {
-    session: LanSession,
-    manifest_bytes: Arc<[u8]>,
+    sessions: Vec<LanSession>,
     claim: Mutex<Option<ClaimState>>,
     #[cfg(desktop)]
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
@@ -1011,6 +1011,20 @@ impl LanSession {
 }
 
 #[cfg(any(desktop, target_os = "android"))]
+fn session_by_id<'a>(shared: &'a LanShared, session_id: &str) -> Option<&'a LanSession> {
+    shared
+        .sessions
+        .iter()
+        .find(|session| session.session_id() == session_id)
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+fn primary_session(shared: &LanShared) -> &LanSession {
+    // Every legacy host and shared host requires at least the clone session.
+    &shared.sessions[0]
+}
+
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone)]
 pub(crate) struct LanCloneHostControl {
     shared: Weak<LanShared>,
@@ -1064,11 +1078,9 @@ pub struct LanCloneHost {
 #[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHost {
     pub fn prepare(session: PreparedCloneSession) -> Self {
-        let manifest_bytes = Arc::from(session.manifest_bytes());
         Self {
             shared: Arc::new(LanShared {
-                manifest_bytes,
-                session: LanSession::Clone(session),
+                sessions: vec![LanSession::Clone(session)],
                 claim: Mutex::new(None),
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
@@ -1087,8 +1099,7 @@ impl LanCloneHost {
     pub fn prepare_logical(session: PreparedLogicalLanSession) -> Self {
         Self {
             shared: Arc::new(LanShared {
-                manifest_bytes: Arc::clone(&session.manifest_bytes),
-                session: LanSession::Logical(session),
+                sessions: vec![LanSession::Logical(session)],
                 claim: Mutex::new(None),
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
@@ -1109,8 +1120,7 @@ impl LanCloneHost {
     ) -> Self {
         Self {
             shared: Arc::new(LanShared {
-                manifest_bytes: Arc::clone(&session.logical.manifest_bytes),
-                session: LanSession::BidirectionalLogical(session),
+                sessions: vec![LanSession::BidirectionalLogical(session)],
                 claim: Mutex::new(None),
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
@@ -1124,6 +1134,45 @@ impl LanCloneHost {
             active_connection: None,
             thread: None,
         }
+    }
+
+    // One raw listener can serve the existing three session types.  Their
+    // transfer engines remain owned by the prepared sessions themselves.
+    pub(crate) fn prepare_shared(
+        clone: PreparedCloneSession,
+        delta: PreparedLogicalLanSession,
+        bidirectional: PreparedBidirectionalLogicalLanSession,
+    ) -> Result<Self, PeerSyncError> {
+        let sessions = vec![
+            LanSession::Clone(clone),
+            LanSession::Logical(delta),
+            LanSession::BidirectionalLogical(bidirectional),
+        ];
+        let mut ids = std::collections::BTreeSet::new();
+        if sessions
+            .iter()
+            .any(|session| !ids.insert(session.session_id()))
+        {
+            return Err(PeerSyncError::Validation(
+                "shared LAN sessions must have distinct IDs".to_owned(),
+            ));
+        }
+        Ok(Self {
+            shared: Arc::new(LanShared {
+                sessions,
+                claim: Mutex::new(None),
+                #[cfg(desktop)]
+                tunnel_probe: Mutex::new(None),
+                devices: Mutex::new(BTreeMap::new()),
+                v2_registration: Mutex::new(None),
+                #[cfg(test)]
+                after_v2_registry_claim: Mutex::new(None),
+            }),
+            address: None,
+            stopped: None,
+            active_connection: None,
+            thread: None,
+        })
     }
 
     // Opt-in protocol v2 state for the existing single-lane host. Keeping it
@@ -1180,6 +1229,28 @@ impl LanCloneHost {
         self.start_on(Ipv4Addr::UNSPECIFIED, 0)
     }
 
+    pub(crate) fn start_fixed_lan(&mut self, port: u16) -> Result<LanPairing, PeerSyncError> {
+        if port == 0 {
+            return Err(PeerSyncError::Validation(
+                "shared LAN port must be nonzero".to_owned(),
+            ));
+        }
+        self.start_on(Ipv4Addr::UNSPECIFIED, port)
+    }
+
+    pub(crate) fn start_fixed_on(
+        &mut self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Result<LanPairing, PeerSyncError> {
+        if port == 0 {
+            return Err(PeerSyncError::Validation(
+                "shared LAN port must be nonzero".to_owned(),
+            ));
+        }
+        self.start_on(address, port)
+    }
+
     // Android source hosting binds the selected private interface.
     #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn start_private_lan(
@@ -1200,6 +1271,16 @@ impl LanCloneHost {
     }
 
     #[cfg(desktop)]
+    pub(crate) fn start_fixed_loopback(&mut self, port: u16) -> Result<LanPairing, PeerSyncError> {
+        if port == 0 {
+            return Err(PeerSyncError::Validation(
+                "shared loopback port must be nonzero".to_owned(),
+            ));
+        }
+        self.start_on(Ipv4Addr::LOCALHOST, port)
+    }
+
+    #[cfg(desktop)]
     pub(crate) fn start_named_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
         self.start_on(Ipv4Addr::LOCALHOST, named_tunnel_origin_port())
     }
@@ -1215,9 +1296,11 @@ impl LanCloneHost {
             .as_ref()
             .map(|registration| registration.permissions.clone());
         let claim = random_secret()?;
+        let expires_at_ms = now_ms().saturating_add(CLAIM_TTL.as_millis());
         *recovered_lock(&self.shared.claim) = Some(ClaimState {
             digest: digest(&claim),
             expires_at: Instant::now() + CLAIM_TTL,
+            expires_at_ms,
             consumed: false,
             v2_permissions: v2_permissions.clone(),
         });
@@ -1251,8 +1334,8 @@ impl LanCloneHost {
         self.stopped = Some(stopped);
         self.active_connection = Some(active_connection);
         Ok(LanPairing {
-            session_id: self.shared.session.session_id().to_owned(),
-            manifest_id: self.shared.session.manifest_id().to_owned(),
+            session_id: primary_session(&self.shared).session_id().to_owned(),
+            manifest_id: primary_session(&self.shared).manifest_id().to_owned(),
             claim: hex::encode(claim),
             permissions: v2_permissions.map(|permissions| permissions.values().to_vec()),
         })
@@ -1262,9 +1345,41 @@ impl LanCloneHost {
         self.address
     }
 
+    pub(crate) fn pairing_expires_at_ms(&self) -> Option<u128> {
+        recovered_lock(&self.shared.claim)
+            .as_ref()
+            .map(|claim| claim.expires_at_ms)
+    }
+
+    pub(crate) fn rotate_pairing_link(&self) -> Result<LanPairing, PeerSyncError> {
+        if self.thread.is_none() {
+            return Err(PeerSyncError::Protocol(
+                "LAN clone host is not running".to_owned(),
+            ));
+        }
+        let claim = random_secret()?;
+        let expires_at_ms = now_ms().saturating_add(CLAIM_TTL.as_millis());
+        let permissions = recovered_lock(&self.shared.v2_registration)
+            .as_ref()
+            .map(|registration| registration.permissions.clone());
+        *recovered_lock(&self.shared.claim) = Some(ClaimState {
+            digest: digest(&claim),
+            expires_at: Instant::now() + CLAIM_TTL,
+            expires_at_ms,
+            consumed: false,
+            v2_permissions: permissions.clone(),
+        });
+        Ok(LanPairing {
+            session_id: primary_session(&self.shared).session_id().to_owned(),
+            manifest_id: primary_session(&self.shared).manifest_id().to_owned(),
+            claim: hex::encode(claim),
+            permissions: permissions.map(|value| value.values().to_vec()),
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn manifest(&self) -> &super::CloneManifest {
-        match &self.shared.session {
+        match primary_session(&self.shared) {
             LanSession::Clone(session) => session.manifest(),
             LanSession::Logical(_) | LanSession::BidirectionalLogical(_) => {
                 panic!("logical LAN session has no clone manifest")
@@ -1303,7 +1418,7 @@ impl LanCloneHost {
         });
         let path_prefix = format!(
             "/v1/sessions/{}/tunnel-check",
-            self.shared.session.session_id()
+            primary_session(&self.shared).session_id()
         );
         let path = format!("{path_prefix}/{}", hex::encode(secret));
         Ok(TunnelOriginProbe {
@@ -1651,7 +1766,17 @@ fn handle_request(
     if request.url == "/v1/peer/hello" {
         return hello(stream, request, shared);
     }
-    let prefix = format!("/v1/sessions/{}", shared.session.session_id());
+    let Some(session_id) = request
+        .url
+        .strip_prefix("/v1/sessions/")
+        .and_then(|path| path.split('/').next())
+    else {
+        return respond_empty(stream, 404);
+    };
+    let Some(session) = session_by_id(shared, session_id) else {
+        return respond_empty(stream, 404);
+    };
+    let prefix = format!("/v1/sessions/{session_id}");
     #[cfg(desktop)]
     {
         let tunnel_probe_prefix = format!("{prefix}/tunnel-check/");
@@ -1664,7 +1789,7 @@ fn handle_request(
         }
     }
     if request.url == format!("{prefix}/claim") {
-        return claim(stream, request, shared);
+        return claim(stream, request, shared, session);
     }
     let device = match authorize(&request, shared) {
         Ok(device) => device,
@@ -1682,41 +1807,45 @@ fn handle_request(
             200,
             &[
                 ("Content-Type", "application/json"),
-                ("ETag", &quoted(shared.session.manifest_id())),
+                ("ETag", &quoted(session.manifest_id())),
             ],
-            &shared.manifest_bytes,
+            match session {
+                LanSession::Clone(session) => session.manifest_bytes(),
+                LanSession::Logical(session) => &session.manifest_bytes,
+                LanSession::BidirectionalLogical(session) => &session.logical.manifest_bytes,
+            },
         );
     }
     if request.url == format!("{prefix}/progress") {
         if request.method != "POST" {
             return respond_empty(stream, 405);
         }
-        return progress(stream, request, shared, &device.device_id);
+        return progress(stream, request, shared, session, &device.device_id);
     }
     if request.url == format!("{prefix}/registration") {
-        return bidirectional_registration(stream, request, shared, &device);
+        return bidirectional_registration(stream, request, session, &device);
     }
     if request.url == format!("{prefix}/remote-apply") {
-        return bidirectional_remote_apply(stream, request, shared, &device, stopped);
+        return bidirectional_remote_apply(stream, request, session, &device, stopped);
     }
     let object_prefix = format!("{prefix}/objects/");
     let Some(object) = request.url.strip_prefix(&object_prefix).map(str::to_owned) else {
         return respond_empty(stream, 404);
     };
-    if object.contains('/') || shared.session.object_size(&object).is_none() {
+    if object.contains('/') || session.object_size(&object).is_none() {
         return respond_empty(stream, 404);
     }
-    match (&shared.session, request.method.as_str()) {
-        (LanSession::Clone(_), "HEAD") => head(stream, shared, &object),
-        (LanSession::Clone(_), "GET") => range(stream, &request, shared, &object, stopped),
+    match (session, request.method.as_str()) {
+        (LanSession::Clone(_), "HEAD") => head(stream, session, &object),
+        (LanSession::Clone(_), "GET") => range(stream, &request, session, &object, stopped),
         (LanSession::Logical(_) | LanSession::BidirectionalLogical(_), "HEAD") => {
-            head(stream, shared, &object)
+            head(stream, session, &object)
         }
         (LanSession::Logical(_) | LanSession::BidirectionalLogical(_), "GET") => {
             if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
                 return respond_empty(stream, 400);
             }
-            logical_object(stream, shared, &device.device_id, &object, stopped)
+            logical_object(stream, shared, session, &device.device_id, &object, stopped)
         }
         _ => respond_empty(stream, 405),
     }
@@ -1766,6 +1895,7 @@ fn claim(
     stream: &mut TcpStream,
     request: HttpRequest,
     shared: &LanShared,
+    session: &LanSession,
 ) -> Result<(), PeerSyncError> {
     if request.method != "POST" {
         return respond_empty(stream, 405);
@@ -1805,7 +1935,7 @@ fn claim(
     } else {
         None
     };
-    let device_id = match (&shared.session, &v2) {
+    let device_id = match (session, &v2) {
         (_, Some((device_id, _, _))) => device_id.clone(),
         (LanSession::BidirectionalLogical(_), None) => match request_body.device_id.as_deref() {
             Some(device_id) if is_canonical_uuid(device_id) => device_id.to_owned(),
@@ -1827,7 +1957,7 @@ fn claim(
     let permissions = v2
         .as_ref()
         .and_then(|_| claim.v2_permissions.clone())
-        .unwrap_or_else(|| shared.session.legacy_permissions());
+        .unwrap_or_else(|| session.legacy_permissions());
     let registered_app_root = v2
         .as_ref()
         .map(|(_, _, registration)| registration.app_root.clone());
@@ -1858,11 +1988,11 @@ fn claim(
     let response = ClaimResponse {
         device_id: device_id.clone(),
         bearer,
-        permission: shared.session.permission(),
+        permission: session.permission(),
         // Legacy logical clients retain their lane-specific source identity.
         source_device_id: source_v2
             .map(|registration| registration.device_id.as_str())
-            .or_else(|| shared.session.source_device_id()),
+            .or_else(|| session.source_device_id()),
         source_device_name: source_v2.map(|registration| registration.name.as_str()),
         permissions: source_v2.map(|_| permissions.values()),
     };
@@ -1925,6 +2055,7 @@ fn progress(
     stream: &mut TcpStream,
     request: HttpRequest,
     shared: &LanShared,
+    session: &LanSession,
     device_id: &str,
 ) -> Result<(), PeerSyncError> {
     let Ok(progress) = serde_json::from_slice::<ProgressRequest>(&request.body) else {
@@ -1933,7 +2064,7 @@ fn progress(
     if progress
         .current_object
         .as_deref()
-        .is_some_and(|object| shared.session.object_size(object).is_none())
+        .is_some_and(|object| session.object_size(object).is_none())
     {
         return respond_empty(stream, 400);
     }
@@ -1947,15 +2078,14 @@ fn progress(
 
 #[cfg(any(desktop, target_os = "android"))]
 fn authenticated_bidirectional_session(
-    shared: &LanShared,
+    session: &LanSession,
     target_device_id: &str,
 ) -> Option<LanBidirectionalSession> {
-    shared
-        .session
+    session
         .bidirectional_control()
-        .and_then(|_| shared.session.source_device_id())
+        .and_then(|_| session.source_device_id())
         .map(|source_device_id| LanBidirectionalSession {
-            session_id: shared.session.session_id().to_owned(),
+            session_id: session.session_id().to_owned(),
             source_device_id: source_device_id.to_owned(),
             target_device_id: target_device_id.to_owned(),
         })
@@ -1965,7 +2095,7 @@ fn authenticated_bidirectional_session(
 fn bidirectional_registration(
     stream: &mut TcpStream,
     request: HttpRequest,
-    shared: &LanShared,
+    session: &LanSession,
     device: &AuthorizedDevice,
 ) -> Result<(), PeerSyncError> {
     if request.method != "POST" {
@@ -1974,7 +2104,9 @@ fn bidirectional_registration(
     if !device.permissions.allows_bidirectional() {
         return respond_empty(stream, 403);
     }
-    let Some(session) = authenticated_bidirectional_session(shared, &device.device_id) else {
+    let Some(bidirectional_session) =
+        authenticated_bidirectional_session(session, &device.device_id)
+    else {
         return respond_empty(stream, 404);
     };
     let Ok(request) = serde_json::from_slice::<LanBidirectionalRegistrationRequest>(&request.body)
@@ -1984,11 +2116,10 @@ fn bidirectional_registration(
     if !request.is_valid() {
         return respond_empty(stream, 400);
     }
-    let control = shared
-        .session
+    let control = session
         .bidirectional_control()
         .expect("checked bidirectional session");
-    match control.register(session, request) {
+    match control.register(bidirectional_session, request) {
         Ok(()) => respond_empty(stream, 204),
         Err(_) => respond_empty(stream, 409),
     }
@@ -1998,7 +2129,7 @@ fn bidirectional_registration(
 fn bidirectional_remote_apply(
     stream: &mut TcpStream,
     request: HttpRequest,
-    shared: &LanShared,
+    session: &LanSession,
     device: &AuthorizedDevice,
     stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
@@ -2008,7 +2139,9 @@ fn bidirectional_remote_apply(
     if !device.permissions.allows_bidirectional() {
         return respond_empty(stream, 403);
     }
-    let Some(session) = authenticated_bidirectional_session(shared, &device.device_id) else {
+    let Some(bidirectional_session) =
+        authenticated_bidirectional_session(session, &device.device_id)
+    else {
         return respond_empty(stream, 404);
     };
     let Ok(request) = serde_json::from_slice::<LanBidirectionalRemoteApplyRequest>(&request.body)
@@ -2018,12 +2151,11 @@ fn bidirectional_remote_apply(
     if !request.is_valid() {
         return respond_empty(stream, 400);
     }
-    let control = shared
-        .session
+    let control = session
         .bidirectional_control()
         .expect("checked bidirectional session");
     let cancellation = AtomicCancellation::new(Arc::clone(stopped));
-    match control.remote_apply(session, request, &cancellation) {
+    match control.remote_apply(bidirectional_session, request, &cancellation) {
         Ok(receipt) if receipt.is_valid() => respond_json(stream, 200, &receipt),
         Err(PeerSyncError::ActivationConflict { .. } | PeerSyncError::StaleManifest { .. }) => {
             respond_empty(stream, 409)
@@ -2033,12 +2165,11 @@ fn bidirectional_remote_apply(
 }
 
 #[cfg(any(desktop, target_os = "android"))]
-fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
-    let size = shared
-        .session
+fn head(stream: &mut TcpStream, session: &LanSession, object: &str) -> Result<(), PeerSyncError> {
+    let size = session
         .object_size(object)
         .ok_or_else(|| PeerSyncError::Storage("session object descriptor is missing".to_owned()))?;
-    let range_header = match &shared.session {
+    let range_header = match session {
         LanSession::Clone(_) => Some(("Accept-Ranges", "bytes")),
         LanSession::Logical(_) | LanSession::BidirectionalLogical(_) => None,
     };
@@ -2054,7 +2185,7 @@ fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), 
 fn range(
     stream: &mut TcpStream,
     request: &HttpRequest,
-    shared: &LanShared,
+    session: &LanSession,
     object: &str,
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
@@ -2064,7 +2195,7 @@ fn range(
     let Some((start, end)) = request.range.as_deref().and_then(parse_range) else {
         return respond_empty(stream, 416);
     };
-    let LanSession::Clone(session) = &shared.session else {
+    let LanSession::Clone(session) = session else {
         return respond_empty(stream, 405);
     };
     let descriptor = &session.manifest().objects[object];
@@ -2103,11 +2234,12 @@ fn range(
 fn logical_object(
     stream: &mut TcpStream,
     shared: &LanShared,
+    selected: &LanSession,
     device_id: &str,
     object: &str,
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
-    let session = match &shared.session {
+    let session = match selected {
         LanSession::Logical(session) => session,
         LanSession::BidirectionalLogical(session) => &session.logical,
         LanSession::Clone(_) => return respond_empty(stream, 405),
@@ -2191,26 +2323,31 @@ fn hello(
         permissions: &'a [String],
         lanes: Lanes<'a>,
     }
-    let descriptor = LaneDescriptor {
-        session_id: shared.session.session_id(),
-        manifest_id: shared.session.manifest_id(),
-    };
-    let lanes = match &shared.session {
-        LanSession::Clone(_) => Lanes {
-            clone: Some(descriptor.clone()),
-            delta: None,
-            bidirectional: None,
-        },
-        LanSession::Logical(_) => Lanes {
-            clone: None,
-            delta: Some(descriptor.clone()),
-            bidirectional: None,
-        },
-        LanSession::BidirectionalLogical(_) => Lanes {
-            clone: None,
-            delta: None,
-            bidirectional: Some(descriptor),
-        },
+    let clone = shared
+        .sessions
+        .iter()
+        .find(|session| matches!(session, LanSession::Clone(_)));
+    let delta = shared
+        .sessions
+        .iter()
+        .find(|session| matches!(session, LanSession::Logical(_)));
+    let bidirectional = shared
+        .sessions
+        .iter()
+        .find(|session| matches!(session, LanSession::BidirectionalLogical(_)));
+    let lanes = Lanes {
+        clone: clone.map(|session| LaneDescriptor {
+            session_id: session.session_id(),
+            manifest_id: session.manifest_id(),
+        }),
+        delta: delta.map(|session| LaneDescriptor {
+            session_id: session.session_id(),
+            manifest_id: session.manifest_id(),
+        }),
+        bidirectional: bidirectional.map(|session| LaneDescriptor {
+            session_id: session.session_id(),
+            manifest_id: session.manifest_id(),
+        }),
     };
     respond_json(
         stream,

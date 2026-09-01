@@ -37,9 +37,13 @@ pub(crate) mod maintenance;
 mod production;
 mod protocol;
 mod session;
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) mod shared_session;
 
 #[cfg(test)]
 mod device_registry_tests;
+#[cfg(all(test, any(desktop, target_os = "android")))]
+mod shared_session_tests;
 
 #[cfg(desktop)]
 mod tunnel;
