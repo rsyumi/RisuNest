@@ -38,6 +38,35 @@ afterEach(() => {
 })
 
 describe('device sync controller', () => {
+    it('retains clone backup paths in the safe target projection', () => {
+        const clone = {
+            ...cloneSnapshot(),
+            state: {
+                ...cloneSnapshot().state,
+                target: {
+                    ...cloneSnapshot().state.target,
+                    phase: 'completed' as const,
+                    backupPaths: ['C:\\sync\\pre-clone.lossless'],
+                },
+            },
+        }
+        const controller = createDeviceSyncController({
+            facade: sourceFacade(),
+            targets: {
+                clone: {
+                    snapshot: () => clone,
+                    subscribe: (listener) => { listener(clone); return () => undefined },
+                    initialize: async () => undefined,
+                    joinClaimed: vi.fn(), confirmDestructiveReplace: vi.fn(), download: vi.fn(),
+                    resume: vi.fn(), cancel: vi.fn(),
+                },
+            },
+        })
+
+        expect(controller.snapshot().targets.clone?.state.target.backupPaths)
+            .toEqual(['C:\\sync\\pre-clone.lossless'])
+    })
+
     it('uses only incoming sources as receive targets and refreshes after a successful operation', async () => {
         const incomingSources = vi.fn(async () => [{ deviceId: 'incoming', name: 'Incoming', permissions: ['read'] as const }])
         const outgoingDevices = vi.fn(async () => [{ deviceId: 'outgoing', name: 'Outgoing', permissions: ['read'] as const }])

@@ -413,7 +413,7 @@ describe('PeerClone facade', () => {
             if (command === 'peer_clone_finalize') {
                 events.push('finalize')
                 finalized = true
-                return { revision: 42 } as T
+                return { revision: 42, backupPath: 'C:\\sync\\pre-clone.lossless' } as T
             }
             if (command === 'peer_clone_release_target') {
                 events.push('native-release')
@@ -464,6 +464,7 @@ describe('PeerClone facade', () => {
             phase: 'completed',
             completedBytes: 10,
             totalBytes: 10,
+            backupPaths: ['C:\\sync\\pre-clone.lossless'],
         })
     })
 
@@ -558,7 +559,7 @@ describe('PeerClone facade', () => {
             if (command === 'peer_clone_finalize') {
                 events.push('finalize')
                 finalized = true
-                return { revision: 42 } as T
+                return { revision: 42, backupPath: 'C:\\sync\\refresh-retry.lossless' } as T
             }
             return undefined as T
         })
@@ -590,12 +591,14 @@ describe('PeerClone facade', () => {
 
         await expect(facade.targetStatus()).rejects.toThrow('refresh failed')
         expect(facade.getState().target.phase).not.toBe('failed')
+        expect(facade.getState().target.backupPaths).toEqual(['C:\\sync\\refresh-retry.lossless'])
         expect(events).toEqual(['capture', 'acquire', 'finalize', 'refresh:42'])
 
         await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
         expect(events).toEqual(['capture', 'acquire', 'finalize', 'refresh:42', 'refresh:42', 'release'])
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_finalize')).toHaveLength(1)
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_release_target')).toHaveLength(1)
+        expect(facade.getState().target.backupPaths).toEqual(['C:\\sync\\refresh-retry.lossless'])
     })
 
     it('retains the completed native target until release succeeds after one renderer refresh', async () => {
@@ -613,7 +616,7 @@ describe('PeerClone facade', () => {
             }
             if (command === 'peer_clone_finalize') {
                 finalized = true
-                return { revision: 42 } as T
+                return { revision: 42, backupPath: 'C:\\sync\\release-retry.lossless' } as T
             }
             if (command === 'peer_clone_release_target' && releaseAttempt++ === 0) {
                 throw new Error('native release failed')
@@ -630,6 +633,7 @@ describe('PeerClone facade', () => {
 
         await expect(facade.targetStatus()).rejects.toThrow('native release failed')
         expect(facade.getState().target.phase).not.toBe('completed')
+        expect(facade.getState().target.backupPaths).toEqual(['C:\\sync\\release-retry.lossless'])
         expect(fenceRelease).not.toHaveBeenCalled()
         await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
 
@@ -637,6 +641,21 @@ describe('PeerClone facade', () => {
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_finalize')).toHaveLength(1)
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_release_target')).toHaveLength(2)
         expect(fenceRelease).toHaveBeenCalledTimes(1)
+        expect(facade.getState().target.backupPaths).toEqual(['C:\\sync\\release-retry.lossless'])
+    })
+
+    it('clears a previous clone backup receipt when a new target joins', () => {
+        const completed = reducePeerCloneState(initialPeerCloneState, {
+            type: 'target-completed',
+            backupPaths: ['C:\\sync\\old.lossless'],
+        })
+
+        const joined = reducePeerCloneState(completed, {
+            type: 'target-joined',
+            pairing: parsePeerCloneUri(pairingUri),
+        })
+
+        expect(joined.target.backupPaths).toBeUndefined()
     })
 
     it('captures target identity before the asynchronous finalize handshake', async () => {

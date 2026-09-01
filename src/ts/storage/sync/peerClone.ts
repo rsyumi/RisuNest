@@ -87,6 +87,7 @@ export interface PeerCloneState {
         destructiveConfirmed: boolean
         completedBytes: number
         totalBytes?: number
+        backupPaths?: string[]
     }
 }
 
@@ -100,7 +101,7 @@ export type PeerCloneEvent =
     | { type: 'target-progress'; completedBytes: number; totalBytes?: number }
     | { type: 'target-cancelled' }
     | { type: 'target-resumed' }
-    | { type: 'target-completed' }
+    | { type: 'target-completed'; backupPaths?: string[] }
     | { type: 'target-failed' }
 
 export const initialPeerCloneState: PeerCloneState = {
@@ -153,7 +154,14 @@ export function reducePeerCloneState(state: PeerCloneState, event: PeerCloneEven
         case 'target-resumed':
             return { ...state, target: { ...state.target, phase: 'downloading' } }
         case 'target-completed':
-            return { ...state, target: { ...state.target, phase: 'completed' } }
+            return {
+                ...state,
+                target: {
+                    ...state.target,
+                    phase: 'completed',
+                    ...(event.backupPaths === undefined ? {} : { backupPaths: event.backupPaths }),
+                },
+            }
         case 'target-failed':
             return { ...state, target: { ...state.target, phase: 'failed' } }
     }
@@ -375,6 +383,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         revision: number
         fence: Awaited<ReturnType<PeerCloneReplacementRuntime['acquireDestructiveReplacementFence']>>
         rendererRefreshed: boolean
+        backupPaths?: string[]
     } | undefined
     const supported = () => options.platform === 'desktop' || unsupported(options.platform)
     const targetArgs = () => {
@@ -408,6 +417,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             let fence = pendingRefresh?.fence
             let revision = pendingRefresh?.revision
             let rendererRefreshed = pendingRefresh?.rendererRefreshed ?? false
+            let backupPaths = pendingRefresh?.backupPaths
             let nativeStarted = revision !== undefined
             try {
                 if (pendingRefresh && !sameTargetRequest(pendingRefresh.request, request)) {
@@ -419,10 +429,22 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 }
                 if (revision === undefined) {
                     nativeStarted = true
-                    const result = await nativeInvoke<{ revision: number; warning?: string }>('peer_clone_finalize', request)
+                    const result = await nativeInvoke<{
+                        revision: number
+                        warning?: string
+                        backupPath?: string
+                    }>('peer_clone_finalize', request)
                     revision = result.revision
                     warning = result.warning ?? ''
-                    pendingRefresh = { request, revision, fence, rendererRefreshed: false }
+                    backupPaths = result.backupPath === undefined ? undefined : [result.backupPath]
+                    pendingRefresh = { request, revision, fence, rendererRefreshed: false, backupPaths }
+                    state = {
+                        ...state,
+                        target: {
+                            ...state.target,
+                            ...(backupPaths === undefined ? {} : { backupPaths }),
+                        },
+                    }
                 }
                 if (!rendererRefreshed) {
                     await fence.refreshCommittedWorkingSet(revision)
@@ -434,7 +456,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 fence.release()
                 fence = undefined
                 const completed = { ...awaiting, phase: 'completed' as const }
-                state = reducePeerCloneState(state, { type: 'target-completed' })
+                state = reducePeerCloneState(state, { type: 'target-completed', backupPaths })
                 ownedTarget = undefined
                 claimOwned = false
                 return completed
