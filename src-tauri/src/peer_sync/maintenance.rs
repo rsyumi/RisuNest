@@ -179,6 +179,16 @@ fn clone_backup_root(app_root: &Path, root: &Path) -> bool {
         || root == app_root.join("peer-clone-activation/backups")
 }
 
+fn clone_activation_stage_job_is_active(app_root: &Path, stage: &Path) -> bool {
+    let Some((_, job_id)) = super::production::activation_stage_identity(stage) else {
+        return false;
+    };
+    let Ok(job) = crate::asset_repository::job_pins::DurableCasJob::open(app_root, &job_id) else {
+        return false;
+    };
+    job.kind() == crate::asset_repository::job_pins::CasJobKind::PeerClone && !job.is_released()
+}
+
 pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), PeerSyncError> {
     delete_backup_with_predelete_hook_inner(app_root, requested, || Ok(()))
 }
@@ -244,6 +254,7 @@ fn delete_backup_with_predelete_hook_inner(
 fn temp_roots(app_root: &Path) -> Vec<(PathBuf, bool)> {
     vec![
         (app_root.join("peer-clone/activation"), true),
+        (app_root.join("peer-clone-activation"), true),
         (app_root.join("peer-bidirectional/staging"), false),
         (app_root.join("peer-bidirectional/backup-staging"), false),
         (app_root.join("peer-delta/staging"), false),
@@ -266,6 +277,7 @@ fn temp_candidates(app_root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, PeerSyncE
             if ordinary_directory(&path).is_none()
                 || path.join("operation.json").exists()
                 || operation_references(app_root, &path)?
+                || (clone_activation && clone_activation_stage_job_is_active(app_root, &path))
             {
                 continue;
             }
@@ -308,6 +320,21 @@ pub(crate) fn temp_usage(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError
 }
 
 pub(crate) fn cleanup_temp(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError> {
+    cleanup_temp_with_predelete_hook_inner(app_root, |_, _| Ok(()))
+}
+
+#[cfg(test)]
+pub(crate) fn cleanup_temp_with_predelete_hook(
+    app_root: &Path,
+    hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
+) -> Result<PeerTempUsage, PeerSyncError> {
+    cleanup_temp_with_predelete_hook_inner(app_root, hook)
+}
+
+fn cleanup_temp_with_predelete_hook_inner(
+    app_root: &Path,
+    mut hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
+) -> Result<PeerTempUsage, PeerSyncError> {
     let candidates = temp_candidates(app_root)?;
     let mut removed = PeerTempUsage::default();
     for (root, path) in candidates {
@@ -316,7 +343,14 @@ pub(crate) fn cleanup_temp(app_root: &Path) -> Result<PeerTempUsage, PeerSyncErr
         if operation_references(app_root, &path)? {
             continue;
         }
+        hook(&root, &path)?;
         let path = validated_direct_child(&root, &path, false)?;
+        if operation_references(app_root, &path)? {
+            continue;
+        }
+        if clone_activation_stage_job_is_active(app_root, &path) {
+            continue;
+        }
         fs::remove_dir_all(&path)?;
         removed.count += usage.count;
         removed.bytes = removed.bytes.saturating_add(usage.bytes);

@@ -441,7 +441,7 @@ pub(super) fn list(snapshots_dir: &Path) -> StoreResult<Vec<SnapshotInfo>> {
     Ok(snapshots)
 }
 
-fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool> {
+pub(super) fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(true);

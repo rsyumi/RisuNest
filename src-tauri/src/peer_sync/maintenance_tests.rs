@@ -1,6 +1,7 @@
 use super::maintenance::{
-    cleanup_temp, delete_backup, delete_backup_with_predelete_hook,
-    desktop_clone_backup_job_is_active, list_backups, temp_usage,
+    cleanup_temp, cleanup_temp_with_predelete_hook, delete_backup,
+    delete_backup_with_predelete_hook, desktop_clone_backup_job_is_active, list_backups,
+    temp_usage,
 };
 use super::PeerSyncError;
 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
@@ -76,6 +77,72 @@ fn temporary_cleanup_keeps_backup_and_active_operation_directories() {
     assert!(!abandoned.exists());
     assert!(active.exists());
     assert!(backup.exists());
+}
+
+#[test]
+fn clone_activation_stage_jobs_preserve_only_matching_unreleased_stages() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let manifest = "e".repeat(64);
+    let desktop_active_id = "00000000-0000-4000-8000-000000000101";
+    let android_active_id = "00000000-0000-4000-8000-000000000102";
+    let released_id = "00000000-0000-4000-8000-000000000103";
+    let unrelated_id = "00000000-0000-4000-8000-000000000104";
+    let desktop_active = root.join(format!(
+        "peer-clone/activation/{manifest}_{desktop_active_id}"
+    ));
+    let android_active = root.join(format!(
+        "peer-clone-activation/{manifest}_{android_active_id}"
+    ));
+    let released = root.join(format!("peer-clone/activation/{manifest}_{released_id}"));
+    let unrelated = root.join(format!("peer-clone/activation/{manifest}_{unrelated_id}"));
+    for stage in [&desktop_active, &android_active, &released, &unrelated] {
+        fs::create_dir_all(stage).expect("create stage");
+        fs::write(stage.join("payload"), b"stage payload").expect("write stage payload");
+    }
+
+    let _desktop_active = DurableCasJob::begin(root, desktop_active_id, CasJobKind::PeerClone, 0)
+        .expect("create active desktop job");
+    let _android_active = DurableCasJob::begin(root, android_active_id, CasJobKind::PeerClone, 0)
+        .expect("create active Android job");
+    let mut released_job = DurableCasJob::begin(root, released_id, CasJobKind::PeerClone, 0)
+        .expect("create released job");
+    released_job
+        .release(CasReleaseOutcome::Aborted)
+        .expect("release matching job");
+    let _unrelated = DurableCasJob::begin(root, unrelated_id, CasJobKind::LogicalDeltaTarget, 0)
+        .expect("create unrelated job");
+
+    assert_eq!(temp_usage(root).expect("calculate usage").count, 2);
+    assert_eq!(cleanup_temp(root).expect("clean abandoned stages").count, 2);
+    assert!(desktop_active.exists());
+    assert!(android_active.exists());
+    assert!(!released.exists());
+    assert!(!unrelated.exists());
+}
+
+#[test]
+fn final_temp_cleanup_recheck_preserves_a_matching_job_created_after_listing() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let id = "00000000-0000-4000-8000-000000000105";
+    let stage = root.join(format!("peer-clone/activation/{}_{id}", "f".repeat(64)));
+    fs::create_dir_all(&stage).expect("create stage");
+    fs::write(stage.join("payload"), b"stage payload").expect("write stage payload");
+    let mut late_job = None;
+
+    let removed = cleanup_temp_with_predelete_hook(root, |_, _| {
+        late_job = Some(
+            DurableCasJob::begin(root, id, CasJobKind::PeerClone, 0)
+                .expect("create matching job during predelete hook"),
+        );
+        Ok(())
+    })
+    .expect("late matching job must preserve stage");
+
+    assert!(late_job.is_some());
+    assert_eq!(removed.count, 0);
+    assert!(stage.exists());
 }
 
 #[test]
@@ -327,5 +394,41 @@ fn final_direct_child_validation_rejects_a_replaced_backup_reparse_root() {
     assert_eq!(
         fs::read(&external_backup).expect("read external backup"),
         b"external backup"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn final_temp_cleanup_validation_rejects_a_replaced_staging_reparse_root() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let app_root = directory.path();
+    let staging_root = app_root.join("peer-delta/staging");
+    let abandoned = staging_root.join("abandoned");
+    fs::create_dir_all(&abandoned).expect("create abandoned stage");
+    fs::write(abandoned.join("payload"), b"local payload").expect("write local payload");
+
+    let external_root = app_root.join("external-staging");
+    let external_stage = external_root.join("abandoned");
+    fs::create_dir_all(&external_stage).expect("create external stage");
+    fs::write(external_stage.join("sentinel"), b"external payload")
+        .expect("write external payload");
+
+    let error = cleanup_temp_with_predelete_hook(app_root, |root, candidate| {
+        assert_eq!(root, staging_root);
+        assert_eq!(
+            candidate,
+            fs::canonicalize(&abandoned).expect("canonicalize abandoned stage")
+        );
+        fs::remove_dir_all(candidate).expect("remove local stage");
+        fs::remove_dir(root).expect("remove staging root");
+        create_directory_link(&external_root, root);
+        Ok(())
+    })
+    .expect_err("replaced staging root must be rejected");
+
+    assert!(matches!(error, PeerSyncError::Validation { .. }));
+    assert_eq!(
+        fs::read(external_stage.join("sentinel")).expect("read external payload"),
+        b"external payload"
     );
 }

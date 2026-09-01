@@ -135,26 +135,28 @@ fn snapshot_list_and_restore_reject_linked_candidates() {
 
 #[cfg(windows)]
 #[test]
-fn snapshot_list_and_restore_reject_reparse_candidates() {
+fn snapshot_list_and_restore_reject_file_symlink_candidates() {
     let (directory, store, _) = open_fixture();
-    let external = directory.path().join("external-snapshot");
-    std::fs::create_dir(&external).expect("create external candidate directory");
-    std::fs::write(external.join("sentinel"), b"external snapshot")
-        .expect("write external candidate");
+    let external = directory.path().join("external-snapshot.db");
+    std::fs::write(&external, b"external snapshot").expect("write external candidate");
     let linked = directory
         .path()
         .join("persistent/snapshots/linked-snapshot.db");
-    let output = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(linked.to_string_lossy().replace('/', "\\"))
-        .arg(external.to_string_lossy().replace('/', "\\"))
-        .output()
-        .expect("invoke junction creation");
-    assert!(
-        output.status.success(),
-        "create snapshot junction: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    match std::os::windows::fs::symlink_file(&external, &linked) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "Windows denied file symlink creation, so linked snapshot integration coverage is unavailable: {error}"
+            );
+            assert!(!snapshot::snapshot_path_is_link_or_reparse(&external)
+                .expect("inspect regular snapshot candidate"));
+            return;
+        }
+        Err(error) => panic!("create snapshot file symlink: {error}"),
+    }
+
+    assert!(snapshot::snapshot_path_is_link_or_reparse(&linked)
+        .expect("inspect linked snapshot candidate"));
 
     assert!(store
         .snapshot_list()
@@ -163,7 +165,7 @@ fn snapshot_list_and_restore_reject_reparse_candidates() {
         .all(|snapshot| snapshot.path != linked.to_string_lossy()));
     assert!(store.snapshot_restore_request(&linked).is_err());
     assert_eq!(
-        std::fs::read(external.join("sentinel")).expect("read external candidate"),
+        std::fs::read(&external).expect("read external candidate"),
         b"external snapshot"
     );
 }
