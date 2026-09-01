@@ -39,6 +39,8 @@
     onMount(() => {
         refresh()
         void getDetailedOSLabel().then((label) => { operatingSystem = label })
+        window.addEventListener('focus', refresh)
+        return () => window.removeEventListener('focus', refresh)
     })
     onDestroy(unsubscribe)
 

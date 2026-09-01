@@ -43,6 +43,14 @@ class GenerationForegroundServiceTest {
   }
 
   @Test
+  fun `timeout termination is unconditional after clearing the refcount`() {
+    assertEquals(
+      GenerationForegroundTermination.UNCONDITIONAL,
+      generationForegroundTimeoutTermination(),
+    )
+  }
+
+  @Test
   fun `service is not sticky`() {
     assertEquals(Service.START_NOT_STICKY, GENERATION_FOREGROUND_START_MODE)
   }
