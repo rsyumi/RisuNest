@@ -280,6 +280,24 @@ pub enum PeerBidirectionalStatusOperation {
 }
 
 impl PeerBidirectionalDurableOperation {
+    pub(crate) fn backup_paths(&self) -> Vec<&str> {
+        match self {
+            Self::SourcePrepared { backup, .. } => {
+                backup.iter().map(|backup| backup.path.as_str()).collect()
+            }
+            Self::TargetPrepared { backups, .. }
+            | Self::AwaitingConflict { backups, .. }
+            | Self::LocalCommitted { backups, .. } => {
+                backups.iter().map(|backup| backup.path.as_str()).collect()
+            }
+            Self::Completed { result, .. } => result
+                .backups
+                .iter()
+                .map(|backup| backup.path.as_str())
+                .collect(),
+        }
+    }
+
     fn operation_id(&self) -> &str {
         match self {
             Self::SourcePrepared { operation_id, .. } => operation_id,

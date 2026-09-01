@@ -135,5 +135,7 @@ mod replacement_tests;
 mod schema_migration_tests;
 #[path = "tests/snapshot_lease_tests.rs"]
 mod snapshot_lease_tests;
+#[path = "tests/storage_stats_tests.rs"]
+mod storage_stats_tests;
 #[path = "tests/working_set_tests.rs"]
 mod working_set_tests;

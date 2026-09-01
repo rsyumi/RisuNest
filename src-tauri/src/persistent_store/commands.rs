@@ -5,9 +5,9 @@ use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode, ColdAlias,
     ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationPage, ConversationQuery,
-    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
-    PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated, SnapshotInfo,
-    StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
+    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
+    PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
+    SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -760,6 +760,117 @@ pub(crate) fn pds_snapshot_list(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_snapshot_delete(
+    state: State<'_, PersistentStoreState>,
+    path: String,
+) -> Result<(), StoreError> {
+    with_store(state, |store| store.snapshot_delete(Path::new(&path)))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_storage_stats(
+    state: State<'_, PersistentStoreState>,
+) -> Result<PersistentStorageStats, StoreError> {
+    with_store(state, PersistentStore::storage_stats)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetGcMaintenanceResult {
+    candidate_count: u64,
+    candidate_bytes: u64,
+    deleted_count: u64,
+    deleted_bytes: u64,
+    blockers: Vec<String>,
+}
+
+fn asset_gc_result(
+    report: crate::asset_repository::migration_gc::AssetGcDryRunReport,
+) -> AssetGcMaintenanceResult {
+    AssetGcMaintenanceResult {
+        candidate_count: report.potential_delete_hashes.len() as u64,
+        candidate_bytes: report.potential_delete_bytes,
+        deleted_count: report.deleted_hashes.len() as u64,
+        deleted_bytes: report.deleted_bytes,
+        blockers: report.blockers,
+    }
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_asset_gc_preview(
+    state: State<'_, PersistentStoreState>,
+) -> Result<AssetGcMaintenanceResult, StoreError> {
+    with_store(state, pds_asset_gc_preview_all)
+}
+
+fn pds_asset_gc_preview_all(
+    store: &PersistentStore,
+) -> Result<AssetGcMaintenanceResult, StoreError> {
+    let now = current_time_ms()?;
+    let mut cursor = None;
+    let mut result = AssetGcMaintenanceResult {
+        candidate_count: 0,
+        candidate_bytes: 0,
+        deleted_count: 0,
+        deleted_bytes: 0,
+        blockers: Vec::new(),
+    };
+    loop {
+        let page = store.asset_gc_dry_run(128, cursor.as_deref(), now, 7 * 24 * 60 * 60 * 1_000)?;
+        let page_result = asset_gc_result(page.report);
+        result.candidate_count += page_result.candidate_count;
+        result.candidate_bytes += page_result.candidate_bytes;
+        result.blockers.extend(page_result.blockers);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_asset_gc_execute(
+    state: State<'_, PersistentStoreState>,
+) -> Result<AssetGcMaintenanceResult, StoreError> {
+    with_store_mut(state, pds_asset_gc_execute_all)
+}
+
+fn pds_asset_gc_execute_all(
+    store: &mut PersistentStore,
+) -> Result<AssetGcMaintenanceResult, StoreError> {
+    let now = current_time_ms()?;
+    let mut cursor = None;
+    let mut result = AssetGcMaintenanceResult {
+        candidate_count: 0,
+        candidate_bytes: 0,
+        deleted_count: 0,
+        deleted_bytes: 0,
+        blockers: Vec::new(),
+    };
+    loop {
+        let page = store.asset_gc_delete_page_with_hook(
+            128,
+            cursor.as_deref(),
+            now,
+            7 * 24 * 60 * 60 * 1_000,
+            |_| Ok(()),
+        )?;
+        let page_result = asset_gc_result(page.report);
+        result.candidate_count += page_result.candidate_count;
+        result.candidate_bytes += page_result.candidate_bytes;
+        result.deleted_count += page_result.deleted_count;
+        result.deleted_bytes += page_result.deleted_bytes;
+        result.blockers.extend(page_result.blockers);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_snapshot_restore_request(
     state: State<'_, PersistentStoreState>,
     path: String,
@@ -1122,5 +1233,141 @@ mod tests {
             worker.join().expect("join maintenance worker");
         }
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    fn register_command_gc_candidate(
+        store: &mut PersistentStore,
+        prepared: &crate::asset_repository::PreparedPayload,
+    ) {
+        store
+            .asset_object_catalog()
+            .register(
+                &[
+                    crate::persistent_store::asset_object_catalog::AssetObjectRegistration {
+                        object_hash: prepared.content_hash.clone(),
+                        byte_size: prepared.byte_size,
+                    },
+                ],
+                0,
+            )
+            .expect("register command GC candidate");
+    }
+
+    #[test]
+    fn asset_gc_preview_command_totals_multiple_pages_without_mutating_maintenance_state() {
+        use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
+
+        let directory = tempdir().expect("create preview command directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+        let total = 129;
+        let mut prepared = Vec::new();
+        for index in 0..total {
+            let payload = cas
+                .prepare_bytes(format!("preview-command-{index}").as_bytes())
+                .expect("prepare candidate");
+            register_command_gc_candidate(&mut store, &payload);
+            prepared.push(payload);
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE asset_gc_maintenance_state
+                 SET catalog_cursor = 'preserve-preview-cursor' WHERE singleton = 1",
+                [],
+            )
+            .expect("seed maintenance cursor");
+        let mut released = DurableCasJob::begin(
+            directory.path(),
+            "preview-released-job",
+            CasJobKind::PeerClone,
+            0,
+        )
+        .expect("begin released journal fixture");
+        released
+            .seal(&mut store, 1)
+            .expect("seal released journal fixture");
+        released
+            .leave_release_record_for_cleanup_retry(CasReleaseOutcome::Aborted)
+            .expect("leave released journal fixture");
+        let released_journal = directory
+            .path()
+            .join("assets-v2/job-pins/job-preview-released-job.journal");
+        assert!(released_journal.is_file());
+        let expected_bytes = prepared
+            .iter()
+            .map(|payload| payload.byte_size)
+            .sum::<u64>();
+
+        let result = pds_asset_gc_preview_all(&store).expect("preview every command page");
+
+        assert_eq!(result.candidate_count, total);
+        assert_eq!(result.candidate_bytes, expected_bytes);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.deleted_bytes, 0);
+        assert!(result.blockers.is_empty());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("read preserved maintenance cursor"),
+            Some("preserve-preview-cursor".to_owned())
+        );
+        assert_eq!(
+            store
+                .query_asset_object_catalog(256, None)
+                .expect("read preserved catalog")
+                .items
+                .len(),
+            total as usize
+        );
+        assert!(prepared.iter().all(|payload| {
+            cas.stat_object(&payload.content_hash)
+                .expect("stat preserved candidate")
+                == Some(payload.byte_size)
+        }));
+        assert!(released_journal.is_file());
+    }
+
+    #[test]
+    fn asset_gc_execute_command_totals_and_deletes_multiple_pages() {
+        let directory = tempdir().expect("create execute command directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+        let total = 129;
+        let mut prepared = Vec::new();
+        for index in 0..total {
+            let payload = cas
+                .prepare_bytes(format!("execute-command-{index}").as_bytes())
+                .expect("prepare candidate");
+            register_command_gc_candidate(&mut store, &payload);
+            prepared.push(payload);
+        }
+        let expected_bytes = prepared
+            .iter()
+            .map(|payload| payload.byte_size)
+            .sum::<u64>();
+
+        let result = pds_asset_gc_execute_all(&mut store).expect("execute every command page");
+
+        assert_eq!(result.candidate_count, total);
+        assert_eq!(result.candidate_bytes, expected_bytes);
+        assert_eq!(result.deleted_count, total);
+        assert_eq!(result.deleted_bytes, expected_bytes);
+        assert!(result.blockers.is_empty());
+        assert!(store
+            .query_asset_object_catalog(256, None)
+            .expect("read deleted catalog")
+            .items
+            .is_empty());
+        assert!(prepared.iter().all(|payload| {
+            cas.stat_object(&payload.content_hash)
+                .expect("stat deleted candidate")
+                .is_none()
+        }));
     }
 }

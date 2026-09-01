@@ -27,7 +27,7 @@ use std::{
 };
 
 const ACTIVE_MANIFEST_KEY: &str = "peerCloneActiveManifest";
-const ACTIVATION_STAGE_SEPARATOR: char = '_';
+pub(crate) const ACTIVATION_STAGE_SEPARATOR: char = '_';
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -443,13 +443,16 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
     }
 }
 
-fn activation_stage_identity(path: &Path) -> Option<(String, String)> {
+pub(crate) fn activation_stage_identity(path: &Path) -> Option<(String, String)> {
     let name = path.file_name()?.to_str()?;
-    let (manifest_id, durable_job_id) = name.split_once(ACTIVATION_STAGE_SEPARATOR)?;
-    if validate_hash(manifest_id).is_err() || uuid::Uuid::parse_str(durable_job_id).is_err() {
+    let (manifest_id, durable_job_id_text) = name.split_once(ACTIVATION_STAGE_SEPARATOR)?;
+    let durable_job_id = uuid::Uuid::parse_str(durable_job_id_text).ok()?;
+    if validate_hash(manifest_id).is_err()
+        || durable_job_id.hyphenated().to_string() != durable_job_id_text
+    {
         return None;
     }
-    Some((manifest_id.to_owned(), durable_job_id.to_owned()))
+    Some((manifest_id.to_owned(), durable_job_id.to_string()))
 }
 
 fn unix_time_ms() -> Result<i64, PeerSyncError> {

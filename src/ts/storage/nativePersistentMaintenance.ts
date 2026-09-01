@@ -19,6 +19,62 @@ export interface NativeSnapshotCreated {
     durationMs: number
 }
 
+export interface NativeStorageBytes {
+    count: number
+    bytes: number
+}
+
+export interface NativePersistentStorageStats {
+    databaseBytes: number
+    assetObjects: NativeStorageBytes
+    assetAliases: NativeStorageAliasStats[]
+    coldAliases: NativeStorageBytes
+    pluginStorage: NativeStorageBytes
+    characters: { active: NativeStorageBytes; trashedCount: number }
+    conversations: { count: number; messageCount: number }
+    assetObjectDeletions: NativeStorageDeletionStats[]
+}
+
+export interface NativeStorageAliasStats extends NativeStorageBytes {
+    kind: string
+    inlayType: string | null
+}
+
+export interface NativeStorageDeletionStats extends NativeStorageBytes {
+    state: string
+}
+
+export interface NativeAssetGcResult {
+    candidateCount: number
+    candidateBytes: number
+    deletedCount: number
+    deletedBytes: number
+    blockers: string[]
+}
+
+export interface NativePeerBackupInfo {
+    path: string
+    bytes: number
+    modifiedAt: number
+}
+
+export interface NativePeerTempUsage {
+    bytes: number
+    count: number
+}
+
+export type NativePeerBackupDeleteErrorCode = 'peer-backup-in-use' | 'peer-backup-delete-failed'
+
+export interface NativePeerBackupDeleteError {
+    code: NativePeerBackupDeleteErrorCode
+}
+
+export function isNativePeerBackupDeleteError(error: unknown): NativePeerBackupDeleteError | null {
+    if (!error || typeof error !== 'object' || Object.keys(error).length !== 1) return null
+    const code = (error as { code?: unknown }).code
+    return code === 'peer-backup-in-use' || code === 'peer-backup-delete-failed' ? { code } : null
+}
+
 export interface NativeSnapshotRestoreActions {
     choose(snapshots: readonly NativeSnapshotInfo[]): Promise<string | null>
     confirm(): Promise<boolean>
@@ -50,6 +106,38 @@ export function createNativePersistentSnapshot(
 
 export function listNativePersistentSnapshots(): Promise<NativeSnapshotInfo[]> {
     return invoke('pds_snapshot_list')
+}
+
+export function getNativePersistentStorageStats(): Promise<NativePersistentStorageStats> {
+    return invoke('pds_storage_stats')
+}
+
+export function deleteNativePersistentSnapshot(path: string): Promise<void> {
+    return invoke('pds_snapshot_delete', { path })
+}
+
+export function previewNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
+    return invoke('pds_asset_gc_preview')
+}
+
+export function executeNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
+    return invoke('pds_asset_gc_execute')
+}
+
+export function listPeerBackups(): Promise<NativePeerBackupInfo[]> {
+    return invoke('peer_backup_list')
+}
+
+export function removePeerBackup(path: string): Promise<void> {
+    return invoke('peer_backup_delete', { path })
+}
+
+export function getPeerTempUsage(): Promise<NativePeerTempUsage> {
+    return invoke('peer_temp_usage')
+}
+
+export function cleanupPeerTemp(): Promise<NativePeerTempUsage> {
+    return invoke('peer_temp_cleanup')
 }
 
 export async function requestNativePersistentSnapshotRestore(

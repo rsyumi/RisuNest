@@ -29,6 +29,7 @@ mod http_stream;
 mod lan;
 pub(crate) mod logical_delta;
 mod logical_delta_transfer;
+pub(crate) mod maintenance;
 #[cfg(any(desktop, target_os = "android", test))]
 mod production;
 mod protocol;
@@ -39,6 +40,8 @@ mod tunnel;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod tunnel_lifecycle;
 
+#[cfg(test)]
+mod maintenance_tests;
 #[cfg(all(test, desktop))]
 mod tests;
 

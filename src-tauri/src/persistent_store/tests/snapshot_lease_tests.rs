@@ -63,6 +63,114 @@ fn snapshots_create_list_and_restore_on_reopen() {
 }
 
 #[test]
+fn snapshot_delete_requires_a_listed_top_level_snapshot_and_removes_its_sidecar() {
+    let (directory, store, _) = open_fixture();
+    let created = store
+        .snapshot_create("delete-test")
+        .expect("create snapshot");
+    let snapshot = std::path::PathBuf::from(&created.path);
+    let sidecar =
+        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(&snapshot);
+    assert!(sidecar.is_file());
+
+    store
+        .snapshot_delete(&snapshot)
+        .expect("delete listed snapshot");
+    assert!(!snapshot.exists());
+    assert!(!sidecar.exists());
+
+    let nested = directory
+        .path()
+        .join("persistent/snapshots/nested/not-a-snapshot.db");
+    std::fs::create_dir_all(nested.parent().expect("nested parent")).expect("create nested parent");
+    std::fs::write(&nested, b"not a snapshot").expect("write nested file");
+    assert!(store.snapshot_delete(&nested).is_err());
+}
+
+#[test]
+fn snapshot_delete_rejects_a_pending_restore_target_without_removing_it() {
+    let (directory, store, _) = open_fixture();
+    let created = store
+        .snapshot_create("pending-delete")
+        .expect("create snapshot");
+    let snapshot = std::path::PathBuf::from(&created.path);
+    store
+        .snapshot_restore_request(&snapshot)
+        .expect("request pending restore");
+
+    let error = store
+        .snapshot_delete(&snapshot)
+        .expect_err("pending restore target must not be deleted");
+
+    assert!(error.to_string().contains("pending restore"));
+    assert!(snapshot.is_file());
+    assert!(directory
+        .path()
+        .join("persistent/snapshots/pending-restore.json")
+        .is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_list_and_restore_reject_linked_candidates() {
+    let (directory, store, _) = open_fixture();
+    let external = directory.path().join("external-snapshot.db");
+    std::fs::write(&external, b"external snapshot").expect("write external candidate");
+    let linked = directory
+        .path()
+        .join("persistent/snapshots/linked-snapshot.db");
+    std::os::unix::fs::symlink(&external, &linked).expect("create snapshot symlink");
+
+    assert!(store
+        .snapshot_list()
+        .expect("list snapshots")
+        .iter()
+        .all(|snapshot| snapshot.path != linked.to_string_lossy()));
+    assert!(store.snapshot_restore_request(&linked).is_err());
+    assert_eq!(
+        std::fs::read(&external).expect("read external candidate"),
+        b"external snapshot"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn snapshot_list_and_restore_reject_file_symlink_candidates() {
+    let (directory, store, _) = open_fixture();
+    let external = directory.path().join("external-snapshot.db");
+    std::fs::write(&external, b"external snapshot").expect("write external candidate");
+    let linked = directory
+        .path()
+        .join("persistent/snapshots/linked-snapshot.db");
+    match std::os::windows::fs::symlink_file(&external, &linked) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "Windows denied file symlink creation, so linked snapshot integration coverage is unavailable: {error}"
+            );
+            assert!(!snapshot::snapshot_path_is_link_or_reparse(&external)
+                .expect("inspect regular snapshot candidate"));
+            return;
+        }
+        Err(error) => panic!("create snapshot file symlink: {error}"),
+    }
+
+    assert!(snapshot::snapshot_path_is_link_or_reparse(&linked)
+        .expect("inspect linked snapshot candidate"));
+
+    assert!(store
+        .snapshot_list()
+        .expect("list snapshots")
+        .iter()
+        .all(|snapshot| snapshot.path != linked.to_string_lossy()));
+    assert!(store.snapshot_restore_request(&linked).is_err());
+    assert_eq!(
+        std::fs::read(&external).expect("read external candidate"),
+        b"external snapshot"
+    );
+}
+
+#[test]
 fn snapshot_creation_persists_asset_roots_before_returning() {
     let (directory, store, _) = open_fixture();
     let generation = super::active_generation(&store.connection).expect("read active generation");
