@@ -36,6 +36,7 @@ impl SharedPairingData {
 
 pub(crate) struct SharedSessionHost {
     host: LanCloneHost,
+    advertised_endpoint: Option<String>,
 }
 
 impl SharedSessionHost {
@@ -46,6 +47,7 @@ impl SharedSessionHost {
     ) -> Result<Self, PeerSyncError> {
         Ok(Self {
             host: LanCloneHost::prepare_shared(clone, delta, bidirectional)?,
+            advertised_endpoint: None,
         })
     }
 
@@ -73,7 +75,9 @@ impl SharedSessionHost {
             ));
         }
         let pairing = self.host.start_fixed_lan(port)?;
-        self.pairing_at("http", advertised_address, pairing)
+        let data = self.pairing_at("http", advertised_address, pairing)?;
+        self.advertised_endpoint = Some(data.endpoint.clone());
+        Ok(data)
     }
 
     pub(crate) fn start_private_lan(
@@ -94,7 +98,9 @@ impl SharedSessionHost {
         // `LanCloneHost` owns the binding primitive. The private-interface
         // fixed-port entry point is intentionally kept in that same host.
         let pairing = self.host.start_fixed_on(address, port)?;
-        self.pairing("http", pairing)
+        let data = self.pairing("http", pairing)?;
+        self.advertised_endpoint = Some(data.endpoint.clone());
+        Ok(data)
     }
 
     #[cfg(desktop)]
@@ -103,11 +109,25 @@ impl SharedSessionHost {
         port: u16,
     ) -> Result<SharedPairingData, PeerSyncError> {
         let pairing = self.host.start_fixed_loopback(port)?;
-        self.pairing("http", pairing)
+        let data = self.pairing("http", pairing)?;
+        self.advertised_endpoint = Some(data.endpoint.clone());
+        Ok(data)
     }
 
-    pub(crate) fn rotate_link(&self) -> Result<SharedPairingData, PeerSyncError> {
-        self.pairing("http", self.host.rotate_pairing_link()?)
+    pub(crate) fn rotate_link(&mut self) -> Result<SharedPairingData, PeerSyncError> {
+        let pairing = self.host.rotate_pairing_link()?;
+        let endpoint = self.advertised_endpoint.clone().ok_or_else(|| {
+            PeerSyncError::Protocol("shared LAN host has no advertised endpoint".to_owned())
+        })?;
+        Ok(SharedPairingData {
+            endpoint,
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+            claim: pairing.claim,
+            expires_at_ms: self.host.pairing_expires_at_ms().ok_or_else(|| {
+                PeerSyncError::Protocol("shared LAN host has no pending pairing link".to_owned())
+            })?,
+        })
     }
 
     pub(crate) fn address(&self) -> Option<SocketAddr> {
@@ -115,7 +135,9 @@ impl SharedSessionHost {
     }
 
     pub(crate) fn stop(&mut self) -> Result<(), PeerSyncError> {
-        self.host.stop()
+        let result = self.host.stop();
+        self.advertised_endpoint = None;
+        result
     }
 
     #[cfg(test)]
