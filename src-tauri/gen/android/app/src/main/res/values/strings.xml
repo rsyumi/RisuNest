@@ -15,4 +15,7 @@
     <string name="peer_sync_source_notification_title">Sharing RisuNest data</string>
     <string name="peer_sync_source_notification_text">A nearby device can copy the prepared library.</string>
     <string name="peer_sync_source_notification_stop">Stop sharing</string>
+    <string name="generation_notification_channel">Generating response</string>
+    <string name="generation_notification_title">Generating response</string>
+    <string name="generation_notification_text">Receiving an AI response.</string>
 </resources>
