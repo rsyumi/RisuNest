@@ -4,6 +4,7 @@ import {
     parsePeerPairingUri,
     type PeerClonePlatform,
 } from './peerClone'
+import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground'
 import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 
 export interface PeerBidirectionalPairing {
@@ -285,39 +286,23 @@ export function createPeerBidirectionalFacade(options: {
     ): boolean => left.lane === right.lane
         && left.operationId === right.operationId
         && left.generation === right.generation
-    const abandonSourceReservation = async (
-        foreground: PeerBidirectionalForegroundIdentity,
-    ): Promise<void> => {
-        const abandoned = await nativeInvoke<boolean>('peer_sync_foreground_source_abandon', { foreground })
-        if (!abandoned) throw new Error('Android bidirectional source foreground identity is stale')
-    }
-    const stopAndAbandonSourceReservation = async (
-        foreground: PeerBidirectionalForegroundIdentity,
-    ): Promise<void> => {
-        if (!bridge?.stopSource(foreground.lane, foreground.operationId, foreground.generation)) {
-            throw new Error('Android bidirectional source foreground service could not stop')
-        }
-        await abandonSourceReservation(foreground)
-    }
-    const recoverSourceReservation = async (): Promise<void> => {
-        const pending = await nativeInvoke<PeerBidirectionalForegroundIdentity | null>(
-            'peer_sync_foreground_source_status',
-            { lane: 'p5-source' },
-        )
-        if (pending?.lane === 'p5-source') await stopAndAbandonSourceReservation(pending)
-    }
-    const failAfterCleanup = async <T>(
-        error: unknown,
-        cleanup: () => Promise<void>,
-        message: string,
-    ): Promise<T> => {
-        try {
-            await cleanup()
-        } catch (cleanupError) {
-            throw new AggregateError([error, cleanupError], message)
-        }
-        throw error
-    }
+    const p5SourceForeground = bridge
+        ? createPeerAndroidSourceForeground<
+              PeerBidirectionalForegroundIdentity,
+              PeerBidirectionalSourceStatus
+          >({
+              invoke: nativeInvoke,
+              bridge,
+              lane: 'p5-source',
+              reserveCommand: 'peer_bidirectional_source_reserve',
+              startCommand: 'peer_bidirectional_start',
+              startArgs: (sessionId, foreground) => ({ sessionId, foreground }),
+              staleIdentityError: 'Android bidirectional source foreground identity is stale',
+              serviceStartError: 'Android bidirectional foreground service could not start',
+              serviceStopError: 'Android bidirectional source foreground service could not stop',
+              cleanupFailureMessage: 'Android bidirectional foreground start and cleanup both failed',
+          })
+        : undefined
     const releaseTargetForeground = async (
         foreground: PeerBidirectionalForegroundIdentity,
     ): Promise<void> => {
@@ -658,36 +643,8 @@ export function createPeerBidirectionalFacade(options: {
             if (!sourceFence) throw new Error('Peer sync source is not prepared')
             if (options.platform === 'desktop') return nativeInvoke('peer_bidirectional_start', { sessionId })
             if (!bridge) throw new Error('Android bidirectional foreground service is unavailable')
-            await recoverSourceReservation()
-            const foreground = await nativeInvoke<PeerBidirectionalForegroundIdentity>(
-                'peer_bidirectional_source_reserve',
-            )
-            let started: boolean
-            try {
-                started = bridge.startSource(foreground.lane, foreground.operationId, foreground.generation)
-            } catch (error) {
-                return failAfterCleanup(
-                    error,
-                    () => stopAndAbandonSourceReservation(foreground),
-                    'Android bidirectional foreground start and cleanup both failed',
-                )
-            }
-            if (!started) {
-                return failAfterCleanup(
-                    new Error('Android bidirectional foreground service could not start'),
-                    () => abandonSourceReservation(foreground),
-                    'Android bidirectional foreground start and cleanup both failed',
-                )
-            }
-            try {
-                return await nativeInvoke('peer_bidirectional_start', { sessionId, foreground })
-            } catch (error) {
-                return failAfterCleanup(
-                    error,
-                    () => stopAndAbandonSourceReservation(foreground),
-                    'Android bidirectional foreground start and cleanup both failed',
-                )
-            }
+            const started = await p5SourceForeground!.start(sessionId)
+            return started.result
         },
         async startQuickTunnel(sessionId) {
             requireDesktop()

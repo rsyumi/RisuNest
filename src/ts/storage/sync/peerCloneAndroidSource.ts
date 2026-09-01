@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import type { PeerCloneInvoke, PeerCloneSourceStatus } from './peerClone'
+import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground'
 import type { PeerSyncForegroundBridge } from './peerSyncShared'
 
 export interface AndroidPeerCloneSourceCapabilities {
@@ -48,39 +49,21 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
     const nativeInvoke = options.invoke ?? invoke
     const bridge = options.bridge ?? nativeBridge()
     let foreground: AndroidPeerCloneForegroundIdentity | undefined
-    const abandonReservation = async (identity: AndroidPeerCloneForegroundIdentity): Promise<void> => {
-        const abandoned = await nativeInvoke<boolean>('peer_sync_foreground_source_abandon', {
-            foreground: identity,
-        })
-        if (!abandoned) throw new Error('Android peer clone foreground identity is stale')
-    }
-    const stopAndAbandonReservation = async (identity: AndroidPeerCloneForegroundIdentity): Promise<void> => {
-        if (!bridge.stopSource(identity.lane, identity.operationId, identity.generation)) {
-            throw new Error('Android peer clone foreground service could not stop')
-        }
-        await abandonReservation(identity)
-    }
-    const recoverReservation = async (): Promise<void> => {
-        const pending = await nativeInvoke<AndroidPeerCloneForegroundIdentity | null>(
-            'peer_sync_foreground_source_status',
-            { lane: 'p1-source' },
-        )
-        if (pending?.lane === 'p1-source') await stopAndAbandonReservation(pending)
-    }
-    const failAfterCleanup = async (
-        error: unknown,
-        cleanup: () => Promise<void>,
-    ): Promise<never> => {
-        try {
-            await cleanup()
-        } catch (cleanupError) {
-            throw new AggregateError(
-                [error, cleanupError],
-                'Android peer clone foreground start and cleanup both failed',
-            )
-        }
-        throw error
-    }
+    const p1SourceForeground = createPeerAndroidSourceForeground<
+        AndroidPeerCloneForegroundIdentity,
+        PeerCloneSourceStatus
+    >({
+        invoke: nativeInvoke,
+        bridge,
+        lane: 'p1-source',
+        reserveCommand: 'peer_clone_android_source_reserve',
+        startCommand: 'peer_clone_android_source_start',
+        startArgs: (sessionId, identity) => ({ sessionId, foreground: identity }),
+        staleIdentityError: 'Android peer clone foreground identity is stale',
+        serviceStartError: 'Android peer clone foreground service could not start',
+        serviceStopError: 'Android peer clone foreground service could not stop',
+        cleanupFailureMessage: 'Android peer clone foreground start and cleanup both failed',
+    })
 
     return {
         foregroundIdentity: () => foreground,
@@ -95,32 +78,9 @@ export function createAndroidPeerCloneSourceFacade(options: AndroidPeerCloneSour
             return nativeInvoke('peer_clone_android_source_status')
         },
         async start(sessionId: string): Promise<PeerCloneSourceStatus> {
-            await recoverReservation()
-            const identity = await nativeInvoke<AndroidPeerCloneForegroundIdentity>(
-                'peer_clone_android_source_reserve',
-            )
-            let started: boolean
-            try {
-                started = bridge.startSource(identity.lane, identity.operationId, identity.generation)
-            } catch (error) {
-                return failAfterCleanup(error, () => stopAndAbandonReservation(identity))
-            }
-            if (!started) {
-                return failAfterCleanup(
-                    new Error('Android peer clone foreground service could not start'),
-                    () => abandonReservation(identity),
-                )
-            }
-            try {
-                const status = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_android_source_start', {
-                    sessionId,
-                    foreground: identity,
-                })
-                foreground = identity
-                return status
-            } catch (error) {
-                return failAfterCleanup(error, () => stopAndAbandonReservation(identity))
-            }
+            const started = await p1SourceForeground.start(sessionId)
+            foreground = started.foreground
+            return started.result
         },
         async stop(sessionId: string): Promise<void> {
             const identity = await nativeInvoke<AndroidPeerCloneForegroundIdentity | null>(
