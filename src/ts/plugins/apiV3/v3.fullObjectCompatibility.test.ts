@@ -8,7 +8,7 @@ const fixture = vi.hoisted(() => ({
     profile: 'maximum-compatibility' as 'scalable-v3' | 'maximum-compatibility',
     invalidations: 0,
     databaseAccessDependencies: null as null | { getSelectedCharacterId(): string | null },
-    fullObjectPermissionRequests: vi.fn(),
+    pluginPermissionReads: vi.fn(),
     listeners: new Set<Function>(),
     scopedAccess: {
         getCurrentCharacter: vi.fn(),
@@ -112,7 +112,10 @@ vi.mock('src/ts/process/mcp/pluginmcp', () => ({ registerMCPModule: vi.fn(), unr
 vi.mock('src/ts/process/files/inlays', () => ({ getInlayAsset: vi.fn() }))
 vi.mock('src/ts/translator/translator', () => ({ getLLMCache: vi.fn(), searchLLMCache: vi.fn() }))
 vi.mock('src/ts/parser/parser.svelte', () => ({ hasher: vi.fn(async () => 'hash') }))
-vi.mock('localforage', () => ({ default: { createInstance: () => ({ getItem: vi.fn(), setItem: vi.fn() }) } }))
+vi.mock('localforage', () => ({ default: { createInstance: () => ({
+    getItem: fixture.pluginPermissionReads,
+    setItem: vi.fn(),
+}) } }))
 vi.mock('src/ts/process/index.svelte', () => ({
     sendChat: vi.fn(),
     doingChat: { subscribe(run: (value: boolean) => void) { run(false); return () => undefined } },
@@ -135,7 +138,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     replacePersistentDatabase: vi.fn(),
 }))
 vi.mock('../pluginCompatibility', () => ({
-    assertPluginFullObjectCompatibility: fixture.fullObjectPermissionRequests,
+    assertPluginFullObjectCompatibility: vi.fn(),
     preparePluginFullObjectCallbackRegistration: vi.fn(() => true),
     runPluginFullObjectReplacement: vi.fn((
         _profile: string,
@@ -341,7 +344,9 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         await expect(api.getChatFromIndex(1, 0)).resolves.toMatchObject({ id: 'trash-chat' })
 
         expect(fixture.profile).toBe('scalable-v3')
-        expect(fixture.fullObjectPermissionRequests).not.toHaveBeenCalled()
+        expect(fixture.pluginPermissionReads).not.toHaveBeenCalledWith(
+            expect.stringContaining('_db'),
+        )
         const { pluginCompatibility } = await import('../plugins.svelte')
         expect(pluginCompatibility.allowsEviction).toBe(true)
 
@@ -360,7 +365,12 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         )
     })
 
-    it('resolves a selected character independently of conversation validity', () => {
+    it('resolves a selected character independently of conversation validity', async () => {
+        fixture.profile = 'scalable-v3'
+        fixture.scopedAccess.getCurrentCharacter.mockResolvedValue(
+            structuredClone(fixture.database.characters[0]),
+        )
+        await fixture.api!.getCharacter()
         fixture.database.characters[0].chats = []
         fixture.database.characters[0].chatPage = 99
 
