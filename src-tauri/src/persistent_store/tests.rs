@@ -71,6 +71,22 @@ fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
     (directory, store, database)
 }
 
+fn empty_working_set_commit(expected_revision: i64) -> WorkingSetCommit {
+    WorkingSetCommit {
+        expected_revision,
+        root: None,
+        replace_presets: None,
+        character: None,
+        character_details: None,
+        replace_character: None,
+        add_character: None,
+        conversations: None,
+        delete_character_id: None,
+        plugin_storage: None,
+        asset_owner_heads: None,
+    }
+}
+
 #[test]
 fn asset_owner_occurrences_are_isolated_by_revision_lease() {
     let (_directory, mut store, database) = open_fixture();
@@ -131,17 +147,9 @@ fn asset_owner_occurrences_are_isolated_by_revision_lease() {
     ];
     let shadowed = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(first_root.clone()),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(original_heads.clone()),
+            ..empty_working_set_commit(1)
         })
         .expect("commit original owner heads");
     let lease = store
@@ -166,17 +174,9 @@ fn asset_owner_occurrences_are_isolated_by_revision_lease() {
     ];
     let reordered = store
         .commit(&WorkingSetCommit {
-            expected_revision: shadowed.revision,
             root: Some(reordered_root),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(reordered_heads.clone()),
+            ..empty_working_set_commit(shadowed.revision)
         })
         .expect("commit reordered owner heads");
 
@@ -232,17 +232,9 @@ fn invalid_or_stale_owner_head_commit_preserves_parent_and_revision() {
     );
     let committed = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(original_root.clone()),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![valid_head.clone()]),
+            ..empty_working_set_commit(1)
         })
         .expect("commit valid owner head");
     let mut rejected_root = original_root.clone();
@@ -256,33 +248,17 @@ fn invalid_or_stale_owner_head_commit_preserves_parent_and_revision() {
 
     assert!(matches!(
         store.commit(&WorkingSetCommit {
-            expected_revision: committed.revision,
             root: Some(rejected_root.clone()),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![invalid_head]),
+            ..empty_working_set_commit(committed.revision)
         }),
         Err(StoreError::Validation { .. })
     ));
     assert!(matches!(
         store.commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(rejected_root),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![valid_head.clone()]),
+            ..empty_working_set_commit(1)
         }),
         Err(StoreError::RevisionConflict { .. })
     ));
@@ -329,17 +305,9 @@ fn character_parent_change_invalidates_omitted_owner_head() {
     let head = AssetOwnerHead::present(owner.clone(), "55".repeat(32), 2);
     let shadowed = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
             character: Some(detail.clone()),
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![head]),
+            ..empty_working_set_commit(1)
         })
         .expect("commit character owner head");
     assert!(store
@@ -349,17 +317,8 @@ fn character_parent_change_invalidates_omitted_owner_head() {
     detail["name"] = json!("Changed through legacy path");
     let changed = store
         .commit(&WorkingSetCommit {
-            expected_revision: shadowed.revision,
-            root: None,
-            replace_presets: None,
             character: Some(detail),
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
-            asset_owner_heads: None,
+            ..empty_working_set_commit(shadowed.revision)
         })
         .expect("commit legacy character change");
 
@@ -399,17 +358,10 @@ fn owner_head_validation_uses_the_final_character_parent_and_rejects_atomically(
 
     let committed = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
-            character: None,
             character_details: Some(vec![earlier_detail.clone()]),
             replace_character: Some(final_character.clone()),
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![final_head.clone()]),
+            ..empty_working_set_commit(1)
         })
         .expect("validate against final character replacement");
 
@@ -438,17 +390,11 @@ fn owner_head_validation_uses_the_final_character_parent_and_rejects_atomically(
 
     assert!(matches!(
         store.commit(&WorkingSetCommit {
-            expected_revision: committed.revision,
             root: Some(rejected_root),
-            replace_presets: None,
-            character: None,
             character_details: Some(vec![earlier_detail]),
             replace_character: Some(final_character),
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![earlier_head]),
+            ..empty_working_set_commit(committed.revision)
         }),
         Err(StoreError::Validation { .. })
     ));
@@ -495,17 +441,9 @@ fn unchanged_asset_owner_head_survives_cow_generation_and_pinned_reads() {
     let absent_head = AssetOwnerHead::absent(absent_owner.clone());
     let committed = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(database_root),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![head.clone(), absent_head.clone()]),
+            ..empty_working_set_commit(1)
         })
         .expect("commit M5 owner head");
     let lease = store
@@ -1389,17 +1327,8 @@ fn cold_aliases_follow_copy_on_write_without_leaking_between_revisions() {
         .expect("pin cold COW fixture");
     let second = store
         .commit(&WorkingSetCommit {
-            expected_revision: first.revision,
             root: Some(json!({ "username": "copy-on-write" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(first.revision)
         })
         .expect("commit copy-on-write revision");
 
@@ -1765,17 +1694,10 @@ fn working_set_asset_alias_batch_is_atomic_with_imported_owners() {
     let committed = store
         .commit_with_asset_aliases(
             &WorkingSetCommit {
-                expected_revision: 1,
                 root: Some(imported_root),
-                replace_presets: None,
-                character: None,
-                character_details: None,
-                replace_character: None,
                 add_character: Some(character),
-                conversations: None,
-                delete_character_id: None,
-                plugin_storage: None,
                 asset_owner_heads: Some(heads.clone()),
+                ..empty_working_set_commit(1)
             },
             &aliases,
         )
@@ -1822,21 +1744,13 @@ fn working_set_asset_alias_batch_is_atomic_with_imported_owners() {
     let error = store
         .commit_with_asset_aliases(
             &WorkingSetCommit {
-                expected_revision: committed.revision,
                 root: Some(json!({ "username": "must not commit" })),
-                replace_presets: None,
-                character: None,
-                character_details: None,
-                replace_character: None,
                 add_character: Some(json!({
                     "chaId": "rejected-native-character",
                     "name": "Rejected native character",
                     "chats": []
                 })),
-                conversations: None,
-                delete_character_id: None,
-                plugin_storage: None,
-                asset_owner_heads: None,
+                ..empty_working_set_commit(committed.revision)
             },
             &[invalid],
         )
@@ -2542,17 +2456,9 @@ fn preset_catalog_reads_and_materializes_in_configured_order() {
     let lease = store.acquire_revision(1).expect("acquire preset lease");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Preset commit", "botPresets": ["strip"] })),
             replace_presets: Some(vec![json!({ "name": "Replacement" })]),
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("replace presets");
     assert_eq!(
@@ -2642,16 +2548,7 @@ fn plugin_storage_is_revisioned_per_key_and_lease_isolated() {
 
     store
         .commit(&WorkingSetCommit {
-            expected_revision: imported.revision,
             root: Some(json!({ "username": "Plugin commit" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![
                 PluginStorageMutation::Set {
                     key: "alpha".to_owned(),
@@ -2661,6 +2558,7 @@ fn plugin_storage_is_revisioned_per_key_and_lease_isolated() {
                     key: "beta".to_owned(),
                 },
             ]),
+            ..empty_working_set_commit(imported.revision)
         })
         .expect("mutate plugin storage");
 
@@ -2737,16 +2635,6 @@ fn plugin_storage_preserves_legacy_object_key_order_across_reopen() {
 
     let updated = store
         .commit(&WorkingSetCommit {
-            expected_revision: imported.revision,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![
                 PluginStorageMutation::Set {
                     key: "zeta".to_owned(),
@@ -2760,6 +2648,7 @@ fn plugin_storage_preserves_legacy_object_key_order_across_reopen() {
                     value: json!("reinserted"),
                 },
             ]),
+            ..empty_working_set_commit(imported.revision)
         })
         .expect("reinsert string key");
     drop(store);
@@ -2818,20 +2707,11 @@ fn ordinary_root_commits_do_not_replace_plugin_records_and_empty_materializes() 
 
     store
         .commit(&WorkingSetCommit {
-            expected_revision: imported.revision,
             root: Some(json!({
                 "username": "ordinary root",
                 "pluginCustomStorage": { "incidental": "ignored" }
             })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(imported.revision)
         })
         .expect("commit ordinary root");
 
@@ -2850,17 +2730,8 @@ fn message(id: &str) -> Value {
 fn commit(store: &mut PersistentStore, revision: i64, mutation: ConversationMutation) -> i64 {
     store
         .commit(&WorkingSetCommit {
-            expected_revision: revision,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
             conversations: Some(vec![mutation]),
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(revision)
         })
         .expect("commit conversation mutation")
         .revision
@@ -2897,17 +2768,8 @@ fn pinned_materialization_is_not_affected_by_active_changes() {
         .expect("acquire materialization lease");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Changed after lease" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("change active generation after lease");
 
@@ -3070,22 +2932,13 @@ fn character_search_uses_rust_unicode_lowercase_matching() {
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 0,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
             add_character: Some(json!({
                 "type": "character",
                 "chaId": "unicode-name",
                 "name": "Éclair",
                 "chats": []
             })),
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(0)
         })
         .expect("add character with Unicode name");
 
@@ -3544,13 +3397,6 @@ fn replace_range_creates_conversation_at_explicit_configured_position() {
     assert_eq!(branch.value["message"].as_array().unwrap().len(), 3);
     assert!(matches!(
         store.commit(&WorkingSetCommit {
-            expected_revision: revision,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
             conversations: Some(vec![ConversationMutation::ReplaceRange {
                 character_id: "char-a".to_owned(),
                 conversation_id: "conv-branch".to_owned(),
@@ -3562,9 +3408,7 @@ fn replace_range_creates_conversation_at_explicit_configured_position() {
                 })),
                 configured_index: Some(0),
             }]),
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(revision)
         }),
         Err(StoreError::Validation { .. })
     ));
@@ -3575,17 +3419,8 @@ fn replace_range_creates_conversation_at_explicit_configured_position() {
 fn cas_conflict_preserves_current_revision() {
     let (_directory, mut store, _) = open_fixture();
     let result = store.commit(&WorkingSetCommit {
-        expected_revision: 0,
         root: Some(json!({ "username": "stale" })),
-        replace_presets: None,
-        character: None,
-        character_details: None,
-        replace_character: None,
-        add_character: None,
-        conversations: None,
-        delete_character_id: None,
-        asset_owner_heads: None,
-        plugin_storage: None,
+        ..empty_working_set_commit(0)
     });
 
     assert!(matches!(
@@ -3624,17 +3459,9 @@ fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
 
     let revision = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(changed_root),
-            replace_presets: None,
-            character: None,
-            character_details: None,
             replace_character: Some(replacement),
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("replace selected character")
         .revision;
@@ -3700,17 +3527,8 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
     let (_directory, mut store, database) = open_fixture();
     let deleted = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
             delete_character_id: Some("char-a".to_owned()),
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("delete middle configured character");
     assert!(store
@@ -3726,17 +3544,8 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
     replacement["name"] = json!("New character");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: deleted.revision,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
             replace_character: Some(replacement),
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(deleted.revision)
         })
         .expect("add replacement after configured gap");
 
@@ -3771,17 +3580,9 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
 
     assert!(matches!(
         store.commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "must roll back" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
             replace_character: Some(invalid.clone()),
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         }),
         Err(StoreError::Validation { .. })
     ));
@@ -3798,17 +3599,8 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
     );
     assert!(matches!(
         store.commit(&WorkingSetCommit {
-            expected_revision: 0,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
             replace_character: Some(invalid),
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(0)
         }),
         Err(StoreError::RevisionConflict { .. })
     ));
@@ -3896,17 +3688,8 @@ fn revision_leases_are_isolated_then_released() {
     let lease = store.acquire_revision(1).expect("acquire revision lease");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "apiType": "fixture-provider", "username": "Changed" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("commit changed root");
 
@@ -3929,20 +3712,11 @@ fn ordinary_commit_during_a_lease_does_not_copy_any_generation_family() {
     let (_directory, mut store, _) = open_fixture();
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "counted-zero".to_owned(),
                 value: json!(0),
             }]),
+            ..empty_working_set_commit(1)
         })
         .expect("seed counted plugin record");
     let count_records = |store: &PersistentStore| {
@@ -3965,17 +3739,8 @@ fn ordinary_commit_during_a_lease_does_not_copy_any_generation_family() {
     let lease = store.acquire_revision(2).expect("acquire revision lease");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 2,
             root: Some(json!({ "username": "Changed without generation copy" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(2)
         })
         .expect("commit root while lease is active");
 
@@ -4152,20 +3917,11 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
         .expect("activate final-family staging");
     let seeded = store
         .commit(&WorkingSetCommit {
-            expected_revision: seeded.revision,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "lease-key".to_owned(),
                 value: json!({ "nested": [0, false, ""] }),
             }]),
+            ..empty_working_set_commit(seeded.revision)
         })
         .expect("seed plugin family before lease");
     let lease = store
@@ -4181,16 +3937,12 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
     changed_character["name"] = json!("Writer Alpha");
     let changed = store
         .commit(&WorkingSetCommit {
-            expected_revision: seeded.revision,
             root: Some(json!({
                 "username": "Writer root",
                 "modules": [{ "id": "writer-module" }]
             })),
             replace_presets: Some(vec![json!({ "name": "Writer preset" })]),
             character: Some(changed_character),
-            character_details: None,
-            replace_character: None,
-            add_character: None,
             conversations: Some(vec![ConversationMutation::ReplaceRange {
                 character_id: "char-a".to_owned(),
                 conversation_id: "conv-short".to_owned(),
@@ -4208,6 +3960,7 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
                 key: "lease-key".to_owned(),
                 value: json!("writer plugin"),
             }]),
+            ..empty_working_set_commit(seeded.revision)
         })
         .expect("mutate writer record families");
     let replacement_alias = AssetAlias {
@@ -4258,17 +4011,8 @@ fn two_revision_leases_remain_independent_until_each_is_released() {
     assert_eq!(store.lease_diagnostics().active_count, 2);
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Writer revision" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("commit writer revision");
 
@@ -4314,17 +4058,8 @@ fn native_job_store_uses_an_independent_connection_and_shared_reader_registry() 
     assert_eq!(store.lease_diagnostics().active_count, 1);
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Writer revision" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("advance live store while native job lease remains open");
     assert_eq!(
@@ -4346,32 +4081,17 @@ fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
     let (_directory, mut store, database) = open_fixture();
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "pinned-zero".to_owned(),
                 value: json!(0),
             }]),
+            ..empty_working_set_commit(1)
         })
         .expect("seed pinned plugin value");
     let lease = store.acquire_revision(2).expect("acquire revision lease");
     let revision = store
         .commit(&WorkingSetCommit {
-            expected_revision: 2,
             root: Some(json!({ "apiType": "fixture-provider", "username": "Changed" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
             conversations: Some(vec![ConversationMutation::ReplaceRange {
                 character_id: "char-a".to_owned(),
                 conversation_id: "conv-short".to_owned(),
@@ -4382,11 +4102,11 @@ fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
                 configured_index: None,
             }]),
             delete_character_id: Some("char-b".to_owned()),
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "pinned-zero".to_owned(),
                 value: json!(1),
             }]),
+            ..empty_working_set_commit(2)
         })
         .expect("commit active changes")
         .revision;
@@ -4508,17 +4228,8 @@ fn character_detail_update_preserves_index_and_conversations() {
 
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
             character: Some(detail.clone()),
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("commit character detail update");
 
@@ -4576,20 +4287,12 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
 
     let prepared = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
             character: Some(group.clone()),
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "zero".to_owned(),
                 value: json!(0),
             }]),
+            ..empty_working_set_commit(1)
         })
         .expect("prepare group and plugin value");
     let configured_index_before = store
@@ -4633,17 +4336,10 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
         .remove("name");
 
     let failed = store.commit(&WorkingSetCommit {
-        expected_revision: prepared.revision,
         root: Some(json!({ "username": "Must roll back" })),
-        replace_presets: None,
-        character: None,
         character_details: Some(vec![updated_group.clone(), invalid_detail]),
-        replace_character: None,
-        add_character: None,
-        conversations: None,
         delete_character_id: Some("char-a".to_owned()),
-        asset_owner_heads: None,
-        plugin_storage: None,
+        ..empty_working_set_commit(prepared.revision)
     });
 
     assert!(failed.is_err());
@@ -4674,17 +4370,10 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
 
     let committed = store
         .commit(&WorkingSetCommit {
-            expected_revision: prepared.revision,
             root: Some(json!({ "username": "Committed" })),
-            replace_presets: None,
-            character: None,
             character_details: Some(vec![updated_group]),
-            replace_character: None,
-            add_character: None,
-            conversations: None,
             delete_character_id: Some("char-a".to_owned()),
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(prepared.revision)
         })
         .expect("commit batch delete");
 
@@ -4789,17 +4478,10 @@ fn invalid_batch_character_detail_ids_leave_every_character_row_unchanged() {
 
     for (name, character_details, delete_character_id) in cases {
         let result = store.commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Must not persist" })),
-            replace_presets: None,
-            character: None,
             character_details: Some(character_details),
-            replace_character: None,
-            add_character: None,
-            conversations: None,
             delete_character_id,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         });
 
         assert!(
@@ -4921,17 +4603,8 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
     );
     store
         .commit(&WorkingSetCommit {
-            expected_revision: revision,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
             add_character: Some(json!({ "chaId": "char-zero", "name": "Zero", "chats": [] })),
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(revision)
         })
         .expect("add character without lastInteraction");
 
@@ -5114,36 +4787,18 @@ fn reopen_invalidates_runtime_and_legacy_leases_then_reclaims_inactive_generatio
     let (directory, mut store, _) = open_fixture();
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
-            root: None,
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "ttl-zero".to_owned(),
                 value: json!(0),
             }]),
+            ..empty_working_set_commit(1)
         })
         .expect("seed leased plugin value");
     let lease = store.acquire_revision(2).expect("acquire revision lease");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 2,
             root: Some(json!({ "username": "Active after lease" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(2)
         })
         .expect("fork active generation");
     store
@@ -5204,20 +4859,12 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
     let (directory, mut store, _) = open_fixture();
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Pilot-mutated root" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "rollback-compatible".to_owned(),
                 value: json!({ "pilot": true }),
             }]),
+            ..empty_working_set_commit(1)
         })
         .expect("mutate fixture through WAL pilot");
     let database_path = directory.path().join("persistent/persistent.db");
@@ -6343,17 +5990,9 @@ fn database_only_replace_preserves_owner_head_across_nested_object_key_order() {
     );
     let activated = store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(root(&database)),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            plugin_storage: None,
             asset_owner_heads: Some(vec![head.clone()]),
+            ..empty_working_set_commit(1)
         })
         .expect("activate semantic owner tuple");
 
@@ -8394,17 +8033,9 @@ fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
     let mut store = PersistentStore::open(directory.path()).expect("open current v5 store");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 0,
             root: Some(json!({ "username": "Preserved live database" })),
             replace_presets: Some(vec![json!({ "name": "Live preset" })]),
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(0)
         })
         .expect("seed live database");
 
@@ -8460,17 +8091,8 @@ fn semantically_invalid_pending_v1_snapshot_preserves_live_database_and_restore_
     let mut store = PersistentStore::open(directory.path()).expect("open current v5 store");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 0,
             root: Some(json!({ "username": "Preserved semantic live database" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(0)
         })
         .expect("seed semantic live database");
 
@@ -8546,17 +8168,8 @@ fn snapshots_create_list_and_restore_on_reopen() {
 
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Changed after snapshot" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("change database after snapshot");
     store
@@ -9469,17 +9082,8 @@ fn dropping_store_with_active_lease_reopens_latest_state_and_truncates_recovered
     let lease = store.acquire_revision(1).expect("acquire WAL reader");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Writer survives lease drop" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("append writer state while lease is active");
     let database_path = directory.path().join("persistent/persistent.db");
@@ -9640,17 +9244,8 @@ fn pending_restore_reopens_cleanly_after_the_store_drops_an_active_lease() {
         .expect("create snapshot while lease is active");
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Writer after restore snapshot" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("commit after restore snapshot");
     store
@@ -9686,17 +9281,8 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
     }
     store
         .commit(&WorkingSetCommit {
-            expected_revision: 1,
             root: Some(json!({ "username": "Current before restore" })),
-            replace_presets: None,
-            character: None,
-            character_details: None,
-            replace_character: None,
-            add_character: None,
-            conversations: None,
-            delete_character_id: None,
-            asset_owner_heads: None,
-            plugin_storage: None,
+            ..empty_working_set_commit(1)
         })
         .expect("change current data");
     store
@@ -9750,17 +9336,8 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
         let (directory, mut store, database) = open_fixture();
         store
             .commit(&WorkingSetCommit {
-                expected_revision: 1,
                 root: Some(json!({ "username": "Current protected data" })),
-                replace_presets: None,
-                character: None,
-                character_details: None,
-                replace_character: None,
-                add_character: None,
-                conversations: None,
-                delete_character_id: None,
-                asset_owner_heads: None,
-                plugin_storage: None,
+                ..empty_working_set_commit(1)
             })
             .expect("change current data");
         let expected = store.materialize(None).expect("materialize current data");
