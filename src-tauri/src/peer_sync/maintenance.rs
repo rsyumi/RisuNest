@@ -381,8 +381,10 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, PeerSyncError> {
 }
 
 #[tauri::command(async)]
-pub(crate) fn peer_backup_list(app: AppHandle) -> Result<Vec<PeerBackupInfo>, PeerSyncError> {
-    list_backups(&app_root(&app)?)
+pub(crate) fn peer_backup_list(app: AppHandle) -> Result<Vec<PeerBackupInfo>, String> {
+    app_root(&app)
+        .and_then(|root| list_backups(&root))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(async)]
@@ -395,11 +397,15 @@ pub(crate) fn peer_backup_delete(
 }
 
 #[tauri::command(async)]
-pub(crate) fn peer_temp_usage(app: AppHandle) -> Result<PeerTempUsage, PeerSyncError> {
-    temp_usage(&app_root(&app)?)
+pub(crate) fn peer_temp_usage(app: AppHandle) -> Result<PeerTempUsage, String> {
+    app_root(&app)
+        .and_then(|root| temp_usage(&root))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(async)]
-pub(crate) fn peer_temp_cleanup(app: AppHandle) -> Result<PeerTempUsage, PeerSyncError> {
-    cleanup_temp(&app_root(&app)?)
+pub(crate) fn peer_temp_cleanup(app: AppHandle) -> Result<PeerTempUsage, String> {
+    app_root(&app)
+        .and_then(|root| cleanup_temp(&root))
+        .map_err(|error| error.to_string())
 }

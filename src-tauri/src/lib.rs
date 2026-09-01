@@ -502,6 +502,8 @@ pub fn run() {
             app.manage(peer_sync::delta_commands::PeerDeltaCommandState::default());
             #[cfg(any(desktop, target_os = "android"))]
             app.manage(peer_sync::bidirectional_commands::PeerBidirectionalCommandState::default());
+            #[cfg(desktop)]
+            app.manage(peer_sync::shared_session::DeviceSyncSourceState::default());
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -673,6 +675,45 @@ pub fn run() {
             peer_sync::bidirectional_commands::peer_bidirectional_resume,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_acknowledge,
+            persistent_store::commands::pds_storage_stats,
+            persistent_store::commands::pds_snapshot_delete,
+            persistent_store::commands::pds_asset_gc_preview,
+            persistent_store::commands::pds_asset_gc_execute,
+            peer_sync::maintenance::peer_backup_list,
+            peer_sync::maintenance::peer_backup_delete,
+            peer_sync::maintenance::peer_temp_usage,
+            peer_sync::maintenance::peer_temp_cleanup,
+            native_log::native_log_tail,
+            native_log::native_log_file_path,
+            native_log::native_log_set_file_enabled,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registry_commands::peer_sync_outgoing_devices,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registry_commands::peer_sync_incoming_sources,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registry_commands::peer_sync_remove_incoming_source,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registry_commands::peer_sync_revoke_outgoing_device,
+            #[cfg(desktop)]
+            peer_sync::shared_session::device_sync_prepare,
+            #[cfg(desktop)]
+            peer_sync::shared_session::device_sync_start,
+            #[cfg(desktop)]
+            peer_sync::shared_session::device_sync_status,
+            #[cfg(desktop)]
+            peer_sync::shared_session::device_sync_stop,
+            #[cfg(desktop)]
+            peer_sync::shared_session::device_sync_rotate_link,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registered_target_commands::peer_sync_registered_hello,
+            #[cfg(desktop)]
+            peer_sync::registered_target_commands::peer_clone_claim_registered_client,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registered_target_commands::peer_delta_pull_registered,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registered_target_commands::peer_bidirectional_sync_registered,
+            #[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registered_target_commands::peer_bidirectional_resolve_registered,
             oauth_login,
             native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,
@@ -774,6 +815,12 @@ pub fn run() {
                 .shutdown_for_exit();
             app.state::<peer_sync::bidirectional_commands::PeerBidirectionalCommandState>()
                 .shutdown_for_exit();
+            if let Err(error) = app
+                .state::<peer_sync::shared_session::DeviceSyncSourceState>()
+                .stop()
+            {
+                crate::nlog!("warn", "device sync exit shutdown failed: {error}");
+            }
         }
         #[cfg(not(desktop))]
         let _ = (app, event);
