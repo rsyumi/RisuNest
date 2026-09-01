@@ -320,34 +320,49 @@ describe('persistent plugin storage capture', () => {
 })
 
 describe('persistent conversation replacement publication', () => {
-    it('forwards replacement options without changing the selected character', async () => {
+    it('forwards inactive replacement options without changing active selection', async () => {
         const harness = await createActiveSessionRuntimeHarness()
+        harness.database.characters.push({
+            type: 'character',
+            chaId: 'char-b',
+            name: 'Inactive',
+            chatPage: 0,
+            chats: [{
+                id: 'chat-b',
+                name: 'Inactive chat',
+                note: '',
+                localLore: [],
+                message: [],
+            }],
+        } as any)
         const selectedCharacterId = harness.database.characters[0].chaId
+        const selectedConversationId = harness.database.characters[0].chats[0].id
         const replacement = {
-            ...structuredClone(harness.database.characters[0].chats[0]),
+            ...structuredClone(harness.database.characters[1].chats[0]),
             name: 'Runtime replacement',
         }
 
         await expect(harness.runtime.replacePersistentConversation(
-            'char-a',
-            'chat-a',
+            'char-b',
+            'chat-b',
             'plugin-chat-set',
             replacement,
             { expectedRevision: 1 },
         )).resolves.toBe(true)
 
         expect(harness.database.characters[0].chaId).toBe(selectedCharacterId)
-        expect(harness.database.characters[0].chats[0]).toEqual(replacement)
+        expect(harness.database.characters[0].chats[0].id).toBe(selectedConversationId)
+        expect(harness.database.characters[1].chats[0]).toEqual(replacement)
         expect(harness.store.commit).toHaveBeenCalledWith(expect.objectContaining({
             expectedRevision: 1,
             conversations: [expect.objectContaining({
-                characterId: 'char-a',
-                conversationId: 'chat-a',
+                characterId: 'char-b',
+                conversationId: 'chat-b',
             })],
         }))
         await expect(harness.runtime.replacePersistentConversation(
-            'char-a',
-            'chat-a',
+            'char-b',
+            'chat-b',
             'plugin-chat-set',
             replacement,
             { expectedRevision: 1 },

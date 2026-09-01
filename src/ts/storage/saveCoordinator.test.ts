@@ -329,6 +329,84 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    it('keeps a nonresident selected sibling summary out of an unrelated root flush', async () => {
+        const database = makeDatabase()
+        const active = {
+            id: 'chat-a', name: 'Active', message: [{ role: 'user', data: 'active' }],
+        } as Chat
+        let durableSibling = {
+            id: 'chat-b', name: 'Sibling', message: [{ role: 'char', data: 'durable sibling' }],
+        } as Chat
+        database.characters[0].chats = [
+            active,
+            createConversationSummaryStubFromChat('char-a', durableSibling, 1),
+        ]
+        let revision = 7
+        const commit = vi.fn(async (input: WorkingSetCommit) => {
+            revision++
+            const exact = input.conversations?.[0]
+            if (exact?.type === 'replace-range' && exact.conversationId === 'chat-b') {
+                durableSibling = {
+                    ...durableSibling,
+                    ...exact.conversation,
+                    message: structuredClone(exact.messages),
+                } as Chat
+            }
+            return { revision }
+        })
+        const store = {
+            commit,
+            readConversation: vi.fn(async (_characterId: string, conversationId: string) => ({
+                revision,
+                value: structuredClone(conversationId === 'chat-a' ? active : durableSibling),
+            })),
+            readCharacter: vi.fn(async () => ({
+                revision,
+                value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
+            })),
+            queryConversations: vi.fn(async () => ({
+                revision,
+                items: [active, durableSibling].map((chat, configuredIndex) => ({
+                    id: chat.id!,
+                    characterId: 'char-a',
+                    name: chat.name ?? '',
+                    configuredIndex,
+                    recentAt: 0,
+                    messageCount: chat.message.length,
+                })),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishConversationReplacement: (result) => {
+                database.characters[0].chats[1] = createConversationSummaryStubFromChat(
+                    result.characterId,
+                    result.conversation,
+                    1,
+                )
+            },
+        })
+        coordinator.initialize(7, database)
+        const replacement = { ...durableSibling, name: 'Updated sibling' }
+
+        await coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'plugin-chat-set', replacement,
+        )
+        database.username = 'Unrelated root change'
+        coordinator.markPersistentDataDirty(32)
+        await coordinator.flushPendingData('unrelated-root-change')
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0]).toEqual({
+            expectedRevision: 8,
+            root: expect.objectContaining({ username: 'Unrelated root change' }),
+        })
+    })
+
     it('publishes the committed exact conversation revision officially', async () => {
         const database = makeDatabase()
         database.characters[0].chats = [{

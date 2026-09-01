@@ -1956,6 +1956,7 @@ export class SaveCoordinator {
                 conversation: candidate,
             }, {
                 preservePendingWork: this.dirtyGeneration !== mutationGeneration,
+                residentBefore,
             })
             return true
         })
@@ -2452,7 +2453,7 @@ export class SaveCoordinator {
             } else if (
                 captured.character &&
                 (
-                    captured.characterCanonical !== this.characterBaseline ||
+                    !this.completeSelectedCaptureMatchesBaseline(captured) ||
                     recordedConversations !== null
                 )
             ) {
@@ -2864,12 +2865,15 @@ export class SaveCoordinator {
 
     private async finishPersistentConversationReplacement(
         result: PersistentConversationReplacementResult,
-        options: { preservePendingWork?: boolean } = {},
+        options: {
+            preservePendingWork?: boolean
+            residentBefore?: { conversation: Chat; canonical: string } | null
+        } = {},
     ): Promise<void> {
         this.currentRevision = result.revision
         this.dirtyGeneration++
         this.dependencies.publishConversationReplacement?.(result)
-        this.advanceCharacterBaselineForConversation(result)
+        this.advanceCharacterBaselineForConversation(result, options.residentBefore ?? null)
         if (!options.preservePendingWork) this.pendingByteCount = 0
         this.lastBackgroundErrorMessage = null
         this.dependencies.onLocalRevision?.(result.revision)
@@ -2927,7 +2931,7 @@ export class SaveCoordinator {
                     characterId: options.characterId,
                     conversationId: options.conversationId,
                     conversation: resident.conversation,
-                })
+                }, resident)
                 break
             }
             deleteCount = candidate.message.length
@@ -3163,7 +3167,7 @@ export class SaveCoordinator {
                 characterId: pending.characterId,
                 conversationId: pending.conversationId,
                 conversation: resident.conversation,
-            })
+            }, resident)
         }
     }
 
@@ -3223,8 +3227,10 @@ export class SaveCoordinator {
 
     private advanceCharacterBaselineForConversation(
         result: PersistentConversationReplacementResult,
+        residentBefore: { conversation: Chat; canonical: string } | null,
     ): void {
         if (
+            residentBefore === null ||
             this.windowedCharacterBaseline !== null ||
             this.characterBaselineId !== result.characterId ||
             this.characterBaseline === null
@@ -3479,7 +3485,26 @@ export class SaveCoordinator {
                 )
         }
         return captured.windowedCharacter === null
-            && captured.characterCanonical === this.characterBaseline
+            && this.completeSelectedCaptureMatchesBaseline(captured)
+    }
+
+    private completeSelectedCaptureMatchesBaseline(captured: CapturedState): boolean {
+        if (captured.characterCanonical === this.characterBaseline) return true
+        if (
+            captured.character === null ||
+            this.characterBaseline === null ||
+            captured.character.chaId !== this.characterBaselineId
+        ) return false
+        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+        if (captured.character.chats.length !== baseline.chats.length) return false
+        const projected = canonicalClone(captured.character)
+        for (let index = 0; index < projected.chats.length; index++) {
+            const conversationId = projected.chats[index]?.id
+            if (!conversationId || !captured.conversationStubIds.has(conversationId)) continue
+            if (baseline.chats[index]?.id !== conversationId) return false
+            projected.chats[index] = baseline.chats[index]
+        }
+        return canonicalJson(projected) === this.characterBaseline
     }
 
     private projectConversationMutations(
