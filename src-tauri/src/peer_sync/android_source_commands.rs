@@ -2,6 +2,7 @@
 use super::android_foreground::test_registry_guard;
 use super::{
     android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane},
+    device_registry::{platform_device_name, DevicePermissions},
     prepare_lossless_clone_session, LanCloneHost, PeerSyncError,
 };
 use crate::{
@@ -77,6 +78,14 @@ pub(crate) struct AndroidPeerCloneSourceState {
 impl AndroidPeerCloneSourceState {
     pub(crate) fn initialize() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
+        if let Ok(source) = self.source.lock() {
+            if let Some(source) = source.as_ref() {
+                let _ = source.host.revoke(device_id);
+            }
+        }
     }
 
     fn status(&self) -> Result<AndroidSourceStatus, String> {
@@ -304,6 +313,9 @@ pub(crate) async fn peer_clone_android_source_prepare(
         .map_err(|error| error.to_string())?;
         let session_id = prepared.manifest().session_id.clone();
         let manifest_id = prepared.manifest_id().to_owned();
+        let mut host = LanCloneHost::prepare(prepared);
+        host.enable_v2_registry(&app_root, platform_device_name(), DevicePermissions::read())
+            .map_err(|error| error.to_string())?;
         *state
             .source
             .lock()
@@ -311,7 +323,7 @@ pub(crate) async fn peer_clone_android_source_prepare(
             session_id,
             manifest_id,
             root: source_root,
-            host: LanCloneHost::prepare(prepared),
+            host,
             pairing_uri: None,
             foreground: None,
             phase: AndroidSourcePhase::Prepared,
@@ -468,6 +480,48 @@ mod tests {
         assert!(capabilities.source_ready);
         assert!(!capabilities.desktop);
         assert!(!capabilities.tunnel_ready);
+    }
+
+    #[test]
+    fn android_prepared_host_enables_v2_registration_and_live_revoke() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("database.risusave");
+        fs::write(&database, b"android-v2").unwrap();
+        let prepared =
+            prepare_clone_session(&FixtureSource { database }, &root.path().join("source"))
+                .unwrap();
+        let mut host = LanCloneHost::prepare(prepared);
+        host.enable_v2_registry(root.path(), "Android", DevicePermissions::read())
+            .unwrap();
+        let pairing = host
+            .start_private_lan(discover_private_lan_address().unwrap())
+            .unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let target_root = tempfile::tempdir().unwrap();
+        let client = super::super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+            target_root.path(),
+            "Android target",
+            &target_root.path().join("credential.json"),
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        assert!(
+            crate::peer_sync::device_registry::OutgoingDeviceRegistry::load(root.path())
+                .unwrap()
+                .devices()
+                .len()
+                == 1
+        );
+        assert!(host.revoke(&client.device_id));
+        assert!(
+            crate::peer_sync::device_registry::OutgoingDeviceRegistry::load(root.path())
+                .unwrap()
+                .devices()
+                .is_empty()
+        );
     }
 
     #[test]
