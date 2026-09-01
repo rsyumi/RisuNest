@@ -37,6 +37,7 @@ describe('production device sync composition', () => {
         })
 
         expect(sourceAndroid).toHaveBeenCalledOnce()
+        expect(sourceAndroid).toHaveBeenCalledWith(runtime)
         expect(sourceDesktop).not.toHaveBeenCalled()
         expect(createController.mock.calls[0]?.[0]).toMatchObject({ facade: androidFacade })
     })

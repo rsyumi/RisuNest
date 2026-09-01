@@ -12,6 +12,7 @@ const foreground = {
 function fixture(options: {
     startSource?: () => boolean
     stopSource?: () => boolean
+    flushPendingData?: (reason: string) => Promise<void>
 } = {}) {
     const calls: Array<[string, Record<string, unknown> | undefined]> = []
     const invoke = vi.fn(async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
@@ -28,11 +29,13 @@ function fixture(options: {
         startSource: vi.fn(options.startSource ?? (() => true)),
         stopSource: vi.fn(options.stopSource ?? (() => true)),
     }
+    const flushPendingData = vi.fn(options.flushPendingData ?? (async () => undefined))
     return {
         calls,
         invoke,
         bridge,
-        facade: createAndroidDeviceSyncFacade({ invoke, bridge }),
+        flushPendingData,
+        facade: createAndroidDeviceSyncFacade({ invoke, bridge, flushPendingData }),
     }
 }
 
@@ -50,6 +53,44 @@ describe('Android unified device sync source facade', () => {
             'device_sync_prepare',
             { request: { method: 'lan', fixedPort: 32145, publicBaseUrl: '' } },
         ]])
+    })
+
+    it('awaits the persistent-data flush before native LAN preparation', async () => {
+        const events: string[] = []
+        let finishFlush: (() => void) | undefined
+        const { facade, invoke, flushPendingData } = fixture({
+            flushPendingData: async () => {
+                events.push('flush-start')
+                await new Promise<void>((resolve) => { finishFlush = resolve })
+                events.push('flush-finish')
+            },
+        })
+        invoke.mockImplementation(async (command: string) => {
+            events.push(command)
+            return { phase: 'prepared' }
+        })
+
+        const preparing = facade.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
+        await vi.waitFor(() => expect(events).toEqual(['flush-start']))
+        expect(invoke).not.toHaveBeenCalled()
+
+        finishFlush?.()
+        await preparing
+
+        expect(flushPendingData).toHaveBeenCalledWith('device-sync-source-prepare')
+        expect(events).toEqual(['flush-start', 'flush-finish', 'device_sync_prepare'])
+    })
+
+    it('does not invoke native preparation when the persistent-data flush fails', async () => {
+        const flushFailure = new Error('flush failed')
+        const { facade, invoke } = fixture({
+            flushPendingData: async () => { throw flushFailure },
+        })
+
+        await expect(facade.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .rejects.toBe(flushFailure)
+
+        expect(invoke).not.toHaveBeenCalled()
     })
 
     it('recovers once, reserves once, and attaches the exact foreground identity without secrets', async () => {
