@@ -60,6 +60,14 @@ const harness = vi.hoisted(() => {
     })
     const embeddingAddText = vi.fn(async () => undefined)
     const embeddingSearch = vi.fn(async () => [['happy', 1]])
+    const chatOutput = new Set<(arg: any) => void | Promise<void>>()
+    const chatOutputListenerProvenance = new WeakMap<object, 'v2.1-live' | 'v3-legacy'>()
+    const projectChatOutput = vi.fn(async (input: any) => ({
+        char: structuredClone(input.liveCharacter),
+        chat: structuredClone(input.liveConversation),
+    }))
+    const setChatToIndex = vi.fn(async (chat: any) => structuredClone(chat))
+    const flushPendingData = vi.fn(async () => undefined)
 
     return {
         store,
@@ -85,6 +93,11 @@ const harness = vi.hoisted(() => {
         notificationConstruct,
         embeddingAddText,
         embeddingSearch,
+        chatOutput,
+        chatOutputListenerProvenance,
+        projectChatOutput,
+        setChatToIndex,
+        flushPendingData,
         isLastCharPunctuation: vi.fn(() => true),
     }
 })
@@ -153,7 +166,14 @@ vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHar
 vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module())
 vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule())
 vi.mock('../globalApi.svelte', async () => (await import('./tests/sendChatTestHarness')).globalApiModule())
-vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChatTestHarness')).pluginsModule())
+vi.mock('../plugins/plugins.svelte', () => ({
+    pluginV2: { chatOutput: harness.chatOutput },
+    chatOutputListenerProvenance: harness.chatOutputListenerProvenance,
+    pluginCompatibility: { profile: 'scalable-v3' },
+}))
+vi.mock('../plugins/pluginDatabaseAccess', () => ({
+    createProductionPluginChatOutputProjector: () => harness.projectChatOutput,
+}))
 vi.mock('./presetChain', async () => (await import('./tests/sendChatTestHarness')).presetChainModule())
 vi.mock('./generationState', () => ({
     doingChat: harness.doingChat,
@@ -181,6 +201,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     acquireCompleteConversation: vi.fn(),
     getActiveConversationSession: () => null,
     invalidateActiveConversationSession: vi.fn(),
+    flushPendingData: harness.flushPendingData,
 }))
 
 import { sendChat } from './index.svelte'
@@ -302,6 +323,7 @@ beforeEach(() => {
     harness.events.length = 0
     harness.requests.length = 0
     harness.characters.clear()
+    harness.chatOutput.clear()
     const character = makeCharacter()
     harness.characters.set(character.chaId, character)
     harness.DBState.db = makeDatabase(character)
@@ -332,6 +354,11 @@ beforeEach(() => {
     harness.embeddingAddText.mockResolvedValue(undefined)
     harness.embeddingSearch.mockResolvedValue([['happy', 1]])
     harness.notificationRequest.mockResolvedValue('granted')
+    harness.projectChatOutput.mockImplementation(async (input: any) => ({
+        char: structuredClone(input.liveCharacter),
+        chat: structuredClone(input.liveConversation),
+    }))
+    harness.setChatToIndex.mockImplementation(async (chat: any) => structuredClone(chat))
 
     class TestNotification {
         static requestPermission = harness.notificationRequest
@@ -344,6 +371,60 @@ beforeEach(() => {
 })
 
 describe('sendChat generation durability control flow', () => {
+    it('dispatches final transformed output sequentially before persistence acknowledgement', async () => {
+        const firstListener = deferred()
+        const firstStarted = deferred()
+        const listenerEvents: string[] = []
+        let durableChat: any
+        const first = vi.fn(async (arg: any) => {
+            listenerEvents.push(`first:${arg.chat.message.at(-1).data}`)
+            firstStarted.resolve()
+            await firstListener.promise
+        })
+        const second = vi.fn(async (arg: any) => {
+            listenerEvents.push(`second:${arg.chat.message.at(-1).data}`)
+            const replacement = structuredClone(arg.chat)
+            replacement.note = 'persisted by targeted setter'
+            durableChat = await harness.setChatToIndex(replacement)
+        })
+        harness.chatOutput.add(first)
+        harness.chatOutput.add(second)
+        harness.chatOutputListenerProvenance.set(first, 'v3-legacy')
+        harness.chatOutputListenerProvenance.set(second, 'v3-legacy')
+        harness.runTrigger.mockImplementation(async (_char, event, context) => {
+            if (event !== 'output') return null
+            const chat = structuredClone(context.chat)
+            chat.message.at(-1).data = 'trigger transformed'
+            return { chat }
+        })
+        harness.runInlayScreen.mockImplementation((_char, text: string) => ({
+            text: text === 'trigger transformed' ? 'inlay transformed' : text,
+        }))
+        harness.requests.push(streaming('provider output'))
+
+        const sending = sendChat()
+        await firstStarted.promise
+
+        expect(first).toHaveBeenCalledOnce()
+        expect(second).not.toHaveBeenCalled()
+        expect(harness.acknowledge).not.toHaveBeenCalled()
+        firstListener.resolve()
+        await expect(sending).resolves.toBe(true)
+
+        expect(listenerEvents).toEqual([
+            'first:inlay transformed',
+            'second:inlay transformed',
+        ])
+        expect(durableChat).toMatchObject({
+            note: 'persisted by targeted setter',
+            message: [expect.anything(), expect.objectContaining({ data: 'inlay transformed' })],
+        })
+        expect(harness.setChatToIndex).toHaveBeenCalledOnce()
+        expect(harness.events.indexOf('ack')).toBeGreaterThan(-1)
+        expect(harness.flushPendingData).not.toHaveBeenCalled()
+        expect(harness.projectChatOutput).toHaveBeenCalledOnce()
+    })
+
     it('acknowledges a non-streaming response before notification and peer publication', async () => {
         const acknowledgement = deferred()
         harness.acknowledge.mockImplementationOnce(async () => {

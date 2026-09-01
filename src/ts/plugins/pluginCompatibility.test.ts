@@ -7,7 +7,6 @@ import {
     createPluginLoadOrchestrator,
     createPluginLoadReentrancyGuard,
     getManualPluginInstallVersion,
-    preparePluginFullObjectCallbackRegistration,
     runPluginFullObjectReplacement,
     runPluginUnloadCallbacks,
     runAwaitablePluginLoader,
@@ -39,15 +38,15 @@ describe('manual plugin installation compatibility', () => {
 })
 
 describe('plugin compatibility profiles', () => {
-    it('keeps legacy output listeners maximum-only until their projector is installed', () => {
+    it('keeps direct maximum full-object replacements gated', () => {
         expect(() => assertPluginFullObjectCompatibility(
             'scalable-v3',
-            'addRisuChatListener',
-        )).toThrow(/addRisuChatListener.*maximum-compatibility.*queryCharacters/i)
+            'setCharacter',
+        )).toThrow(/setCharacter.*maximum-compatibility.*queryCharacters/i)
 
         expect(() => assertPluginFullObjectCompatibility(
             'maximum-compatibility',
-            'addRisuChatListener',
+            'setCharacter',
         )).not.toThrow()
     })
 
@@ -67,27 +66,6 @@ describe('plugin compatibility profiles', () => {
 
         expect(result).toBe('replaced')
         expect(events).toEqual(['replace', 'invalidate'])
-    })
-
-    it('rechecks plugin lifetime and profile after an asynchronous permission wait', () => {
-        const controller = new AbortController()
-        controller.abort()
-
-        expect(preparePluginFullObjectCallbackRegistration(
-            'scalable-v3',
-            'addRisuChatListener',
-            controller.signal,
-        )).toBe(false)
-        expect(() => preparePluginFullObjectCallbackRegistration(
-            'scalable-v3',
-            'addRisuChatListener',
-            new AbortController().signal,
-        )).toThrow(/maximum-compatibility/i)
-        expect(preparePluginFullObjectCallbackRegistration(
-            'maximum-compatibility',
-            'addRisuChatListener',
-            new AbortController().signal,
-        )).toBe(true)
     })
 
     it('selects scalable mode unless an enabled API v2.1 plugin exists', () => {

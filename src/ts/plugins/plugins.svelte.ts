@@ -42,6 +42,11 @@ import {
     applyPluginDatabaseUpdate,
     validatePluginDatabaseUpdate,
 } from "./pluginDatabaseAccess";
+import {
+    registerChatOutputListener,
+    removeChatOutputListener,
+    type ChatOutputListener,
+} from './pluginChatOutputListeners'
 
 export const customProviderStore = writable([] as string[])
 
@@ -587,9 +592,6 @@ export type PluginV2ProviderOptions = {
 
 export type EditFunction = (content: string) => string | null | undefined | Promise<string | null | undefined>
 type ReplacerFunction = (content: OpenAIChat[], type: string) => OpenAIChat[] | Promise<OpenAIChat[]>
-type ChatOutputListenerArg = { char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number }
-type ChatOutputListener = (arg: ChatOutputListenerArg) => void | Promise<void>
-
 export const pluginV2 = {
     providers: new Map<string, (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>>(),
     providerOptions: new Map<string, PluginV2ProviderOptions>(),
@@ -603,6 +605,10 @@ export const pluginV2 = {
     unload: new Set<() => void | Promise<void>>(),
     loaded: false
 }
+export const chatOutputListenerProvenance = new WeakMap<
+    ChatOutputListener,
+    'v2.1-live' | 'v3-legacy'
+>()
 
 export const allowedDbKeys = [
     'characters',
@@ -710,7 +716,12 @@ export const getV2PluginAPIs = () => {
         },
         addRisuChatListener: (mode: string, func: ChatOutputListener) => {
             if (mode === 'output') {
-                pluginV2.chatOutput.add(func)
+                registerChatOutputListener(
+                    pluginV2.chatOutput,
+                    chatOutputListenerProvenance,
+                    func,
+                    'v2.1-live',
+                )
             }
             else {
                 throw (`chat listener mode ${mode} not found`)
@@ -718,7 +729,11 @@ export const getV2PluginAPIs = () => {
         },
         removeRisuChatListener: (mode: string, func: ChatOutputListener) => {
             if (mode === 'output') {
-                pluginV2.chatOutput.delete(func)
+                removeChatOutputListener(
+                    pluginV2.chatOutput,
+                    chatOutputListenerProvenance,
+                    func,
+                )
             }
             else {
                 throw (`chat listener mode ${mode} not found`)

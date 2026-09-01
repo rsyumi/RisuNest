@@ -209,7 +209,11 @@ export function globalApiModule(overrides: ModuleOverrides = {}) {
 }
 
 export function pluginsModule(chatOutput: Set<unknown> = new Set()) {
-    return { pluginV2: { chatOutput } }
+    return {
+        pluginV2: { chatOutput },
+        chatOutputListenerProvenance: new WeakMap(),
+        pluginCompatibility: { profile: 'maximum-compatibility' },
+    }
 }
 
 export function presetChainModule(overrides: ModuleOverrides = {}) {

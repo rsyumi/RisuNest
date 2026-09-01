@@ -1,4 +1,4 @@
-import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginCompatibility, pluginStorageStore, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
+import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, chatOutputListenerProvenance, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginCompatibility, pluginStorageStore, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
@@ -51,10 +51,13 @@ import {
 import type { CompleteConversationLease } from "src/ts/storage/activeWorkingSet.svelte";
 import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
 import {
-    assertPluginFullObjectCompatibility,
-    preparePluginFullObjectCallbackRegistration,
     runPluginFullObjectReplacement,
 } from "../pluginCompatibility";
+import {
+    registerChatOutputListener,
+    removeChatOutputListener,
+    type ChatOutputListener,
+} from '../pluginChatOutputListeners'
 import {
     createProductionPluginDatabaseAccess,
     linkPluginQueryAbortSignals,
@@ -711,8 +714,6 @@ function throwIfPluginReadAborted(signal: AbortSignal): void {
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
-    const requireFullObjectAccess = (operation: string) =>
-        assertPluginFullObjectCompatibility(pluginCompatibility.profile, operation)
     const pluginLifetime = new AbortController()
     const fullObjectContext = (): PluginFullObjectCallContext => ({
         pluginName: plugin.name,
@@ -826,21 +827,34 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         addRisuChatListener: async (mode:'output', func:Function) => {
-            requireFullObjectAccess('addRisuChatListener')
             //permission check, lets use same as replacer
             const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
             if(!conf){
                 return;
             }
-            if (!preparePluginFullObjectCallbackRegistration(
-                pluginCompatibility.profile,
-                'addRisuChatListener',
-                pluginLifetime.signal,
-            )) return
-            oldApis.addRisuChatListener(mode, func as any);
-            addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuChatListener(mode, func as any));
+            if (pluginLifetime.signal.aborted) return
+            if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
+            const listener = func as ChatOutputListener
+            registerChatOutputListener(
+                pluginV2.chatOutput,
+                chatOutputListenerProvenance,
+                listener,
+                'v3-legacy',
+            )
+            addPluginUnloadCallback(plugin.name, () => removeChatOutputListener(
+                pluginV2.chatOutput,
+                chatOutputListenerProvenance,
+                listener,
+            ));
         },
-        removeRisuChatListener: oldApis.removeRisuChatListener,
+        removeRisuChatListener: (mode:'output', func:Function) => {
+            if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
+            removeChatOutputListener(
+                pluginV2.chatOutput,
+                chatOutputListenerProvenance,
+                func as ChatOutputListener,
+            )
+        },
         setDatabaseLite: (database: Record<string, unknown>) =>
             getPluginDatabaseAccess().setDatabaseLite(database, allowedDbKeys),
         setDatabase: (database: Record<string, unknown>) =>

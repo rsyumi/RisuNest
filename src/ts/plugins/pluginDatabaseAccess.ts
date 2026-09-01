@@ -29,6 +29,7 @@ import {
     withPersistentRevisionLease,
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
+import { isConversationSummaryStub } from '../storage/conversationResidency'
 import type { PluginCompatibilityProfile } from './pluginCompatibility'
 
 export const PLUGIN_SUMMARY_QUERY_DEFAULT_LIMIT = 50
@@ -67,6 +68,22 @@ export interface PluginConversationWindow extends ConversationWindow {
 }
 
 export type PluginCompleteCharacter = Database['characters'][number]
+
+export interface PluginChatOutputProjectionInput {
+    characterId: string
+    conversationId: string
+    liveCharacter: PluginCompleteCharacter
+    liveConversation: Chat
+}
+
+export interface PluginChatOutputProjection {
+    char: PluginCompleteCharacter
+    chat: Chat
+}
+
+export type PluginChatOutputProjector = (
+    input: PluginChatOutputProjectionInput,
+) => Promise<PluginChatOutputProjection>
 
 export interface PluginFullObjectCallContext {
     pluginName: string
@@ -1130,4 +1147,44 @@ export function createProductionPluginDatabaseAccess(
         ...dependencies,
         store: getPersistentDataStore(),
     })
+}
+
+export function createProductionPluginChatOutputProjector(
+    snapshot: <T>(value: T) => T,
+): PluginChatOutputProjector {
+    let store: ReturnType<typeof getPersistentDataStore> | undefined
+    let openPromise: Promise<void> | undefined
+    return async (input) => {
+        const persistentStore = store ??= getPersistentDataStore()
+        await (openPromise ??= persistentStore.open())
+        const lease = await acquireCurrentRevisionWithRetry(
+            (revision) => persistentStore.acquireRevision(revision),
+            async () => (await persistentStore.readRoot()).revision,
+        )
+        return withPersistentRevisionLease(lease, async (reader) => {
+            const durable = await readPinnedCompleteCharacter(reader, input.characterId)
+            if (!durable) throw new Error(`Missing listener character ${input.characterId}`)
+
+            const liveCompleteChats = new Map(
+                input.liveCharacter.chats
+                    .filter((chat) => !isConversationSummaryStub(chat) && chat.id)
+                    .map((chat) => [chat.id!, snapshot(chat)]),
+            )
+            liveCompleteChats.set(input.conversationId, snapshot(input.liveConversation))
+
+            const { chats: _liveChats, ...liveDetail } = snapshot(input.liveCharacter)
+            const char = {
+                ...durable,
+                ...liveDetail,
+                chats: durable.chats.map(
+                    (chat) => liveCompleteChats.get(chat.id!) ?? chat,
+                ),
+            } as PluginCompleteCharacter
+            const chat = char.chats.find(
+                (candidate) => candidate.id === input.conversationId,
+            )
+            if (!chat) throw new Error(`Missing listener conversation ${input.conversationId}`)
+            return { char: snapshot(char), chat: snapshot(chat) }
+        })
+    }
 }

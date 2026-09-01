@@ -11,9 +11,11 @@ import type {
 import { RevisionConflictError } from '../storage/persistentDataStore'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { createCatalogCharacterStub } from '../storage/workingSetCatalog'
+import { createConversationSummaryStubFromChat } from '../storage/conversationResidency'
 import {
     createPluginDatabaseAccess,
     createProductionPluginDatabaseAccess,
+    createProductionPluginChatOutputProjector,
     linkPluginQueryAbortSignals,
     type PluginCompleteCharacter,
     type PluginFullObjectCallContext,
@@ -336,6 +338,63 @@ function callContext(): PluginFullObjectCallContext {
 }
 
 describe('plugin database access', () => {
+    it('projector overlays durable, dirty resident, and exact live output without flushing', async () => {
+        const harness = createHarness()
+        const durable = makeCharacter('active')
+        durable.name = 'Durable owner'
+        durable.chats.push({
+            id: 'active-chat-c',
+            name: 'C',
+            note: 'durable selected',
+            localLore: [],
+            message: [{ role: 'char', data: 'durable output' }],
+        })
+        const dirtyResident: PluginCompleteCharacter['chats'][number] = {
+            ...structuredClone(durable.chats[1]),
+            note: 'dirty resident metadata',
+            message: [{ role: 'user' as const, data: 'dirty resident message' }],
+        }
+        const liveSelected: PluginCompleteCharacter['chats'][number] = {
+            ...structuredClone(durable.chats[2]),
+            note: 'final live metadata',
+            message: [
+                ...durable.chats[2].message,
+                { role: 'char' as const, data: 'newly generated output' },
+            ],
+        }
+        const liveCharacter: PluginCompleteCharacter = {
+            ...structuredClone(durable),
+            name: 'Live owner detail',
+            chats: [
+                createConversationSummaryStubFromChat('active', durable.chats[0], 0),
+                dirtyResident,
+                liveSelected,
+            ],
+        }
+        harness.pinnedDatabases.push(makeFullObjectDatabase([durable]))
+        vi.mocked(getPersistentDataStore).mockReturnValue(harness.store)
+        const projector = createProductionPluginChatOutputProjector(structuredClone)
+
+        const projected = await projector({
+            characterId: 'active',
+            conversationId: 'active-chat-c',
+            liveCharacter,
+            liveConversation: liveSelected,
+        })
+
+        expect(projected.char.name).toBe('Live owner detail')
+        expect(projected.char.chats[0].message).toEqual(durable.chats[0].message)
+        expect(projected.char.chats[1]).toEqual(dirtyResident)
+        expect(projected.char.chats[2]).toEqual(liveSelected)
+        expect(projected.chat).toEqual(liveSelected)
+        expect(projected.chat).not.toBe(liveSelected)
+        expect(harness.releasedLeases).toHaveLength(1)
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+        expect(harness.flushPendingData).not.toHaveBeenCalled()
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
+    })
+
     it('merges active and trash configured order before resolving an index', async () => {
         const harness = createHarness()
         harness.pinnedDatabases.push(makeFullObjectDatabase([

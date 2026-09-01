@@ -32,7 +32,13 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
-import { pluginV2 } from "../plugins/plugins.svelte";
+import {
+    chatOutputListenerProvenance,
+    pluginCompatibility,
+    pluginV2,
+} from "../plugins/plugins.svelte";
+import { dispatchChatOutputListeners } from '../plugins/pluginChatOutputListeners'
+import { createProductionPluginChatOutputProjector } from '../plugins/pluginDatabaseAccess'
 import { activatePresetChainForRequest } from "./presetChain";
 import {
     reserveGeneration,
@@ -83,27 +89,27 @@ export interface OpenAIChat{
     cachePoint?: boolean
 }
 
-async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
+const projectPluginChatOutput = createProductionPluginChatOutputProjector(
+    <T>(value: T) => $state.snapshot(value) as T,
+)
+
+export async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
     if(pluginV2.chatOutput.size === 0){
         return
     }
-
-    const charSnapshot = $state.snapshot(char)
-    const chatSnapshot = $state.snapshot(chat)
-    for(const listener of pluginV2.chatOutput){
-        try {
-            await listener({
-                char: charSnapshot,
-                chat: chatSnapshot,
-                characterIndex,
-                chatIndex,
-                messageIndex,
-            })
-        }
-        catch(e) {
-            console.error(e)
-        }
-    }
+    await dispatchChatOutputListeners({
+        listeners: pluginV2.chatOutput,
+        provenance: chatOutputListenerProvenance,
+        profile: pluginCompatibility.profile,
+        char,
+        chat,
+        characterIndex,
+        chatIndex,
+        messageIndex,
+        snapshot: <T>(value: T) => $state.snapshot(value) as T,
+        projectScalable: projectPluginChatOutput,
+        onError: (error) => console.error(error),
+    })
 }
 
 export interface MultiModal{
