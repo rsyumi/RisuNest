@@ -21,6 +21,7 @@ mod client;
 pub(crate) mod commands;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod delta_commands;
+pub(crate) mod device_registry;
 // The loopback host is a test-only transport double; production clone hosting
 // goes through lan::LanCloneHost.
 #[cfg(all(desktop, test))]
@@ -34,6 +35,9 @@ pub(crate) mod maintenance;
 mod production;
 mod protocol;
 mod session;
+
+#[cfg(test)]
+mod device_registry_tests;
 
 #[cfg(desktop)]
 mod tunnel;
