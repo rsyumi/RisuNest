@@ -222,14 +222,19 @@ export function createNativeNewInlayImageEncoder(
         async encodeNewInlayImage(key, data, input) {
             const result = await invokeCommand(
                 'native_media_encode_inlay_image',
-                { id: key, data: Array.from(data), name: input.name },
+                {
+                    id: key,
+                    data: Array.from(data),
+                    name: input.name,
+                    ...(input.options === undefined ? {} : { options: input.options }),
+                },
             ) as NativeEncodedInlayImage
             const metadata = result.metadata
             if (
                 metadata.kind !== 'inlay'
                 || metadata.key !== key
-                || metadata.mime !== 'image/webp'
-                || metadata.ext !== 'webp'
+                || !(['image/webp', 'image/png', 'image/jpeg'] as const).includes(metadata.mime as never)
+                || !(['webp', 'png', 'jpg'] as const).includes(metadata.ext as never)
                 || metadata.inlayType !== 'image'
                 || !Number.isSafeInteger(metadata.width)
                 || !Number.isSafeInteger(metadata.height)

@@ -39,16 +39,16 @@ describe('native asset repository adapters', () => {
         })
     })
 
-    it('accepts only one unchanged-dimension WebP encoding result', async () => {
+    it('forwards configurable inlay options and accepts truthful PNG metadata', async () => {
         const invoke = vi.fn(async () => ({
             data: [4, 5, 6],
             metadata: {
                 key: 'inlay-id',
                 kind: 'inlay',
                 size: 3,
-                mime: 'image/webp',
+                mime: 'image/png',
                 name: 'Image',
-                ext: 'webp',
+                ext: 'png',
                 inlayType: 'image',
                 width: 13,
                 height: 17,
@@ -59,20 +59,24 @@ describe('native asset repository adapters', () => {
         await expect(encoder.encodeNewInlayImage(
             'inlay-id',
             Uint8Array.of(1, 2),
-            { name: 'Image' },
+            { name: 'Image', options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true } },
         )).resolves.toEqual({
             data: Uint8Array.of(4, 5, 6),
             metadata: {
                 kind: 'inlay',
-                mime: 'image/webp',
+                mime: 'image/png',
                 name: 'Image',
-                ext: 'webp',
+                ext: 'png',
                 inlayType: 'image',
                 width: 13,
                 height: 17,
             },
         })
         expect(invoke).toHaveBeenCalledOnce()
+        expect(invoke).toHaveBeenCalledWith('native_media_encode_inlay_image', {
+            id: 'inlay-id', data: [1, 2], name: 'Image',
+            options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true },
+        })
     })
 
     it('exposes a native-only durable CAS pin session without catalog enumeration', async () => {

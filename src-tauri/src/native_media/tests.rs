@@ -1,6 +1,7 @@
 use super::{
-    decode_physical_key, recover_inlay_writes, respond, sha256_hex, write_inlay_image,
-    write_inlay_image_with_suffix, InlayImageMetadata,
+    decode_physical_key, encode_inlay_image, recover_inlay_writes, respond, sha256_hex,
+    write_inlay_image, write_inlay_image_with_suffix, InlayEncodeFormat, InlayEncodeOptions,
+    InlayImageMetadata,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::json;
@@ -525,6 +526,87 @@ fn writes_png_inlay_as_full_dimension_webp_with_truthful_metadata() {
 }
 
 #[test]
+fn configurable_inlay_encoding_preserves_original_and_skipped_webp_bytes() {
+    let png = encoded_fixture(ImageFormat::Png, 8, 4);
+    let webp = encoded_fixture(ImageFormat::WebP, 8, 4);
+    for (source, format, skip, expected_mime, expected_ext, expected_bytes) in [
+        (
+            &png,
+            InlayEncodeFormat::Original,
+            false,
+            "image/png",
+            "png",
+            true,
+        ),
+        (
+            &webp,
+            InlayEncodeFormat::Original,
+            false,
+            "image/webp",
+            "webp",
+            true,
+        ),
+        (
+            &webp,
+            InlayEncodeFormat::Webp,
+            true,
+            "image/webp",
+            "webp",
+            true,
+        ),
+    ] {
+        let result = encode_inlay_image(
+            "matrix",
+            source,
+            "source",
+            Some(InlayEncodeOptions {
+                format,
+                quality: 12,
+                max_dimension: 0,
+                skip_reencode: skip,
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.metadata.mime, expected_mime);
+        assert_eq!(result.metadata.ext, expected_ext);
+        assert_eq!(result.data.as_slice() == source.as_slice(), expected_bytes);
+    }
+    let png_result = encode_inlay_image(
+        "png",
+        &png,
+        "source",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Png,
+            quality: 12,
+            max_dimension: 0,
+            skip_reencode: false,
+        }),
+    )
+    .unwrap();
+    assert_eq!(&png_result.data[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(png_result.metadata.mime, "image/png");
+}
+
+#[test]
+fn configurable_inlay_encoding_resizes_before_webp_encoding() {
+    let source = encoded_fixture(ImageFormat::Png, 20, 10);
+    let result = encode_inlay_image(
+        "resize",
+        &source,
+        "source",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Webp,
+            quality: 70,
+            max_dimension: 5,
+            skip_reencode: false,
+        }),
+    )
+    .unwrap();
+    assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
+    assert_eq!(result.metadata.mime, "image/webp");
+}
+
+#[test]
 fn first_write_creates_a_missing_app_data_directory() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("new-app-data");
@@ -877,6 +959,7 @@ fn simulated_disk_full_while_staging_restores_the_prior_pair() {
         "disk-full",
         &encoded_fixture(ImageFormat::Jpeg, 8, 4),
         "new.jpg",
+        None,
         suffix.to_owned(),
     )
     .unwrap_err();

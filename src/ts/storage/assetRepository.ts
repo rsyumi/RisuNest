@@ -4,6 +4,7 @@ import {
     type BlobMetadata,
     type BlobStore,
     type BlobWriteMetadata,
+    type InlayEncodeOptions,
     type InlayBlobMetadata,
 } from './blobStore'
 import {
@@ -267,7 +268,7 @@ export interface NewInlayImageEncoder {
     encodeNewInlayImage(
         key: string,
         data: Uint8Array,
-        input: { name: string },
+        input: { name: string, options?: InlayEncodeOptions },
     ): Promise<NewInlayImageEncoding>
 }
 
@@ -313,7 +314,7 @@ export type CompleteAssetRepositoryBlobStore = BlobStore &
         prepareOwnedNewInlayImage(
             key: string,
             ownedData: Uint8Array,
-            input: { name: string },
+            input: { name: string, options?: InlayEncodeOptions },
         ): Promise<PreparedCompleteAssetWrite>
     }
 
@@ -326,7 +327,7 @@ export interface CompleteTypedAssetRepository {
     prepareOwnedNewInlayImage(
         identity: AssetAliasIdentity,
         ownedData: Uint8Array,
-        input: { name: string },
+        input: { name: string, options?: InlayEncodeOptions },
     ): Promise<PreparedCompleteAssetWrite>
     put(
         identity: AssetAliasIdentity,
@@ -336,7 +337,7 @@ export interface CompleteTypedAssetRepository {
     putNewInlayImage(
         identity: AssetAliasIdentity,
         data: Uint8Array,
-        input: { name: string },
+        input: { name: string, options?: InlayEncodeOptions },
     ): Promise<InlayBlobMetadata>
     read(identity: AssetAliasIdentity, range?: BlobReadRange): Promise<Uint8Array | null>
     stat(identity: AssetAliasIdentity): Promise<BlobMetadata | null>

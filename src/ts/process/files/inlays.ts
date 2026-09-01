@@ -1,10 +1,17 @@
 import localforage from "localforage";
 import { v4 } from "uuid";
 import { getImageType } from "src/ts/media";
-import { getDatabase } from "../../storage/database.svelte";
+import { getDatabase, type Database } from "../../storage/database.svelte";
 import { getModelInfo, LLMFlags, LLMFormat } from "src/ts/model/modellist";
 import { asBuffer } from "../../util";
-import { type BlobMetadata, type BlobStore, type BlobWriteMetadata, type InlayBlobMetadata } from "../../storage/blobStore";
+import {
+    defaultInlayEncodeOptions,
+    type BlobMetadata,
+    type BlobStore,
+    type BlobWriteMetadata,
+    type InlayBlobMetadata,
+    type InlayEncodeOptions,
+} from "../../storage/blobStore";
 import { resolveBlobStore } from "../../storage/platformBlobStore";
 import { isTauri } from "../../platform";
 
@@ -34,6 +41,27 @@ const inlayStorage = localforage.createInstance({
     name: 'inlay',
     storeName: 'inlay'
 })
+
+export function getInlayEncodeOptions(): InlayEncodeOptions {
+    const db = (getDatabase() ?? {}) as Partial<Pick<Database,
+        'risunestInlayFormat' | 'risunestInlayWebpQuality' | 'risunestInlayMaxDimension' | 'risunestInlaySkipReencode'>>
+    const format = db.risunestInlayFormat === 'png' || db.risunestInlayFormat === 'original'
+        ? db.risunestInlayFormat : defaultInlayEncodeOptions.format
+    const quality = Math.min(100, Math.max(1, Math.round(Number.isFinite(db.risunestInlayWebpQuality)
+        ? db.risunestInlayWebpQuality! : defaultInlayEncodeOptions.quality)))
+    const maxDimension = Math.max(0, Math.round(Number.isFinite(db.risunestInlayMaxDimension)
+        ? db.risunestInlayMaxDimension! : defaultInlayEncodeOptions.maxDimension))
+    return { format, quality, maxDimension, skipReencode: db.risunestInlaySkipReencode === true }
+}
+
+function sourceImageOutput(data: Uint8Array): { mime: string, ext: string } | null {
+    if (data.byteLength >= 8 && data.slice(0, 8).every((value, index) => value === [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a][index])) {
+        return { mime: 'image/png', ext: 'png' }
+    }
+    if (data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return { mime: 'image/jpeg', ext: 'jpg' }
+    if (isNativeInlayFormat(data)) return { mime: 'image/webp', ext: 'webp' }
+    return null
+}
 
 export async function postInlayAsset(img:{
     name:string,
@@ -121,28 +149,43 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
     if (!response.ok) throw new Error(`Failed to read Inlay image source: ${response.status}`)
     const data = new Uint8Array(await response.arrayBuffer())
     validateNewInlayImage(data, response.headers.get('Content-Type') ?? '', arg.ext ?? '')
+    const options = getInlayEncodeOptions()
     const nativeFastPath = isTauri && isNativeInlayFormat(data)
     if (nativeFastPath) {
         const blobStore = await resolveBlobStore()
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
-        await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid })
+        await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid, options })
         return imgid
     }
     const ready = imageReadiness(imgObj, sourceUrl)
 
     let drawHeight = 0
     let drawWidth = 0
-    const canvas = document.createElement('canvas')
-    const ctx = canvas.getContext('2d')
     await ready
     drawHeight = imgObj.naturalHeight || imgObj.height
     drawWidth = imgObj.naturalWidth || imgObj.width
+    if (options.format === 'original') {
+        const output = sourceImageOutput(data)
+        if (!output) throw new Error('Original Inlay image must be PNG, JPEG, or WebP')
+        await (await resolveBlobStore()).put(imgid, data, {
+            kind: 'inlay', inlayType: 'image', mime: output.mime,
+            name: arg.name ?? imgid, ext: output.ext, height: drawHeight, width: drawWidth,
+        })
+        return `${imgid}`
+    }
+    if (options.maxDimension > 0 && Math.max(drawWidth, drawHeight) > options.maxDimension) {
+        const ratio = options.maxDimension / Math.max(drawWidth, drawHeight)
+        drawWidth = Math.max(1, Math.round(drawWidth * ratio))
+        drawHeight = Math.max(1, Math.round(drawHeight * ratio))
+    }
+    const canvas = document.createElement('canvas')
+    const ctx = canvas.getContext('2d')
     canvas.width = drawWidth
     canvas.height = drawHeight
     if (!ctx) throw new Error('Image canvas is unavailable')
     ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
     const imageBlob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Failed to encode Inlay image')), 'image/webp', 0.85)
+        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Failed to encode Inlay image')), `image/${options.format}`, options.quality / 100)
     })
     const output = imageBlob.type.toLowerCase() === 'image/webp'
         ? { mime: 'image/webp', ext: 'webp' }
@@ -477,7 +520,7 @@ export async function setInlayAsset(id: string, img: InlayAsset){
     if (img.type === 'image') validateNewInlayImage(bytes, mime, img.ext)
     if (isTauri && img.type === 'image' && isNativeInlayFormat(bytes)) {
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
-        await blobStore.putNewInlayImage(id, bytes, { name: img.name })
+        await blobStore.putNewInlayImage(id, bytes, { name: img.name, options: getInlayEncodeOptions() })
         return
     }
     if (img.type === 'image') {

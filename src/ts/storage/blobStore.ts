@@ -1,5 +1,17 @@
 export type BlobKind = 'asset' | 'inlay'
 export type InlayBlobType = 'image' | 'video' | 'audio' | 'signature'
+export type InlayEncodeFormat = 'webp' | 'png' | 'original'
+
+export interface InlayEncodeOptions {
+    format: InlayEncodeFormat
+    quality: number
+    maxDimension: number
+    skipReencode: boolean
+}
+
+export const defaultInlayEncodeOptions: InlayEncodeOptions = {
+    format: 'webp', quality: 85, maxDimension: 0, skipReencode: false,
+}
 
 export interface AssetBlobMetadata {
     key: string
@@ -41,7 +53,7 @@ export interface BlobStore {
     putNewInlayImage?(
         key: string,
         data: Uint8Array,
-        input: { name: string },
+        input: { name: string, options?: InlayEncodeOptions },
     ): Promise<InlayBlobMetadata>
     read(key: string, range?: BlobReadRange): Promise<Uint8Array | null>
     stat(key: string): Promise<BlobMetadata | null>
