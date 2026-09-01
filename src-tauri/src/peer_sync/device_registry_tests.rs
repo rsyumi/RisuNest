@@ -1,7 +1,7 @@
 use super::device_registry::{
-    incoming_source_summaries, outgoing_device_summaries, remove_incoming_source,
-    revoke_outgoing_device, DevicePermissions, IncomingSource, IncomingSourceRegistry,
-    OutgoingDevice, OutgoingDeviceRegistry,
+    incoming_source_summaries, outgoing_device_summaries, record_incoming_completed_operation,
+    remove_incoming_source, revoke_outgoing_device, DevicePermissions, IncomingSource,
+    IncomingSourceRegistry, OutgoingDevice, OutgoingDeviceRegistry,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -123,6 +123,93 @@ fn incoming_registry_stores_bearer_and_revoke_replaces_file_atomically() {
         .sources()
         .is_empty());
     assert!(!root.path().join("peer-sync/sources.json.tmp").exists());
+}
+
+#[test]
+fn incoming_completion_accounting_persists_positive_and_zero_byte_successes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: 40,
+        })
+        .unwrap();
+    registry.save().unwrap();
+
+    registry
+        .record_completed_operation(SOURCE_ID, 12, 30)
+        .unwrap();
+    registry
+        .record_completed_operation(SOURCE_ID, 0, 31)
+        .unwrap();
+
+    let restored = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(restored.sources()[0].total_bytes, 52);
+    assert_eq!(restored.sources()[0].last_seen_ms, 31);
+}
+
+#[test]
+fn incoming_completion_accounting_rejects_overflow_without_mutating_memory_or_file() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: u64::MAX,
+        })
+        .unwrap();
+    registry.save().unwrap();
+    let before = fs::read(root.path().join("peer-sync/sources.json")).unwrap();
+
+    assert!(registry
+        .record_completed_operation(SOURCE_ID, 1, 30)
+        .is_err());
+    assert_eq!(registry.sources()[0].total_bytes, u64::MAX);
+    assert_eq!(registry.sources()[0].last_seen_ms, 25);
+    assert_eq!(
+        fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn incoming_completion_accounting_does_not_infer_an_outgoing_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let mut outgoing = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    outgoing
+        .upsert(OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Target".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 1,
+            last_seen_ms: 2,
+            total_bytes: 3,
+        })
+        .unwrap();
+    outgoing.save().unwrap();
+
+    record_incoming_completed_operation(root.path(), TARGET_ID, 99).unwrap();
+
+    assert_eq!(
+        OutgoingDeviceRegistry::load(root.path()).unwrap().devices()[0].total_bytes,
+        3
+    );
+    assert!(IncomingSourceRegistry::load(root.path())
+        .unwrap()
+        .sources()
+        .is_empty());
 }
 
 #[test]

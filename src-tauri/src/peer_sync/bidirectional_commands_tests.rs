@@ -378,6 +378,31 @@ fn context(operation_id: &str) -> PeerBidirectionalOperationContext {
     }
 }
 
+const BIDIRECTIONAL_ACCOUNTING_SOURCE_ID: &str = "123e4567-e89b-42d3-a456-426614174002";
+
+fn register_bidirectional_accounting_source(root: &Path, total_bytes: u64, last_seen_ms: u64) {
+    let mut registry = super::super::device_registry::IncomingSourceRegistry::load(root).unwrap();
+    registry
+        .upsert(super::super::device_registry::IncomingSource {
+            device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
+            name: "bidirectional source".to_owned(),
+            endpoint: "http://192.168.0.98:32146".to_owned(),
+            bearer: "a".repeat(64),
+            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+            last_seen_ms,
+            total_bytes,
+        })
+        .unwrap();
+    registry.save().unwrap();
+}
+
+fn bidirectional_accounting_source(root: &Path) -> super::super::device_registry::IncomingSource {
+    super::super::device_registry::IncomingSourceRegistry::load(root)
+        .unwrap()
+        .sources()[0]
+        .clone()
+}
+
 fn backup(side: PeerBidirectionalBackupSide) -> PeerBidirectionalBackupReceipt {
     PeerBidirectionalBackupReceipt {
         package_id: "f".repeat(64),
@@ -1899,6 +1924,54 @@ fn local_committed_operation_survives_reopen_and_atomic_completion() {
     };
     journal.store(&completed).unwrap();
     assert_eq!(journal.load().unwrap(), Some(completed));
+}
+
+#[test]
+fn bidirectional_durable_completion_accounts_once_and_retained_retry_does_not() {
+    let directory = tempfile::tempdir().unwrap();
+    register_bidirectional_accounting_source(directory.path(), 40, 7);
+    let operation_id = "123e4567-e89b-42d3-a456-426614174098";
+    let result = PeerBidirectionalCompletedResult {
+        kind: "updated".to_owned(),
+        operation_id: operation_id.to_owned(),
+        revision: 8,
+        remote_revision: 4,
+        transferred_objects: 3,
+        transferred_bytes: 27,
+        backups: Vec::new(),
+    };
+    let completed = PeerBidirectionalDurableOperation::Completed {
+        schema: OPERATION_SCHEMA.to_owned(),
+        remote_apply_receipt: None,
+        source_binding: None,
+        result: result.clone(),
+    };
+
+    PeerBidirectionalOperationJournal::new(directory.path())
+        .store(&completed)
+        .unwrap();
+    record_bidirectional_completion(
+        directory.path(),
+        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+        &result,
+    )
+    .unwrap();
+    let after_completed = bidirectional_accounting_source(directory.path());
+    assert_eq!(after_completed.total_bytes, 67);
+    assert!(after_completed.last_seen_ms > 7);
+
+    assert!(matches!(
+        retained_result(&completed).unwrap(),
+        PeerBidirectionalSyncResult::Updated { .. }
+    ));
+    assert!(matches!(
+        retained_result(&completed).unwrap(),
+        PeerBidirectionalSyncResult::Updated { .. }
+    ));
+    assert_eq!(
+        bidirectional_accounting_source(directory.path()),
+        after_completed
+    );
 }
 
 #[test]

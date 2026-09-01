@@ -1615,7 +1615,7 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
         })
         .map_err(|error| error.to_string())?;
         let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
-        pull_logical_delta_with_cancellation(
+        let result = pull_logical_delta_with_cancellation(
             &mut store,
             &cas,
             &app_root,
@@ -1625,7 +1625,15 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
             &mut client,
             &cancellation,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        record_delta_completion(
+            &app_root,
+            &source_device_id,
+            client.is_v2_registered(),
+            &result,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(result)
     })
     .await
     .map_err(|error| format!("peer delta pull worker failed: {error}"))?
@@ -1691,6 +1699,33 @@ pub async fn peer_delta_pull(
     outcome
 }
 
+fn record_delta_completion(
+    app_root: &Path,
+    source_device_id: &str,
+    registered_v2: bool,
+    result: &PeerDeltaPullResult,
+) -> Result<(), PeerSyncError> {
+    if !registered_v2 {
+        return Ok(());
+    }
+    let transferred_bytes = match result {
+        PeerDeltaPullResult::NoChanges {
+            transferred_bytes, ..
+        }
+        | PeerDeltaPullResult::Updated {
+            transferred_bytes, ..
+        } => *transferred_bytes,
+        PeerDeltaPullResult::Conflict { .. } | PeerDeltaPullResult::FullCloneRequired { .. } => {
+            return Ok(())
+        }
+    };
+    super::device_registry::record_incoming_completed_operation(
+        app_root,
+        source_device_id,
+        transferred_bytes,
+    )
+}
+
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -1748,6 +1783,7 @@ mod tests {
         asset_repository::job_pins::{collect_durable_cas_job_roots, CasObjectRole},
         local_backup::AtomicCancellation,
         peer_sync::{
+            device_registry::{DevicePermissions, IncomingSource, IncomingSourceRegistry},
             logical_delta::{
                 build_logical_manifest, BuiltLogicalManifest, LogicalManifest,
                 LogicalManifestBuilderInput, LogicalRecordEnvelope, LogicalRecordLocator,
@@ -1794,6 +1830,28 @@ mod tests {
         inner: Cursor<Vec<u8>>,
         cancelled: Arc<AtomicBool>,
         first: bool,
+    }
+
+    const ACCOUNTING_SOURCE_ID: &str = "00000000-0000-4000-8000-000000000024";
+
+    fn register_accounting_source(root: &Path, total_bytes: u64, last_seen_ms: u64) {
+        let mut registry = IncomingSourceRegistry::load(root).unwrap();
+        registry
+            .upsert(IncomingSource {
+                device_id: ACCOUNTING_SOURCE_ID.to_owned(),
+                name: "accounting source".to_owned(),
+                endpoint: "http://192.168.0.24:32145".to_owned(),
+                bearer: "a".repeat(64),
+                permissions: DevicePermissions::read(),
+                last_seen_ms,
+                total_bytes,
+            })
+            .unwrap();
+        registry.save().unwrap();
+    }
+
+    fn accounting_source(root: &Path) -> IncomingSource {
+        IncomingSourceRegistry::load(root).unwrap().sources()[0].clone()
     }
 
     impl Read for CancelAfterFirstReadCursor {
@@ -3025,8 +3083,71 @@ mod tests {
     }
 
     #[test]
+    fn delta_completion_accounting_counts_only_updated_and_no_changes_once() {
+        let directory = tempfile::tempdir().unwrap();
+        register_accounting_source(directory.path(), 40, 7);
+
+        record_delta_completion(
+            directory.path(),
+            ACCOUNTING_SOURCE_ID,
+            true,
+            &PeerDeltaPullResult::Updated {
+                revision: 1,
+                transferred_objects: 1,
+                transferred_bytes: 12,
+            },
+        )
+        .unwrap();
+        let after_updated = accounting_source(directory.path());
+        assert_eq!(after_updated.total_bytes, 52);
+        assert!(after_updated.last_seen_ms > 7);
+
+        record_delta_completion(
+            directory.path(),
+            ACCOUNTING_SOURCE_ID,
+            true,
+            &PeerDeltaPullResult::NoChanges {
+                revision: 1,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+            },
+        )
+        .unwrap();
+        let after_no_changes = accounting_source(directory.path());
+        assert_eq!(after_no_changes.total_bytes, 52);
+        assert!(after_no_changes.last_seen_ms >= after_updated.last_seen_ms);
+
+        for non_success in [
+            PeerDeltaPullResult::Conflict {
+                reason: "stale revision",
+            },
+            PeerDeltaPullResult::FullCloneRequired {
+                reason: "missing common base",
+            },
+        ] {
+            record_delta_completion(directory.path(), ACCOUNTING_SOURCE_ID, true, &non_success)
+                .unwrap();
+        }
+        assert_eq!(accounting_source(directory.path()), after_no_changes);
+
+        record_delta_completion(
+            directory.path(),
+            ACCOUNTING_SOURCE_ID,
+            false,
+            &PeerDeltaPullResult::Updated {
+                revision: 2,
+                transferred_objects: 1,
+                transferred_bytes: 99,
+            },
+        )
+        .unwrap();
+        assert_eq!(accounting_source(directory.path()), after_no_changes);
+    }
+
+    #[test]
     fn cancelled_target_cleans_only_its_unsealed_job_and_retries_with_a_fresh_job() {
         let directory = tempfile::tempdir().unwrap();
+        register_accounting_source(directory.path(), 40, 7);
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let local = store
@@ -3078,6 +3199,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, PeerSyncError::Cancelled);
+        assert_eq!(accounting_source(directory.path()).total_bytes, 40);
+        assert_eq!(accounting_source(directory.path()).last_seen_ms, 7);
         assert_eq!(source.reads, 1);
         assert_eq!(store.revision().unwrap(), 0);
         assert!(unowned.join("keep").is_file());

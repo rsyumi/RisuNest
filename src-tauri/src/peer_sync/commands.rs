@@ -1575,23 +1575,47 @@ impl PeerCloneCommandState {
                 Err(error) => Err(error),
             }
         })();
-        let mut runtime = self.lock_runtime()?;
-        let target = require_target_mut(&mut runtime, request, &paths.job_root)?;
-        target.client = Some(client);
-        target.cancellation = None;
-        match &result {
-            Ok(_) => {
-                target.status.phase = PeerCloneTargetPhase::Completed;
-                target.status.error = None;
+        let completed_source = {
+            let mut runtime = self.lock_runtime()?;
+            let target = require_target_mut(&mut runtime, request, &paths.job_root)?;
+            let completed_source = result.as_ref().ok().and_then(|_| {
+                client.source_device_id().map(|source_id| {
+                    (
+                        source_id.to_owned(),
+                        target
+                            .status
+                            .total_bytes
+                            .unwrap_or(target.status.completed_bytes),
+                    )
+                })
+            });
+            target.client = Some(client);
+            target.cancellation = None;
+            match &result {
+                Ok(_) => {
+                    target.status.phase = PeerCloneTargetPhase::Completed;
+                    target.status.error = None;
+                }
+                Err(error) => {
+                    target.status.phase = if matches!(error, PeerSyncError::Cancelled) {
+                        PeerCloneTargetPhase::Cancelled
+                    } else {
+                        PeerCloneTargetPhase::Failed
+                    };
+                    target.status.error = Some(error.to_string());
+                }
             }
-            Err(error) => {
-                target.status.phase = if matches!(error, PeerSyncError::Cancelled) {
-                    PeerCloneTargetPhase::Cancelled
-                } else {
-                    PeerCloneTargetPhase::Failed
-                };
-                target.status.error = Some(error.to_string());
-            }
+            completed_source
+        };
+        if let Some((source_id, verified_bytes)) = completed_source {
+            let app_root = peer_root.parent().ok_or_else(|| {
+                PeerSyncError::Storage("peer clone target root has no app root".to_owned())
+            })?;
+            super::device_registry::record_incoming_completed_operation(
+                app_root,
+                &source_id,
+                verified_bytes,
+            )?;
         }
         result
     }
@@ -2951,6 +2975,26 @@ mod tests {
         assert_eq!(
             target_store.read_root(None).unwrap().value["username"],
             "Source"
+        );
+        let completed_bytes = downloaded.total_bytes.unwrap();
+        let accounted =
+            super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
+                .unwrap();
+        assert_eq!(accounted.sources()[0].total_bytes, completed_bytes);
+        assert!(target
+            .finalize_target(
+                &mut target_store,
+                &target_cas,
+                &target_root.path().join("peer-sync"),
+                &request,
+            )
+            .is_err());
+        assert_eq!(
+            super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
+                .unwrap()
+                .sources()[0]
+                .total_bytes,
+            completed_bytes
         );
         let target_job_root = target_root
             .path()

@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
@@ -273,6 +274,36 @@ impl IncomingSourceRegistry {
         Ok(())
     }
 
+    pub(crate) fn record_completed_operation(
+        &mut self,
+        source_id: &str,
+        bytes: u64,
+        seen_at_ms: u64,
+    ) -> Result<(), PeerSyncError> {
+        validate_id(source_id)?;
+        let mut updated = self.sources.clone();
+        let source = updated
+            .iter_mut()
+            .find(|item| item.device_id == source_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered incoming source is missing".to_owned())
+            })?;
+        source.total_bytes = source
+            .total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| PeerSyncError::Validation("peer total bytes overflow".to_owned()))?;
+        source.last_seen_ms = seen_at_ms;
+        write_registry(
+            &self.root.join("sources.json"),
+            &IncomingFile {
+                schema: INCOMING_SCHEMA.to_owned(),
+                sources: updated.clone(),
+            },
+        )?;
+        self.sources = updated;
+        Ok(())
+    }
+
     pub(crate) fn save(&self) -> Result<(), PeerSyncError> {
         write_registry(
             &self.root.join("sources.json"),
@@ -338,6 +369,28 @@ pub(crate) fn remove_incoming_source(
     let mut registry = IncomingSourceRegistry::load(app_root)?;
     registry.remove(device_id)?;
     registry.save()
+}
+
+pub(crate) fn record_incoming_completed_operation(
+    app_root: &Path,
+    source_id: &str,
+    bytes: u64,
+) -> Result<(), PeerSyncError> {
+    let seen_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| PeerSyncError::Storage("peer completion timestamp overflow".to_owned()))?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    if !registry
+        .sources()
+        .iter()
+        .any(|source| source.device_id == source_id)
+    {
+        return Ok(());
+    }
+    registry.record_completed_operation(source_id, bytes, seen_at_ms)
 }
 
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {

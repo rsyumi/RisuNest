@@ -143,6 +143,7 @@ pub struct LanCloneClient {
     session_url: String,
     pub device_id: String,
     bearer: String,
+    source_device_id: Option<String>,
     manifest_id: Option<String>,
 }
 
@@ -230,6 +231,7 @@ impl LanCloneClient {
             session_url,
             device_id: response.device_id,
             bearer: response.bearer,
+            source_device_id: None,
             manifest_id: None,
         })
     }
@@ -368,6 +370,7 @@ impl LanCloneClient {
                     session_url,
                     device_id: response.device_id,
                     bearer: response.bearer,
+                    source_device_id: None,
                     manifest_id: None,
                 },
                 false,
@@ -403,6 +406,7 @@ impl LanCloneClient {
                 session_url,
                 device_id: response.device_id,
                 bearer: response.bearer,
+                source_device_id: Some(source_device_id),
                 manifest_id: None,
             },
             true,
@@ -437,6 +441,7 @@ impl LanCloneClient {
             reqwest::Url,
             String,
             Option<String>,
+            Option<String>,
         ),
         PeerSyncError,
     > {
@@ -448,6 +453,7 @@ impl LanCloneClient {
             session_url,
             self.bearer,
             self.manifest_id,
+            self.source_device_id,
         ))
     }
 
@@ -654,6 +660,7 @@ impl LanCloneClient {
             })?,
             device_id: self.device_id.clone(),
             bearer: self.bearer.clone(),
+            source_device_id: self.source_device_id.clone(),
             permission: "clone-read".to_owned(),
         };
         persisted.validate()?;
@@ -710,6 +717,7 @@ impl LanCloneClient {
             session_url,
             device_id: persisted.device_id,
             bearer: persisted.bearer,
+            source_device_id: persisted.source_device_id,
             manifest_id: Some(persisted.manifest_id),
         })
     }
@@ -724,6 +732,8 @@ struct PersistedLanCredential {
     manifest_id: String,
     device_id: String,
     bearer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_device_id: Option<String>,
     permission: String,
 }
 
@@ -734,6 +744,10 @@ impl PersistedLanCredential {
             || !is_canonical_uuid(&self.device_id)
             || !is_lower_hex_256(&self.manifest_id)
             || !is_lower_hex_256(&self.bearer)
+            || self
+                .source_device_id
+                .as_deref()
+                .is_some_and(|source_id| !is_canonical_uuid(source_id))
             || self.permission != "clone-read"
         {
             return Err(PeerSyncError::Protocol(
@@ -3112,6 +3126,7 @@ mod timeout_tests {
             session_url,
             device_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             bearer: TEST_BEARER.to_owned(),
+            source_device_id: None,
             manifest_id: None,
         }
     }
@@ -3136,6 +3151,7 @@ mod timeout_tests {
             bearer: TEST_BEARER.to_owned(),
             source_device_id: "00000000-0000-4000-8000-000000000002".to_owned(),
             manifest_id: "a".repeat(64),
+            registered_v2: false,
             verified_bytes: Arc::new(Mutex::new(0)),
         }
     }
@@ -4146,6 +4162,7 @@ mod timeout_tests {
             session_url: String::new(),
             device_id: claimed.device_id,
             bearer: claimed.bearer,
+            source_device_id: None,
             manifest_id: None,
         };
 
@@ -4615,6 +4632,7 @@ pub struct LanLogicalDeltaClient {
     bearer: String,
     source_device_id: String,
     manifest_id: String,
+    registered_v2: bool,
     verified_bytes: Arc<Mutex<u64>>,
 }
 
@@ -4783,6 +4801,7 @@ impl LanLogicalDeltaClient {
                     bearer: response.bearer,
                     source_device_id,
                     manifest_id: manifest_id.to_owned(),
+                    registered_v2: false,
                     verified_bytes: Arc::new(Mutex::new(0)),
                 },
                 false,
@@ -4829,6 +4848,7 @@ impl LanLogicalDeltaClient {
                 bearer: response.bearer,
                 source_device_id,
                 manifest_id: manifest_id.to_owned(),
+                registered_v2: true,
                 verified_bytes: Arc::new(Mutex::new(0)),
             },
             true,
@@ -4996,12 +5016,17 @@ impl LanLogicalDeltaClient {
             bearer: response.bearer,
             source_device_id,
             manifest_id: manifest_id.to_owned(),
+            registered_v2: false,
             verified_bytes: Arc::new(Mutex::new(0)),
         })
     }
 
     pub fn source_device_id(&self) -> &str {
         &self.source_device_id
+    }
+
+    pub(crate) fn is_v2_registered(&self) -> bool {
+        self.registered_v2
     }
 
     pub fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
@@ -5294,6 +5319,7 @@ impl LanBidirectionalLogicalClient {
                 bearer: credential.bearer,
                 source_device_id: credential.source_device_id,
                 manifest_id: credential.manifest_id,
+                registered_v2: false,
                 verified_bytes: Arc::new(Mutex::new(0)),
             },
             endpoint,

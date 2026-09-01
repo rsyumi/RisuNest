@@ -120,6 +120,7 @@ pub struct LoopbackCloneClient {
     root: PathBuf,
     transport: HttpCloneTransport,
     required_manifest_id: Option<String>,
+    source_device_id: Option<String>,
     manifest: Option<CloneManifest>,
     manifest_id: Option<String>,
     ledger: LedgerState,
@@ -223,6 +224,7 @@ impl LoopbackCloneClient {
                 bearer: None,
             },
             required_manifest_id: None,
+            source_device_id: None,
             manifest: None,
             manifest_id: None,
             ledger,
@@ -243,7 +245,7 @@ impl LoopbackCloneClient {
         expected_manifest_id: &str,
     ) -> Result<Self, PeerSyncError> {
         super::protocol::validate_hash(expected_manifest_id)?;
-        let (http, ranges, session_url, bearer, persisted_manifest_id) =
+        let (http, ranges, session_url, bearer, persisted_manifest_id, source_device_id) =
             lan.into_resumable_parts()?;
         if persisted_manifest_id
             .as_deref()
@@ -266,6 +268,7 @@ impl LoopbackCloneClient {
                 bearer: Some(bearer),
             },
             required_manifest_id: Some(expected_manifest_id.to_owned()),
+            source_device_id,
             manifest: None,
             manifest_id: None,
             ledger,
@@ -278,6 +281,10 @@ impl LoopbackCloneClient {
             #[cfg(test)]
             fail_record_activation: false,
         })
+    }
+
+    pub(crate) fn source_device_id(&self) -> Option<&str> {
+        self.source_device_id.as_deref()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
