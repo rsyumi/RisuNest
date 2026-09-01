@@ -8,6 +8,7 @@
     import Button from 'src/lib/UI/GUI/Button.svelte'
     import { restoreNativePersistentSnapshot, restartNativeApp } from 'src/ts/storage/nativePersistentMaintenance'
     import { getNativeOfficialAccountFlow } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
+    import { DBState } from 'src/ts/stores.svelte'
     import { nativeFileOperation, importRisuSaveFromSystemPicker, exportRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
     import { alertPartialDestinationWarning, hasPartialDestinationWarning } from 'src/ts/storage/risuSaveFileRoute'
     import { NativeFileJobActivationCommittedError, NativeFileJobError, type NativeFileJobStatus } from 'src/ts/storage/nativeFileJobs'
@@ -83,7 +84,7 @@
     </div>
 {/if}
 <Button onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
-{#if isTauri}
+{#if isTauri && DBState.db.account}
     <Button onclick={async () => {
         try {
             await restoreNativePersistentSnapshot({

@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
     downloadFile: vi.fn(async () => undefined),
     selectedTarget: null as any,
     acquireCompleteConversation: vi.fn(),
+    postInlayAsset: vi.fn(),
+    alertError: vi.fn(),
 }))
 
 vi.mock('src/ts/stores.svelte', () => ({
@@ -45,7 +47,8 @@ vi.mock('src/ts/util', () => ({
     BufferToText: (value: Uint8Array) => new TextDecoder().decode(value),
     selectMultipleFile: vi.fn(),
 }))
-vi.mock('./inlays', () => ({ postInlayAsset: vi.fn() }))
+vi.mock('./inlays', () => ({ postInlayAsset: mocks.postInlayAsset }))
+vi.mock('src/ts/alert', () => ({ alertError: mocks.alertError }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     captureSelectedConversationTarget: () => mocks.selectedTarget,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
@@ -84,6 +87,8 @@ describe('postChatFile PO append', () => {
         mocks.downloadFile.mockClear()
         mocks.selectedTarget = null
         mocks.acquireCompleteConversation.mockReset()
+        mocks.postInlayAsset.mockReset()
+        mocks.alertError.mockReset()
         doingChat.set(false)
     })
 
@@ -233,9 +238,14 @@ describe('postChatFile PO append', () => {
 })
 
 describe('postChatFile attachment errors', () => {
-    it('keeps rejected animated attachments out of results', async () => {
-        const source = await import('./multisend.ts?raw')
-        expect(source.default).toContain('alertError(language.risuNest.inlay.unsupportedAnimated)')
-        expect(source.default).toContain('postData = await postInlayAsset(file)')
+    it.each(['gif', 'avif'])('rejects %s attachments without appending an asset or message', async (extension) => {
+        mocks.postInlayAsset.mockRejectedValueOnce(new Error('unsupported animation'))
+        const conversation = mocks.dbState.db!.characters[0].chats[0]
+
+        await expect(postChatFile({ name: `animated.${extension}`, data: new Uint8Array([1]) })).resolves.toEqual([])
+
+        expect(mocks.alertError).toHaveBeenCalledWith('unsupported')
+        expect(conversation.message).toEqual([{ role: 'char', data: 'before' }])
+        expect(mocks.sendChat).not.toHaveBeenCalled()
     })
 })

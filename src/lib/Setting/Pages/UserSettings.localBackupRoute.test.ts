@@ -32,4 +32,9 @@ describe('UserSettings local backup route', () => {
             expect(source).not.toContain(control)
         }
     })
+
+    it('keeps official account actions behind the existing account gate', async () => {
+        const backupSource = await import('./RisuNestBackupRestore.svelte?raw')
+        expect(backupSource.default).toContain('{#if isTauri && DBState.db.account}')
+    })
 })
