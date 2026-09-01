@@ -25,6 +25,7 @@ describe('device settings', () => {
 
     afterEach(() => {
         vi.restoreAllMocks()
+        vi.unstubAllEnvs()
         vi.resetModules()
         localStorage.clear()
         setRuntimePerformanceProfile('normal')
@@ -44,6 +45,16 @@ describe('device settings', () => {
         localStorage.setItem('risuNestDeviceSettings', JSON.stringify({ ...defaults, syncFixedPort: -1 }))
         deviceSettings = await loadDeviceSettings()
         expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
+    })
+
+    it('keeps the configured build profile when no valid stored profile exists', async () => {
+        vi.stubEnv('VITE_RUNTIME_PERFORMANCE_PROFILE', 'low-spec')
+        localStorage.setItem('risuNestDeviceSettings', '{not json')
+
+        await loadDeviceSettings()
+        const { getRuntimePerformanceProfile } = await import('../runtimePerformanceProfile')
+
+        expect(getRuntimePerformanceProfile()).toBe('low-spec')
     })
 
     it('guards storage read and write failures', async () => {

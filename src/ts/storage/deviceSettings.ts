@@ -47,23 +47,30 @@ function isValidSettings(value: unknown): value is RisuNestDeviceSettings {
         && typeof settings.syncPublicBaseUrl === 'string'
 }
 
-function readSettings(): RisuNestDeviceSettings {
+function readSettings(): {
+    settings: RisuNestDeviceSettings
+    hasStoredProfile: boolean
+} {
     try {
         const stored = localStorage.getItem(storageKey)
-        if (!stored) return snapshot(defaults)
+        if (!stored) return { settings: snapshot(defaults), hasStoredProfile: false }
         const parsed: unknown = JSON.parse(stored)
-        return isValidSettings(parsed) ? snapshot(parsed) : snapshot(defaults)
+        return isValidSettings(parsed)
+            ? { settings: snapshot(parsed), hasStoredProfile: true }
+            : { settings: snapshot(defaults), hasStoredProfile: false }
     } catch {
-        return snapshot(defaults)
+        return { settings: snapshot(defaults), hasStoredProfile: false }
     }
 }
 
-let settings = readSettings()
-setRuntimePerformanceProfile(settings.performanceProfile)
+const initialSettings = readSettings()
+let settings = initialSettings.settings
+if (initialSettings.hasStoredProfile) {
+    setRuntimePerformanceProfile(settings.performanceProfile)
+}
 const listeners = new Set<(settings: RisuNestDeviceSettings) => void>()
 
 export function getDeviceSettings(): RisuNestDeviceSettings {
-    setRuntimePerformanceProfile(settings.performanceProfile)
     return snapshot(settings)
 }
 
