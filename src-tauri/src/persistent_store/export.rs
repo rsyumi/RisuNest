@@ -1741,9 +1741,14 @@ mod tests {
                 "assets/windows.bin".to_owned(),
                 "remote/windows.bin".to_owned(),
             ),
+            (
+                "assets/folder/legacy.bin".to_owned(),
+                "remote/legacy.bin".to_owned(),
+            ),
         ]);
         let mut storage = json!({
             "direct": "assets/direct.bin",
+            "legacy": "assets/folder/legacy.bin",
             "nested": ["assets/chain.bin", "prefix assets/direct.bin"],
             "windows": "assets\\windows.bin",
             "assets/direct.bin": "object-key",
@@ -1754,6 +1759,7 @@ mod tests {
         project_plugin_storage_resources(&mut storage, &replacements);
 
         assert_eq!(storage["direct"], json!("remote/direct.bin"));
+        assert_eq!(storage["legacy"], json!("remote/legacy.bin"));
         assert_eq!(storage["nested"][0], json!("assets/chain-step.bin"));
         assert_eq!(storage["nested"][1], json!("prefix assets/direct.bin"));
         assert_eq!(storage["assets/direct.bin"], json!("object-key"));
