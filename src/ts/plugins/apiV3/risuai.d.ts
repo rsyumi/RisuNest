@@ -371,9 +371,9 @@ interface Persona {
  */
 interface DatabaseSubset {
     /** Currently selected persona ID */
-    selectedPersona?: string;
+    selectedPersona?: number;
     /** Character ordering */
-    characterOrder?: string[];
+    characterOrder?: any[];
     /** Array of characters and group chats */
     characters?: any[];
     /** Risuai modules */
@@ -467,7 +467,8 @@ interface CustomTextTheme {
  *
  * @example
  * ```typescript
- * const doc = risuai.getRootDocument();
+ * const doc = await risuai.getRootDocument();
+ * if (!doc) return;
  * const element = doc.querySelector('.my-element');
  *
  * // Set text content
@@ -866,11 +867,11 @@ interface SafeElement {
  * const doc = risuai.getRootDocument();
  *
  * // Create elements (whitelist only)
- * const div = doc.createElement('div');
- * const button = doc.createElement('button');
+ * const div = await doc.createElement('div');
+ * const button = await doc.createElement('button');
  *
  * // Create anchor with URL validation
- * const link = doc.createAnchorElement('https://example.com');
+ * const link = await doc.createAnchorElement('https://example.com');
  * ```
  */
 interface SafeDocument extends SafeElement {
@@ -883,8 +884,8 @@ interface SafeDocument extends SafeElement {
      *
      * @example
      * ```typescript
-     * const div = doc.createElement('div'); // ✅ Allowed
-     * const custom = doc.createElement('custom-element'); // Creates <div> instead
+ * const div = await doc.createElement('div'); // ✅ Allowed
+ * const custom = await doc.createElement('custom-element'); // Creates <div> instead
      * ```
      */
     createElement(tagName: string): Promise<SafeElement>;
@@ -898,8 +899,8 @@ interface SafeDocument extends SafeElement {
      *
      * @example
      * ```typescript
-     * const link = doc.createAnchorElement('https://example.com'); // ✅ Valid
-     * const bad = doc.createAnchorElement('javascript:alert()'); // href becomes '#'
+ * const link = await doc.createAnchorElement('https://example.com'); // ✅ Valid
+ * const bad = await doc.createAnchorElement('javascript:alert()'); // href becomes '#'
      * ```
      */
     createAnchorElement(href: string): Promise<SafeElement>;
@@ -1376,6 +1377,7 @@ interface RisuaiPluginAPI {
      * @example
      * ```typescript
      * const doc = await risuai.getRootDocument();
+     * if (!doc) return;
      * const element = await doc.querySelector('.chat-container');
      * ```
      */
@@ -1850,7 +1852,8 @@ interface RisuaiPluginAPI {
      * ```typescript
      * await risuai.addTTSPreprocessor(async (ctx) => {
      *   if (ctx.ttsMode !== 'openai') return;
-     *   return { text: ctx.text.replace(/\*(.*?)\*\//g, '') };
+     *   const emphasis = new RegExp(String.raw`\*.*?\*`, 'g');
+     *   return { text: ctx.text.replace(emphasis, '') };
      * });
      * ```
      */
@@ -2212,6 +2215,7 @@ interface RisuaiPluginAPI {
     /**
      * Sends a chat message as if it were sent by the user, triggering the normal chat processing flow.
      * @param message - The chat message to send, if string is a blank message, it will trigger the send action without adding a new message.
+     * @returns Promise resolving to whether the message was sent successfully.
      */
     sendChat(message: string): Promise<boolean>;
 }
