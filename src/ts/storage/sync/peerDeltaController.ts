@@ -5,6 +5,7 @@ import {
     type PeerDeltaPullResult,
     type PeerDeltaSourceStatus,
 } from './peerDelta'
+import { createPeerSourcePolling } from './peerSourcePolling'
 import type { PeerCloneTunnelStatus } from './peerClone'
 
 type PeerDeltaFacade = ReturnType<typeof createPeerDeltaFacade>
@@ -33,8 +34,6 @@ export function createPeerDeltaController(options: {
     }
     let initialized = false
     let initialization: Promise<void> | undefined
-    let sourceTimer: ReturnType<typeof setInterval> | undefined
-    let sourcePolling = false
     let sourceError = ''
     let pullError = ''
     let activePull: { pairingUri: string, promise: Promise<PeerDeltaPullResult> } | undefined
@@ -46,10 +45,6 @@ export function createPeerDeltaController(options: {
     const update = (next: Partial<PeerDeltaControllerSnapshot>): void => {
         snapshot = { ...snapshot, ...next }
         publish()
-    }
-    const stopSourcePolling = (): void => {
-        if (sourceTimer) clearInterval(sourceTimer)
-        sourceTimer = undefined
     }
     const refreshSourceState = async (): Promise<PeerDeltaSourceStatus> => {
         const sourceStatus = await options.facade.status()
@@ -65,9 +60,9 @@ export function createPeerDeltaController(options: {
         })
         return sourceStatus
     }
-    const pollSource = async (): Promise<void> => {
-        if (sourcePolling) return
-        sourcePolling = true
+    const sourcePolling = createPeerSourcePolling({
+        intervalMilliseconds: options.sourcePollMilliseconds ?? 1_000,
+        poll: async (): Promise<void> => {
         try {
             const sourceStatus = await options.facade.status()
             const tunnelStatus = sourceStatus.tunnel
@@ -81,22 +76,15 @@ export function createPeerDeltaController(options: {
                     ? sourceStatus.pairingUri ?? snapshot.sourcePairingUri
                     : '',
             })
-            if (sourceStatus.phase !== 'running') stopSourcePolling()
+            if (sourceStatus.phase !== 'running') sourcePolling.stop()
         } catch (cause) {
             sourceError = cause instanceof Error ? cause.message : String(cause)
             publish()
-        } finally {
-            sourcePolling = false
         }
-    }
-    const beginSourcePolling = (): void => {
-        if (!sourceTimer) {
-            sourceTimer = setInterval(
-                () => void pollSource(),
-                options.sourcePollMilliseconds ?? 1_000,
-            )
-        }
-    }
+        },
+    })
+    const beginSourcePolling = (): void => sourcePolling.start()
+    const stopSourcePolling = (): void => sourcePolling.stop()
     const run = async <T>(operation: () => Promise<T>): Promise<T> => {
         try {
             const result = await operation()

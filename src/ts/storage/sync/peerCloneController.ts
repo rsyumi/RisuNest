@@ -7,6 +7,7 @@ import {
     type PeerCloneState,
     type PeerCloneTunnelStatus,
 } from './peerClone'
+import { createPeerSourcePolling } from './peerSourcePolling'
 
 type PeerCloneFacade = ReturnType<typeof createPeerCloneFacade>
 
@@ -39,9 +40,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
     }
     let initialized = false
     let initialization: Promise<void> | undefined
-    let sourceTimer: ReturnType<typeof setInterval> | undefined
     let targetTimer: ReturnType<typeof setInterval> | undefined
-    let sourcePolling = false
     let targetPolling = false
 
     const publish = () => {
@@ -60,10 +59,6 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         snapshot = { ...snapshot, error: '' }
         publish()
     }
-    const stopSourcePolling = () => {
-        if (sourceTimer) clearInterval(sourceTimer)
-        sourceTimer = undefined
-    }
     const stopTargetPolling = () => {
         if (targetTimer) clearInterval(targetTimer)
         targetTimer = undefined
@@ -76,9 +71,9 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         snapshot = { ...snapshot, sourceStatus, tunnelStatus }
         return sourceStatus
     }
-    const pollSource = async () => {
-        if (sourcePolling) return
-        sourcePolling = true
+    const sourcePolling = createPeerSourcePolling({
+        intervalMilliseconds: options.sourcePollMilliseconds ?? 1_000,
+        poll: async (): Promise<void> => {
         try {
             const sourceStatus = await refreshSourceState()
             snapshot = { ...snapshot, error: '' }
@@ -86,15 +81,15 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
                 snapshot = { ...snapshot, sourcePairingUri: '' }
             }
             if (sourceStatus.phase !== 'starting' && sourceStatus.phase !== 'running' && sourceStatus.phase !== 'stopping') {
-                stopSourcePolling()
+                sourcePolling.stop()
             }
             publish()
         } catch (cause) {
             failure(cause)
-        } finally {
-            sourcePolling = false
         }
-    }
+        },
+    })
+    const stopSourcePolling = (): void => sourcePolling.stop()
     const pollTarget = async () => {
         if (targetPolling) return
         targetPolling = true
@@ -115,11 +110,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
             targetPolling = false
         }
     }
-    const beginSourcePolling = () => {
-        if (!sourceTimer) {
-            sourceTimer = setInterval(() => void pollSource(), options.sourcePollMilliseconds ?? 1_000)
-        }
-    }
+    const beginSourcePolling = (): void => sourcePolling.start()
     const beginTargetPolling = () => {
         if (!targetTimer) {
             targetTimer = setInterval(() => void pollTarget(), options.targetPollMilliseconds ?? 500)

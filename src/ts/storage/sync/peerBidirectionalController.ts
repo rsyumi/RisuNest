@@ -8,6 +8,7 @@ import {
     type PeerBidirectionalSourceStatus,
     type PeerBidirectionalSyncResult,
 } from './peerBidirectional'
+import { createPeerSourcePolling } from './peerSourcePolling'
 
 export type PeerBidirectionalOperationPhase =
     | 'idle'
@@ -91,8 +92,6 @@ export function createPeerBidirectionalController(options: {
     }
     let initialized = false
     let initialization: Promise<void> | undefined
-    let sourceTimer: ReturnType<typeof setInterval> | undefined
-    let sourcePolling = false
     let sourcePollEpoch = 0
     let operationErrorOwner = 0
     let sourceRefreshErrorOwner: number | undefined
@@ -123,13 +122,9 @@ export function createPeerBidirectionalController(options: {
         snapshot.operationRetained = retainedPhase(snapshot.operationPhase)
         publish()
     }
-    const stopSourcePolling = (): void => {
-        if (sourceTimer) clearInterval(sourceTimer)
-        sourceTimer = undefined
-    }
-    const pollSource = async (): Promise<void> => {
-        if (sourcePolling) return
-        sourcePolling = true
+    const sourcePolling = createPeerSourcePolling({
+        intervalMilliseconds: options.sourcePollMilliseconds ?? 1_000,
+        poll: async (): Promise<void> => {
         const pollEpoch = sourcePollEpoch
         try {
             const status = await options.facade.status()
@@ -145,7 +140,7 @@ export function createPeerBidirectionalController(options: {
                 operationError: clearSourceRefreshError ? '' : snapshot.operationError,
                 ...operationSnapshot(status.operation),
             })
-            if (status.source.phase !== 'running') stopSourcePolling()
+            if (status.source.phase !== 'running') sourcePolling.stop()
         } catch (cause) {
             if (pollEpoch !== sourcePollEpoch) return
             if (cause instanceof PeerBidirectionalRefreshError && cause.status) {
@@ -160,18 +155,11 @@ export function createPeerBidirectionalController(options: {
             } else {
                 update({ sourceError: cause instanceof Error ? cause.message : String(cause) })
             }
-        } finally {
-            sourcePolling = false
         }
-    }
-    const beginSourcePolling = (): void => {
-        if (!sourceTimer) {
-            sourceTimer = setInterval(
-                () => void pollSource(),
-                options.sourcePollMilliseconds ?? 1_000,
-            )
-        }
-    }
+        },
+    })
+    const beginSourcePolling = (): void => sourcePolling.start()
+    const stopSourcePolling = (): void => sourcePolling.stop()
     const runSource = <T>(
         key: string,
         operation: () => Promise<T>,
