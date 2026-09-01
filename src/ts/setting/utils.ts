@@ -14,9 +14,19 @@ import { displaySettingsItems } from './displaySettingsData.svelte';
  */
 export const UNINITIALIZED = Symbol('uninitialized');
 
+export function resolveLanguagePath(path: string): unknown {
+    let value: unknown = language;
+    for (const segment of path.split('.')) {
+        if (!value || typeof value !== 'object') return undefined;
+        value = (value as Record<string, unknown>)[segment];
+    }
+    return value;
+}
+
 export function getLabel(item: SettingItem): string {
-    if (item.labelKey && (language as any)[item.labelKey]) {
-        return (language as any)[item.labelKey];
+    const label = item.labelKey ? resolveLanguagePath(item.labelKey) : undefined;
+    if (typeof label === 'string') {
+        return label;
     }
     return item.fallbackLabel ?? '';
 }

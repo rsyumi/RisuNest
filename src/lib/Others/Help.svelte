@@ -1,5 +1,7 @@
 <button title={name+' '+language.showHelp} class="relative help inline-flex items-center cursor-default hover:text-green-500" style="vertical-align: -2px;" onclick={() => {
-    alertMd(language.help[key])
+    alertMd(key.includes('.')
+        ? resolveLanguagePath(key) as string
+        : language.help[key as keyof typeof language.help])
 }}>
     
     {#if key === "experimental"}
@@ -18,10 +20,11 @@
     import { TriangleAlert, FlaskConicalIcon, CircleQuestionMarkIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { alertMd } from "src/ts/alert";
+    import { resolveLanguagePath } from "src/ts/setting/utils";
 
     interface Props {
         unrecommended?: boolean;
-        key: (keyof (typeof language.help));
+        key: string;
         name?: string;
     }
 

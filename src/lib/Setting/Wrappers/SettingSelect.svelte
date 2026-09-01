@@ -1,11 +1,10 @@
 <script lang="ts">
     import type { SettingItem, SettingContext } from 'src/ts/setting/types';
-    import { UNINITIALIZED, getLabel, getSettingValue, setSettingValue } from 'src/ts/setting/utils';
+    import { UNINITIALIZED, getLabel, getSettingValue, resolveLanguagePath, setSettingValue } from 'src/ts/setting/utils';
     import { untrack } from 'svelte';
     import SelectInput from 'src/lib/UI/GUI/SelectInput.svelte';
     import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte';
     import Help from 'src/lib/Others/Help.svelte';
-    import { language } from 'src/lang';
 
     interface Props {
         item: SettingItem;
@@ -51,7 +50,7 @@
 <SelectInput bind:value={localValue}>
     {#each processedOptions as opt}
         <OptionInput value={opt.value}>
-            {opt.labelKey ? (language as any)[opt.labelKey] : opt.label}
+            {opt.labelKey ? (resolveLanguagePath(opt.labelKey) ?? opt.label) : opt.label}
         </OptionInput>
     {/each}
 </SelectInput>

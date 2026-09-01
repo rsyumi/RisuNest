@@ -10,6 +10,7 @@ import {
 import { changeFullscreen, sleep } from "./util"
 import { get } from "svelte/store";
 import { setDatabase, getDatabase, type Database } from "./storage/database.svelte";
+import { getDeviceSettings } from "./storage/deviceSettings";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
@@ -171,6 +172,7 @@ function registerAndroidScreenshotPublicationRecovery() {
 export async function loadData() {
     if (get(loadedStore)) return
     try {
+        getDeviceSettings()
         if (isTauri) {
             LoadingStatusState.text = 'Checking Files...'
             if (isTauriDesktop) appWindow.maximize()

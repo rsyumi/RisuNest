@@ -1,9 +1,8 @@
 <script lang="ts">
     import type { SettingItem, SettingContext } from 'src/ts/setting/types';
-    import { getLabel, getSettingValue, setSettingValue } from 'src/ts/setting/utils';
+    import { getLabel, getSettingValue, resolveLanguagePath, setSettingValue } from 'src/ts/setting/utils';
     import SegmentedControl from 'src/lib/UI/GUI/SegmentedControl.svelte';
     import Help from 'src/lib/Others/Help.svelte';
-    import { language } from 'src/lang';
     import { DBState } from 'src/ts/stores.svelte';
 
     interface Props {
@@ -16,10 +15,13 @@
     // Transform options: filter by condition + resolve labelKey translations
     let processedOptions = $derived((item.options?.segmentOptions ?? [])
         .filter(opt => !opt.condition || opt.condition(ctx))
-        .map(opt => ({
-            value: opt.value,
-            label: opt.labelKey ? ((language as any)[opt.labelKey] ?? opt.label ?? '') : (opt.label ?? '')
-        })));
+        .map(opt => {
+            const translated = opt.labelKey ? resolveLanguagePath(opt.labelKey) : undefined;
+            return {
+                value: opt.value,
+                label: typeof translated === 'string' ? translated : (opt.label ?? '')
+            };
+        }));
 
     // Reset value if current selection becomes hidden due to condition changes
     $effect(() => {

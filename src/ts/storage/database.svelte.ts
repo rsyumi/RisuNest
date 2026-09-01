@@ -692,6 +692,16 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.newMessageButtonStyle ??= 'bottom-center'
     data.chatLoadInitialPages = normalizeChatLoadPages(data.chatLoadInitialPages, DEFAULT_CHAT_LOAD_INITIAL_PAGES)
     data.chatLoadAdditionalPages = normalizeChatLoadPages(data.chatLoadAdditionalPages, DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES)
+    data.risunestInlayFormat = data.risunestInlayFormat === 'png' || data.risunestInlayFormat === 'original'
+        ? data.risunestInlayFormat
+        : 'webp'
+    data.risunestInlayWebpQuality = Math.min(100, Math.max(1, Math.round(
+        Number.isFinite(data.risunestInlayWebpQuality) ? data.risunestInlayWebpQuality : 85,
+    )))
+    data.risunestInlayMaxDimension = Math.max(0, Math.round(
+        Number.isFinite(data.risunestInlayMaxDimension) ? data.risunestInlayMaxDimension : 0,
+    ))
+    data.risunestInlaySkipReencode = data.risunestInlaySkipReencode === true
     data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
     delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.echoMessage ??= "Echo Message"
@@ -1150,6 +1160,10 @@ export interface Database{
     realmDirectOpen:boolean
     OaiCompAPIKeys: {[key:string]:string}
     inlayErrorResponse:boolean
+    risunestInlayFormat?: 'webp' | 'png' | 'original'
+    risunestInlayWebpQuality?: number
+    risunestInlayMaxDimension?: number
+    risunestInlaySkipReencode?: boolean
     reasoningEffort:number
     bulkEnabling:boolean
     showTranslationLoading: boolean
