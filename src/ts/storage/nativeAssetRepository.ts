@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import type { InlayBlobMetadata } from './blobStore'
+import { defaultInlayEncodeOptions, type InlayBlobMetadata, type InlayEncodeOptions } from './blobStore'
 import { validateBlobReadRange } from './blobStore'
 import type {
     AssetObjectUrlResolver,
@@ -215,26 +215,45 @@ interface NativeEncodedInlayImage {
     metadata: InlayBlobMetadata
 }
 
+function sourceInlayMime(data: Uint8Array): { mime: string, ext: string } | null {
+    if (data.byteLength >= 8 && data.slice(0, 8).every((byte, index) => byte === [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a][index])) {
+        return { mime: 'image/png', ext: 'png' }
+    }
+    if (data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return { mime: 'image/jpeg', ext: 'jpg' }
+    if (data.byteLength >= 12 && new TextDecoder().decode(data.subarray(0, 4)) === 'RIFF'
+        && new TextDecoder().decode(data.subarray(8, 12)) === 'WEBP') return { mime: 'image/webp', ext: 'webp' }
+    return null
+}
+
+function expectedNativeInlayOutput(options: InlayEncodeOptions, source: Uint8Array): { mime: string, ext: string } | null {
+    if (options.format === 'webp') return { mime: 'image/webp', ext: 'webp' }
+    if (options.format === 'png') return { mime: 'image/png', ext: 'png' }
+    return sourceInlayMime(source)
+}
+
 export function createNativeNewInlayImageEncoder(
     invokeCommand: InvokeCommand = invoke,
 ): NewInlayImageEncoder {
     return {
         async encodeNewInlayImage(key, data, input) {
+            const options = input.options ?? defaultInlayEncodeOptions
             const result = await invokeCommand(
                 'native_media_encode_inlay_image',
                 {
                     id: key,
                     data: Array.from(data),
                     name: input.name,
-                    ...(input.options === undefined ? {} : { options: input.options }),
+                    ...(input.options === undefined ? {} : { options }),
                 },
             ) as NativeEncodedInlayImage
             const metadata = result.metadata
+            const expected = expectedNativeInlayOutput(options, data)
             if (
                 metadata.kind !== 'inlay'
                 || metadata.key !== key
-                || !(['image/webp', 'image/png', 'image/jpeg'] as const).includes(metadata.mime as never)
-                || !(['webp', 'png', 'jpg'] as const).includes(metadata.ext as never)
+                || !expected
+                || metadata.mime !== expected.mime
+                || metadata.ext !== expected.ext
                 || metadata.inlayType !== 'image'
                 || !Number.isSafeInteger(metadata.width)
                 || !Number.isSafeInteger(metadata.height)

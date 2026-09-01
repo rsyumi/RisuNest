@@ -79,6 +79,24 @@ describe('native asset repository adapters', () => {
         })
     })
 
+    it.each([
+        ['webp', 'image/png', 'png'],
+        ['png', 'image/webp', 'webp'],
+        ['original', 'image/webp', 'png'],
+    ] as const)('rejects a native %s response with a mismatched MIME and extension pair', async (format, mime, ext) => {
+        const encoder = createNativeNewInlayImageEncoder(async () => ({
+            data: [4],
+            metadata: {
+                key: 'inlay-id', kind: 'inlay', size: 1, mime, name: 'Image', ext,
+                inlayType: 'image', width: 1, height: 1,
+            },
+        }))
+
+        await expect(encoder.encodeNewInlayImage('inlay-id', Uint8Array.of(1), {
+            name: 'Image', options: { format, quality: 85, maxDimension: 0, skipReencode: false },
+        })).rejects.toThrow('invalid metadata')
+    })
+
     it('exposes a native-only durable CAS pin session without catalog enumeration', async () => {
         const invoke = vi.fn(async (command: string) => {
             if (command === 'asset_cas_job_begin') return 'session-1'

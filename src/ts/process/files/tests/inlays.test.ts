@@ -17,6 +17,7 @@ import {
     writeInlayImage,
 } from '../inlays'
 import { createBackedBlobStore } from 'src/ts/storage/platformBlobStore'
+import { getDatabase } from 'src/ts/storage/database.svelte'
 
 //#region module mocks
 
@@ -176,9 +177,54 @@ beforeEach(() => {
         onerror: (() => void) | null = null
         set src(_value: string) { queueMicrotask(() => this.onload?.()) }
     })
+    vi.mocked(getDatabase).mockReturnValue({} as any)
 })
 
 describe('setInlayAsset', () => {
+    test('preserves static WebP bytes when skip re-encode is enabled without a resize', async () => {
+        const source = new TextEncoder().encode('RIFF\x04\0\0\0WEBPVP8 ')
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'webp', risunestInlayWebpQuality: 85,
+            risunestInlayMaxDimension: 0, risunestInlaySkipReencode: true,
+        } as any)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(source, {
+            headers: { 'Content-Type': 'image/webp' },
+        })))
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:source-webp')
+
+        await setInlayAsset('source-webp', {
+            data: new Blob([source], { type: 'image/webp' }),
+            ext: 'webp', name: 'source.webp', type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob('source-webp')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(source)
+        expect(stored).toMatchObject({ ext: 'webp', height: 100, width: 100 })
+        expect(stored!.data.type).toBe('image/webp')
+    })
+
+    test('re-encodes skipped WebP when the configured long side requires resizing', async () => {
+        const source = new TextEncoder().encode('RIFF\x04\0\0\0WEBPVP8 ')
+        vi.mocked(getDatabase).mockReturnValue({
+            risunestInlayFormat: 'webp', risunestInlayWebpQuality: 42,
+            risunestInlayMaxDimension: 50, risunestInlaySkipReencode: true,
+        } as any)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(source, {
+            headers: { 'Content-Type': 'image/webp' },
+        })))
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:resized-webp')
+
+        await setInlayAsset('resized-webp', {
+            data: new Blob([source], { type: 'image/webp' }),
+            ext: 'webp', name: 'source.webp', type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob('resized-webp')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).not.toEqual(source)
+        expect(stored).toMatchObject({ ext: 'webp', height: 50, width: 50 })
+        expect(fakeCtx.drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 50, 50)
+    })
+
     test('optimizes direct browser image writes at decoded natural dimensions', async () => {
         vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:direct-image')
         const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')

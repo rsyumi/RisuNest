@@ -173,6 +173,15 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
         })
         return `${imgid}`
     }
+    const sourceOutput = sourceImageOutput(data)
+    if (options.format === 'webp' && options.skipReencode && sourceOutput?.mime === 'image/webp'
+        && (options.maxDimension === 0 || Math.max(drawWidth, drawHeight) <= options.maxDimension)) {
+        await (await resolveBlobStore()).put(imgid, data, {
+            kind: 'inlay', inlayType: 'image', mime: 'image/webp',
+            name: arg.name ?? imgid, ext: 'webp', height: drawHeight, width: drawWidth,
+        })
+        return `${imgid}`
+    }
     if (options.maxDimension > 0 && Math.max(drawWidth, drawHeight) > options.maxDimension) {
         const ratio = options.maxDimension / Math.max(drawWidth, drawHeight)
         drawWidth = Math.max(1, Math.round(drawWidth * ratio))

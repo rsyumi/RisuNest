@@ -607,6 +607,27 @@ fn configurable_inlay_encoding_resizes_before_webp_encoding() {
 }
 
 #[test]
+fn original_inlay_ignores_max_dimension_and_preserves_oriented_jpeg_bytes() {
+    let source = with_exif_orientation(encoded_fixture(ImageFormat::Jpeg, 8, 3), 6);
+    let result = encode_inlay_image(
+        "original-jpeg",
+        &source,
+        "source.jpg",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Original,
+            quality: 1,
+            max_dimension: 1,
+            skip_reencode: false,
+        }),
+    )
+    .unwrap();
+    assert_eq!(result.data, source);
+    assert_eq!((result.metadata.width, result.metadata.height), (3, 8));
+    assert_eq!(result.metadata.mime, "image/jpeg");
+    assert_eq!(result.metadata.ext, "jpg");
+}
+
+#[test]
 fn first_write_creates_a_missing_app_data_directory() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("new-app-data");

@@ -977,6 +977,28 @@ fn encode_inlay_image(
     let options = options.unwrap_or_default();
     let width = decoded.width();
     let height = decoded.height();
+    if options.format == InlayEncodeFormat::Original {
+        let (mime, ext) = match format {
+            ImageFormat::Png => ("image/png", "png"),
+            ImageFormat::Jpeg => ("image/jpeg", "jpg"),
+            ImageFormat::WebP => ("image/webp", "webp"),
+            _ => unreachable!(),
+        };
+        return Ok(EncodedInlayImage {
+            data: data.to_vec(),
+            metadata: InlayImageMetadata {
+                key: id.to_owned(),
+                kind: "inlay".to_owned(),
+                size: data.len() as u64,
+                mime: mime.to_owned(),
+                name: name.to_owned(),
+                ext: ext.to_owned(),
+                inlay_type: "image".to_owned(),
+                width,
+                height,
+            },
+        });
+    }
     let needs_resize = options.max_dimension > 0 && width.max(height) > options.max_dimension;
     if needs_resize {
         let scale = options.max_dimension as f64 / width.max(height) as f64;
@@ -988,21 +1010,7 @@ fn encode_inlay_image(
     }
     let rgba = decoded.to_rgba8();
     let (encoded, mime, ext) = match options.format {
-        InlayEncodeFormat::Original => (
-            data.to_vec(),
-            match format {
-                ImageFormat::Png => "image/png",
-                ImageFormat::Jpeg => "image/jpeg",
-                ImageFormat::WebP => "image/webp",
-                _ => unreachable!(),
-            },
-            match format {
-                ImageFormat::Jpeg => "jpg",
-                ImageFormat::Png => "png",
-                ImageFormat::WebP => "webp",
-                _ => unreachable!(),
-            },
-        ),
+        InlayEncodeFormat::Original => unreachable!(),
         InlayEncodeFormat::Png => {
             let mut value = Vec::new();
             DynamicImage::ImageRgba8(rgba.clone())
