@@ -1,3 +1,4 @@
+use super::lan::validate_lan_endpoint;
 use super::{
     device_registry::DevicePermissions,
     lan::{
@@ -257,6 +258,22 @@ fn expired_link_is_rejected_by_monotonic_enforcement() {
         claim(&pairing, "00000000-0000-4000-8000-000000000023").status(),
         reqwest::StatusCode::GONE
     );
+    host.stop().unwrap();
+}
+
+#[test]
+fn fixed_lan_advertises_the_reachable_address_not_wildcard() {
+    let (_root, mut host) = host();
+    let pairing = host
+        .start_fixed_lan(std::net::Ipv4Addr::LOCALHOST, 32149)
+        .unwrap();
+    assert_eq!(
+        validate_lan_endpoint(&pairing.endpoint).unwrap(),
+        pairing.endpoint
+    );
+    assert!(claim(&pairing, "00000000-0000-4000-8000-000000000025")
+        .status()
+        .is_success());
     host.stop().unwrap();
 }
 

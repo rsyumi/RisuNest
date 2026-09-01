@@ -61,10 +61,19 @@ impl SharedSessionHost {
 
     pub(crate) fn start_fixed_lan(
         &mut self,
+        advertised_address: Ipv4Addr,
         port: u16,
     ) -> Result<SharedPairingData, PeerSyncError> {
+        if !advertised_address.is_private()
+            && !advertised_address.is_link_local()
+            && !advertised_address.is_loopback()
+        {
+            return Err(PeerSyncError::Validation(
+                "shared LAN advertised address must be private or link-local IPv4".to_owned(),
+            ));
+        }
         let pairing = self.host.start_fixed_lan(port)?;
-        self.pairing("http", pairing)
+        self.pairing_at("http", advertised_address, pairing)
     }
 
     pub(crate) fn start_private_lan(
@@ -124,6 +133,30 @@ impl SharedSessionHost {
         })?;
         Ok(SharedPairingData {
             endpoint: format!("{scheme}://{address}"),
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+            claim: pairing.claim,
+            expires_at_ms: self.host.pairing_expires_at_ms().ok_or_else(|| {
+                PeerSyncError::Protocol("shared LAN host has no pending pairing link".to_owned())
+            })?,
+        })
+    }
+
+    fn pairing_at(
+        &self,
+        scheme: &str,
+        advertised_address: Ipv4Addr,
+        pairing: LanPairing,
+    ) -> Result<SharedPairingData, PeerSyncError> {
+        let port = self
+            .host
+            .address()
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("shared LAN host did not expose an address".to_owned())
+            })?
+            .port();
+        Ok(SharedPairingData {
+            endpoint: format!("{scheme}://{advertised_address}:{port}"),
             session_id: pairing.session_id,
             manifest_id: pairing.manifest_id,
             claim: pairing.claim,
