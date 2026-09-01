@@ -7751,6 +7751,46 @@ fn command_state_excludes_source_preparation_and_target_work() {
 }
 
 #[test]
+fn bidirectional_restart_uses_the_canonical_source_identity_for_durable_checks() {
+    let directory = tempfile::tempdir().unwrap();
+    let canonical =
+        super::super::device_registry::load_or_create_device_id(directory.path()).unwrap();
+    let legacy = directory.path().join("peer-delta").join("source-device-id");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, "123e4567-e89b-42d3-a456-426614174199").unwrap();
+    fs::remove_file(&legacy).unwrap();
+    let source_device_id =
+        super::super::delta_commands::canonical_source_device_id(directory.path()).unwrap();
+    let operation = PeerBidirectionalDurableOperation::SourcePrepared {
+        schema: OPERATION_SCHEMA.to_owned(),
+        operation_id: "123e4567-e89b-42d3-a456-426614174200".to_owned(),
+        source_device_id: source_device_id.clone(),
+        target_device_id: "123e4567-e89b-42d3-a456-426614174201".to_owned(),
+        expected_source_revision: 0,
+        previous_shared: generation("previous", "0", 'a'),
+        expected_source_generation: generation("source", "0", 'b'),
+        shared_generation: LanBidirectionalGeneration {
+            generation_id: "shared".to_owned(),
+            manifest_hash: "c".repeat(64),
+            generation_sequence: "1".to_owned(),
+        },
+        incoming_revision: 1,
+        transferred_objects: 0,
+        transferred_bytes: 0,
+        backup_required: false,
+        backup: None,
+        durable_job_id: "123e4567-e89b-42d3-a456-426614174202".to_owned(),
+    };
+
+    let restarted =
+        super::super::delta_commands::canonical_source_device_id(directory.path()).unwrap();
+    assert_eq!(source_device_id, canonical);
+    assert_eq!(restarted, canonical);
+    assert!(retained_allows_source_prepare(&operation, &restarted));
+    assert!(!legacy.exists());
+}
+
+#[test]
 fn source_prepared_status_exposes_the_recoverable_operation() {
     let operation_id = "123e4567-e89b-42d3-a456-426614174120";
     let operation = PeerBidirectionalDurableOperation::SourcePrepared {

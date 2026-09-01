@@ -47,6 +47,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 
+#[cfg(test)]
 const SOURCE_DEVICE_ID_FILE: &str = "source-device-id";
 const P4_DELTA_TARGET_JOB_PREFIX: &str = "p4-delta-target-";
 const P4_SOURCE_PIN_PREFIX: &str = "logical-session-p4-source-";
@@ -1369,10 +1370,8 @@ pub async fn peer_delta_prepare(
                 P4_SOURCE_PIN_PREFIX,
             )
             .map_err(|error| error.to_string())?;
-            let source_device_id = load_or_create_source_device_id(
-                &app_root.join("peer-delta").join(SOURCE_DEVICE_ID_FILE),
-            )
-            .map_err(|error| error.to_string())?;
+            let source_device_id =
+                canonical_source_device_id(&app_root).map_err(|error| error.to_string())?;
             state
                 .install_source(session, &source_device_id, built.manifest_bytes)
                 .map_err(|error| error.to_string())
@@ -1702,15 +1701,31 @@ fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<Stri
     super::tunnel_lifecycle::build_lane_pairing_uri("peer-delta", endpoint, pairing)
 }
 
+pub(crate) fn canonical_source_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
+    super::device_registry::load_or_create_device_id(app_root)
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
+}
+
+#[cfg(test)]
 pub(crate) fn load_or_create_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
+    if let Ok(value) = fs::read_to_string(path) {
+        let value = value.trim_end_matches(['\r', '\n']);
+        if uuid::Uuid::parse_str(value)
+            .map(|parsed| parsed.to_string() != value)
+            .unwrap_or(true)
+        {
+            return Err(PeerSyncError::Storage(
+                "invalid persisted source device identity".to_owned(),
+            ));
+        }
+    }
     let legacy_parent = path.parent().ok_or_else(|| {
         PeerSyncError::Storage("source device identity path has no parent".to_owned())
     })?;
     let app_root = legacy_parent.parent().ok_or_else(|| {
         PeerSyncError::Storage("source device identity path has no app root".to_owned())
     })?;
-    super::device_registry::load_or_create_device_id(app_root)
-        .map_err(|error| PeerSyncError::Storage(error.to_string()))
+    canonical_source_device_id(app_root)
 }
 
 fn now_millis() -> Result<i64, PeerSyncError> {
@@ -2196,6 +2211,69 @@ mod tests {
             first
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn delta_prepare_stop_prepare_keeps_the_canonical_v2_source_identity() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let canonical =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let legacy = source_root
+            .path()
+            .join("peer-delta")
+            .join(SOURCE_DEVICE_ID_FILE);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "00000000-0000-4000-8000-000000000099").unwrap();
+        fs::remove_file(&legacy).unwrap();
+
+        let state = PeerDeltaCommandState::default();
+        for _ in 0..2 {
+            let source_device_id = canonical_source_device_id(source_root.path()).unwrap();
+            assert_eq!(source_device_id, canonical);
+            let (session, manifest_bytes) = prepared_delta_source(source_root.path());
+            let prepared = state
+                .install_source(session, &source_device_id, manifest_bytes)
+                .unwrap();
+            state
+                .configure_v2_registry(
+                    source_root.path(),
+                    "Windows",
+                    super::super::device_registry::DevicePermissions::read(),
+                )
+                .unwrap();
+            let running = state
+                .start_source(prepared.session_id.as_deref().unwrap(), Ipv4Addr::LOCALHOST)
+                .unwrap();
+            let pairing = url::Url::parse(running.pairing_uri.as_deref().unwrap()).unwrap();
+            let endpoint = pairing
+                .query_pairs()
+                .find(|(key, _)| key == "endpoint")
+                .unwrap()
+                .1
+                .into_owned();
+            let manifest_id = pairing
+                .query_pairs()
+                .find(|(key, _)| key == "manifest")
+                .unwrap()
+                .1
+                .into_owned();
+            let claim = pairing.fragment().unwrap().strip_prefix("claim=").unwrap();
+            let client = super::super::lan::LanLogicalDeltaClient::claim_v2_and_register(
+                target_root.path(),
+                "Android",
+                &endpoint,
+                prepared.session_id.as_deref().unwrap(),
+                &manifest_id,
+                claim,
+            )
+            .unwrap();
+            assert_eq!(client.hello().unwrap().device_id, canonical);
+            state
+                .stop_source(prepared.session_id.as_deref().unwrap())
+                .unwrap();
+        }
+        assert!(!legacy.exists());
     }
 
     #[test]

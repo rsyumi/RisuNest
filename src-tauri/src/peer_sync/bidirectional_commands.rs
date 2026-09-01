@@ -5925,9 +5925,7 @@ fn run_retained_remote_completion(
         return retained_result(&retained);
     }
     let cas = PayloadCas::new(app_root)?;
-    let local_device_id = super::delta_commands::load_or_create_source_device_id(
-        &app_root.join("peer-delta").join("source-device-id"),
-    )?;
+    let local_device_id = super::delta_commands::canonical_source_device_id(app_root)?;
     let session_store = store.open_native_job_store().map_err(store_error)?;
     let outcome = resume_bidirectional_local_committed_with_remote(
         store,
@@ -6042,10 +6040,8 @@ pub async fn peer_bidirectional_prepare(
         let retained = PeerBidirectionalOperationJournal::new(&root)
             .load()
             .map_err(|error| error.to_string())?;
-        let source_device_id = super::delta_commands::load_or_create_source_device_id(
-            &root.join("peer-delta").join("source-device-id"),
-        )
-        .map_err(|error| error.to_string())?;
+        let source_device_id = super::delta_commands::canonical_source_device_id(&root)
+            .map_err(|error| error.to_string())?;
         if retained
             .as_ref()
             .is_some_and(|operation| !retained_allows_source_prepare(operation, &source_device_id))
@@ -6302,10 +6298,8 @@ pub async fn peer_bidirectional_sync(
             .load()
             .map_err(|error| error.to_string())?
         {
-            let local_device_id = super::delta_commands::load_or_create_source_device_id(
-                &root.join("peer-delta").join("source-device-id"),
-            )
-            .map_err(|error| error.to_string())?;
+            let local_device_id = super::delta_commands::canonical_source_device_id(&root)
+                .map_err(|error| error.to_string())?;
             match &retained {
                 PeerBidirectionalDurableOperation::TargetPrepared { context, .. } => {
                     if context.credential.device_id != local_device_id {
@@ -6438,10 +6432,8 @@ pub async fn peer_bidirectional_sync(
                 _ => return retained_result(&retained).map_err(|error| error.to_string()),
             }
         }
-        let local_device_id = super::delta_commands::load_or_create_source_device_id(
-            &root.join("peer-delta").join("source-device-id"),
-        )
-        .map_err(|error| error.to_string())?;
+        let local_device_id = super::delta_commands::canonical_source_device_id(&root)
+            .map_err(|error| error.to_string())?;
         let mut client = claim_bidirectional_client(
             &root,
             &endpoint,
@@ -6661,10 +6653,8 @@ pub async fn peer_bidirectional_resolve_with_link(
         if retained.operation_id() != operation_id {
             return Err("another bidirectional operation is retained".to_owned());
         }
-        let local_device_id = super::delta_commands::load_or_create_source_device_id(
-            &root.join("peer-delta").join("source-device-id"),
-        )
-        .map_err(|error| error.to_string())?;
+        let local_device_id = super::delta_commands::canonical_source_device_id(&root)
+            .map_err(|error| error.to_string())?;
         let PeerBidirectionalDurableOperation::AwaitingConflict { context, .. } = &retained else {
             return retained_result(&retained).map_err(|error| error.to_string());
         };

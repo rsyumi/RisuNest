@@ -260,7 +260,7 @@ impl LanCloneClient {
         validate_object_hash(manifest_id)?;
         validate_device_name(target_name)?;
         let target_device_id = load_or_create_device_id(app_root)?;
-        let mut client = Self::claim_v2_with_device(
+        let (mut client, registered_v2) = Self::claim_v2_with_device(
             endpoint,
             session_id,
             claim,
@@ -269,7 +269,9 @@ impl LanCloneClient {
         )?;
         client.manifest_id = Some(manifest_id.to_owned());
         client.persist(credential_path)?;
-        client.register_incoming_source(app_root)?;
+        if registered_v2 {
+            client.register_incoming_source(app_root)?;
+        }
         Ok(client)
     }
 
@@ -315,7 +317,7 @@ impl LanCloneClient {
         claim: &str,
         device_id: &str,
         device_name: &str,
-    ) -> Result<Self, PeerSyncError> {
+    ) -> Result<(Self, bool), PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(claim)
@@ -347,6 +349,30 @@ impl LanCloneClient {
             .send()
             .map_err(transport)?;
         let response = read_claim_response(response, "LAN")?;
+        if is_legacy_shaped_claim_response(&response) && response.source_device_id.is_none() {
+            if !is_canonical_uuid(&response.device_id)
+                || !is_lower_hex_256(&response.bearer)
+                || response.permission != "clone-read"
+            {
+                return Err(PeerSyncError::Protocol(
+                    "invalid LAN claim response".to_owned(),
+                ));
+            }
+            return Ok((
+                Self {
+                    client,
+                    ranges: HttpRangeStream::new(Duration::from_secs(3))?,
+                    control_timeout: CONTROL_REQUEST_TIMEOUT,
+                    endpoint,
+                    session_id: session_id.to_owned(),
+                    session_url,
+                    device_id: response.device_id,
+                    bearer: response.bearer,
+                    manifest_id: None,
+                },
+                false,
+            ));
+        }
         let source_device_id = response.source_device_id.ok_or_else(|| {
             PeerSyncError::Protocol("v2 source device identity is missing".to_owned())
         })?;
@@ -367,17 +393,20 @@ impl LanCloneClient {
                 "invalid LAN v2 claim response".to_owned(),
             ));
         }
-        Ok(Self {
-            client,
-            ranges: HttpRangeStream::new(Duration::from_secs(3))?,
-            control_timeout: CONTROL_REQUEST_TIMEOUT,
-            endpoint,
-            session_id: session_id.to_owned(),
-            session_url,
-            device_id: response.device_id,
-            bearer: response.bearer,
-            manifest_id: None,
-        })
+        Ok((
+            Self {
+                client,
+                ranges: HttpRangeStream::new(Duration::from_secs(3))?,
+                control_timeout: CONTROL_REQUEST_TIMEOUT,
+                endpoint,
+                session_id: session_id.to_owned(),
+                session_url,
+                device_id: response.device_id,
+                bearer: response.bearer,
+                manifest_id: None,
+            },
+            true,
+        ))
     }
 
     fn register_incoming_source(&self, app_root: &Path) -> Result<(), PeerSyncError> {
@@ -2349,6 +2378,10 @@ fn read_claim_response(
     serde_json::from_slice(&body).map_err(|error| PeerSyncError::Protocol(error.to_string()))
 }
 
+fn is_legacy_shaped_claim_response(response: &ClaimResponseOwned) -> bool {
+    response.source_device_name.is_none() && response.permissions.is_none()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PeerHello {
     pub(crate) device_id: String,
@@ -3132,6 +3165,106 @@ mod timeout_tests {
             session_id: session_id.to_owned(),
             inner,
         })
+    }
+
+    fn tolerant_legacy_claim_server(
+        response: serde_json::Value,
+    ) -> (String, mpsc::Receiver<usize>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (calls_tx, calls_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut stream).starts_with("POST "));
+            calls_tx.send(1).unwrap();
+            let body = serde_json::to_vec(&response).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+            finish_response(&mut stream);
+        });
+        (endpoint, calls_rx, server)
+    }
+
+    #[test]
+    fn v2_clients_keep_a_tolerant_legacy_claim_response_without_retrying() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target_root = tempfile::tempdir().unwrap();
+        let session_id = "00000000-0000-4000-8000-000000000097";
+        let manifest_id = "a".repeat(64);
+        let claim = "b".repeat(64);
+        let bearer = "c".repeat(64);
+
+        let (endpoint, calls, server) = tolerant_legacy_claim_server(serde_json::json!({
+            "deviceId": "00000000-0000-4000-8000-000000000098",
+            "bearer": bearer,
+            "permission": "clone-read"
+        }));
+        let credential = target_root.path().join("clone-credential.json");
+        let clone = LanCloneClient::claim_v2_and_persist_and_register(
+            target_root.path(),
+            "Android",
+            &credential,
+            &endpoint,
+            session_id,
+            &manifest_id,
+            &claim,
+        )
+        .unwrap();
+        assert_eq!(clone.device_id, "00000000-0000-4000-8000-000000000098");
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        server.join().unwrap();
+
+        let (endpoint, calls, server) = tolerant_legacy_claim_server(serde_json::json!({
+            "deviceId": "00000000-0000-4000-8000-000000000099",
+            "bearer": "d".repeat(64),
+            "permission": "logical-read",
+            "sourceDeviceId": "00000000-0000-4000-8000-000000000100"
+        }));
+        let delta = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            session_id,
+            &manifest_id,
+            &claim,
+        )
+        .unwrap();
+        assert_eq!(
+            delta.source_device_id(),
+            "00000000-0000-4000-8000-000000000100"
+        );
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        server.join().unwrap();
+
+        let (endpoint, calls, server) = tolerant_legacy_claim_server(serde_json::json!({
+            "deviceId": "00000000-0000-4000-8000-000000000101",
+            "bearer": "e".repeat(64),
+            "permission": "logical-bidirectional",
+            "sourceDeviceId": "00000000-0000-4000-8000-000000000102"
+        }));
+        let bidirectional = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            session_id,
+            &manifest_id,
+            &claim,
+        )
+        .unwrap();
+        assert_eq!(
+            bidirectional.source_device_id(),
+            "00000000-0000-4000-8000-000000000102"
+        );
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        server.join().unwrap();
     }
 
     fn finish_response(stream: &mut TcpStream) {
@@ -4550,6 +4683,7 @@ impl LanLogicalDeltaClient {
             claim,
             "logical-read",
         )
+        .map(|(client, _)| client)
     }
 
     pub(crate) fn hello(&self) -> Result<PeerHello, PeerSyncError> {
@@ -4569,7 +4703,7 @@ impl LanLogicalDeltaClient {
         manifest_id: &str,
         claim: &str,
         expected_permission: &str,
-    ) -> Result<Self, PeerSyncError> {
+    ) -> Result<(Self, bool), PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
@@ -4624,6 +4758,36 @@ impl LanLogicalDeltaClient {
         }
         let response: ClaimResponseOwned = serde_json::from_slice(&body)
             .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+        if is_legacy_shaped_claim_response(&response) {
+            let source_device_id = response.source_device_id.ok_or_else(|| {
+                PeerSyncError::Protocol(
+                    "logical delta source device identity is missing".to_owned(),
+                )
+            })?;
+            if !is_canonical_uuid(&response.device_id)
+                || !is_canonical_uuid(&source_device_id)
+                || !is_lower_hex_256(&response.bearer)
+                || response.permission != expected_permission
+            {
+                return Err(PeerSyncError::Protocol(
+                    "invalid logical delta claim response".to_owned(),
+                ));
+            }
+            return Ok((
+                Self {
+                    control_client,
+                    object_client,
+                    control_timeout: timeouts.control_request,
+                    session_url,
+                    device_id: response.device_id,
+                    bearer: response.bearer,
+                    source_device_id,
+                    manifest_id: manifest_id.to_owned(),
+                    verified_bytes: Arc::new(Mutex::new(0)),
+                },
+                false,
+            ));
+        }
         let source_device_id = response.source_device_id.ok_or_else(|| {
             PeerSyncError::Protocol("v2 source device identity is missing".to_owned())
         })?;
@@ -4655,17 +4819,20 @@ impl LanLogicalDeltaClient {
             total_bytes: 0,
         })?;
         registry.save()?;
-        Ok(Self {
-            control_client,
-            object_client,
-            control_timeout: timeouts.control_request,
-            session_url,
-            device_id: response.device_id,
-            bearer: response.bearer,
-            source_device_id,
-            manifest_id: manifest_id.to_owned(),
-            verified_bytes: Arc::new(Mutex::new(0)),
-        })
+        Ok((
+            Self {
+                control_client,
+                object_client,
+                control_timeout: timeouts.control_request,
+                session_url,
+                device_id: response.device_id,
+                bearer: response.bearer,
+                source_device_id,
+                manifest_id: manifest_id.to_owned(),
+                verified_bytes: Arc::new(Mutex::new(0)),
+            },
+            true,
+        ))
     }
 
     pub fn claim(
@@ -5008,7 +5175,7 @@ impl LanBidirectionalLogicalClient {
         manifest_id: &str,
         claim: &str,
     ) -> Result<Self, PeerSyncError> {
-        let inner = LanLogicalDeltaClient::claim_v2_and_register_with_permission(
+        let (inner, _) = LanLogicalDeltaClient::claim_v2_and_register_with_permission(
             app_root,
             target_name,
             endpoint,
