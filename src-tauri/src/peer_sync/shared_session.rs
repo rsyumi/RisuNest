@@ -9,7 +9,9 @@ use super::{
     PeerSyncError, PreparedCloneSession,
 };
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+#[cfg(desktop)]
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[cfg(desktop)]
 use super::{
@@ -21,9 +23,12 @@ use super::{
 };
 #[cfg(desktop)]
 use crate::{
-    asset_repository::PayloadCas, local_backup::CancellationProbe,
-    persistent_store::PersistentStore,
+    asset_repository::PayloadCas,
+    local_backup::{CancellationProbe, NeverCancelled},
+    persistent_store::{self, PersistentStore, StoreError},
 };
+#[cfg(desktop)]
+use tauri::{AppHandle, Manager, State};
 
 /// The three source preparations have a fixed dependency order.  A source
 /// lane owns its preparation artifacts until the shared host has been torn
@@ -168,8 +173,11 @@ impl<P: SharedSourceOwnership> SharedSessionLifecycle<P> {
                 primary = Some(error);
             }
         }
-        // Prepared sessions can own open package and generation resources.
-        // Drop the common host before lane cleanup removes their artifacts.
+        if primary.is_some() {
+            self.runtime()?.host = host.take();
+        }
+        // A stopped host can be dropped before lane cleanup removes prepared
+        // artifacts. A host that failed to stop remains owned for the retry.
         drop(host);
         {
             let mut preparation = self.preparation()?;
@@ -180,13 +188,27 @@ impl<P: SharedSourceOwnership> SharedSessionLifecycle<P> {
                 primary = cleanup_error;
             }
         }
-        let has_remaining = !self.runtime()?.acquired.is_empty();
+        let runtime = self.runtime()?;
+        let has_remaining = runtime.host.is_some() || !runtime.acquired.is_empty();
+        drop(runtime);
         self.set_phase(if has_remaining {
             SharedSessionPhase::Stopping
         } else {
             SharedSessionPhase::Idle
         })?;
         primary.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn with_host_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut P::Host) -> T,
+    ) -> Result<T, PeerSyncError> {
+        let _operation = self.operation()?;
+        let mut runtime = self.runtime()?;
+        let host = runtime.host.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared source host is not prepared".to_owned())
+        })?;
+        Ok(operation(host))
     }
 
     #[cfg(test)]
@@ -360,6 +382,809 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
     }
 }
 
+#[cfg(desktop)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceSyncListenMethod {
+    Lan,
+    Quick,
+    #[serde(rename = "fixed-url")]
+    FixedUrl,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSyncPrepareRequest {
+    pub method: DeviceSyncListenMethod,
+    pub fixed_port: u16,
+    pub public_base_url: Option<String>,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSyncLinkPermissions {
+    pub read: bool,
+    pub bidirectional: bool,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceSyncSourcePhase {
+    Idle,
+    Preparing,
+    Prepared,
+    Starting,
+    Running,
+    Stopping,
+    Error,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceSyncErrorCategory {
+    InvalidConfiguration,
+    PortUnavailable,
+    PreparationFailed,
+    TransportUnavailable,
+    CleanupFailed,
+    StateUnavailable,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSyncSourceStatus {
+    pub phase: DeviceSyncSourcePhase,
+    pub endpoint: Option<String>,
+    pub pairing_uri: Option<String>,
+    pub expires_at_ms: Option<u64>,
+    pub latest_error: Option<DeviceSyncErrorCategory>,
+}
+
+#[cfg(desktop)]
+#[derive(Clone)]
+struct DeviceSyncConfiguration {
+    app_root: PathBuf,
+    method: DeviceSyncListenMethod,
+    fixed_port: u16,
+    public_base_url: Option<String>,
+}
+
+#[cfg(desktop)]
+struct DeviceSyncRuntime {
+    phase: DeviceSyncSourcePhase,
+    configuration: Option<DeviceSyncConfiguration>,
+    pairing: Option<SharedPairingData>,
+    latest_error: Option<DeviceSyncErrorCategory>,
+    tunnel: Option<Box<dyn SharedPeerTunnel>>,
+    failed_tunnel: Option<Box<dyn SharedPeerTunnelCleanup>>,
+}
+
+#[cfg(desktop)]
+pub(crate) trait SharedPublicOriginVerifier: Send + Sync {
+    fn verify(&self, host: &SharedSessionHost, public_url: &url::Url) -> Result<(), PeerSyncError>;
+}
+
+#[cfg(desktop)]
+struct SystemSharedPublicOriginVerifier;
+
+#[cfg(desktop)]
+impl SharedPublicOriginVerifier for SystemSharedPublicOriginVerifier {
+    fn verify(&self, host: &SharedSessionHost, public_url: &url::Url) -> Result<(), PeerSyncError> {
+        host.verify_public_origin(public_url)
+    }
+}
+
+#[cfg(desktop)]
+pub(crate) trait SharedPeerTunnel: Send {
+    fn transport_url(&self) -> url::Url;
+    fn lifecycle(&mut self) -> Result<SharedPeerTunnelLifecycle, PeerSyncError> {
+        Ok(SharedPeerTunnelLifecycle::Running)
+    }
+    fn stop(&mut self) -> Result<(), PeerSyncError>;
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedPeerTunnelLifecycle {
+    Running,
+    CleanupPending,
+    Stopped,
+}
+
+#[cfg(desktop)]
+pub(crate) trait SharedPeerTunnelCleanup: Send {
+    fn stop(&mut self) -> Result<(), PeerSyncError>;
+}
+
+#[cfg(desktop)]
+pub(crate) trait SharedPeerTunnelLauncher: Send + Sync {
+    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError>;
+
+    fn take_failed_cleanup(&self) -> Option<Box<dyn SharedPeerTunnelCleanup>> {
+        None
+    }
+}
+
+#[cfg(desktop)]
+struct UnavailableSharedPeerTunnelLauncher;
+
+#[cfg(desktop)]
+impl SharedPeerTunnelLauncher for UnavailableSharedPeerTunnelLauncher {
+    fn start(&self, _: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        Err(PeerSyncError::Transport(
+            "shared quick tunnel launcher is unavailable".to_owned(),
+        ))
+    }
+}
+
+#[cfg(desktop)]
+pub struct DeviceSyncSourceState<P = SharedSourceEngines>
+where
+    P: SharedSourceOwnership<Host = SharedSessionHost>,
+{
+    operation: Arc<Mutex<()>>,
+    runtime: Arc<Mutex<DeviceSyncRuntime>>,
+    lifecycle: Arc<SharedSessionLifecycle<P>>,
+    lan_address_override: Option<Ipv4Addr>,
+    quick_tunnel_launcher: Arc<dyn SharedPeerTunnelLauncher>,
+    public_origin_verifier: Arc<dyn SharedPublicOriginVerifier>,
+}
+
+#[cfg(desktop)]
+impl<P> Clone for DeviceSyncSourceState<P>
+where
+    P: SharedSourceOwnership<Host = SharedSessionHost>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            operation: Arc::clone(&self.operation),
+            runtime: Arc::clone(&self.runtime),
+            lifecycle: Arc::clone(&self.lifecycle),
+            lan_address_override: self.lan_address_override,
+            quick_tunnel_launcher: Arc::clone(&self.quick_tunnel_launcher),
+            public_origin_verifier: Arc::clone(&self.public_origin_verifier),
+        }
+    }
+}
+
+#[cfg(desktop)]
+impl Default for DeviceSyncSourceState<SharedSourceEngines> {
+    fn default() -> Self {
+        Self::new(
+            SharedSourceEngines::new(),
+            None,
+            Arc::new(super::tunnel_lifecycle::SystemSharedPeerTunnelLauncher::default()),
+            Arc::new(SystemSharedPublicOriginVerifier),
+        )
+    }
+}
+
+#[cfg(desktop)]
+impl<P> DeviceSyncSourceState<P>
+where
+    P: SharedSourceOwnership<Host = SharedSessionHost>,
+{
+    fn new(
+        preparation: P,
+        lan_address_override: Option<Ipv4Addr>,
+        quick_tunnel_launcher: Arc<dyn SharedPeerTunnelLauncher>,
+        public_origin_verifier: Arc<dyn SharedPublicOriginVerifier>,
+    ) -> Self {
+        Self {
+            operation: Arc::new(Mutex::new(())),
+            runtime: Arc::new(Mutex::new(DeviceSyncRuntime {
+                phase: DeviceSyncSourcePhase::Idle,
+                configuration: None,
+                pairing: None,
+                latest_error: None,
+                tunnel: None,
+                failed_tunnel: None,
+            })),
+            lifecycle: Arc::new(SharedSessionLifecycle::new(preparation)),
+            lan_address_override,
+            quick_tunnel_launcher,
+            public_origin_verifier,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(preparation: P, lan_address: Ipv4Addr) -> Self {
+        Self::new(
+            preparation,
+            Some(lan_address),
+            Arc::new(UnavailableSharedPeerTunnelLauncher),
+            Arc::new(SystemSharedPublicOriginVerifier),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_quick_tunnel(
+        preparation: P,
+        quick_tunnel_launcher: Arc<dyn SharedPeerTunnelLauncher>,
+    ) -> Self {
+        Self::new(
+            preparation,
+            Some(Ipv4Addr::LOCALHOST),
+            quick_tunnel_launcher,
+            Arc::new(SystemSharedPublicOriginVerifier),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_transports(
+        preparation: P,
+        quick_tunnel_launcher: Arc<dyn SharedPeerTunnelLauncher>,
+        public_origin_verifier: Arc<dyn SharedPublicOriginVerifier>,
+    ) -> Self {
+        Self::new(
+            preparation,
+            Some(Ipv4Addr::LOCALHOST),
+            quick_tunnel_launcher,
+            public_origin_verifier,
+        )
+    }
+
+    pub(crate) fn prepare<C>(
+        &self,
+        context: &mut C,
+        app_root: &Path,
+        request: DeviceSyncPrepareRequest,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError>
+    where
+        P: SharedSourcePreparation<C>,
+    {
+        let _operation = self.lock_operation()?;
+        if request.fixed_port == 0 {
+            return self.fail(
+                DeviceSyncErrorCategory::InvalidConfiguration,
+                PeerSyncError::Validation("device sync fixed port must be nonzero".to_owned()),
+            );
+        }
+        let public_base_url = match request.method {
+            DeviceSyncListenMethod::FixedUrl => Some(
+                match validate_fixed_public_base_url(
+                    request.public_base_url.as_deref().unwrap_or_default(),
+                ) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        return self.fail(DeviceSyncErrorCategory::InvalidConfiguration, error)
+                    }
+                },
+            ),
+            DeviceSyncListenMethod::Lan | DeviceSyncListenMethod::Quick => None,
+        };
+        {
+            let runtime = self.lock_runtime()?;
+            if matches!(
+                runtime.phase,
+                DeviceSyncSourcePhase::Prepared | DeviceSyncSourcePhase::Running
+            ) {
+                return Ok(Self::status_from_runtime(&runtime));
+            }
+        }
+        self.set_phase(DeviceSyncSourcePhase::Preparing)?;
+        if let Err(error) = self.lifecycle.prepare(context) {
+            return self.fail(DeviceSyncErrorCategory::PreparationFailed, error);
+        }
+        let mut runtime = self.lock_runtime()?;
+        runtime.configuration = Some(DeviceSyncConfiguration {
+            app_root: app_root.to_path_buf(),
+            method: request.method,
+            fixed_port: request.fixed_port,
+            public_base_url: public_base_url.map(|url| url.to_string()),
+        });
+        runtime.pairing = None;
+        runtime.latest_error = None;
+        runtime.phase = DeviceSyncSourcePhase::Prepared;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn start(
+        &self,
+        permissions: DeviceSyncLinkPermissions,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        let _operation = self.lock_operation()?;
+        let was_running = self.lock_runtime()?.phase == DeviceSyncSourcePhase::Running;
+        if was_running {
+            let status = self.status()?;
+            if status.phase == DeviceSyncSourcePhase::Running {
+                return Ok(status);
+            }
+            return Err(PeerSyncError::Protocol(
+                "device sync tunnel is no longer running; stop before starting again".to_owned(),
+            ));
+        }
+        {
+            let runtime = self.lock_runtime()?;
+            if runtime.tunnel.is_some() || runtime.failed_tunnel.is_some() {
+                drop(runtime);
+                return self.fail(
+                    DeviceSyncErrorCategory::CleanupFailed,
+                    PeerSyncError::Protocol(
+                        "device sync tunnel cleanup is pending; retry stop before starting"
+                            .to_owned(),
+                    ),
+                );
+            }
+        }
+        if !permissions.read || (permissions.bidirectional && !permissions.read) {
+            return self.fail(
+                DeviceSyncErrorCategory::InvalidConfiguration,
+                PeerSyncError::Validation(
+                    "device sync sharing requires read permission".to_owned(),
+                ),
+            );
+        }
+        let configuration = match self.lock_runtime()?.configuration.clone() {
+            Some(configuration) => configuration,
+            None => {
+                return self.fail(
+                    DeviceSyncErrorCategory::StateUnavailable,
+                    PeerSyncError::Protocol("device sync source is not prepared".to_owned()),
+                )
+            }
+        };
+        let advertised_lan_address = if configuration.method == DeviceSyncListenMethod::Lan {
+            Some(match self.lan_address_override {
+                Some(address) => address,
+                None => match super::lan::discover_lan_ipv4() {
+                    Ok(address) => address,
+                    Err(error) => {
+                        return self.fail(DeviceSyncErrorCategory::TransportUnavailable, error)
+                    }
+                },
+            })
+        } else {
+            None
+        };
+        self.set_phase(DeviceSyncSourcePhase::Starting)?;
+        let host_permissions = if permissions.bidirectional {
+            DevicePermissions::read_and_bidirectional()
+        } else {
+            DevicePermissions::read()
+        };
+        let start = self.lifecycle.with_host_mut(|host| {
+            host.enable_v2_registry(
+                &configuration.app_root,
+                super::device_registry::platform_device_name(),
+                host_permissions,
+            )?;
+            match configuration.method {
+                DeviceSyncListenMethod::Lan => host
+                    .start_fixed_lan(
+                        advertised_lan_address.expect("LAN address resolved"),
+                        configuration.fixed_port,
+                    )
+                    .map(|pairing| (pairing, None)),
+                DeviceSyncListenMethod::Quick => {
+                    let mut pairing = host.start_fixed_loopback(configuration.fixed_port)?;
+                    let tunnel = self.quick_tunnel_launcher.start(host.clone())?;
+                    let endpoint = tunnel.transport_url().to_string();
+                    host.set_advertised_endpoint(endpoint.clone())?;
+                    pairing.endpoint = endpoint;
+                    Ok((pairing, Some(tunnel)))
+                }
+                DeviceSyncListenMethod::FixedUrl => {
+                    let mut pairing = host.start_fixed_loopback(configuration.fixed_port)?;
+                    let public_url = validate_fixed_public_base_url(
+                        configuration.public_base_url.as_deref().unwrap_or_default(),
+                    )?;
+                    self.public_origin_verifier.verify(host, &public_url)?;
+                    let endpoint = public_url.to_string();
+                    host.set_advertised_endpoint(endpoint.clone())?;
+                    pairing.endpoint = endpoint;
+                    Ok((pairing, None))
+                }
+            }
+        })?;
+        let (pairing, tunnel) = match start {
+            Ok(result) => result,
+            Err(error) => {
+                let category = if is_shared_port_unavailable(&error) {
+                    DeviceSyncErrorCategory::PortUnavailable
+                } else {
+                    DeviceSyncErrorCategory::TransportUnavailable
+                };
+                if let Some(mut failed_tunnel) = self.quick_tunnel_launcher.take_failed_cleanup() {
+                    if let Err(cleanup_error) = failed_tunnel.stop() {
+                        crate::nlog!(
+                            "error",
+                            "shared quick tunnel start cleanup failed: {cleanup_error}"
+                        );
+                        self.lock_runtime()?.failed_tunnel = Some(failed_tunnel);
+                    }
+                }
+                match self.lifecycle.with_host_mut(SharedSessionHost::stop) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(cleanup_error)) | Err(cleanup_error) => {
+                        crate::nlog!(
+                            "error",
+                            "shared listener cleanup after start failure failed: {cleanup_error}"
+                        );
+                    }
+                }
+                return self.fail(category, error);
+            }
+        };
+        let mut runtime = self.lock_runtime()?;
+        runtime.pairing = Some(pairing);
+        runtime.tunnel = tunnel;
+        runtime.latest_error = None;
+        runtime.phase = DeviceSyncSourcePhase::Running;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn status(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.phase == DeviceSyncSourcePhase::Running {
+            let lifecycle = runtime.tunnel.as_mut().map(|tunnel| tunnel.lifecycle());
+            match lifecycle {
+                Some(Ok(SharedPeerTunnelLifecycle::Running)) | None => {}
+                Some(Ok(SharedPeerTunnelLifecycle::CleanupPending)) => {
+                    runtime.phase = DeviceSyncSourcePhase::Error;
+                    runtime.latest_error = Some(DeviceSyncErrorCategory::CleanupFailed);
+                    runtime.pairing = None;
+                }
+                Some(Ok(SharedPeerTunnelLifecycle::Stopped)) => {
+                    runtime.phase = DeviceSyncSourcePhase::Error;
+                    runtime.latest_error = Some(DeviceSyncErrorCategory::TransportUnavailable);
+                    runtime.pairing = None;
+                }
+                Some(Err(error)) => {
+                    crate::nlog!("error", "shared quick tunnel status failed: {error}");
+                    runtime.phase = DeviceSyncSourcePhase::Error;
+                    runtime.latest_error = Some(DeviceSyncErrorCategory::TransportUnavailable);
+                    runtime.pairing = None;
+                }
+            }
+        }
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn rotate_link(
+        &self,
+        permissions: DeviceSyncLinkPermissions,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        let _operation = self.lock_operation()?;
+        if !permissions.read {
+            return self.fail(
+                DeviceSyncErrorCategory::InvalidConfiguration,
+                PeerSyncError::Validation(
+                    "device sync sharing requires read permission".to_owned(),
+                ),
+            );
+        }
+        if self.lock_runtime()?.phase != DeviceSyncSourcePhase::Running {
+            return self.fail(
+                DeviceSyncErrorCategory::StateUnavailable,
+                PeerSyncError::Protocol("device sync source is not running".to_owned()),
+            );
+        }
+        let host_permissions = if permissions.bidirectional {
+            DevicePermissions::read_and_bidirectional()
+        } else {
+            DevicePermissions::read()
+        };
+        let rotated = self.lifecycle.with_host_mut(|host| {
+            host.set_pairing_permissions(host_permissions)?;
+            host.rotate_link()
+        })??;
+        let mut runtime = self.lock_runtime()?;
+        runtime.pairing = Some(rotated);
+        runtime.latest_error = None;
+        runtime.phase = DeviceSyncSourcePhase::Running;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn stop(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        let _operation = self.lock_operation()?;
+        if self.lock_runtime()?.phase == DeviceSyncSourcePhase::Idle {
+            return self.status();
+        }
+        self.set_phase(DeviceSyncSourcePhase::Stopping)?;
+        let mut primary = None;
+        let mut tunnel = self.lock_runtime()?.tunnel.take();
+        let mut retain_tunnel = false;
+        if let Some(active) = tunnel.as_mut() {
+            if let Err(error) = active.stop() {
+                primary = Some(error);
+                retain_tunnel = true;
+            }
+        }
+        if retain_tunnel {
+            self.lock_runtime()?.tunnel = tunnel;
+        }
+        let mut failed_tunnel = self.lock_runtime()?.failed_tunnel.take();
+        let mut retain_failed_tunnel = false;
+        if let Some(failed) = failed_tunnel.as_mut() {
+            if let Err(error) = failed.stop() {
+                if primary.is_none() {
+                    primary = Some(error);
+                }
+                retain_failed_tunnel = true;
+            }
+        }
+        if retain_failed_tunnel {
+            self.lock_runtime()?.failed_tunnel = failed_tunnel;
+        }
+        if let Err(error) = self.lifecycle.stop() {
+            if primary.is_none() {
+                primary = Some(error);
+            }
+        }
+        self.lock_runtime()?.pairing = None;
+        if let Some(error) = primary {
+            return self.fail(DeviceSyncErrorCategory::CleanupFailed, error);
+        }
+        let mut runtime = self.lock_runtime()?;
+        runtime.phase = DeviceSyncSourcePhase::Idle;
+        runtime.configuration = None;
+        runtime.pairing = None;
+        runtime.tunnel = None;
+        runtime.failed_tunnel = None;
+        runtime.latest_error = None;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
+        let result = self
+            .lifecycle
+            .with_host_mut(|host| host.revoke_registered_device(device_id));
+        if let Err(error) = result {
+            crate::nlog!("warn", "shared source live bearer revoke skipped: {error}");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pairing_for_test(&self) -> Option<SharedPairingData> {
+        self.runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.pairing.clone())
+    }
+
+    fn fail<T>(
+        &self,
+        category: DeviceSyncErrorCategory,
+        error: PeerSyncError,
+    ) -> Result<T, PeerSyncError> {
+        self.record_error_category(category);
+        Err(error)
+    }
+
+    fn record_error_category(&self, category: DeviceSyncErrorCategory) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.phase = DeviceSyncSourcePhase::Error;
+            runtime.latest_error = Some(category);
+        }
+    }
+
+    fn clear_error_category(&self) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.latest_error = None;
+        }
+    }
+
+    fn status_from_runtime(runtime: &DeviceSyncRuntime) -> DeviceSyncSourceStatus {
+        DeviceSyncSourceStatus {
+            phase: runtime.phase,
+            endpoint: runtime
+                .pairing
+                .as_ref()
+                .map(|pairing| pairing.endpoint.clone()),
+            pairing_uri: runtime
+                .pairing
+                .as_ref()
+                .map(SharedPairingData::canonical_uri),
+            expires_at_ms: runtime
+                .pairing
+                .as_ref()
+                .and_then(|pairing| u64::try_from(pairing.expires_at_ms).ok()),
+            latest_error: runtime.latest_error,
+        }
+    }
+
+    fn set_phase(&self, phase: DeviceSyncSourcePhase) -> Result<(), PeerSyncError> {
+        self.lock_runtime()?.phase = phase;
+        Ok(())
+    }
+
+    fn lock_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, PeerSyncError> {
+        self.operation.lock().map_err(|error| {
+            PeerSyncError::Storage(format!("device sync operation mutex poisoned: {error}"))
+        })
+    }
+
+    fn lock_runtime(&self) -> Result<std::sync::MutexGuard<'_, DeviceSyncRuntime>, PeerSyncError> {
+        self.runtime.lock().map_err(|error| {
+            PeerSyncError::Storage(format!("device sync runtime mutex poisoned: {error}"))
+        })
+    }
+}
+
+#[cfg(desktop)]
+fn validate_fixed_public_base_url(value: &str) -> Result<url::Url, PeerSyncError> {
+    super::tunnel::validate_public_base_url(value)
+        .ok_or_else(|| PeerSyncError::Validation("device sync public URL is invalid".to_owned()))
+}
+
+#[cfg(desktop)]
+fn is_shared_port_unavailable(error: &PeerSyncError) -> bool {
+    matches!(error, PeerSyncError::Transport(message) if message == "shared fixed port is unavailable")
+}
+
+#[cfg(desktop)]
+fn device_sync_store_error(error: PeerSyncError) -> StoreError {
+    StoreError::Store {
+        message: error.to_string(),
+    }
+}
+
+#[cfg(desktop)]
+fn device_sync_command_failure(
+    state: &DeviceSyncSourceState,
+    operation: &str,
+    fallback: DeviceSyncErrorCategory,
+    error: impl std::fmt::Display,
+) -> DeviceSyncErrorCategory {
+    crate::nlog!("error", "device sync {operation} failed: {error}");
+    let category = state
+        .status()
+        .ok()
+        .and_then(|status| status.latest_error)
+        .unwrap_or(fallback);
+    state.record_error_category(category);
+    category
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn device_sync_prepare(
+    app: AppHandle,
+    state: State<'_, DeviceSyncSourceState>,
+    request: DeviceSyncPrepareRequest,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    state.clear_error_category();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let app_root = app.path().app_data_dir().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "device sync application data directory is unavailable: {error}"
+            ))
+        })?;
+        let cas = PayloadCas::new(&app_root)?;
+        persistent_store::commands::with_store_mut(app.state(), |store| {
+            let expected_bidirectional_revision = store.revision()?;
+            let mut context = SharedSourcePreparationContext {
+                store,
+                cas: &cas,
+                app_root: &app_root,
+                cancellation: &NeverCancelled,
+                expected_bidirectional_revision,
+            };
+            worker_state
+                .prepare(&mut context, &app_root, request)
+                .map_err(device_sync_store_error)
+        })
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
+    })
+    .await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(device_sync_command_failure(
+            &state,
+            "prepare",
+            DeviceSyncErrorCategory::PreparationFailed,
+            error,
+        )),
+        Err(error) => Err(device_sync_command_failure(
+            &state,
+            "prepare worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn device_sync_start(
+    state: State<'_, DeviceSyncSourceState>,
+    permissions: DeviceSyncLinkPermissions,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    state.clear_error_category();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || worker_state.start(permissions)).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(device_sync_command_failure(
+            &state,
+            "start",
+            DeviceSyncErrorCategory::TransportUnavailable,
+            error,
+        )),
+        Err(error) => Err(device_sync_command_failure(
+            &state,
+            "start worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub fn device_sync_status(
+    state: State<'_, DeviceSyncSourceState>,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    state.status().map_err(|error| {
+        device_sync_command_failure(
+            state.inner(),
+            "status",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )
+    })
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn device_sync_stop(
+    state: State<'_, DeviceSyncSourceState>,
+) -> Result<(), DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    state.clear_error_category();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || worker_state.stop()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(device_sync_command_failure(
+            &state,
+            "stop",
+            DeviceSyncErrorCategory::CleanupFailed,
+            error,
+        )),
+        Err(error) => Err(device_sync_command_failure(
+            &state,
+            "stop worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn device_sync_rotate_link(
+    state: State<'_, DeviceSyncSourceState>,
+    permissions: DeviceSyncLinkPermissions,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    state.clear_error_category();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || worker_state.rotate_link(permissions)).await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(device_sync_command_failure(
+            &state,
+            "link rotation",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+        Err(error) => Err(device_sync_command_failure(
+            &state,
+            "link rotation worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SharedPairingData {
     pub(crate) endpoint: String,
@@ -384,9 +1209,14 @@ impl SharedPairingData {
     }
 }
 
-pub(crate) struct SharedSessionHost {
+struct SharedSessionHostInner {
     host: LanCloneHost,
     advertised_endpoint: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedSessionHost {
+    inner: Arc<Mutex<SharedSessionHostInner>>,
 }
 
 impl SharedSessionHost {
@@ -396,8 +1226,10 @@ impl SharedSessionHost {
         bidirectional: PreparedBidirectionalLogicalLanSession,
     ) -> Result<Self, PeerSyncError> {
         Ok(Self {
-            host: LanCloneHost::prepare_shared(clone, delta, bidirectional)?,
-            advertised_endpoint: None,
+            inner: Arc::new(Mutex::new(SharedSessionHostInner {
+                host: LanCloneHost::prepare_shared(clone, delta, bidirectional)?,
+                advertised_endpoint: None,
+            })),
         })
     }
 
@@ -407,7 +1239,8 @@ impl SharedSessionHost {
         source_name: &str,
         permissions: DevicePermissions,
     ) -> Result<(), PeerSyncError> {
-        self.host
+        self.inner()?
+            .host
             .enable_v2_registry(app_root, source_name, permissions)
     }
 
@@ -424,9 +1257,13 @@ impl SharedSessionHost {
                 "shared LAN advertised address must be private or link-local IPv4".to_owned(),
             ));
         }
-        let pairing = self.host.start_fixed_lan(port)?;
-        let data = self.pairing_at("http", advertised_address, pairing)?;
-        self.advertised_endpoint = Some(data.endpoint.clone());
+        let mut inner = self.inner()?;
+        let pairing = inner
+            .host
+            .start_fixed_lan(port)
+            .map_err(map_shared_listener_start_error)?;
+        let data = Self::pairing_at(&inner.host, "http", advertised_address, pairing)?;
+        inner.advertised_endpoint = Some(data.endpoint.clone());
         Ok(data)
     }
 
@@ -447,9 +1284,13 @@ impl SharedSessionHost {
         }
         // `LanCloneHost` owns the binding primitive. The private-interface
         // fixed-port entry point is intentionally kept in that same host.
-        let pairing = self.host.start_fixed_on(address, port)?;
-        let data = self.pairing("http", pairing)?;
-        self.advertised_endpoint = Some(data.endpoint.clone());
+        let mut inner = self.inner()?;
+        let pairing = inner
+            .host
+            .start_fixed_on(address, port)
+            .map_err(map_shared_listener_start_error)?;
+        let data = Self::pairing(&inner.host, "http", pairing)?;
+        inner.advertised_endpoint = Some(data.endpoint.clone());
         Ok(data)
     }
 
@@ -458,15 +1299,20 @@ impl SharedSessionHost {
         &mut self,
         port: u16,
     ) -> Result<SharedPairingData, PeerSyncError> {
-        let pairing = self.host.start_fixed_loopback(port)?;
-        let data = self.pairing("http", pairing)?;
-        self.advertised_endpoint = Some(data.endpoint.clone());
+        let mut inner = self.inner()?;
+        let pairing = inner
+            .host
+            .start_fixed_loopback(port)
+            .map_err(map_shared_listener_start_error)?;
+        let data = Self::pairing(&inner.host, "http", pairing)?;
+        inner.advertised_endpoint = Some(data.endpoint.clone());
         Ok(data)
     }
 
     pub(crate) fn rotate_link(&mut self) -> Result<SharedPairingData, PeerSyncError> {
-        let pairing = self.host.rotate_pairing_link()?;
-        let endpoint = self.advertised_endpoint.clone().ok_or_else(|| {
+        let inner = self.inner()?;
+        let pairing = inner.host.rotate_pairing_link()?;
+        let endpoint = inner.advertised_endpoint.clone().ok_or_else(|| {
             PeerSyncError::Protocol("shared LAN host has no advertised endpoint".to_owned())
         })?;
         Ok(SharedPairingData {
@@ -474,33 +1320,39 @@ impl SharedSessionHost {
             session_id: pairing.session_id,
             manifest_id: pairing.manifest_id,
             claim: pairing.claim,
-            expires_at_ms: self.host.pairing_expires_at_ms().ok_or_else(|| {
+            expires_at_ms: inner.host.pairing_expires_at_ms().ok_or_else(|| {
                 PeerSyncError::Protocol("shared LAN host has no pending pairing link".to_owned())
             })?,
         })
     }
 
     pub(crate) fn address(&self) -> Option<SocketAddr> {
-        self.host.address()
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.host.address())
     }
 
     pub(crate) fn stop(&mut self) -> Result<(), PeerSyncError> {
-        let result = self.host.stop();
-        self.advertised_endpoint = None;
+        let mut inner = self.inner()?;
+        let result = inner.host.stop();
+        inner.advertised_endpoint = None;
         result
     }
 
     #[cfg(test)]
     pub(crate) fn expire_link_for_test(&self) {
-        self.host.expire_claim_for_test();
+        if let Ok(inner) = self.inner.lock() {
+            inner.host.expire_claim_for_test();
+        }
     }
 
     fn pairing(
-        &self,
+        host: &LanCloneHost,
         scheme: &str,
         pairing: LanPairing,
     ) -> Result<SharedPairingData, PeerSyncError> {
-        let address = self.host.address().ok_or_else(|| {
+        let address = host.address().ok_or_else(|| {
             PeerSyncError::Protocol("shared LAN host did not expose an address".to_owned())
         })?;
         Ok(SharedPairingData {
@@ -508,20 +1360,19 @@ impl SharedSessionHost {
             session_id: pairing.session_id,
             manifest_id: pairing.manifest_id,
             claim: pairing.claim,
-            expires_at_ms: self.host.pairing_expires_at_ms().ok_or_else(|| {
+            expires_at_ms: host.pairing_expires_at_ms().ok_or_else(|| {
                 PeerSyncError::Protocol("shared LAN host has no pending pairing link".to_owned())
             })?,
         })
     }
 
     fn pairing_at(
-        &self,
+        host: &LanCloneHost,
         scheme: &str,
         advertised_address: Ipv4Addr,
         pairing: LanPairing,
     ) -> Result<SharedPairingData, PeerSyncError> {
-        let port = self
-            .host
+        let port = host
             .address()
             .ok_or_else(|| {
                 PeerSyncError::Protocol("shared LAN host did not expose an address".to_owned())
@@ -532,9 +1383,62 @@ impl SharedSessionHost {
             session_id: pairing.session_id,
             manifest_id: pairing.manifest_id,
             claim: pairing.claim,
-            expires_at_ms: self.host.pairing_expires_at_ms().ok_or_else(|| {
+            expires_at_ms: host.pairing_expires_at_ms().ok_or_else(|| {
                 PeerSyncError::Protocol("shared LAN host has no pending pairing link".to_owned())
             })?,
         })
+    }
+
+    fn set_advertised_endpoint(&self, endpoint: String) -> Result<(), PeerSyncError> {
+        self.inner()?.advertised_endpoint = Some(endpoint);
+        Ok(())
+    }
+
+    fn revoke_registered_device(&self, device_id: &str) {
+        if let Ok(inner) = self.inner.lock() {
+            inner.host.revoke(device_id);
+        }
+    }
+
+    fn set_pairing_permissions(&self, permissions: DevicePermissions) -> Result<(), PeerSyncError> {
+        self.inner()?.host.set_v2_pairing_permissions(permissions)
+    }
+
+    #[cfg(desktop)]
+    pub(crate) fn issue_tunnel_probe(
+        &self,
+    ) -> Result<super::lan::TunnelOriginProbe, PeerSyncError> {
+        self.inner()?.host.issue_tunnel_probe()
+    }
+
+    #[cfg(desktop)]
+    pub(crate) fn clear_tunnel_probe(&self) {
+        if let Ok(inner) = self.inner.lock() {
+            inner.host.clear_tunnel_probe();
+        }
+    }
+
+    #[cfg(desktop)]
+    fn verify_public_origin(&self, public_url: &url::Url) -> Result<(), PeerSyncError> {
+        let mut shared = self.clone();
+        super::tunnel::verify_public_origin(&mut shared, public_url).map_err(|error| {
+            crate::nlog!("error", "shared fixed URL origin probe failed: {error}");
+            PeerSyncError::Transport("shared fixed URL origin probe failed".to_owned())
+        })
+    }
+
+    fn inner(&self) -> Result<std::sync::MutexGuard<'_, SharedSessionHostInner>, PeerSyncError> {
+        self.inner
+            .lock()
+            .map_err(|error| PeerSyncError::Storage(format!("shared host mutex poisoned: {error}")))
+    }
+}
+
+fn map_shared_listener_start_error(error: PeerSyncError) -> PeerSyncError {
+    if matches!(error, PeerSyncError::Transport(_)) {
+        crate::nlog!("error", "shared listener start failed: {error}");
+        PeerSyncError::Transport("shared fixed port is unavailable".to_owned())
+    } else {
+        error
     }
 }

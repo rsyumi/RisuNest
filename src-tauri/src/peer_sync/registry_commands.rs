@@ -1,7 +1,5 @@
 #[cfg(target_os = "android")]
 use super::android_source_commands::AndroidPeerCloneSourceState;
-#[cfg(desktop)]
-use super::commands::PeerCloneCommandState;
 use super::{
     bidirectional_commands::PeerBidirectionalCommandState,
     delta_commands::PeerDeltaCommandState,
@@ -10,6 +8,8 @@ use super::{
         revoke_outgoing_device, IncomingSourceSummary, OutgoingDeviceSummary,
     },
 };
+#[cfg(desktop)]
+use super::{commands::PeerCloneCommandState, shared_session::DeviceSyncSourceState};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
@@ -37,15 +37,18 @@ pub fn peer_sync_revoke_outgoing_device(
     clone: State<'_, PeerCloneCommandState>,
     delta: State<'_, PeerDeltaCommandState>,
     bidirectional: State<'_, PeerBidirectionalCommandState>,
+    shared: State<'_, DeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
     let clone = clone.inner().clone();
     let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
+    let shared = shared.inner().clone();
     revoke_outgoing_device(&app_root(&app)?, &device_id, move |id| {
         clone.revoke_registered_device(id);
         delta.revoke_registered_device(id);
         bidirectional.revoke_registered_device(id);
+        shared.revoke_registered_device(id);
     })
     .map_err(|e| e.to_string())
 }

@@ -269,29 +269,8 @@ impl TunnelMode {
         {
             return Err(TunnelError::InvalidNamedConfiguration);
         }
-        if has_explicit_authority_port(expected_public_base_url) {
-            return Err(TunnelError::InvalidNamedConfiguration);
-        }
-        if !has_bare_authority_path(expected_public_base_url) {
-            return Err(TunnelError::InvalidNamedConfiguration);
-        }
-        let expected_public_base_url = Url::parse(expected_public_base_url)
-            .map_err(|_| TunnelError::InvalidNamedConfiguration)?;
-        let is_public_domain = matches!(
-            expected_public_base_url.host(),
-            Some(url::Host::Domain(host)) if host.contains('.') && !host.eq_ignore_ascii_case("localhost")
-        );
-        if expected_public_base_url.scheme() != "https"
-            || !is_public_domain
-            || !expected_public_base_url.username().is_empty()
-            || expected_public_base_url.password().is_some()
-            || expected_public_base_url.port().is_some()
-            || !matches!(expected_public_base_url.path(), "" | "/")
-            || expected_public_base_url.query().is_some()
-            || expected_public_base_url.fragment().is_some()
-        {
-            return Err(TunnelError::InvalidNamedConfiguration);
-        }
+        let expected_public_base_url = validate_public_base_url(expected_public_base_url)
+            .ok_or(TunnelError::InvalidNamedConfiguration)?;
         Ok(Self::Named {
             token,
             expected_public_base_url,
@@ -1021,6 +1000,39 @@ fn verify_named_route(
     }
 }
 
+pub(crate) fn validate_public_base_url(value: &str) -> Option<Url> {
+    if has_explicit_authority_port(value) || !has_bare_authority_path(value) {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    let is_public_domain = matches!(
+        url.host(),
+        Some(url::Host::Domain(host)) if host.contains('.') && !host.eq_ignore_ascii_case("localhost")
+    );
+    if url.scheme() != "https"
+        || !is_public_domain
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url)
+}
+
+pub(crate) fn verify_public_origin<S>(
+    peer_session: &mut S,
+    expected_public_base_url: &Url,
+) -> Result<(), String>
+where
+    S: PeerSession,
+{
+    peer_session.verify_named_origin(expected_public_base_url, NAMED_ORIGIN_VERIFY_TIMEOUT)
+}
+
 impl PeerSession for super::LanCloneHost {
     fn revoke(&mut self) -> Result<(), String> {
         self.stop()
@@ -1035,6 +1047,26 @@ impl PeerSession for super::LanCloneHost {
         let probe = self
             .issue_tunnel_probe()
             .map_err(|_| "named tunnel origin verification failed".to_owned())?;
+        let result = verify_named_route(expected_public_base_url, &probe, timeout);
+        self.clear_tunnel_probe();
+        result
+    }
+}
+
+impl PeerSession for super::shared_session::SharedSessionHost {
+    fn revoke(&mut self) -> Result<(), String> {
+        self.stop()
+            .map_err(|_| "shared peer session cleanup failed".to_owned())
+    }
+
+    fn verify_named_origin(
+        &mut self,
+        expected_public_base_url: &Url,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let probe = self
+            .issue_tunnel_probe()
+            .map_err(|_| "shared origin verification failed".to_owned())?;
         let result = verify_named_route(expected_public_base_url, &probe, timeout);
         self.clear_tunnel_probe();
         result
@@ -1079,6 +1111,16 @@ pub(crate) fn start_quick_desktop_tunnel(
             process_cleanup_error: None,
         });
     };
+    start_quick_desktop_tunnel_session(peer_session, origin)
+}
+
+pub(crate) fn start_quick_desktop_tunnel_session<S>(
+    peer_session: S,
+    origin: SocketAddr,
+) -> Result<RunningTunnel, TunnelStartFailure<SystemTunnelProcess, S>>
+where
+    S: PeerSession,
+{
     TunnelAdapter::system().start(TunnelMode::Quick, origin, peer_session)
 }
 

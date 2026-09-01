@@ -1235,6 +1235,18 @@ impl LanCloneHost {
         Ok(())
     }
 
+    pub(crate) fn set_v2_pairing_permissions(
+        &self,
+        permissions: DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        let mut registration = recovered_lock(&self.shared.v2_registration);
+        let registration = registration
+            .as_mut()
+            .ok_or_else(|| PeerSyncError::Protocol("LAN v2 registry is not enabled".to_owned()))?;
+        registration.permissions = permissions;
+        Ok(())
+    }
+
     fn rehydrate_registered_devices(&self) -> Result<(), PeerSyncError> {
         let Some(registration) = recovered_lock(&self.shared.v2_registration).clone() else {
             return Ok(());

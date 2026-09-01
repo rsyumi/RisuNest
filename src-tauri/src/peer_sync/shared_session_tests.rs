@@ -14,7 +14,10 @@ use super::{
     },
     prepare_clone_session,
     shared_session::{
-        SharedPairingData, SharedSessionHost, SharedSessionLifecycle, SharedSessionPhase,
+        DeviceSyncLinkPermissions, DeviceSyncListenMethod, DeviceSyncPrepareRequest,
+        DeviceSyncSourcePhase, DeviceSyncSourceState, SharedPairingData, SharedPeerTunnel,
+        SharedPeerTunnelCleanup, SharedPeerTunnelLauncher, SharedPeerTunnelLifecycle,
+        SharedPublicOriginVerifier, SharedSessionHost, SharedSessionLifecycle, SharedSessionPhase,
         SharedSourceLane, SharedSourceOwnership, SharedSourcePreparation,
     },
     CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError, PinnedCloneRevision,
@@ -29,8 +32,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io::{Cursor, Read},
+    net::{Ipv4Addr, TcpListener},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Default)]
@@ -38,11 +42,12 @@ struct LifecycleFixture {
     events: Vec<&'static str>,
     fail_prepare: Option<SharedSourceLane>,
     fail_build: bool,
+    fail_stop_host_once: bool,
     cleanup_failures: Vec<SharedSourceLane>,
 }
 
 impl SharedSourceOwnership for LifecycleFixture {
-    type Host = ();
+    type Host = u32;
 
     fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
         self.events.push("build-host");
@@ -51,7 +56,7 @@ impl SharedSourceOwnership for LifecycleFixture {
                 "host construction failed after move".to_owned(),
             ));
         }
-        Ok(())
+        Ok(0)
     }
 
     fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
@@ -73,6 +78,9 @@ impl SharedSourceOwnership for LifecycleFixture {
 
     fn stop_host(&mut self, _: &mut Self::Host) -> Result<(), PeerSyncError> {
         self.events.push("stop-host");
+        if std::mem::take(&mut self.fail_stop_host_once) {
+            return Err(PeerSyncError::Transport("host stop failed".to_owned()));
+        }
         Ok(())
     }
 }
@@ -112,6 +120,17 @@ fn unified_preparation_builds_the_host_only_after_all_sources_prepare() {
             "build-host",
         ]
     );
+}
+
+#[test]
+fn prepared_lifecycle_exposes_its_host_without_transferring_ownership() {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture::default());
+    lifecycle.prepare(&mut ()).unwrap();
+
+    lifecycle.with_host_mut(|host| *host = 7).unwrap();
+
+    assert_eq!(lifecycle.with_host_mut(|host| *host).unwrap(), 7);
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Prepared);
 }
 
 #[test]
@@ -229,6 +248,41 @@ fn cleanup_failure_retains_the_lane_for_a_retry() {
             "cleanup-bidirectional",
         ]
     );
+}
+
+#[test]
+fn host_stop_failure_retains_the_host_for_a_retry_after_all_lane_cleanup() {
+    let lifecycle = SharedSessionLifecycle::new(LifecycleFixture {
+        fail_stop_host_once: true,
+        ..LifecycleFixture::default()
+    });
+    lifecycle.prepare(&mut ()).unwrap();
+
+    assert!(lifecycle.stop().is_err());
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Stopping);
+    lifecycle
+        .with_preparation(|fixture| {
+            assert_eq!(
+                fixture.events,
+                [
+                    "prepare-clone",
+                    "prepare-delta",
+                    "prepare-bidirectional",
+                    "build-host",
+                    "stop-host",
+                    "cleanup-bidirectional",
+                    "cleanup-delta",
+                    "cleanup-clone",
+                ]
+            );
+        })
+        .unwrap();
+
+    lifecycle.stop().unwrap();
+    assert_eq!(lifecycle.phase().unwrap(), SharedSessionPhase::Idle);
+    lifecycle
+        .with_preparation(|fixture| assert_eq!(fixture.events.last(), Some(&"stop-host")))
+        .unwrap();
 }
 
 #[test]
@@ -512,8 +566,954 @@ fn host() -> (tempfile::TempDir, SharedSessionHost) {
         .unwrap();
     (root, host)
 }
+
+struct TransportPreparation {
+    host: Option<SharedSessionHost>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl SharedSourceOwnership for TransportPreparation {
+    type Host = SharedSessionHost;
+
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        self.events.lock().unwrap().push("build-host");
+        self.host
+            .take()
+            .ok_or_else(|| PeerSyncError::Protocol("fixture host already moved".to_owned()))
+    }
+
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
+        self.events.lock().unwrap().push(match lane {
+            SharedSourceLane::Clone => "cleanup-clone",
+            SharedSourceLane::Delta => "cleanup-delta",
+            SharedSourceLane::Bidirectional => "cleanup-bidirectional",
+        });
+        Ok(())
+    }
+
+    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError> {
+        self.events.lock().unwrap().push("stop-host");
+        host.stop()
+    }
+}
+
+impl SharedSourcePreparation<()> for TransportPreparation {
+    fn prepare(&mut self, lane: SharedSourceLane, _: &mut ()) -> Result<(), PeerSyncError> {
+        self.events.lock().unwrap().push(match lane {
+            SharedSourceLane::Clone => "prepare-clone",
+            SharedSourceLane::Delta => "prepare-delta",
+            SharedSourceLane::Bidirectional => "prepare-bidirectional",
+        });
+        Ok(())
+    }
+}
+
+fn available_port() -> u16 {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn unified_lan_transport_uses_the_requested_fixed_port_and_releases_it_on_stop() {
+    let (root, host) = host();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::clone(&events),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+
+    let status = state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(
+        status.endpoint.as_deref(),
+        Some(format!("http://127.0.0.1:{port}").as_str())
+    );
+    assert!(status
+        .pairing_uri
+        .as_deref()
+        .unwrap()
+        .starts_with("risuailocal://peer-clone/v2?"));
+    assert!(status.expires_at_ms.unwrap() > 0);
+    assert_eq!(status.latest_error, None);
+    state.stop().unwrap();
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "prepare-clone",
+            "prepare-delta",
+            "prepare-bidirectional",
+            "build-host",
+            "stop-host",
+            "cleanup-bidirectional",
+            "cleanup-delta",
+            "cleanup-clone",
+        ]
+    );
+}
+
+#[test]
+fn concurrent_unified_start_calls_preserve_one_running_listener() {
+    let (root, host) = host();
+    let state = Arc::new(DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    ));
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let starts = (0..2)
+        .map(|_| {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                state
+                    .start(DeviceSyncLinkPermissions {
+                        read: true,
+                        bidirectional: false,
+                    })
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let statuses = starts
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(statuses[0], statuses[1]);
+    assert_eq!(statuses[0].phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(
+        reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{port}/v1/peer/hello"))
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    state.stop().unwrap();
+}
+
+struct FakeSharedTunnelLauncher {
+    public_url: url::Url,
+    seen_origin: Arc<Mutex<Option<std::net::SocketAddr>>>,
+}
+
+impl SharedPeerTunnelLauncher for FakeSharedTunnelLauncher {
+    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        *self.seen_origin.lock().unwrap() = host.address();
+        Ok(Box::new(FakeSharedTunnel {
+            _host: host,
+            public_url: self.public_url.clone(),
+        }))
+    }
+}
+
+struct FakeSharedTunnel {
+    _host: SharedSessionHost,
+    public_url: url::Url,
+}
+
+impl SharedPeerTunnel for FakeSharedTunnel {
+    fn transport_url(&self) -> url::Url {
+        self.public_url.clone()
+    }
+
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn unified_quick_transport_uses_the_fixed_loopback_port_and_public_tunnel_url() {
+    let (root, host) = host();
+    let seen_origin = Arc::new(Mutex::new(None));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(FakeSharedTunnelLauncher {
+            public_url: url::Url::parse("https://session-id.trycloudflare.com/").unwrap(),
+            seen_origin: Arc::clone(&seen_origin),
+        }),
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+
+    let status = state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+
+    assert_eq!(
+        *seen_origin.lock().unwrap(),
+        Some((Ipv4Addr::LOCALHOST, port).into())
+    );
+    assert_eq!(
+        status.endpoint.as_deref(),
+        Some("https://session-id.trycloudflare.com/")
+    );
+    assert!(status
+        .pairing_uri
+        .as_deref()
+        .unwrap()
+        .contains("endpoint=https%3A%2F%2Fsession-id.trycloudflare.com%2F"));
+    state.stop().unwrap();
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+}
+
+struct LifecycleTunnelLauncher {
+    lifecycle: Arc<Mutex<SharedPeerTunnelLifecycle>>,
+    starts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SharedPeerTunnelLauncher for LifecycleTunnelLauncher {
+    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(LifecycleTunnel {
+            _host: host,
+            lifecycle: Arc::clone(&self.lifecycle),
+        }))
+    }
+}
+
+struct LifecycleTunnel {
+    _host: SharedSessionHost,
+    lifecycle: Arc<Mutex<SharedPeerTunnelLifecycle>>,
+}
+
+impl SharedPeerTunnel for LifecycleTunnel {
+    fn transport_url(&self) -> url::Url {
+        url::Url::parse("https://lifecycle.trycloudflare.com/").unwrap()
+    }
+
+    fn lifecycle(&mut self) -> Result<SharedPeerTunnelLifecycle, PeerSyncError> {
+        Ok(*self.lifecycle.lock().unwrap())
+    }
+
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        *self.lifecycle.lock().unwrap() = SharedPeerTunnelLifecycle::Stopped;
+        Ok(())
+    }
+}
+
+#[test]
+fn unified_quick_status_reports_a_naturally_stopped_tunnel() {
+    let (root, host) = host();
+    let lifecycle = Arc::new(Mutex::new(SharedPeerTunnelLifecycle::Running));
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(LifecycleTunnelLauncher {
+            lifecycle: Arc::clone(&lifecycle),
+            starts: Arc::clone(&starts),
+        }),
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+
+    *lifecycle.lock().unwrap() = SharedPeerTunnelLifecycle::Stopped;
+    assert!(state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .is_err());
+    let status = state.status().unwrap();
+
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(
+        status.latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
+    );
+    assert_eq!(status.endpoint, None);
+    assert_eq!(status.pairing_uri, None);
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    state.stop().unwrap();
+}
+
+#[test]
+fn cleanup_pending_quick_tunnel_blocks_restart_until_stop_retries_it() {
+    let (root, host) = host();
+    let lifecycle = Arc::new(Mutex::new(SharedPeerTunnelLifecycle::Running));
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(LifecycleTunnelLauncher {
+            lifecycle: Arc::clone(&lifecycle),
+            starts: Arc::clone(&starts),
+        }),
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+
+    *lifecycle.lock().unwrap() = SharedPeerTunnelLifecycle::CleanupPending;
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Error);
+    assert!(state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .is_err());
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    assert_eq!(state.stop().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(
+        *lifecycle.lock().unwrap(),
+        SharedPeerTunnelLifecycle::Stopped
+    );
+}
+
+struct FakePublicOriginVerifier {
+    seen: Arc<Mutex<Vec<(std::net::SocketAddr, url::Url)>>>,
+}
+
+impl SharedPublicOriginVerifier for FakePublicOriginVerifier {
+    fn verify(&self, host: &SharedSessionHost, public_url: &url::Url) -> Result<(), PeerSyncError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((host.address().unwrap(), public_url.clone()));
+        Ok(())
+    }
+}
+
+#[test]
+fn fixed_url_probes_the_external_origin_without_launching_cloudflared() {
+    let (root, host) = host();
+    let tunnel_origin = Arc::new(Mutex::new(None));
+    let probes = Arc::new(Mutex::new(Vec::new()));
+    let state = DeviceSyncSourceState::new_for_test_with_transports(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(FakeSharedTunnelLauncher {
+            public_url: url::Url::parse("https://must-not-launch.example.com/").unwrap(),
+            seen_origin: Arc::clone(&tunnel_origin),
+        }),
+        Arc::new(FakePublicOriginVerifier {
+            seen: Arc::clone(&probes),
+        }),
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::FixedUrl,
+                fixed_port: port,
+                public_base_url: Some("https://sync.example.com/".to_owned()),
+            },
+        )
+        .unwrap();
+
+    let status = state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: true,
+        })
+        .unwrap();
+
+    assert_eq!(*tunnel_origin.lock().unwrap(), None);
+    assert_eq!(
+        *probes.lock().unwrap(),
+        [(
+            (Ipv4Addr::LOCALHOST, port).into(),
+            url::Url::parse("https://sync.example.com/").unwrap(),
+        )]
+    );
+    assert_eq!(
+        status.endpoint.as_deref(),
+        Some("https://sync.example.com/")
+    );
+    state.stop().unwrap();
+}
+
+#[test]
+fn invalid_fixed_url_records_only_the_safe_configuration_category() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+
+    assert!(state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::FixedUrl,
+                fixed_port: available_port(),
+                public_base_url: Some("http://localhost/private?token=secret".to_owned()),
+            },
+        )
+        .is_err());
+
+    let status = state.status().unwrap();
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(
+        status.latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+    );
+    assert_eq!(status.endpoint, None);
+    assert_eq!(status.pairing_uri, None);
+}
+
+#[test]
+fn unified_transport_rotation_keeps_the_endpoint_and_replaces_only_the_pairing_link() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    let initial = state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+
+    let rotated = state
+        .rotate_link(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: true,
+        })
+        .unwrap();
+
+    assert_eq!(rotated.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(rotated.endpoint, initial.endpoint);
+    assert_ne!(rotated.pairing_uri, initial.pairing_uri);
+    assert!(rotated.expires_at_ms.unwrap() >= initial.expires_at_ms.unwrap());
+    state.stop().unwrap();
+}
+
+struct FailingSharedTunnelLauncher;
+
+impl SharedPeerTunnelLauncher for FailingSharedTunnelLauncher {
+    fn start(&self, _: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        Err(PeerSyncError::Transport(
+            "raw quick-tunnel diagnostic".to_owned(),
+        ))
+    }
+}
+
+struct RetryableStartCleanupLauncher {
+    cleanup_available: std::sync::atomic::AtomicBool,
+    cleanup_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SharedPeerTunnelLauncher for RetryableStartCleanupLauncher {
+    fn start(&self, _: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        Err(PeerSyncError::Transport(
+            "raw quick start failure with cleanup owner".to_owned(),
+        ))
+    }
+
+    fn take_failed_cleanup(&self) -> Option<Box<dyn SharedPeerTunnelCleanup>> {
+        self.cleanup_available
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| {
+                Box::new(RetryableStartCleanup {
+                    attempts: Arc::clone(&self.cleanup_attempts),
+                }) as Box<dyn SharedPeerTunnelCleanup>
+            })
+    }
+}
+
+struct RetryableStartCleanup {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SharedPeerTunnelCleanup for RetryableStartCleanup {
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == 0 {
+            Err(PeerSyncError::Transport(
+                "raw quick start cleanup failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct FailingPublicOriginVerifier;
+
+impl SharedPublicOriginVerifier for FailingPublicOriginVerifier {
+    fn verify(&self, _: &SharedSessionHost, _: &url::Url) -> Result<(), PeerSyncError> {
+        Err(PeerSyncError::Transport(
+            "raw fixed-origin diagnostic".to_owned(),
+        ))
+    }
+}
+
+#[test]
+fn transport_failures_are_not_misreported_as_port_conflicts() {
+    for (method, public_base_url, launcher, verifier) in [
+        (
+            DeviceSyncListenMethod::Quick,
+            None,
+            Arc::new(FailingSharedTunnelLauncher) as Arc<dyn SharedPeerTunnelLauncher>,
+            Arc::new(FakePublicOriginVerifier {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }) as Arc<dyn SharedPublicOriginVerifier>,
+        ),
+        (
+            DeviceSyncListenMethod::FixedUrl,
+            Some("https://sync.example.com/".to_owned()),
+            Arc::new(FakeSharedTunnelLauncher {
+                public_url: url::Url::parse("https://unused.example.com/").unwrap(),
+                seen_origin: Arc::new(Mutex::new(None)),
+            }) as Arc<dyn SharedPeerTunnelLauncher>,
+            Arc::new(FailingPublicOriginVerifier) as Arc<dyn SharedPublicOriginVerifier>,
+        ),
+    ] {
+        let (root, host) = host();
+        let state = DeviceSyncSourceState::new_for_test_with_transports(
+            TransportPreparation {
+                host: Some(host),
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            launcher,
+            verifier,
+        );
+        let port = available_port();
+        state
+            .prepare(
+                &mut (),
+                root.path(),
+                DeviceSyncPrepareRequest {
+                    method,
+                    fixed_port: port,
+                    public_base_url,
+                },
+            )
+            .unwrap();
+
+        assert!(state
+            .start(DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            })
+            .is_err());
+        let status = state.status().unwrap();
+        assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
+        assert_eq!(
+            status.latest_error,
+            Some(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
+        );
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        state.stop().unwrap();
+    }
+}
+
+#[test]
+fn quick_start_failure_retains_failed_cleanup_for_explicit_stop_retry() {
+    let (root, host) = host();
+    let cleanup_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(RetryableStartCleanupLauncher {
+            cleanup_available: std::sync::atomic::AtomicBool::new(true),
+            cleanup_attempts: Arc::clone(&cleanup_attempts),
+        }),
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+
+    assert!(state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .is_err());
+    assert_eq!(
+        cleanup_attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+
+    assert_eq!(state.stop().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(
+        cleanup_attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[test]
+fn fixed_port_conflict_has_its_own_safe_error_category() {
+    let (root, host) = host();
+    let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+
+    assert!(state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .is_err());
+    assert_eq!(
+        state.status().unwrap().latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::PortUnavailable)
+    );
+    state.stop().unwrap();
+}
+
+struct RetryableTunnelLauncher {
+    public_url: url::Url,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl SharedPeerTunnelLauncher for RetryableTunnelLauncher {
+    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        Ok(Box::new(RetryableTunnel {
+            _host: host,
+            public_url: self.public_url.clone(),
+            events: Arc::clone(&self.events),
+            fail_once: true,
+        }))
+    }
+}
+
+struct RetryableTunnel {
+    _host: SharedSessionHost,
+    public_url: url::Url,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    fail_once: bool,
+}
+
+impl SharedPeerTunnel for RetryableTunnel {
+    fn transport_url(&self) -> url::Url {
+        self.public_url.clone()
+    }
+
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        self.events.lock().unwrap().push("stop-tunnel");
+        if std::mem::take(&mut self.fail_once) {
+            return Err(PeerSyncError::Transport(
+                "raw retryable tunnel cleanup failure".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn unified_stop_retries_tunnel_after_attempting_host_and_all_prepared_cleanup() {
+    let (root, host) = host();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::clone(&events),
+        },
+        Arc::new(RetryableTunnelLauncher {
+            public_url: url::Url::parse("https://retry.trycloudflare.com/").unwrap(),
+            events: Arc::clone(&events),
+        }),
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+
+    assert!(state.stop().is_err());
+    assert_eq!(
+        state.status().unwrap().latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::CleanupFailed)
+    );
+    assert_eq!(state.status().unwrap().endpoint, None);
+    assert_eq!(state.status().unwrap().pairing_uri, None);
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "prepare-clone",
+            "prepare-delta",
+            "prepare-bidirectional",
+            "build-host",
+            "stop-tunnel",
+            "stop-host",
+            "cleanup-bidirectional",
+            "cleanup-delta",
+            "cleanup-clone",
+        ]
+    );
+
+    assert_eq!(state.stop().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(events.lock().unwrap().last(), Some(&"stop-tunnel"));
+    assert_eq!(state.stop().unwrap().phase, DeviceSyncSourcePhase::Idle);
+}
+
+#[test]
+fn device_sync_wire_names_match_the_settings_contract() {
+    let request: DeviceSyncPrepareRequest = serde_json::from_value(serde_json::json!({
+        "method": "fixed-url",
+        "fixedPort": 32145,
+        "publicBaseUrl": "https://sync.example.com/"
+    }))
+    .unwrap();
+    assert_eq!(request.method, DeviceSyncListenMethod::FixedUrl);
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::json!({
+            "method": "fixed-url",
+            "fixedPort": 32145,
+            "publicBaseUrl": "https://sync.example.com/"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap(),
+        serde_json::json!({"read": true, "bidirectional": false})
+    );
+    assert_eq!(
+        serde_json::to_value(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable)
+            .unwrap(),
+        "transport-unavailable"
+    );
+    let status = super::shared_session::DeviceSyncSourceStatus {
+        phase: DeviceSyncSourcePhase::Error,
+        endpoint: None,
+        pairing_uri: None,
+        expires_at_ms: None,
+        latest_error: Some(super::shared_session::DeviceSyncErrorCategory::TransportUnavailable),
+    };
+    let serialized = serde_json::to_value(status).unwrap();
+    assert_eq!(
+        serialized,
+        serde_json::json!({
+            "phase": "error",
+            "endpoint": null,
+            "pairingUri": null,
+            "expiresAtMs": null,
+            "latestError": "transport-unavailable"
+        })
+    );
+    assert!(!serialized.to_string().contains("raw"));
+    assert!(!serialized.to_string().contains("bearer"));
+}
 fn claim(pairing: &SharedPairingData, id: &str) -> reqwest::blocking::Response {
     reqwest::blocking::Client::new().post(format!("{}/v1/sessions/{}/claim", pairing.endpoint, pairing.session_id)).json(&serde_json::json!({"claim": pairing.claim, "protocolVersion":2, "deviceId":id, "deviceName":"target"})).send().unwrap()
+}
+
+#[test]
+fn unified_source_revoke_hook_invalidates_an_established_live_bearer() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+    let pairing = state.pairing_for_test().unwrap();
+    let device_id = "00000000-0000-4000-8000-000000000031";
+    let response = claim(&pairing, device_id);
+    assert!(response.status().is_success());
+    let bearer = response.json::<serde_json::Value>().unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let client = reqwest::blocking::Client::new();
+    assert_eq!(
+        client
+            .get(format!("{}/v1/peer/hello", pairing.endpoint))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    state.revoke_registered_device(device_id);
+
+    assert_eq!(
+        client
+            .get(format!("{}/v1/peer/hello", pairing.endpoint))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    state.stop().unwrap();
 }
 
 #[test]
