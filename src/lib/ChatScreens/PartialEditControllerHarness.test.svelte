@@ -31,12 +31,12 @@
 </script>
 
 <div bind:this={bodyRoot}>
-    <p>Translated text</p>
+    <p>Shared text</p>
 </div>
 
 {#if bodyRoot}
     <PartialEditController
-        messageData="Original text"
+        messageData="Shared text"
         chatIndex={0}
         {bodyRoot}
         blockEditEnabled={true}

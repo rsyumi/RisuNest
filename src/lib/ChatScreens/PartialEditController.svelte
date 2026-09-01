@@ -253,13 +253,19 @@
             : { extendToEOL: true, snapStartToPrevEOL: true };
 
         const translationContext = await getTranslationContextIfNeeded();
-        if (
+        const sourceChanged =
             requestId !== matchingRequestId ||
             translatedView !== sourceIdentity.translatedView ||
             messageData !== sourceIdentity.messageData ||
             chatIndex !== sourceIdentity.chatIndex ||
-            bodyRoot !== sourceIdentity.bodyRoot
-        ) return;
+            bodyRoot !== sourceIdentity.bodyRoot;
+        const detachedElement = typeof elementOrText !== 'string' &&
+            (!bodyRoot || !bodyRoot.contains(elementOrText));
+        if (sourceChanged || detachedElement) {
+            hideBlockButton();
+            hideDragButton();
+            return;
+        }
 
         const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
         const sourceData = translationContext?.data ?? messageData;

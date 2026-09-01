@@ -92,24 +92,92 @@ test('abandons a deferred translation partial edit when the translated view chan
     await tick()
     document.dispatchEvent(new MouseEvent('mousemove', { clientX: 10, clientY: 10 }))
     await tick()
-    document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!.click()
+    const staleEditButton = document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!
+    staleEditButton.click()
     await vi.waitFor(() => expect(getTranslationEditContext).toHaveBeenCalledOnce())
 
     const harness = mounted as HarnessInstance
     harness.setTranslatedView(false)
     await tick()
-    translationContext.resolve({ key: 'translation-key', data: 'Translated text' })
+    translationContext.resolve({ key: 'translation-key', data: 'Shared text' })
     await Promise.resolve()
     await Promise.resolve()
     await Promise.resolve()
     await tick()
 
-    const modalOpened = document.querySelector('.partial-edit-modal') !== null
+    const firstCompletionModalOpened = document.querySelector('.partial-edit-modal') !== null
+    const controlsHidden = staleEditButton.closest<HTMLElement>('.partial-edit-btn-wrapper')?.style.display === 'none'
+    staleEditButton.click()
+    await Promise.resolve()
+    await Promise.resolve()
+    await tick()
+    const secondClickModalOpened = document.querySelector('.partial-edit-modal') !== null
     document.querySelector<HTMLButtonElement>('.partial-edit-save-btn')?.click()
     await tick()
 
-    expect({ modalOpened, saves: harness.getSaves() }).toEqual({
-        modalOpened: false,
+    expect({
+        firstCompletionModalOpened,
+        controlsHidden,
+        contextRequests: getTranslationEditContext.mock.calls.length,
+        secondClickModalOpened,
+        saves: harness.getSaves(),
+    }).toEqual({
+        firstCompletionModalOpened: false,
+        controlsHidden: true,
+        contextRequests: 1,
+        secondClickModalOpened: false,
+        saves: [],
+    })
+})
+
+test('abandons a deferred translation partial edit when its rendered block detaches', async () => {
+    const translationContext = deferred<{ key: string; data: string } | null>()
+    const getTranslationEditContext = vi.fn(() => translationContext.promise)
+    mounted = mount(PartialEditControllerHarness, {
+        target,
+        props: { getTranslationEditContext },
+    })
+    await tick()
+
+    const bodyRoot = target.querySelector('div')!
+    const translatedBlock = target.querySelector('p')!
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(translatedBlock)
+    TestIntersectionObserver.instance?.setVisible(bodyRoot)
+    await tick()
+    document.dispatchEvent(new MouseEvent('mousemove', { clientX: 10, clientY: 10 }))
+    await tick()
+    const staleEditButton = document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!
+    staleEditButton.click()
+    await vi.waitFor(() => expect(getTranslationEditContext).toHaveBeenCalledOnce())
+
+    translatedBlock.remove()
+    translationContext.resolve({ key: 'translation-key', data: 'Shared text' })
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    await tick()
+
+    const firstCompletionModalOpened = document.querySelector('.partial-edit-modal') !== null
+    const controlsHidden = staleEditButton.closest<HTMLElement>('.partial-edit-btn-wrapper')?.style.display === 'none'
+    staleEditButton.click()
+    await Promise.resolve()
+    await Promise.resolve()
+    await tick()
+    const secondClickModalOpened = document.querySelector('.partial-edit-modal') !== null
+    document.querySelector<HTMLButtonElement>('.partial-edit-save-btn')?.click()
+    await tick()
+
+    expect({
+        firstCompletionModalOpened,
+        controlsHidden,
+        contextRequests: getTranslationEditContext.mock.calls.length,
+        secondClickModalOpened,
+        saves: (mounted as HarnessInstance).getSaves(),
+    }).toEqual({
+        firstCompletionModalOpened: false,
+        controlsHidden: true,
+        contextRequests: 1,
+        secondClickModalOpened: false,
         saves: [],
     })
 })
