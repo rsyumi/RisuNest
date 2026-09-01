@@ -6,6 +6,7 @@
     import { getDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
     import { getProductionDeviceSyncController } from 'src/ts/storage/sync/deviceSyncProduction'
     import type { DeviceSyncControllerSnapshot } from 'src/ts/storage/sync/deviceSyncController'
+    import { androidPeerSyncNotificationsEnabled } from 'src/ts/storage/sync/peerSyncShared'
     import Button from 'src/lib/UI/GUI/Button.svelte'
 
     const controller = getProductionDeviceSyncController()
@@ -17,6 +18,7 @@
     let stagedUri = $state('')
     let qrDataUrl = $state('')
     let now = $state(Date.now())
+    let notificationsEnabled = $state<boolean | null>(null)
     const sharing = $derived(snapshot.source.phase !== 'idle')
     const sourceError = $derived(snapshot.source.latestError ?? snapshot.error)
     const pairUri = $derived(snapshot.source.pairingUri ?? '')
@@ -38,8 +40,8 @@
     }
     function stateColor(): string {
         if (sourceError || snapshot.source.phase === 'error') return 'bg-draculared'
-        if (snapshot.source.phase === 'running') return 'bg-green-500'
-        if (snapshot.source.phase === 'prepared' || snapshot.source.phase === 'preparing' || snapshot.source.phase === 'starting' || snapshot.source.phase === 'stopping') return 'bg-yellow-400'
+        if (snapshot.source.phase === 'running') return 'bg-selected'
+        if (snapshot.source.phase === 'prepared' || snapshot.source.phase === 'preparing' || snapshot.source.phase === 'starting' || snapshot.source.phase === 'stopping') return 'bg-darkbutton'
         return 'bg-textcolor2'
     }
     function updateSettings(partial: Partial<typeof settings>): void { updateDeviceSettings(partial); settings = getDeviceSettings() }
@@ -50,7 +52,7 @@
     }
     async function startOrStop(): Promise<void> {
         if (snapshot.source.phase === 'running') { await controller.stop(); return }
-        await controller.prepare({ method: isTauriAndroid ? 'lan' : settings.syncListenMethod, fixedPort: settings.syncFixedPort, publicBaseUrl: settings.syncPublicBaseUrl })
+        if (snapshot.source.phase !== 'prepared') await controller.prepare({ method: isTauriAndroid ? 'lan' : settings.syncListenMethod, fixedPort: settings.syncFixedPort, publicBaseUrl: settings.syncPublicBaseUrl })
         await controller.start(permissions)
     }
     async function copyLink(): Promise<void> { if (pairUri && !expired) await navigator.clipboard.writeText(pairUri) }
@@ -60,15 +62,15 @@
         if (direction === 'incoming') await controller.revokeIncoming(deviceId)
         else await controller.revokeOutgoing(deviceId)
     }
-    async function chooseTarget(value: string): Promise<void> { targetId = value; if (value !== 'new-link') await controller.selectRegisteredClone(value) }
+    function chooseTarget(value: string): void { targetId = value }
     async function startClone(): Promise<void> {
         if (!await alertConfirm(sync.work.cloneConfirm)) return
-        if (targetId === 'new-link') { controller.stageLink(stagedUri); await controller.claimStagedClone() }
+        if (targetId === 'new-link') { controller.stageLink(stagedUri); await controller.claimStagedClone() } else await controller.selectRegisteredClone(targetId)
         await controller.confirmCloneReplace(); await controller.downloadClone()
     }
     async function startDelta(): Promise<void> { if (targetId === 'new-link') { controller.stageLink(stagedUri); await controller.pullStagedDelta() } else await controller.pullRegisteredDelta(targetId) }
     async function startBidi(): Promise<void> { if (targetId === 'new-link') { controller.stageLink(stagedUri); await controller.syncStagedBidirectional() } else await controller.syncRegisteredBidirectional(targetId) }
-    async function resolve(winner: 'local' | 'remote'): Promise<void> { if (selectedIncoming) await controller.resolveRegisteredBidirectional(selectedIncoming.deviceId, winner) }
+    async function resolve(winner: 'local' | 'remote'): Promise<void> { const sourceId = snapshot.stagedSourceDeviceId ?? selectedIncoming?.deviceId; if (sourceId) await controller.resolveRegisteredBidirectional(sourceId, winner) }
     async function abandon(): Promise<void> { if (await alertConfirm(sync.work.abandonConfirm)) await controller.abandonBidirectional() }
     function bytes(value?: number): string { return `${value ?? 0}` }
     function time(value?: number): string { return value ? new Date(value).toLocaleString() : '-' }
@@ -77,7 +79,8 @@
     }
     onMount(() => {
         const unsubscribe = controller.subscribe((next) => { snapshot = next; void createQr() })
-        void controller.initialize()
+        void controller.initialize().catch(() => undefined)
+        notificationsEnabled = androidPeerSyncNotificationsEnabled()
         const timer = setInterval(() => { now = Date.now() }, 1000)
         return () => { clearInterval(timer); unsubscribe() }
     })
@@ -86,16 +89,17 @@
 <section class="mt-4">
     <h3 class="text-xl font-bold">{sync.menuTitle}</h3>
     <p class="mt-1 text-sm text-textcolor2">{sync.intro}</p>
-    {#if isTauriAndroid}<p class="mt-3 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">{sync.androidLanOnly}</p>{/if}
+    {#if isTauriAndroid}<p class="mt-3 rounded-md border border-borderc bg-bgcolor p-2 text-sm text-textcolor2">{sync.androidLanOnly}</p>{#if notificationsEnabled === false}<p class="mt-2 text-sm text-draculared">{language.peerClone.notificationsDisabledWarning}</p>{/if}{/if}
 
     <div class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
         <div class="flex items-center justify-between gap-3"><h4 class="font-bold">{sync.share.title}</h4><span class="flex items-center gap-2 text-sm"><span class="h-2 w-2 rounded-full {stateColor()}"></span>{stateLabel()}</span></div>
         {#if !isTauriAndroid}<div class="mt-3 flex flex-wrap gap-2" aria-label={sync.share.title}>{#each [['lan', sync.share.methodLan], ['quick', sync.share.methodQuick], ['fixed-url', sync.share.methodFixed]] as [method, label]}<Button size="sm" styled="outlined" selected={settings.syncListenMethod === method} onclick={() => updateSettings({ syncListenMethod: method as typeof settings.syncListenMethod })}>{label}</Button>{/each}</div>{/if}
-        {#if settings.syncListenMethod !== 'quick' || isTauriAndroid}<label class="mt-3 block text-sm font-bold" for="device-sync-port">{sync.share.port}</label><input id="device-sync-port" type="number" min="1" max="65535" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncFixedPort} oninput={(event) => updateSettings({ syncFixedPort: Number(event.currentTarget.value) })} />{:else}<p class="mt-3 text-sm text-textcolor2">{sync.share.quickNote}</p>{/if}
+        {#if settings.syncListenMethod !== 'quick' || isTauriAndroid}<label class="mt-3 block text-sm font-bold" for="device-sync-port">{sync.share.port}</label><input id="device-sync-port" type="number" min="1" max="65535" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncFixedPort} oninput={(event) => { const port = Number(event.currentTarget.value); if (Number.isInteger(port) && port >= 1 && port <= 65535) updateSettings({ syncFixedPort: port }) }} />{:else}<p class="mt-3 text-sm text-textcolor2">{sync.share.quickNote}</p>{/if}
         {#if settings.syncListenMethod === 'fixed-url' && !isTauriAndroid}<label class="mt-3 block text-sm font-bold" for="device-sync-public-url">{sync.share.publicUrl}</label><input id="device-sync-public-url" type="url" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncPublicBaseUrl} oninput={(event) => updateSettings({ syncPublicBaseUrl: event.currentTarget.value })} /><p class="mt-2 text-sm text-textcolor2">{sync.share.fixedNote}</p><details class="mt-2 text-sm text-textcolor2"><summary>{sync.share.fixedGuideTitle}</summary><p class="mt-2">{format(sync.share.fixedGuideBody, settings.syncFixedPort)}</p></details>{/if}
         <label class="mt-3 flex gap-2 text-sm"><input type="checkbox" checked={settings.syncAutoListen} onchange={(event) => updateSettings({ syncAutoListen: event.currentTarget.checked })} />{sync.share.autoListen}</label>
-        <Button className="mt-3" styled={snapshot.source.phase === 'running' ? 'danger' : 'primary'} onclick={startOrStop}>{snapshot.source.phase === 'running' ? sync.share.stop : sync.share.start}</Button>
-        {#if snapshot.source.phase === 'running' && pairUri}<div class="mt-4 border-t border-darkborderc pt-4"><label class="flex gap-2 text-sm"><input type="checkbox" bind:checked={permissions.read} />{sync.share.permRead}</label><label class="mt-2 flex gap-2 text-sm"><input type="checkbox" bind:checked={permissions.bidirectional} />{sync.share.permBidirectional}</label><p class="mt-1 text-xs text-textcolor2">{sync.share.permBidirectionalHelp}</p><div class="mt-3 flex flex-wrap gap-4">{#if qrDataUrl}<img class:opacity-40={expired} src={qrDataUrl} alt={sync.share.pairTitle} width="192" height="192" />{/if}<div><h5 class="font-bold">{sync.share.pairTitle}</h5><p class="mt-1 text-sm text-textcolor2">{sync.share.pairNote}</p><p class="mt-2 text-sm">{expired ? sync.share.pairExpired : format(sync.share.pairRemaining, `${Math.ceil(remaining / 1000)}s`)}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={expired} onclick={copyLink}>{sync.share.copyLink}</Button><Button size="sm" styled="outlined" onclick={rotate}>{sync.share.newLink}</Button></div></div></div></div>{/if}
+        <div class="mt-3"><label class="flex gap-2 text-sm"><input type="checkbox" bind:checked={permissions.read} />{sync.share.permRead}</label><label class="mt-2 flex gap-2 text-sm"><input type="checkbox" bind:checked={permissions.bidirectional} />{sync.share.permBidirectional}</label><p class="mt-1 text-xs text-textcolor2">{sync.share.permBidirectionalHelp}</p></div>
+        <Button className="mt-3" disabled={['preparing', 'starting', 'stopping'].includes(snapshot.source.phase)} styled={snapshot.source.phase === 'running' ? 'danger' : 'primary'} onclick={startOrStop}>{snapshot.source.phase === 'running' ? sync.share.stop : sync.share.start}</Button>
+        {#if snapshot.source.phase === 'running' && pairUri}<div class="mt-4 border-t border-darkborderc pt-4"><div class="mt-3 flex flex-wrap gap-4">{#if qrDataUrl}<img class:opacity-40={expired} src={qrDataUrl} alt={sync.share.pairTitle} width="192" height="192" />{/if}<div><h5 class="font-bold">{sync.share.pairTitle}</h5><p class="mt-1 text-sm text-textcolor2">{sync.share.pairNote}</p><p class="mt-2 text-sm">{expired ? sync.share.pairExpired : format(sync.share.pairRemaining, `${Math.ceil(remaining / 1000)}s`)}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={expired} onclick={copyLink}>{sync.share.copyLink}</Button><Button size="sm" styled="outlined" onclick={rotate}>{sync.share.newLink}</Button></div></div></div></div>{/if}
         {#if sourceError}<p class="mt-3 text-sm text-draculared">{sourceError === 'registration-expired' ? sync.registrationExpired : sync.share.stateError}</p>{/if}
     </div>
 
