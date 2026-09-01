@@ -470,7 +470,7 @@ pub fn run() {
     let app = builder
         .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
-            native_log_state.configure_file_path(app_data_dir.join("native-log"));
+            native_log_state.configure_file_path(&app_data_dir);
             app.manage(native_log_state.clone());
             native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
             let state = native_file_jobs::NativeFileJobState::initialize(

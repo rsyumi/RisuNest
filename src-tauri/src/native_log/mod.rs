@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
-pub(crate) const RING_CAPACITY: usize = 2_000;
-pub(crate) const FILE_ROTATE_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const RING_CAPACITY: usize = 1_000;
+pub(crate) const FILE_ROTATE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const FILE_LOG_DISABLED_MARKER: &str = "file-log.enabled";
 
 #[derive(Clone, Debug, Serialize)]
@@ -45,7 +45,7 @@ impl NativeLogState {
     }
 
     pub(crate) fn configure_file_path(&self, root: impl AsRef<Path>) {
-        let root = root.as_ref().to_path_buf();
+        let root = root.as_ref().join("logs");
         let _ = fs::create_dir_all(&root);
         if let Ok(mut inner) = self.0.lock() {
             inner.root = Some(root);
@@ -98,7 +98,7 @@ impl NativeLogState {
             .ok()
             .and_then(|inner| inner.root.clone())
             .unwrap_or_default()
-            .join("native.log")
+            .join("risunest.log")
     }
 
     pub(crate) fn file_enabled(&self) -> bool {
@@ -140,9 +140,9 @@ fn write_file(inner: &Inner, entry: &LogEntry) {
     if root.join(FILE_LOG_DISABLED_MARKER).exists() {
         return;
     }
-    let path = root.join("native.log");
+    let path = root.join("risunest.log");
     if fs::metadata(&path)
-        .map(|metadata| metadata.len() >= FILE_ROTATE_BYTES as u64)
+        .map(|metadata| metadata.len() > FILE_ROTATE_BYTES as u64)
         .unwrap_or(false)
     {
         let rotated = path.with_extension("log.1");

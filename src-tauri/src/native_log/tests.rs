@@ -8,14 +8,14 @@ use std::sync::{
 #[test]
 fn keeps_a_fifo_ring_and_returns_the_newest_tail() {
     let state = NativeLogState::for_tests();
-    for number in 0..=RING_CAPACITY {
+    for number in 0..=1_000 {
         state.record("info", "test", format!("entry {number}"));
     }
     let entries = state.tail(None);
-    assert_eq!(entries.len(), RING_CAPACITY);
+    assert_eq!(entries.len(), 1_000);
     assert_eq!(entries.first().unwrap().message, "entry 1");
-    assert_eq!(state.tail(Some(2))[0].message, "entry 1999");
-    assert_eq!(state.tail(Some(2))[1].message, "entry 2000");
+    assert_eq!(state.tail(Some(2))[0].message, "entry 999");
+    assert_eq!(state.tail(Some(2))[1].message, "entry 1000");
 }
 
 #[test]
@@ -37,22 +37,38 @@ fn serializes_timestamp_and_masks_sensitive_values_before_every_sink() {
 fn marker_absence_enables_file_logging_and_toggling_reverses_that() {
     let temp = tempfile::tempdir().unwrap();
     let state = NativeLogState::initialize(temp.path());
+    assert_eq!(
+        state.file_path(),
+        temp.path().join("logs").join("risunest.log")
+    );
     assert!(state.file_enabled());
     state.set_file_enabled(false).unwrap();
     assert!(!state.file_enabled());
-    assert!(temp.path().join(FILE_LOG_DISABLED_MARKER).exists());
+    assert!(temp
+        .path()
+        .join("logs")
+        .join(FILE_LOG_DISABLED_MARKER)
+        .exists());
     state.set_file_enabled(true).unwrap();
     assert!(state.file_enabled());
-    assert!(!temp.path().join(FILE_LOG_DISABLED_MARKER).exists());
+    assert!(!temp
+        .path()
+        .join("logs")
+        .join(FILE_LOG_DISABLED_MARKER)
+        .exists());
 }
 
 #[test]
-fn rotates_the_file_at_five_mib_and_ignores_file_write_failures() {
+fn rotates_the_file_above_two_mib_and_ignores_file_write_failures() {
     let temp = tempfile::tempdir().unwrap();
     let state = NativeLogState::initialize(temp.path());
-    fs::write(state.file_path(), vec![b'x'; FILE_ROTATE_BYTES]).unwrap();
+    fs::write(state.file_path(), vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
     state.record("info", "test", "after rotation");
-    assert!(state.file_path().with_extension("log.1").exists());
+    assert_eq!(
+        state.file_path(),
+        temp.path().join("logs").join("risunest.log")
+    );
+    assert!(temp.path().join("logs").join("risunest.log.1").exists());
     assert!(fs::read_to_string(state.file_path())
         .unwrap()
         .contains("after rotation"));
