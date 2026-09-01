@@ -18,6 +18,7 @@
     let errorMessage = $state('')
     let fileLogEnabled = $state(getDeviceSettings().nativeFileLogEnabled)
     let fileLogPath = $state('')
+    let fileLogUpdatePending = $state(false)
     let formattedLog = $derived(entries
         .slice()
         .reverse()
@@ -26,7 +27,7 @@
 
     const unsubscribe = subscribeDeviceSettings((settings) => {
         fileLogEnabled = settings.nativeFileLogEnabled
-        if (fileLogEnabled) void loadFilePath()
+        if (fileLogEnabled && !fileLogUpdatePending) void loadFilePath()
     })
 
     onDestroy(unsubscribe)
@@ -74,6 +75,9 @@
     }
 
     async function changeFileLogging(enabled: boolean) {
+        if (fileLogUpdatePending) return
+        fileLogUpdatePending = true
+        fileLogEnabled = enabled
         try {
             await setNativeLogFileEnabled(enabled)
             updateDeviceSettings({ nativeFileLogEnabled: enabled })
@@ -83,6 +87,8 @@
             console.error('Native log viewer command failed', error)
             fileLogEnabled = getDeviceSettings().nativeFileLogEnabled
             errorMessage = language.error
+        } finally {
+            fileLogUpdatePending = false
         }
     }
 </script>
@@ -103,6 +109,7 @@
             class="hidden"
             type="checkbox"
             checked={fileLogEnabled}
+            disabled={fileLogUpdatePending}
             onchange={(event) => void changeFileLogging(event.currentTarget.checked)}
         />
         <span class="w-5 h-5 rounded-md border-2 border-darkborderc flex justify-center items-center" class:bg-darkborderc={fileLogEnabled}>

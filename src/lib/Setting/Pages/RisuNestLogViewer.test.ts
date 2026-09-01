@@ -11,14 +11,25 @@ const nativeLog = vi.hoisted(() => ({
 const alerts = vi.hoisted(() => ({ alertMd: vi.fn() }))
 const deviceSettings = vi.hoisted(() => {
     let listener: ((settings: { nativeFileLogEnabled: boolean }) => void) | undefined
+    let settings = { nativeFileLogEnabled: true }
     return {
-        getDeviceSettings: vi.fn(() => ({ nativeFileLogEnabled: true })),
-        updateDeviceSettings: vi.fn(),
+        getDeviceSettings: vi.fn(() => ({ ...settings })),
+        updateDeviceSettings: vi.fn((partial: { nativeFileLogEnabled: boolean }) => {
+            settings = { ...settings, ...partial }
+            listener?.({ ...settings })
+        }),
         subscribeDeviceSettings: vi.fn((nextListener) => {
             listener = nextListener
             return () => { listener = undefined }
         }),
-        emit(settings: { nativeFileLogEnabled: boolean }) { listener?.(settings) },
+        emit(nextSettings: { nativeFileLogEnabled: boolean }) {
+            settings = { ...nextSettings }
+            listener?.({ ...settings })
+        },
+        reset(nativeFileLogEnabled = true) {
+            settings = { nativeFileLogEnabled }
+            listener = undefined
+        },
     }
 })
 
@@ -48,6 +59,7 @@ describe('RisuNestLogViewer', () => {
     let mounted: ReturnType<typeof mount> | undefined
 
     beforeEach(() => {
+        deviceSettings.reset()
         target = document.createElement('div')
         document.body.append(target)
         nativeLog.getNativeLogTail.mockResolvedValue([])
@@ -143,5 +155,64 @@ describe('RisuNestLogViewer', () => {
         expect(target.textContent).toContain('Localized error')
         expect(target.textContent).not.toContain('native command detail')
         expect(error).toHaveBeenCalledWith('Native log viewer command failed', expect.any(Error))
+    })
+
+    it('disables the file logging checkbox while its native update is pending', async () => {
+        let resolveNativeUpdate: (() => void) | undefined
+        nativeLog.setNativeLogFileEnabled.mockImplementation(() => new Promise<void>((resolve) => {
+            resolveNativeUpdate = resolve
+        }))
+        await render()
+        const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+
+        checkbox.checked = false
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }))
+        await tick()
+
+        expect(checkbox.disabled).toBe(true)
+        expect(nativeLog.setNativeLogFileEnabled).toHaveBeenCalledOnce()
+
+        resolveNativeUpdate!()
+        await Promise.resolve()
+        await tick()
+        expect(checkbox.disabled).toBe(false)
+        expect(checkbox.checked).toBe(false)
+    })
+
+    it('rolls back a failed native update and re-enables the checkbox', async () => {
+        let rejectNativeUpdate: ((error: Error) => void) | undefined
+        nativeLog.setNativeLogFileEnabled.mockImplementation(() => new Promise<void>((_resolve, reject) => {
+            rejectNativeUpdate = reject
+        }))
+        const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        await render()
+        const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+
+        checkbox.checked = false
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }))
+        await tick()
+        expect(checkbox.disabled).toBe(true)
+
+        rejectNativeUpdate!(new Error('native toggle failed'))
+        await Promise.resolve()
+        await tick()
+        expect(checkbox.disabled).toBe(false)
+        expect(checkbox.checked).toBe(true)
+        expect(deviceSettings.updateDeviceSettings).not.toHaveBeenCalled()
+        expect(error).toHaveBeenCalledWith('Native log viewer command failed', expect.any(Error))
+    })
+
+    it('loads the file path once when enabling file logging', async () => {
+        deviceSettings.reset(false)
+        await render()
+        nativeLog.getNativeLogFilePath.mockClear()
+        const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+
+        checkbox.checked = true
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }))
+        await Promise.resolve()
+        await tick()
+
+        expect(nativeLog.getNativeLogFilePath).toHaveBeenCalledOnce()
     })
 })
