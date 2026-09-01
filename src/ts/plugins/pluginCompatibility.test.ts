@@ -39,15 +39,15 @@ describe('manual plugin installation compatibility', () => {
 })
 
 describe('plugin compatibility profiles', () => {
-    it('rejects legacy full-object plugin access in the scalable profile', () => {
+    it('keeps scoped setters maximum-only until their scalable adapter is installed', () => {
         expect(() => assertPluginFullObjectCompatibility(
             'scalable-v3',
-            'getCharacter',
-        )).toThrow(/getCharacter.*maximum-compatibility.*queryCharacters/i)
+            'setCharacter',
+        )).toThrow(/setCharacter.*maximum-compatibility.*queryCharacters/i)
 
         expect(() => assertPluginFullObjectCompatibility(
             'maximum-compatibility',
-            'getCharacter',
+            'setCharacter',
         )).not.toThrow()
     })
 
@@ -809,6 +809,7 @@ describe('plugin compatibility profiles', () => {
             flushPendingData: vi.fn(async () => undefined),
             getCompatibilityDatabase: () => liveDatabase,
             getCompatibilityProfile: () => controller.profile,
+            getSelectedCharacterId: () => liveDatabase.characters[0]?.chaId ?? null,
             getNavigationGeneration: () => 0,
             applyCompatibilityDatabaseLite: vi.fn(),
             applyCompatibilityDatabase: applyMaximumUpdate,

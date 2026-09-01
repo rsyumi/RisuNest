@@ -1,4 +1,4 @@
-import type { Database } from '../storage/database.svelte'
+import type { Chat, Database } from '../storage/database.svelte'
 import type { PersistentReplacementOptions } from '../storage/saveCoordinator'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { isCatalogCharacterStub } from '../storage/workingSetCatalog'
@@ -14,6 +14,7 @@ import type {
 import {
     acquireCurrentRevisionWithRetry,
     assertPinnedRevision,
+    iteratePinnedCharacterSummaries,
     iteratePinnedCharacters,
     iteratePinnedConversations,
     withPersistentRevisionLease,
@@ -56,11 +57,28 @@ export interface PluginConversationWindow extends ConversationWindow {
     revision: DataRevision
 }
 
+export type PluginCompleteCharacter = Database['characters'][number]
+
+export interface PluginFullObjectCallContext {
+    pluginName: string
+    signal: AbortSignal
+}
+
+export interface PluginResolvedCharacterTarget {
+    revision: DataRevision
+    characterId: string
+}
+
+export interface PluginResolvedConversationTarget extends PluginResolvedCharacterTarget {
+    conversationId: string
+}
+
 export interface PluginDatabaseAccessDependencies {
     store: PersistentDataStore
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
     getCompatibilityProfile(): PluginCompatibilityProfile
+    getSelectedCharacterId(): string | null
     getNavigationGeneration(): number
     applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
     applyCompatibilityDatabase(database: Record<string, unknown>): Promise<void>
@@ -84,6 +102,18 @@ export interface PluginDatabaseAccessDependencies {
 }
 
 export interface PluginDatabaseAccess {
+    getCurrentCharacter(
+        context: PluginFullObjectCallContext,
+    ): Promise<PluginCompleteCharacter | undefined>
+    getCharacterFromIndex(
+        index: number,
+        context: PluginFullObjectCallContext,
+    ): Promise<PluginCompleteCharacter | null>
+    getChatFromIndex(
+        characterIndex: number,
+        chatIndex: number,
+        context: PluginFullObjectCallContext,
+    ): Promise<Chat | null>
     queryCharacters(input?: PluginCharacterQuery): Promise<CharacterPage>
     queryConversations(input: PluginConversationQuery): Promise<ConversationPage>
     queryConversationMessages(
@@ -162,6 +192,71 @@ export function linkPluginQueryAbortSignals(
 function throwIfQueryAborted(signal: AbortSignal | undefined): void {
     if (!signal?.aborted) return
     throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+}
+
+function throwIfFullObjectCallAborted(signal: AbortSignal): void {
+    if (!signal.aborted) return
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+}
+
+async function resolvePinnedCharacterTarget(
+    reader: PersistentRevisionLease,
+    index: number,
+): Promise<PluginResolvedCharacterTarget | null> {
+    if (!Number.isSafeInteger(index) || index < 0) return null
+    let position = 0
+    for await (const summary of iteratePinnedCharacterSummaries(reader)) {
+        if (position++ === index) {
+            return { revision: reader.revision, characterId: summary.id }
+        }
+    }
+    return null
+}
+
+async function resolvePinnedConversationTarget(
+    reader: PersistentRevisionLease,
+    characterIndex: number,
+    chatIndex: number,
+): Promise<PluginResolvedConversationTarget | null> {
+    if (!Number.isSafeInteger(chatIndex) || chatIndex < 0) return null
+    const character = await resolvePinnedCharacterTarget(reader, characterIndex)
+    if (!character) return null
+    let position = 0
+    let cursor: string | undefined
+    do {
+        const page = await reader.queryConversations({
+            characterId: character.characterId,
+            order: 'configured',
+            limit: 128,
+            cursor,
+        })
+        assertPinnedRevision(
+            reader.revision,
+            page.revision,
+            `Conversation page for ${character.characterId}`,
+        )
+        for (const summary of page.items) {
+            if (position++ === chatIndex) {
+                return { ...character, conversationId: summary.id }
+            }
+        }
+        cursor = page.nextCursor
+    } while (cursor !== undefined)
+    return null
+}
+
+async function readPinnedCompleteCharacter(
+    reader: PersistentRevisionLease,
+    characterId: string,
+): Promise<PluginCompleteCharacter | null> {
+    const detail = await reader.readCharacter(characterId)
+    if (!detail) return null
+    assertPinnedRevision(reader.revision, detail.revision, `Character ${characterId}`)
+    const chats: Chat[] = []
+    for await (const conversation of iteratePinnedConversations(reader, characterId)) {
+        chats.push(conversation.value)
+    }
+    return { ...detail.value, chats } as PluginCompleteCharacter
 }
 
 function hasCharacterUpdate(database: Record<string, unknown>): boolean {
@@ -316,6 +411,84 @@ export function createPluginDatabaseAccess(
     }
 
     return {
+        async getCurrentCharacter(context) {
+            const initialProfile = dependencies.getCompatibilityProfile()
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-read')
+            throwIfFullObjectCallAborted(context.signal)
+            const characterId = dependencies.getSelectedCharacterId()
+            if (characterId === null) {
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                return undefined
+            }
+            await openStore()
+            const lease = await acquireCurrentRevisionReader()
+            return withPersistentRevisionLease(lease, async (reader) => {
+                throwIfFullObjectCallAborted(context.signal)
+                const value = await readPinnedCompleteCharacter(reader, characterId)
+                throwIfFullObjectCallAborted(context.signal)
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                return value === null ? undefined : dependencies.snapshot(value)
+            })
+        },
+
+        async getCharacterFromIndex(index, context) {
+            const initialProfile = dependencies.getCompatibilityProfile()
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-read')
+            throwIfFullObjectCallAborted(context.signal)
+            await openStore()
+            const lease = await acquireCurrentRevisionReader()
+            return withPersistentRevisionLease(lease, async (reader) => {
+                throwIfFullObjectCallAborted(context.signal)
+                const target = await resolvePinnedCharacterTarget(reader, index)
+                const value = target
+                    ? await readPinnedCompleteCharacter(reader, target.characterId)
+                    : null
+                throwIfFullObjectCallAborted(context.signal)
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                return value === null ? null : dependencies.snapshot(value)
+            })
+        },
+
+        async getChatFromIndex(characterIndex, chatIndex, context) {
+            const initialProfile = dependencies.getCompatibilityProfile()
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-read')
+            throwIfFullObjectCallAborted(context.signal)
+            await openStore()
+            const lease = await acquireCurrentRevisionReader()
+            return withPersistentRevisionLease(lease, async (reader) => {
+                throwIfFullObjectCallAborted(context.signal)
+                const target = await resolvePinnedConversationTarget(
+                    reader,
+                    characterIndex,
+                    chatIndex,
+                )
+                const found = target
+                    ? await reader.readConversation(target.characterId, target.conversationId)
+                    : null
+                if (found) {
+                    assertPinnedRevision(
+                        reader.revision,
+                        found.revision,
+                        `Conversation ${target!.conversationId}`,
+                    )
+                }
+                throwIfFullObjectCallAborted(context.signal)
+                if (dependencies.getCompatibilityProfile() !== initialProfile) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                return found === null ? null : dependencies.snapshot(found.value)
+            })
+        },
+
         async queryCharacters(input = {}) {
             const limit = positiveLimit(
                 input.limit,

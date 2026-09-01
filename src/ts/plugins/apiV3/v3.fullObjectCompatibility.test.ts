@@ -1,13 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { Database } from '../../storage/database.types'
+import type { Database } from '../../storage/database.svelte'
 
 const fixture = vi.hoisted(() => ({
     api: null as Record<string, (...args: any[]) => any> | null,
     selectedIndex: 0,
-    profile: 'maximum-compatibility' as const,
+    profile: 'maximum-compatibility' as 'scalable-v3' | 'maximum-compatibility',
     invalidations: 0,
     listeners: new Set<Function>(),
+    scopedAccess: {
+        getCurrentCharacter: vi.fn(),
+        getCharacterFromIndex: vi.fn(),
+        getChatFromIndex: vi.fn(),
+    },
     database: {
         characters: [
             {
@@ -146,7 +151,7 @@ vi.mock('../pluginCompatibility', () => ({
     }),
 }))
 vi.mock('../pluginDatabaseAccess', () => ({
-    createProductionPluginDatabaseAccess: vi.fn(() => ({})),
+    createProductionPluginDatabaseAccess: vi.fn(() => fixture.scopedAccess),
     linkPluginQueryAbortSignals: vi.fn(),
 }))
 
@@ -174,8 +179,12 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         resetDatabase()
         fixture.api = null
         fixture.selectedIndex = 0
+        fixture.profile = 'maximum-compatibility'
         fixture.invalidations = 0
         fixture.listeners.clear()
+        fixture.scopedAccess.getCurrentCharacter.mockReset()
+        fixture.scopedAccess.getCharacterFromIndex.mockReset()
+        fixture.scopedAccess.getChatFromIndex.mockReset()
         await executePluginV3({
             name: `contract-plugin-${crypto.randomUUID()}`,
             script: '',
@@ -239,5 +248,33 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         fixture.selectedIndex = 1
         await api.setCharacterToIndex(1, structuredClone(fixture.database.characters[1]))
         expect(fixture.invalidations).toBe(2)
+    })
+
+    it('routes scalable getters through scoped access without changing the maximum oracle', async () => {
+        fixture.profile = 'scalable-v3'
+        const active = structuredClone(fixture.database.characters[0])
+        const trashed = structuredClone(fixture.database.characters[1])
+        fixture.scopedAccess.getCurrentCharacter.mockResolvedValue(active)
+        fixture.scopedAccess.getCharacterFromIndex.mockResolvedValue(trashed)
+        fixture.scopedAccess.getChatFromIndex.mockResolvedValue(trashed.chats[0])
+        const api = fixture.api!
+
+        await expect(api.getCharacter()).resolves.toMatchObject({ chaId: 'active' })
+        await expect(api.getCharacterFromIndex(1)).resolves.toMatchObject({ chaId: 'trashed' })
+        await expect(api.getChatFromIndex(1, 0)).resolves.toMatchObject({ id: 'trash-chat' })
+
+        expect(fixture.scopedAccess.getCurrentCharacter.mock.calls[0][0]).toMatchObject({
+            pluginName: expect.stringContaining('contract-plugin-'),
+            signal: expect.any(AbortSignal),
+        })
+        expect(fixture.scopedAccess.getCharacterFromIndex).toHaveBeenCalledWith(
+            1,
+            expect.objectContaining({ pluginName: expect.stringContaining('contract-plugin-') }),
+        )
+        expect(fixture.scopedAccess.getChatFromIndex).toHaveBeenCalledWith(
+            1,
+            0,
+            expect.objectContaining({ pluginName: expect.stringContaining('contract-plugin-') }),
+        )
     })
 })

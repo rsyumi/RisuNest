@@ -15,6 +15,8 @@ import {
     createPluginDatabaseAccess,
     createProductionPluginDatabaseAccess,
     linkPluginQueryAbortSignals,
+    type PluginCompleteCharacter,
+    type PluginFullObjectCallContext,
 } from './pluginDatabaseAccess'
 
 vi.mock('../storage/persistentDataStoreFactory', () => ({
@@ -78,6 +80,8 @@ function createHarness() {
     } as unknown as Database
     let compatibilityProfile: 'scalable-v3' | 'maximum-compatibility' = 'scalable-v3'
     let navigationGeneration = 0
+    let selectedCharacterId: string | null = 'active'
+    const getSelectedCharacterId = vi.fn(() => selectedCharacterId)
     const materializedDatabases: Database[] = []
     const pinnedDatabases: Database[] = []
     const releasedLeases: Array<ReturnType<typeof vi.fn>> = []
@@ -225,6 +229,7 @@ function createHarness() {
         flushPendingData,
         getCompatibilityDatabase: () => compatibilityDatabase,
         getCompatibilityProfile: () => compatibilityProfile,
+        getSelectedCharacterId,
         getNavigationGeneration: () => navigationGeneration,
         applyCompatibilityDatabaseLite,
         applyCompatibilityDatabase,
@@ -252,6 +257,10 @@ function createHarness() {
         pinnedDatabases,
         releasedLeases,
         replacePersistentDatabase,
+        getSelectedCharacterId,
+        setSelectedCharacterId(id: string | null) {
+            selectedCharacterId = id
+        },
         setCompatibilityProfile(profile: 'scalable-v3' | 'maximum-compatibility') {
             compatibilityProfile = profile
         },
@@ -263,7 +272,118 @@ function createHarness() {
     }
 }
 
+function makeCharacter(id: string, trashed = false): PluginCompleteCharacter {
+    return {
+        type: 'character',
+        chaId: id,
+        name: id,
+        ...(trashed ? { trashTime: 1 } : {}),
+        chatPage: 0,
+        chats: [
+            { id: `${id}-chat-a`, name: 'A', message: [{ role: 'user', data: 'a' }] },
+            { id: `${id}-chat-b`, name: 'B', message: [{ role: 'char', data: 'b' }] },
+        ],
+    } as PluginCompleteCharacter
+}
+
+function makeFullObjectDatabase(
+    characters: PluginCompleteCharacter[] = [
+        makeCharacter('active'),
+        makeCharacter('trashed', true),
+    ],
+): Database {
+    return { username: 'Fixture', botPresets: [], characters } as unknown as Database
+}
+
+function callContext(): PluginFullObjectCallContext {
+    return { pluginName: 'fixture-plugin', signal: new AbortController().signal }
+}
+
 describe('plugin database access', () => {
+    it('merges active and trash configured order before resolving an index', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase([
+            makeCharacter('active-a'),
+            makeCharacter('trash-b', true),
+            makeCharacter('active-c'),
+        ]))
+
+        await expect(harness.access.getCharacterFromIndex(1, callContext()))
+            .resolves.toMatchObject({ chaId: 'trash-b' })
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
+    it('returns exact detached current, indexed character, and indexed chat objects', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database, database, database)
+
+        const current = await harness.access.getCurrentCharacter(callContext())
+        const indexed = await harness.access.getCharacterFromIndex(0, callContext())
+        const chat = await harness.access.getChatFromIndex(0, 1, callContext())
+
+        expect(current).toEqual(database.characters[0])
+        expect(indexed).toEqual(database.characters[0])
+        expect(chat).toEqual(database.characters[0].chats[1])
+        current!.name = 'mutated snapshot'
+        chat!.message.splice(0)
+        expect(database.characters[0].name).not.toBe('mutated snapshot')
+        expect(database.characters[0].chats[1].message).not.toHaveLength(0)
+        expect(harness.releasedLeases).toHaveLength(3)
+        expect(harness.releasedLeases.every((release) => release.mock.calls.length === 1)).toBe(true)
+    })
+
+    it('keeps undefined, null, abort, and lease-release contracts', async () => {
+        const harness = createHarness()
+        harness.setSelectedCharacterId(null)
+        await expect(harness.access.getCurrentCharacter(callContext())).resolves.toBeUndefined()
+
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database, database)
+        await expect(harness.access.getCharacterFromIndex(99, callContext())).resolves.toBeNull()
+        await expect(harness.access.getChatFromIndex(0, 99, callContext())).resolves.toBeNull()
+
+        const controller = new AbortController()
+        controller.abort(new DOMException('plugin unloaded', 'AbortError'))
+        await expect(harness.access.getCharacterFromIndex(0, {
+            pluginName: 'fixture', signal: controller.signal,
+        })).rejects.toMatchObject({ name: 'AbortError' })
+        expect(harness.releasedLeases.every((release) => release.mock.calls.length === 1)).toBe(true)
+    })
+
+    it('uses the pinned character ID when the compatibility array reorders during acquire', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        const acquire = deferred<PersistentRevisionLease>()
+        const originalAcquire = harness.store.acquireRevision.bind(harness.store)
+        vi.mocked(harness.store.acquireRevision).mockImplementationOnce(() => acquire.promise)
+        harness.pinnedDatabases.push(database)
+
+        const pending = harness.access.getCharacterFromIndex(1, callContext())
+        await vi.waitFor(() => expect(harness.store.acquireRevision).toHaveBeenCalledOnce())
+        harness.compatibilityDatabase.characters = structuredClone(database.characters).reverse()
+        acquire.resolve(await originalAcquire(4))
+
+        await expect(pending).resolves.toMatchObject({ chaId: 'trashed' })
+    })
+
+    it('polls exact chat getters without full materialization or profile changes', async () => {
+        const harness = createHarness()
+        const database = makeFullObjectDatabase()
+        harness.pinnedDatabases.push(database, database, database)
+
+        await harness.access.getChatFromIndex(0, 0, callContext())
+        await harness.access.getChatFromIndex(0, 0, callContext())
+        await harness.access.getChatFromIndex(0, 0, callContext())
+
+        expect(harness.flushPendingData).toHaveBeenCalledTimes(3)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(harness.replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(harness.releasedLeases).toHaveLength(3)
+    })
+
     it('composes scalable API v3 queries with the shared production store', async () => {
         const harness = createHarness()
         vi.mocked(getPersistentDataStore).mockReturnValue(harness.store)
@@ -276,6 +396,7 @@ describe('plugin database access', () => {
             flushPendingData: harness.flushPendingData,
             getCompatibilityDatabase: () => harness.compatibilityDatabase,
             getCompatibilityProfile: () => 'scalable-v3',
+            getSelectedCharacterId: harness.getSelectedCharacterId,
             getNavigationGeneration: () => 0,
             applyCompatibilityDatabaseLite: harness.applyCompatibilityDatabaseLite,
             applyCompatibilityDatabase: harness.applyCompatibilityDatabase,

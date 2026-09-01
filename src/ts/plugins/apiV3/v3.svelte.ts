@@ -59,6 +59,7 @@ import {
     type PluginCharacterQuery,
     type PluginConversationMessageQuery,
     type PluginConversationQuery,
+    type PluginFullObjectCallContext,
 } from "../pluginDatabaseAccess";
 
 /*
@@ -89,6 +90,7 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
         flushPendingData,
         getCompatibilityDatabase: () => DBState.db,
         getCompatibilityProfile: () => pluginCompatibility.profile,
+        getSelectedCharacterId: () => captureSelectedConversationTarget()?.characterId ?? null,
         getNavigationGeneration: getPersistentNavigationGeneration,
         applyCompatibilityDatabaseLite: (database) =>
             applyPreparedPluginDatabaseUpdate(database, true),
@@ -699,10 +701,15 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
     const oldApis = getV2PluginAPIs();
     const requireFullObjectAccess = (operation: string) =>
         assertPluginFullObjectCompatibility(pluginCompatibility.profile, operation)
-    const getCompleteCurrentCharacter = () => {
-        requireFullObjectAccess('getCharacter')
-        return oldApis.getChar()
-    }
+    const pluginLifetime = new AbortController()
+    const fullObjectContext = (): PluginFullObjectCallContext => ({
+        pluginName: plugin.name,
+        signal: pluginLifetime.signal,
+    })
+    const getCompleteCurrentCharacter = () =>
+        pluginCompatibility.profile === 'maximum-compatibility'
+            ? oldApis.getChar()
+            : getPluginDatabaseAccess().getCurrentCharacter(fullObjectContext())
     const setCompleteCurrentCharacter = (character: unknown) => {
         return runPluginFullObjectReplacement(
             pluginCompatibility.profile,
@@ -712,7 +719,6 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             invalidateActiveConversationSession,
         )
     }
-    const pluginLifetime = new AbortController()
     addPluginUnloadCallback(plugin.name, () => pluginLifetime.abort())
     return {
 
@@ -956,7 +962,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getCharacterFromIndex: (index:number) => {
-            requireFullObjectAccess('getCharacterFromIndex')
+            if (pluginCompatibility.profile === 'scalable-v3') {
+                return getPluginDatabaseAccess().getCharacterFromIndex(index, fullObjectContext())
+            }
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
@@ -981,7 +989,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             )
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
-            requireFullObjectAccess('getChatFromIndex')
+            if (pluginCompatibility.profile === 'scalable-v3') {
+                return getPluginDatabaseAccess().getChatFromIndex(
+                    characterIndex,
+                    chatIndex,
+                    fullObjectContext(),
+                )
+            }
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
