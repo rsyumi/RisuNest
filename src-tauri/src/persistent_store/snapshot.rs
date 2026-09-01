@@ -416,8 +416,10 @@ pub(super) fn list(snapshots_dir: &Path) -> StoreResult<Vec<SnapshotInfo>> {
     for entry in fs::read_dir(snapshots_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !entry.file_type()?.is_file()
+        let file_type = entry.file_type()?;
+        if !file_type.is_file()
             || path.extension().and_then(|value| value.to_str()) != Some("db")
+            || snapshot_path_is_link_or_reparse(&path)?
         {
             continue;
         }
@@ -439,11 +441,61 @@ pub(super) fn list(snapshots_dir: &Path) -> StoreResult<Vec<SnapshotInfo>> {
     Ok(snapshots)
 }
 
+fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
 pub(super) fn restore_request(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
     let path = validate_snapshot_path(snapshots_dir, path)?;
     let marker = snapshots_dir.join(PENDING_RESTORE_FILE);
     fs::write(marker, serde_json::to_vec(&PendingRestore { path })?)?;
     Ok(())
+}
+
+pub(super) fn delete(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
+    // The UI may only delete a path returned by the current list.  This second
+    // lookup closes the time-of-check gap and avoids accepting an arbitrary
+    // direct child supplied by a renderer or plugin.
+    let listed = list(snapshots_dir)?;
+    let requested = fs::canonicalize(path)
+        .map_err(|_| validation("snapshot delete target is not currently listed"))?;
+    let selected = listed
+        .into_iter()
+        .find_map(|snapshot| {
+            let listed_path = PathBuf::from(snapshot.path);
+            fs::canonicalize(&listed_path)
+                .ok()
+                .filter(|candidate| candidate == &requested)
+        })
+        .ok_or_else(|| validation("snapshot delete target is not currently listed"))?;
+    let metadata = fs::symlink_metadata(&selected)?;
+    if !metadata.is_file() || snapshot_path_is_link_or_reparse(&selected)? {
+        return Err(validation("snapshot delete target must be a regular file"));
+    }
+    let snapshots_dir = fs::canonicalize(snapshots_dir)?;
+    if selected.parent() != Some(snapshots_dir.as_path()) {
+        return Err(validation(
+            "snapshot delete target must be directly inside snapshots",
+        ));
+    }
+    if pending_restore_target(&snapshots_dir)?.as_deref() == Some(selected.as_path()) {
+        return Err(validation("snapshot delete target is pending restore"));
+    }
+    remove_snapshot_with_sidecar(&selected)
 }
 
 fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) -> StoreResult<()> {

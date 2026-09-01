@@ -897,6 +897,57 @@ pub(crate) struct PersistentStore {
     pending_restore_failure: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageCountBytes {
+    pub(crate) count: u64,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageCharacterStats {
+    pub(crate) active: StorageCountBytes,
+    pub(crate) trashed_count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageConversationStats {
+    pub(crate) count: u64,
+    pub(crate) message_count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageAliasStats {
+    pub(crate) kind: String,
+    pub(crate) inlay_type: Option<String>,
+    pub(crate) count: u64,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageDeletionStats {
+    pub(crate) state: String,
+    pub(crate) count: u64,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PersistentStorageStats {
+    pub(crate) database_bytes: u64,
+    pub(crate) asset_objects: StorageCountBytes,
+    pub(crate) asset_aliases: Vec<StorageAliasStats>,
+    pub(crate) cold_aliases: StorageCountBytes,
+    pub(crate) plugin_storage: StorageCountBytes,
+    pub(crate) characters: StorageCharacterStats,
+    pub(crate) conversations: StorageConversationStats,
+    pub(crate) asset_object_deletions: Vec<StorageDeletionStats>,
+}
+
 pub(crate) struct PreparedReplaceCommit {
     staging_id: String,
     revision: i64,
@@ -1934,6 +1985,110 @@ impl PersistentStore {
         snapshot::list(&self.snapshots_dir)
     }
 
+    pub(crate) fn snapshot_delete(&self, path: &Path) -> StoreResult<()> {
+        snapshot::delete(&self.snapshots_dir, path)
+    }
+
+    pub(crate) fn storage_stats(&self) -> StoreResult<PersistentStorageStats> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let active = active_generation(&transaction)?;
+        let database_bytes = query_count_bytes(
+            &transaction,
+            "SELECT 1, page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+        )?
+        .bytes;
+        let asset_objects = query_count_bytes(
+            &transaction,
+            "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM asset_objects",
+            [],
+        )?;
+        let cold_aliases = query_count_bytes(
+            &transaction,
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM cold_aliases WHERE generation = ?1",
+            [&active],
+        )?;
+        let plugin_storage = query_count_bytes(
+            &transaction,
+            "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM plugin_storage WHERE generation = ?1",
+            [&active],
+        )?;
+        let active_characters = query_count_bytes(
+            &transaction,
+            "SELECT COUNT(*), COALESCE(SUM(length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
+            [&active],
+        )?;
+        let trashed_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM characters WHERE generation = ?1 AND trashed = 1",
+            [&active],
+            |row| row.get(0),
+        )?;
+        let (conversation_count, message_count): (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM conversations WHERE generation = ?1",
+            [&active],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut aliases = Vec::new();
+        let mut statement = transaction.prepare(
+            "SELECT kind, inlay_type, COUNT(*), COALESCE(SUM(size), 0)
+             FROM asset_aliases WHERE generation = ?1 GROUP BY kind, inlay_type",
+        )?;
+        for row in statement.query_map([&active], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (kind, inlay_type, count, bytes) = row?;
+            aliases.push(StorageAliasStats {
+                kind,
+                inlay_type,
+                count: nonnegative_u64(count)?,
+                bytes: nonnegative_u64(bytes)?,
+            });
+        }
+        drop(statement);
+        let mut deletions = Vec::new();
+        let mut statement = transaction.prepare(
+            "SELECT state, COUNT(*), COALESCE(SUM(byte_size), 0)
+             FROM asset_object_deletions GROUP BY state",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (state, count, bytes) = row?;
+            deletions.push(StorageDeletionStats {
+                state,
+                count: nonnegative_u64(count)?,
+                bytes: nonnegative_u64(bytes)?,
+            });
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(PersistentStorageStats {
+            database_bytes,
+            asset_objects,
+            asset_aliases: aliases,
+            cold_aliases,
+            plugin_storage,
+            characters: StorageCharacterStats {
+                active: active_characters,
+                trashed_count: nonnegative_u64(trashed_count)?,
+            },
+            conversations: StorageConversationStats {
+                count: nonnegative_u64(conversation_count)?,
+                message_count: nonnegative_u64(message_count)?,
+            },
+            asset_object_deletions: deletions,
+        })
+    }
+
     pub(crate) fn snapshot_restore_request(&self, path: &Path) -> StoreResult<()> {
         snapshot::restore_request(&self.snapshots_dir, path)
     }
@@ -2313,6 +2468,25 @@ impl PersistentStore {
                 .unwrap_or(0),
         }
     }
+}
+
+fn nonnegative_u64(value: i64) -> StoreResult<u64> {
+    u64::try_from(value).map_err(|_| StoreError::Validation {
+        message: "storage statistic is negative".to_owned(),
+    })
+}
+
+fn query_count_bytes<P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+) -> StoreResult<StorageCountBytes> {
+    let (count, bytes): (i64, i64) =
+        connection.query_row(sql, params, |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(StorageCountBytes {
+        count: nonnegative_u64(count)?,
+        bytes: nonnegative_u64(bytes)?,
+    })
 }
 
 fn recover_asset_object_deletions(

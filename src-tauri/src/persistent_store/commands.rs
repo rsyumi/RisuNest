@@ -5,9 +5,9 @@ use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode, ColdAlias,
     ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationPage, ConversationQuery,
-    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
-    PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated, SnapshotInfo,
-    StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
+    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
+    PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
+    SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -752,6 +752,91 @@ pub(crate) fn pds_snapshot_list(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<SnapshotInfo>, StoreError> {
     with_store(state, PersistentStore::snapshot_list)
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_snapshot_delete(
+    state: State<'_, PersistentStoreState>,
+    path: String,
+) -> Result<(), StoreError> {
+    with_store(state, |store| store.snapshot_delete(Path::new(&path)))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_storage_stats(
+    state: State<'_, PersistentStoreState>,
+) -> Result<PersistentStorageStats, StoreError> {
+    with_store(state, PersistentStore::storage_stats)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetGcMaintenanceResult {
+    candidate_count: u64,
+    candidate_bytes: u64,
+    deleted_count: u64,
+    deleted_bytes: u64,
+    blockers: Vec<String>,
+}
+
+fn asset_gc_result(
+    report: crate::asset_repository::migration_gc::AssetGcDryRunReport,
+) -> AssetGcMaintenanceResult {
+    AssetGcMaintenanceResult {
+        candidate_count: report.potential_delete_hashes.len() as u64,
+        candidate_bytes: report.potential_delete_bytes,
+        deleted_count: report.deleted_hashes.len() as u64,
+        deleted_bytes: report.deleted_bytes,
+        blockers: report.blockers,
+    }
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_asset_gc_preview(
+    state: State<'_, PersistentStoreState>,
+) -> Result<AssetGcMaintenanceResult, StoreError> {
+    with_store(state, |store| {
+        let page =
+            store.asset_gc_dry_run(128, None, current_time_ms()?, 7 * 24 * 60 * 60 * 1_000)?;
+        Ok(asset_gc_result(page.report))
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_asset_gc_execute(
+    state: State<'_, PersistentStoreState>,
+) -> Result<AssetGcMaintenanceResult, StoreError> {
+    with_store_mut(state, |store| {
+        let now = current_time_ms()?;
+        let mut cursor = None;
+        let mut result = AssetGcMaintenanceResult {
+            candidate_count: 0,
+            candidate_bytes: 0,
+            deleted_count: 0,
+            deleted_bytes: 0,
+            blockers: Vec::new(),
+        };
+        loop {
+            let page = store.asset_gc_delete_page_with_hook(
+                128,
+                cursor.as_deref(),
+                now,
+                7 * 24 * 60 * 60 * 1_000,
+                |_| Ok(()),
+            )?;
+            let page_result = asset_gc_result(page.report);
+            result.candidate_count += page_result.candidate_count;
+            result.candidate_bytes += page_result.candidate_bytes;
+            result.deleted_count += page_result.deleted_count;
+            result.deleted_bytes += page_result.deleted_bytes;
+            result.blockers.extend(page_result.blockers);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(result)
+    })
 }
 
 #[tauri::command(async)]

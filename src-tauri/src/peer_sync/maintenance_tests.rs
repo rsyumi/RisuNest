@@ -1,0 +1,48 @@
+use super::maintenance::{cleanup_temp, delete_backup, list_backups, temp_usage};
+use super::PeerSyncError;
+use std::fs;
+
+#[test]
+fn backup_deletion_requires_a_current_listed_regular_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let backup = directory
+        .path()
+        .join("peer-clone/activation/backups/clone.risulossless");
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create root");
+    fs::write(&backup, b"backup").expect("write backup");
+
+    let listed = list_backups(directory.path()).expect("list backups");
+    assert_eq!(listed.len(), 1);
+    delete_backup(directory.path(), std::path::Path::new(&listed[0].path))
+        .expect("delete listed backup");
+    assert!(!backup.exists());
+
+    let outside = directory.path().join("outside.risulossless");
+    fs::write(&outside, b"outside").expect("write outside file");
+    assert!(matches!(
+        delete_backup(directory.path(), &outside),
+        Err(PeerSyncError::Validation { .. })
+    ));
+    assert!(outside.exists());
+}
+
+#[test]
+fn temporary_cleanup_keeps_backup_and_active_operation_directories() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let abandoned = root.join("peer-delta/staging/abandoned");
+    let active = root.join("peer-bidirectional/staging/active");
+    let backup = root.join("peer-clone/activation/backups/backup.risulossless");
+    fs::create_dir_all(&abandoned).expect("create abandoned");
+    fs::create_dir_all(&active).expect("create active");
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(abandoned.join("payload"), b"abandoned").expect("write abandoned");
+    fs::write(active.join("operation.json"), b"{}").expect("write operation");
+    fs::write(&backup, b"backup").expect("write backup");
+
+    assert_eq!(temp_usage(root).expect("usage").count, 1);
+    assert_eq!(cleanup_temp(root).expect("cleanup").count, 1);
+    assert!(!abandoned.exists());
+    assert!(active.exists());
+    assert!(backup.exists());
+}
