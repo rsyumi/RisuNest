@@ -642,8 +642,8 @@ export function createPeerBidirectionalFacade(options: {
             requireNative()
             if (!sourceFence) throw new Error('Peer sync source is not prepared')
             if (options.platform === 'desktop') return nativeInvoke('peer_bidirectional_start', { sessionId })
-            if (!bridge) throw new Error('Android bidirectional foreground service is unavailable')
-            const started = await p5SourceForeground!.start(sessionId)
+            if (!p5SourceForeground) throw new Error('Android bidirectional foreground service is unavailable')
+            const started = await p5SourceForeground.start(sessionId)
             return started.result
         },
         async startQuickTunnel(sessionId) {

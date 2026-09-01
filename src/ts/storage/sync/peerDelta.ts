@@ -217,8 +217,8 @@ export function createPeerDeltaFacade(options: {
         async start(sessionId: string): Promise<PeerDeltaSourceStatus> {
             requireNative()
             if (options.platform === 'desktop') return nativeInvoke('peer_delta_start', { sessionId })
-            if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
-            const started = await p4SourceForeground!.start(sessionId)
+            if (!p4SourceForeground) throw new Error('Android peer delta foreground service is unavailable')
+            const started = await p4SourceForeground.start(sessionId)
             return started.result
         },
         async startQuickTunnel(sessionId: string): Promise<PeerDeltaSourceStatus> {
