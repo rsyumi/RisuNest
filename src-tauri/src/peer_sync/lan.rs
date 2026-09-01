@@ -1,4 +1,8 @@
 use super::{
+    device_registry::{
+        load_or_create_device_id, DevicePermissions, IncomingSource, IncomingSourceRegistry,
+        OutgoingDevice, OutgoingDeviceRegistry,
+    },
     http_stream::HttpRangeStream,
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
     PeerSyncError,
@@ -29,7 +33,7 @@ use std::{
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -126,6 +130,7 @@ pub struct LanPairing {
     pub session_id: String,
     pub manifest_id: String,
     pub claim: String,
+    pub(crate) permissions: Option<Vec<String>>,
 }
 
 pub struct LanCloneClient {
@@ -182,6 +187,9 @@ impl LanCloneClient {
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
                 device_id: None,
+                protocol_version: None,
+                device_name: None,
+                permissions: None,
             })
             .timeout(control_timeout)
             .send()
@@ -596,6 +604,33 @@ pub struct LanDevice {
 struct DeviceState {
     info: LanDevice,
     bearer_digest: [u8; 32],
+    permissions: DevicePermissions,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+#[derive(Clone)]
+struct HostV2Registration {
+    app_root: PathBuf,
+    device_id: String,
+    name: String,
+    permissions: DevicePermissions,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+impl HostV2Registration {
+    fn new(
+        app_root: &Path,
+        name: &str,
+        permissions: DevicePermissions,
+    ) -> Result<Self, PeerSyncError> {
+        validate_device_name(name)?;
+        Ok(Self {
+            app_root: app_root.to_path_buf(),
+            device_id: load_or_create_device_id(app_root)?,
+            name: name.to_owned(),
+            permissions: permissions.clone(),
+        })
+    }
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -603,6 +638,7 @@ struct ClaimState {
     digest: [u8; 32],
     expires_at: Instant,
     consumed: bool,
+    v2_permissions: Option<DevicePermissions>,
 }
 
 #[cfg(desktop)]
@@ -627,6 +663,7 @@ struct LanShared {
     #[cfg(desktop)]
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
     devices: Mutex<BTreeMap<String, DeviceState>>,
+    v2_registration: Mutex<Option<HostV2Registration>>,
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -760,6 +797,13 @@ impl LanSession {
         }
     }
 
+    fn legacy_permissions(&self) -> DevicePermissions {
+        match self {
+            Self::BidirectionalLogical(_) => DevicePermissions::read_and_bidirectional(),
+            Self::Clone(_) | Self::Logical(_) => DevicePermissions::read(),
+        }
+    }
+
     fn source_device_id(&self) -> Option<&str> {
         match self {
             Self::Clone(_) => None,
@@ -807,6 +851,23 @@ impl LanCloneHostControl {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
+        if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
+            let mut registry = match OutgoingDeviceRegistry::load(&registration.app_root) {
+                Ok(registry) => registry,
+                Err(_) => return false,
+            };
+            if registry
+                .devices()
+                .iter()
+                .any(|device| device.device_id == device_id)
+                && registry
+                    .remove(device_id)
+                    .and_then(|_| registry.save())
+                    .is_err()
+            {
+                return false;
+            }
+        }
         let mut devices = recovered_lock(&shared.devices);
         let Some(device) = devices.get_mut(device_id) else {
             return false;
@@ -842,6 +903,7 @@ impl LanCloneHost {
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
+                v2_registration: Mutex::new(None),
             }),
             address: None,
             stopped: None,
@@ -859,6 +921,7 @@ impl LanCloneHost {
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
+                v2_registration: Mutex::new(None),
             }),
             address: None,
             stopped: None,
@@ -878,12 +941,61 @@ impl LanCloneHost {
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
+                v2_registration: Mutex::new(None),
             }),
             address: None,
             stopped: None,
             active_connection: None,
             thread: None,
         }
+    }
+
+    // Opt-in protocol v2 state for the existing single-lane host. Keeping it
+    // explicit avoids changing legacy pairing links or their response shape.
+    pub(crate) fn enable_v2_registry(
+        &mut self,
+        app_root: &Path,
+        source_name: &str,
+        permissions: DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        if self.thread.is_some() {
+            return Err(PeerSyncError::Protocol(
+                "LAN clone host is already running".to_owned(),
+            ));
+        }
+        *recovered_lock(&self.shared.v2_registration) =
+            Some(HostV2Registration::new(app_root, source_name, permissions)?);
+        Ok(())
+    }
+
+    fn rehydrate_registered_devices(&self) -> Result<(), PeerSyncError> {
+        let Some(registration) = recovered_lock(&self.shared.v2_registration).clone() else {
+            return Ok(());
+        };
+        let registry = OutgoingDeviceRegistry::load(&registration.app_root)?;
+        let mut devices = recovered_lock(&self.shared.devices);
+        devices.clear();
+        for device in registry.devices() {
+            let digest: [u8; 32] = hex::decode(&device.bearer_digest)
+                .map_err(|_| PeerSyncError::Validation("invalid peer bearer digest".to_owned()))?
+                .try_into()
+                .map_err(|_| PeerSyncError::Validation("invalid peer bearer digest".to_owned()))?;
+            devices.insert(
+                device.device_id.clone(),
+                DeviceState {
+                    info: LanDevice {
+                        device_id: device.device_id.clone(),
+                        verified_bytes: 0,
+                        current_object: None,
+                        last_seen_unix_ms: now_ms(),
+                        revoked: false,
+                    },
+                    bearer_digest: digest,
+                    permissions: device.permissions.clone(),
+                },
+            );
+        }
+        Ok(())
     }
 
     // Desktop trusted-LAN hosting; Android hosts bind explicit interfaces.
@@ -922,11 +1034,16 @@ impl LanCloneHost {
                 "LAN clone host is already running".to_owned(),
             ));
         }
+        self.rehydrate_registered_devices()?;
+        let v2_permissions = recovered_lock(&self.shared.v2_registration)
+            .as_ref()
+            .map(|registration| registration.permissions.clone());
         let claim = random_secret()?;
         *recovered_lock(&self.shared.claim) = Some(ClaimState {
             digest: digest(&claim),
             expires_at: Instant::now() + CLAIM_TTL,
             consumed: false,
+            v2_permissions: v2_permissions.clone(),
         });
         let listener = TcpListener::bind((bind_address, port)).map_err(|error| {
             #[cfg(desktop)]
@@ -961,6 +1078,7 @@ impl LanCloneHost {
             session_id: self.shared.session.session_id().to_owned(),
             manifest_id: self.shared.session.manifest_id().to_owned(),
             claim: hex::encode(claim),
+            permissions: v2_permissions.map(|permissions| permissions.values().to_vec()),
         })
     }
 
@@ -1347,6 +1465,11 @@ fn handle_request(
     shared: &LanShared,
     stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
+    // Route before constructing a session path. This endpoint stays stable
+    // across source restarts, unlike the per-session endpoints below.
+    if request.url == "/v1/peer/hello" {
+        return hello(stream, request, shared);
+    }
     let prefix = format!("/v1/sessions/{}", shared.session.session_id());
     #[cfg(desktop)]
     {
@@ -1366,6 +1489,9 @@ fn handle_request(
         Ok(device) => device,
         Err(status) => return respond_empty(stream, status),
     };
+    if !device.permissions.allows_read() {
+        return respond_empty(stream, 403);
+    }
     if request.url == format!("{prefix}/manifest") {
         if request.method != "GET" {
             return respond_empty(stream, 405);
@@ -1384,7 +1510,7 @@ fn handle_request(
         if request.method != "POST" {
             return respond_empty(stream, 405);
         }
-        return progress(stream, request, shared, &device);
+        return progress(stream, request, shared, &device.device_id);
     }
     if request.url == format!("{prefix}/registration") {
         return bidirectional_registration(stream, request, shared, &device);
@@ -1409,7 +1535,7 @@ fn handle_request(
             if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
                 return respond_empty(stream, 400);
             }
-            logical_object(stream, shared, &device, &object, stopped)
+            logical_object(stream, shared, &device.device_id, &object, stopped)
         }
         _ => respond_empty(stream, 405),
     }
@@ -1475,12 +1601,36 @@ fn claim(
     if secret.len() != 32 {
         return respond_empty(stream, 403);
     }
-    let device_id = match &shared.session {
-        LanSession::BidirectionalLogical(_) => match request_body.device_id.as_deref() {
+    let has_v2_field = request_body.protocol_version.is_some()
+        || request_body.device_name.is_some()
+        || request_body.permissions.is_some();
+    let v2 = if has_v2_field {
+        if request_body.protocol_version != Some(2) || request_body.permissions.is_some() {
+            return respond_empty(stream, 400);
+        }
+        let Some(device_id) = request_body.device_id.as_deref() else {
+            return respond_empty(stream, 400);
+        };
+        let Some(device_name) = request_body.device_name.as_deref() else {
+            return respond_empty(stream, 400);
+        };
+        if !is_canonical_uuid(device_id) || validate_device_name(device_name).is_err() {
+            return respond_empty(stream, 400);
+        }
+        let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+            return respond_empty(stream, 400);
+        };
+        Some((device_id.to_owned(), device_name.to_owned(), registration))
+    } else {
+        None
+    };
+    let device_id = match (&shared.session, &v2) {
+        (_, Some((device_id, _, _))) => device_id.clone(),
+        (LanSession::BidirectionalLogical(_), None) => match request_body.device_id.as_deref() {
             Some(device_id) if is_canonical_uuid(device_id) => device_id.to_owned(),
             _ => return respond_empty(stream, 400),
         },
-        LanSession::Clone(_) | LanSession::Logical(_) => uuid::Uuid::new_v4().to_string(),
+        (LanSession::Clone(_) | LanSession::Logical(_), None) => uuid::Uuid::new_v4().to_string(),
     };
     let mut claim = recovered_lock(&shared.claim);
     let Some(claim) = claim.as_mut() else {
@@ -1492,13 +1642,44 @@ fn claim(
     if !constant_time_eq(&claim.digest, &digest(&secret)) {
         return respond_empty(stream, 403);
     }
+    let bearer = hex::encode(random_secret()?);
+    let permissions = v2
+        .as_ref()
+        .and_then(|_| claim.v2_permissions.clone())
+        .unwrap_or_else(|| shared.session.legacy_permissions());
+    if let Some((_, name, registration)) = &v2 {
+        let mut registry = match OutgoingDeviceRegistry::load(&registration.app_root) {
+            Ok(registry) => registry,
+            Err(_) => return respond_empty(stream, 500),
+        };
+        if registry
+            .register_claim(OutgoingDevice {
+                device_id: device_id.clone(),
+                name: name.clone(),
+                bearer_digest: hex::encode(digest(bearer.as_bytes())),
+                permissions: permissions.clone(),
+                created_at_ms: now_ms() as u64,
+                last_seen_ms: 0,
+                total_bytes: 0,
+            })
+            .and_then(|_| registry.save())
+            .is_err()
+        {
+            return respond_empty(stream, 500);
+        }
+    }
     claim.consumed = true;
-    let bearer = random_secret()?;
+    let source_v2 = v2.as_ref().map(|(_, _, registration)| registration);
     let response = ClaimResponse {
         device_id: device_id.clone(),
-        bearer: hex::encode(bearer),
+        bearer,
         permission: shared.session.permission(),
-        source_device_id: shared.session.source_device_id(),
+        // Legacy logical clients retain their lane-specific source identity.
+        source_device_id: source_v2
+            .map(|registration| registration.device_id.as_str())
+            .or_else(|| shared.session.source_device_id()),
+        source_device_name: source_v2.map(|registration| registration.name.as_str()),
+        permissions: source_v2.map(|_| permissions.values()),
     };
     recovered_lock(&shared.devices).insert(
         device_id,
@@ -1511,13 +1692,20 @@ fn claim(
                 revoked: false,
             },
             bearer_digest: digest(response.bearer.as_bytes()),
+            permissions: permissions.clone(),
         },
     );
     respond_json(stream, 200, &response)
 }
 
 #[cfg(any(desktop, target_os = "android"))]
-fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
+struct AuthorizedDevice {
+    device_id: String,
+    permissions: DevicePermissions,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<AuthorizedDevice, u16> {
     let value = request.authorization.as_deref().ok_or(401_u16)?;
     let Some(bearer) = value.strip_prefix("Bearer ") else {
         return Err(401);
@@ -1533,7 +1721,10 @@ fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
                 return Err(403);
             }
             device.info.last_seen_unix_ms = now_ms();
-            return Ok(id.clone());
+            return Ok(AuthorizedDevice {
+                device_id: id.clone(),
+                permissions: device.permissions.clone(),
+            });
         }
     }
     Err(401)
@@ -1585,12 +1776,15 @@ fn bidirectional_registration(
     stream: &mut TcpStream,
     request: HttpRequest,
     shared: &LanShared,
-    device_id: &str,
+    device: &AuthorizedDevice,
 ) -> Result<(), PeerSyncError> {
     if request.method != "POST" {
         return respond_empty(stream, 405);
     }
-    let Some(session) = authenticated_bidirectional_session(shared, device_id) else {
+    if !device.permissions.allows_bidirectional() {
+        return respond_empty(stream, 403);
+    }
+    let Some(session) = authenticated_bidirectional_session(shared, &device.device_id) else {
         return respond_empty(stream, 404);
     };
     let Ok(request) = serde_json::from_slice::<LanBidirectionalRegistrationRequest>(&request.body)
@@ -1615,13 +1809,16 @@ fn bidirectional_remote_apply(
     stream: &mut TcpStream,
     request: HttpRequest,
     shared: &LanShared,
-    device_id: &str,
+    device: &AuthorizedDevice,
     stopped: &Arc<AtomicBool>,
 ) -> Result<(), PeerSyncError> {
     if request.method != "POST" {
         return respond_empty(stream, 405);
     }
-    let Some(session) = authenticated_bidirectional_session(shared, device_id) else {
+    if !device.permissions.allows_bidirectional() {
+        return respond_empty(stream, 403);
+    }
+    let Some(session) = authenticated_bidirectional_session(shared, &device.device_id) else {
         return respond_empty(stream, 404);
     };
     let Ok(request) = serde_json::from_slice::<LanBidirectionalRemoteApplyRequest>(&request.body)
@@ -1751,11 +1948,90 @@ fn set_current_object(shared: &LanShared, device_id: &str, object: Option<&str>)
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ClaimRequest {
     claim: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permissions: Option<Vec<String>>,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+fn hello(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+) -> Result<(), PeerSyncError> {
+    if request.method != "GET"
+        || request.range.is_some()
+        || request.range_count != 0
+        || !request.body.is_empty()
+    {
+        return respond_empty(stream, 404);
+    }
+    let device = match authorize(&request, shared) {
+        Ok(device) => device,
+        Err(status) => return respond_empty(stream, status),
+    };
+    let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+        return respond_empty(stream, 404);
+    };
+    #[derive(Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LaneDescriptor<'a> {
+        session_id: &'a str,
+        manifest_id: &'a str,
+    }
+    #[derive(Serialize)]
+    struct Lanes<'a> {
+        clone: Option<LaneDescriptor<'a>>,
+        delta: Option<LaneDescriptor<'a>>,
+        bidirectional: Option<LaneDescriptor<'a>>,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Hello<'a> {
+        device_id: &'a str,
+        name: &'a str,
+        permissions: &'a [String],
+        lanes: Lanes<'a>,
+    }
+    let descriptor = LaneDescriptor {
+        session_id: shared.session.session_id(),
+        manifest_id: shared.session.manifest_id(),
+    };
+    let lanes = match &shared.session {
+        LanSession::Clone(_) => Lanes {
+            clone: Some(descriptor.clone()),
+            delta: None,
+            bidirectional: None,
+        },
+        LanSession::Logical(_) => Lanes {
+            clone: None,
+            delta: Some(descriptor.clone()),
+            bidirectional: None,
+        },
+        LanSession::BidirectionalLogical(_) => Lanes {
+            clone: None,
+            delta: None,
+            bidirectional: Some(descriptor),
+        },
+    };
+    respond_json(
+        stream,
+        200,
+        &Hello {
+            device_id: &registration.device_id,
+            name: &registration.name,
+            permissions: device.permissions.values(),
+            lanes,
+        },
+    )
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -1898,6 +2174,10 @@ struct ClaimResponse<'a> {
     permission: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_device_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_device_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permissions: Option<&'a [String]>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1906,7 +2186,21 @@ struct ClaimResponseOwned {
     bearer: String,
     permission: String,
     source_device_id: Option<String>,
+    source_device_name: Option<String>,
+    permissions: Option<Vec<String>>,
 }
+
+#[cfg(any(desktop, target_os = "android"))]
+fn validate_device_name(value: &str) -> Result<(), PeerSyncError> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(PeerSyncError::Validation(
+            "invalid peer device name".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(desktop, target_os = "android"))]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProgressRequest {
@@ -2475,6 +2769,7 @@ fn copy_exact_response(
 #[cfg(all(test, desktop))]
 mod timeout_tests {
     use super::*;
+    use crate::peer_sync::device_registry::DevicePermissions;
     use crate::peer_sync::{
         logical_delta::{
             build_logical_manifest, LogicalManifestBuilderInput, LogicalRecordEnvelope,
@@ -3057,6 +3352,45 @@ mod timeout_tests {
         .unwrap()
     }
 
+    fn prepared_logical_session(
+        session_id: &str,
+        source_device_id: &str,
+    ) -> PreparedLogicalLanSession {
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Root,
+                LogicalRecordEnvelope::Root {
+                    value: serde_json::json!({}),
+                    owner_heads: vec![],
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        PreparedLogicalLanSession::new(
+            session_id,
+            source_device_id,
+            built.manifest_hash,
+            built.manifest_bytes,
+            built
+                .manifest
+                .objects
+                .iter()
+                .map(|object| LogicalDeltaObject {
+                    hash: object.hash.clone(),
+                    size: object.size,
+                })
+                .collect(),
+            Box::new(LogicalFixtureSource(BTreeMap::new())),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn p5_remote_apply_waits_past_the_short_control_timeout_for_a_terminal_response() {
         let _guard = LOGICAL_LAN_TEST_LOCK
@@ -3239,6 +3573,181 @@ mod timeout_tests {
             }),
             Err(PeerSyncError::Transport(_))
         ));
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn v2_claim_persists_both_registries_and_hello_rehydrates_after_restart() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_name = "Windows desktop";
+        let target_name = "Android";
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let target_id =
+            super::super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000090",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), source_name, DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+
+        let client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            target_name,
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        assert_eq!(client.device_id, target_id);
+        assert_eq!(client.source_device_id(), source_id);
+        assert_eq!(
+            super::super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .device_id,
+            target_id
+        );
+        let incoming =
+            super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
+                .unwrap();
+        let source = &incoming.sources()[0];
+        assert_eq!(source.device_id, source_id);
+        assert_eq!(source.name, source_name);
+
+        let hello = reqwest::blocking::Client::new()
+            .get(format!("{endpoint}/v1/peer/hello"))
+            .bearer_auth(&client.bearer)
+            .send()
+            .unwrap();
+        assert_eq!(hello.status(), reqwest::StatusCode::OK);
+        let hello: serde_json::Value = hello.json().unwrap();
+        assert_eq!(hello["deviceId"], source_id);
+        assert_eq!(hello["name"], source_name);
+        assert_eq!(hello["lanes"]["delta"]["sessionId"], pairing.session_id);
+        assert!(hello["lanes"]["clone"].is_null());
+        assert!(hello["lanes"]["bidirectional"].is_null());
+
+        let bearer = client.bearer.clone();
+        host.stop().unwrap();
+        let mut restarted = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000091",
+            &source_id,
+        ));
+        restarted
+            .enable_v2_registry(source_root.path(), source_name, DevicePermissions::read())
+            .unwrap();
+        restarted.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let restarted_endpoint = format!("http://{}", restarted.address().unwrap());
+        assert_eq!(
+            reqwest::blocking::Client::new()
+                .get(format!("{restarted_endpoint}/v1/peer/hello"))
+                .bearer_auth(bearer)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        restarted.stop().unwrap();
+    }
+
+    #[test]
+    fn invalid_v2_claim_fields_do_not_consume_the_one_use_claim() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000092",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let url = format!("{endpoint}/v1/sessions/{}/claim", pairing.session_id);
+        let target_id =
+            super::super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+        let raw = reqwest::blocking::Client::new();
+
+        for body in [
+            serde_json::json!({"claim": pairing.claim, "version": 2, "deviceId": target_id, "deviceName": "Android"}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 3, "deviceId": target_id, "deviceName": "Android"}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": "bad", "deviceName": "Android"}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": target_id, "deviceName": ""}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": target_id, "deviceName": "Android", "permissions": ["bidirectional"]}),
+        ] {
+            assert_eq!(
+                raw.post(&url).json(&body).send().unwrap().status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            raw.post(&url)
+                .json(&serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": target_id, "deviceName": "Android"}))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn v2_read_only_claim_cannot_invoke_bidirectional_handlers() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let target_id = "00000000-0000-4000-8000-000000000093";
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000094",
+                &source_id,
+                Arc::clone(&control),
+            ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let session_url = format!("{endpoint}/v1/sessions/{}", pairing.session_id);
+        let claim: serde_json::Value = reqwest::blocking::Client::new()
+            .post(format!("{session_url}/claim"))
+            .json(&serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": target_id, "deviceName": "Android"}))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(claim["permissions"], serde_json::json!(["read"]));
+        assert_eq!(
+            reqwest::blocking::Client::new()
+                .post(format!("{session_url}/registration"))
+                .bearer_auth(claim["bearer"].as_str().unwrap())
+                .json(&serde_json::json!({
+                    "libraryId": "library",
+                    "generation": {"generationId": "generation-1", "manifestHash": pairing.manifest_id, "generationSequence": "1"},
+                    "expectedRevision": 0
+                }))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert!(control.registrations.lock().unwrap().is_empty());
         host.stop().unwrap();
     }
 
@@ -3639,6 +4148,112 @@ fn build_bidirectional_remote_apply_client() -> Result<reqwest::Client, PeerSync
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanLogicalDeltaClient {
+    pub(crate) fn claim_v2_and_register(
+        app_root: &Path,
+        target_name: &str,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        if endpoint.len() > MAX_URL_BYTES
+            || !is_canonical_uuid(session_id)
+            || !is_lower_hex_256(manifest_id)
+            || !is_lower_hex_256(claim)
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid logical delta pairing data".to_owned(),
+            ));
+        }
+        validate_device_name(target_name)?;
+        let endpoint = validate_private_lan_endpoint(endpoint)?;
+        let target_device_id = load_or_create_device_id(app_root)?;
+        let session_url = format!("{endpoint}/v1/sessions/{session_id}");
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "logical delta session URL is too long".to_owned(),
+            ));
+        }
+        let timeouts = LogicalClientTimeouts {
+            control_request: CONTROL_REQUEST_TIMEOUT,
+            object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+        };
+        let control_client = build_logical_http_client(LogicalRequestKind::Control, timeouts)?;
+        let object_client = build_logical_http_client(LogicalRequestKind::Object, timeouts)?;
+        let response = control_client
+            .post(format!("{session_url}/claim"))
+            .json(&ClaimRequest {
+                claim: claim.to_owned(),
+                device_id: Some(target_device_id.clone()),
+                protocol_version: Some(2),
+                device_name: Some(target_name.to_owned()),
+                permissions: None,
+            })
+            .timeout(timeouts.control_request)
+            .send()
+            .map_err(transport)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        let mut body = Vec::new();
+        response
+            .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(transport)?;
+        if body.len() > MAX_CLAIM_RESPONSE_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "logical delta claim response is too large".to_owned(),
+            ));
+        }
+        let response: ClaimResponseOwned = serde_json::from_slice(&body)
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+        let source_device_id = response.source_device_id.ok_or_else(|| {
+            PeerSyncError::Protocol("v2 source device identity is missing".to_owned())
+        })?;
+        let source_name = response.source_device_name.ok_or_else(|| {
+            PeerSyncError::Protocol("v2 source device name is missing".to_owned())
+        })?;
+        let granted = response
+            .permissions
+            .ok_or_else(|| PeerSyncError::Protocol("v2 permissions are missing".to_owned()))?;
+        let granted = DevicePermissions::from_values(granted)?;
+        if response.device_id != target_device_id
+            || !is_canonical_uuid(&source_device_id)
+            || validate_device_name(&source_name).is_err()
+            || !is_lower_hex_256(&response.bearer)
+            || response.permission != "logical-read"
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid logical delta v2 claim response".to_owned(),
+            ));
+        }
+        let mut registry = IncomingSourceRegistry::load(app_root)?;
+        registry.upsert(IncomingSource {
+            device_id: source_device_id.clone(),
+            name: source_name,
+            endpoint: endpoint.clone(),
+            bearer: response.bearer.clone(),
+            permissions: granted,
+            last_seen_ms: now_ms() as u64,
+            total_bytes: 0,
+        })?;
+        registry.save()?;
+        Ok(Self {
+            control_client,
+            object_client,
+            control_timeout: timeouts.control_request,
+            session_url,
+            device_id: response.device_id,
+            bearer: response.bearer,
+            source_device_id,
+            manifest_id: manifest_id.to_owned(),
+            verified_bytes: Arc::new(Mutex::new(0)),
+        })
+    }
+
     pub fn claim(
         endpoint: &str,
         session_id: &str,
@@ -3753,6 +4368,9 @@ impl LanLogicalDeltaClient {
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
                 device_id: device_id.map(str::to_owned),
+                protocol_version: None,
+                device_name: None,
+                permissions: None,
             })
             .timeout(control_timeout)
             .send()

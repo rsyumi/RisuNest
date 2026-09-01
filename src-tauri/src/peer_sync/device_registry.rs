@@ -35,8 +35,25 @@ impl DevicePermissions {
             .any(|permission| permission == "bidirectional")
     }
 
+    pub(crate) fn from_values(values: Vec<String>) -> Result<Self, PeerSyncError> {
+        let permissions = Self(values);
+        permissions.validate()?;
+        Ok(permissions)
+    }
+
+    pub(crate) fn values(&self) -> &[String] {
+        &self.0
+    }
+
     fn validate(&self) -> Result<(), PeerSyncError> {
-        if !self.allows_read()
+        if self.0.is_empty()
+            || !self.allows_read()
+            || self.0.len()
+                != self
+                    .0
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
             || self
                 .0
                 .iter()
@@ -122,6 +139,26 @@ impl OutgoingDeviceRegistry {
             .iter_mut()
             .find(|item| item.device_id == device.device_id)
         {
+            *existing = device;
+        } else {
+            self.devices.push(device);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn register_claim(
+        &mut self,
+        mut device: OutgoingDevice,
+    ) -> Result<(), PeerSyncError> {
+        validate_outgoing(std::slice::from_ref(&device))?;
+        if let Some(existing) = self
+            .devices
+            .iter_mut()
+            .find(|item| item.device_id == device.device_id)
+        {
+            device.created_at_ms = existing.created_at_ms;
+            device.last_seen_ms = existing.last_seen_ms;
+            device.total_bytes = existing.total_bytes;
             *existing = device;
         } else {
             self.devices.push(device);

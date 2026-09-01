@@ -2164,6 +2164,7 @@ mod tests {
             session_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             manifest_id: "1".repeat(64),
             claim: "2".repeat(64),
+            permissions: None,
         };
 
         let uri = build_pairing_uri("http://192.168.1.8:1234", &pairing).unwrap();

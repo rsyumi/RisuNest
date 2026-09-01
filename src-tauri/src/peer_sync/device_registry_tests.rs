@@ -57,6 +57,43 @@ fn outgoing_registry_persists_digest_permissions_last_seen_and_total_bytes() {
 }
 
 #[test]
+fn reregistering_a_claim_preserves_created_at_last_seen_and_total_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Old name".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 20,
+            total_bytes: 30,
+        })
+        .unwrap();
+
+    registry
+        .register_claim(OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "New name".into(),
+            bearer_digest: "b".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            created_at_ms: 99,
+            last_seen_ms: 99,
+            total_bytes: 99,
+        })
+        .unwrap();
+
+    let registered = &registry.devices()[0];
+    assert_eq!(registered.name, "New name");
+    assert_eq!(registered.bearer_digest, "b".repeat(64));
+    assert!(registered.permissions.allows_bidirectional());
+    assert_eq!(registered.created_at_ms, 10);
+    assert_eq!(registered.last_seen_ms, 20);
+    assert_eq!(registered.total_bytes, 30);
+}
+
+#[test]
 fn incoming_registry_stores_bearer_and_revoke_replaces_file_atomically() {
     let root = tempfile::tempdir().unwrap();
     let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
