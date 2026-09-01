@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { parsePeerCloneEndpoint, parsePeerPairingUri } from './peerClone'
 
-type DeviceSyncInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
+export type DeviceSyncInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
 export type DeviceSyncMethod = 'lan' | 'quick' | 'fixed-url'
 export type DeviceSyncPhase = 'idle' | 'preparing' | 'prepared' | 'starting' | 'running' | 'stopping' | 'error'
@@ -157,7 +157,7 @@ export function parseDeviceSyncUri(uri: string): StagedDeviceSyncLink {
     })
 }
 
-function safeStatus(value: unknown): DeviceSyncStatus {
+export function safeDeviceSyncStatus(value: unknown): DeviceSyncStatus {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         throw new DeviceSyncError('state-unavailable')
     }
@@ -266,21 +266,21 @@ export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = 
             throw new Error('Choose a valid port')
         }
     }
-    const status = async (): Promise<DeviceSyncStatus> => safeStatus(await safeInvoke(nativeInvoke, 'device_sync_status'))
+    const status = async (): Promise<DeviceSyncStatus> => safeDeviceSyncStatus(await safeInvoke(nativeInvoke, 'device_sync_status'))
     const source = async (command: string, settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> => {
         validate(settings)
-        return safeStatus(await safeInvoke(nativeInvoke, command, { request: { ...settings } }))
+        return safeDeviceSyncStatus(await safeInvoke(nativeInvoke, command, { request: { ...settings } }))
     }
     return {
         prepare: (settings: DeviceSyncSettingsInput) => source('device_sync_prepare', settings),
         start: async (permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> =>
-            safeStatus(await safeInvoke(nativeInvoke, 'device_sync_start', { permissions })),
+            safeDeviceSyncStatus(await safeInvoke(nativeInvoke, 'device_sync_start', { permissions })),
         status,
         async stop(): Promise<void> {
             await safeInvoke(nativeInvoke, 'device_sync_stop')
         },
         async rotateLink(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
-            return safeStatus(await safeInvoke(nativeInvoke, 'device_sync_rotate_link', { permissions }))
+            return safeDeviceSyncStatus(await safeInvoke(nativeInvoke, 'device_sync_rotate_link', { permissions }))
         },
         async outgoingDevices(): Promise<RegisteredDevice[]> {
             return safeDevices(await safeInvoke(nativeInvoke, 'peer_sync_outgoing_devices'))

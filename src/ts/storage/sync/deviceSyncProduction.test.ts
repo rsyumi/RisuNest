@@ -12,6 +12,35 @@ import {
 } from './deviceSyncProduction'
 
 describe('production device sync composition', () => {
+    it('selects the Android unified source facade while leaving desktop composition injectable', () => {
+        const runtime = {
+            flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),
+            acquireDestructiveReplacementFence: vi.fn(),
+        }
+        const androidFacade = { platform: 'android-source' }
+        const sourceAndroid = vi.fn(() => androidFacade)
+        const sourceDesktop = vi.fn(() => ({ platform: 'desktop-source' }))
+        const createController = vi.fn((_options: unknown) => ({ kind: 'controller' }))
+
+        createProductionDeviceSyncController({
+            platform: 'android', runtime,
+            factories: {
+                sourceAndroid: sourceAndroid as never,
+                sourceDesktop: sourceDesktop as never,
+                cloneDesktop: vi.fn(),
+                deltaDesktop: vi.fn(),
+                cloneAndroid: vi.fn(() => ({ kind: 'clone' }) as never),
+                deltaAndroid: vi.fn(() => ({ kind: 'delta' }) as never),
+                bidirectional: vi.fn(() => ({ kind: 'bidirectional' }) as never),
+                controller: createController as never,
+            },
+        })
+
+        expect(sourceAndroid).toHaveBeenCalledOnce()
+        expect(sourceDesktop).not.toHaveBeenCalled()
+        expect(createController.mock.calls[0]?.[0]).toMatchObject({ facade: androidFacade })
+    })
+
     it('composes every desktop target before returning the controller', () => {
         const runtime = {
             flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),

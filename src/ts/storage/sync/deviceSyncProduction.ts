@@ -5,6 +5,7 @@ import {
     flushPendingData,
 } from '../persistentDataRuntime.svelte'
 import { createDeviceSyncFacade } from './deviceSync'
+import { createAndroidDeviceSyncFacade } from './deviceSyncAndroid'
 import {
     createDeviceSyncController,
     type DeviceSyncBidirectionalTarget,
@@ -178,6 +179,8 @@ const productionRuntime = {
 }
 
 type ProductionFactories = {
+    sourceDesktop?(): ReturnType<typeof createDeviceSyncFacade>
+    sourceAndroid?(): ReturnType<typeof createAndroidDeviceSyncFacade>
     cloneDesktop(runtime: typeof productionRuntime): DeviceSyncCloneTarget
     cloneAndroid(runtime: typeof productionRuntime): DeviceSyncCloneTarget
     deltaDesktop(runtime: typeof productionRuntime): DeviceSyncDeltaTarget
@@ -191,6 +194,8 @@ function targetOnly<T extends { initializeTarget(): Promise<void> }>(controller:
 }
 
 const defaultFactories: ProductionFactories = {
+    sourceDesktop: () => createDeviceSyncFacade(),
+    sourceAndroid: () => createAndroidDeviceSyncFacade(),
     cloneDesktop: (runtime) => targetOnly(getDesktopPeerCloneController(runtime)),
     cloneAndroid: (runtime) => createAndroidDeviceSyncCloneTarget(getAndroidPeerCloneFacade({
         capturePersistentMutationToken: runtime.capturePersistentMutationToken,
@@ -223,7 +228,9 @@ export function createProductionDeviceSyncController(options: {
         : factories.deltaDesktop(runtime)
     const bidirectional = factories.bidirectional(runtime)
     return factories.controller({
-        facade: options.facade ?? createDeviceSyncFacade(),
+        facade: options.facade ?? (platform === 'android'
+            ? factories.sourceAndroid?.() ?? createAndroidDeviceSyncFacade()
+            : factories.sourceDesktop?.() ?? createDeviceSyncFacade()),
         targets: { clone, delta, bidirectional },
     })
 }
