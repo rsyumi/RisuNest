@@ -1,4 +1,7 @@
-import { isLegacyBackupAssetKey } from '../../drive/backupAssets'
+import {
+    collectExactPluginStorageAssetReferences,
+    isLegacyBackupAssetKey,
+} from '../../drive/backupAssets'
 import {
     isColdStorageBackupData,
     listCharacterResources,
@@ -274,6 +277,21 @@ async function collectPinnedReferences(reader: PersistentRevisionReader): Promis
     const root = rootRecord.value
     const assets = new Set<string>()
     addOfficialAssets(assets, listDatabaseRootResources(root))
+    const pluginStorage = await reader.queryPluginStorage()
+    assertPinnedRevision(reader.revision, pluginStorage.revision, 'Plugin storage catalog')
+    for (const summary of pluginStorage.items) {
+        const value = await reader.readPluginStorage(summary.key)
+        if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
+        assertPinnedRevision(
+            reader.revision,
+            value.revision,
+            `Plugin storage value ${summary.key}`,
+        )
+        addOfficialAssets(
+            assets,
+            collectExactPluginStorageAssetReferences(value.value),
+        )
+    }
     const coldKeys = new Set<string>()
     for await (const character of iteratePinnedCharacters(reader)) {
         const detail = {

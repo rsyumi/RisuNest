@@ -771,6 +771,61 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(replace).not.toHaveBeenCalled()
     })
 
+    it('publishes and projects exact plugin storage assets from the pinned revision', async () => {
+        const database = makeDatabase()
+        const pluginAssetKey = 'assets/plugin-official.bin'
+        const laterAssetKey = 'assets/plugin-later.bin'
+        const rejectedNestedKey = 'assets/plugins/plugin-nested.bin'
+        database.pluginCustomStorage = {
+            plugin: {
+                nested: [{ asset: pluginAssetKey }],
+                rejectedNested: rejectedNestedKey,
+                prose: 'prefix assets/not-a-reference.bin',
+            },
+        }
+        const blobs = new Map(
+            resources(database).map((key, index): [string, Uint8Array] => [
+                key,
+                Uint8Array.of(index + 1),
+            ]),
+        )
+        blobs.set(pluginAssetKey, Uint8Array.of(91, 92))
+        blobs.set(laterAssetKey, Uint8Array.of(93))
+        blobs.set(rejectedNestedKey, Uint8Array.of(94))
+        const harness = await makeHarness({ database, blobs })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Later local user' },
+            pluginStorage: [{
+                type: 'set',
+                key: 'plugin',
+                value: { nested: [{ asset: laterAssetKey }] },
+            }],
+        })
+
+        await publication.publish()
+
+        expect(harness.writeItem.mock.calls.some(([key]) => key === pluginAssetKey)).toBe(true)
+        expect(harness.writeItem.mock.calls.some(([key]) => key === laterAssetKey)).toBe(false)
+        expect(harness.writeItem.mock.calls.some(([key]) => key === rejectedNestedKey)).toBe(false)
+        expect(harness.writeItem.mock.calls.some(
+            ([key]) => key === 'assets/not-a-reference.bin',
+        )).toBe(false)
+        const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
+        const projected = await decodeRisuSave(databaseWrite!.bytes!)
+        expect(projected.pluginCustomStorage.plugin).toEqual({
+            nested: [{ asset: `remote/${pluginAssetKey}` }],
+            rejectedNested: rejectedNestedKey,
+            prose: 'prefix assets/not-a-reference.bin',
+        })
+        expect((await harness.store.readPluginStorage('plugin'))?.value).toEqual({
+            nested: [{ asset: laterAssetKey }],
+        })
+    })
+
     it('uploads each local asset once across publications', async () => {
         const harness = await makeHarness()
         const assetCount = resources(harness.database).length
