@@ -3,6 +3,7 @@ import type { BlobStore } from '../storage/blobStore'
 import { configureOfficialAccountAssetReader } from '../storage/accountAssetAccess'
 import {
     collectBackupAssetKeys,
+    collectExactPluginStorageAssetReferences,
     collectPinnedBackupAssetReferences,
     collectReferencedBackupInlays,
     createPinnedBackupReferenceAccumulator,
@@ -11,6 +12,7 @@ import {
     getBackupInlayName,
     isLegacyBackupAssetKey,
     readBackupAsset,
+    replaceExactPluginStorageAssetReferences,
     selectLegacyBackupAssetKeys,
     writeBackupAsset,
 } from './backupAssets'
@@ -123,6 +125,60 @@ describe('backup inlay entries', () => {
     })
 })
 
+describe('plugin storage asset references', () => {
+    test('collects only whole flat paths recursively and normalizes separators', () => {
+        const cyclic: Record<string, unknown> = {
+            direct: 'assets/direct.webp',
+            nested: [{ audio: 'assets\\voice.mp3' }],
+            collisionA: 'assets/a/x.bin',
+            collisionB: 'assets/b/x.bin',
+            prose: 'prefix assets/not-a-reference.png',
+            serialized: '{"path":"assets/not-json.png"}',
+        }
+        cyclic.self = cyclic
+
+        expect(collectExactPluginStorageAssetReferences(cyclic)).toEqual([
+            'assets/direct.webp',
+            'assets/voice.mp3',
+        ])
+    })
+
+    test('projects exact values once without changing keys, source, or own proto data', () => {
+        const source = JSON.parse(
+            '{"direct":"assets/direct.webp",' +
+            '"nested":["assets/chain.bin","prefix assets/direct.webp"],' +
+            '"windows":"assets\\\\windows.bin",' +
+            '"nestedPath":"assets/a/x.bin",' +
+            '"assets/direct.webp":"object-key-is-not-a-reference",' +
+            '"__proto__":"assets/proto.bin"}',
+        ) as Record<string, unknown>
+        const projected = replaceExactPluginStorageAssetReferences(source, {
+            'assets/direct.webp': 'remote/direct.webp',
+            'assets/chain.bin': 'assets/chain-step.bin',
+            'assets/chain-step.bin': 'remote/chain-final.bin',
+            'assets/windows.bin': 'remote/windows.bin',
+            'assets/a/x.bin': 'remote/a/x.bin',
+            'assets/proto.bin': 'remote/proto.bin',
+        })
+
+        expect(projected).not.toBe(source)
+        expect(projected.direct).toBe('remote/direct.webp')
+        expect(projected.nested).toEqual([
+            'assets/chain-step.bin',
+            'prefix assets/direct.webp',
+        ])
+        expect(projected['assets/direct.webp']).toBe('object-key-is-not-a-reference')
+        expect(projected.windows).toBe('remote/windows.bin')
+        expect(projected.nestedPath).toBe('remote/a/x.bin')
+        expect(Object.hasOwn(projected, '__proto__')).toBe(true)
+        expect(projected.__proto__).toBe('remote/proto.bin')
+        expect(Object.getPrototypeOf(projected)).toBe(Object.prototype)
+        expect(source.direct).toBe('assets/direct.webp')
+        expect((source.nested as unknown[])[0]).toBe('assets/chain.bin')
+        expect(source.__proto__).toBe('assets/proto.bin')
+    })
+})
+
 describe('pinned backup reference accumulator', () => {
     test('collects full references record by record and lets cold characters override stubs', () => {
         const accumulator = createPinnedBackupReferenceAccumulator('full')
@@ -158,7 +214,12 @@ describe('pinned backup reference accumulator', () => {
                 ],
             } as never,
         })
-        accumulator.visitPluginStorage({ value: 0, markup: '{{inlayeddata::plugin-inlay}}' })
+        accumulator.visitPluginStorage({
+            direct: 'assets/plugin.webp',
+            nested: [{ audio: 'assets\\plugin-audio.mp3' }],
+            prose: 'prefix assets/not-a-reference.png',
+            markup: '{{inlayeddata::plugin-inlay}}',
+        })
         accumulator.visitColdPayload({
             character: {
                 chaId: 'char-1', name: 'Character', type: 'character', chats: [],
@@ -173,6 +234,8 @@ describe('pinned backup reference accumulator', () => {
         expect(result.assetKeys).toEqual([
             'assets/cold-extra.png',
             'assets/cold.png',
+            'assets/plugin-audio.mp3',
+            'assets/plugin.webp',
             'assets/root.png',
         ])
         expect(result.inlayKeys).toEqual([
@@ -210,6 +273,10 @@ describe('pinned backup reference accumulator', () => {
                 chaId: 'char-1', name: 'Character', type: 'character', image: 'assets/profile.png',
                 additionalAssets: [['bulk', 'assets/bulk.png', 'png']],
             } as never,
+        })
+        accumulator.visitPluginStorage({
+            asset: 'assets/plugin-partial.bin',
+            inlay: '{{inlay::plugin-partial-inlay}}',
         })
 
         const result = accumulator.finish()

@@ -21,6 +21,75 @@ export function isLegacyBackupAssetKey(key: string): boolean {
     return normalized.startsWith('assets/') && normalized.length > 'assets/'.length
 }
 
+function normalizeExactLegacyAssetReference(value: string): string | null {
+    return isLegacyBackupAssetKey(value) ? value.replace(/\\/g, '/') : null
+}
+
+function normalizeExactPluginStorageBackupAssetReference(value: string): string | null {
+    const normalized = normalizeExactLegacyAssetReference(value)
+    return normalized && !normalized.slice('assets/'.length).includes('/') ? normalized : null
+}
+
+export function collectExactPluginStorageAssetReferences(value: unknown): string[] {
+    const references = new Set<string>()
+    const seen = new WeakSet<object>()
+    const visit = (candidate: unknown): void => {
+        if (typeof candidate === 'string') {
+            const normalized = normalizeExactPluginStorageBackupAssetReference(candidate)
+            if (normalized) references.add(normalized)
+            return
+        }
+        if (!candidate || typeof candidate !== 'object' || seen.has(candidate)) return
+        seen.add(candidate)
+        for (const child of Object.values(candidate)) visit(child)
+    }
+    visit(value)
+    return [...references].sort()
+}
+
+export function replaceExactPluginStorageAssetReferences<T>(
+    value: T,
+    replacements: Readonly<Record<string, string>>,
+): T {
+    if (Object.keys(replacements).length === 0) return value
+    const seen = new WeakMap<object, unknown>()
+    const project = (candidate: unknown): unknown => {
+        if (typeof candidate === 'string') {
+            const normalized = normalizeExactLegacyAssetReference(candidate)
+            if (!normalized) return candidate
+            for (const key of candidate === normalized
+                ? [candidate]
+                : [candidate, normalized]) {
+                if (Object.prototype.hasOwnProperty.call(replacements, key)) {
+                    return replacements[key]
+                }
+            }
+            return candidate
+        }
+        if (!candidate || typeof candidate !== 'object') return candidate
+        const existing = seen.get(candidate)
+        if (existing) return existing
+        if (Array.isArray(candidate)) {
+            const projected: unknown[] = []
+            seen.set(candidate, projected)
+            for (const child of candidate) projected.push(project(child))
+            return projected
+        }
+        const projected: Record<string, unknown> = {}
+        seen.set(candidate, projected)
+        for (const key of Object.keys(candidate)) {
+            Object.defineProperty(projected, key, {
+                configurable: true,
+                enumerable: true,
+                value: project((candidate as Record<string, unknown>)[key]),
+                writable: true,
+            })
+        }
+        return projected
+    }
+    return project(value) as T
+}
+
 export function selectLegacyBackupAssetKeys(keys: readonly string[]): string[] {
     return keys.filter(isLegacyBackupAssetKey)
 }
@@ -298,7 +367,11 @@ export function createPinnedBackupReferenceAccumulator(
             if (mode === 'full') addInlayReferences(record.value, inlayKeys)
         },
         visitPluginStorage(value) {
-            if (mode === 'full') addInlayReferences(value, inlayKeys)
+            if (mode !== 'full') return
+            for (const key of collectExactPluginStorageAssetReferences(value)) {
+                rootAssets.add(key)
+            }
+            addInlayReferences(value, inlayKeys)
         },
         visitColdPayload(value) {
             if (mode !== 'full') return
