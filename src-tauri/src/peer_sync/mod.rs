@@ -117,3 +117,5 @@ impl From<std::io::Error> for PeerSyncError {
         Self::Storage(error.to_string())
     }
 }
+#[cfg(any(target_os = "android", test))]
+mod target_foreground_transition;

@@ -9,6 +9,10 @@ fn android_p5_target_foreground_retains_running_until_durable_terminal_projectio
     let _registry_guard = super::super::android_foreground::test_registry_guard();
     let state = PeerBidirectionalCommandState::default();
     let foreground = state.reserve_target_foreground().unwrap();
+    assert_eq!(
+        state.reserve_target_foreground().unwrap_err().to_string(),
+        r#"Protocol("Android bidirectional target foreground cleanup is pending")"#,
+    );
     assert_eq!(foreground.lane, AndroidForegroundLane::P5Target);
     assert!(registry().attach_exact(&foreground));
     let cancellation = state.mark_target_running_exact(&foreground).unwrap();

@@ -6,6 +6,11 @@ use super::android_foreground::{registry, AndroidCancellationProbe, AndroidForeg
 use super::lan::discover_lan_ipv4;
 #[cfg(test)]
 pub(crate) use super::lan::DISCOVER_LAN_IPV4_OVERRIDE;
+#[cfg(any(target_os = "android", test))]
+use super::target_foreground_transition::{
+    AndroidTargetForegroundTransition,
+    AndroidTargetForegroundTransitionPhase as AndroidBidirectionalTargetPhase,
+};
 #[cfg(desktop)]
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
@@ -4546,23 +4551,8 @@ pub struct PeerBidirectionalStatus {
 }
 
 #[cfg(any(target_os = "android", test))]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AndroidBidirectionalTargetStatus {
-    foreground: AndroidForegroundKey,
-    phase: AndroidBidirectionalTargetPhase,
-    result: Option<PeerBidirectionalSyncResult>,
-    error: Option<String>,
-}
-
-#[cfg(any(target_os = "android", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum AndroidBidirectionalTargetPhase {
-    Reserved,
-    Running,
-    Terminal,
-}
+type AndroidBidirectionalTargetStatus =
+    AndroidTargetForegroundTransition<PeerBidirectionalSyncResult>;
 
 struct BidirectionalSourceRuntime {
     session_id: String,
@@ -4637,12 +4627,9 @@ impl PeerBidirectionalCommandState {
         let foreground = registry()
             .reserve(AndroidForegroundLane::P5Target)
             .map_err(PeerSyncError::Protocol)?;
-        runtime.target_foreground = Some(AndroidBidirectionalTargetStatus {
-            foreground: foreground.clone(),
-            phase: AndroidBidirectionalTargetPhase::Reserved,
-            result: None,
-            error: None,
-        });
+        runtime.target_foreground = Some(AndroidBidirectionalTargetStatus::reserved(
+            foreground.clone(),
+        ));
         Ok(foreground)
     }
 
@@ -4656,13 +4643,11 @@ impl PeerBidirectionalCommandState {
         let target = runtime.target_foreground.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("Android bidirectional target foreground is absent".to_owned())
         })?;
-        if target.foreground != *foreground
-            || target.phase != AndroidBidirectionalTargetPhase::Reserved
-        {
-            return Err(PeerSyncError::Protocol(
+        target.require_exact_reserved(foreground).map_err(|_| {
+            PeerSyncError::Protocol(
                 "Android bidirectional target foreground identity is stale".to_owned(),
-            ));
-        }
+            )
+        })?;
         if !registry().retain_target_exact(foreground) {
             return Err(PeerSyncError::Protocol(
                 "Android bidirectional target foreground could not be retained".to_owned(),
@@ -4673,7 +4658,7 @@ impl PeerBidirectionalCommandState {
                 "Android bidirectional target foreground is not attached".to_owned(),
             )
         })?;
-        target.phase = AndroidBidirectionalTargetPhase::Running;
+        target.mark_running();
         Ok(cancellation)
     }
 
@@ -4688,18 +4673,12 @@ impl PeerBidirectionalCommandState {
         let target = runtime.target_foreground.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("Android bidirectional target foreground is absent".to_owned())
         })?;
-        if target.foreground != *foreground
-            || target.phase != AndroidBidirectionalTargetPhase::Running
-        {
-            return Err(PeerSyncError::Protocol(
+        target.require_exact_running(foreground).map_err(|_| {
+            PeerSyncError::Protocol(
                 "Android bidirectional target foreground identity is stale".to_owned(),
-            ));
-        }
-        target.phase = AndroidBidirectionalTargetPhase::Terminal;
-        match outcome {
-            Ok(result) => target.result = Some(result),
-            Err(error) => target.error = Some(error),
-        }
+            )
+        })?;
+        target.publish_terminal(outcome);
         Ok(())
     }
 
@@ -4719,7 +4698,7 @@ impl PeerBidirectionalCommandState {
             .lock()?
             .target_foreground
             .as_ref()
-            .is_some_and(|target| target.foreground == *foreground);
+            .is_some_and(|target| target.matches(foreground));
         // The runtime guard is dropped before cancel_exact: a registered
         // source_stop callback runs synchronously on this thread and re-locks
         // this non-reentrant mutex. cancel_exact keeps the exact-generation
@@ -4737,10 +4716,10 @@ impl PeerBidirectionalCommandState {
         let Some(target) = runtime.target_foreground.as_ref() else {
             return Ok(registry().release_target_exact(foreground));
         };
-        if target.foreground != *foreground {
+        if !target.matches(foreground) {
             return Ok(false);
         }
-        if target.phase == AndroidBidirectionalTargetPhase::Running {
+        if target.is_running() {
             // Both guards are dropped before cancel_exact: a registered
             // source_stop callback runs synchronously on this thread and
             // re-locks these non-reentrant mutexes. cancel_exact keeps the

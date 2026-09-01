@@ -7,6 +7,11 @@ use super::lan::discover_lan_ipv4;
 #[cfg(desktop)]
 use super::lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
 use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
+#[cfg(any(target_os = "android", test))]
+use super::target_foreground_transition::{
+    AndroidTargetForegroundTransition, AndroidTargetForegroundTransitionError,
+    AndroidTargetForegroundTransitionPhase as AndroidTargetForegroundPhase,
+};
 use super::{
     lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
     logical_delta::decode_logical_manifest,
@@ -172,23 +177,7 @@ struct PeerDeltaRuntime {
 }
 
 #[cfg(any(target_os = "android", test))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AndroidTargetForegroundStatus {
-    foreground: AndroidForegroundKey,
-    phase: AndroidTargetForegroundPhase,
-    result: Option<PeerDeltaPullResult>,
-    error: Option<String>,
-}
-
-#[cfg(any(target_os = "android", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum AndroidTargetForegroundPhase {
-    Reserved,
-    Running,
-    Terminal,
-}
+type AndroidTargetForegroundStatus = AndroidTargetForegroundTransition<PeerDeltaPullResult>;
 
 #[derive(Clone)]
 pub struct PeerDeltaCommandState {
@@ -243,12 +232,8 @@ impl PeerDeltaCommandState {
         let foreground = registry()
             .reserve(AndroidForegroundLane::P4Target)
             .map_err(PeerSyncError::Protocol)?;
-        runtime.target_foreground = Some(AndroidTargetForegroundStatus {
-            foreground: foreground.clone(),
-            phase: AndroidTargetForegroundPhase::Reserved,
-            result: None,
-            error: None,
-        });
+        runtime.target_foreground =
+            Some(AndroidTargetForegroundStatus::reserved(foreground.clone()));
         Ok(foreground)
     }
 
@@ -262,22 +247,23 @@ impl PeerDeltaCommandState {
         let target = runtime.target_foreground.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("Android peer delta target foreground is absent".to_owned())
         })?;
-        if target.foreground != *foreground {
-            return Err(PeerSyncError::Protocol(
-                "Android peer delta target foreground identity is stale".to_owned(),
-            ));
-        }
-        if target.phase != AndroidTargetForegroundPhase::Reserved {
-            return Err(PeerSyncError::Protocol(
-                "Android peer delta target foreground is not reserved".to_owned(),
-            ));
-        }
+        target
+            .require_exact_reserved(foreground)
+            .map_err(|error| match error {
+                AndroidTargetForegroundTransitionError::Stale => PeerSyncError::Protocol(
+                    "Android peer delta target foreground identity is stale".to_owned(),
+                ),
+                AndroidTargetForegroundTransitionError::NotReserved => PeerSyncError::Protocol(
+                    "Android peer delta target foreground is not reserved".to_owned(),
+                ),
+                AndroidTargetForegroundTransitionError::NotRunning => unreachable!(),
+            })?;
         if !registry().retain_target_exact(foreground) {
             return Err(PeerSyncError::Protocol(
                 "Android peer delta target foreground could not be retained".to_owned(),
             ));
         }
-        target.phase = AndroidTargetForegroundPhase::Running;
+        target.mark_running();
         Ok(())
     }
 
@@ -292,21 +278,18 @@ impl PeerDeltaCommandState {
         let target = runtime.target_foreground.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("Android peer delta target foreground is absent".to_owned())
         })?;
-        if target.foreground != *foreground {
-            return Err(PeerSyncError::Protocol(
-                "Android peer delta target foreground identity is stale".to_owned(),
-            ));
-        }
-        if target.phase != AndroidTargetForegroundPhase::Running {
-            return Err(PeerSyncError::Protocol(
-                "Android peer delta target foreground is not running".to_owned(),
-            ));
-        }
-        target.phase = AndroidTargetForegroundPhase::Terminal;
-        match outcome {
-            Ok(result) => target.result = Some(result),
-            Err(error) => target.error = Some(error),
-        }
+        target
+            .require_exact_running(foreground)
+            .map_err(|error| match error {
+                AndroidTargetForegroundTransitionError::Stale => PeerSyncError::Protocol(
+                    "Android peer delta target foreground identity is stale".to_owned(),
+                ),
+                AndroidTargetForegroundTransitionError::NotRunning => PeerSyncError::Protocol(
+                    "Android peer delta target foreground is not running".to_owned(),
+                ),
+                AndroidTargetForegroundTransitionError::NotReserved => unreachable!(),
+            })?;
+        target.publish_terminal(outcome);
         Ok(())
     }
 
@@ -320,7 +303,7 @@ impl PeerDeltaCommandState {
             let Some(target) = runtime.target_foreground.as_ref() else {
                 return Ok(false);
             };
-            if target.foreground != *foreground {
+            if !target.matches(foreground) {
                 return Ok(false);
             }
         }
@@ -348,10 +331,10 @@ impl PeerDeltaCommandState {
         let Some(target) = runtime.target_foreground.as_ref() else {
             return Ok(registry().release_target_exact(foreground));
         };
-        if target.foreground != *foreground {
+        if !target.matches(foreground) {
             return Ok(false);
         }
-        if target.phase == AndroidTargetForegroundPhase::Running {
+        if target.is_running() {
             // Both guards are dropped before cancel_exact: a registered
             // source_stop callback runs synchronously on this thread and
             // re-locks these non-reentrant mutexes. cancel_exact keeps the
@@ -2002,6 +1985,15 @@ mod tests {
         let state = PeerDeltaCommandState::default();
         let foreground = state.reserve_target_foreground().unwrap();
         assert!(registry().attach_exact(&foreground));
+        let mut stale = foreground.clone();
+        stale.generation -= 1;
+        assert_eq!(
+            state
+                .mark_target_running_exact(&stale)
+                .unwrap_err()
+                .to_string(),
+            r#"Protocol("Android peer delta target foreground identity is stale")"#,
+        );
         assert_eq!(
             state.target_foreground_status().unwrap().unwrap().phase,
             AndroidTargetForegroundPhase::Reserved,
@@ -2026,9 +2018,6 @@ mod tests {
             terminal.result,
             Some(PeerDeltaPullResult::NoChanges { revision: 7, .. })
         ));
-        let mut stale = foreground.clone();
-        stale.generation -= 1;
-
         assert!(!state.release_target_foreground_exact(&stale).unwrap());
         assert!(state.release_target_foreground_exact(&foreground).unwrap());
         assert!(state.release_target_foreground_exact(&foreground).unwrap());
