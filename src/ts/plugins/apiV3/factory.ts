@@ -40,7 +40,9 @@ await (async function() {
     const pendingRequests = new Map();
     const callbackRegistry = new Map();
     const callbackIdByFunction = new WeakMap();
-    const proxyRefRegistry = new Map();
+    // WeakMap so dropped proxies do not pin their ref ids for the whole
+    // plugin lifetime; release() also removes the mapping explicitly.
+    const proxyRefRegistry = new WeakMap();
     const abortControllers = new Map();
 
     function serializeArg(arg) {
@@ -87,7 +89,10 @@ await (async function() {
                 get: (target, prop) => {
                     if (prop === 'then') return undefined;
                     if (prop === 'release') {
-                        return () => send({ type: 'RELEASE_INSTANCE', id: val.id });
+                        return () => {
+                            proxyRefRegistry.delete(proxy);
+                            send({ type: 'RELEASE_INSTANCE', id: val.id });
+                        };
                     }
                     return (...args) => sendRequest('CALL_INSTANCE', {
                         id: val.id,
@@ -602,6 +607,13 @@ export class SandboxHost {
 
                 const wrapper = async (...innerArgs: any[]) => {
                     return new Promise((resolve, reject) => {
+                        // After terminate() the iframe is gone; posting would be a
+                        // no-op and the promise would never settle, hanging callers
+                        // (e.g. chat output dispatch) that await this callback.
+                        if (!this.iframe?.contentWindow) {
+                            reject(new Error('Plugin sandbox terminated'));
+                            return;
+                        }
                         const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
                         this.pendingCallbacks.set(reqId, { resolve, reject });
 
@@ -650,6 +662,7 @@ export class SandboxHost {
                 if (instance) {
                     return instance;
                 }
+                throw new Error(`Remote instance ${remoteRef.id} not found or already released`);
             }
             if (arg && typeof arg === 'object' && arg.constructor === Object) {
                 let out: any = null;
@@ -982,6 +995,9 @@ export class SandboxHost {
         }
         this.closeActiveStreams();
         this.instanceRegistry.clear();
+        for (const pending of this.pendingCallbacks.values()) {
+            pending.reject(new Error('Plugin sandbox terminated'));
+        }
         this.pendingCallbacks.clear();
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
