@@ -1359,6 +1359,82 @@ fn android_clone_registry_recovers_one_persisted_job_without_exposing_the_bearer
 }
 
 #[test]
+fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    host.enable_v2_registry(
+        source_root.path(),
+        "Android source",
+        super::device_registry::DevicePermissions::read(),
+    )
+    .unwrap();
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let credential = target_root.path().join("registration-credential.json");
+    let _client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Android target",
+        &credential,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let source_device_id =
+        super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+    let registered = super::device_registry::incoming_source_by_id(
+        target_root.path(),
+        &source_device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let target_device_id = super::device_registry::load_or_create_device_id(target_root.path())
+        .unwrap();
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+
+    let started = registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+        )
+        .unwrap();
+    let resumed = registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+        )
+        .unwrap();
+
+    assert_eq!(started, resumed);
+    assert_eq!(started.phase, AndroidCloneJobPhase::Ready);
+    assert!(!serde_json::to_string(&started).unwrap().contains(&registered.bearer));
+    assert!(registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            "00000000-0000-4000-8000-000000000299",
+            &registered.bearer,
+        )
+        .is_err());
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();

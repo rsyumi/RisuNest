@@ -5,6 +5,8 @@ use super::{
     },
     PeerSyncError,
 };
+#[cfg(any(target_os = "android", test))]
+use super::android_client::{AndroidCloneJobPhase, AndroidCloneJobStatus};
 use serde::Serialize;
 use std::{
     fmt,
@@ -14,6 +16,8 @@ use tauri::{AppHandle, Manager, State};
 
 #[cfg(desktop)]
 use super::commands::PeerCloneCommandState;
+#[cfg(target_os = "android")]
+use super::android_commands::AndroidPeerCloneCommandState;
 use super::{
     android_foreground::AndroidForegroundKey,
     bidirectional_commands::{
@@ -74,10 +78,71 @@ pub struct RegisteredSourceHello {
     lanes: RegisteredHelloLanes,
 }
 
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidRegisteredCloneStatus {
+    source_device_id: String,
+    job_id: String,
+    phase: AndroidCloneJobPhase,
+    completed_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_revision: Option<u64>,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn safe_android_clone_status(
+    source_device_id: &str,
+    status: &AndroidCloneJobStatus,
+) -> AndroidRegisteredCloneStatus {
+    AndroidRegisteredCloneStatus {
+        source_device_id: source_device_id.to_owned(),
+        job_id: status.job_id.clone(),
+        phase: status.phase,
+        completed_bytes: status.completed_bytes,
+        total_bytes: status.total_bytes,
+        error: status.error.clone(),
+        committed_revision: status.committed_revision,
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn validate_android_registered_source_endpoint(endpoint: &str) -> Result<String, PeerSyncError> {
+    let endpoint = super::lan::validate_lan_endpoint(endpoint)?;
+    let parsed = url::Url::parse(&endpoint)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    let allowed = parsed.scheme() == "http"
+        && matches!(
+            parsed.host(),
+            Some(url::Host::Ipv4(address))
+                if address.is_private() || address.is_link_local() || address.is_loopback()
+        );
+    if !allowed {
+        return Err(PeerSyncError::Validation(
+            "Android registered source must use a private LAN IPv4 endpoint".to_owned(),
+        ));
+    }
+    Ok(endpoint)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(desktop)]
 pub struct RegisteredCloneTarget {
+    source_device_id: String,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidPeerCloneClaimResult {
     source_device_id: String,
     endpoint: String,
     session_id: String,
@@ -223,6 +288,78 @@ pub async fn peer_clone_claim_registered_client(
 }
 
 #[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn peer_clone_claim_client(
+    app: AppHandle,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    claim: String,
+) -> Result<AndroidPeerCloneClaimResult, String> {
+    let root = app_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let endpoint = validate_android_registered_source_endpoint(&endpoint)
+            .map_err(|error| safe_failure("Android clone registration endpoint", error))?;
+        let credential_root = root.join("peer-clone").join("android-registration");
+        std::fs::create_dir_all(&credential_root)
+            .map_err(|error| safe_command_failure("Android clone registration storage", error))?;
+        let client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+            &root,
+            super::device_registry::platform_device_name(),
+            &credential_root.join("credential.json"),
+            &endpoint,
+            &session_id,
+            &manifest_id,
+            &claim,
+        )
+        .map_err(|error| safe_failure("Android clone registration", error))?;
+        let source_device_id = client
+            .registered_source_device_id()
+            .ok_or(RegisteredTargetError::TransportUnavailable)?
+            .to_owned();
+        Ok(AndroidPeerCloneClaimResult {
+            source_device_id,
+            endpoint,
+            session_id,
+            manifest_id,
+        })
+    })
+    .await
+    .map_err(|error| safe_command_failure("Android clone registration worker", error))?
+    .map_err(|error: RegisteredTargetError| error.to_string())
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn peer_clone_claim_registered_client(
+    app: AppHandle,
+    state: State<'_, AndroidPeerCloneCommandState>,
+    device_id: String,
+) -> Result<AndroidRegisteredCloneStatus, String> {
+    let root = app_root(&app)?;
+    let registry = state.registry()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = resolve_registered_source(&root, &device_id, RegisteredLane::Clone)?;
+        let local_device_id = super::device_registry::load_or_create_device_id(&root)
+            .map_err(|error| safe_failure("registered Android local identity", error))?;
+        let status = registry
+            .connect_registered(
+                &connection.source.endpoint,
+                &connection.lane.session_id,
+                &connection.lane.manifest_id,
+                &local_device_id,
+                &connection.source.device_id,
+                &connection.source.bearer,
+            )
+            .map_err(|error| safe_failure("registered Android clone target", error))?;
+        Ok(safe_android_clone_status(&connection.source.device_id, &status))
+    })
+    .await
+    .map_err(|error| safe_command_failure("registered Android clone worker", error))?
+    .map_err(|error: RegisteredTargetError| error.to_string())
+}
+
+#[tauri::command]
 pub async fn peer_delta_pull_registered(
     app: AppHandle,
     state: State<'_, PeerDeltaCommandState>,
@@ -338,6 +475,9 @@ fn resolve_registered_source_with(
     let source = incoming_source_by_id(app_root, device_id)
         .map_err(|error| safe_failure("registered source lookup", error))?
         .ok_or(RegisteredTargetError::SourceMissing)?;
+    #[cfg(target_os = "android")]
+    validate_android_registered_source_endpoint(&source.endpoint)
+        .map_err(|error| safe_failure("registered Android LAN endpoint", error))?;
     let current = registered_hello_outcome(
         "registered source hello",
         hello(&source.endpoint, &source.bearer),
@@ -612,6 +752,36 @@ mod tests {
         assert!(!target_json.contains(BEARER));
         assert!(!hello_json.contains("endpoint"));
         assert!(target_json.contains("http://127.0.0.1:32145"));
+    }
+
+    #[test]
+    fn android_registered_sources_reject_public_or_https_endpoints_before_transport() {
+        assert!(validate_android_registered_source_endpoint("http://192.168.4.8:32145").is_ok());
+        assert!(validate_android_registered_source_endpoint("http://10.0.0.7:32145").is_ok());
+        assert!(validate_android_registered_source_endpoint("https://sync.example.com").is_err());
+        assert!(validate_android_registered_source_endpoint("http://8.8.8.8:32145").is_err());
+    }
+
+    #[test]
+    fn android_registered_clone_status_omits_native_connection_secrets() {
+        let status = crate::peer_sync::android_client::AndroidCloneJobStatus {
+            job_id: "00000000-0000-4000-8000-000000000199".to_owned(),
+            endpoint: "http://192.168.4.8:32145".to_owned(),
+            session_id: SESSION_ID.to_owned(),
+            manifest_id: MANIFEST_ID.to_owned(),
+            phase: crate::peer_sync::android_client::AndroidCloneJobPhase::Ready,
+            completed_bytes: 0,
+            total_bytes: None,
+            error: None,
+            committed_revision: None,
+        };
+        let json = serde_json::to_string(&safe_android_clone_status(SOURCE_ID, &status)).unwrap();
+        assert!(json.contains(SOURCE_ID));
+        assert!(json.contains("ready"));
+        assert!(!json.contains("192.168.4.8"));
+        assert!(!json.contains(SESSION_ID));
+        assert!(!json.contains(MANIFEST_ID));
+        assert!(!json.contains(BEARER));
     }
 
     #[test]

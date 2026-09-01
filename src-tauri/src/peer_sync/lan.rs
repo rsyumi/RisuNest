@@ -553,6 +553,10 @@ impl LanCloneClient {
         Ok((&self.endpoint, &self.session_id, manifest_id))
     }
 
+    pub(crate) fn registered_source_device_id(&self) -> Option<&str> {
+        self.source_device_id.as_deref()
+    }
+
     // Desktop resume validation compares persisted targets.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn matches_target(

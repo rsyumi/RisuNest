@@ -27,7 +27,7 @@ impl AndroidPeerCloneCommandState {
         }
     }
 
-    fn registry(&self) -> Result<Arc<AndroidCloneJobRegistry>, String> {
+    pub(crate) fn registry(&self) -> Result<Arc<AndroidCloneJobRegistry>, String> {
         self.registry.clone()
     }
 

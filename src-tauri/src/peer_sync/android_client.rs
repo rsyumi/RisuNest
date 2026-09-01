@@ -239,6 +239,61 @@ impl AndroidResumableCloneJob {
         result
     }
 
+    fn from_registered(
+        job_root: impl AsRef<Path>,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        target_device_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let job_root = job_root.as_ref();
+        let job_id = validate_job_id_from_path(job_root)?;
+        fs::create_dir(job_root)?;
+        let root = fs::canonicalize(job_root)?;
+        let result = (|| {
+            write_new_json(
+                &root.join("ownership.json"),
+                &AndroidCloneJobOwnership {
+                    schema: JOB_OWNERSHIP_SCHEMA.to_owned(),
+                    job_id: job_id.clone(),
+                },
+            )?;
+            let descriptor = AndroidCloneJobDescriptor {
+                schema: JOB_SCHEMA.to_owned(),
+                job_id: job_id.clone(),
+                manifest_id: manifest_id.to_owned(),
+            };
+            write_new_json(&root.join("job.json"), &descriptor)?;
+            let lan = LanCloneClient::from_registered_and_persist(
+                &root.join("credential.json"),
+                endpoint,
+                session_id,
+                manifest_id,
+                target_device_id,
+                source_device_id,
+                bearer,
+            )?;
+            let client = LoopbackCloneClient::from_lan(&root, lan, manifest_id)?;
+            write_new_json(
+                &root.join("status.json"),
+                &AndroidClonePersistedStatus::ready(),
+            )?;
+            Ok(Self {
+                root: root.clone(),
+                descriptor,
+                endpoint: endpoint.to_owned(),
+                session_id: session_id.to_owned(),
+                client,
+            })
+        })();
+        if result.is_err() {
+            let _ = cleanup_unpublished_job(&root, &job_id);
+        }
+        result
+    }
+
     pub fn open(job_root: impl AsRef<Path>) -> Result<Self, PeerSyncError> {
         let (root, descriptor) = validate_job(job_root.as_ref())?;
         validate_marker_if_present(
@@ -631,6 +686,56 @@ impl AndroidCloneJobRegistry {
         let job_root = self.jobs_root.join(&job_id);
         let job =
             AndroidResumableCloneJob::claim(&job_root, &endpoint, session_id, manifest_id, claim)?;
+        if let Err(error) = self.write_current_id(&job_id) {
+            let _ = job.discard();
+            return Err(error);
+        }
+        job.status()
+    }
+
+    pub(crate) fn connect_registered(
+        &self,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        target_device_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
+        let endpoint = validate_lan_endpoint(endpoint)?;
+        validate_session_id(session_id)?;
+        if !is_sha256(manifest_id) {
+            return Err(PeerSyncError::Protocol(
+                "invalid LAN manifest identity".to_owned(),
+            ));
+        }
+        let state = self.lock()?;
+        self.recover_locked(&state, false)?;
+        if let Some(job_id) = self.read_current_id()? {
+            let current = AndroidResumableCloneJob::open(self.jobs_root.join(job_id))?;
+            let status = current.status()?;
+            if current.endpoint == endpoint
+                && current.session_id == session_id
+                && current.descriptor.manifest_id == manifest_id
+                && current.client.source_device_id() == Some(source_device_id)
+            {
+                return Ok(status);
+            }
+            return Err(PeerSyncError::Validation(
+                "Android clone target already owns a different job".to_owned(),
+            ));
+        }
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let job_root = self.jobs_root.join(&job_id);
+        let job = AndroidResumableCloneJob::from_registered(
+            &job_root,
+            &endpoint,
+            session_id,
+            manifest_id,
+            target_device_id,
+            source_device_id,
+            bearer,
+        )?;
         if let Err(error) = self.write_current_id(&job_id) {
             let _ = job.discard();
             return Err(error);
