@@ -1,12 +1,14 @@
 use super::PeerSyncError;
+use crate::trust_boundary::{is_link_like, is_lower_hex_256};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
+const MAX_DEVICE_ID_BYTES: usize = 64;
 const OUTGOING_SCHEMA: &str = "risunest.peer-device-registry/v1";
 const INCOMING_SCHEMA: &str = "risunest.peer-source-registry/v1";
 
@@ -93,7 +95,7 @@ pub(crate) struct OutgoingDeviceRegistry {
 
 impl OutgoingDeviceRegistry {
     pub(crate) fn load(app_root: &Path) -> Result<Self, PeerSyncError> {
-        let root = peer_root(app_root);
+        let root = ensure_peer_root(app_root)?;
         let path = root.join("devices.json");
         let devices = match read_registry(&path)? {
             None => Vec::new(),
@@ -169,7 +171,7 @@ pub(crate) struct IncomingSourceRegistry {
 
 impl IncomingSourceRegistry {
     pub(crate) fn load(app_root: &Path) -> Result<Self, PeerSyncError> {
-        let root = peer_root(app_root);
+        let root = ensure_peer_root(app_root)?;
         let path = root.join("sources.json");
         let sources = match read_registry(&path)? {
             None => Vec::new(),
@@ -220,20 +222,20 @@ impl IncomingSourceRegistry {
 }
 
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
-    let root = peer_root(app_root);
+    let root = ensure_peer_root(app_root)?;
     let current = root.join("device-id");
-    if current.exists() {
+    if path_exists(&current)? {
         return read_device_id(&current);
     }
     let legacy = app_root.join("peer-delta/source-device-id");
-    let device_id = if legacy.exists() {
+    let has_legacy = path_exists(&legacy)?;
+    let device_id = if has_legacy {
         read_device_id(&legacy)?
     } else {
         uuid::Uuid::new_v4().to_string()
     };
-    fs::create_dir_all(&root)?;
     write_owner_only(&current, device_id.as_bytes())?;
-    if legacy.exists() {
+    if has_legacy {
         fs::remove_file(legacy)?;
     }
     Ok(device_id)
@@ -243,27 +245,73 @@ fn peer_root(app_root: &Path) -> PathBuf {
     app_root.join("peer-sync")
 }
 
+fn ensure_peer_root(app_root: &Path) -> Result<PathBuf, PeerSyncError> {
+    let root = peer_root(app_root);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) => ensure_ordinary_directory(&metadata, "peer sync directory")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&root)?;
+            let metadata = fs::symlink_metadata(&root)?;
+            ensure_ordinary_directory(&metadata, "peer sync directory")?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(root)
+}
+
+fn ensure_ordinary_directory(metadata: &fs::Metadata, label: &str) -> Result<(), PeerSyncError> {
+    if !metadata.is_dir() || is_link_like(metadata) {
+        return invalid(&format!("{label} must be an ordinary directory"));
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> Result<bool, PeerSyncError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn read_device_id(path: &Path) -> Result<String, PeerSyncError> {
-    let value = fs::read_to_string(path)?.trim().to_owned();
-    uuid::Uuid::parse_str(&value)
-        .map_err(|_| PeerSyncError::Validation("invalid peer device id".to_owned()))?;
+    let bytes = read_regular_bounded_file(path, MAX_DEVICE_ID_BYTES, "peer device id")?;
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| PeerSyncError::Validation("invalid peer device id".to_owned()))?
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    validate_id(&value)?;
     Ok(value)
 }
 
 fn read_registry(path: &Path) -> Result<Option<Vec<u8>>, PeerSyncError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return invalid("peer registry must be a regular file");
-            }
-            if metadata.len() as usize > MAX_REGISTRY_BYTES {
-                return invalid("peer registry exceeds 1 MiB");
-            }
-            Ok(Some(fs::read(path)?))
-        }
+        Ok(_) => read_regular_bounded_file(path, MAX_REGISTRY_BYTES, "peer registry").map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_regular_bounded_file(
+    path: &Path,
+    maximum: usize,
+    label: &str,
+) -> Result<Vec<u8>, PeerSyncError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || is_link_like(&metadata) {
+        return invalid(&format!("{label} must be a regular file"));
+    }
+    if metadata.len() > maximum as u64 {
+        return invalid(&format!("{label} exceeds its size limit"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return invalid(&format!("{label} exceeds its size limit"));
+    }
+    Ok(bytes)
 }
 
 fn parse_registry<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, PeerSyncError> {
@@ -275,10 +323,13 @@ fn invalid<T>(message: &str) -> Result<T, PeerSyncError> {
 }
 
 fn validate_id(value: &str) -> Result<(), PeerSyncError> {
-    if value.is_empty() || value.len() > 128 {
-        invalid("invalid peer device id")
-    } else {
+    if uuid::Uuid::parse_str(value)
+        .map(|parsed| parsed.to_string() == value)
+        .unwrap_or(false)
+    {
         Ok(())
+    } else {
+        invalid("invalid peer device id")
     }
 }
 fn validate_name(value: &str) -> Result<(), PeerSyncError> {
@@ -292,12 +343,7 @@ fn validate_outgoing(devices: &[OutgoingDevice]) -> Result<(), PeerSyncError> {
     for item in devices {
         validate_id(&item.device_id)?;
         validate_name(&item.name)?;
-        if item.bearer_digest.len() != 64
-            || !item
-                .bearer_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
+        if !is_lower_hex_256(&item.bearer_digest) {
             return invalid("invalid peer bearer digest");
         }
         item.permissions.validate()?;
@@ -308,7 +354,10 @@ fn validate_incoming(sources: &[IncomingSource]) -> Result<(), PeerSyncError> {
     for item in sources {
         validate_id(&item.device_id)?;
         validate_name(&item.name)?;
-        if item.endpoint.is_empty() || item.endpoint.len() > 2048 || item.bearer.len() != 64 {
+        if item.endpoint.len() > 2048
+            || super::lan::validate_lan_endpoint(&item.endpoint).is_err()
+            || !is_lower_hex_256(&item.bearer)
+        {
             return invalid("invalid registered peer source");
         }
         item.permissions.validate()?;
@@ -325,14 +374,18 @@ fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncEr
     let parent = path
         .parent()
         .ok_or_else(|| PeerSyncError::Storage("peer registry has no parent".to_owned()))?;
-    fs::create_dir_all(parent)?;
-    if fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return invalid("peer registry cannot be a link");
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    ensure_ordinary_directory(&parent_metadata, "peer registry parent")?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.is_file() || is_link_like(&metadata) {
+            return invalid("peer registry must be a regular file");
+        }
     }
-    let temporary = path.with_extension("json.tmp");
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| PeerSyncError::Storage("peer registry has no UTF-8 name".to_owned()))?;
+    let temporary = parent.join(format!(".{name}-{}.tmp", uuid::Uuid::new_v4()));
     let result = write_owner_only(&temporary, &bytes).and_then(|_| {
         fs::rename(&temporary, path)?;
         Ok(())
