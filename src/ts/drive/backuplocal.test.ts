@@ -254,6 +254,11 @@ describe('local backup persistent snapshot', () => {
         )
         await store.open()
         const persisted = structuredClone(risuSaveFixtureDatabase) as Database
+        const pluginAssetKey = 'assets/plugin-storage.bin'
+        const pluginAssetBytes = Uint8Array.of(11, 22, 33)
+        persisted.pluginCustomStorage = {
+            nested: { asset: pluginAssetKey },
+        }
         const imported = await store.replaceFromDatabase(persisted)
         const materializeDatabase = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
             new Error('local backup must not materialize the database'),
@@ -269,6 +274,12 @@ describe('local backup persistent snapshot', () => {
                 mutationGeneration: 0,
             })),
         } as unknown as PersistentDataRuntime
+        state.blobStore = {
+            ...emptyBlobStore(),
+            read: vi.fn(async (key: string) => key === pluginAssetKey
+                ? pluginAssetBytes.slice()
+                : null),
+        }
 
         const { SaveLocalBackup } = await import('./backuplocal')
         await SaveLocalBackup()
@@ -280,6 +291,7 @@ describe('local backup persistent snapshot', () => {
             persisted.characters[0].chats[0].message,
         )
         expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
+        expect(state.written.get('plugin-storage.bin')).toEqual(pluginAssetBytes)
         expect(state.snapshotSeenByColdStorage).toEqual({ characters: [] })
         expect(materializeDatabase).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith('local-backup')
@@ -293,7 +305,13 @@ describe('local backup persistent snapshot', () => {
         )
         await store.open()
         const persisted = structuredClone(risuSaveFixtureDatabase) as Database
-        persisted.pluginCustomStorage = { zero: 0 }
+        persisted.pluginCustomStorage = {
+            zero: 0,
+            nested: {
+                asset: 'assets/plugin-partial.bin',
+                inlay: '{{inlay::plugin-partial-inlay}}',
+            },
+        }
         const imported = await store.replaceFromDatabase(persisted)
         const materializeDatabase = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
             new Error('partial backup must not materialize the database'),
@@ -327,6 +345,22 @@ describe('local backup persistent snapshot', () => {
             backupName: 'coldstorage_partial-second.json',
             value: { message: [{ role: 'user', data: 'second partial payload' }] },
         }]
+        state.blobStore = {
+            ...emptyBlobStore(),
+            read: vi.fn(async (key: string) => [
+                'assets/plugin-partial.bin',
+                'plugin-partial-inlay',
+            ].includes(key) ? Uint8Array.of(7, 7) : null),
+            list: vi.fn(async () => [{
+                key: 'plugin-partial-inlay',
+                kind: 'inlay' as const,
+                size: 2,
+                mime: 'application/octet-stream',
+                name: 'partial.bin',
+                ext: 'bin',
+                inlayType: 'signature' as const,
+            }]),
+        }
 
         const { SavePartialLocalBackup } = await import('./backuplocal')
         await SavePartialLocalBackup()
@@ -339,7 +373,15 @@ describe('local backup persistent snapshot', () => {
         )
         expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
         expect(backedUp.pluginCustomStorage.zero).toBe(0)
-        expect(readPluginStorage).toHaveBeenCalledTimes(1)
+        expect(backedUp.pluginCustomStorage.nested).toEqual({
+            asset: 'assets/plugin-partial.bin',
+            inlay: '{{inlay::plugin-partial-inlay}}',
+        })
+        expect(state.written.has('plugin-partial.bin')).toBe(false)
+        expect(state.written.has(getBackupInlayName('plugin-partial-inlay'))).toBe(false)
+        expect(readPluginStorage).toHaveBeenCalledTimes(2)
+        expect(readPluginStorage).toHaveBeenNthCalledWith(1, 'zero')
+        expect(readPluginStorage).toHaveBeenNthCalledWith(2, 'nested')
         expect(state.snapshotSeenByColdStorage).toEqual({ characters: [] })
         expect(materializeDatabase).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith(
