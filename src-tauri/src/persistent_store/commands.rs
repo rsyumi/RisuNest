@@ -149,7 +149,8 @@ fn peer_staging_path_is_ordinary_directory(path: &Path) -> bool {
         Ok(metadata) => metadata.is_dir() && !peer_staging_entry_is_symlink_or_reparse(&metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
-            eprintln!(
+            crate::nlog!(
+                "warn",
                 "warning: failed to inspect peer sync staging path {}: {error}",
                 path.display()
             );
@@ -172,7 +173,8 @@ fn sweep_peer_logical_staging_directories(app_root: &Path) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                eprintln!(
+                crate::nlog!(
+                    "warn",
                     "warning: failed to read peer sync staging root {}: {error}",
                     staging_root.display()
                 );
@@ -184,7 +186,8 @@ fn sweep_peer_logical_staging_directories(app_root: &Path) {
                 Ok(entry) => entry,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    eprintln!(
+                    crate::nlog!(
+                        "warn",
                         "warning: failed to enumerate peer sync staging root {}: {error}",
                         staging_root.display()
                     );
@@ -196,7 +199,8 @@ fn sweep_peer_logical_staging_directories(app_root: &Path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    eprintln!(
+                    crate::nlog!(
+                        "warn",
                         "warning: failed to inspect peer sync staging entry {}: {error}",
                         entry_path.display()
                     );
@@ -215,7 +219,8 @@ fn sweep_peer_logical_staging_directories(app_root: &Path) {
                 match fs::remove_dir_all(&entry_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => eprintln!(
+                    Err(error) => crate::nlog!(
+                        "warn",
                         "warning: failed to remove peer sync staging directory {}: {error}",
                         entry_path.display()
                     ),

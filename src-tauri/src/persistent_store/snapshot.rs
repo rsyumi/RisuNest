@@ -156,7 +156,10 @@ pub(super) fn apply_pending_restore(
             Ok(())
         })();
         if let Err(error) = remove_database_files(&candidate) {
-            eprintln!("persistent restore candidate cleanup skipped: {error}");
+            crate::nlog!(
+                "warn",
+                "persistent restore candidate cleanup skipped: {error}"
+            );
         }
         replacement?;
         Ok(())
@@ -169,7 +172,7 @@ pub(super) fn apply_pending_restore(
         }
         Err(error) => {
             let message = format!("persistent snapshot restore skipped: {error}");
-            eprintln!("{message}");
+            crate::nlog!("warn", "{message}");
             Ok(Some(message))
         }
     }
@@ -204,7 +207,10 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
 
     if result.is_err() {
         if let Err(error) = remove_database_files(&candidate) {
-            eprintln!("persistent restore candidate cleanup skipped: {error}");
+            crate::nlog!(
+                "warn",
+                "persistent restore candidate cleanup skipped: {error}"
+            );
         }
     }
     result?;

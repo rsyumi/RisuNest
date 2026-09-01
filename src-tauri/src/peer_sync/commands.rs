@@ -411,7 +411,10 @@ impl PeerCloneCommandState {
     pub(crate) fn initialize(peer_root: &Path) -> Self {
         let state = Self::default();
         if let Err(error) = sweep_activated_target_residues(peer_root) {
-            eprintln!("warning: failed to sweep activated peer clone target residues: {error}");
+            crate::nlog!(
+                "warn",
+                "failed to sweep activated peer clone target residues: {error}"
+            );
         }
         let source = match recover_source(peer_root) {
             Ok(source) => source,

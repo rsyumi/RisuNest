@@ -8,6 +8,7 @@ mod lossless_backup;
 #[allow(dead_code)]
 mod lossless_f0;
 pub mod native_file_jobs;
+pub(crate) mod native_log;
 mod native_media;
 mod native_tokenizer;
 mod peer_sync;
@@ -203,13 +204,13 @@ fn check_auth(fpath: String, auth: String) -> bool {
     //check file exists
     let path = Path::new(&fpath);
     if !path.exists() {
-        println!("File {} does not exist", path.display());
+        crate::nlog!("warn", "authentication file does not exist");
         return false;
     }
 
     // check file is a file
     if !path.is_file() {
-        println!("File {} is not a file", path.display());
+        crate::nlog!("warn", "authentication path is not a file");
         return false;
     }
 
@@ -218,7 +219,7 @@ fn check_auth(fpath: String, auth: String) -> bool {
 
     //check file size is less than 1000 bytes
     if size > 1000 {
-        println!("File {} is too large", path.display());
+        crate::nlog!("warn", "authentication file is too large");
         return false;
     }
 
@@ -227,15 +228,15 @@ fn check_auth(fpath: String, auth: String) -> bool {
 
     // check read error
     if got_auth.is_err() {
-        println!("Error reading file {}", path.display());
+        crate::nlog!("warn", "authentication file could not be read");
         return false;
     } else {
         // check auth
         if got_auth.unwrap() != auth {
-            println!("Auth does not match");
+            crate::nlog!("warn", "authentication did not match");
             return false;
         }
-        println!("Auth matches");
+        crate::nlog!("info", "authentication matched");
         return true;
     }
 }
@@ -252,11 +253,11 @@ async fn install_python(path: String) -> bool {
     }
     let zip_path: std::path::PathBuf = Path::new(&path).join("python.zip");
 
-    println!("Path: {}", path);
+    crate::nlog!("info", "installing embedded Python");
     if os == "windows" {
         url = "https://www.python.org/ftp/python/3.11.7/python-3.11.7-embed-amd64.zip".to_string()
     } else {
-        println!("OS not supported");
+        crate::nlog!("warn", "embedded Python install is unsupported on this OS");
         return false;
     }
 
@@ -283,7 +284,10 @@ async fn install_python(path: String) -> bool {
         let mut zipf = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
         zipf.extract(&py_path).unwrap();
     } else {
-        println!("OS not supported");
+        crate::nlog!(
+            "warn",
+            "embedded Python extraction is unsupported on this OS"
+        );
         return false;
     }
 
@@ -298,11 +302,11 @@ async fn install_python(path: String) -> bool {
             if !res.starts_with("Python ") {
                 return false;
             }
-            println!("{}", res);
+            crate::nlog!("info", "embedded Python version check completed");
             return true;
         }
         Err(e) => {
-            println!("{}", e);
+            crate::nlog!("warn", "embedded Python version check failed: {e}");
             return false;
         }
     }
@@ -328,14 +332,14 @@ async fn install_pip(path: String) -> bool {
     match output {
         Ok(o) => {
             let res = String::from_utf8(o.stdout).unwrap();
-            println!("{}", res);
+            crate::nlog!("info", "pip installer completed");
             if !res.starts_with("Python ") {
                 return false;
             }
             return true;
         }
         Err(e) => {
-            println!("{}", e);
+            crate::nlog!("warn", "pip installer failed: {e}");
             return false;
         }
     }
@@ -352,10 +356,10 @@ fn check_requirements_local() -> String {
             if !res.starts_with("Python ") {
                 return "Python is not installed".to_string();
             }
-            println!("{}", res);
+            crate::nlog!("info", "Python availability check completed");
         }
         Err(e) => {
-            println!("{}", e);
+            crate::nlog!("warn", "Python availability check failed: {e}");
             return "Python is not installed, or not loadable".to_string();
         }
     }
@@ -368,10 +372,10 @@ fn check_requirements_local() -> String {
             if !res.starts_with("git version ") {
                 return "Git is not installed".to_string();
             }
-            println!("{}", res);
+            crate::nlog!("info", "Git availability check completed");
         }
         Err(e) => {
-            println!("{}", e);
+            crate::nlog!("warn", "Git availability check failed: {e}");
             return "Git is not installed, or not loadable".to_string();
         }
     }
@@ -397,7 +401,7 @@ fn post_py_install(path: String) {
 #[cfg(desktop)]
 #[tauri::command]
 fn install_py_dependencies(path: String, dependency: String) -> Result<(), String> {
-    println!("installing {}", dependency);
+    crate::nlog!("info", "installing Python dependency");
     let py_path = Path::new(&path).join("python");
     let py_exec_path = py_path.join("python.exe");
     let mut py = Command::new(py_exec_path);
@@ -408,13 +412,12 @@ fn install_py_dependencies(path: String, dependency: String) -> Result<(), Strin
         .arg(dependency)
         .output();
     match output {
-        Ok(o) => {
-            let res = String::from_utf8(o.stdout).unwrap();
-            println!("{}", res);
+        Ok(_) => {
+            crate::nlog!("info", "Python dependency installation completed");
             return Ok(());
         }
         Err(e) => {
-            println!("{}", e);
+            crate::nlog!("warn", "Python dependency installation failed: {e}");
             return Err(e.to_string());
         }
     }
@@ -433,8 +436,7 @@ fn run_py_server(handle: tauri::AppHandle, py_path: String) {
     //set working directory to server path
     py_server.current_dir(server_path.parent().unwrap());
 
-    println!("server_path: {}", server_path.display());
-    println!("py_exec_path: {}", py_exec_path.display());
+    crate::nlog!("info", "starting Python server");
     let mut _child = py_server
         .arg("-m")
         .arg("uvicorn")
@@ -443,12 +445,14 @@ fn run_py_server(handle: tauri::AppHandle, py_path: String) {
         .arg("main:app")
         .spawn()
         .expect("failed to execute process");
-    println!("server started");
+    crate::nlog!("info", "Python server started");
     return;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    native_log::install_panic_hook();
+    let native_log_state = native_log::global_state();
     let mut builder = tauri::Builder::default();
 
     #[cfg(desktop)]
@@ -464,8 +468,10 @@ pub fn run() {
     }
 
     let app = builder
-        .setup(|app| {
+        .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
+            native_log_state.configure_file_path(&app_data_dir);
+            app.manage(native_log_state.clone());
             native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
             let state = native_file_jobs::NativeFileJobState::initialize(
                 app_data_dir.join("native-file-jobs"),
