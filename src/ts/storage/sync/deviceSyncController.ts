@@ -85,6 +85,8 @@ export interface DeviceSyncControllerSnapshot {
     error: DeviceSyncErrorCode | null
     stagedLink: StagedDeviceSyncLink | null
     stagedSourceDeviceId: string | null
+    activeCloneSourceDeviceId: string | null
+    activeBidirectionalSourceDeviceId: string | null
     expiredSourceIds: readonly string[]
     targets: {
         clone?: SafePeerCloneControllerSnapshot
@@ -96,7 +98,9 @@ export interface DeviceSyncControllerSnapshot {
 function createInitialSnapshot(): DeviceSyncControllerSnapshot {
     return {
         source: { phase: 'idle' }, sources: [], devices: [], error: null,
-        stagedLink: null, stagedSourceDeviceId: null, expiredSourceIds: [], targets: {},
+        stagedLink: null, stagedSourceDeviceId: null,
+        activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null,
+        expiredSourceIds: [], targets: {},
     }
 }
 
@@ -199,6 +203,31 @@ export function createDeviceSyncController(options: {
     }
     const ensureReceiveAllowed = (): void => {
         if (snapshot.source.phase !== 'idle') throw new DeviceSyncError('unavailable')
+    }
+    const ensureSourceAllowed = (): void => {
+        const clone = options.targets?.clone?.snapshot()
+        const clonePhase = clone?.state.target.phase as string | undefined
+        const targetPhase = clone?.targetPhase
+        if (
+            clonePhase === 'downloading'
+            || targetPhase === 'downloading'
+            || targetPhase === 'cancelling'
+            || targetPhase === 'awaitingActivation'
+            || targetPhase === 'activating'
+            || (clone?.platform === 'android' && clone.resumeAvailable === true)
+        ) throw new DeviceSyncError('unavailable')
+        if (options.targets?.delta?.snapshot().pullPhase === 'running') {
+            throw new DeviceSyncError('unavailable')
+        }
+        const bidirectionalPhase = options.targets?.bidirectional?.snapshot().operationPhase
+        if (
+            bidirectionalPhase === 'running'
+            || bidirectionalPhase === 'awaitingConflict'
+            || bidirectionalPhase === 'targetPrepared'
+            || bidirectionalPhase === 'localCommitted'
+            || bidirectionalPhase === 'sourceUnavailable'
+            || bidirectionalPhase === 'refreshPending'
+        ) throw new DeviceSyncError('unavailable')
     }
     const receive = async <T>(operation: () => Promise<T>, deviceId?: string): Promise<T> => {
         ensureReceiveAllowed()
@@ -314,10 +343,16 @@ export function createDeviceSyncController(options: {
             return initialization
         },
         prepare(settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> {
-            return runExclusive(() => updateSource(() => options.facade.prepare(settings)))
+            return runExclusive(() => {
+                ensureSourceAllowed()
+                return updateSource(() => options.facade.prepare(settings))
+            })
         },
         start(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
-            return runExclusive(() => updateSource(() => options.facade.start(permissions)))
+            return runExclusive(() => {
+                ensureSourceAllowed()
+                return updateSource(() => options.facade.start(permissions))
+            })
         },
         stop(): Promise<DeviceSyncStatus> {
             return runExclusive(async () => {
@@ -356,6 +391,7 @@ export function createDeviceSyncController(options: {
                 const deviceId = await claimStaged()
                 try {
                     await joinRegisteredClone(deviceId)
+                    update({ activeCloneSourceDeviceId: deviceId })
                     clearExpired(deviceId)
                 } catch (error) { throw fail(error, deviceId) }
             })
@@ -365,6 +401,7 @@ export function createDeviceSyncController(options: {
                 ensureReceiveAllowed()
                 try {
                     await joinRegisteredClone(deviceId)
+                    update({ activeCloneSourceDeviceId: deviceId })
                     clearExpired(deviceId)
                 } catch (error) { throw fail(error, deviceId) }
             })
@@ -382,19 +419,20 @@ export function createDeviceSyncController(options: {
             return runExclusive(() => receive(async () => {
                 if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
                 await options.targets.clone.download()
-            }, snapshot.stagedSourceDeviceId ?? undefined))
+            }, snapshot.activeCloneSourceDeviceId ?? undefined))
         },
         resumeClone(): Promise<void> {
             return runExclusive(() => receive(async () => {
                 if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
                 await options.targets.clone.resume()
-            }, snapshot.stagedSourceDeviceId ?? undefined))
+            }, snapshot.activeCloneSourceDeviceId ?? undefined))
         },
         cancelClone(): Promise<void> {
             return runExclusive(() => receive(async () => {
                 if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
                 await options.targets.clone.cancel()
-            }, snapshot.stagedSourceDeviceId ?? undefined))
+                update({ activeCloneSourceDeviceId: null })
+            }, snapshot.activeCloneSourceDeviceId ?? undefined))
         },
         pullStagedDelta(): Promise<unknown> {
             return runExclusive(async () => {
@@ -409,6 +447,8 @@ export function createDeviceSyncController(options: {
                 ensureReceiveAllowed()
                 const deviceId = await claimStaged()
                 if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                requireSource(deviceId, 'bidirectional')
+                update({ activeBidirectionalSourceDeviceId: deviceId })
                 return registeredReceive(deviceId, 'bidirectional', () => (
                     options.targets!.bidirectional!.syncRegistered(deviceId)
                 ))
@@ -423,6 +463,8 @@ export function createDeviceSyncController(options: {
         syncRegisteredBidirectional(deviceId: string): Promise<unknown> {
             return runExclusive(async () => {
                 if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                requireSource(deviceId, 'bidirectional')
+                update({ activeBidirectionalSourceDeviceId: deviceId })
                 return registeredReceive(deviceId, 'bidirectional', () => (
                     options.targets!.bidirectional!.syncRegistered(deviceId)
                 ))
@@ -431,6 +473,8 @@ export function createDeviceSyncController(options: {
         resolveRegisteredBidirectional(deviceId: string, winner: 'local' | 'remote'): Promise<unknown> {
             return runExclusive(async () => {
                 if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
+                requireSource(deviceId, 'bidirectional')
+                update({ activeBidirectionalSourceDeviceId: deviceId })
                 return registeredReceive(deviceId, 'bidirectional', () => (
                     options.targets!.bidirectional!.resolveRegistered(deviceId, winner)
                 ))
@@ -440,19 +484,21 @@ export function createDeviceSyncController(options: {
             return runExclusive(() => receive(async () => {
                 if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
                 return options.targets.bidirectional.resume()
-            }))
+            }, snapshot.activeBidirectionalSourceDeviceId ?? undefined))
         },
         acknowledgeBidirectional(): Promise<void> {
             return runExclusive(() => receive(async () => {
                 if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
                 await options.targets.bidirectional.acknowledge()
-            }))
+                update({ activeBidirectionalSourceDeviceId: null })
+            }, snapshot.activeBidirectionalSourceDeviceId ?? undefined))
         },
         abandonBidirectional(): Promise<void> {
             return runExclusive(() => receive(async () => {
                 if (!options.targets?.bidirectional) throw new DeviceSyncError('unavailable')
                 await options.targets.bidirectional.abandon()
-            }))
+                update({ activeBidirectionalSourceDeviceId: null })
+            }, snapshot.activeBidirectionalSourceDeviceId ?? undefined))
         },
         dispose(): void {
             if (disposed) return

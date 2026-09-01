@@ -16,12 +16,14 @@ describe('device sync facade', () => {
         })
     })
 
-    it('keeps registry DTOs free of endpoint and bearer secrets while preserving source endpoint', async () => {
+    it('keeps registry DTOs free of endpoint and bearer secrets while preserving a valid source endpoint', async () => {
+        const endpoint = 'http://192.168.1.2:32145/'
+        const pairingUri = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
         const invoke = vi.fn(async (command: string) => {
             if (command === 'peer_sync_incoming_sources') {
                 return [{ deviceId: 'source', name: 'Source', permissions: ['read'], endpoint: 'http://private', bearer: 'secret' }]
             }
-            return { phase: 'running', endpoint: 'http://private', bearer: 'secret', pairingUri: 'risuailocal://peer-clone/v2' }
+            return { phase: 'running', endpoint, bearer: 'secret', pairingUri }
         })
         const facade = createDeviceSyncFacade({ invoke })
 
@@ -30,7 +32,7 @@ describe('device sync facade', () => {
 
         expect(sources).toEqual([{ deviceId: 'source', name: 'Source', permissions: ['read'] }])
         expect(status).toEqual({
-            phase: 'running', endpoint: 'http://private', pairingUri: 'risuailocal://peer-clone/v2',
+            phase: 'running', endpoint, pairingUri,
         })
     })
 
@@ -75,17 +77,76 @@ describe('device sync facade', () => {
         await expect(facade.claimStagedClone(link)).rejects.toMatchObject({ code: 'unavailable' })
     })
 
-    it('drops non-finite source expiration values', async () => {
+    it('rejects non-finite source expiration values', async () => {
         const invoke = vi.fn(async () => ({ phase: 'running', expiresAtMs: Number.NaN }))
         const facade = createDeviceSyncFacade({ invoke })
 
-        await expect(facade.status()).resolves.toEqual({ phase: 'running' })
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+    })
+
+    it.each([undefined, 'unknown'])('rejects missing or unknown source phase %s', async (phase) => {
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase })) })
+
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+    })
+
+    it.each([
+        'http://user:secret@192.168.1.2:32145/',
+        'http://example.com:32145/',
+        'http://127.0.0.1:32145/',
+        'https://192.168.1.2/',
+        'https://public.example:8443/',
+    ])('rejects unsafe source endpoint %s', async (endpoint) => {
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase: 'running', endpoint })) })
+
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+    })
+
+    it('rejects malformed or endpoint-mismatched source pairing state', async () => {
+        const endpoint = 'http://192.168.1.2:32145/'
+        const otherEndpoint = 'http://192.168.1.3:32145/'
+        const validPairing = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(otherEndpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const matchingPairing = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const invoke = vi.fn()
+            .mockResolvedValueOnce({ phase: 'running', pairingUri: validPairing })
+            .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: 'risuailocal://peer-clone/v2' })
+            .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: validPairing })
+            .mockResolvedValueOnce({
+                phase: 'running', endpoint,
+                pairingUri: matchingPairing.replace('risuailocal://', 'risuailocal://user:secret@'),
+            })
+            .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: `\n${matchingPairing}\t` })
+            .mockResolvedValueOnce({
+                phase: 'running', endpoint,
+                pairingUri: matchingPairing.replace(
+                    `endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000`,
+                    `session=123e4567-e89b-12d3-a456-426614174000&endpoint=${encodeURIComponent(endpoint)}`,
+                ),
+            })
+        const facade = createDeviceSyncFacade({ invoke })
+
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
     })
 
     it('preserves the transient native preparing source phase', async () => {
         const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase: 'preparing' })) })
 
         await expect(facade.status()).resolves.toEqual({ phase: 'preparing' })
+    })
+
+    it('treats native null option fields as absent', async () => {
+        const facade = createDeviceSyncFacade({
+            invoke: vi.fn(async () => ({
+                phase: 'idle', endpoint: null, pairingUri: null, expiresAtMs: null, latestError: null,
+            })),
+        })
+
+        await expect(facade.status()).resolves.toEqual({ phase: 'idle' })
     })
 
     it('accepts only exact native source error categories from latestError', async () => {

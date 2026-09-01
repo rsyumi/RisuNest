@@ -5,6 +5,7 @@ import {
     type PeerCloneReplacementRuntime,
     type PeerCloneSourceStatus,
     type PeerCloneState,
+    type PeerCloneTargetStatus,
     type PeerCloneTunnelStatus,
 } from './peerClone'
 import { createPeerSourcePolling } from './peerSourcePolling'
@@ -16,6 +17,7 @@ export interface PeerCloneControllerSnapshot {
     sourceStatus: PeerCloneSourceStatus
     tunnelStatus: PeerCloneTunnelStatus
     state: PeerCloneState
+    targetPhase?: PeerCloneTargetStatus['phase']
     sourcePairingUri: string
     error: string
     warning: string
@@ -97,6 +99,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         targetPolling = true
         try {
             const status = await facade.targetStatus()
+            snapshot = { ...snapshot, targetPhase: status.phase }
             const phase = facade.getState().target.phase
             if (phase === 'failed') {
                 snapshot = { ...snapshot, error: status.error ?? 'Peer clone target failed' }
@@ -198,10 +201,12 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         },
         join(pairingUri: string): void {
             facade.join(pairingUri)
+            snapshot = { ...snapshot, targetPhase: 'idle' }
             success()
         },
         joinClaimed(target: { endpoint: string, sessionId: string, manifestId: string }): void {
             facade.joinClaimed(target)
+            snapshot = { ...snapshot, targetPhase: 'idle' }
             success()
         },
         confirmDestructiveReplace(): void {
@@ -254,14 +259,17 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         }),
         download: () => run(async () => {
             await facade.download()
+            snapshot = { ...snapshot, targetPhase: 'downloading' }
             beginTargetPolling()
         }),
         resume: () => run(async () => {
             await facade.resume()
+            snapshot = { ...snapshot, targetPhase: 'downloading' }
             beginTargetPolling()
         }),
         cancel: () => run(async () => {
             await facade.cancel()
+            snapshot = { ...snapshot, targetPhase: 'cancelled' }
             stopTargetPolling()
         }),
     }

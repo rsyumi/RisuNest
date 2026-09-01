@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { parsePeerPairingUri } from './peerClone'
+import { parsePeerCloneEndpoint, parsePeerPairingUri } from './peerClone'
 
 type DeviceSyncInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
@@ -137,7 +137,14 @@ export function parseDeviceSyncUri(uri: string): StagedDeviceSyncLink {
     } catch {
         throw new Error('Invalid device sync link')
     }
-    if (value.protocol !== 'risuailocal:' || value.hostname !== 'peer-clone' || value.pathname !== '/v2') {
+    if (
+        value.protocol !== 'risuailocal:'
+        || value.hostname !== 'peer-clone'
+        || value.pathname !== '/v2'
+        || value.username !== ''
+        || value.password !== ''
+        || value.port !== ''
+    ) {
         throw new Error('Invalid device sync link')
     }
     value.pathname = '/v1'
@@ -151,17 +158,73 @@ export function parseDeviceSyncUri(uri: string): StagedDeviceSyncLink {
 }
 
 function safeStatus(value: unknown): DeviceSyncStatus {
-    const source = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new DeviceSyncError('state-unavailable')
+    }
+    const source = value as Record<string, unknown>
     const phase = source.phase
+    if (
+        phase !== 'idle'
+        && phase !== 'preparing'
+        && phase !== 'prepared'
+        && phase !== 'starting'
+        && phase !== 'running'
+        && phase !== 'stopping'
+        && phase !== 'error'
+    ) throw new DeviceSyncError('state-unavailable')
+    let endpoint: string | undefined
+    let rawEndpoint: string | undefined
+    if (source.endpoint !== undefined && source.endpoint !== null) {
+        if (typeof source.endpoint !== 'string') throw new DeviceSyncError('state-unavailable')
+        try {
+            endpoint = parsePeerCloneEndpoint(source.endpoint)
+            rawEndpoint = source.endpoint
+        } catch {
+            throw new DeviceSyncError('state-unavailable')
+        }
+    }
+    let pairingUri: string | undefined
+    if (source.pairingUri !== undefined && source.pairingUri !== null) {
+        if (typeof source.pairingUri !== 'string' || !endpoint || phase !== 'running') {
+            throw new DeviceSyncError('state-unavailable')
+        }
+        try {
+            const pairing = parseDeviceSyncUri(source.pairingUri)
+            const parsedUri = new URL(source.pairingUri)
+            const pairingEndpoint = parsedUri.searchParams.get('endpoint')
+            const sessionId = parsedUri.searchParams.get('session')
+            const manifestId = parsedUri.searchParams.get('manifest')
+            if (
+                pairing.endpoint !== endpoint
+                || pairingEndpoint !== rawEndpoint
+                || !sessionId
+                || !manifestId
+            ) throw new DeviceSyncError('state-unavailable')
+            const query = new URLSearchParams()
+            query.append('endpoint', pairingEndpoint)
+            query.append('session', sessionId)
+            query.append('manifest', manifestId)
+            const canonical = `risuailocal://peer-clone/v2?${query.toString()}#claim=${pairing.claim}`
+            if (source.pairingUri !== canonical) throw new DeviceSyncError('state-unavailable')
+            pairingUri = canonical
+        } catch {
+            throw new DeviceSyncError('state-unavailable')
+        }
+    }
+    let expiresAtMs: number | undefined
+    if (source.expiresAtMs !== undefined && source.expiresAtMs !== null) {
+        if (
+            typeof source.expiresAtMs !== 'number'
+            || !Number.isFinite(source.expiresAtMs)
+            || source.expiresAtMs < 0
+        ) throw new DeviceSyncError('state-unavailable')
+        expiresAtMs = source.expiresAtMs
+    }
     return {
-        phase: phase === 'preparing' || phase === 'prepared' || phase === 'starting' || phase === 'running' || phase === 'stopping' || phase === 'error'
-            ? phase
-            : 'idle',
-        ...(typeof source.endpoint === 'string' ? { endpoint: source.endpoint } : {}),
-        ...(typeof source.pairingUri === 'string' ? { pairingUri: source.pairingUri } : {}),
-        ...(typeof source.expiresAtMs === 'number' && Number.isFinite(source.expiresAtMs) && source.expiresAtMs >= 0
-            ? { expiresAtMs: source.expiresAtMs }
-            : {}),
+        phase,
+        ...(endpoint ? { endpoint } : {}),
+        ...(pairingUri ? { pairingUri } : {}),
+        ...(expiresAtMs === undefined ? {} : { expiresAtMs }),
         ...(source.latestError === 'invalid-configuration'
             || source.latestError === 'port-unavailable'
             || source.latestError === 'preparation-failed'

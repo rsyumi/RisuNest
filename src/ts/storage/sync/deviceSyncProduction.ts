@@ -68,6 +68,11 @@ export function createAndroidDeviceSyncCloneTarget(
         return {
             platform: 'android',
             resumeAvailable: state.phase === 'paused',
+            targetPhase: state.phase === 'downloading'
+                ? 'downloading'
+                : state.phase === 'cancelled' || state.phase === 'completed' || state.phase === 'failed'
+                    ? state.phase
+                    : 'idle',
             sourceStatus: { phase: 'idle', devices: [] },
             tunnelStatus: { phase: 'idle' },
             state: {

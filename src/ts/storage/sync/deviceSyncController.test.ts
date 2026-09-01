@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { DeviceSyncError } from './deviceSync'
 import { createDeviceSyncController, startDeviceSyncAutoListen } from './deviceSyncController'
+import type { PeerCloneControllerSnapshot } from './peerCloneController'
 
 const cloneSnapshot = (error = '') => ({
     sourceStatus: { phase: 'idle' as const, devices: [] },
@@ -23,6 +24,13 @@ const bidirectionalSnapshot = (operationError = '') => ({
     sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '',
     operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false,
     sourceError: '', operationError,
+})
+
+const sourceFacade = (prepare = vi.fn(async () => ({ phase: 'prepared' as const }))) => ({
+    status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
+    prepare, start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
+    rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
+    revokeOutgoing: async () => undefined,
 })
 
 describe('device sync controller', () => {
@@ -257,6 +265,146 @@ describe('device sync controller', () => {
         await preparing
     })
 
+    it.each(['downloading', 'cancelling', 'awaitingActivation', 'activating'] as const)(
+        'blocks source preparation while a persistent clone target is %s',
+        async (phase) => {
+            const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+            const clone = {
+                snapshot: () => ({
+                    ...cloneSnapshot(),
+                    targetPhase: phase,
+                    state: {
+                        ...cloneSnapshot().state,
+                        target: {
+                            ...cloneSnapshot().state.target,
+                            phase: phase === 'downloading' ? 'downloading' as const : 'idle' as const,
+                        },
+                    },
+                }),
+                subscribe: () => () => undefined, initialize: async () => undefined, joinClaimed: vi.fn(),
+                confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn(),
+            }
+            const controller = createDeviceSyncController({ facade: sourceFacade(prepare), targets: { clone } })
+            await controller.initialize()
+
+            await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+                .rejects.toMatchObject({ code: 'unavailable' })
+            expect(prepare).not.toHaveBeenCalled()
+        },
+    )
+
+    it('blocks sharing after clone download start resolves while its persistent snapshot remains active', async () => {
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        let value: PeerCloneControllerSnapshot = cloneSnapshot()
+        const clone = {
+            snapshot: () => value,
+            subscribe: () => () => undefined, initialize: async () => undefined, joinClaimed: vi.fn(),
+            confirmDestructiveReplace: vi.fn(),
+            download: vi.fn(async () => {
+                value = {
+                    ...cloneSnapshot(),
+                    state: {
+                        ...cloneSnapshot().state,
+                        target: { ...cloneSnapshot().state.target, phase: 'downloading' as const },
+                    },
+                }
+            }),
+            resume: vi.fn(), cancel: vi.fn(),
+        }
+        const controller = createDeviceSyncController({ facade: sourceFacade(prepare), targets: { clone } })
+        await controller.initialize()
+        await controller.downloadClone()
+
+        await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .rejects.toMatchObject({ code: 'unavailable' })
+        expect(clone.download).toHaveBeenCalledOnce()
+        expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it('blocks source preparation for a recovered Android resumable clone job', async () => {
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        const clone = {
+            snapshot: () => ({ ...cloneSnapshot(), platform: 'android' as const, resumeAvailable: true }),
+            subscribe: () => () => undefined, initialize: async () => undefined, joinClaimed: vi.fn(),
+            confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn(),
+        }
+        const controller = createDeviceSyncController({ facade: sourceFacade(prepare), targets: { clone } })
+        await controller.initialize()
+
+        await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .rejects.toMatchObject({ code: 'unavailable' })
+        expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it('blocks source preparation after a delta pull promise resolves while its snapshot remains running', async () => {
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        const delta = {
+            snapshot: () => ({ ...deltaSnapshot(), pullPhase: 'running' as const }),
+            subscribe: () => () => undefined, initialize: async () => undefined,
+            pullRegistered: vi.fn(async () => ({ kind: 'noChanges' })),
+        }
+        const controller = createDeviceSyncController({ facade: sourceFacade(prepare), targets: { delta } })
+        await controller.initialize()
+
+        await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .rejects.toMatchObject({ code: 'unavailable' })
+        expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ['running', false],
+        ['awaitingConflict', false],
+        ['sourcePrepared', true],
+        ['targetPrepared', false],
+        ['localCommitted', false],
+        ['sourceUnavailable', false],
+        ['refreshPending', false],
+        ['completed', true],
+        ['stale', true],
+    ] as const)('applies the source rehost rule to durable bidirectional phase %s', async (operationPhase, allowed) => {
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        const bidirectional = {
+            snapshot: () => ({
+                ...bidirectionalSnapshot(), operationPhase,
+                operationRetained: !['stale'].includes(operationPhase),
+            }),
+            subscribe: () => () => undefined, initialize: async () => undefined,
+            syncRegistered: vi.fn(), resolveRegistered: vi.fn(), resume: vi.fn(), acknowledge: vi.fn(), abandon: vi.fn(),
+        }
+        const controller = createDeviceSyncController({ facade: sourceFacade(prepare), targets: { bidirectional } })
+        await controller.initialize()
+        const preparing = controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
+
+        if (allowed) await expect(preparing).resolves.toMatchObject({ phase: 'prepared' })
+        else await expect(preparing).rejects.toMatchObject({ code: 'unavailable' })
+        expect(prepare).toHaveBeenCalledTimes(allowed ? 1 : 0)
+    })
+
+    it('prevents auto-listen from sharing while a recovered target is active', async () => {
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        const start = vi.fn(async () => ({ phase: 'running' as const }))
+        const clone = {
+            snapshot: () => ({
+                ...cloneSnapshot(),
+                state: { ...cloneSnapshot().state, target: { ...cloneSnapshot().state.target, phase: 'downloading' as const } },
+            }),
+            subscribe: () => () => undefined, initialize: async () => undefined, joinClaimed: vi.fn(),
+            confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn(),
+        }
+        const controller = createDeviceSyncController({
+            facade: { ...sourceFacade(prepare), start }, targets: { clone },
+        })
+        const report = vi.fn()
+
+        await startDeviceSyncAutoListen({
+            syncAutoListen: true, syncListenMethod: 'lan', syncFixedPort: 32145, syncPublicBaseUrl: '',
+        }, { controller, report })
+
+        expect(prepare).not.toHaveBeenCalled()
+        expect(start).not.toHaveBeenCalled()
+        expect(report).toHaveBeenCalledWith(expect.objectContaining({ code: 'unavailable' }))
+    })
+
     it('blocks receive work while the native source is preparing', async () => {
         const pullRegistered = vi.fn()
         const controller = createDeviceSyncController({
@@ -310,6 +458,122 @@ describe('device sync controller', () => {
         await controller.claimStagedClone()
         expect(controller.snapshot().expiredSourceIds).toEqual([])
         expect(reconnectRegisteredClone).toHaveBeenCalledWith('source')
+    })
+
+    it.each(['downloadClone', 'resumeClone', 'cancelClone'] as const)(
+        'attributes %s expiry to the selected clone source, never a stale staged source',
+        async (action) => {
+            const clone = {
+                snapshot: () => cloneSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined,
+                joinClaimed: vi.fn(), confirmDestructiveReplace: vi.fn(),
+                download: vi.fn(async () => { throw new DeviceSyncError('registration-expired') }),
+                resume: vi.fn(async () => { throw new DeviceSyncError('registration-expired') }),
+                cancel: vi.fn(async () => { throw new DeviceSyncError('registration-expired') }),
+            }
+            const controller = createDeviceSyncController({
+                facade: {
+                    status: async () => ({ phase: 'idle' as const }),
+                    incomingSources: async () => [
+                        { deviceId: 'staged-source', name: 'Staged', permissions: ['read'] as const },
+                        { deviceId: 'selected-source', name: 'Selected', permissions: ['read'] as const },
+                    ],
+                    outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
+                    start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
+                    rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
+                    revokeOutgoing: async () => undefined,
+                    claimStagedClone: async () => ({
+                        sourceDeviceId: 'staged-source', endpoint: 'http://source/',
+                        sessionId: 'session', manifestId: 'a'.repeat(64),
+                    }),
+                    reconnectRegisteredClone: async (deviceId) => ({
+                        sourceDeviceId: deviceId, endpoint: 'http://source/',
+                        sessionId: 'session', manifestId: 'a'.repeat(64),
+                    }),
+                },
+                targets: { clone },
+            })
+            await controller.initialize()
+            controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+            await controller.claimStagedClone()
+            await controller.selectRegisteredClone('selected-source')
+
+            await expect(controller[action]()).rejects.toMatchObject({ code: 'registration-expired' })
+            expect(controller.snapshot().expiredSourceIds).toEqual(['selected-source'])
+            expect(controller.snapshot().activeCloneSourceDeviceId).toBe('selected-source')
+            expect(controller.snapshot().stagedSourceDeviceId).toBe('staged-source')
+        },
+    )
+
+    it('attributes durable bidirectional retry and resolve expiry to their active registered source', async () => {
+        const resume = vi.fn(async () => { throw new DeviceSyncError('registration-expired') })
+        const resolveRegistered = vi.fn(async () => { throw new DeviceSyncError('registration-expired') })
+        const bidirectional = {
+            snapshot: () => bidirectionalSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined,
+            syncRegistered: vi.fn(async () => ({ kind: 'conflict' })), resolveRegistered,
+            resume, acknowledge: vi.fn(), abandon: vi.fn(),
+        }
+        const controller = createDeviceSyncController({
+            facade: {
+                status: async () => ({ phase: 'idle' as const }),
+                incomingSources: async () => [
+                    { deviceId: 'staged-source', name: 'Staged', permissions: ['read', 'bidirectional'] as const },
+                    { deviceId: 'bidi-source', name: 'Bidi', permissions: ['read', 'bidirectional'] as const },
+                    { deviceId: 'resolve-source', name: 'Resolve', permissions: ['read', 'bidirectional'] as const },
+                ],
+                outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
+                start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
+                rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
+                revokeOutgoing: async () => undefined,
+                claimStagedClone: async () => ({
+                    sourceDeviceId: 'staged-source', endpoint: 'http://source/',
+                    sessionId: 'session', manifestId: 'a'.repeat(64),
+                }),
+            },
+            targets: { bidirectional },
+        })
+        await controller.initialize()
+        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        await controller.syncStagedBidirectional()
+        await controller.syncRegisteredBidirectional('bidi-source')
+
+        await expect(controller.resumeBidirectional()).rejects.toMatchObject({ code: 'registration-expired' })
+        expect(controller.snapshot().expiredSourceIds).toEqual(['bidi-source'])
+        expect(controller.snapshot().stagedSourceDeviceId).toBe('staged-source')
+        await expect(controller.resolveRegisteredBidirectional('resolve-source', 'local'))
+            .rejects.toMatchObject({ code: 'registration-expired' })
+        expect(controller.snapshot().expiredSourceIds).toEqual(['bidi-source', 'resolve-source'])
+        expect(controller.snapshot().activeBidirectionalSourceDeviceId).toBe('resolve-source')
+    })
+
+    it('clears clone expiry when that exact source is re-registered successfully', async () => {
+        let reconnectFails = true
+        const clone = {
+            snapshot: () => cloneSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined,
+            joinClaimed: vi.fn(), confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn(),
+        }
+        const controller = createDeviceSyncController({
+            facade: {
+                status: async () => ({ phase: 'idle' as const }),
+                incomingSources: async () => [{ deviceId: 'source', name: 'Source', permissions: ['read'] as const }],
+                outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
+                start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
+                rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
+                revokeOutgoing: async () => undefined,
+                reconnectRegisteredClone: async () => {
+                    if (reconnectFails) throw new DeviceSyncError('registration-expired')
+                    return { sourceDeviceId: 'source', endpoint: 'http://source/', sessionId: 'session', manifestId: 'a'.repeat(64) }
+                },
+            },
+            targets: { clone },
+        })
+        await controller.initialize()
+        await expect(controller.selectRegisteredClone('source')).rejects.toMatchObject({ code: 'registration-expired' })
+        reconnectFails = false
+
+        await controller.selectRegisteredClone('source')
+
+        expect(controller.snapshot().expiredSourceIds).toEqual([])
+        expect(controller.snapshot().activeCloneSourceDeviceId).toBe('source')
     })
 
     it('exposes the complete typed target action surface through one controller', async () => {
