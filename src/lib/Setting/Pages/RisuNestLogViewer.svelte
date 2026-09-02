@@ -22,6 +22,7 @@
     let fileLogUpdatePending = $state(false)
     let viewRequest = 0
     let copyRequest = 0
+    let clipboardWriteQueue = Promise.resolve()
 
     function formatLog(logEntries: NativeLogEntry[]) {
         return logEntries
@@ -77,19 +78,25 @@
             logLoaded = true
             errorMessage = ''
             const text = formatLog(freshEntries) || language.risuNest.diag.logEmpty
-            try {
-                await navigator.clipboard.writeText(text)
-            } catch {
-                const textarea = document.createElement('textarea')
-                textarea.value = text
-                document.body.appendChild(textarea)
-                textarea.select()
+            const pendingWrite = clipboardWriteQueue.then(async () => {
+                if (request !== copyRequest) return
                 try {
-                    if (!document.execCommand('copy')) throw new Error('copy failed')
-                } finally {
-                    document.body.removeChild(textarea)
+                    await navigator.clipboard.writeText(text)
+                } catch {
+                    if (request !== copyRequest) return
+                    const textarea = document.createElement('textarea')
+                    textarea.value = text
+                    document.body.appendChild(textarea)
+                    textarea.select()
+                    try {
+                        if (!document.execCommand('copy')) throw new Error('copy failed')
+                    } finally {
+                        document.body.removeChild(textarea)
+                    }
                 }
-            }
+            })
+            clipboardWriteQueue = pendingWrite.catch(() => undefined)
+            await pendingWrite
         } catch {
             if (request === copyRequest) errorMessage = language.error
         }

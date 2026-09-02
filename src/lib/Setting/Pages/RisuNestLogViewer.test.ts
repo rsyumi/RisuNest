@@ -193,6 +193,50 @@ describe('RisuNestLogViewer', () => {
         expect(writeText).toHaveBeenCalledWith('[1970-01-01T00:00:02.000Z] [error] newest')
     })
 
+    it('serializes clipboard writes so a late fallback cannot overwrite the newest copy', async () => {
+        nativeLog.getNativeLogTail
+            .mockResolvedValueOnce([
+                { tsMs: 1_000, level: 'error', target: 'native', message: 'older' },
+            ])
+            .mockResolvedValueOnce([
+                { tsMs: 2_000, level: 'error', target: 'native', message: 'newest' },
+            ])
+        let rejectFirstWrite: ((error: Error) => void) | undefined
+        let clipboardText = ''
+        const writeText = vi.fn((text: string) => {
+            if (writeText.mock.calls.length === 1) {
+                return new Promise<void>((_resolve, reject) => {
+                    rejectFirstWrite = reject
+                })
+            }
+            clipboardText = text
+            return Promise.resolve()
+        })
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText },
+        })
+        Object.defineProperty(document, 'execCommand', {
+            configurable: true,
+            value: vi.fn(() => {
+                clipboardText = document.querySelector<HTMLTextAreaElement>('textarea')!.value
+                return true
+            }),
+        })
+        await render()
+        const copyButton = target.querySelector<HTMLButtonElement>('[data-copy-log]')!
+
+        copyButton.click()
+        await settleAction()
+        copyButton.click()
+        await settleAction()
+        rejectFirstWrite!(new Error('first clipboard write denied'))
+        await vi.waitFor(() => expect(writeText).toHaveBeenCalledTimes(2))
+        await settleAction()
+
+        expect(clipboardText).toBe('[1970-01-01T00:00:02.000Z] [error] newest')
+    })
+
     it('synchronizes file logging with native state and device settings', async () => {
         await render()
 
