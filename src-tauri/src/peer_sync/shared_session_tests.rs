@@ -1,4 +1,7 @@
-use super::lan::validate_lan_endpoint;
+use super::lan::{
+    validate_lan_endpoint, PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1,
+    PEER_COMPLETION_LEASE_HEADER, PEER_COMPLETION_RESUME_HEADER, PEER_COMPLETION_SCHEMA,
+};
 use super::{
     android_foreground::{
         registry as android_foreground_registry, test_registry_guard, AndroidForegroundLane,
@@ -2447,26 +2450,108 @@ fn clone_terminal_progress_with_operation_id_defers_completion_accounting() {
         .unwrap()
         .to_owned();
     let client = reqwest::blocking::Client::new();
-    let manifest = client
-        .get(format!(
-            "{}/v1/sessions/{}/manifest",
-            pairing.endpoint, pairing.session_id
-        ))
+    let manifest_url = format!(
+        "{}/v1/sessions/{}/manifest",
+        pairing.endpoint, pairing.session_id
+    );
+    let legacy_manifest = client
+        .get(&manifest_url)
         .bearer_auth(&bearer)
         .send()
-        .unwrap()
-        .json::<CloneManifest>()
         .unwrap();
+    assert!(legacy_manifest
+        .headers()
+        .get(PEER_COMPLETION_LEASE_HEADER)
+        .is_none());
+    let manifest = legacy_manifest.json::<CloneManifest>().unwrap();
     let total_bytes = manifest
         .objects
         .values()
         .map(|object| object.size)
         .sum::<u64>();
+    let first_manifest = client
+        .get(&manifest_url)
+        .bearer_auth(&bearer)
+        .header(
+            PEER_COMPLETION_CAPABILITY_HEADER,
+            PEER_COMPLETION_CAPABILITY_V1,
+        )
+        .send()
+        .unwrap();
+    assert_eq!(first_manifest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        first_manifest
+            .headers()
+            .get(PEER_COMPLETION_CAPABILITY_HEADER)
+            .unwrap(),
+        PEER_COMPLETION_CAPABILITY_V1
+    );
+    let lease_a = first_manifest
+        .headers()
+        .get(PEER_COMPLETION_LEASE_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(uuid::Uuid::parse_str(&lease_a).unwrap().get_version_num(), 4);
+    let retry_manifest = client
+        .get(&manifest_url)
+        .bearer_auth(&bearer)
+        .header(
+            PEER_COMPLETION_CAPABILITY_HEADER,
+            PEER_COMPLETION_CAPABILITY_V1,
+        )
+        .send()
+        .unwrap();
+    assert_eq!(retry_manifest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        retry_manifest
+            .headers()
+            .get(PEER_COMPLETION_LEASE_HEADER)
+            .unwrap(),
+        lease_a.as_str()
+    );
+    assert_eq!(
+        client
+            .get(&manifest_url)
+            .bearer_auth(&bearer)
+            .header(
+                PEER_COMPLETION_CAPABILITY_HEADER,
+                PEER_COMPLETION_CAPABILITY_V1,
+            )
+            .header(
+                PEER_COMPLETION_RESUME_HEADER,
+                "00000000-0000-4000-8000-000000000035",
+            )
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
     let progress_url = format!(
         "{}/v1/sessions/{}/progress",
         pairing.endpoint, pairing.session_id
     );
 
+    for operation_id in [None, Some("00000000-0000-4000-8000-000000000034")] {
+        let mut progress = serde_json::json!({
+            "verifiedBytes": total_bytes,
+            "currentObject": null
+        });
+        if let Some(operation_id) = operation_id {
+            progress["operationId"] = operation_id.into();
+        }
+        assert_eq!(
+            client
+                .post(&progress_url)
+                .bearer_auth(&bearer)
+                .json(&progress)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+    }
     assert_eq!(
         client
             .post(&progress_url)
@@ -2474,7 +2559,7 @@ fn clone_terminal_progress_with_operation_id_defers_completion_accounting() {
             .json(&serde_json::json!({
                 "verifiedBytes": total_bytes,
                 "currentObject": null,
-                "operationId": "00000000-0000-4000-8000-000000000034"
+                "operationId": lease_a
             }))
             .send()
             .unwrap()
@@ -2487,17 +2572,104 @@ fn clone_terminal_progress_with_operation_id_defers_completion_accounting() {
     );
     assert_eq!(
         client
+            .get(&manifest_url)
+            .bearer_auth(&bearer)
+            .header(
+                PEER_COMPLETION_CAPABILITY_HEADER,
+                PEER_COMPLETION_CAPABILITY_V1,
+            )
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let resumed = client
+        .get(&manifest_url)
+        .bearer_auth(&bearer)
+        .header(
+            PEER_COMPLETION_CAPABILITY_HEADER,
+            PEER_COMPLETION_CAPABILITY_V1,
+        )
+        .header(PEER_COMPLETION_RESUME_HEADER, &lease_a)
+        .send()
+        .unwrap();
+    assert_eq!(resumed.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resumed
+            .headers()
+            .get(PEER_COMPLETION_LEASE_HEADER)
+            .unwrap(),
+        lease_a.as_str()
+    );
+    let completion_url = format!("{}/v1/peer/completion", pairing.endpoint);
+    let completion_a = serde_json::json!({
+        "schema": PEER_COMPLETION_SCHEMA,
+        "lane": "clone",
+        "operationId": lease_a,
+        "manifestId": pairing.manifest_id,
+        "transferredBytes": total_bytes
+    });
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .post(&completion_url)
+                .bearer_auth(&bearer)
+                .json(&completion_a)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        OutgoingDeviceRegistry::load(root.path()).unwrap().devices()[0].total_bytes,
+        total_bytes
+    );
+    let next_manifest = client
+        .get(format!(
+            "{}/v1/sessions/{}/manifest",
+            pairing.endpoint, pairing.session_id
+        ))
+        .bearer_auth(&bearer)
+        .header(
+            PEER_COMPLETION_CAPABILITY_HEADER,
+            PEER_COMPLETION_CAPABILITY_V1,
+        )
+        .send()
+        .unwrap();
+    assert_eq!(next_manifest.status(), reqwest::StatusCode::OK);
+    let lease_b = next_manifest
+        .headers()
+        .get(PEER_COMPLETION_LEASE_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(lease_b, lease_a);
+
+    assert_eq!(
+        client
             .post(&progress_url)
             .bearer_auth(&bearer)
             .json(&serde_json::json!({
                 "verifiedBytes": total_bytes,
                 "currentObject": null,
-                "operationId": "not-a-uuid"
+                "operationId": lease_a
             }))
             .send()
             .unwrap()
             .status(),
-        reqwest::StatusCode::BAD_REQUEST
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        client
+            .post(&completion_url)
+            .bearer_auth(&bearer)
+            .json(&completion_a)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
     );
     assert_eq!(
         client
@@ -2505,16 +2677,48 @@ fn clone_terminal_progress_with_operation_id_defers_completion_accounting() {
             .bearer_auth(&bearer)
             .json(&serde_json::json!({
                 "verifiedBytes": total_bytes,
-                "currentObject": null
+                "currentObject": null,
+                "operationId": lease_b
             }))
             .send()
             .unwrap()
             .status(),
         reqwest::StatusCode::NO_CONTENT
     );
+    let completion_b = serde_json::json!({
+        "schema": PEER_COMPLETION_SCHEMA,
+        "lane": "clone",
+        "operationId": lease_b,
+        "manifestId": pairing.manifest_id,
+        "transferredBytes": total_bytes
+    });
+    assert_eq!(
+        client
+            .post(&completion_url)
+            .bearer_auth(&bearer)
+            .json(&completion_b)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        client
+            .post(&progress_url)
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({
+                "verifiedBytes": total_bytes,
+                "currentObject": null,
+                "operationId": lease_a
+            }))
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
     assert_eq!(
         OutgoingDeviceRegistry::load(root.path()).unwrap().devices()[0].total_bytes,
-        total_bytes
+        total_bytes.checked_mul(2).unwrap()
     );
     state.stop().unwrap();
 }

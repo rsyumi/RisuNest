@@ -1,11 +1,13 @@
 use super::device_registry::{
-    incoming_completed_operation_recorded_for_lane, incoming_source_summaries,
+    accept_outgoing_completion_offer, incoming_completed_operation_recorded_for_lane,
+    incoming_source_summaries, issue_outgoing_unmeasured_completion_offer,
     outgoing_device_summaries, record_incoming_completed_operation,
     record_incoming_completed_operation_best_effort,
-    record_incoming_completed_operation_once_for_lane, register_incoming_source,
-    register_outgoing_claim, remove_incoming_source, revoke_outgoing_device, CompletionLane,
-    DevicePermissions, IncomingSource, IncomingSourceRegistry, OutgoingDevice,
-    OutgoingDeviceRegistry,
+    record_incoming_completed_operation_once_for_lane, record_outgoing_completed_operation,
+    register_incoming_source, register_outgoing_claim, remove_incoming_source,
+    revoke_outgoing_device, seal_outgoing_completion_lease, CompletionAcceptance, CompletionLane,
+    CompletionSealStatus, DevicePermissions, IncomingSource, IncomingSourceRegistry,
+    OutgoingDevice, OutgoingDeviceRegistry,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -13,6 +15,447 @@ use std::thread;
 
 const SOURCE_ID: &str = "b8e9d6d7-6d4c-43d8-b00a-80c8f34478b6";
 const TARGET_ID: &str = "5c39d09f-4b6d-4e21-9ad3-a674c4c1c9b0";
+
+#[test]
+fn source_issued_completion_lease_blocks_a_b_a_replay_after_reload() {
+    let root = tempfile::tempdir().unwrap();
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Windows desktop".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 0,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let manifest_id = "b".repeat(64);
+    assert!(issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Bidirectional,
+        &manifest_id,
+        None,
+    )
+    .is_err());
+
+    let operation_a = issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_id,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        issue_outgoing_unmeasured_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            &manifest_id,
+            None,
+        )
+        .unwrap(),
+        operation_a
+    );
+    assert_eq!(
+        seal_outgoing_completion_lease(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_a.as_str(),
+            &manifest_id,
+            11,
+        )
+        .unwrap(),
+        CompletionSealStatus::Sealed
+    );
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_a.as_str(),
+            &manifest_id,
+            11,
+        )
+        .unwrap(),
+        CompletionAcceptance::Recorded
+    );
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Renamed desktop".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 99,
+            last_seen_ms: 99,
+            total_bytes: 99,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_a.as_str(),
+            &manifest_id,
+            11,
+        )
+        .unwrap(),
+        CompletionAcceptance::AlreadyRecorded
+    );
+
+    let operation_b = issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_id,
+        None,
+    )
+    .unwrap();
+    assert_ne!(operation_b, operation_a);
+    assert_eq!(
+        seal_outgoing_completion_lease(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_b.as_str(),
+            &manifest_id,
+            7,
+        )
+        .unwrap(),
+        CompletionSealStatus::Sealed
+    );
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_b.as_str(),
+            &manifest_id,
+            7,
+        )
+        .unwrap(),
+        CompletionAcceptance::Recorded
+    );
+
+    assert_eq!(
+        seal_outgoing_completion_lease(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_a.as_str(),
+            &manifest_id,
+            11,
+        )
+        .unwrap(),
+        CompletionSealStatus::Conflict
+    );
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_a.as_str(),
+            &manifest_id,
+            11,
+        )
+        .unwrap(),
+        CompletionAcceptance::Rejected
+    );
+    assert_eq!(
+        outgoing_device_summaries(root.path()).unwrap()[0].total_bytes,
+        18
+    );
+
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Re-paired desktop".into(),
+            bearer_digest: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 100,
+            last_seen_ms: 100,
+            total_bytes: 100,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            operation_b.as_str(),
+            &manifest_id,
+            7,
+        )
+        .unwrap(),
+        CompletionAcceptance::Rejected
+    );
+    record_outgoing_completed_operation(root.path(), TARGET_ID, "delta", &"d".repeat(64), 5)
+        .unwrap();
+    assert_eq!(
+        outgoing_device_summaries(root.path()).unwrap()[0].total_bytes,
+        23
+    );
+}
+
+#[test]
+fn unmeasured_completion_lease_supersedes_only_prepared_work_and_resumes_ready_work() {
+    let root = tempfile::tempdir().unwrap();
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Windows desktop".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 0,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let manifest_a = "a".repeat(64);
+    let manifest_b = "b".repeat(64);
+    let lease_a = issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_a,
+        None,
+    )
+    .unwrap();
+    let lease_b = issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_b,
+        None,
+    )
+    .unwrap();
+    assert_ne!(lease_a, lease_b);
+    assert_eq!(
+        seal_outgoing_completion_lease(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            lease_a.as_str(),
+            &manifest_a,
+            8,
+        )
+        .unwrap(),
+        CompletionSealStatus::Conflict
+    );
+    assert_eq!(
+        issue_outgoing_unmeasured_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            &manifest_b,
+            None,
+        )
+        .unwrap(),
+        lease_b
+    );
+    assert_eq!(
+        seal_outgoing_completion_lease(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            lease_b.as_str(),
+            &manifest_b,
+            8,
+        )
+        .unwrap(),
+        CompletionSealStatus::Sealed
+    );
+    assert!(issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_b,
+        None,
+    )
+    .is_err());
+    assert_eq!(
+        issue_outgoing_unmeasured_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            &manifest_b,
+            Some(lease_b.as_str()),
+        )
+        .unwrap(),
+        lease_b
+    );
+    assert!(issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_a,
+        None,
+    )
+    .is_err());
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            lease_b.as_str(),
+            &manifest_b,
+            8,
+        )
+        .unwrap(),
+        CompletionAcceptance::Recorded
+    );
+    assert_eq!(
+        issue_outgoing_unmeasured_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            &manifest_b,
+            Some(lease_b.as_str()),
+        )
+        .unwrap(),
+        lease_b
+    );
+    assert!(issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_b,
+        Some(lease_a.as_str()),
+    )
+    .is_err());
+    let next = issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &manifest_b,
+        None,
+    )
+    .unwrap();
+    assert_ne!(next, lease_b);
+}
+
+#[test]
+fn completion_lease_issue_and_seal_write_failures_leave_persisted_state_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Windows desktop".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 0,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let registry_path = root.path().join("peer-sync/devices.json");
+    let preserved_path = root.path().join("peer-sync/devices.preserved.json");
+    let before_issue = fs::read(&registry_path).unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    fs::rename(&registry_path, &preserved_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+    assert!(registry
+        .issue_completion_lease(
+            TARGET_ID,
+            CompletionLane::Delta,
+            &"b".repeat(64),
+            None,
+            None,
+        )
+        .is_err());
+    fs::remove_dir(&registry_path).unwrap();
+    fs::rename(&preserved_path, &registry_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), before_issue);
+
+    let lease = issue_outgoing_unmeasured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Delta,
+        &"b".repeat(64),
+        None,
+    )
+    .unwrap();
+    let before_seal = fs::read(&registry_path).unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    fs::rename(&registry_path, &preserved_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+    assert!(registry
+        .seal_completion_lease(
+            TARGET_ID,
+            CompletionLane::Delta,
+            lease.as_str(),
+            &"b".repeat(64),
+            9,
+        )
+        .is_err());
+    fs::remove_dir(&registry_path).unwrap();
+    fs::rename(&preserved_path, &registry_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), before_seal);
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Delta,
+            lease.as_str(),
+            &"b".repeat(64),
+            9,
+        )
+        .unwrap(),
+        CompletionAcceptance::Rejected
+    );
+}
+
+#[test]
+fn completion_lease_issue_rejects_impossible_measurement_states() {
+    let root = tempfile::tempdir().unwrap();
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Windows desktop".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 0,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+
+    assert!(registry
+        .issue_completion_lease(
+            TARGET_ID,
+            CompletionLane::Clone,
+            &"b".repeat(64),
+            None,
+            None,
+        )
+        .is_err());
+    assert!(registry
+        .issue_completion_lease(
+            TARGET_ID,
+            CompletionLane::Delta,
+            &"b".repeat(64),
+            Some(1),
+            None,
+        )
+        .is_err());
+}
 
 #[test]
 fn stable_device_id_migrates_once_and_is_idempotent() {
@@ -695,6 +1138,61 @@ fn registries_reject_malformed_oversized_and_linked_files() {
     std::os::unix::fs::symlink(&outside, peer_root.join("devices.json")).unwrap();
     #[cfg(unix)]
     assert!(OutgoingDeviceRegistry::load(root.path()).is_err());
+}
+
+#[test]
+fn outgoing_registry_rejects_impossible_completion_lease_states() {
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = root.path().join("peer-sync");
+    fs::create_dir_all(&peer_root).unwrap();
+    let device = serde_json::json!({
+        "deviceId": TARGET_ID,
+        "name": "Windows desktop",
+        "bearerDigest": "a".repeat(64),
+        "permissions": ["read"],
+        "createdAtMs": 1,
+        "lastSeenMs": 0,
+        "totalBytes": 0
+    });
+    for impossible in [
+        serde_json::json!({
+            "deviceId": TARGET_ID,
+            "bearerDigest": "a".repeat(64),
+            "lane": "delta",
+            "leaseId": "00000000-0000-4000-8000-000000000001",
+            "manifestId": "b".repeat(64),
+            "ready": true
+        }),
+        serde_json::json!({
+            "deviceId": TARGET_ID,
+            "bearerDigest": "a".repeat(64),
+            "lane": "delta",
+            "leaseId": "00000000-0000-4000-8000-000000000002",
+            "manifestId": "b".repeat(64),
+            "transferredBytes": 1,
+            "ready": false
+        }),
+        serde_json::json!({
+            "deviceId": TARGET_ID,
+            "bearerDigest": "a".repeat(64),
+            "lane": "clone",
+            "leaseId": "00000000-0000-4000-8000-000000000003",
+            "manifestId": "b".repeat(64),
+            "ready": false
+        }),
+    ] {
+        fs::write(
+            peer_root.join("devices.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "risunest.peer-device-registry/v1",
+                "devices": [device.clone()],
+                "completionOffers": [impossible]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(OutgoingDeviceRegistry::load(root.path()).is_err());
+    }
 }
 
 #[test]

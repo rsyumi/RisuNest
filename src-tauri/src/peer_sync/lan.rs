@@ -1,9 +1,13 @@
 use super::{
     device_registry::{
-        completion_receipt_id, load_or_create_device_id, outgoing_device_is_registered,
+        accept_outgoing_completion_offer, completion_receipt_id,
+        issue_outgoing_measured_completion_offer, issue_outgoing_unmeasured_completion_offer,
+        load_or_create_device_id, outgoing_completion_offer_active,
+        outgoing_completion_offer_is_current, outgoing_device_is_registered,
         record_outgoing_completed_operation, record_outgoing_seen, register_incoming_source,
-        register_outgoing_claim, revoke_outgoing_device, CompletionLane, DevicePermissions,
-        IncomingSource, OutgoingDevice, OutgoingDeviceRegistry,
+        register_outgoing_claim, revoke_outgoing_device, seal_outgoing_completion_lease,
+        CompletionAcceptance, CompletionLane, CompletionLeaseId, CompletionSealStatus,
+        DevicePermissions, IncomingSource, OutgoingDevice, OutgoingDeviceRegistry,
     },
     http_stream::HttpRangeStream,
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
@@ -127,6 +131,8 @@ const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PEER_COMPLETION_SCHEMA: &str = "risunest.peer-completion/v1";
 pub(crate) const PEER_COMPLETION_CAPABILITY_HEADER: &str = "RisuNest-Peer-Completion";
 pub(crate) const PEER_COMPLETION_CAPABILITY_V1: &str = "v1";
+pub(crate) const PEER_COMPLETION_LEASE_HEADER: &str = "RisuNest-Peer-Completion-Lease";
+pub(crate) const PEER_COMPLETION_RESUME_HEADER: &str = "RisuNest-Peer-Completion-Resume";
 #[cfg(any(desktop, target_os = "android"))]
 const LOGICAL_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -150,6 +156,36 @@ pub struct LanCloneClient {
     bearer: String,
     source_device_id: Option<String>,
     manifest_id: Option<String>,
+}
+
+pub(crate) struct LanCompletionManifestResponse {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) completion_lease_id: Option<CompletionLeaseId>,
+}
+
+fn parse_completion_lease_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<CompletionLeaseId>, PeerSyncError> {
+    let completion_versions = headers
+        .get_all(PEER_COMPLETION_CAPABILITY_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    let completion_leases = headers
+        .get_all(PEER_COMPLETION_LEASE_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    match (completion_versions.as_slice(), completion_leases.as_slice()) {
+        ([], []) => Ok(None),
+        ([version], [lease]) if version.as_bytes() == PEER_COMPLETION_CAPABILITY_V1.as_bytes() => {
+            let lease = lease.to_str().map_err(|_| {
+                PeerSyncError::Protocol("invalid peer completion lease header".to_owned())
+            })?;
+            CompletionLeaseId::parse(lease).map(Some)
+        }
+        _ => Err(PeerSyncError::Protocol(
+            "invalid peer completion lease headers".to_owned(),
+        )),
+    }
 }
 
 impl LanCloneClient {
@@ -682,15 +718,41 @@ impl LanCloneClient {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn fetch_manifest(&self, expected_manifest_id: &str) -> Result<Vec<u8>, PeerSyncError> {
+        Ok(self
+            .fetch_manifest_request(expected_manifest_id, false, None)?
+            .bytes)
+    }
+
+    pub(crate) fn fetch_manifest_with_completion_lease(
+        &self,
+        expected_manifest_id: &str,
+        resume_lease_id: Option<&CompletionLeaseId>,
+    ) -> Result<LanCompletionManifestResponse, PeerSyncError> {
+        self.fetch_manifest_request(expected_manifest_id, true, resume_lease_id)
+    }
+
+    fn fetch_manifest_request(
+        &self,
+        expected_manifest_id: &str,
+        completion_v1: bool,
+        resume_lease_id: Option<&CompletionLeaseId>,
+    ) -> Result<LanCompletionManifestResponse, PeerSyncError> {
         if !is_lower_hex_256(expected_manifest_id) {
             return Err(PeerSyncError::Protocol(
                 "invalid LAN manifest identity".to_owned(),
             ));
         }
-        let response = self
-            .control_request(self.client.get(format!("{}/manifest", self.session_url)))
-            .send()
-            .map_err(transport)?;
+        let mut request = self.client.get(format!("{}/manifest", self.session_url));
+        if completion_v1 {
+            request = request.header(
+                PEER_COMPLETION_CAPABILITY_HEADER,
+                PEER_COMPLETION_CAPABILITY_V1,
+            );
+            if let Some(resume_lease_id) = resume_lease_id {
+                request = request.header(PEER_COMPLETION_RESUME_HEADER, resume_lease_id.as_str());
+            }
+        }
+        let response = self.control_request(request).send().map_err(transport)?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
@@ -708,6 +770,11 @@ impl LanCloneClient {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
             .ok_or_else(|| PeerSyncError::Protocol("LAN manifest ETag is missing".to_owned()))?;
+        let completion_lease_id = if completion_v1 {
+            parse_completion_lease_headers(response.headers())?
+        } else {
+            None
+        };
         let mut bytes = Vec::new();
         response
             .take(MAX_MANIFEST_BYTES as u64 + 1)
@@ -725,7 +792,10 @@ impl LanCloneClient {
                 received,
             });
         }
-        Ok(bytes)
+        Ok(LanCompletionManifestResponse {
+            bytes,
+            completion_lease_id,
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1751,6 +1821,8 @@ struct HttpRequest {
     url: String,
     authorization: Option<String>,
     content_type: Option<String>,
+    peer_completion: Option<String>,
+    peer_completion_resume: Option<String>,
     range: Option<String>,
     range_count: usize,
     body: Vec<u8>,
@@ -1864,6 +1936,8 @@ fn read_request_with_elapsed(
 
     let mut authorization = None;
     let mut content_type = None;
+    let mut peer_completion = None;
+    let mut peer_completion_resume = None;
     let mut range = None;
     let mut range_count = 0_usize;
     let mut content_length = None;
@@ -1884,6 +1958,14 @@ fn read_request_with_elapsed(
             }
         } else if name.eq_ignore_ascii_case("content-type") {
             if content_type.replace(value.to_owned()).is_some() {
+                return Err(RequestReadError::Http(400));
+            }
+        } else if name.eq_ignore_ascii_case(PEER_COMPLETION_CAPABILITY_HEADER) {
+            if peer_completion.replace(value.to_owned()).is_some() {
+                return Err(RequestReadError::Http(400));
+            }
+        } else if name.eq_ignore_ascii_case(PEER_COMPLETION_RESUME_HEADER) {
+            if peer_completion_resume.replace(value.to_owned()).is_some() {
                 return Err(RequestReadError::Http(400));
             }
         } else if name.eq_ignore_ascii_case("range") {
@@ -1946,6 +2028,8 @@ fn read_request_with_elapsed(
         url: url.to_owned(),
         authorization,
         content_type,
+        peer_completion,
+        peer_completion_resume,
         range,
         range_count,
         body,
@@ -2015,6 +2099,86 @@ fn handle_request(
     if request.url == format!("{prefix}/manifest") {
         if request.method != "GET" {
             return respond_empty(stream, 405);
+        }
+        if let Some(completion_version) = request.peer_completion.as_deref() {
+            if completion_version != PEER_COMPLETION_CAPABILITY_V1 {
+                return respond_empty(stream, 400);
+            }
+            if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
+                if matches!(session, LanSession::BidirectionalLogical(_))
+                    && !device.permissions.allows_bidirectional()
+                {
+                    return respond_empty(stream, 403);
+                }
+                let issued = match session {
+                    LanSession::Clone(clone) => {
+                        let transferred_bytes = clone
+                            .manifest()
+                            .objects
+                            .values()
+                            .try_fold(0_u64, |total, object| total.checked_add(object.size))
+                            .ok_or_else(|| {
+                                PeerSyncError::Validation(
+                                    "clone manifest byte count overflow".to_owned(),
+                                )
+                            })?;
+                        issue_outgoing_measured_completion_offer(
+                            &registration.app_root,
+                            &device.device_id,
+                            CompletionLane::Clone,
+                            session.manifest_id(),
+                            transferred_bytes,
+                            request.peer_completion_resume.as_deref(),
+                        )
+                    }
+                    LanSession::Logical(_) => issue_outgoing_unmeasured_completion_offer(
+                        &registration.app_root,
+                        &device.device_id,
+                        CompletionLane::Delta,
+                        session.manifest_id(),
+                        request.peer_completion_resume.as_deref(),
+                    ),
+                    LanSession::BidirectionalLogical(_) => {
+                        issue_outgoing_unmeasured_completion_offer(
+                            &registration.app_root,
+                            &device.device_id,
+                            CompletionLane::Bidirectional,
+                            session.manifest_id(),
+                            request.peer_completion_resume.as_deref(),
+                        )
+                    }
+                };
+                let lease = match issued {
+                    Ok(lease) => lease,
+                    Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                        return respond_empty(stream, 409);
+                    }
+                    Err(_) => return respond_empty(stream, 500),
+                };
+                let etag = quoted(session.manifest_id());
+                return respond_bytes(
+                    stream,
+                    200,
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("ETag", &etag),
+                        (
+                            PEER_COMPLETION_CAPABILITY_HEADER,
+                            PEER_COMPLETION_CAPABILITY_V1,
+                        ),
+                        (PEER_COMPLETION_LEASE_HEADER, lease.as_str()),
+                    ],
+                    match session {
+                        LanSession::Clone(session) => session.manifest_bytes(),
+                        LanSession::Logical(session) => &session.manifest_bytes,
+                        LanSession::BidirectionalLogical(session) => {
+                            &session.logical.manifest_bytes
+                        }
+                    },
+                );
+            }
+        } else if request.peer_completion_resume.is_some() {
+            return respond_empty(stream, 400);
         }
         return respond_bytes(
             stream,
@@ -2319,8 +2483,33 @@ fn progress(
         device.info.current_object = progress.current_object;
         device.info.last_seen_unix_ms = now_ms();
     }
-    if clone_completed && progress.operation_id.is_none() {
-        if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
+    if clone_completed {
+        if let Some(completion_lease_id) = progress.operation_id.as_deref() {
+            let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+                return respond_empty(stream, 409);
+            };
+            match seal_outgoing_completion_lease(
+                &registration.app_root,
+                device_id,
+                CompletionLane::Clone,
+                completion_lease_id,
+                session.manifest_id(),
+                progress.verified_bytes,
+            ) {
+                Ok(CompletionSealStatus::Sealed | CompletionSealStatus::AlreadyCompleted) => {}
+                Ok(CompletionSealStatus::Conflict) => return respond_empty(stream, 409),
+                Err(_) => return respond_empty(stream, 500),
+            }
+        } else if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
+            match outgoing_completion_offer_active(
+                &registration.app_root,
+                device_id,
+                CompletionLane::Clone,
+            ) {
+                Ok(true) => return respond_empty(stream, 409),
+                Ok(false) => {}
+                Err(_) => return respond_empty(stream, 500),
+            }
             let receipt_id =
                 completion_receipt_id("clone", session.session_id(), session.manifest_id());
             if record_outgoing_completed_operation(
@@ -2417,6 +2606,33 @@ fn bidirectional_remote_apply(
     }
     let operation_id = request.operation_id.clone();
     let completion_deferred = request.completion_deferred_v1 == Some(true);
+    if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
+        let valid_completion_mode = if completion_deferred {
+            outgoing_completion_offer_is_current(
+                &registration.app_root,
+                &device.device_id,
+                CompletionLane::Bidirectional,
+                &operation_id,
+            )
+        } else {
+            outgoing_completion_offer_active(
+                &registration.app_root,
+                &device.device_id,
+                CompletionLane::Bidirectional,
+            )
+            .map(|active| !active)
+        };
+        match valid_completion_mode {
+            Ok(true) => {}
+            Ok(false) => return respond_empty(stream, 409),
+            Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                return respond_empty(stream, 409);
+            }
+            Err(_) => return respond_empty(stream, 500),
+        }
+    } else if completion_deferred {
+        return respond_empty(stream, 409);
+    }
     let control = session
         .bidirectional_control()
         .expect("checked bidirectional session");
@@ -2624,23 +2840,20 @@ fn completion(
     let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
         return respond_empty(stream, 404);
     };
-    let receipt_id = completion_receipt_id(
-        lane.as_str(),
-        &completion.operation_id,
-        &completion.manifest_id,
-    );
-    if record_outgoing_completed_operation(
+    match accept_outgoing_completion_offer(
         &registration.app_root,
         &device.device_id,
-        lane.as_str(),
-        &receipt_id,
+        lane,
+        &completion.operation_id,
+        &completion.manifest_id,
         completion.transferred_bytes,
-    )
-    .is_err()
-    {
-        return respond_empty(stream, 500);
+    ) {
+        Ok(CompletionAcceptance::Recorded | CompletionAcceptance::AlreadyRecorded) => {
+            respond_empty(stream, 204)
+        }
+        Ok(CompletionAcceptance::Rejected) => respond_empty(stream, 409),
+        Err(_) => respond_empty(stream, 500),
     }
-    respond_empty(stream, 204)
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -3880,7 +4093,8 @@ fn copy_exact_response(
 mod timeout_tests {
     use super::*;
     use crate::peer_sync::device_registry::{
-        CompletionLane, DevicePermissions, IncomingSourceRegistry, OutgoingDeviceRegistry,
+        seal_outgoing_completion_lease, CompletionLane, CompletionSealStatus, DevicePermissions,
+        IncomingSourceRegistry, OutgoingDeviceRegistry,
     };
     use crate::peer_sync::{
         logical_delta::{
@@ -4602,6 +4816,53 @@ mod timeout_tests {
     }
 
     #[test]
+    fn clone_manifest_completion_opt_in_safely_falls_back_when_legacy_server_omits_headers() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let session_id = "00000000-0000-4000-8000-000000000120";
+        let manifest_bytes = br#"{"objects":{}}"#.to_vec();
+        let manifest_id = sha256_hex(&manifest_bytes);
+        let response_manifest_id = manifest_id.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            assert!(
+                request.starts_with(&format!("GET /v1/sessions/{session_id}/manifest HTTP/1.1"))
+            );
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("risunest-peer-completion: v1\r\n"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"{response_manifest_id}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                manifest_bytes.len()
+            )
+            .unwrap();
+            stream.write_all(&manifest_bytes).unwrap();
+            stream.flush().unwrap();
+            finish_response(&mut stream);
+        });
+        let client = LanCloneClient {
+            client: build_clone_http_client(CONTROL_REQUEST_TIMEOUT).unwrap(),
+            ranges: HttpRangeStream::new(Duration::from_secs(3)).unwrap(),
+            control_timeout: CONTROL_REQUEST_TIMEOUT,
+            endpoint: endpoint.clone(),
+            session_id: session_id.to_owned(),
+            session_url: format!("{endpoint}/v1/sessions/{session_id}"),
+            device_id: "00000000-0000-4000-8000-000000000121".to_owned(),
+            bearer: TEST_BEARER.to_owned(),
+            source_device_id: Some("00000000-0000-4000-8000-000000000122".to_owned()),
+            manifest_id: Some(manifest_id.clone()),
+        };
+
+        let observed = client
+            .fetch_manifest_with_completion_lease(&manifest_id, None)
+            .unwrap();
+        server.join().unwrap();
+        assert!(observed.completion_lease_id.is_none());
+    }
+
+    #[test]
     fn object_head_requires_the_exact_ok_status() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let client = direct_client(listener.local_addr().unwrap());
@@ -4741,6 +5002,7 @@ mod timeout_tests {
         remote_apply_error: Mutex<Option<PeerSyncError>>,
         remote_apply_started: Mutex<Option<mpsc::Sender<()>>>,
         remote_apply_bytes: Mutex<u64>,
+        remote_apply_calls: Mutex<usize>,
     }
 
     impl LanBidirectionalControl for BidirectionalControlFixture {
@@ -4759,6 +5021,7 @@ mod timeout_tests {
             request: LanBidirectionalRemoteApplyRequest,
             cancellation: &dyn CancellationProbe,
         ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+            *self.remote_apply_calls.lock().unwrap() += 1;
             if let Some(started) = self.remote_apply_started.lock().unwrap().take() {
                 started.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -5026,6 +5289,7 @@ mod timeout_tests {
         };
 
         client.request_remote_apply(request.clone()).unwrap();
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         client.request_remote_apply(request).unwrap();
 
         let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
@@ -5240,6 +5504,33 @@ mod timeout_tests {
         );
 
         let bearer = client.bearer.clone();
+        let pending_manifest = pairing.manifest_id.clone();
+        let completion_lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        assert_eq!(
+            seal_outgoing_completion_lease(
+                source_root.path(),
+                &target_id,
+                CompletionLane::Delta,
+                completion_lease.as_str(),
+                &pending_manifest,
+                31,
+            )
+            .unwrap(),
+            CompletionSealStatus::Sealed
+        );
+        assert!(client.fetch_manifest_with_completion_lease(None).is_err());
+        assert_eq!(
+            client
+                .fetch_manifest_with_completion_lease(Some(&completion_lease))
+                .unwrap()
+                .completion_lease_id
+                .unwrap(),
+            completion_lease
+        );
         host.stop().unwrap();
         let mut restarted = LanCloneHost::prepare_logical(prepared_logical_session(
             "00000000-0000-4000-8000-000000000091",
@@ -5248,7 +5539,7 @@ mod timeout_tests {
         restarted
             .enable_v2_registry(source_root.path(), source_name, DevicePermissions::read())
             .unwrap();
-        let restarted_pairing = restarted.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        restarted.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let restarted_endpoint = format!("http://{}", restarted.address().unwrap());
         assert_eq!(
             reqwest::blocking::Client::new()
@@ -5265,8 +5556,8 @@ mod timeout_tests {
                 &bearer,
                 PeerCompletionCapability::V1,
                 CompletionLane::Delta,
-                "00000000-0000-4000-8000-000000000112",
-                &restarted_pairing.manifest_id,
+                completion_lease.as_str(),
+                &pending_manifest,
                 31,
             )
             .unwrap(),
@@ -5367,8 +5658,13 @@ mod timeout_tests {
             &pairing.claim,
         )
         .unwrap();
+        let completion_lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
         let request = LanBidirectionalRemoteApplyRequest {
-            operation_id: "00000000-0000-4000-8000-000000000110".to_owned(),
+            operation_id: completion_lease.as_str().to_owned(),
             source_endpoint: endpoint,
             source_session_id: pairing.session_id,
             source_manifest_id: pairing.manifest_id.clone(),
@@ -5385,6 +5681,7 @@ mod timeout_tests {
         };
 
         client.request_remote_apply(request.clone()).unwrap();
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
@@ -5394,21 +5691,34 @@ mod timeout_tests {
         );
         let capability = client.hello_with_capabilities().unwrap().completion;
         assert_eq!(
+            seal_outgoing_completion_lease(
+                source_root.path(),
+                &client.inner.device_id,
+                CompletionLane::Bidirectional,
+                completion_lease.as_str(),
+                &client.inner.manifest_id,
+                17,
+            )
+            .unwrap(),
+            CompletionSealStatus::Sealed
+        );
+        assert_eq!(
             client
-                .deliver_completion(capability, "00000000-0000-4000-8000-000000000110", 17,)
+                .deliver_completion(capability, completion_lease.as_str(), 17)
                 .unwrap(),
             PeerCompletionDelivery::Delivered
         );
         let mut legacy = request;
         legacy.operation_id = "00000000-0000-4000-8000-000000000111".to_owned();
         legacy.completion_deferred_v1 = None;
-        client.request_remote_apply(legacy).unwrap();
+        assert!(client.request_remote_apply(legacy).is_err());
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
                 .devices()[0]
                 .total_bytes,
-            34
+            17
         );
         host.stop().unwrap();
     }
@@ -5523,7 +5833,79 @@ mod timeout_tests {
                 .send()
                 .unwrap()
                 .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        let completion_lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        let pending_retry = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        assert_eq!(pending_retry, completion_lease);
+        let operation_id = completion_lease.as_str();
+        let valid = serde_json::json!({
+            "schema": PEER_COMPLETION_SCHEMA,
+            "lane": "delta",
+            "operationId": operation_id,
+            "manifestId": pairing.manifest_id,
+            "transferredBytes": 23
+        });
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&valid)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            seal_outgoing_completion_lease(
+                source_root.path(),
+                &client.device_id,
+                CompletionLane::Delta,
+                operation_id,
+                &pairing.manifest_id,
+                23,
+            )
+            .unwrap(),
+            CompletionSealStatus::Sealed
+        );
+        for forged in [
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":operation_id,"manifestId":pairing.manifest_id,"transferredBytes":24}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":"00000000-0000-4000-8000-000000000113","manifestId":pairing.manifest_id,"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":operation_id,"manifestId":"f".repeat(64),"transferredBytes":23}),
+        ] {
+            assert_eq!(
+                raw.post(&url)
+                    .bearer_auth(&client.bearer)
+                    .json(&forged)
+                    .send()
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&valid)
+                .send()
+                .unwrap()
+                .status(),
             reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            client
+                .fetch_manifest_with_completion_lease(Some(&completion_lease))
+                .unwrap()
+                .completion_lease_id
+                .unwrap(),
+            completion_lease
         );
         let capability = client.hello_with_capabilities().unwrap().completion;
         assert_eq!(
@@ -5532,8 +5914,68 @@ mod timeout_tests {
                 .unwrap(),
             PeerCompletionDelivery::Delivered
         );
+        let mismatched_retry = serde_json::json!({
+            "schema": PEER_COMPLETION_SCHEMA,
+            "lane": "delta",
+            "operationId": operation_id,
+            "manifestId": pairing.manifest_id,
+            "transferredBytes": 24
+        });
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&mismatched_retry)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+
+        let next_completion_lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        let next_operation_id = next_completion_lease.as_str();
+        assert_eq!(
+            seal_outgoing_completion_lease(
+                source_root.path(),
+                &client.device_id,
+                CompletionLane::Delta,
+                next_operation_id,
+                &pairing.manifest_id,
+                7,
+            )
+            .unwrap(),
+            CompletionSealStatus::Sealed
+        );
+        let next = serde_json::json!({
+            "schema": PEER_COMPLETION_SCHEMA,
+            "lane": "delta",
+            "operationId": next_operation_id,
+            "manifestId": pairing.manifest_id,
+            "transferredBytes": 7
+        });
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&next)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&valid)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
         let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
-        assert_eq!(registry.devices()[0].total_bytes, 23);
+        assert_eq!(registry.devices()[0].total_bytes, 30);
         host.stop().unwrap();
     }
 
@@ -5568,13 +6010,30 @@ mod timeout_tests {
         device.total_bytes = u64::MAX;
         registry.upsert(device).unwrap();
         registry.save().unwrap();
+        let completion_lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        assert_eq!(
+            seal_outgoing_completion_lease(
+                source_root.path(),
+                &client.device_id,
+                CompletionLane::Delta,
+                completion_lease.as_str(),
+                &pairing.manifest_id,
+                1,
+            )
+            .unwrap(),
+            CompletionSealStatus::Sealed
+        );
 
         let result = deliver_peer_completion(
             &endpoint,
             &client.bearer,
             PeerCompletionCapability::V1,
             CompletionLane::Delta,
-            "00000000-0000-4000-8000-000000000105",
+            completion_lease.as_str(),
             &pairing.manifest_id,
             1,
         );
@@ -5591,7 +6050,7 @@ mod timeout_tests {
                 &client.bearer,
                 PeerCompletionCapability::V1,
                 CompletionLane::Delta,
-                "00000000-0000-4000-8000-000000000105",
+                completion_lease.as_str(),
                 &pairing.manifest_id,
                 1,
             )
@@ -6877,13 +7336,34 @@ impl LanLogicalDeltaClient {
     }
 
     pub fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
-        let response = self
-            .authorized_control(
-                self.control_client
-                    .get(format!("{}/manifest", self.session_url)),
-            )
-            .send()
-            .map_err(transport)?;
+        Ok(self.fetch_manifest_request(false, None)?.bytes)
+    }
+
+    pub(crate) fn fetch_manifest_with_completion_lease(
+        &self,
+        resume_lease_id: Option<&CompletionLeaseId>,
+    ) -> Result<LanCompletionManifestResponse, PeerSyncError> {
+        self.fetch_manifest_request(true, resume_lease_id)
+    }
+
+    fn fetch_manifest_request(
+        &self,
+        completion_v1: bool,
+        resume_lease_id: Option<&CompletionLeaseId>,
+    ) -> Result<LanCompletionManifestResponse, PeerSyncError> {
+        let mut request = self
+            .control_client
+            .get(format!("{}/manifest", self.session_url));
+        if completion_v1 {
+            request = request.header(
+                PEER_COMPLETION_CAPABILITY_HEADER,
+                PEER_COMPLETION_CAPABILITY_V1,
+            );
+            if let Some(resume_lease_id) = resume_lease_id {
+                request = request.header(PEER_COMPLETION_RESUME_HEADER, resume_lease_id.as_str());
+            }
+        }
+        let response = self.authorized_control(request).send().map_err(transport)?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
@@ -6903,6 +7383,11 @@ impl LanLogicalDeltaClient {
             .ok_or_else(|| {
                 PeerSyncError::Protocol("logical delta manifest ETag is missing".to_owned())
             })?;
+        let completion_lease_id = if completion_v1 {
+            parse_completion_lease_headers(response.headers())?
+        } else {
+            None
+        };
         let mut bytes = Vec::new();
         response
             .take(MAX_MANIFEST_BYTES as u64 + 1)
@@ -6920,7 +7405,10 @@ impl LanLogicalDeltaClient {
                 received,
             });
         }
-        Ok(bytes)
+        Ok(LanCompletionManifestResponse {
+            bytes,
+            completion_lease_id,
+        })
     }
 
     fn authorized_control(
@@ -7238,6 +7726,14 @@ impl LanBidirectionalLogicalClient {
 
     pub(crate) fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
         self.inner.fetch_manifest()
+    }
+
+    pub(crate) fn fetch_manifest_with_completion_lease(
+        &self,
+        resume_lease_id: Option<&CompletionLeaseId>,
+    ) -> Result<LanCompletionManifestResponse, PeerSyncError> {
+        self.inner
+            .fetch_manifest_with_completion_lease(resume_lease_id)
     }
 
     pub(crate) fn register(
