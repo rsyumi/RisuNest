@@ -77,7 +77,7 @@ describe('RisuNestStorageDashboard', () => {
         expect(button('Clean up sync temp files')).toBeUndefined()
 
         button('Calculate size')?.click()
-        await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB'))
+        await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB used'))
         await vi.waitFor(() => expect(button('Clean up sync temp files')?.disabled).toBe(false))
         button('Clean up sync temp files')?.click()
         await vi.waitFor(() => expect(maintenance.cleanupPeerTemp).toHaveBeenCalledOnce())
@@ -96,5 +96,48 @@ describe('RisuNestStorageDashboard', () => {
         const peerDelete = [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.dataset.path === 'peer.risudat')
         peerDelete?.click()
         await vi.waitFor(() => expect(alerts.alertError).toHaveBeenCalledWith("This backup is used by a sync in progress and can't be deleted."))
+    })
+
+    it('surfaces a temporary-size failure with safe localized copy', async () => {
+        const target = setup()
+        maintenance.getPeerTempUsage.mockRejectedValue(new Error('private native detail'))
+        await vi.waitFor(() => expect(target.textContent).toContain('Calculate size'))
+
+        ;[...target.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.trim() === 'Calculate size')?.click()
+
+        await vi.waitFor(() => expect(alerts.alertError).toHaveBeenCalledWith("Couldn't calculate temporary file size. Refresh the information and try again."))
+        expect(alerts.alertError.mock.calls.at(-1)?.[0]).not.toContain("wasn't changed")
+    })
+
+    it('disables only the active action and prevents its duplicate submission', async () => {
+        const target = setup()
+        let resolveTemp: ((value: { count: number; bytes: number }) => void) | undefined
+        maintenance.getPeerTempUsage.mockImplementation(() => new Promise((resolve) => { resolveTemp = resolve }))
+        await vi.waitFor(() => expect(target.textContent).toContain('Calculate size'))
+        const button = (text: string) => [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === text)
+
+        button('Calculate size')?.click()
+        await tick()
+        expect(button('Calculate size')?.disabled).toBe(true)
+        expect(button('Create snapshot now')?.disabled).toBe(false)
+        expect(button('Clean up unused images')?.disabled).toBe(false)
+        button('Calculate size')?.click()
+        expect(maintenance.getPeerTempUsage).toHaveBeenCalledOnce()
+
+        resolveTemp?.({ count: 1, bytes: 1024 })
+        await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB used'))
+    })
+
+    it('keeps stale totals visible and offers retry after a post-snapshot reload fails', async () => {
+        const target = setup()
+        maintenance.createNativePersistentSnapshot.mockResolvedValue({ path: 'new.db', bytes: 1, modifiedAt: 4 })
+        await vi.waitFor(() => expect(target.textContent).toContain('Total data'))
+        maintenance.getNativePersistentStorageStats.mockRejectedValueOnce(new Error('reload failed'))
+
+        ;[...target.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.trim() === 'Create snapshot now')?.click()
+
+        await vi.waitFor(() => expect(target.textContent).toContain('Storage totals may be out of date.'))
+        expect(target.textContent).toContain('Total data')
+        expect(target.textContent).toContain('Retry')
     })
 })

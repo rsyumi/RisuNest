@@ -79,6 +79,7 @@ describe('RisuNest Android platform settings', () => {
         expect(target.textContent).toContain('140.0.1')
         expect(target.textContent).toContain('foreground')
         expect(target.querySelector('[role="status"][aria-live="polite"]')).not.toBeNull()
+        expect(target.querySelector('[role="status"] button')).toBeNull()
         target.querySelector('button')?.click()
         expect(mocks.openNotificationSettings).toHaveBeenCalledOnce()
         mocks.updateDeviceSettings.mockClear()
@@ -91,6 +92,7 @@ describe('RisuNest Android platform settings', () => {
         const target = mountPlatform(false)
         await tick()
         expect(target.textContent).toContain("This feature doesn't work while notifications are off.")
+        expect(target.querySelector('[role="alert"]')).not.toBeNull()
 
         mocks.notificationStatus = true
         window.dispatchEvent(new Event('focus'))

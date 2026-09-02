@@ -51,10 +51,18 @@
         conflictBackups: language.risuNest.storage.conflictBackups,
     }
 
-    function showActionError(error: unknown): void {
+    function showActionError(error: unknown, fallback = language.risuNest.storage.actionFailed): void {
         alertError(isNativePeerBackupDeleteError(error)?.code === 'peer-backup-in-use'
             ? language.risuNest.storage.syncBackupInUse
-            : language.risuNest.storage.actionFailed)
+            : fallback)
+    }
+
+    function isBusy(action: string): boolean {
+        return state.busy.includes(action)
+    }
+
+    async function calculateTempSize(): Promise<void> {
+        try { await dashboard.calculateTempSize() } catch (error) { showActionError(error, language.risuNest.storage.calculateSizeFailed) }
     }
 
     async function cleanTemp(): Promise<void> {
@@ -102,13 +110,14 @@
 </script>
 
 <h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.storage.title}</h2>
+{#if state.loadFailed}
+    <div class="text-textcolor2" role="alert" aria-live="assertive">
+        <span>{rollup ? language.risuNest.storage.staleTotals : language.risuNest.storage.loadFailed}</span>
+        <Button size="sm" disabled={state.loading} onclick={() => dashboard.load()}>{language.risuNest.storage.retry}</Button>
+    </div>
+{/if}
 {#if state.loading && !rollup}
     <span class="text-textcolor2" role="status" aria-live="polite">{language.loading}</span>
-{:else if state.loadFailed && !rollup}
-    <div class="text-textcolor2" role="alert" aria-live="assertive">
-        <span>{language.risuNest.storage.loadFailed}</span>
-        <Button size="sm" disabled={state.loading || state.busy !== null} onclick={() => dashboard.load()}>{language.risuNest.storage.retry}</Button>
-    </div>
 {:else if rollup}
     <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
         {#each rollup.cards as card}
@@ -129,16 +138,19 @@
     </p>
 
     <div class="mt-3 flex flex-wrap gap-2">
-        <Button disabled={state.loading || state.busy !== null} onclick={createSnapshot}>{language.risuNest.storage.createSnapshot}</Button>
+        <Button disabled={isBusy('create-snapshot')} onclick={createSnapshot}>{language.risuNest.storage.createSnapshot}</Button>
         {#if state.tempUsage}
-            <Button disabled={state.loading || state.busy !== null} onclick={cleanTemp}>{language.risuNest.storage.cleanSyncTemp}</Button>
+            <Button disabled={isBusy('cleanup-temp')} onclick={cleanTemp}>{language.risuNest.storage.cleanSyncTemp}</Button>
         {:else}
-            <Button disabled={state.loading || state.busy !== null} onclick={() => dashboard.calculateTempSize()}>{language.risuNest.storage.calculateSize}</Button>
+            <Button disabled={isBusy('calculate-temp')} onclick={calculateTempSize}>{language.risuNest.storage.calculateSize}</Button>
         {/if}
-        <Button disabled={state.loading || state.busy !== null} onclick={runGc}>{language.risuNest.storage.gcRun}</Button>
+        <Button disabled={isBusy('preview-gc') || isBusy('execute-gc')} onclick={runGc}>{language.risuNest.storage.gcRun}</Button>
     </div>
     <div role="status" aria-live="polite">
-        <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.cleanSyncTempNote}{#if state.tempUsage} {formatRisuNestStorageBytes(state.tempUsage.bytes)}{/if}</p>
+        <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.cleanSyncTempNote}</p>
+        {#if state.tempUsage}
+            <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.tempUsage.replace('{size}', formatRisuNestStorageBytes(state.tempUsage.bytes))}</p>
+        {/if}
         {#if state.gcPreview}
             <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.gcResult.replace('{0}', String(state.gcPreview.candidateCount)).replace('{1}', formatRisuNestStorageBytes(state.gcPreview.candidateBytes))}</p>
         {/if}
@@ -147,19 +159,19 @@
     <details class="mt-3">
         <summary>{language.risuNest.storage.snapshots}</summary>
         {#each state.snapshots as snapshot}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button disabled={state.loading || state.busy !== null} onclick={() => deleteSnapshot(snapshot.path)}>{language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button disabled={isBusy(`delete-snapshot:${snapshot.path}`)} onclick={() => deleteSnapshot(snapshot.path)}>{language.remove}</button></div>
         {/each}
     </details>
     <details class="mt-2">
         <summary>{language.risuNest.storage.conflictBackups}</summary>
         {#each state.conflictBackups as backup}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.createdAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.byteLength)})</span><button disabled={state.loading || state.busy !== null} onclick={() => deleteConflictBackup(backup.id)}>{language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.createdAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.byteLength)})</span><button disabled={isBusy(`delete-conflict-backup:${backup.id}`)} onclick={() => deleteConflictBackup(backup.id)}>{language.remove}</button></div>
         {/each}
     </details>
     <details class="mt-2">
         <summary>{language.risuNest.storage.syncBackups}</summary>
         {#each state.peerBackups as backup}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.bytes)})</span><button data-path={backup.path} disabled={state.loading || state.busy !== null} onclick={() => deletePeerBackup(backup.path)}>{language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.bytes)})</span><button data-path={backup.path} disabled={isBusy(`delete-peer-backup:${backup.path}`)} onclick={() => deletePeerBackup(backup.path)}>{language.remove}</button></div>
         {/each}
     </details>
 {/if}

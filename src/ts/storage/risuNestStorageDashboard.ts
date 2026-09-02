@@ -13,7 +13,7 @@ export type RisuNestStorageCardId = 'total' | 'media' | 'inlays' | 'plugins' | '
 export interface RisuNestStorageDashboardSnapshot {
     loading: boolean
     loadFailed: boolean
-    busy: string | null
+    busy: string[]
     stats: NativePersistentStorageStats | null
     snapshots: NativeSnapshotInfo[]
     conflictBackups: SyncConflictBackupEntry[]
@@ -91,7 +91,7 @@ export function storageDashboardRollup(
 
 export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDependencies) {
     let state: RisuNestStorageDashboardSnapshot = {
-        loading: false, loadFailed: false, busy: null, stats: null,
+        loading: false, loadFailed: false, busy: [], stats: null,
         snapshots: [], conflictBackups: [], peerBackups: [], tempUsage: null, gcPreview: null,
     }
     const listeners = new Set<(snapshot: RisuNestStorageDashboardSnapshot) => void>()
@@ -100,26 +100,40 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
         state = { ...state, ...next }
         publish()
     }
+    const activeActions = new Set<string>()
+    let latestReload = 0
+    let pendingReloads = 0
+    const publishBusy = () => update({ busy: [...activeActions] })
+    const invalidatePendingReloads = () => {
+        if (pendingReloads === 0) return
+        latestReload += 1
+        update({ loadFailed: true })
+    }
     const run = async <T>(busy: string, action: () => Promise<T>): Promise<T | undefined> => {
-        if (state.busy || state.loading) return undefined
-        update({ busy })
+        if (activeActions.has(busy) || (state.loading && !state.stats)) return undefined
+        activeActions.add(busy)
+        publishBusy()
         try {
             return await action()
         } finally {
-            update({ busy: null })
+            activeActions.delete(busy)
+            publishBusy()
         }
     }
     const reload = async (): Promise<void> => {
-        update({ loading: true, loadFailed: false })
+        const reloadId = ++latestReload
+        pendingReloads += 1
+        update({ loading: true })
         try {
             const [stats, snapshots, conflictBackups, peerBackups] = await Promise.all([
                 deps.getStats(), deps.listSnapshots(), deps.listConflictBackups(), deps.listPeerBackups(),
             ])
-            update({ stats, snapshots, conflictBackups, peerBackups, loadFailed: false })
+            if (reloadId === latestReload) update({ stats, snapshots, conflictBackups, peerBackups, loadFailed: false })
         } catch {
-            update({ loadFailed: true })
+            if (reloadId === latestReload) update({ loadFailed: true })
         } finally {
-            update({ loading: false })
+            pendingReloads -= 1
+            update({ loading: pendingReloads > 0 })
         }
     }
 
@@ -131,7 +145,7 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
             return () => listeners.delete(listener)
         },
         async load(): Promise<void> {
-            if (state.busy || state.loading) return
+            if (state.loading) return
             await reload()
         },
         async calculateTempSize() {
@@ -164,20 +178,23 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
             })
         },
         async deleteSnapshot(path: string) {
-            return run('delete-snapshot', async () => {
+            return run(`delete-snapshot:${path}`, async () => {
                 await deps.deleteSnapshot(path)
+                invalidatePendingReloads()
                 update({ snapshots: state.snapshots.filter((snapshot) => snapshot.path !== path) })
             })
         },
         async deleteConflictBackup(id: string) {
-            return run('delete-conflict-backup', async () => {
+            return run(`delete-conflict-backup:${id}`, async () => {
                 await deps.deleteConflictBackup(id)
+                invalidatePendingReloads()
                 update({ conflictBackups: state.conflictBackups.filter((backup) => backup.id !== id) })
             })
         },
         async deletePeerBackup(path: string) {
-            return run('delete-peer-backup', async () => {
+            return run(`delete-peer-backup:${path}`, async () => {
                 await deps.deletePeerBackup(path)
+                invalidatePendingReloads()
                 update({ peerBackups: state.peerBackups.filter((backup) => backup.path !== path) })
             })
         },

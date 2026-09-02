@@ -104,9 +104,9 @@ describe('RisuNest storage dashboard view model', () => {
         await dashboard.calculateTempSize()
 
         const cleanup = dashboard.cleanupTemp()
-        expect(dashboard.snapshot().busy).toBe('cleanup-temp')
+        expect(dashboard.snapshot().busy).toContain('cleanup-temp')
         await dashboard.previewGc()
-        expect(previewGc).not.toHaveBeenCalled()
+        expect(previewGc).toHaveBeenCalledOnce()
         resolveCleanup?.()
         await cleanup
         expect(dashboard.snapshot().tempUsage).toEqual({ count: 0, bytes: 0 })
@@ -115,5 +115,107 @@ describe('RisuNest storage dashboard view model', () => {
         expect(dashboard.snapshot().gcPreview).toMatchObject({ candidateCount: 2, candidateBytes: 1024 })
         await dashboard.executeGc()
         expect(executeGc).toHaveBeenCalledOnce()
+    })
+
+    it('blocks duplicate actions while allowing a different action to run', async () => {
+        let resolveTemp: ((value: { count: number; bytes: number }) => void) | undefined
+        const getTemp = vi.fn(() => new Promise<{ count: number; bytes: number }>((resolve) => { resolveTemp = resolve }))
+        const previewGc = vi.fn().mockResolvedValue({ candidateCount: 0, candidateBytes: 0, deletedCount: 0, deletedBytes: 0, blockers: [] })
+        const dashboard = createRisuNestStorageDashboard({
+            getStats: vi.fn().mockResolvedValue(stats), listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp, cleanupTemp: vi.fn(), previewGc, executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
+        })
+        await dashboard.load()
+
+        const calculation = dashboard.calculateTempSize()
+        await dashboard.calculateTempSize()
+        await dashboard.previewGc()
+
+        expect(getTemp).toHaveBeenCalledOnce()
+        expect(previewGc).toHaveBeenCalledOnce()
+        expect(dashboard.snapshot().busy).toEqual(['calculate-temp'])
+        resolveTemp?.({ count: 1, bytes: 1024 })
+        await calculation
+        expect(dashboard.snapshot().busy).toEqual([])
+    })
+
+    it('marks retained totals stale when a post-action reload fails', async () => {
+        const getStats = vi.fn().mockResolvedValueOnce(stats).mockRejectedValueOnce(new Error('reload failed'))
+        const dashboard = createRisuNestStorageDashboard({
+            getStats, listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp: vi.fn(), cleanupTemp: vi.fn(), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn().mockResolvedValue({}),
+        })
+        await dashboard.load()
+        await dashboard.createSnapshot()
+
+        expect(dashboard.snapshot()).toMatchObject({ stats, loadFailed: true, loading: false })
+    })
+
+    it('keeps the stale marker visible while a retry is pending', async () => {
+        let resolveRetry: ((value: typeof stats) => void) | undefined
+        const getStats = vi.fn()
+            .mockResolvedValueOnce(stats)
+            .mockRejectedValueOnce(new Error('reload failed'))
+            .mockImplementationOnce(() => new Promise<typeof stats>((resolve) => { resolveRetry = resolve }))
+        const dashboard = createRisuNestStorageDashboard({
+            getStats, listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp: vi.fn(), cleanupTemp: vi.fn(), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn().mockResolvedValue({}),
+        })
+        await dashboard.load()
+        await dashboard.createSnapshot()
+
+        const retry = dashboard.load()
+        expect(dashboard.snapshot()).toMatchObject({ stats, loadFailed: true, loading: true })
+        resolveRetry?.(stats)
+        await retry
+        expect(dashboard.snapshot()).toMatchObject({ stats, loadFailed: false, loading: false })
+    })
+
+    it('keeps concurrent reloads loading and ignores an older response that finishes last', async () => {
+        const pendingReloads: Array<(value: typeof stats) => void> = []
+        const getStats = vi.fn()
+            .mockResolvedValueOnce(stats)
+            .mockImplementation(() => new Promise<typeof stats>((resolve) => { pendingReloads.push(resolve) }))
+        const newerStats = { ...stats, databaseBytes: 9 * 1024 * 1024 }
+        const olderStats = { ...stats, databaseBytes: 4 * 1024 * 1024 }
+        const dashboard = createRisuNestStorageDashboard({
+            getStats, listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp: vi.fn(), cleanupTemp: vi.fn(), previewGc: vi.fn(), executeGc: vi.fn().mockResolvedValue({}), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn().mockResolvedValue({}),
+        })
+        await dashboard.load()
+
+        const snapshotAction = dashboard.createSnapshot()
+        const gcAction = dashboard.executeGc()
+        await vi.waitFor(() => expect(pendingReloads).toHaveLength(2))
+
+        pendingReloads[1](newerStats)
+        await vi.waitFor(() => expect(dashboard.snapshot().stats).toBe(newerStats))
+        expect(dashboard.snapshot().loading).toBe(true)
+
+        pendingReloads[0](olderStats)
+        await Promise.all([snapshotAction, gcAction])
+        expect(dashboard.snapshot()).toMatchObject({ stats: newerStats, loading: false, loadFailed: false })
+    })
+
+    it('does not restore a deleted row from a reload that was already pending', async () => {
+        let resolveReload: ((value: typeof stats) => void) | undefined
+        const getStats = vi.fn()
+            .mockResolvedValueOnce(stats)
+            .mockImplementationOnce(() => new Promise<typeof stats>((resolve) => { resolveReload = resolve }))
+        const deleteSnapshot = vi.fn().mockResolvedValue(undefined)
+        const dashboard = createRisuNestStorageDashboard({
+            getStats, listSnapshots: vi.fn().mockResolvedValue(snapshots), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp: vi.fn(), cleanupTemp: vi.fn(), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot, deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
+        })
+        await dashboard.load()
+
+        const reload = dashboard.load()
+        await vi.waitFor(() => expect(dashboard.snapshot().loading).toBe(true))
+        await dashboard.deleteSnapshot('snapshot.db')
+        expect(dashboard.snapshot().snapshots).toEqual([])
+
+        resolveReload?.(stats)
+        await reload
+        expect(dashboard.snapshot()).toMatchObject({ snapshots: [], loadFailed: true, loading: false })
     })
 })

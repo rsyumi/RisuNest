@@ -135,6 +135,7 @@ describe('RisuNestLogViewer', () => {
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
         expect(checkbox.classList.contains('sr-only')).toBe(true)
         expect(checkbox.classList.contains('hidden')).toBe(false)
+        expect(checkbox.closest('label')?.className).toContain('focus-within:ring-selected')
         checkbox.checked = false
         checkbox.dispatchEvent(new Event('change', { bubbles: true }))
         await Promise.resolve()
@@ -150,13 +151,10 @@ describe('RisuNestLogViewer', () => {
 
     it('shows localized failure copy without rendering raw command details', async () => {
         nativeLog.getNativeLogTail.mockRejectedValue(new Error('native command detail'))
-        const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-
         await render()
 
         expect(target.textContent).toContain('Localized error')
         expect(target.textContent).not.toContain('native command detail')
-        expect(error).toHaveBeenCalledWith('Native log viewer command failed', expect.any(Error))
         expect(target.querySelector('[role="alert"][aria-live="assertive"]')).not.toBeNull()
     })
 
@@ -187,7 +185,6 @@ describe('RisuNestLogViewer', () => {
         nativeLog.setNativeLogFileEnabled.mockImplementation(() => new Promise<void>((_resolve, reject) => {
             rejectNativeUpdate = reject
         }))
-        const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         await render()
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
 
@@ -202,7 +199,6 @@ describe('RisuNestLogViewer', () => {
         expect(checkbox.disabled).toBe(false)
         expect(checkbox.checked).toBe(true)
         expect(deviceSettings.updateDeviceSettings).not.toHaveBeenCalled()
-        expect(error).toHaveBeenCalledWith('Native log viewer command failed', expect.any(Error))
     })
 
     it('loads the file path once when enabling file logging', async () => {

@@ -6,11 +6,12 @@ import storageSource from './RisuNestStorageDashboard.svelte?raw'
 import englishSource from 'src/lang/en.ts?raw'
 
 describe('RisuNest settings accessibility and copy', () => {
-    it('labels the performance profile as a selected single-choice control', () => {
-        expect(performanceSource).toContain('role="radiogroup"')
+    it('labels the performance profile as a pressed button group', () => {
+        expect(performanceSource).toContain('role="group"')
         expect(performanceSource).toContain('aria-label={language.risuNest.perf.profile}')
-        expect(performanceSource).toContain('role="radio"')
-        expect(performanceSource).toContain('aria-checked=')
+        expect(performanceSource).toContain('aria-pressed=')
+        expect(performanceSource).not.toContain('role="radio"')
+        expect(performanceSource).not.toContain('text-white')
     })
 
     it('uses localized loading and async status regions', () => {
@@ -18,6 +19,7 @@ describe('RisuNest settings accessibility and copy', () => {
         expect(storageSource).not.toContain('Loading...')
         expect(storageSource).toContain('aria-live="polite"')
         expect(backupSource).toContain('aria-live="polite"')
+        expect(backupSource).not.toContain('console.error')
     })
 
     it('uses the theme error token', () => {

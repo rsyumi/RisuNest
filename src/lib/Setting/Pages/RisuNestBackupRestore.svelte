@@ -33,7 +33,6 @@
     }
 
     function showRisuSaveError(error: unknown): void {
-        console.error('RisuSave operation failed', error)
         const partialDestinationMayRemain = hasPartialDestinationWarning(error)
         if (error instanceof DOMException && error.name === 'AbortError') {
             alertPartialDestinationWarning(error, language.screenshotPartialDestinationMayRemain, alertError)
@@ -104,7 +103,7 @@
                 restart: restartNativeApp,
                 onEmpty: () => alertNormal(language.noLocalSnapshots),
             })
-        } catch (error) { console.error('Native snapshot restore failed', error); alertError(language.risuNest.backup.actionFailed) }
+        } catch { alertError(language.risuNest.backup.actionFailed) }
     }} className="mt-2">{language.restoreLocalSnapshot}</Button>
 {/if}
 <Button onclick={() => openSyncConflictBackups()} className="mt-2">{language.syncConflictBackups}</Button>
@@ -115,14 +114,14 @@
         try {
             const result = await getNativeOfficialAccountFlow().restore()
             if (result.kind === 'missing') alertNormal(language.risuNest.backup.officialMissing)
-        } catch (error) { console.error('Official account restore failed', error); alertError(language.risuNest.backup.actionFailed) }
+        } catch { alertError(language.risuNest.backup.actionFailed) }
     })} className="mt-2">{language.risuNest.backup.officialRestore}</Button>
     <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {
         if (!await alertConfirm(language.risuNest.backup.officialPublishConfirm)) return
         const controller = new AbortController()
         nativePublishController = controller
         try { await getNativeOfficialAccountFlow().publish(controller.signal); alertNormal(language.risuNest.backup.officialPublished) }
-        catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) { console.error('Official account publish failed', error); alertError(language.risuNest.backup.actionFailed) } }
+        catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) alertError(language.risuNest.backup.actionFailed) }
         finally { if (nativePublishController === controller) nativePublishController = null }
     })} className="mt-2">{language.risuNest.backup.officialPublish}</Button>
     {#if nativePublishController}

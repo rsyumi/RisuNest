@@ -40,8 +40,7 @@
         try {
             entries = await getNativeLogTail()
             errorMessage = ''
-        } catch (error) {
-            console.error('Native log viewer command failed', error)
+        } catch {
             errorMessage = language.error
         }
         if (fileLogEnabled) await loadFilePath()
@@ -50,8 +49,7 @@
     async function loadFilePath() {
         try {
             fileLogPath = await getNativeLogFilePath()
-        } catch (error) {
-            console.error('Native log viewer command failed', error)
+        } catch {
             errorMessage = language.error
         }
     }
@@ -83,8 +81,7 @@
             updateDeviceSettings({ nativeFileLogEnabled: enabled })
             fileLogEnabled = enabled
             if (enabled) await loadFilePath()
-        } catch (error) {
-            console.error('Native log viewer command failed', error)
+        } catch {
             fileLogEnabled = getDeviceSettings().nativeFileLogEnabled
             errorMessage = language.error
         } finally {
@@ -104,7 +101,7 @@
         </button>
     </div>
 
-    <label class="flex items-center gap-2 cursor-pointer">
+    <label class="flex items-center gap-2 cursor-pointer rounded-md focus-within:ring-2 focus-within:ring-selected">
         <input
             class="sr-only"
             type="checkbox"

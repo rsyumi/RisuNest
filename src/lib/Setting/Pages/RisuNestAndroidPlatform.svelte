@@ -51,13 +51,13 @@
 
 {#if notificationStatus !== null}
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.platform.title}</h2>
-    <div class="flex flex-col gap-2 text-textcolor" role="status" aria-live="polite">
-        <span>{language.risuNest.platform.notifications}: {notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}</span>
+    <div class="flex flex-col gap-2 text-textcolor">
+        <span role="status" aria-live="polite">{language.risuNest.platform.notifications}: {notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}</span>
         <Button onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
         <Check bind:check={keepAlive} name={language.risuNest.platform.keepAlive} />
         <span class="text-textcolor2 text-sm">{language.risuNest.platform.keepAliveHelp}</span>
         {#if !notificationStatus}
-            <span class="text-draculared text-sm">{language.risuNest.platform.keepAliveNeedsNotifications}</span>
+            <span class="text-draculared text-sm" role="alert">{language.risuNest.platform.keepAliveNeedsNotifications}</span>
         {/if}
         <span>{language.risuNest.platform.operatingSystem}: {operatingSystem}</span>
         <span>{language.risuNest.platform.webView}: {webView}</span>
