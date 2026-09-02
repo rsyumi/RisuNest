@@ -142,6 +142,7 @@ export function createDeviceSyncController(options: {
     let activeWork: Promise<unknown> | undefined
     let sourceEpoch = 0
     let stagedLinkEpoch = 0
+    let rehostPrepared = false
     let disposed = false
 
     const publish = (): void => {
@@ -412,7 +413,9 @@ export function createDeviceSyncController(options: {
                     observeSource(snapshot.source)
                     throw fail(error, 'source')
                 }
-                return updateSource(() => options.facade.status(), epoch)
+                const source = await updateSource(() => options.facade.status(), epoch)
+                rehostPrepared = false
+                return source
             })
         },
         rotateLink(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
@@ -431,18 +434,21 @@ export function createDeviceSyncController(options: {
                 const epoch = beginSourceLifecycle()
                 try {
                     let source = snapshot.source
-                    if (source.phase === 'idle' || source.phase === 'error') {
+                    if (source.phase === 'prepared') rehostPrepared = true
+                    if ((source.phase === 'idle' || source.phase === 'error') && !rehostPrepared) {
                         source = await options.facade.prepare(settings)
                         if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
+                        rehostPrepared = true
                         update({
                             source,
                             sourceError: source.latestError ?? null,
                             error: source.latestError ?? snapshot.workError,
                         })
                     }
-                    if (source.phase !== 'prepared') throw new DeviceSyncError('unavailable')
+                    if (!rehostPrepared) throw new DeviceSyncError('unavailable')
                     source = await options.facade.start(permissions)
                     if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
+                    rehostPrepared = false
                     update({ source, sourceError: null, workError: null, error: null })
                     observeSource(source)
                     return source

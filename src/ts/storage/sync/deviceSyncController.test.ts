@@ -965,6 +965,7 @@ describe('device sync controller', () => {
     })
 
     it('retains the prepared source after rehost start fails so retry does not prepare twice', async () => {
+        vi.useFakeTimers()
         const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
         const start = vi.fn()
             .mockRejectedValueOnce(new Error('start failed'))
@@ -976,8 +977,12 @@ describe('device sync controller', () => {
             acknowledge: vi.fn(), abandon: vi.fn(),
         }
         const controller = createDeviceSyncController({
-            facade: { ...sourceFacade(prepare), start },
+            facade: {
+                ...sourceFacade(prepare), start,
+                status: async () => ({ phase: 'error' as const, latestError: 'transport-unavailable' as const }),
+            },
             targets: { bidirectional },
+            sourcePollMilliseconds: 10,
         })
         const settings = { method: 'lan' as const, fixedPort: 32145, publicBaseUrl: '' }
         const permissions = { read: true, bidirectional: false }
@@ -985,6 +990,8 @@ describe('device sync controller', () => {
         await expect(controller.rehostBidirectionalSource(settings, permissions))
             .rejects.toMatchObject({ code: 'operation-failed' })
         expect(controller.snapshot().source.phase).toBe('prepared')
+        await vi.advanceTimersByTimeAsync(10)
+        expect(controller.snapshot().source.phase).toBe('error')
 
         await controller.rehostBidirectionalSource(settings, permissions)
 
