@@ -4798,6 +4798,71 @@ mod tests {
     }
 
     #[test]
+    fn production_target_does_not_report_a_foreign_same_manifest_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let target_root = directory.path().join("peer-target");
+        let manifest_id = "abababababababababababababababababababababababababababababababab";
+        let old_session_id = uuid::Uuid::new_v4().to_string();
+        let mut old_observer = |_path: &Path| Ok(());
+        let mut target = LosslessCloneTargetAdapter::new_with_owned_backup_observer(
+            &mut store,
+            &cas,
+            &target_root,
+            1,
+            &NeverCancelled,
+            manifest_id,
+            &old_session_id,
+            &mut old_observer,
+        )
+        .unwrap();
+        let mut stage = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut stage,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming),
+            )
+            .unwrap();
+        target.leave_durable_job_after_commit_once_for_test();
+        assert!(target
+            .activate_if_current(&mut stage, None, manifest_id)
+            .is_err());
+        drop(target);
+
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+        let mut observed = Vec::new();
+        let mut new_observer = |path: &Path| {
+            observed.push(path.to_owned());
+            Ok(())
+        };
+        let target = LosslessCloneTargetAdapter::new_with_owned_backup_observer(
+            &mut store,
+            &cas,
+            &target_root,
+            2,
+            &NeverCancelled,
+            manifest_id,
+            &new_session_id,
+            &mut new_observer,
+        )
+        .unwrap();
+
+        assert_eq!(target.committed_backup_path(), None);
+        drop(target);
+        assert!(observed.is_empty());
+        assert_eq!(
+            fs::read_dir(target_root.join("backups")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
     fn production_target_retries_same_manifest_with_a_new_pre_replacement_backup() {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path();

@@ -378,6 +378,8 @@ struct TargetRuntime {
     #[cfg(test)]
     fail_finalize_cleanup_once: bool,
     #[cfg(test)]
+    fail_finalize_backup_receipt_once: bool,
+    #[cfg(test)]
     fail_release_cleanup_once: bool,
 }
 
@@ -1210,6 +1212,8 @@ impl PeerCloneCommandState {
             #[cfg(test)]
             fail_finalize_cleanup_once: false,
             #[cfg(test)]
+            fail_finalize_backup_receipt_once: false,
+            #[cfg(test)]
             fail_release_cleanup_once: false,
         });
         Ok(result)
@@ -1290,6 +1294,8 @@ impl PeerCloneCommandState {
             #[cfg(test)]
             fail_finalize_cleanup_once: false,
             #[cfg(test)]
+            fail_finalize_backup_receipt_once: false,
+            #[cfg(test)]
             fail_release_cleanup_once: false,
         });
         Ok(result)
@@ -1339,6 +1345,16 @@ impl PeerCloneCommandState {
             PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
         })?;
         target.fail_finalize_cleanup_once = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_target_finalize_backup_receipt_once_for_test(&self) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let target = runtime.target.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+        })?;
+        target.fail_finalize_backup_receipt_once = true;
         Ok(())
     }
 
@@ -1432,6 +1448,8 @@ impl PeerCloneCommandState {
                 status: PeerCloneTargetStatus::idle(),
                 #[cfg(test)]
                 fail_finalize_cleanup_once: false,
+                #[cfg(test)]
+                fail_finalize_backup_receipt_once: false,
                 #[cfg(test)]
                 fail_release_cleanup_once: false,
             });
@@ -1635,7 +1653,7 @@ impl PeerCloneCommandState {
         request: &PeerCloneTargetRequest,
     ) -> Result<PeerCloneFinalizeResult, PeerSyncError> {
         let paths = target_paths(peer_root, request)?;
-        let (worker, fail_cleanup_after_commit) = {
+        let (worker, fail_cleanup_after_commit, fail_backup_receipt) = {
             let mut runtime = self.lock_runtime()?;
             let target = require_target_mut(&mut runtime, request, &paths.job_root)?;
             if target.status.phase != PeerCloneTargetPhase::AwaitingActivation {
@@ -1648,6 +1666,10 @@ impl PeerCloneCommandState {
                 target.worker.take(),
                 #[cfg(test)]
                 std::mem::take(&mut target.fail_finalize_cleanup_once),
+                #[cfg(not(test))]
+                false,
+                #[cfg(test)]
+                std::mem::take(&mut target.fail_finalize_backup_receipt_once),
                 #[cfg(not(test))]
                 false,
             )
@@ -1677,12 +1699,24 @@ impl PeerCloneCommandState {
         let activation_root = peer_root.join("activation");
         let result = (|| {
             let expected_revision = store.revision().map_err(store_error)?;
-            let mut target = LosslessCloneTargetAdapter::new(
+            let mut backup_observer = |_backup_path: &Path| {
+                if fail_backup_receipt {
+                    Err(PeerSyncError::Storage(
+                        "injected peer clone backup receipt failure".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            let mut target = LosslessCloneTargetAdapter::new_with_owned_backup_observer(
                 store,
                 cas,
                 &activation_root,
                 expected_revision,
                 &NeverCancelled,
+                &request.manifest_id,
+                &request.session_id,
+                &mut backup_observer,
             )?;
             #[cfg(test)]
             if fail_cleanup_after_commit {
@@ -1695,7 +1729,10 @@ impl PeerCloneCommandState {
             let outcome = match activation {
                 Ok(()) | Err(PeerSyncError::AlreadyActivated) => Ok(None),
                 Err(error) => match target.active_manifest_id() {
-                    Ok(Some(active)) if active == request.manifest_id => {
+                    Ok(Some(active))
+                        if active == request.manifest_id
+                            && target.committed_backup_path().is_some() =>
+                    {
                         Ok(Some(bounded_finalize_warning(&error)))
                     }
                     Ok(_) => Err(error),
@@ -3131,6 +3168,11 @@ mod tests {
         assert!(finalized.warning.is_some());
         let backup_path = finalized.backup_path.as_ref().unwrap();
         assert!(backup_path.is_file());
+        assert!(backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&request.session_id));
         assert_eq!(
             backup_path.parent(),
             Some(
@@ -3282,6 +3324,88 @@ mod tests {
         assert_eq!(
             target_store.read_root(None).unwrap().value["username"],
             "Source"
+        );
+        source.stop_source(&request.session_id).unwrap();
+    }
+
+    #[test]
+    fn product_backup_receipt_failure_stays_retryable_after_commit() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        let mut target_store = PersistentStore::open(target_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        seed_product_store(&mut target_store, "Target", 0);
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let running = source
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+        let request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                source.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+        };
+        let peer_root = target_root.path().join("peer-sync");
+        let target = PeerCloneCommandState::default();
+        target
+            .claim_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                &pairing.claim,
+            )
+            .unwrap();
+        target
+            .start_target_download(&peer_root, request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        target
+            .fail_target_finalize_backup_receipt_once_for_test()
+            .unwrap();
+
+        assert!(target
+            .finalize_target(&mut target_store, &target_cas, &peer_root, &request)
+            .is_err());
+        assert_eq!(target_store.revision().unwrap(), 2);
+        assert_eq!(
+            target.target_status(&request).unwrap().phase,
+            PeerCloneTargetPhase::Failed
+        );
+
+        drop(target);
+        let recovered = PeerCloneCommandState::default();
+        recovered
+            .resume_target_download(&peer_root, request.clone())
+            .unwrap();
+        wait_for_target_phase(&recovered, PeerCloneTargetPhase::AwaitingActivation);
+        let receipt = recovered
+            .finalize_target(&mut target_store, &target_cas, &peer_root, &request)
+            .unwrap();
+        assert_eq!(receipt.revision, 2);
+        assert!(receipt.backup_path.as_ref().unwrap().is_file());
+        assert_eq!(
+            fs::read_dir(peer_root.join("activation/backups"))
+                .unwrap()
+                .count(),
+            1
         );
         source.stop_source(&request.session_id).unwrap();
     }
