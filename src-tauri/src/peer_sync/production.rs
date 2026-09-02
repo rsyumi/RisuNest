@@ -463,6 +463,7 @@ pub(crate) struct LosslessCloneTargetAdapter<'a> {
     expected_revision: i64,
     cancellation: &'a dyn CancellationProbe,
     backup_observer: Option<&'a mut dyn FnMut(&Path) -> Result<(), PeerSyncError>>,
+    backup_observer_stage: Option<(String, String)>,
     committed_backup_path: Option<PathBuf>,
     #[cfg(test)]
     fail_cleanup_after_commit: bool,
@@ -480,7 +481,15 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         expected_revision: i64,
         cancellation: &'a dyn CancellationProbe,
     ) -> Result<Self, PeerSyncError> {
-        Self::initialize(store, cas, root, expected_revision, cancellation, None)
+        Self::initialize(
+            store,
+            cas,
+            root,
+            expected_revision,
+            cancellation,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn new_with_backup_observer(
@@ -498,6 +507,32 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
             expected_revision,
             cancellation,
             Some(backup_observer),
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_owned_backup_observer(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        root: &Path,
+        expected_revision: i64,
+        cancellation: &'a dyn CancellationProbe,
+        manifest_id: &str,
+        durable_job_id: &str,
+        backup_observer: &'a mut dyn FnMut(&Path) -> Result<(), PeerSyncError>,
+    ) -> Result<Self, PeerSyncError> {
+        validate_hash(manifest_id)?;
+        let durable_job_id = uuid::Uuid::parse_str(durable_job_id)
+            .map_err(|_| PeerSyncError::Validation("invalid peer clone durable job id".to_owned()))?
+            .to_string();
+        Self::initialize(
+            store,
+            cas,
+            root,
+            expected_revision,
+            cancellation,
+            Some(backup_observer),
+            Some((manifest_id.to_owned(), durable_job_id)),
         )
     }
 
@@ -508,6 +543,7 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         expected_revision: i64,
         cancellation: &'a dyn CancellationProbe,
         backup_observer: Option<&'a mut dyn FnMut(&Path) -> Result<(), PeerSyncError>>,
+        backup_observer_stage: Option<(String, String)>,
     ) -> Result<Self, PeerSyncError> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
@@ -519,6 +555,7 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
             expected_revision,
             cancellation,
             backup_observer,
+            backup_observer_stage,
             committed_backup_path: None,
             #[cfg(test)]
             fail_cleanup_after_commit: false,
@@ -622,7 +659,13 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         }
         let outcome = if job.is_sealed() && self.marker_committed(manifest_id)? {
             let backup_path = self.expected_backup_path(manifest_id, durable_job_id);
-            self.observe_committed_backup(&backup_path)?;
+            if self
+                .backup_observer_stage
+                .as_ref()
+                .is_none_or(|owned| owned.0 == manifest_id && owned.1 == durable_job_id)
+            {
+                self.observe_committed_backup(&backup_path)?;
+            }
             CasReleaseOutcome::Committed
         } else {
             CasReleaseOutcome::Aborted
@@ -676,7 +719,12 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
 
     fn begin(&mut self, manifest_id: &str) -> Result<Self::Stage, PeerSyncError> {
         validate_hash(manifest_id)?;
-        let stage_id = uuid::Uuid::new_v4().to_string();
+        let stage_id = self
+            .backup_observer_stage
+            .as_ref()
+            .filter(|owned| owned.0 == manifest_id)
+            .map(|owned| owned.1.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let directory = self.root.join(format!(
             "{manifest_id}{ACTIVATION_STAGE_SEPARATOR}{stage_id}"
         ));

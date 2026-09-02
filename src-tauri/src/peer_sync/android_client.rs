@@ -20,6 +20,9 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 const JOB_SCHEMA: &str = "risunest.android-peer-clone-job/v1";
 const JOB_OWNERSHIP_SCHEMA: &str = "risunest.android-peer-clone-ownership/v1";
 const JOB_STATUS_SCHEMA: &str = "risunest.android-peer-clone-status/v1";
@@ -674,6 +677,10 @@ impl AndroidResumableCloneJob {
 pub(crate) struct AndroidCloneJobRegistry {
     jobs_root: PathBuf,
     state: Mutex<()>,
+    #[cfg(test)]
+    leave_activation_stage_after_commit: AtomicBool,
+    #[cfg(test)]
+    fail_backup_receipt_write: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,6 +704,10 @@ impl AndroidCloneJobRegistry {
         let registry = Self {
             jobs_root,
             state: Mutex::new(()),
+            #[cfg(test)]
+            leave_activation_stage_after_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_backup_receipt_write: AtomicBool::new(false),
         };
         let state = registry.lock()?;
         registry.recover_locked(&state, true)?;
@@ -882,25 +893,48 @@ impl AndroidCloneJobRegistry {
         let manifest_id = status.manifest_id;
         let mut client = job.into_activation_client()?;
         let observer_root = root.clone();
+        #[cfg(test)]
+        let fail_backup_receipt_write =
+            self.fail_backup_receipt_write.swap(false, Ordering::SeqCst);
         let mut backup_observer = |backup_path: &Path| {
+            #[cfg(test)]
+            if fail_backup_receipt_write {
+                return Err(PeerSyncError::Storage(
+                    "injected Android backup receipt persistence failure".to_owned(),
+                ));
+            }
             AndroidResumableCloneJob::open(&observer_root)?
                 .record_backup_path(backup_path)
                 .map(|_| ())
         };
-        let mut target = LosslessCloneTargetAdapter::new_with_backup_observer(
+        let mut target = LosslessCloneTargetAdapter::new_with_owned_backup_observer(
             store,
             cas,
             activation_root,
             expected_revision,
             cancellation,
+            &manifest_id,
+            job_id,
             &mut backup_observer,
         )?;
+        #[cfg(test)]
+        if self
+            .leave_activation_stage_after_commit
+            .swap(false, Ordering::SeqCst)
+        {
+            target.leave_durable_job_after_commit_once_for_test();
+        }
         let mut validator = AndroidVerifiedCloneValidator;
         let activation = activate_downloaded_clone(&mut client, &mut target, &mut validator);
         match activation {
             Ok(()) | Err(PeerSyncError::AlreadyActivated) => {}
             Err(error) => match target.active_manifest_id() {
-                Ok(Some(active)) if active == manifest_id => {}
+                Ok(Some(active))
+                    if active == manifest_id
+                        && AndroidResumableCloneJob::open(&root)?
+                            .status()?
+                            .backup_path
+                            .is_some() => {}
                 Ok(_) => return Err(error),
                 Err(reconcile) => {
                     return Err(PeerSyncError::Storage(format!(
@@ -920,6 +954,17 @@ impl AndroidCloneJobRegistry {
             revision: committed_revision,
             backup_path: status.backup_path,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn leave_activation_stage_after_commit_once_for_test(&self) {
+        self.leave_activation_stage_after_commit
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_backup_receipt_write_once_for_test(&self) {
+        self.fail_backup_receipt_write.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn release(&self, job_id: &str) -> Result<(), PeerSyncError> {

@@ -1935,6 +1935,176 @@ fn android_clone_registry_waits_for_explicit_lossless_activation_and_cleans_afte
         .exists());
 }
 
+#[test]
+fn android_clone_registry_does_not_attribute_a_prior_same_manifest_stage_to_a_new_job() {
+    let source_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source_cas = crate::asset_repository::PayloadCas::new(source_root.path()).unwrap();
+    let target_cas = crate::asset_repository::PayloadCas::new(target_root.path()).unwrap();
+    let mut source_store =
+        crate::persistent_store::PersistentStore::open(source_root.path()).unwrap();
+    let mut target_store =
+        crate::persistent_store::PersistentStore::open(target_root.path()).unwrap();
+    seed_android_product_store(&mut source_store, "Source");
+    seed_android_product_store(&mut target_store, "Target");
+    let activation_root = target_root.path().join("peer-clone-activation");
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+
+    let prepared = prepare_lossless_clone_session(
+        &mut source_store,
+        &source_cas,
+        1,
+        &source_root.path().join("preparation-one"),
+        &source_root.path().join("session-one"),
+        &crate::local_backup::NeverCancelled,
+    )
+    .unwrap();
+    let mut host = LanCloneHost::prepare(prepared);
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let first = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    registry
+        .download(&first.job_id, &TransferCancellation::new())
+        .unwrap();
+    registry.leave_activation_stage_after_commit_once_for_test();
+    let first_receipt = registry
+        .finalize(
+            &first.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            1,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+    let first_backup = first_receipt.backup_path.unwrap();
+    registry.release(&first.job_id).unwrap();
+    let pairing = host.rotate_pairing_link().unwrap();
+    let second = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    registry
+        .download(&second.job_id, &TransferCancellation::new())
+        .unwrap();
+
+    let second_receipt = registry
+        .finalize(
+            &second.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            2,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+
+    assert_eq!(second_receipt.revision, 2);
+    assert_eq!(second_receipt.backup_path, None);
+    assert_eq!(registry.current().unwrap().unwrap().backup_path, None);
+    assert!(first_backup.is_file());
+    assert_eq!(
+        fs::read_dir(activation_root.join("backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_retries_after_backup_receipt_persistence_fails() {
+    let source_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source_cas = crate::asset_repository::PayloadCas::new(source_root.path()).unwrap();
+    let target_cas = crate::asset_repository::PayloadCas::new(target_root.path()).unwrap();
+    let mut source_store =
+        crate::persistent_store::PersistentStore::open(source_root.path()).unwrap();
+    let mut target_store =
+        crate::persistent_store::PersistentStore::open(target_root.path()).unwrap();
+    seed_android_product_store(&mut source_store, "Source");
+    seed_android_product_store(&mut target_store, "Target");
+    let prepared = prepare_lossless_clone_session(
+        &mut source_store,
+        &source_cas,
+        1,
+        &source_root.path().join("preparation"),
+        &source_root.path().join("session"),
+        &crate::local_backup::NeverCancelled,
+    )
+    .unwrap();
+    let mut host = LanCloneHost::prepare(prepared);
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    registry
+        .download(&claimed.job_id, &TransferCancellation::new())
+        .unwrap();
+    let activation_root = target_root.path().join("peer-clone-activation");
+    registry.fail_backup_receipt_write_once_for_test();
+
+    assert!(registry
+        .finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            1,
+            &crate::local_backup::NeverCancelled,
+        )
+        .is_err());
+    assert_eq!(target_store.revision().unwrap(), 2);
+    let interrupted = registry.current().unwrap().unwrap();
+    assert_eq!(interrupted.committed_revision, None);
+    assert_eq!(interrupted.backup_path, None);
+
+    let receipt = registry
+        .finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            2,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+
+    assert_eq!(receipt.revision, 2);
+    assert!(receipt.backup_path.as_ref().unwrap().is_file());
+    assert_eq!(
+        registry.current().unwrap().unwrap().committed_revision,
+        Some(2)
+    );
+    assert_eq!(
+        fs::read_dir(activation_root.join("backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    host.stop().unwrap();
+}
+
 fn seed_android_product_store(
     store: &mut crate::persistent_store::PersistentStore,
     username: &str,
