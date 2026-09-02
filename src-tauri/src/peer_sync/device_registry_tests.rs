@@ -728,6 +728,48 @@ fn registry_command_views_are_directional_and_never_serialize_credentials() {
 
 #[cfg(unix)]
 #[test]
+fn peer_registry_storage_is_owner_only_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = root.path().join("peer-sync");
+    fs::create_dir(&peer_root).unwrap();
+    fs::set_permissions(&peer_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+    super::device_registry::load_or_create_device_id(root.path()).unwrap();
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: 40,
+        })
+        .unwrap();
+    registry.save().unwrap();
+
+    assert_eq!(
+        fs::metadata(&peer_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for name in ["device-id", "sources.json"] {
+        assert_eq!(
+            fs::metadata(peer_root.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "{name} must be owner-only"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn device_ids_and_peer_root_reject_symlinks() {
     use std::os::unix::fs::symlink;
 

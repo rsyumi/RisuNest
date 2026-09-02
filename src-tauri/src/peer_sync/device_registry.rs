@@ -755,11 +755,27 @@ fn ensure_peer_root(app_root: &Path) -> Result<PathBuf, PeerSyncError> {
     match fs::symlink_metadata(&root) {
         Ok(metadata) => ensure_ordinary_directory(&metadata, "peer sync directory")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&root)?;
+            }
+            #[cfg(not(unix))]
             fs::create_dir_all(&root)?;
             let metadata = fs::symlink_metadata(&root)?;
             ensure_ordinary_directory(&metadata, "peer sync directory")?;
         }
         Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     }
     Ok(root)
 }
@@ -959,10 +975,19 @@ fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncEr
     result
 }
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), PeerSyncError> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     file.write_all(bytes)?;
