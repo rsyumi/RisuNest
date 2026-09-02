@@ -89,7 +89,6 @@
         <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
     </div>
 {/if}
-<Button onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
 {#if isTauri}
     <Button onclick={async () => {
         try {
@@ -106,6 +105,7 @@
         } catch { alertError(language.risuNest.backup.actionFailed) }
     }} className="mt-2">{language.restoreLocalSnapshot}</Button>
 {/if}
+<Button onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
 <Button onclick={() => openSyncConflictBackups()} className="mt-2">{language.syncConflictBackups}</Button>
 {#if isTauri && DBState.db.account}
     <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {

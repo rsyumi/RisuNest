@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import settingsRawSource from '../Settings.svelte?raw'
 import pageRawSource from './RisuNestSettings.svelte?raw'
+import backupRestoreRawSource from './RisuNestBackupRestore.svelte?raw'
 import tauriLibRawSource from '../../../../src-tauri/src/lib.rs?raw'
 import peerCloneAndroidRawSource from './PeerCloneAndroidSettings.svelte?raw'
 import { languageEnglish } from 'src/lang/en'
@@ -10,6 +11,7 @@ import { languageKorean } from 'src/lang/ko'
 const normalizeNewlines = (source: string) => source.replace(/\r\n?/g, '\n')
 const settingsSource = normalizeNewlines(settingsRawSource)
 const pageSource = normalizeNewlines(pageRawSource)
+const backupRestoreSource = normalizeNewlines(backupRestoreRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
 const peerCloneAndroidSource = normalizeNewlines(peerCloneAndroidRawSource)
 
@@ -50,6 +52,17 @@ describe('RisuNest settings navigation', () => {
         expect(pageSource).toContain('{#if isTauri}\n    <RisuNestStorageDashboard />')
         expect(pageSource).toContain('{#if isTauriAndroid}\n    <RisuNestAndroidPlatform />')
         expect(pageSource).toContain('{#if isTauri}\n    <RisuNestLogViewer />')
+    })
+})
+
+describe('RisuNest backup and restore layout', () => {
+    it('keeps local snapshot restore above PocketRisu restore', () => {
+        const localSnapshotRestore = backupRestoreSource.indexOf('{language.restoreLocalSnapshot}</Button>')
+        const pocketRisuRestore = backupRestoreSource.indexOf('{language.loadPocketRisuBackup}</Button>')
+
+        expect(localSnapshotRestore).toBeGreaterThanOrEqual(0)
+        expect(pocketRisuRestore).toBeGreaterThanOrEqual(0)
+        expect(localSnapshotRestore).toBeLessThan(pocketRisuRestore)
     })
 })
 
