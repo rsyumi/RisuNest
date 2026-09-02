@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     selectedTarget: null as any,
     acquireCompleteConversation: vi.fn(),
     postInlayAsset: vi.fn(),
+    UnsupportedAnimatedInlayError: class UnsupportedAnimatedInlayError extends Error {},
     alertError: vi.fn(),
 }))
 
@@ -47,7 +48,10 @@ vi.mock('src/ts/util', () => ({
     BufferToText: (value: Uint8Array) => new TextDecoder().decode(value),
     selectMultipleFile: vi.fn(),
 }))
-vi.mock('./inlays', () => ({ postInlayAsset: mocks.postInlayAsset }))
+vi.mock('./inlays', () => ({
+    postInlayAsset: mocks.postInlayAsset,
+    UnsupportedAnimatedInlayError: mocks.UnsupportedAnimatedInlayError,
+}))
 vi.mock('src/ts/alert', () => ({ alertError: mocks.alertError }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     captureSelectedConversationTarget: () => mocks.selectedTarget,
@@ -58,6 +62,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
 }))
 
 import { postChatFile } from './multisend'
+import { UnsupportedAnimatedInlayError } from './inlays'
 import { doingChat, reserveGeneration } from '../generationState'
 
 function createDatabase(): Database {
@@ -238,8 +243,15 @@ describe('postChatFile PO append', () => {
 })
 
 describe('postChatFile attachment errors', () => {
-    it.each(['gif', 'avif'])('rejects %s attachments without appending an asset or message', async (extension) => {
-        mocks.postInlayAsset.mockRejectedValueOnce(new Error('unsupported animation'))
+    beforeEach(() => {
+        mocks.dbState.db = createDatabase()
+        mocks.sendChat.mockClear()
+        mocks.postInlayAsset.mockReset()
+        mocks.alertError.mockReset()
+    })
+
+    it.each(['gif', 'avif'])('skips typed unsupported %s attachments without appending an asset or message', async (extension) => {
+        mocks.postInlayAsset.mockRejectedValueOnce(new UnsupportedAnimatedInlayError('unsupported animation'))
         const conversation = mocks.dbState.db!.characters[0].chats[0]
 
         await expect(postChatFile({ name: `animated.${extension}`, data: new Uint8Array([1]) })).resolves.toEqual([])
@@ -247,5 +259,24 @@ describe('postChatFile attachment errors', () => {
         expect(mocks.alertError).toHaveBeenCalledWith('unsupported')
         expect(conversation.message).toEqual([{ role: 'char', data: 'before' }])
         expect(mocks.sendChat).not.toHaveBeenCalled()
+    })
+
+    it.each(['png', 'mp3'])('propagates ordinary %s attachment failures', async (extension) => {
+        const failure = new Error('storage failed')
+        mocks.postInlayAsset.mockRejectedValueOnce(failure)
+
+        await expect(postChatFile({ name: `attachment.${extension}`, data: new Uint8Array([1]) }))
+            .rejects.toBe(failure)
+
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('keeps null unsupported-extension results as a silent skip', async () => {
+        mocks.postInlayAsset.mockResolvedValueOnce(null)
+
+        await expect(postChatFile({ name: 'attachment.avi', data: new Uint8Array([1]) }))
+            .resolves.toEqual([])
+
+        expect(mocks.alertError).not.toHaveBeenCalled()
     })
 })

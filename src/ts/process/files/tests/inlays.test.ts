@@ -16,6 +16,7 @@ import {
     saveInlayedSignature,
     setInlayAsset,
     writeInlayImage,
+    UnsupportedAnimatedInlayError,
 } from '../inlays'
 import { createBackedBlobStore } from 'src/ts/storage/platformBlobStore'
 import { getDatabase } from 'src/ts/storage/database.svelte'
@@ -319,10 +320,12 @@ describe('setInlayAsset', () => {
         ['animated WebP', new TextEncoder().encode('RIFF\x0c\0\0\0WEBPANIM\0\0\0\0'), 'webp', 'image/webp'],
         ['APNG', apngBytes(), 'png', 'image/png'],
     ])('rejects new %s input rather than flattening it', async (_label, bytes, ext, mime) => {
-        await expect(setInlayAsset('unsupported-image', {
+        const rejection = setInlayAsset('unsupported-image', {
             data: new Blob([bytes.slice().buffer as ArrayBuffer], { type: mime }),
             ext, name: `unsupported.${ext}`, type: 'image',
-        })).rejects.toThrow(/unsupported/i)
+        })
+
+        await expect(rejection).rejects.toBeInstanceOf(UnsupportedAnimatedInlayError)
 
         expect(await getInlayAssetBlob('unsupported-image')).toBeNull()
     })

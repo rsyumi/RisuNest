@@ -25,6 +25,13 @@ export type InlayAsset = {
     width?: number
 }
 
+export class UnsupportedAnimatedInlayError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'UnsupportedAnimatedInlayError'
+    }
+}
+
 const inlayImageExts = [
     'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif'
 ]
@@ -514,13 +521,13 @@ function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): voi
     const gifSignature = data.byteLength >= 6
         && new TextDecoder().decode(data.subarray(0, 6)).startsWith('GIF8')
     if (normalizedExt === 'gif' || normalizedMime === 'image/gif' || gifSignature) {
-        throw new Error('New GIF Inlay images are unsupported because animation cannot be preserved')
+        throw new UnsupportedAnimatedInlayError('New GIF Inlay images are unsupported because animation cannot be preserved')
     }
     if (normalizedExt === 'avif' || normalizedMime === 'image/avif' || hasAvifBrand(data)) {
-        throw new Error('New AVIF Inlay images are unsupported')
+        throw new UnsupportedAnimatedInlayError('New AVIF Inlay images are unsupported')
     }
-    if (isAnimatedWebP(data)) throw new Error('Animated WebP Inlay images are unsupported')
-    if (isAnimatedPng(data)) throw new Error('APNG Inlay images are unsupported')
+    if (isAnimatedWebP(data)) throw new UnsupportedAnimatedInlayError('Animated WebP Inlay images are unsupported')
+    if (isAnimatedPng(data)) throw new UnsupportedAnimatedInlayError('APNG Inlay images are unsupported')
 }
 
 export async function setInlayAsset(id: string, img: InlayAsset){
