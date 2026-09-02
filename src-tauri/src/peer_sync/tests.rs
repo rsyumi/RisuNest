@@ -1386,14 +1386,12 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
     .unwrap();
     let source_device_id =
         super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
-    let registered = super::device_registry::incoming_source_by_id(
-        target_root.path(),
-        &source_device_id,
-    )
-    .unwrap()
-    .unwrap();
-    let target_device_id = super::device_registry::load_or_create_device_id(target_root.path())
-        .unwrap();
+    let registered =
+        super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+            .unwrap()
+            .unwrap();
+    let target_device_id =
+        super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
 
@@ -1420,7 +1418,9 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
 
     assert_eq!(started, resumed);
     assert_eq!(started.phase, AndroidCloneJobPhase::Ready);
-    assert!(!serde_json::to_string(&started).unwrap().contains(&registered.bearer));
+    assert!(!serde_json::to_string(&started)
+        .unwrap()
+        .contains(&registered.bearer));
     assert!(registry
         .connect_registered(
             &registered.endpoint,
@@ -1431,6 +1431,57 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             &registered.bearer,
         )
         .is_err());
+    assert!(registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            "00000000-0000-4000-8000-000000000298",
+            &source_device_id,
+            &registered.bearer,
+        )
+        .is_err());
+    let rotated_bearer = if registered.bearer == "f".repeat(64) {
+        "e".repeat(64)
+    } else {
+        "f".repeat(64)
+    };
+    assert!(registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &rotated_bearer,
+        )
+        .is_err());
+
+    drop(registry);
+    let reopened =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let recovered = reopened
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+        )
+        .unwrap();
+    assert_eq!(recovered, started);
+    let safe_current = serde_json::to_string(&reopened.current_for_command().unwrap()).unwrap();
+    assert!(safe_current.contains(&source_device_id));
+    assert!(!safe_current.contains(&registered.endpoint));
+    assert!(!safe_current.contains(&pairing.session_id));
+    assert!(!safe_current.contains(&pairing.manifest_id));
+    assert!(!safe_current.contains(&registered.bearer));
+    let report = reopened
+        .download(&recovered.job_id, &TransferCancellation::new())
+        .unwrap();
+    assert!(report.verified_objects >= 1);
+    assert!(report.transferred_bytes >= 64);
     host.stop().unwrap();
 }
 

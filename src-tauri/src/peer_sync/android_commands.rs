@@ -1,5 +1,5 @@
 use super::{
-    android_client::{AndroidCloneJobRegistry, AndroidCloneJobStatus},
+    android_client::{AndroidCloneCurrentStatus, AndroidCloneJobRegistry, AndroidCloneJobStatus},
     android_jni, PeerSyncError,
 };
 use crate::{
@@ -84,9 +84,9 @@ pub(crate) async fn peer_clone_android_claim(
 #[tauri::command]
 pub(crate) async fn peer_clone_android_current(
     state: State<'_, AndroidPeerCloneCommandState>,
-) -> Result<Option<AndroidCloneJobStatus>, String> {
+) -> Result<Option<AndroidCloneCurrentStatus>, String> {
     let registry = state.registry()?;
-    tauri::async_runtime::spawn_blocking(move || registry.current())
+    tauri::async_runtime::spawn_blocking(move || registry.current_for_command())
         .await
         .map_err(|error| format!("Android peer clone status worker failed: {error}"))?
         .map_err(|error| error.to_string())

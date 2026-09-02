@@ -100,6 +100,14 @@ pub(crate) struct AndroidCloneJobStatus {
     pub(crate) committed_revision: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+#[cfg(any(target_os = "android", test))]
+pub(crate) enum AndroidCloneCurrentStatus {
+    Legacy(AndroidCloneJobStatus),
+    Registered(super::registered_target_commands::AndroidRegisteredCloneStatus),
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AndroidCloneJobDescriptor {
@@ -714,11 +722,15 @@ impl AndroidCloneJobRegistry {
         if let Some(job_id) = self.read_current_id()? {
             let current = AndroidResumableCloneJob::open(self.jobs_root.join(job_id))?;
             let status = current.status()?;
-            if current.endpoint == endpoint
-                && current.session_id == session_id
-                && current.descriptor.manifest_id == manifest_id
-                && current.client.source_device_id() == Some(source_device_id)
-            {
+            let credential = LanCloneClient::open_persisted(&current.root.join("credential.json"))?;
+            if credential.matches_registered_credential(
+                &endpoint,
+                session_id,
+                manifest_id,
+                target_device_id,
+                source_device_id,
+                bearer,
+            )? {
                 return Ok(status);
             }
             return Err(PeerSyncError::Validation(
@@ -761,6 +773,36 @@ impl AndroidCloneJobRegistry {
             return Ok(Some(status));
         }
         Ok(Some(job.status()?))
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn current_for_command(
+        &self,
+    ) -> Result<Option<AndroidCloneCurrentStatus>, PeerSyncError> {
+        let state = self.lock()?;
+        self.recover_locked(&state, false)?;
+        let Some(job_id) = self.read_current_id()? else {
+            return Ok(None);
+        };
+        let job_root = self.jobs_root.join(&job_id);
+        if !job_root.exists() {
+            self.remove_current_id()?;
+            return Ok(None);
+        }
+        let job = AndroidResumableCloneJob::open(job_root)?;
+        let mut status = job.status()?;
+        if job.cancel_requested()? {
+            status.phase = AndroidCloneJobPhase::Cancelled;
+        }
+        Ok(Some(match job.client.source_device_id() {
+            Some(source_device_id) => AndroidCloneCurrentStatus::Registered(
+                super::registered_target_commands::safe_android_clone_status(
+                    source_device_id,
+                    &status,
+                ),
+            ),
+            None => AndroidCloneCurrentStatus::Legacy(status),
+        }))
     }
 
     #[cfg(test)]

@@ -1691,6 +1691,7 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
     .await
 }
 
+#[cfg(desktop)]
 pub(crate) async fn peer_delta_pull_registered_client(
     app: AppHandle,
     state: PeerDeltaCommandState,
@@ -1701,6 +1702,32 @@ pub(crate) async fn peer_delta_pull_registered_client(
         Ok(client)
     })
     .await
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn peer_delta_pull_registered_client(
+    app: AppHandle,
+    state: PeerDeltaCommandState,
+    client: LanLogicalDeltaClient,
+    expected_revision: i64,
+    foreground: AndroidForegroundKey,
+) -> Result<PeerDeltaPullResult, String> {
+    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target).await?;
+    state
+        .mark_target_running_exact(&foreground)
+        .map_err(|error| error.to_string())?;
+    let outcome = peer_delta_pull_with_client_factory(
+        app,
+        state.clone(),
+        expected_revision,
+        cancellation,
+        move |_| Ok(client),
+    )
+    .await;
+    state
+        .publish_target_terminal_exact(&foreground, outcome.clone())
+        .map_err(|error| error.to_string())?;
+    outcome
 }
 
 async fn peer_delta_pull_with_client_factory<

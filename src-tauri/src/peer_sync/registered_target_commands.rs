@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "android", test))]
+use super::android_client::{AndroidCloneJobPhase, AndroidCloneJobStatus};
 use super::{
     device_registry::{incoming_source_by_id, DevicePermissions, IncomingSource},
     lan::{
@@ -5,8 +7,6 @@ use super::{
     },
     PeerSyncError,
 };
-#[cfg(any(target_os = "android", test))]
-use super::android_client::{AndroidCloneJobPhase, AndroidCloneJobStatus};
 use serde::Serialize;
 use std::{
     fmt,
@@ -14,10 +14,10 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 
-#[cfg(desktop)]
-use super::commands::PeerCloneCommandState;
 #[cfg(target_os = "android")]
 use super::android_commands::AndroidPeerCloneCommandState;
+#[cfg(desktop)]
+use super::commands::PeerCloneCommandState;
 use super::{
     android_foreground::AndroidForegroundKey,
     bidirectional_commands::{
@@ -95,7 +95,7 @@ pub struct AndroidRegisteredCloneStatus {
 }
 
 #[cfg(any(target_os = "android", test))]
-fn safe_android_clone_status(
+pub(crate) fn safe_android_clone_status(
     source_device_id: &str,
     status: &AndroidCloneJobStatus,
 ) -> AndroidRegisteredCloneStatus {
@@ -105,21 +105,20 @@ fn safe_android_clone_status(
         phase: status.phase,
         completed_bytes: status.completed_bytes,
         total_bytes: status.total_bytes,
-        error: status.error.clone(),
+        error: status.error.as_ref().map(|_| "transferFailed".to_owned()),
         committed_revision: status.committed_revision,
     }
 }
 
-#[cfg(any(target_os = "android", test))]
 fn validate_android_registered_source_endpoint(endpoint: &str) -> Result<String, PeerSyncError> {
     let endpoint = super::lan::validate_lan_endpoint(endpoint)?;
-    let parsed = url::Url::parse(&endpoint)
-        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    let parsed =
+        url::Url::parse(&endpoint).map_err(|error| PeerSyncError::Validation(error.to_string()))?;
     let allowed = parsed.scheme() == "http"
         && matches!(
             parsed.host(),
             Some(url::Host::Ipv4(address))
-                if address.is_private() || address.is_link_local() || address.is_loopback()
+                if address.is_private() || address.is_link_local()
         );
     if !allowed {
         return Err(PeerSyncError::Validation(
@@ -230,12 +229,33 @@ fn registered_hello(
     app_root: &Path,
     device_id: &str,
 ) -> Result<RegisteredSourceHello, RegisteredTargetError> {
+    registered_hello_with(
+        app_root,
+        device_id,
+        cfg!(target_os = "android"),
+        authenticated_peer_hello_status,
+    )
+}
+
+fn registered_hello_with<F>(
+    app_root: &Path,
+    device_id: &str,
+    require_android_lan: bool,
+    transport: F,
+) -> Result<RegisteredSourceHello, RegisteredTargetError>
+where
+    F: FnOnce(&str, &str) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
+{
     let source = incoming_source_by_id(app_root, device_id)
         .map_err(|error| safe_failure("registered source lookup", error))?
         .ok_or(RegisteredTargetError::SourceMissing)?;
+    if require_android_lan {
+        validate_android_registered_source_endpoint(&source.endpoint)
+            .map_err(|error| safe_failure("registered Android hello endpoint", error))?;
+    }
     let current = registered_hello_outcome(
         "registered source hello",
-        authenticated_peer_hello_status(&source.endpoint, &source.bearer),
+        transport(&source.endpoint, &source.bearer),
     )?;
     if current.device_id != source.device_id {
         crate::nlog!(
@@ -301,8 +321,12 @@ pub async fn peer_clone_claim_client(
         let endpoint = validate_android_registered_source_endpoint(&endpoint)
             .map_err(|error| safe_failure("Android clone registration endpoint", error))?;
         let credential_root = root.join("peer-clone").join("android-registration");
-        std::fs::create_dir_all(&credential_root)
-            .map_err(|error| safe_command_failure("Android clone registration storage", error))?;
+        std::fs::create_dir_all(&credential_root).map_err(|error| {
+            safe_failure(
+                "Android clone registration storage",
+                PeerSyncError::from(error),
+            )
+        })?;
         let client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
             &root,
             super::device_registry::platform_device_name(),
@@ -352,7 +376,10 @@ pub async fn peer_clone_claim_registered_client(
                 &connection.source.bearer,
             )
             .map_err(|error| safe_failure("registered Android clone target", error))?;
-        Ok(safe_android_clone_status(&connection.source.device_id, &status))
+        Ok(safe_android_clone_status(
+            &connection.source.device_id,
+            &status,
+        ))
     })
     .await
     .map_err(|error| safe_command_failure("registered Android clone worker", error))?
@@ -360,6 +387,7 @@ pub async fn peer_clone_claim_registered_client(
 }
 
 #[tauri::command]
+#[cfg(desktop)]
 pub async fn peer_delta_pull_registered(
     app: AppHandle,
     state: State<'_, PeerDeltaCommandState>,
@@ -390,6 +418,47 @@ pub async fn peer_delta_pull_registered(
             crate::nlog!("warn", "registered delta pull failed: {error}");
             "transportUnavailable".to_owned()
         })
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn peer_delta_pull_registered(
+    app: AppHandle,
+    state: State<'_, PeerDeltaCommandState>,
+    device_id: String,
+    expected_revision: i64,
+    foreground: AndroidForegroundKey,
+) -> Result<PeerDeltaPullResult, String> {
+    let root = app_root(&app)?;
+    let connection = tauri::async_runtime::spawn_blocking(move || {
+        resolve_registered_source(&root, &device_id, RegisteredLane::Delta)
+    })
+    .await
+    .map_err(|error| safe_command_failure("registered delta hello worker", error))?
+    .map_err(|error| error.to_string())?;
+    let local_device_id = super::device_registry::load_or_create_device_id(&app_root(&app)?)
+        .map_err(|error| safe_failure("registered delta local identity", error).to_string())?;
+    let client = LanLogicalDeltaClient::from_registered(
+        &connection.source.endpoint,
+        &connection.lane.session_id,
+        &connection.lane.manifest_id,
+        &local_device_id,
+        &connection.source.device_id,
+        &connection.source.bearer,
+    )
+    .map_err(|error| safe_failure("registered delta client", error).to_string())?;
+    peer_delta_pull_registered_client(
+        app,
+        state.inner().clone(),
+        client,
+        expected_revision,
+        foreground,
+    )
+    .await
+    .map_err(|error| {
+        crate::nlog!("warn", "registered delta pull failed: {error}");
+        "transportUnavailable".to_owned()
+    })
 }
 
 #[tauri::command]
@@ -760,6 +829,25 @@ mod tests {
         assert!(validate_android_registered_source_endpoint("http://10.0.0.7:32145").is_ok());
         assert!(validate_android_registered_source_endpoint("https://sync.example.com").is_err());
         assert!(validate_android_registered_source_endpoint("http://8.8.8.8:32145").is_err());
+        assert!(validate_android_registered_source_endpoint("http://127.0.0.1:32145").is_err());
+    }
+
+    #[test]
+    fn android_registered_hello_rejects_public_endpoint_before_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let mut public = source(DevicePermissions::read());
+        public.endpoint = "https://sync.example.com".to_owned();
+        register_incoming_source(root.path(), public).unwrap();
+        let transport_called = std::cell::Cell::new(false);
+
+        let error = registered_hello_with(root.path(), SOURCE_ID, true, |_, _| {
+            transport_called.set(true);
+            unreachable!("public Android endpoints must be rejected before transport")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), "transportUnavailable");
+        assert!(!transport_called.get());
     }
 
     #[test]
@@ -772,7 +860,10 @@ mod tests {
             phase: crate::peer_sync::android_client::AndroidCloneJobPhase::Ready,
             completed_bytes: 0,
             total_bytes: None,
-            error: None,
+            error: Some(format!(
+                "transfer failed at {} with {BEARER}",
+                "http://192.168.4.8:32145"
+            )),
             committed_revision: None,
         };
         let json = serde_json::to_string(&safe_android_clone_status(SOURCE_ID, &status)).unwrap();
@@ -782,6 +873,7 @@ mod tests {
         assert!(!json.contains(SESSION_ID));
         assert!(!json.contains(MANIFEST_ID));
         assert!(!json.contains(BEARER));
+        assert!(json.contains("transferFailed"));
     }
 
     #[test]
@@ -830,6 +922,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(desktop)]
     fn registered_clone_primes_the_existing_target_runtime() {
         let root = tempfile::tempdir().unwrap();
         let state = crate::peer_sync::commands::PeerCloneCommandState::default();

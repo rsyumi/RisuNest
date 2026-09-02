@@ -557,6 +557,23 @@ impl LanCloneClient {
         self.source_device_id.as_deref()
     }
 
+    pub(crate) fn matches_registered_credential(
+        &self,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        target_device_id: &str,
+        source_device_id: &str,
+        bearer: &str,
+    ) -> Result<bool, PeerSyncError> {
+        Ok(self.endpoint == validate_lan_endpoint(endpoint)?
+            && self.session_id == session_id
+            && self.manifest_id.as_deref() == Some(manifest_id)
+            && self.device_id == target_device_id
+            && self.source_device_id.as_deref() == Some(source_device_id)
+            && constant_time_eq(&digest(self.bearer.as_bytes()), &digest(bearer.as_bytes())))
+    }
+
     // Desktop resume validation compares persisted targets.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn matches_target(
