@@ -81,7 +81,13 @@ describe('Android peer clone facade', () => {
         expect(JSON.stringify(nativeBridge)).not.toContain('bbbbbbbb')
     })
 
-    it('creates a registered job and starts it without reusing the staged claim', async () => {
+    it('creates and polls a secret-free registered job by opaque job id', async () => {
+        const registeredStatus = {
+            sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+            jobId: '11111111-1111-4111-8111-111111111111',
+            phase: 'ready' as const,
+            completedBytes: 0,
+        }
         const invoke = vi.fn(async <T>(command: string): Promise<T> => {
             if (command === 'peer_clone_android_capabilities') {
                 return {
@@ -89,14 +95,47 @@ describe('Android peer clone facade', () => {
                     httpTransportReady: true, productionEnabled: true,
                 } as T
             }
-            if (command === 'peer_clone_claim_registered_client') {
+            if (command === 'peer_clone_claim_registered_client' || command === 'peer_clone_android_current') {
+                return registeredStatus as T
+            }
+            throw new Error(`unexpected command ${command}`)
+        })
+        const nativeBridge = bridge('uidt')
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: nativeBridge,
+            runtime: runtime().replacement,
+        })
+
+        await facade.joinRegistered(registeredStatus.sourceDeviceId)
+        expect(facade.getState().destructiveConfirmed).toBe(false)
+        await expect(facade.download()).rejects.toThrow('destructive replacement confirmation')
+        facade.confirmDestructiveReplace()
+        await facade.download()
+
+        await expect(facade.targetStatus()).resolves.toEqual(registeredStatus)
+        expect(invoke).toHaveBeenCalledWith('peer_clone_claim_registered_client', {
+            deviceId: registeredStatus.sourceDeviceId,
+        })
+        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_claim')).toBe(false)
+        expect(nativeBridge.schedule).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111')
+        expect(JSON.stringify(await facade.targetStatus())).not.toMatch(/endpoint|sessionId|manifestId/i)
+    })
+
+    it('recovers and resumes a registered job without reconstructing a pairing', async () => {
+        const registeredStatus = {
+            sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+            jobId: '11111111-1111-4111-8111-111111111111',
+            phase: 'paused' as const,
+            completedBytes: 12,
+            totalBytes: 42,
+        }
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_current') return registeredStatus as T
+            if (command === 'peer_clone_android_capabilities') {
                 return {
-                    jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
-                    phase: 'ready',
-                    completedBytes: 0,
+                    androidClient: true, atomicActivationReady: true, losslessBackupReady: true,
+                    httpTransportReady: true, productionEnabled: true,
                 } as T
             }
             throw new Error(`unexpected command ${command}`)
@@ -108,15 +147,66 @@ describe('Android peer clone facade', () => {
             runtime: runtime().replacement,
         })
 
-        await facade.joinRegistered('source-device')
-        expect(facade.getState().destructiveConfirmed).toBe(false)
-        await expect(facade.download()).rejects.toThrow('destructive replacement confirmation')
+        await expect(facade.recover()).resolves.toEqual(registeredStatus)
         facade.confirmDestructiveReplace()
-        await facade.download()
+        await facade.resume()
 
-        expect(invoke).toHaveBeenCalledWith('peer_clone_claim_registered_client', { deviceId: 'source-device' })
+        expect(nativeBridge.schedule).toHaveBeenCalledWith(registeredStatus.jobId)
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_claim')).toBe(false)
-        expect(nativeBridge.schedule).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111')
+    })
+
+    it.each([
+        ['missing source identity', {
+            jobId: '11111111-1111-4111-8111-111111111111', phase: 'ready', completedBytes: 0,
+        }],
+        ['secret-bearing registered response', {
+            sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+            jobId: '11111111-1111-4111-8111-111111111111', phase: 'ready', completedBytes: 0,
+            endpoint: 'http://192.168.1.4:43123/',
+        }],
+        ['invalid registered phase', {
+            sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+            jobId: '11111111-1111-4111-8111-111111111111', phase: 'unknown', completedBytes: 0,
+        }],
+        ['mismatched source identity', {
+            sourceDeviceId: '33333333-3333-4333-8333-333333333333',
+            jobId: '11111111-1111-4111-8111-111111111111', phase: 'ready', completedBytes: 0,
+        }],
+    ])('fails closed for %s', async (_label, response) => {
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_capabilities') {
+                return {
+                    androidClient: true, atomicActivationReady: true, losslessBackupReady: true,
+                    httpTransportReady: true, productionEnabled: true,
+                } as T
+            }
+            if (command === 'peer_clone_claim_registered_client') return response as T
+            throw new Error(`unexpected command ${command}`)
+        })
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.joinRegistered('22222222-2222-4222-8222-222222222222'))
+            .rejects.toThrow('invalid Android peer clone status')
+        expect(facade.getState().phase).toBe('idle')
+    })
+
+    it('fails closed for a malformed legacy current status', async () => {
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => ({
+                jobId: '11111111-1111-4111-8111-111111111111',
+                phase: 'ready',
+                completedBytes: 0,
+            }) as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).rejects.toThrow('invalid Android peer clone status')
+        expect(facade.getState().phase).toBe('idle')
     })
 
     it('captures the confirmed pairing before the capability await', async () => {
