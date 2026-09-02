@@ -126,7 +126,7 @@
         return sync.share.stateError
     }
     function cloneBackupPaths(): string[] {
-        const paths = (cloneTarget as unknown as { backupPaths?: unknown } | undefined)?.backupPaths
+        const paths = cloneTarget?.backupPaths
         return Array.isArray(paths) ? paths.filter((path): path is string => typeof path === 'string' && path.length > 0) : []
     }
     function sourceRequest() {

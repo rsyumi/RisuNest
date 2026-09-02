@@ -4,6 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import type { DeviceSyncControllerSnapshot } from 'src/ts/storage/sync/deviceSyncController'
 import { encodeLogicalRecordKey } from 'src/ts/storage/sync/logicalRecordKey'
+import deviceSyncRawSource from './DeviceSyncSettings.svelte?raw'
+
+const deviceSyncSource = deviceSyncRawSource.replace(/\r\n?/g, '\n')
 
 const environment = vi.hoisted(() => ({ android: false, notifications: true }))
 const settingsState = vi.hoisted(() => ({
@@ -77,6 +80,13 @@ describe('DeviceSyncSettings', () => {
         vi.clearAllMocks()
         qrCode.toDataURL.mockImplementation(async (uri: string) => `data:image/mock,${uri}`)
         target = document.createElement('div'); document.body.append(target)
+    })
+
+    it('uses the redesigned controller page without legacy embeds or receipt casts', () => {
+        expect(deviceSyncSource).not.toContain('PeerCloneSettings')
+        expect(deviceSyncSource).not.toContain('PeerCloneAndroidSettings')
+        expect(deviceSyncSource).not.toContain('cloneTarget as unknown')
+        expect(deviceSyncSource).toContain('cloneTarget?.backupPaths')
     })
     afterEach(async () => { if (mounted) await unmount(mounted); mounted = undefined; document.body.replaceChildren(); vi.useRealTimers() })
     const render = async (state = snapshot()) => { controllerState.controller.snapshot.mockReturnValue(state); mounted = mount(DeviceSyncSettings, { target }); await tick() }

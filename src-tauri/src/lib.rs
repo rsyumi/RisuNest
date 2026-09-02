@@ -505,6 +505,8 @@ pub fn run() {
             app.manage(peer_sync::bidirectional_commands::PeerBidirectionalCommandState::default());
             #[cfg(desktop)]
             app.manage(peer_sync::shared_session::DeviceSyncSourceState::default());
+            #[cfg(target_os = "android")]
+            app.manage(peer_sync::shared_session::AndroidDeviceSyncSourceState::default());
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -564,6 +566,8 @@ pub fn run() {
             peer_sync::commands::peer_clone_revoke,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_claim_client,
+            #[cfg(target_os = "android")]
+            peer_sync::registered_target_commands::peer_clone_claim_client,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_download,
             #[cfg(desktop)]
@@ -695,19 +699,21 @@ pub fn run() {
             peer_sync::registry_commands::peer_sync_remove_incoming_source,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::registry_commands::peer_sync_revoke_outgoing_device,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::shared_session::device_sync_prepare,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::shared_session::device_sync_start,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::shared_session::device_sync_status,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::shared_session::device_sync_stop,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::shared_session::device_sync_rotate_link,
+            #[cfg(target_os = "android")]
+            peer_sync::shared_session::device_sync_source_reserve,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::registered_target_commands::peer_sync_registered_hello,
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::registered_target_commands::peer_clone_claim_registered_client,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::registered_target_commands::peer_delta_pull_registered,

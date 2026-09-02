@@ -13,6 +13,10 @@ const pageSource = normalizeNewlines(pageRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
 const peerCloneAndroidSource = normalizeNewlines(peerCloneAndroidRawSource)
 
+function expectExactRustBlock(source: string, block: string): void {
+    expect(source.split(block)).toHaveLength(2)
+}
+
 describe('RisuNest settings navigation', () => {
     it('places RisuNest and Tauri-only Device Sync before Support', () => {
         expect(settingsSource).toContain('Wrench')
@@ -50,6 +54,9 @@ describe('RisuNest settings navigation', () => {
 })
 
 describe('RisuNest native command integration', () => {
+    const setupStart = tauriLibSource.indexOf('.setup(move |app| {')
+    const setupEnd = tauriLibSource.indexOf('Ok(())', setupStart)
+    const setupSource = tauriLibSource.slice(setupStart, setupEnd)
     const handlerStart = tauriLibSource.indexOf('.invoke_handler(tauri::generate_handler![')
     const handlerEnd = tauriLibSource.indexOf('])\n        .build(', handlerStart)
     const handlerSource = tauriLibSource.slice(handlerStart, handlerEnd)
@@ -74,6 +81,7 @@ describe('RisuNest native command integration', () => {
         'device_sync_status',
         'device_sync_stop',
         'device_sync_rotate_link',
+        'device_sync_source_reserve',
         'peer_sync_registered_hello',
         'peer_clone_claim_registered_client',
         'peer_delta_pull_registered',
@@ -83,6 +91,61 @@ describe('RisuNest native command integration', () => {
 
     it.each(commands)('registers %s exactly once', (command) => {
         expect(handlerSource.match(new RegExp(`\\b${command}\\b`, 'g')) ?? []).toHaveLength(1)
+    })
+
+    it('manages the target-specific unified sharing state exactly once', () => {
+        expectExactRustBlock(setupSource, `#[cfg(desktop)]
+            app.manage(peer_sync::shared_session::DeviceSyncSourceState::default());`)
+        expectExactRustBlock(setupSource, `#[cfg(target_os = "android")]
+            app.manage(peer_sync::shared_session::AndroidDeviceSyncSourceState::default());`)
+    })
+
+    it.each([
+        'device_sync_prepare',
+        'device_sync_start',
+        'device_sync_status',
+        'device_sync_stop',
+        'device_sync_rotate_link',
+    ])('exposes shared_session::%s on desktop and Android', (command) => {
+        expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
+            peer_sync::shared_session::${command},`)
+    })
+
+    it('registers the Android source reservation command only on Android', () => {
+        expectExactRustBlock(handlerSource, `#[cfg(target_os = "android")]
+            peer_sync::shared_session::device_sync_source_reserve,`)
+    })
+
+    it('uses target-exclusive staged clone claim handlers', () => {
+        expectExactRustBlock(handlerSource, `#[cfg(desktop)]
+            peer_sync::commands::peer_clone_claim_client,`)
+        expectExactRustBlock(handlerSource, `#[cfg(target_os = "android")]
+            peer_sync::registered_target_commands::peer_clone_claim_client,`)
+    })
+
+    it('exposes registered reconnect commands on both supported native targets', () => {
+        for (const command of [
+            'peer_sync_registered_hello',
+            'peer_clone_claim_registered_client',
+            'peer_delta_pull_registered',
+            'peer_bidirectional_sync_registered',
+            'peer_bidirectional_resolve_registered',
+        ]) {
+            expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registered_target_commands::${command},`)
+        }
+    })
+
+    it('preserves directional registry commands on desktop and Android', () => {
+        for (const command of [
+            'peer_sync_outgoing_devices',
+            'peer_sync_incoming_sources',
+            'peer_sync_remove_incoming_source',
+            'peer_sync_revoke_outgoing_device',
+        ]) {
+            expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
+            peer_sync::registry_commands::${command},`)
+        }
     })
 })
 
