@@ -1,9 +1,11 @@
 use super::*;
 use std::fs;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
 };
+
+static PANIC_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn keeps_a_fifo_ring_and_returns_the_newest_tail() {
@@ -249,17 +251,17 @@ fn file_write_failure_is_nonfatal_when_log_root_is_a_file() {
 }
 
 #[test]
-fn panic_capture_includes_payload_and_location() {
+fn panic_capture_excludes_raw_payload_and_includes_location() {
     let state = NativeLogState::for_tests();
-    state.record_panic("panic payload", "file.rs", 42, 7);
+    state.record_panic("file.rs", 42, 7);
     let entry = state.tail(None).pop().unwrap();
     assert_eq!(entry.level, "panic");
-    assert!(entry.message.contains("panic payload"));
-    assert!(entry.message.contains("file.rs:42:7"));
+    assert_eq!(entry.message, "panic captured at file.rs:42:7");
 }
 
 #[test]
 fn configured_panic_hook_writes_the_first_setup_panic_immediately() {
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let state = NativeLogState::initialize(temp.path());
     let original = std::panic::take_hook();
@@ -270,7 +272,7 @@ fn configured_panic_hook_writes_the_first_setup_panic_immediately() {
     drop(installed);
 
     let log = fs::read_to_string(state.file_path()).unwrap();
-    assert!(log.contains("Authorization: ***"));
+    assert!(log.contains("panic captured at"));
     assert!(!log.contains("fixture-pre-setup-secret"));
 }
 
@@ -337,13 +339,24 @@ fn ring_only_entries_before_configuration_never_reach_the_file_sink() {
 }
 
 #[test]
-fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
+fn panic_hook_records_before_calling_the_previous_hook_exactly_once() {
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
     let state = NativeLogState::for_tests();
     let original = std::panic::take_hook();
-    let previous_called = Arc::new(AtomicBool::new(false));
-    let previous_called_by_hook = previous_called.clone();
+    let previous_calls = Arc::new(AtomicUsize::new(0));
+    let previous_calls_by_hook = previous_calls.clone();
+    let recorded_before_previous = Arc::new(AtomicBool::new(false));
+    let recorded_before_previous_by_hook = recorded_before_previous.clone();
+    let state_seen_by_hook = state.clone();
     std::panic::set_hook(Box::new(move |_| {
-        previous_called_by_hook.store(true, Ordering::SeqCst);
+        recorded_before_previous_by_hook.store(
+            state_seen_by_hook
+                .tail(Some(1))
+                .pop()
+                .is_some_and(|entry| entry.message.contains("panic captured at")),
+            Ordering::SeqCst,
+        );
+        previous_calls_by_hook.fetch_add(1, Ordering::SeqCst);
     }));
     install_panic_hook_for(state.clone());
     let _ = std::panic::catch_unwind(|| panic!("captured panic"));
@@ -351,31 +364,63 @@ fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
     std::panic::set_hook(original);
     drop(installed);
 
-    assert!(!previous_called.load(Ordering::SeqCst));
+    assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+    assert!(recorded_before_previous.load(Ordering::SeqCst));
     assert!(state.tail(None).iter().any(|entry| {
         entry.level == "panic"
-            && entry.message.contains("captured panic")
+            && entry.message.contains("panic captured at")
             && entry.message.contains("tests.rs")
     }));
 }
 
 #[test]
-fn panic_hook_does_not_forward_sensitive_payloads_to_the_previous_hook() {
+fn repeated_panic_hook_initialization_does_not_duplicate_the_chain() {
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
     let state = NativeLogState::for_tests();
     let original = std::panic::take_hook();
-    let previous_called = Arc::new(AtomicBool::new(false));
-    let previous_called_by_hook = previous_called.clone();
+    let previous_calls = Arc::new(AtomicUsize::new(0));
+    let previous_calls_by_hook = previous_calls.clone();
     std::panic::set_hook(Box::new(move |_| {
-        previous_called_by_hook.store(true, Ordering::SeqCst);
+        previous_calls_by_hook.fetch_add(1, Ordering::SeqCst);
+    }));
+    let installed = std::sync::Once::new();
+
+    install_panic_hook_once_for(&installed, state.clone());
+    install_panic_hook_once_for(&installed, state.clone());
+    let _ = std::panic::catch_unwind(|| panic!("one captured panic"));
+    let installed_hook = std::panic::take_hook();
+    std::panic::set_hook(original);
+    drop(installed_hook);
+
+    assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state
+            .tail(None)
+            .iter()
+            .filter(|entry| entry.level == "panic")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn panic_hook_masks_sensitive_payload_in_native_log_while_preserving_previous_hook() {
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
+    let state = NativeLogState::for_tests();
+    let original = std::panic::take_hook();
+    let previous_calls = Arc::new(AtomicUsize::new(0));
+    let previous_calls_by_hook = previous_calls.clone();
+    std::panic::set_hook(Box::new(move |_| {
+        previous_calls_by_hook.fetch_add(1, Ordering::SeqCst);
     }));
     install_panic_hook_for(state.clone());
-    let _ = std::panic::catch_unwind(|| panic!("Authorization: Bearer fixture-panic-secret"));
+    let _ = std::panic::catch_unwind(|| panic!("database password is fixture-panic-secret"));
     let installed = std::panic::take_hook();
     std::panic::set_hook(original);
     drop(installed);
 
-    assert!(!previous_called.load(Ordering::SeqCst));
+    assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
     let entry = state.tail(Some(1)).pop().unwrap();
     assert!(!entry.message.contains("fixture-panic-secret"));
-    assert!(entry.message.contains("Authorization: ***"));
+    assert!(entry.message.contains("panic captured at"));
 }

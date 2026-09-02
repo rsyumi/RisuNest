@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
@@ -32,6 +32,7 @@ struct Inner {
 pub(crate) struct NativeLogState(Arc<Mutex<Inner>>);
 
 static GLOBAL_SINK: OnceLock<NativeLogState> = OnceLock::new();
+static PANIC_HOOK_INSTALLED: Once = Once::new();
 
 impl NativeLogState {
     pub(crate) fn initialize(root: impl AsRef<Path>) -> Self {
@@ -100,10 +101,9 @@ impl NativeLogState {
         }
     }
 
-    pub(crate) fn record_panic(&self, payload: &str, file: &str, line: u32, column: u32) -> String {
-        let message = format!("{payload} at {file}:{line}:{column}");
+    pub(crate) fn record_panic(&self, file: &str, line: u32, column: u32) {
+        let message = format!("panic captured at {file}:{line}:{column}");
         self.record("panic", "panic", &message);
-        message
     }
 
     pub(crate) fn tail(&self, limit: Option<usize>) -> Vec<LogEntry> {
@@ -447,28 +447,22 @@ fn format_console_line(level: &str, target: &str, message: &str) -> String {
 }
 
 pub(crate) fn install_panic_hook() {
-    install_panic_hook_for(global_state());
+    install_panic_hook_once_for(&PANIC_HOOK_INSTALLED, global_state());
+}
+
+fn install_panic_hook_once_for(installed: &Once, state: NativeLogState) {
+    installed.call_once(move || install_panic_hook_for(state));
 }
 
 fn install_panic_hook_for(state: NativeLogState) {
-    // PanicHookInfo exposes the original payload by reference and cannot be
-    // forwarded with a redacted replacement. Recreate the useful default
-    // diagnostic from masked payload and location instead of invoking a
-    // previous hook with raw data.
+    let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-string panic payload");
-        let message = if let Some(location) = info.location() {
-            state.record_panic(payload, location.file(), location.line(), location.column())
+        if let Some(location) = info.location() {
+            state.record_panic(location.file(), location.line(), location.column());
         } else {
-            state.record("panic", "panic", payload);
-            payload.to_owned()
-        };
-        eprintln!("{}", format_console_line("panic", "panic", &message));
+            state.record("panic", "panic", "panic captured");
+        }
+        previous(info);
     }));
 }
 
