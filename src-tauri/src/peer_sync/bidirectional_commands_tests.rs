@@ -1931,6 +1931,44 @@ fn assert_no_logical_delta_staging_orphans(repository_root: &Path) {
 }
 
 #[test]
+fn operation_journal_rejects_a_missing_newly_published_backup() {
+    let directory = tempfile::tempdir().unwrap();
+    let operation_id = "123e4567-e89b-42d3-a456-426614174003";
+    let operation = PeerBidirectionalDurableOperation::LocalCommitted {
+        schema: OPERATION_SCHEMA.to_owned(),
+        context: context(operation_id),
+        committed_revision: 8,
+        shared_generation: generation("local-a", "3", 'e'),
+        changed: true,
+        remote_backup_required: false,
+        remote_apply_receipt: None,
+        transferred_objects: 2,
+        transferred_bytes: 19,
+        backups: vec![PeerBidirectionalBackupReceipt {
+            package_id: "f".repeat(64),
+            side: PeerBidirectionalBackupSide::Local,
+            path: bidirectional_backup_path(
+                directory.path(),
+                operation_id,
+                PeerBidirectionalBackupSide::Local,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        }],
+    };
+
+    assert!(matches!(
+        PeerBidirectionalOperationJournal::new(directory.path()).store(&operation),
+        Err(PeerSyncError::Storage(message))
+            if message == "bidirectional backup disappeared before receipt publication"
+    ));
+    assert!(!directory
+        .path()
+        .join("peer-bidirectional/operation.json")
+        .exists());
+}
+
+#[test]
 fn local_committed_operation_survives_reopen_and_atomic_completion() {
     let directory = tempfile::tempdir().unwrap();
     let journal = PeerBidirectionalOperationJournal::new(directory.path());
@@ -8815,19 +8853,21 @@ fn status_does_not_promote_source_postcommit_with_a_missing_physical_backup() {
         "123e4567-e89b-42d3-a456-426614174159",
         durable_job_id,
     );
+    let backup_path = bidirectional_backup_path(
+        directory.path(),
+        operation_id,
+        PeerBidirectionalBackupSide::Remote,
+    );
+    fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+    fs::write(&backup_path, b"published backup").unwrap();
     evidence.backup = Some(LanBidirectionalBackupReceipt {
         package_id: "f".repeat(64),
-        path: bidirectional_backup_path(
-            directory.path(),
-            operation_id,
-            PeerBidirectionalBackupSide::Remote,
-        )
-        .to_string_lossy()
-        .into_owned(),
+        path: backup_path.to_string_lossy().into_owned(),
     });
     let retained = evidence.durable_operation(durable_job_id.to_owned());
     let journal = PeerBidirectionalOperationJournal::new(directory.path());
     journal.store(&retained).unwrap();
+    fs::remove_file(backup_path).unwrap();
 
     assert!(PeerBidirectionalCommandState::default()
         .status(directory.path(), &mut store)

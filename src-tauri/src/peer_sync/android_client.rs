@@ -699,19 +699,33 @@ impl AndroidResumableCloneJob {
         &self,
         backup_path: &Path,
     ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
-        let mut status = self.reconciled_status()?;
-        match status.backup_path.as_deref() {
-            Some(existing) if existing == backup_path => return self.status(),
-            Some(_) => {
-                return Err(PeerSyncError::Validation(
-                    "Android clone job backup path changed".to_owned(),
-                ))
+        super::maintenance::with_backup_reference_lifecycle(|| {
+            let app_root = self.root.parent().and_then(Path::parent).ok_or_else(|| {
+                PeerSyncError::Storage("Android clone job has no app root".to_owned())
+            })?;
+            if !legacy_backup_owns_activation(
+                Some(backup_path),
+                &app_root.join("peer-clone-activation"),
+                &self.descriptor.job_id,
+            )? {
+                return Err(PeerSyncError::Storage(
+                    "Android clone backup disappeared before receipt publication".to_owned(),
+                ));
             }
-            None => {}
-        }
-        status.backup_path = Some(backup_path.to_owned());
-        self.write_status(&status)?;
-        self.status()
+            let mut status = self.reconciled_status()?;
+            match status.backup_path.as_deref() {
+                Some(existing) if existing == backup_path => return self.status(),
+                Some(_) => {
+                    return Err(PeerSyncError::Validation(
+                        "Android clone job backup path changed".to_owned(),
+                    ))
+                }
+                None => {}
+            }
+            status.backup_path = Some(backup_path.to_owned());
+            self.write_status(&status)?;
+            self.status()
+        })
     }
 
     pub fn discard_at(job_root: impl AsRef<Path>) -> Result<(), PeerSyncError> {
@@ -1407,13 +1421,15 @@ impl AndroidCloneJobRegistry {
 
     fn write_current_id(&self, job_id: &str) -> Result<(), PeerSyncError> {
         validate_job_id(job_id)?;
-        write_json_atomic(
-            &self.jobs_root.join("current.json"),
-            &AndroidCloneRegistryOwnership {
-                schema: REGISTRY_SCHEMA.to_owned(),
-                job_id: job_id.to_owned(),
-            },
-        )
+        super::maintenance::with_backup_reference_lifecycle(|| {
+            write_json_atomic(
+                &self.jobs_root.join("current.json"),
+                &AndroidCloneRegistryOwnership {
+                    schema: REGISTRY_SCHEMA.to_owned(),
+                    job_id: job_id.to_owned(),
+                },
+            )
+        })
     }
 
     fn remove_current_id(&self) -> Result<(), PeerSyncError> {

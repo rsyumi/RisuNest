@@ -7237,6 +7237,12 @@ impl PeerBidirectionalOperationJournal {
     }
 
     pub(crate) fn load(&self) -> Result<Option<PeerBidirectionalDurableOperation>, PeerSyncError> {
+        super::maintenance::with_backup_reference_lifecycle(|| self.load_with_backup_lifecycle())
+    }
+
+    pub(crate) fn load_with_backup_lifecycle(
+        &self,
+    ) -> Result<Option<PeerBidirectionalDurableOperation>, PeerSyncError> {
         let Some(bytes) = self.read_bounded()? else {
             return Ok(None);
         };
@@ -7247,6 +7253,14 @@ impl PeerBidirectionalOperationJournal {
     }
 
     fn load_for_acknowledge(&self) -> Result<AcknowledgeOperationLoad, PeerSyncError> {
+        super::maintenance::with_backup_reference_lifecycle(|| {
+            self.load_for_acknowledge_with_backup_lifecycle()
+        })
+    }
+
+    fn load_for_acknowledge_with_backup_lifecycle(
+        &self,
+    ) -> Result<AcknowledgeOperationLoad, PeerSyncError> {
         let Some(bytes) = self.read_bounded()? else {
             return Ok(AcknowledgeOperationLoad::Absent);
         };
@@ -7319,6 +7333,16 @@ impl PeerBidirectionalOperationJournal {
     }
 
     fn abandon_invalid_record(
+        &self,
+        operation_id: &str,
+        snapshot: InvalidOperationSnapshot,
+    ) -> Result<(), PeerSyncError> {
+        super::maintenance::with_backup_reference_lifecycle(|| {
+            self.abandon_invalid_record_with_backup_lifecycle(operation_id, snapshot)
+        })
+    }
+
+    fn abandon_invalid_record_with_backup_lifecycle(
         &self,
         operation_id: &str,
         snapshot: InvalidOperationSnapshot,
@@ -7440,6 +7464,66 @@ impl PeerBidirectionalOperationJournal {
     }
 
     pub(crate) fn store(
+        &self,
+        operation: &PeerBidirectionalDurableOperation,
+    ) -> Result<(), PeerSyncError> {
+        if operation.backup_paths().is_empty() {
+            return self.store_unlocked(operation);
+        }
+        super::maintenance::with_backup_reference_lifecycle(|| {
+            self.validate_local_backup_publications(operation)?;
+            self.store_unlocked(operation)
+        })
+    }
+
+    fn validate_local_backup_publications(
+        &self,
+        operation: &PeerBidirectionalDurableOperation,
+    ) -> Result<(), PeerSyncError> {
+        let app_root = self.root.parent().ok_or_else(|| {
+            PeerSyncError::Storage("bidirectional operation root has no app root".to_owned())
+        })?;
+        for backup_path in operation.backup_paths() {
+            let path = Path::new(backup_path);
+            let candidate = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                app_root.join(path)
+            };
+            let expected_local = bidirectional_backup_path(
+                app_root,
+                operation.operation_id(),
+                PeerBidirectionalBackupSide::Local,
+            );
+            let expected_remote = bidirectional_backup_path(
+                app_root,
+                operation.operation_id(),
+                PeerBidirectionalBackupSide::Remote,
+            );
+            // Older synthetic and migrated records can contain non-canonical paths. New
+            // production publications always use the operation-owned deterministic path.
+            if candidate != expected_local && candidate != expected_remote {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    PeerSyncError::Storage(
+                        "bidirectional backup disappeared before receipt publication".to_owned(),
+                    )
+                } else {
+                    error.into()
+                }
+            })?;
+            if !metadata.is_file() || backup_path_is_link_like(&metadata) {
+                return Err(PeerSyncError::Storage(
+                    "bidirectional backup disappeared before receipt publication".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn store_unlocked(
         &self,
         operation: &PeerBidirectionalDurableOperation,
     ) -> Result<(), PeerSyncError> {

@@ -847,12 +847,14 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
             .map_err(lossless_error)?;
         let mut reader = File::open(package)?;
         let now_ms = unix_time_ms()?;
-        let mut durable_job = DurableCasJob::begin(
-            self.cas.repository_root(),
-            &stage.durable_job_id,
-            CasJobKind::PeerClone,
-            now_ms,
-        )?;
+        let mut durable_job = super::maintenance::with_backup_reference_lifecycle(|| {
+            Ok(DurableCasJob::begin(
+                self.cas.repository_root(),
+                &stage.durable_job_id,
+                CasJobKind::PeerClone,
+                now_ms,
+            )?)
+        })?;
         let commit_attempted = std::cell::Cell::new(false);
         #[cfg(test)]
         let leave_precommit = std::mem::take(&mut self.leave_durable_after_precommit_failure);

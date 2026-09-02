@@ -46,6 +46,25 @@ fn active_temp_paths() -> &'static Mutex<HashMap<PathBuf, usize>> {
     PATHS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn backup_reference_lifecycle() -> &'static Mutex<()> {
+    static LIFECYCLE: OnceLock<Mutex<()>> = OnceLock::new();
+    LIFECYCLE.get_or_init(|| Mutex::new(()))
+}
+
+// Publication may run while a lane owns its runtime mutex. The deletion side must
+// therefore inspect only durable files while this lock is held and never acquire a
+// lane runtime mutex.
+pub(crate) fn with_backup_reference_lifecycle<T>(
+    operation: impl FnOnce() -> Result<T, PeerSyncError>,
+) -> Result<T, PeerSyncError> {
+    let _lifecycle = backup_reference_lifecycle().lock().map_err(|error| {
+        PeerSyncError::Storage(format!(
+            "peer backup reference lifecycle is poisoned: {error}"
+        ))
+    })?;
+    operation()
+}
+
 #[cfg(test)]
 pub(crate) fn active_temp_registry_is_locked() -> bool {
     matches!(
@@ -385,7 +404,36 @@ fn load_bidirectional_operation(
 }
 
 fn operation_references(app_root: &Path, candidate: &Path) -> Result<bool, PeerSyncError> {
-    let Some(operation) = load_bidirectional_operation(app_root)? else {
+    operation_references_inner(app_root, candidate, load_bidirectional_operation(app_root)?)
+}
+
+fn operation_references_with_lifecycle(
+    app_root: &Path,
+    candidate: &Path,
+) -> Result<bool, PeerSyncError> {
+    let operation_root = app_root.join("peer-bidirectional");
+    let Some(_) =
+        validate_existing_plain_path(app_root, &operation_root, ExpectedPathKind::Directory)?
+    else {
+        return Ok(false);
+    };
+    let operation_path = operation_root.join("operation.json");
+    if operation_path.exists() {
+        validate_existing_plain_path(app_root, &operation_path, ExpectedPathKind::File)?
+            .ok_or_else(|| {
+                PeerSyncError::Storage("bidirectional operation journal is missing".to_owned())
+            })?;
+    }
+    let journal = super::bidirectional_commands::PeerBidirectionalOperationJournal::new(app_root);
+    operation_references_inner(app_root, candidate, journal.load_with_backup_lifecycle()?)
+}
+
+fn operation_references_inner(
+    app_root: &Path,
+    candidate: &Path,
+    operation: Option<super::bidirectional_commands::PeerBidirectionalDurableOperation>,
+) -> Result<bool, PeerSyncError> {
+    let Some(operation) = operation else {
         return Ok(false);
     };
     let candidate =
@@ -574,8 +622,16 @@ fn delete_backup_with_predelete_hooks_inner(
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
     postvalidation_hook()?;
-    boundary.remove_file()?;
-    Ok(())
+    with_backup_reference_lifecycle(|| {
+        let selected = validated_direct_child(app_root, &root, &selected, true)?;
+        if operation_references_with_lifecycle(app_root, &selected)? {
+            return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
+        }
+        if clone_backup_is_in_use(app_root, &root, &selected)? {
+            return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
+        }
+        boundary.remove_file()
+    })
 }
 
 fn temp_roots(app_root: &Path) -> Vec<(PathBuf, bool)> {

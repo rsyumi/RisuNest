@@ -754,6 +754,51 @@ fn final_predelete_recheck_rejects_a_matching_job_created_after_initial_checks()
     assert!(backup.exists());
 }
 
+#[test]
+fn final_locked_recheck_rejects_a_desktop_reference_published_after_validation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let operation_id = "00000000-0000-4000-8000-000000000006";
+    let session_id = "00000000-0000-4000-8000-000000000007";
+    let backup = root.join(format!(
+        "peer-clone/activation/backups/pre-clone-{operation_id}.lossless"
+    ));
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(&backup, b"backup").expect("write backup");
+
+    let error = delete_backup_with_postvalidation_hook(root, &backup, || {
+        let marker = root
+            .join("peer-clone/targets")
+            .join(session_id)
+            .join("activation-operation.json");
+        fs::create_dir_all(marker.parent().expect("marker parent"))
+            .expect("create target marker root");
+        fs::write(
+            marker,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "risunest.peer-clone-target-operation/v1",
+                "sessionId": session_id,
+                "manifestId": "0".repeat(64),
+                "operationId": operation_id,
+                "backupPath": format!(
+                    "activation/backups/pre-clone-{operation_id}.lossless"
+                ),
+                "completionAcknowledged": false,
+            }))
+            .expect("serialize target marker"),
+        )
+        .expect("publish target marker after validation");
+        Ok(())
+    })
+    .expect_err("reference published after validation must block deletion");
+
+    assert_eq!(
+        error,
+        PeerSyncError::Validation("peer-backup-in-use".to_owned())
+    );
+    assert!(backup.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn backup_and_temp_maintenance_do_not_follow_leaf_symlinks() {

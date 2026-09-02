@@ -2032,17 +2032,19 @@ fn load_or_create_target_operation_id(
     job_root: &Path,
     request: &PeerCloneTargetRequest,
 ) -> Result<String, PeerSyncError> {
-    let path = job_root.join(TARGET_OPERATION_MARKER_FILE);
-    if let Some(bytes) = read_target_operation_marker_bytes(&path)? {
-        if let Ok(marker) = serde_json::from_slice::<TargetOperationMarker>(&bytes) {
-            if marker.validate_for(request).is_ok() {
-                return Ok(marker.operation_id);
+    super::maintenance::with_backup_reference_lifecycle(|| {
+        let path = job_root.join(TARGET_OPERATION_MARKER_FILE);
+        if let Some(bytes) = read_target_operation_marker_bytes(&path)? {
+            if let Ok(marker) = serde_json::from_slice::<TargetOperationMarker>(&bytes) {
+                if marker.validate_for(request).is_ok() {
+                    return Ok(marker.operation_id);
+                }
             }
         }
-    }
-    let marker = TargetOperationMarker::new(request);
-    write_target_operation_marker(&path, &marker, request)?;
-    Ok(marker.operation_id)
+        let marker = TargetOperationMarker::new(request);
+        write_target_operation_marker(&path, &marker, request)?;
+        Ok(marker.operation_id)
+    })
 }
 
 fn read_target_operation_marker(
@@ -2155,24 +2157,26 @@ fn persist_target_backup_receipt(
     operation_id: &str,
     backup_path: &Path,
 ) -> Result<(), PeerSyncError> {
-    let marker_path = job_root.join(TARGET_OPERATION_MARKER_FILE);
-    let mut marker = read_target_operation_marker(&marker_path, request)?.ok_or_else(|| {
-        PeerSyncError::Storage("peer clone target operation marker is missing".to_owned())
-    })?;
-    if marker.operation_id != operation_id {
-        return Err(PeerSyncError::Validation(
-            "peer clone backup receipt belongs to another operation".to_owned(),
-        ));
-    }
-    let expected = fs::canonicalize(target_backup_path(peer_root, operation_id))?;
-    let actual = fs::canonicalize(backup_path)?;
-    if actual != expected {
-        return Err(PeerSyncError::Validation(
-            "peer clone backup receipt path is not operation-owned".to_owned(),
-        ));
-    }
-    marker.backup_path = Some(target_backup_relative_path(operation_id));
-    write_target_operation_marker(&marker_path, &marker, request)
+    super::maintenance::with_backup_reference_lifecycle(|| {
+        let marker_path = job_root.join(TARGET_OPERATION_MARKER_FILE);
+        let mut marker = read_target_operation_marker(&marker_path, request)?.ok_or_else(|| {
+            PeerSyncError::Storage("peer clone target operation marker is missing".to_owned())
+        })?;
+        if marker.operation_id != operation_id {
+            return Err(PeerSyncError::Validation(
+                "peer clone backup receipt belongs to another operation".to_owned(),
+            ));
+        }
+        let expected = fs::canonicalize(target_backup_path(peer_root, operation_id))?;
+        let actual = fs::canonicalize(backup_path)?;
+        if actual != expected {
+            return Err(PeerSyncError::Validation(
+                "peer clone backup receipt path is not operation-owned".to_owned(),
+            ));
+        }
+        marker.backup_path = Some(target_backup_relative_path(operation_id));
+        write_target_operation_marker(&marker_path, &marker, request)
+    })
 }
 
 fn recover_target_backup_receipt(

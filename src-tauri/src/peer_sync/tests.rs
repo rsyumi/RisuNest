@@ -1107,6 +1107,43 @@ fn android_clone_job_resumes_from_a_verified_chunk_after_actual_process_kill() {
 }
 
 #[test]
+fn android_clone_rejects_a_missing_backup_before_receipt_publication() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[97]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let job_id = "99999999-9999-4999-8999-999999999998";
+    let job_root = app_root.path().join("peer-clone-jobs").join(job_id);
+    fs::create_dir_all(job_root.parent().unwrap()).unwrap();
+    let job = AndroidResumableCloneJob::claim(
+        &job_root,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let backup_path = app_root
+        .path()
+        .join("peer-clone-activation/backups")
+        .join(format!("pre-clone-{job_id}.lossless"));
+    fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+    fs::write(&backup_path, b"published backup").unwrap();
+    fs::remove_file(&backup_path).unwrap();
+
+    assert!(matches!(
+        job.record_backup_path(&backup_path),
+        Err(PeerSyncError::Storage(message))
+            if message == "Android clone backup disappeared before receipt publication"
+    ));
+    assert!(job.status().unwrap().backup_path.is_none());
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_clone_progress_status_failure_pauses_and_resumes_without_redownloading_verified_chunks()
 {
     let source_root = tempfile::tempdir().unwrap();
