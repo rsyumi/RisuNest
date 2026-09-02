@@ -628,6 +628,11 @@ where
         P: SharedSourcePreparation<C>,
     {
         let _operation = self.operation()?;
+        if self.lifecycle.phase()? == SharedSessionPhase::Stopping {
+            return Err(PeerSyncError::Protocol(
+                "shared source cleanup is pending; retry stop before preparing".to_owned(),
+            ));
+        }
         if request.method != DeviceSyncListenMethod::Lan || request.fixed_port == 0 {
             return self.fail(
                 DeviceSyncErrorCategory::InvalidConfiguration,
@@ -641,7 +646,13 @@ where
         }
         self.set_phase(DeviceSyncSourcePhase::Preparing)?;
         if let Err(error) = self.lifecycle.prepare(context) {
-            return self.fail(DeviceSyncErrorCategory::PreparationFailed, error);
+            let mut runtime = self.runtime()?;
+            runtime.configuration = None;
+            runtime.pairing = None;
+            runtime.foreground = None;
+            runtime.latest_error = Some(DeviceSyncErrorCategory::PreparationFailed);
+            runtime.phase = DeviceSyncSourcePhase::Error;
+            return Err(error);
         }
         let mut runtime = self.runtime()?;
         runtime.configuration = Some(AndroidDeviceSyncConfiguration {
@@ -823,25 +834,30 @@ where
                 let mut runtime = self.runtime()?;
                 runtime.phase = DeviceSyncSourcePhase::Stopping;
                 runtime.pairing = None;
-                runtime.foreground.take()
+                runtime.foreground.clone()
             };
             cleanup = self.lifecycle.stop();
             let mut runtime = self.runtime()?;
-            runtime.configuration = None;
             runtime.pairing = None;
             runtime.latest_error = cleanup
                 .as_ref()
                 .err()
                 .map(|_| DeviceSyncErrorCategory::CleanupFailed);
+            if cleanup.is_ok() {
+                runtime.configuration = None;
+                runtime.foreground = None;
+            }
             runtime.phase = if cleanup.is_ok() {
                 DeviceSyncSourcePhase::Idle
             } else {
                 DeviceSyncSourcePhase::Error
             };
         }
-        if let Some(key) = foreground.as_ref() {
-            let _ = registry().cancel_exact(key);
-            let _ = registry().detach_if_generation(key);
+        if cleanup.is_ok() {
+            if let Some(key) = foreground.as_ref() {
+                let _ = registry().cancel_exact(key);
+                let _ = registry().detach_if_generation(key);
+            }
         }
         cleanup.map(|()| foreground)
     }
@@ -862,13 +878,11 @@ where
         let Ok(_operation) = self.operation() else {
             return;
         };
-        if self
-            .runtime()
-            .ok()
-            .and_then(|runtime| runtime.foreground.clone())
-            .as_ref()
-            != Some(key)
-        {
+        let should_stop_running = self.runtime().ok().is_some_and(|runtime| {
+            runtime.phase == DeviceSyncSourcePhase::Running
+                && runtime.foreground.as_ref() == Some(key)
+        });
+        if !should_stop_running {
             return;
         }
         if self

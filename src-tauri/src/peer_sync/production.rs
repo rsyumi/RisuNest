@@ -23,12 +23,22 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const UNIFIED_ACTIVE_SOURCE_MARKER_SCHEMA: &str = "risunest.peer-clone-active-source/v1";
 const UNIFIED_ACTIVE_SOURCE_MARKER_FILE: &str = "active-source.json";
 const MAX_UNIFIED_ACTIVE_SOURCE_MARKER_BYTES: u64 = 4 * 1024;
+static UNIFIED_SOURCE_FILES: Mutex<()> = Mutex::new(());
+
+fn lock_unified_source_files() -> Result<MutexGuard<'static, ()>, PeerSyncError> {
+    UNIFIED_SOURCE_FILES.lock().map_err(|error| {
+        PeerSyncError::Storage(format!(
+            "shared clone source filesystem mutex is unavailable: {error}"
+        ))
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -183,18 +193,21 @@ impl PreparedUnifiedCloneSource {
     }
 
     pub(crate) fn cleanup(&mut self) -> Result<(), PeerSyncError> {
+        let _files = lock_unified_source_files()?;
         self.prepared.take();
-        remove_unified_directory(&self.session_root)?;
-        match read_unified_source_marker(&self.marker_path)? {
-            None => Ok(()),
-            Some(marker) if marker == self.marker => {
-                fs::remove_file(&self.marker_path)?;
-                Ok(())
-            }
-            Some(_) => Err(PeerSyncError::Validation(
+        let marker = read_unified_source_marker(&self.marker_path)?;
+        if marker.as_ref().is_some_and(|marker| marker != &self.marker) {
+            return Err(PeerSyncError::Validation(
                 "prepared clone source marker belongs to another session".to_owned(),
-            )),
+            ));
         }
+        remove_unified_directory(&self.session_root)?;
+        if marker.is_some() {
+            fs::remove_file(&self.marker_path)?;
+        }
+        sweep_unified_source_directories(self.session_root.parent().ok_or_else(|| {
+            PeerSyncError::Storage("shared clone source session has no owned parent".to_owned())
+        })?)
     }
 }
 
@@ -204,6 +217,7 @@ pub(crate) fn prepare_unified_clone_source(
     peer_root: &Path,
     cancellation: &dyn CancellationProbe,
 ) -> Result<PreparedUnifiedCloneSource, PeerSyncError> {
+    let _files = lock_unified_source_files()?;
     let operation_id = uuid::Uuid::new_v4().to_string();
     let preparation_parent = peer_root.join("source-preparation");
     let sessions_parent = peer_root.join("source-sessions");
@@ -280,6 +294,44 @@ fn remove_unified_directory(path: &Path) -> Result<(), PeerSyncError> {
         ));
     }
     fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn sweep_unified_source_directories(parent: &Path) -> Result<(), PeerSyncError> {
+    let metadata = match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || unified_metadata_is_link(&metadata) {
+        return Err(PeerSyncError::Validation(
+            "peer clone cleanup root is not an ordinary directory".to_owned(),
+        ));
+    }
+    let canonical_parent = fs::canonicalize(parent)?;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(&name)
+            .map(|value| value.to_string() != name)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || unified_metadata_is_link(&metadata) {
+            continue;
+        }
+        let canonical = fs::canonicalize(entry.path())?;
+        if canonical.parent() != Some(canonical_parent.as_path()) {
+            return Err(PeerSyncError::Validation(
+                "peer clone cleanup target escaped its owned root".to_owned(),
+            ));
+        }
+        fs::remove_dir_all(canonical)?;
+    }
     Ok(())
 }
 

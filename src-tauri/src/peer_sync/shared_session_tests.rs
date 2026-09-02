@@ -64,6 +64,7 @@ struct AndroidHostEvents {
     fail_start_once: bool,
     fail_port_once: bool,
     fail_stop_once: bool,
+    fail_prepare: Option<SharedSourceLane>,
 }
 
 struct AndroidHostFixture {
@@ -154,7 +155,14 @@ impl SharedSourceOwnership for AndroidPreparationFixture {
 }
 
 impl SharedSourcePreparation<()> for AndroidPreparationFixture {
-    fn prepare(&mut self, _: SharedSourceLane, _: &mut ()) -> Result<(), PeerSyncError> {
+    fn prepare(&mut self, lane: SharedSourceLane, _: &mut ()) -> Result<(), PeerSyncError> {
+        let mut events = self.events.lock().unwrap();
+        if events.fail_prepare == Some(lane) {
+            events.fail_prepare = None;
+            return Err(PeerSyncError::Storage(format!(
+                "injected {lane:?} preparation failure"
+            )));
+        }
         Ok(())
     }
 }
@@ -214,6 +222,40 @@ fn android_unified_source_accepts_only_explicit_nonzero_lan_ports() {
             .phase,
         DeviceSyncSourcePhase::Prepared
     );
+}
+
+#[test]
+fn android_lane_prepare_failures_leave_a_terminal_retryable_phase() {
+    for lane in [
+        SharedSourceLane::Clone,
+        SharedSourceLane::Delta,
+        SharedSourceLane::Bidirectional,
+    ] {
+        let events = Arc::new(Mutex::new(AndroidHostEvents {
+            fail_prepare: Some(lane),
+            ..Default::default()
+        }));
+        let state = android_state(events);
+        let root = tempfile::tempdir().unwrap();
+
+        assert!(state
+            .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+            .is_err());
+        let failed = state.status().unwrap();
+        assert_eq!(failed.phase, DeviceSyncSourcePhase::Error);
+        assert_eq!(
+            failed.latest_error,
+            Some(super::shared_session::DeviceSyncErrorCategory::PreparationFailed)
+        );
+        assert_eq!(
+            state
+                .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+                .unwrap()
+                .phase,
+            DeviceSyncSourcePhase::Prepared
+        );
+        assert_eq!(state.stop_for_test().unwrap(), None);
+    }
 }
 
 #[test]
@@ -475,6 +517,59 @@ fn android_start_cleanup_failure_requires_explicit_stop_before_reprepare() {
     assert_eq!(state.stop_for_test().unwrap(), None);
     assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Idle);
     assert_eq!(events.lock().unwrap().stops, 2);
+}
+
+#[test]
+fn android_explicit_stop_returns_exact_foreground_when_native_cleanup_needs_retry() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents::default()));
+    let state = android_state(Arc::clone(&events));
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let foreground = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&foreground));
+    state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            },
+            foreground.clone(),
+        )
+        .unwrap();
+    events.lock().unwrap().fail_stop_once = true;
+
+    assert!(state.stop_for_test().is_err());
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(
+        android_foreground_registry().source_status(AndroidForegroundLane::DeviceSyncSource),
+        Some(foreground.clone())
+    );
+    assert!(state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .is_err());
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(
+        android_foreground_registry().source_status(AndroidForegroundLane::DeviceSyncSource),
+        Some(foreground.clone())
+    );
+    assert!(android_foreground_registry().cancel_exact(&foreground));
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Error);
+
+    assert_eq!(state.stop_for_test().unwrap(), Some(foreground.clone()));
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert!(android_foreground_registry()
+        .source_status(AndroidForegroundLane::DeviceSyncSource)
+        .is_none());
+    let next = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(next.generation > foreground.generation);
+    assert!(android_foreground_registry().detach_if_generation(&next));
 }
 
 #[derive(Default)]
@@ -835,6 +930,13 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
         .join("peer-clone")
         .join("active-source.json")
         .exists());
+    let sessions = root.path().join("peer-clone").join("source-sessions");
+    let stale = sessions.join("323e4567-e89b-42d3-a456-426614174000");
+    let noncanonical = sessions.join("423E4567-E89B-42D3-A456-426614174000");
+    let canonical_file = sessions.join("523e4567-e89b-42d3-a456-426614174000");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::create_dir_all(&noncanonical).unwrap();
+    std::fs::write(&canonical_file, b"preserve file").unwrap();
 
     lifecycle.stop().unwrap();
 
@@ -844,6 +946,47 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
         .join("peer-clone")
         .join("active-source.json")
         .exists());
+    assert!(!stale.exists());
+    assert!(noncanonical.is_dir());
+    assert!(canonical_file.is_file());
+}
+
+#[cfg(desktop)]
+#[test]
+fn real_shared_clone_cleanup_preserves_session_owned_by_a_different_active_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let cas = PayloadCas::new(root.path()).unwrap();
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    seed_shared_source_store(&mut store);
+    let expected_revision = store.revision().unwrap();
+    let lifecycle = SharedSessionLifecycle::new(SharedSourceEngines::new());
+    let mut context = SharedSourcePreparationContext {
+        store: &mut store,
+        cas: &cas,
+        app_root: root.path(),
+        cancellation: &NeverCancelled,
+        expected_bidirectional_revision: expected_revision,
+    };
+    lifecycle.prepare(&mut context).unwrap();
+    let marker_path = root.path().join("peer-clone").join("active-source.json");
+    let original = std::fs::read(&marker_path).unwrap();
+    let marker: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let active_directory = marker["directoryId"].as_str().unwrap().to_owned();
+    let active_session = root
+        .path()
+        .join("peer-clone")
+        .join("source-sessions")
+        .join(&active_directory);
+    let mut foreign = marker;
+    foreign["directoryId"] =
+        serde_json::Value::String("623e4567-e89b-42d3-a456-426614174000".to_owned());
+    std::fs::write(&marker_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+    assert!(lifecycle.stop().is_err());
+    assert!(active_session.is_dir());
+    std::fs::write(&marker_path, original).unwrap();
+    lifecycle.stop().unwrap();
+    assert!(!active_session.exists());
 }
 
 #[cfg(desktop)]
