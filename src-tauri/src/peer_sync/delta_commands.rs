@@ -1115,7 +1115,6 @@ struct DeltaCompletionAttempt {
 fn delta_completion_context(
     attempt: &DeltaCompletionAttempt,
     source_device_id: &str,
-    durable_job_id: &str,
     manifest_id: &str,
     pre_revision: i64,
     pre_common_base: Option<SyncGenerationIdentity>,
@@ -1129,7 +1128,6 @@ fn delta_completion_context(
         source_device_id: source_device_id.to_owned(),
         manifest_id: manifest_id.to_owned(),
         mode: attempt.mode,
-        durable_job_id: durable_job_id.to_owned(),
         pre_revision,
         pre_common_base,
         post_revision,
@@ -1375,7 +1373,6 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
             delta_completion_context(
                 attempt,
                 source_device_id,
-                &job_id,
                 &manifest_id,
                 expected_revision,
                 pre_common_base.clone(),
@@ -1452,7 +1449,6 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
                 let context = delta_completion_context(
                     attempt,
                     source_device_id,
-                    &job_id,
                     &manifest_id,
                     expected_revision,
                     pre_common_base.clone(),
@@ -1497,9 +1493,7 @@ fn finish_pull(
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match activation {
         Ok(LogicalDeltaActivation::Activated { revision }) => {
-            if !intent_written {
-                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
-            }
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
             Ok(if plan.apply.is_empty() {
                 PeerDeltaPullResult::NoChanges {
                     revision,
@@ -1515,9 +1509,7 @@ fn finish_pull(
             })
         }
         Ok(LogicalDeltaActivation::AlreadyActive { revision }) => {
-            if !intent_written {
-                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
-            }
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
             Ok(PeerDeltaPullResult::NoChanges {
                 revision,
                 transferred_objects: 0,
@@ -1554,9 +1546,7 @@ fn finish_bootstrap(
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match bootstrap {
         Ok(()) => {
-            if !intent_written {
-                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
-            }
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
             Ok(PeerDeltaPullResult::NoChanges {
                 revision: expected_revision,
                 transferred_objects: 0,
@@ -2099,19 +2089,19 @@ async fn peer_delta_pull_with_client_factory<
         })
         .map_err(|error| local_operation_failure("peer delta store", error, registered))?;
         let mut completion_transport = LanDeltaCompletionTransport;
-        if let Some(completed) =
-            recover_delta_completion(&mut store, &app_root, &mut completion_transport).map_err(
-                |error| peer_operation_failure("peer delta completion recovery", error, registered),
-            )?
-        {
-            return Ok(recovered_delta_result(completed));
-        }
+        let recovered = recover_delta_completion(&mut store, &app_root, &mut completion_transport)
+            .map_err(|error| {
+                peer_operation_failure("peer delta completion recovery", error, registered)
+            })?;
         reclaim_abandoned_durable_cas_jobs(
             &app_root,
             P4_DELTA_TARGET_JOB_PREFIX,
             CasJobKind::LogicalDeltaTarget,
         )
         .map_err(|error| local_operation_failure("peer delta recovery", error, registered))?;
+        if let Some(completed) = recovered {
+            return Ok(recovered_delta_result(completed));
+        }
         let mut client = client_factory(&app_root)
             .map_err(|error| peer_operation_failure("peer delta client", error, registered))?;
         let (manifest, completion) = fetch_delta_manifest_and_completion(&client)
@@ -2132,6 +2122,12 @@ async fn peer_delta_pull_with_client_factory<
         );
         let recovered = recover_delta_completion(&mut store, &app_root, &mut completion_transport)
             .map_err(|error| peer_operation_failure("peer delta completion", error, registered))?;
+        reclaim_abandoned_durable_cas_jobs(
+            &app_root,
+            P4_DELTA_TARGET_JOB_PREFIX,
+            CasJobKind::LogicalDeltaTarget,
+        )
+        .map_err(|error| local_operation_failure("peer delta recovery", error, registered))?;
         if let Some(completed) = recovered {
             return Ok(recovered_delta_result(completed));
         }
@@ -3458,7 +3454,6 @@ mod tests {
         let context = delta_completion_context(
             &attempt,
             ACCOUNTING_SOURCE_ID,
-            &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
             &"b".repeat(64),
             0,
             None,
@@ -3815,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_unsupported_activation_defers_accounting_until_durable_recovery() {
+    fn registered_unsupported_activation_releases_the_job_before_durable_accounting_recovery() {
         let directory = tempfile::tempdir().unwrap();
         register_accounting_source(directory.path(), 40, 7);
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -3882,8 +3877,7 @@ mod tests {
             directory.path(),
             &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
         )
-        .unwrap()
-        .is_sealed());
+        .is_err());
 
         let completed =
             recover_delta_completion(&mut store, directory.path(), &mut NoCompletionTransport)

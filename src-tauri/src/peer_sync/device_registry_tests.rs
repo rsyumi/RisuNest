@@ -1,10 +1,10 @@
 use super::device_registry::{
     accept_outgoing_completion_offer, finalize_incoming_completion_delivery,
-    incoming_completed_operation_recorded_for_lane,
-    incoming_completed_operation_recorded_for_lane_with_bytes, incoming_completion_is_durable,
-    incoming_source_summaries, issue_outgoing_unmeasured_completion_offer,
-    outgoing_device_summaries, prepare_incoming_completion_delivery,
-    record_incoming_completed_operation, record_incoming_completed_operation_best_effort,
+    incoming_completed_operation_bytes_for_lane, incoming_completed_operation_recorded_for_lane,
+    incoming_completion_is_durable, incoming_source_summaries,
+    issue_outgoing_unmeasured_completion_offer, outgoing_device_summaries,
+    prepare_incoming_completion_delivery, record_incoming_completed_operation,
+    record_incoming_completed_operation_best_effort,
     record_incoming_completed_operation_once_for_lane, register_incoming_source,
     register_outgoing_claim, remove_incoming_source, revoke_outgoing_device,
     seal_outgoing_completion_lease, snapshot_incoming_completion_delivery, CompletionAcceptance,
@@ -243,30 +243,27 @@ fn unsupported_completion_records_once_without_creating_an_outbox() {
             .unwrap();
     assert!(json.get("pendingCompletionDeliveries").is_none());
 
-    record_incoming_completed_operation_once_for_lane(
+    let registry_path = root.path().join("peer-sync/sources.json");
+    let before = fs::read(&registry_path).unwrap();
+    assert!(record_incoming_completed_operation_once_for_lane(
         root.path(),
         SOURCE_ID,
         CompletionLane::Bidirectional,
         &receipt_id,
         10,
     )
-    .unwrap();
-    assert!(incoming_completed_operation_recorded_for_lane_with_bytes(
-        root.path(),
-        SOURCE_ID,
-        CompletionLane::Bidirectional,
-        &receipt_id,
-        9,
-    )
-    .unwrap());
-    assert!(!incoming_completed_operation_recorded_for_lane_with_bytes(
-        root.path(),
-        SOURCE_ID,
-        CompletionLane::Bidirectional,
-        &receipt_id,
-        10,
-    )
-    .unwrap());
+    .is_err());
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+    assert_eq!(
+        incoming_completed_operation_bytes_for_lane(
+            root.path(),
+            SOURCE_ID,
+            CompletionLane::Bidirectional,
+            &receipt_id,
+        )
+        .unwrap(),
+        Some(9)
+    );
 }
 
 #[test]

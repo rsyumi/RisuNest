@@ -1007,12 +1007,10 @@ impl IncomingSourceRegistry {
         let retained = receipts
             .iter_mut()
             .find(|receipt| receipt.device_id == source_id && receipt.lane == lane);
-        if lane == CompletionLane::Delta.as_str()
-            && retained.as_ref().is_some_and(|receipt| {
-                receipt.receipt_id == receipt_id && receipt.transferred_bytes != Some(bytes)
-            })
-        {
-            return invalid("delta completion receipt byte count conflicts");
+        if retained.as_ref().is_some_and(|receipt| {
+            receipt.receipt_id == receipt_id && receipt.transferred_bytes != Some(bytes)
+        }) {
+            return invalid("incoming completion receipt byte count conflicts");
         }
         if !retained
             .as_ref()
@@ -1072,22 +1070,27 @@ impl IncomingSourceRegistry {
         }))
     }
 
-    fn has_completed_operation_for_lane_with_bytes(
+    fn completed_operation_bytes_for_lane(
         &self,
         source_id: &str,
         lane: CompletionLane,
         receipt_id: &str,
-        bytes: u64,
-    ) -> Result<bool, PeerSyncError> {
+    ) -> Result<Option<u64>, PeerSyncError> {
         validate_id(source_id)?;
         validate_receipt_id(receipt_id)?;
         let lane = lane.as_str();
-        Ok(self.completed_receipts.iter().any(|receipt| {
+        let Some(receipt) = self.completed_receipts.iter().find(|receipt| {
             receipt.device_id == source_id
                 && receipt.lane == lane
                 && receipt.receipt_id == receipt_id
-                && receipt.transferred_bytes == Some(bytes)
-        }))
+        }) else {
+            return Ok(None);
+        };
+        receipt.transferred_bytes.map(Some).ok_or_else(|| {
+            PeerSyncError::Validation(
+                "incoming completion receipt byte count is missing".to_owned(),
+            )
+        })
     }
 
     pub(crate) fn prepare_completion_delivery(
@@ -1684,18 +1687,17 @@ pub(crate) fn incoming_completed_operation_recorded_for_lane(
         .has_completed_operation_for_lane(source_id, lane, receipt_id)
 }
 
-pub(crate) fn incoming_completed_operation_recorded_for_lane_with_bytes(
+pub(crate) fn incoming_completed_operation_bytes_for_lane(
     app_root: &Path,
     source_id: &str,
     lane: CompletionLane,
     receipt_id: &str,
-    bytes: u64,
-) -> Result<bool, PeerSyncError> {
+) -> Result<Option<u64>, PeerSyncError> {
     let _guard = incoming_registry_lock()
         .lock()
         .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
     IncomingSourceRegistry::load(app_root)?
-        .has_completed_operation_for_lane_with_bytes(source_id, lane, receipt_id, bytes)
+        .completed_operation_bytes_for_lane(source_id, lane, receipt_id)
 }
 
 pub(crate) fn prepare_incoming_completion_delivery(

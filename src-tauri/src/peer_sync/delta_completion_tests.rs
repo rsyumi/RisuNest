@@ -4,9 +4,10 @@ use super::delta_completion::{
     DeltaCompletionTransport, PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
 };
 use super::device_registry::{
-    completion_receipt_id, record_incoming_completed_operation_once_for_lane,
-    snapshot_incoming_completion_delivery, CompletionLane, DevicePermissions, IncomingSource,
-    IncomingSourceRegistry, PendingCompletionDelivery,
+    completion_receipt_id, prepare_incoming_completion_delivery,
+    record_incoming_completed_operation_once_for_lane, snapshot_incoming_completion_delivery,
+    CompletionLane, DevicePermissions, IncomingSource, IncomingSourceRegistry,
+    PendingCompletionDelivery,
 };
 use crate::{
     asset_repository::{
@@ -38,7 +39,6 @@ fn context(operation_id: &str) -> DeltaCompletionContext {
         source_device_id: SOURCE_ID.to_owned(),
         manifest_id: "b".repeat(64),
         mode: DeltaCompletionMode::CompletionV1,
-        durable_job_id: format!("p4-delta-target-{operation_id}"),
         pre_revision: 4,
         pre_common_base: Some(identity("base", 'a', "1")),
         post_revision: 5,
@@ -46,6 +46,10 @@ fn context(operation_id: &str) -> DeltaCompletionContext {
         transferred_objects: 1,
         transferred_bytes: 17,
     }
+}
+
+fn job_id(operation: &DeltaCompletionContext) -> String {
+    format!("p4-delta-target-{}", operation.operation_id)
 }
 
 fn register_source(root: &Path, total_bytes: u64) {
@@ -68,8 +72,33 @@ struct FixtureTransport {
     root: PathBuf,
     prepared_bytes: u64,
     expected_before_delivery: u64,
+    prepare_failures: usize,
     prepares: usize,
     deliveries: usize,
+}
+
+struct OfflineTransport;
+
+impl DeltaCompletionTransport for OfflineTransport {
+    fn prepare(
+        &mut self,
+        _source: &IncomingSource,
+        _context: &DeltaCompletionContext,
+    ) -> Result<u64, super::PeerSyncError> {
+        Err(super::PeerSyncError::Protocol(
+            "source is offline".to_owned(),
+        ))
+    }
+
+    fn deliver(
+        &mut self,
+        _source: &IncomingSource,
+        _delivery: &PendingCompletionDelivery,
+    ) -> Result<(), super::PeerSyncError> {
+        Err(super::PeerSyncError::Protocol(
+            "source is offline".to_owned(),
+        ))
+    }
 }
 
 impl DeltaCompletionTransport for FixtureTransport {
@@ -79,6 +108,12 @@ impl DeltaCompletionTransport for FixtureTransport {
         _context: &DeltaCompletionContext,
     ) -> Result<u64, super::PeerSyncError> {
         self.prepares += 1;
+        if self.prepare_failures > 0 {
+            self.prepare_failures -= 1;
+            return Err(super::PeerSyncError::Protocol(
+                "injected source prepare response loss".to_owned(),
+            ));
+        }
         Ok(self.prepared_bytes)
     }
 
@@ -96,8 +131,37 @@ impl DeltaCompletionTransport for FixtureTransport {
     }
 }
 
+fn fixture_transport(root: &Path, prepared_bytes: u64, expected: u64) -> FixtureTransport {
+    FixtureTransport {
+        root: root.to_owned(),
+        prepared_bytes,
+        expected_before_delivery: expected,
+        prepare_failures: 0,
+        prepares: 0,
+        deliveries: 0,
+    }
+}
+
+fn pending_delivery(
+    operation: &DeltaCompletionContext,
+    useful_bytes: u64,
+) -> PendingCompletionDelivery {
+    PendingCompletionDelivery {
+        source_device_id: operation.source_device_id.clone(),
+        lane: CompletionLane::Delta.as_str().to_owned(),
+        completion_lease_id: operation.operation_id.clone(),
+        manifest_id: operation.manifest_id.clone(),
+        useful_bytes,
+        receipt_id: completion_receipt_id(
+            CompletionLane::Delta.as_str(),
+            &operation.operation_id,
+            &operation.manifest_id,
+        ),
+    }
+}
+
 #[test]
-fn delta_completion_journal_is_single_flight_and_source_prepare_is_retryable() {
+fn delta_completion_journal_is_single_flight_and_activation_intent_is_retryable() {
     let root = tempfile::tempdir().unwrap();
     let journal = PeerDeltaCompletionJournal::new(root.path());
     let first = context(OPERATION_ID);
@@ -110,18 +174,8 @@ fn delta_completion_journal_is_single_flight_and_source_prepare_is_retryable() {
             context: first.clone(),
         })
     );
+    journal.store_activation_intent(&first).unwrap();
     assert!(journal.store_activation_intent(&second).is_err());
-
-    journal.store_source_prepared(&first, 17).unwrap();
-    journal.store_source_prepared(&first, 17).unwrap();
-    assert!(journal.store_source_prepared(&first, 18).is_err());
-    assert_eq!(
-        journal.load().unwrap(),
-        Some(PeerDeltaDurableCompletion::SourcePrepared {
-            context: first.clone(),
-            useful_bytes: 17,
-        })
-    );
 
     journal.remove_exact(&first).unwrap();
     journal.remove_exact(&first).unwrap();
@@ -197,26 +251,7 @@ fn completed_delta_tombstone_is_bounded_and_cleaned_on_load() {
 }
 
 #[test]
-fn source_prepared_persists_authoritative_bytes_across_a_retried_transfer() {
-    let root = tempfile::tempdir().unwrap();
-    let journal = PeerDeltaCompletionJournal::new(root.path());
-    let mut operation = context(OPERATION_ID);
-    operation.transferred_bytes = 0;
-
-    journal.store_activation_intent(&operation).unwrap();
-    journal.store_source_prepared(&operation, 17).unwrap();
-
-    assert_eq!(
-        journal.load().unwrap(),
-        Some(PeerDeltaDurableCompletion::SourcePrepared {
-            context: operation,
-            useful_bytes: 17,
-        })
-    );
-}
-
-#[test]
-fn v1_completion_uses_source_bytes_and_finalizes_remote_first_once() {
+fn v1_completion_retries_after_a_lost_source_prepare_response() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), 5);
     let mut operation = context(OPERATION_ID);
@@ -224,13 +259,85 @@ fn v1_completion_uses_source_bytes_and_finalizes_remote_first_once() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 17,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 17, 5);
+    transport.prepare_failures = 1;
+
+    assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (1, 0));
+    assert!(
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta,)
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(
+        complete_delta_accounting(root.path(), &mut transport).unwrap(),
+        17
+    );
+    assert_eq!((transport.prepares, transport.deliveries), (2, 1));
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        22
+    );
+}
+
+#[test]
+fn v1_completion_restart_uses_pending_source_bytes_without_preparing_again() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let mut operation = context(OPERATION_ID);
+    operation.transferred_bytes = 0;
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    prepare_incoming_completion_delivery(root.path(), pending_delivery(&operation, 17)).unwrap();
+    let mut transport = fixture_transport(root.path(), 99, 5);
+
+    assert_eq!(
+        complete_delta_accounting(root.path(), &mut transport).unwrap(),
+        17
+    );
+    assert_eq!((transport.prepares, transport.deliveries), (0, 1));
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        22
+    );
+}
+
+#[test]
+fn v1_completion_rejects_a_mismatched_pending_delivery_before_source_prepare() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let operation = context(OPERATION_ID);
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    prepare_incoming_completion_delivery(
+        root.path(),
+        pending_delivery(&context(OTHER_OPERATION_ID), 23),
+    )
+    .unwrap();
+    let before = std::fs::read(root.path().join("peer-sync/sources.json")).unwrap();
+    let mut transport = fixture_transport(root.path(), 17, 5);
+
+    assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
+    assert_eq!(
+        std::fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn v1_completion_uses_cumulative_source_bytes_after_a_shrunk_retry() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let mut operation = context(OPERATION_ID);
+    operation.transferred_bytes = 0;
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let mut transport = fixture_transport(root.path(), 17, 5);
 
     assert_eq!(
         complete_delta_accounting(root.path(), &mut transport).unwrap(),
@@ -254,29 +361,20 @@ fn v1_completion_uses_source_bytes_and_finalizes_remote_first_once() {
 }
 
 #[test]
-fn v1_completion_overflow_retains_source_proof_and_pending_outbox() {
+fn v1_completion_overflow_retains_activation_intent_and_pending_outbox() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), u64::MAX);
     let operation = context(OPERATION_ID);
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 1,
-        expected_before_delivery: u64::MAX,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 1, u64::MAX);
 
     assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
     assert_eq!((transport.prepares, transport.deliveries), (1, 1));
     assert!(matches!(
         PeerDeltaCompletionJournal::new(root.path()).load().unwrap(),
-        Some(PeerDeltaDurableCompletion::SourcePrepared {
-            useful_bytes: 1,
-            ..
-        })
+        Some(PeerDeltaDurableCompletion::ActivationIntent { .. })
     ));
     let registry = IncomingSourceRegistry::load(root.path()).unwrap();
     assert_eq!(registry.sources()[0].total_bytes, u64::MAX);
@@ -285,6 +383,13 @@ fn v1_completion_overflow_retains_source_proof_and_pending_outbox() {
             .unwrap()
             .unwrap();
     assert_eq!(pending.delivery.useful_bytes, 1);
+
+    assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (1, 2));
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        u64::MAX
+    );
 }
 
 #[test]
@@ -297,13 +402,7 @@ fn unsupported_completion_records_target_only_once_including_zero_bytes() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 99,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 99, 5);
 
     assert_eq!(
         complete_delta_accounting(root.path(), &mut transport).unwrap(),
@@ -353,13 +452,7 @@ fn unsupported_completion_rejects_a_same_receipt_with_different_bytes() {
         .store_activation_intent(&operation)
         .unwrap();
     let before = std::fs::read(root.path().join("peer-sync/sources.json")).unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 99,
-        expected_before_delivery: 15,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 99, 15);
 
     assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
     assert_eq!(
@@ -387,7 +480,7 @@ fn recovery_clears_uncommitted_intent_without_counting() {
     operation.post_revision = 1;
     let mut job = DurableCasJob::begin(
         root.path(),
-        &operation.durable_job_id,
+        &job_id(&operation),
         CasJobKind::LogicalDeltaTarget,
         1,
     )
@@ -397,13 +490,7 @@ fn recovery_clears_uncommitted_intent_without_counting() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 17,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 17, 5);
 
     assert!(
         recover_delta_completion(&mut store, root.path(), &mut transport)
@@ -419,11 +506,11 @@ fn recovery_clears_uncommitted_intent_without_counting() {
         .load()
         .unwrap()
         .is_none());
-    assert!(DurableCasJob::open(root.path(), &operation.durable_job_id).is_err());
+    assert!(DurableCasJob::open(root.path(), &job_id(&operation)).is_err());
 }
 
 #[test]
-fn uncommitted_recovery_rejects_a_released_unsealed_job_without_counting() {
+fn uncommitted_recovery_tolerates_released_unsealed_and_missing_jobs_without_counting() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), 5);
     let mut store = PersistentStore::open(root.path()).unwrap();
@@ -433,7 +520,7 @@ fn uncommitted_recovery_rejects_a_released_unsealed_job_without_counting() {
     operation.post_revision = 1;
     let mut job = DurableCasJob::begin(
         root.path(),
-        &operation.durable_job_id,
+        &job_id(&operation),
         CasJobKind::LogicalDeltaTarget,
         1,
     )
@@ -444,15 +531,13 @@ fn uncommitted_recovery_rejects_a_released_unsealed_job_without_counting() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 17,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 17, 5);
 
-    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
+    assert!(
+        recover_delta_completion(&mut store, root.path(), &mut transport)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!((transport.prepares, transport.deliveries), (0, 0));
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
@@ -461,10 +546,62 @@ fn uncommitted_recovery_rejects_a_released_unsealed_job_without_counting() {
     assert!(PeerDeltaCompletionJournal::new(root.path())
         .load()
         .unwrap()
-        .is_some());
-    let retained = DurableCasJob::open(root.path(), &operation.durable_job_id).unwrap();
-    assert!(!retained.is_sealed());
-    assert!(retained.is_released());
+        .is_none());
+    assert!(DurableCasJob::open(root.path(), &job_id(&operation)).is_err());
+
+    let missing_root = tempfile::tempdir().unwrap();
+    register_source(missing_root.path(), 5);
+    let mut missing_store = PersistentStore::open(missing_root.path()).unwrap();
+    PeerDeltaCompletionJournal::new(missing_root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let mut missing_transport = fixture_transport(missing_root.path(), 17, 5);
+    assert!(recover_delta_completion(
+        &mut missing_store,
+        missing_root.path(),
+        &mut missing_transport,
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        (missing_transport.prepares, missing_transport.deliveries),
+        (0, 0)
+    );
+    assert!(PeerDeltaCompletionJournal::new(missing_root.path())
+        .load()
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn uncommitted_recovery_does_not_touch_an_exact_id_job_owned_by_another_lane() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    let mut operation = context(OPERATION_ID);
+    operation.pre_revision = 0;
+    operation.pre_common_base = None;
+    operation.post_revision = 1;
+    let job =
+        DurableCasJob::begin(root.path(), &job_id(&operation), CasJobKind::PeerClone, 1).unwrap();
+    let job_path = job.journal_path().to_path_buf();
+    drop(job);
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let journal_path = root.path().join("peer-delta/completion-operation.json");
+    let journal_before = std::fs::read(&journal_path).unwrap();
+    let job_before = std::fs::read(&job_path).unwrap();
+    let mut transport = fixture_transport(root.path(), 17, 5);
+
+    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+    assert_eq!(std::fs::read(&job_path).unwrap(), job_before);
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        5
+    );
 }
 
 fn committed_context(root: &Path) -> (PersistentStore, PayloadCas, DeltaCompletionContext) {
@@ -498,29 +635,14 @@ fn committed_context(root: &Path) -> (PersistentStore, PayloadCas, DeltaCompleti
 }
 
 #[test]
-fn committed_recovery_counts_then_releases_job_and_journal_once() {
+fn committed_recovery_without_job_counts_and_removes_the_journal_once() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), 5);
     let (mut store, _cas, operation) = committed_context(root.path());
-    let mut job = DurableCasJob::begin(
-        root.path(),
-        &operation.durable_job_id,
-        CasJobKind::LogicalDeltaTarget,
-        1,
-    )
-    .unwrap();
-    job.seal(&mut store, 1).unwrap();
-    drop(job);
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 99,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 99, 5);
 
     let completed = recover_delta_completion(&mut store, root.path(), &mut transport)
         .unwrap()
@@ -535,7 +657,6 @@ fn committed_recovery_counts_then_releases_job_and_journal_once() {
         .load()
         .unwrap()
         .is_none());
-    assert!(DurableCasJob::open(root.path(), &operation.durable_job_id).is_err());
     assert!(
         recover_delta_completion(&mut store, root.path(), &mut transport)
             .unwrap()
@@ -544,13 +665,13 @@ fn committed_recovery_counts_then_releases_job_and_journal_once() {
 }
 
 #[test]
-fn committed_recovery_rejects_a_released_job_until_exact_accounting_is_durable() {
+fn committed_recovery_with_a_released_job_completes_exact_accounting() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), 5);
     let (mut store, _cas, operation) = committed_context(root.path());
     let mut job = DurableCasJob::begin(
         root.path(),
-        &operation.durable_job_id,
+        &job_id(&operation),
         CasJobKind::LogicalDeltaTarget,
         1,
     )
@@ -562,28 +683,63 @@ fn committed_recovery_rejects_a_released_job_until_exact_accounting_is_durable()
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 99,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
+    let mut transport = fixture_transport(root.path(), 99, 5);
 
-    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
+    assert!(
+        recover_delta_completion(&mut store, root.path(), &mut transport)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!((transport.prepares, transport.deliveries), (0, 0));
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
-        5
+        22
     );
     assert!(PeerDeltaCompletionJournal::new(root.path())
         .load()
         .unwrap()
-        .is_some());
-    let retained = DurableCasJob::open(root.path(), &operation.durable_job_id).unwrap();
+        .is_none());
+    let retained = DurableCasJob::open(root.path(), &job_id(&operation)).unwrap();
     assert!(retained.is_sealed());
     assert!(retained.is_released());
+}
 
+#[test]
+fn committed_recovery_overflow_reuses_pending_bytes_and_retains_recovery_state() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), u64::MAX);
+    let (mut store, _cas, mut operation) = committed_context(root.path());
+    operation.mode = DeltaCompletionMode::CompletionV1;
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    prepare_incoming_completion_delivery(root.path(), pending_delivery(&operation, 1)).unwrap();
+    let mut transport = fixture_transport(root.path(), 99, u64::MAX);
+
+    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (0, 1));
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        u64::MAX
+    );
+    assert!(matches!(
+        PeerDeltaCompletionJournal::new(root.path()).load().unwrap(),
+        Some(PeerDeltaDurableCompletion::ActivationIntent { .. })
+    ));
+    let pending =
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta)
+            .unwrap()
+            .unwrap();
+    assert_eq!(pending.delivery.useful_bytes, 1);
+}
+
+#[test]
+fn committed_recovery_without_job_uses_existing_v1_receipt_while_source_is_offline() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let (mut store, _cas, mut operation) = committed_context(root.path());
+    operation.mode = DeltaCompletionMode::CompletionV1;
+    operation.transferred_bytes = 0;
     let receipt_id = completion_receipt_id(
         CompletionLane::Delta.as_str(),
         &operation.operation_id,
@@ -594,104 +750,20 @@ fn committed_recovery_rejects_a_released_job_until_exact_accounting_is_durable()
         SOURCE_ID,
         CompletionLane::Delta,
         &receipt_id,
-        operation.transferred_bytes,
+        23,
     )
     .unwrap();
-    assert!(
-        recover_delta_completion(&mut store, root.path(), &mut transport)
-            .unwrap()
-            .is_some()
-    );
-    assert!(PeerDeltaCompletionJournal::new(root.path())
-        .load()
-        .unwrap()
-        .is_none());
-    assert!(DurableCasJob::open(root.path(), &operation.durable_job_id).is_err());
-}
-
-#[test]
-fn committed_recovery_overflow_retains_job_and_journal_without_success() {
-    let root = tempfile::tempdir().unwrap();
-    register_source(root.path(), u64::MAX);
-    let (mut store, _cas, mut operation) = committed_context(root.path());
-    operation.mode = DeltaCompletionMode::CompletionV1;
-    let mut job = DurableCasJob::begin(
-        root.path(),
-        &operation.durable_job_id,
-        CasJobKind::LogicalDeltaTarget,
-        1,
-    )
-    .unwrap();
-    job.seal(&mut store, 1).unwrap();
-    drop(job);
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    PeerDeltaCompletionJournal::new(root.path())
-        .store_source_prepared(&operation, 1)
-        .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 99,
-        expected_before_delivery: u64::MAX,
-        prepares: 0,
-        deliveries: 0,
-    };
 
-    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
-    assert_eq!((transport.prepares, transport.deliveries), (0, 1));
-    assert_eq!(
-        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
-        u64::MAX
-    );
-    assert!(matches!(
-        PeerDeltaCompletionJournal::new(root.path()).load().unwrap(),
-        Some(PeerDeltaDurableCompletion::SourcePrepared {
-            useful_bytes: 1,
-            ..
-        })
-    ));
-    let pending =
-        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta)
-            .unwrap()
-            .unwrap();
-    assert_eq!(pending.delivery.useful_bytes, 1);
-    let retained = DurableCasJob::open(root.path(), &operation.durable_job_id).unwrap();
-    assert!(retained.is_sealed());
-    assert!(!retained.is_released());
-}
-
-#[test]
-fn committed_recovery_requires_job_until_exact_target_receipt_is_durable() {
-    let root = tempfile::tempdir().unwrap();
-    register_source(root.path(), 5);
-    let (mut store, _cas, operation) = committed_context(root.path());
-    PeerDeltaCompletionJournal::new(root.path())
-        .store_activation_intent(&operation)
-        .unwrap();
-    let mut transport = FixtureTransport {
-        root: root.path().to_owned(),
-        prepared_bytes: 99,
-        expected_before_delivery: 5,
-        prepares: 0,
-        deliveries: 0,
-    };
-
-    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
-    assert_eq!(
-        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
-        5
-    );
-    assert!(PeerDeltaCompletionJournal::new(root.path())
-        .load()
+    let completed = recover_delta_completion(&mut store, root.path(), &mut OfflineTransport)
         .unwrap()
-        .is_some());
-
-    complete_delta_accounting(root.path(), &mut transport).unwrap();
-    assert!(
-        recover_delta_completion(&mut store, root.path(), &mut transport)
-            .unwrap()
-            .is_some()
+        .unwrap();
+    assert_eq!(completed.useful_bytes, 23);
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        28
     );
     assert!(PeerDeltaCompletionJournal::new(root.path())
         .load()
