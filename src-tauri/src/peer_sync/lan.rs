@@ -2,8 +2,8 @@ use super::{
     device_registry::{
         completion_receipt_id, load_or_create_device_id, outgoing_device_is_registered,
         record_outgoing_completed_operation, record_outgoing_seen, register_incoming_source,
-        register_outgoing_claim, revoke_outgoing_device, DevicePermissions, IncomingSource,
-        OutgoingDevice, OutgoingDeviceRegistry,
+        register_outgoing_claim, revoke_outgoing_device, CompletionLane, DevicePermissions,
+        IncomingSource, OutgoingDevice, OutgoingDeviceRegistry,
     },
     http_stream::HttpRangeStream,
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
@@ -124,6 +124,9 @@ const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PEER_COMPLETION_SCHEMA: &str = "risunest.peer-completion/v1";
+pub(crate) const PEER_COMPLETION_CAPABILITY_HEADER: &str = "RisuNest-Peer-Completion";
+pub(crate) const PEER_COMPLETION_CAPABILITY_V1: &str = "v1";
 #[cfg(any(desktop, target_os = "android"))]
 const LOGICAL_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -578,6 +581,32 @@ impl LanCloneClient {
         authenticated_peer_hello(&self.endpoint, &self.bearer)
     }
 
+    pub(crate) fn hello_with_capabilities(
+        &self,
+    ) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
+        authenticated_peer_hello_with_capabilities(&self.endpoint, &self.bearer)
+    }
+
+    pub(crate) fn deliver_completion(
+        &self,
+        capability: PeerCompletionCapability,
+        operation_id: &str,
+        transferred_bytes: u64,
+    ) -> Result<PeerCompletionDelivery, PeerSyncError> {
+        let manifest_id = self.manifest_id.as_deref().ok_or_else(|| {
+            PeerSyncError::Protocol("LAN clone manifest identity is missing".to_owned())
+        })?;
+        deliver_peer_completion(
+            &self.endpoint,
+            &self.bearer,
+            capability,
+            CompletionLane::Clone,
+            operation_id,
+            manifest_id,
+            transferred_bytes,
+        )
+    }
+
     pub(super) fn into_resumable_parts(
         self,
     ) -> Result<
@@ -787,6 +816,25 @@ impl LanCloneClient {
         if let Some(object) = current_object {
             validate_object_hash(object)?
         }
+        self.report_progress_for_operation(verified_bytes, current_object, None)
+    }
+
+    pub(crate) fn report_progress_for_operation(
+        &self,
+        verified_bytes: u64,
+        current_object: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Result<(), PeerSyncError> {
+        if let Some(operation_id) = operation_id {
+            if !is_canonical_v4_uuid(operation_id) {
+                return Err(PeerSyncError::Protocol(
+                    "invalid clone completion operation identifier".to_owned(),
+                ));
+            }
+        }
+        if let Some(object) = current_object {
+            validate_object_hash(object)?
+        }
         let response = self
             .control_request(
                 self.client
@@ -794,6 +842,7 @@ impl LanCloneClient {
                     .json(&ProgressRequest {
                         verified_bytes,
                         current_object: current_object.map(str::to_owned),
+                        operation_id: operation_id.map(str::to_owned),
                     }),
             )
             .send()
@@ -1701,6 +1750,7 @@ struct HttpRequest {
     method: String,
     url: String,
     authorization: Option<String>,
+    content_type: Option<String>,
     range: Option<String>,
     range_count: usize,
     body: Vec<u8>,
@@ -1813,6 +1863,7 @@ fn read_request_with_elapsed(
     }
 
     let mut authorization = None;
+    let mut content_type = None;
     let mut range = None;
     let mut range_count = 0_usize;
     let mut content_length = None;
@@ -1829,6 +1880,10 @@ fn read_request_with_elapsed(
         let value = value.trim();
         if name.eq_ignore_ascii_case("authorization") {
             if authorization.replace(value.to_owned()).is_some() {
+                return Err(RequestReadError::Http(400));
+            }
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.replace(value.to_owned()).is_some() {
                 return Err(RequestReadError::Http(400));
             }
         } else if name.eq_ignore_ascii_case("range") {
@@ -1890,6 +1945,7 @@ fn read_request_with_elapsed(
         method: method.to_owned(),
         url: url.to_owned(),
         authorization,
+        content_type,
         range,
         range_count,
         body,
@@ -1920,6 +1976,9 @@ fn handle_request(
     // across source restarts, unlike the per-session endpoints below.
     if request.url == "/v1/peer/hello" {
         return hello(stream, request, shared);
+    }
+    if request.url == "/v1/peer/completion" {
+        return completion(stream, request, shared);
     }
     let Some(session_id) = request
         .url
@@ -2224,6 +2283,13 @@ fn progress(
         return respond_empty(stream, 400);
     };
     if progress
+        .operation_id
+        .as_deref()
+        .is_some_and(|operation_id| !is_canonical_v4_uuid(operation_id))
+    {
+        return respond_empty(stream, 400);
+    }
+    if progress
         .current_object
         .as_deref()
         .is_some_and(|object| session.object_size(object).is_none())
@@ -2253,7 +2319,7 @@ fn progress(
         device.info.current_object = progress.current_object;
         device.info.last_seen_unix_ms = now_ms();
     }
-    if clone_completed {
+    if clone_completed && progress.operation_id.is_none() {
         if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
             let receipt_id =
                 completion_receipt_id("clone", session.session_id(), session.manifest_id());
@@ -2350,24 +2416,27 @@ fn bidirectional_remote_apply(
         return respond_empty(stream, 400);
     }
     let operation_id = request.operation_id.clone();
+    let completion_deferred = request.completion_deferred_v1 == Some(true);
     let control = session
         .bidirectional_control()
         .expect("checked bidirectional session");
     let cancellation = AtomicCancellation::new(Arc::clone(stopped));
     match control.remote_apply(bidirectional_session, request, &cancellation) {
         Ok(receipt) if receipt.is_valid() => {
-            if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
-                let receipt_id = completion_receipt_id("bidirectional", &operation_id, "");
-                if record_outgoing_completed_operation(
-                    &registration.app_root,
-                    &device.device_id,
-                    "bidirectional",
-                    &receipt_id,
-                    receipt.transferred_bytes,
-                )
-                .is_err()
-                {
-                    return respond_empty(stream, 500);
+            if !completion_deferred {
+                if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
+                    let receipt_id = completion_receipt_id("bidirectional", &operation_id, "");
+                    if record_outgoing_completed_operation(
+                        &registration.app_root,
+                        &device.device_id,
+                        "bidirectional",
+                        &receipt_id,
+                        receipt.transferred_bytes,
+                    )
+                    .is_err()
+                    {
+                        return respond_empty(stream, 500);
+                    }
                 }
             }
             respond_json(stream, 200, &receipt)
@@ -2499,6 +2568,82 @@ struct ClaimRequest {
 }
 
 #[cfg(any(desktop, target_os = "android"))]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerCompletionRequest {
+    schema: String,
+    lane: String,
+    operation_id: String,
+    manifest_id: String,
+    transferred_bytes: u64,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+fn completion(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+) -> Result<(), PeerSyncError> {
+    if request.method != "POST" {
+        return respond_empty(stream, 405);
+    }
+    if request.range.is_some() || request.range_count != 0 {
+        return respond_empty(stream, 400);
+    }
+    let device = match authorize(&request, shared) {
+        Ok(device) => device,
+        Err(status) => return respond_empty(stream, status),
+    };
+    if !request
+        .content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return respond_empty(stream, 415);
+    }
+    let Ok(completion) = serde_json::from_slice::<PeerCompletionRequest>(&request.body) else {
+        return respond_empty(stream, 400);
+    };
+    let Ok(lane) = CompletionLane::parse(&completion.lane) else {
+        return respond_empty(stream, 400);
+    };
+    if completion.schema != PEER_COMPLETION_SCHEMA
+        || !is_canonical_v4_uuid(&completion.operation_id)
+        || validate_object_hash(&completion.manifest_id).is_err()
+    {
+        return respond_empty(stream, 400);
+    }
+    let permitted = match lane {
+        CompletionLane::Clone | CompletionLane::Delta => device.permissions.allows_read(),
+        CompletionLane::Bidirectional => device.permissions.allows_bidirectional(),
+    };
+    if !permitted {
+        return respond_empty(stream, 403);
+    }
+    let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+        return respond_empty(stream, 404);
+    };
+    let receipt_id = completion_receipt_id(
+        lane.as_str(),
+        &completion.operation_id,
+        &completion.manifest_id,
+    );
+    if record_outgoing_completed_operation(
+        &registration.app_root,
+        &device.device_id,
+        lane.as_str(),
+        &receipt_id,
+        completion.transferred_bytes,
+    )
+    .is_err()
+    {
+        return respond_empty(stream, 500);
+    }
+    respond_empty(stream, 204)
+}
+
+#[cfg(any(desktop, target_os = "android"))]
 fn hello(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -2564,9 +2709,13 @@ fn hello(
             manifest_id: session.manifest_id(),
         }),
     };
-    respond_json(
+    respond_json_with_headers(
         stream,
         200,
+        &[(
+            PEER_COMPLETION_CAPABILITY_HEADER,
+            PEER_COMPLETION_CAPABILITY_V1,
+        )],
         &Hello {
             device_id: &registration.device_id,
             name: &registration.name,
@@ -2651,6 +2800,8 @@ pub(crate) struct LanBidirectionalRemoteApplyRequest {
     pub(crate) expected_source_generation: LanBidirectionalGeneration,
     pub(crate) expected_common_base_manifest_hash: String,
     pub(crate) backup_losing_side: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completion_deferred_v1: Option<bool>,
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -2783,6 +2934,29 @@ pub(crate) enum AuthenticatedPeerHelloOutcome {
     AuthorizationExpired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerCompletionCapability {
+    Unsupported,
+    V1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerHelloWithCapabilities {
+    pub(crate) hello: PeerHello,
+    pub(crate) completion: PeerCompletionCapability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerCompletionDelivery {
+    Unsupported,
+    Delivered,
+}
+
+enum AuthenticatedPeerHelloCapabilitiesOutcome {
+    Hello(PeerHelloWithCapabilities),
+    AuthorizationExpired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerHelloLane {
@@ -2823,6 +2997,32 @@ pub(crate) fn authenticated_peer_hello_status(
     endpoint: &str,
     bearer: &str,
 ) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError> {
+    match authenticated_peer_hello_capabilities_status(endpoint, bearer)? {
+        AuthenticatedPeerHelloCapabilitiesOutcome::Hello(observed) => {
+            Ok(AuthenticatedPeerHelloOutcome::Hello(observed.hello))
+        }
+        AuthenticatedPeerHelloCapabilitiesOutcome::AuthorizationExpired => {
+            Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired)
+        }
+    }
+}
+
+pub(crate) fn authenticated_peer_hello_with_capabilities(
+    endpoint: &str,
+    bearer: &str,
+) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
+    match authenticated_peer_hello_capabilities_status(endpoint, bearer)? {
+        AuthenticatedPeerHelloCapabilitiesOutcome::Hello(observed) => Ok(observed),
+        AuthenticatedPeerHelloCapabilitiesOutcome::AuthorizationExpired => {
+            Err(PeerSyncError::Transport("HTTP 401 Unauthorized".to_owned()))
+        }
+    }
+}
+
+fn authenticated_peer_hello_capabilities_status(
+    endpoint: &str,
+    bearer: &str,
+) -> Result<AuthenticatedPeerHelloCapabilitiesOutcome, PeerSyncError> {
     let endpoint = validate_lan_endpoint(endpoint)?;
     if !is_lower_hex_256(bearer) {
         return Err(PeerSyncError::Protocol(
@@ -2835,7 +3035,7 @@ pub(crate) fn authenticated_peer_hello_status(
         .send()
         .map_err(transport)?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired);
+        return Ok(AuthenticatedPeerHelloCapabilitiesOutcome::AuthorizationExpired);
     }
     if response.status() != reqwest::StatusCode::OK {
         return Err(PeerSyncError::Transport(format!(
@@ -2843,6 +3043,17 @@ pub(crate) fn authenticated_peer_hello_status(
             response.status()
         )));
     }
+    let completion = match response.headers().get(PEER_COMPLETION_CAPABILITY_HEADER) {
+        None => PeerCompletionCapability::Unsupported,
+        Some(value) if value.as_bytes() == PEER_COMPLETION_CAPABILITY_V1.as_bytes() => {
+            PeerCompletionCapability::V1
+        }
+        Some(_) => {
+            return Err(PeerSyncError::Protocol(
+                "invalid peer completion capability".to_owned(),
+            ));
+        }
+    };
     let mut body = Vec::new();
     response
         .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
@@ -2864,12 +3075,70 @@ pub(crate) fn authenticated_peer_hello_status(
             "invalid peer hello response".to_owned(),
         ));
     }
-    Ok(AuthenticatedPeerHelloOutcome::Hello(PeerHello {
-        device_id: response.device_id,
-        name: response.name,
-        permissions,
-        lanes: response.lanes,
-    }))
+    Ok(AuthenticatedPeerHelloCapabilitiesOutcome::Hello(
+        PeerHelloWithCapabilities {
+            hello: PeerHello {
+                device_id: response.device_id,
+                name: response.name,
+                permissions,
+                lanes: response.lanes,
+            },
+            completion,
+        },
+    ))
+}
+
+pub(crate) fn deliver_peer_completion(
+    endpoint: &str,
+    bearer: &str,
+    capability: PeerCompletionCapability,
+    lane: CompletionLane,
+    operation_id: &str,
+    manifest_id: &str,
+    transferred_bytes: u64,
+) -> Result<PeerCompletionDelivery, PeerSyncError> {
+    let endpoint = validate_lan_endpoint(endpoint)?;
+    if !is_lower_hex_256(bearer)
+        || !is_canonical_v4_uuid(operation_id)
+        || validate_object_hash(manifest_id).is_err()
+    {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer completion request".to_owned(),
+        ));
+    }
+    if capability == PeerCompletionCapability::Unsupported {
+        return Ok(PeerCompletionDelivery::Unsupported);
+    }
+    let request = PeerCompletionRequest {
+        schema: PEER_COMPLETION_SCHEMA.to_owned(),
+        lane: lane.as_str().to_owned(),
+        operation_id: operation_id.to_owned(),
+        manifest_id: manifest_id.to_owned(),
+        transferred_bytes,
+    };
+    let response = build_clone_http_client(CONTROL_REQUEST_TIMEOUT)?
+        .post(format!("{endpoint}/v1/peer/completion"))
+        .bearer_auth(bearer)
+        .json(&request)
+        .send()
+        .map_err(transport)?;
+    if response.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(PeerSyncError::Transport(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(transport)?;
+    if !body.is_empty() {
+        return Err(PeerSyncError::Protocol(
+            "peer completion response must be empty".to_owned(),
+        ));
+    }
+    Ok(PeerCompletionDelivery::Delivered)
 }
 
 fn valid_hello_lanes(lanes: &PeerHelloLanes) -> bool {
@@ -2895,6 +3164,8 @@ fn validate_device_name(value: &str) -> Result<(), PeerSyncError> {
 struct ProgressRequest {
     verified_bytes: u64,
     current_object: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
 }
 
 fn validate_object_hash(object: &str) -> Result<(), PeerSyncError> {
@@ -3214,6 +3485,7 @@ mod endpoint_tests {
             },
             expected_common_base_manifest_hash: "f".repeat(64),
             backup_losing_side: false,
+            completion_deferred_v1: None,
         };
         assert!(request.is_valid());
     }
@@ -3226,6 +3498,12 @@ fn is_lower_hex_256(value: &str) -> bool {
 fn is_canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value)
         .map(|parsed| parsed.to_string() == value)
+        .unwrap_or(false)
+}
+
+fn is_canonical_v4_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|parsed| parsed.get_version_num() == 4 && parsed.to_string() == value)
         .unwrap_or(false)
 }
 
@@ -3549,14 +3827,22 @@ fn respond_json<T: Serialize>(
     status: u16,
     value: &T,
 ) -> Result<(), PeerSyncError> {
+    respond_json_with_headers(stream, status, &[], value)
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+fn respond_json_with_headers<T: Serialize>(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    value: &T,
+) -> Result<(), PeerSyncError> {
     let body =
         serde_json::to_vec(value).map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-    respond_bytes(
-        stream,
-        status,
-        &[("Content-Type", "application/json")],
-        &body,
-    )
+    let mut response_headers = Vec::with_capacity(headers.len() + 1);
+    response_headers.push(("Content-Type", "application/json"));
+    response_headers.extend_from_slice(headers);
+    respond_bytes(stream, status, &response_headers, &body)
 }
 #[cfg(any(desktop, target_os = "android"))]
 fn copy_exact_response(
@@ -3594,7 +3880,7 @@ fn copy_exact_response(
 mod timeout_tests {
     use super::*;
     use crate::peer_sync::device_registry::{
-        DevicePermissions, IncomingSourceRegistry, OutgoingDeviceRegistry,
+        CompletionLane, DevicePermissions, IncomingSourceRegistry, OutgoingDeviceRegistry,
     };
     use crate::peer_sync::{
         logical_delta::{
@@ -4543,6 +4829,7 @@ mod timeout_tests {
             },
             expected_common_base_manifest_hash: pairing.manifest_id,
             backup_losing_side: false,
+            completion_deferred_v1: None,
         };
         let requester = thread::spawn(move || client.request_remote_apply(request));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -4678,6 +4965,7 @@ mod timeout_tests {
                 expected_source_generation: generation.clone(),
                 expected_common_base_manifest_hash: generation.manifest_hash.clone(),
                 backup_losing_side: false,
+                completion_deferred_v1: None,
             })
             .unwrap();
 
@@ -4734,6 +5022,7 @@ mod timeout_tests {
             },
             expected_common_base_manifest_hash: pairing.manifest_id,
             backup_losing_side: false,
+            completion_deferred_v1: None,
         };
 
         client.request_remote_apply(request.clone()).unwrap();
@@ -4818,6 +5107,7 @@ mod timeout_tests {
                 expected_source_generation: generation.clone(),
                 expected_common_base_manifest_hash: pairing.manifest_id.clone(),
                 backup_losing_side: false,
+                completion_deferred_v1: None,
             })
             .unwrap();
         assert_eq!(accepted.committed_generation, generation);
@@ -4837,6 +5127,7 @@ mod timeout_tests {
                 expected_source_generation: generation.clone(),
                 expected_common_base_manifest_hash: pairing.manifest_id.clone(),
                 backup_losing_side: false,
+                completion_deferred_v1: None,
             }),
             Err(PeerSyncError::ActivationConflict { .. })
         ));
@@ -4854,6 +5145,7 @@ mod timeout_tests {
                 expected_source_generation: generation.clone(),
                 expected_common_base_manifest_hash: pairing.manifest_id.clone(),
                 backup_losing_side: false,
+                completion_deferred_v1: None,
             }),
             Err(PeerSyncError::Transport(message)) if message.contains("500")
         ));
@@ -4956,18 +5248,449 @@ mod timeout_tests {
         restarted
             .enable_v2_registry(source_root.path(), source_name, DevicePermissions::read())
             .unwrap();
-        restarted.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let restarted_pairing = restarted.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let restarted_endpoint = format!("http://{}", restarted.address().unwrap());
         assert_eq!(
             reqwest::blocking::Client::new()
                 .get(format!("{restarted_endpoint}/v1/peer/hello"))
-                .bearer_auth(bearer)
+                .bearer_auth(&bearer)
                 .send()
                 .unwrap()
                 .status(),
             reqwest::StatusCode::OK
         );
+        assert_eq!(
+            deliver_peer_completion(
+                &restarted_endpoint,
+                &bearer,
+                PeerCompletionCapability::V1,
+                CompletionLane::Delta,
+                "00000000-0000-4000-8000-000000000112",
+                &restarted_pairing.manifest_id,
+                31,
+            )
+            .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            31
+        );
         restarted.stop().unwrap();
+    }
+
+    #[test]
+    fn authenticated_hello_advertises_completion_v1_without_changing_json() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000101",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+        let raw = reqwest::blocking::Client::new()
+            .get(format!("{endpoint}/v1/peer/hello"))
+            .bearer_auth(&client.bearer)
+            .send()
+            .unwrap();
+        assert_eq!(
+            raw.headers()
+                .get(PEER_COMPLETION_CAPABILITY_HEADER)
+                .unwrap(),
+            PEER_COMPLETION_CAPABILITY_V1
+        );
+        let json: serde_json::Value = raw.json().unwrap();
+        let json = json.as_object().unwrap();
+        assert_eq!(json.len(), 4);
+        for key in ["deviceId", "name", "permissions", "lanes"] {
+            assert!(json.contains_key(key));
+        }
+        let observed = client.hello_with_capabilities().unwrap();
+        assert_eq!(observed.hello.device_id, source_id);
+        assert_eq!(observed.completion, PeerCompletionCapability::V1);
+        assert_eq!(client.hello().unwrap(), observed.hello);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn v2_bidirectional_completion_deferred_flag_prevents_legacy_early_accounting() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        *control.remote_apply_bytes.lock().unwrap() = 17;
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000109",
+                &source_device_id,
+                Arc::clone(&control),
+            ));
+        host.enable_v2_registry(
+            source_root.path(),
+            "Windows",
+            DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let request = LanBidirectionalRemoteApplyRequest {
+            operation_id: "00000000-0000-4000-8000-000000000110".to_owned(),
+            source_endpoint: endpoint,
+            source_session_id: pairing.session_id,
+            source_manifest_id: pairing.manifest_id.clone(),
+            source_claim: pairing.claim,
+            expected_source_revision: 0,
+            expected_source_generation: LanBidirectionalGeneration {
+                generation_id: "generation-1".to_owned(),
+                manifest_hash: pairing.manifest_id.clone(),
+                generation_sequence: "1".to_owned(),
+            },
+            expected_common_base_manifest_hash: pairing.manifest_id,
+            backup_losing_side: false,
+            completion_deferred_v1: Some(true),
+        };
+
+        client.request_remote_apply(request.clone()).unwrap();
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            0
+        );
+        let capability = client.hello_with_capabilities().unwrap().completion;
+        assert_eq!(
+            client
+                .deliver_completion(capability, "00000000-0000-4000-8000-000000000110", 17,)
+                .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        let mut legacy = request;
+        legacy.operation_id = "00000000-0000-4000-8000-000000000111".to_owned();
+        legacy.completion_deferred_v1 = None;
+        client.request_remote_apply(legacy).unwrap();
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            34
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn completion_endpoint_authenticates_validates_permissions_and_counts_exact_retry_once() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000102",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let url = format!("{endpoint}/v1/peer/completion");
+        let operation_id = "00000000-0000-4000-8000-000000000103";
+        let valid = serde_json::json!({
+            "schema": PEER_COMPLETION_SCHEMA,
+            "lane": "delta",
+            "operationId": operation_id,
+            "manifestId": pairing.manifest_id,
+            "transferredBytes": 23
+        });
+        let raw = reqwest::blocking::Client::new();
+
+        assert_eq!(
+            raw.post(&url).json(&valid).send().unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            raw.get(&url)
+                .bearer_auth(&client.bearer)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+        for invalid in [
+            serde_json::json!({"schema":"wrong","lane":"delta","operationId":operation_id,"manifestId":pairing.manifest_id,"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"unknown","operationId":operation_id,"manifestId":pairing.manifest_id,"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":"not-a-uuid","manifestId":pairing.manifest_id,"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":"00000000-0000-1000-8000-000000000103","manifestId":pairing.manifest_id,"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":operation_id,"manifestId":"BAD","transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":operation_id,"manifestId":pairing.manifest_id,"transferredBytes":23,"extra":true}),
+        ] {
+            assert_eq!(
+                raw.post(&url)
+                    .bearer_auth(&client.bearer)
+                    .json(&invalid)
+                    .send()
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .header(reqwest::header::CONTENT_TYPE, "text/plain")
+                .body(serde_json::to_vec(&valid).unwrap())
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .body(vec![b'x'; MAX_BODY_BYTES + 1])
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let forbidden = serde_json::json!({
+            "schema": PEER_COMPLETION_SCHEMA,
+            "lane": "bidirectional",
+            "operationId": operation_id,
+            "manifestId": pairing.manifest_id,
+            "transferredBytes": 23
+        });
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&forbidden)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+
+        assert_eq!(
+            raw.post(&url)
+                .bearer_auth(&client.bearer)
+                .json(&valid)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        let capability = client.hello_with_capabilities().unwrap().completion;
+        assert_eq!(
+            client
+                .deliver_completion(capability, operation_id, 23)
+                .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
+        assert_eq!(registry.devices()[0].total_bytes, 23);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn completion_endpoint_persistence_failure_is_atomic_and_retryable() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000104",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let mut registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
+        let mut device = registry.devices()[0].clone();
+        device.total_bytes = u64::MAX;
+        registry.upsert(device).unwrap();
+        registry.save().unwrap();
+
+        let result = deliver_peer_completion(
+            &endpoint,
+            &client.bearer,
+            PeerCompletionCapability::V1,
+            CompletionLane::Delta,
+            "00000000-0000-4000-8000-000000000105",
+            &pairing.manifest_id,
+            1,
+        );
+        assert!(result.is_err());
+        let mut registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
+        assert_eq!(registry.devices()[0].total_bytes, u64::MAX);
+        let mut device = registry.devices()[0].clone();
+        device.total_bytes = 0;
+        registry.upsert(device).unwrap();
+        registry.save().unwrap();
+        assert_eq!(
+            deliver_peer_completion(
+                &endpoint,
+                &client.bearer,
+                PeerCompletionCapability::V1,
+                CompletionLane::Delta,
+                "00000000-0000-4000-8000-000000000105",
+                &pairing.manifest_id,
+                1,
+            )
+            .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            1
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn completion_client_skips_legacy_servers_and_retries_the_same_request_after_response_loss() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut hello, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut hello).starts_with("GET /v1/peer/hello "));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "deviceId":"00000000-0000-4000-8000-000000000106",
+                "name":"Legacy",
+                "permissions":["read"],
+                "lanes":{"clone":null,"delta":null,"bidirectional":null}
+            }))
+            .unwrap();
+            write!(hello, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            hello.write_all(&body).unwrap();
+            hello.flush().unwrap();
+            finish_response(&mut hello);
+        });
+        let observed = authenticated_peer_hello_with_capabilities(&endpoint, TEST_BEARER).unwrap();
+        server.join().unwrap();
+        assert_eq!(observed.completion, PeerCompletionCapability::Unsupported);
+        assert_eq!(
+            deliver_peer_completion(
+                &endpoint,
+                TEST_BEARER,
+                observed.completion,
+                CompletionLane::Clone,
+                "00000000-0000-4000-8000-000000000107",
+                &"a".repeat(64),
+                9,
+            )
+            .unwrap(),
+            PeerCompletionDelivery::Unsupported
+        );
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let head = read_request_head(&mut stream);
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
+                    })
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let body_start = head.find("\r\n\r\n").unwrap() + 4;
+                let mut body = head.as_bytes()[body_start..].to_vec();
+                while body.len() < length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).unwrap();
+                    body.extend_from_slice(&chunk[..read]);
+                }
+                bodies.push(body[..length].to_vec());
+                if attempt == 1 {
+                    stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    stream.flush().unwrap();
+                    finish_response(&mut stream);
+                }
+            }
+            assert_eq!(bodies[0], bodies[1]);
+        });
+        let deliver = || {
+            deliver_peer_completion(
+                &endpoint,
+                TEST_BEARER,
+                PeerCompletionCapability::V1,
+                CompletionLane::Clone,
+                "00000000-0000-4000-8000-000000000108",
+                &"b".repeat(64),
+                11,
+            )
+        };
+        assert!(deliver().is_err());
+        assert_eq!(deliver().unwrap(), PeerCompletionDelivery::Delivered);
+        server.join().unwrap();
     }
 
     #[test]
@@ -5779,6 +6502,39 @@ impl LanLogicalDeltaClient {
         authenticated_peer_hello(endpoint, &self.bearer)
     }
 
+    pub(crate) fn hello_with_capabilities(
+        &self,
+    ) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
+        let endpoint = self
+            .session_url
+            .split("/v1/sessions/")
+            .next()
+            .ok_or_else(|| PeerSyncError::Protocol("invalid logical session URL".to_owned()))?;
+        authenticated_peer_hello_with_capabilities(endpoint, &self.bearer)
+    }
+
+    pub(crate) fn deliver_completion(
+        &self,
+        capability: PeerCompletionCapability,
+        operation_id: &str,
+        transferred_bytes: u64,
+    ) -> Result<PeerCompletionDelivery, PeerSyncError> {
+        let endpoint = self
+            .session_url
+            .split("/v1/sessions/")
+            .next()
+            .ok_or_else(|| PeerSyncError::Protocol("invalid logical session URL".to_owned()))?;
+        deliver_peer_completion(
+            endpoint,
+            &self.bearer,
+            capability,
+            CompletionLane::Delta,
+            operation_id,
+            &self.manifest_id,
+            transferred_bytes,
+        )
+    }
+
     fn claim_v2_and_register_with_permission(
         app_root: &Path,
         target_name: &str,
@@ -6330,6 +7086,29 @@ impl LanBidirectionalLogicalClient {
         authenticated_peer_hello(&self.endpoint, &self.inner.bearer)
     }
 
+    pub(crate) fn hello_with_capabilities(
+        &self,
+    ) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
+        authenticated_peer_hello_with_capabilities(&self.endpoint, &self.inner.bearer)
+    }
+
+    pub(crate) fn deliver_completion(
+        &self,
+        capability: PeerCompletionCapability,
+        operation_id: &str,
+        transferred_bytes: u64,
+    ) -> Result<PeerCompletionDelivery, PeerSyncError> {
+        deliver_peer_completion(
+            &self.endpoint,
+            &self.inner.bearer,
+            capability,
+            CompletionLane::Bidirectional,
+            operation_id,
+            &self.inner.manifest_id,
+            transferred_bytes,
+        )
+    }
+
     // Android targets claim over trusted-LAN endpoints.
     #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn claim(
@@ -6589,6 +7368,7 @@ impl LogicalProgressReporter {
             .json(&ProgressRequest {
                 verified_bytes: self.verified_bytes()?,
                 current_object: current_object.map(str::to_owned),
+                operation_id: None,
             })
             .timeout(self.control_timeout)
             .send()

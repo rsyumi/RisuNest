@@ -15,6 +15,32 @@ const MAX_DEVICE_ID_BYTES: usize = 64;
 const OUTGOING_SCHEMA: &str = "risunest.peer-device-registry/v1";
 const INCOMING_SCHEMA: &str = "risunest.peer-source-registry/v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionLane {
+    Clone,
+    Delta,
+    Bidirectional,
+}
+
+impl CompletionLane {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Clone => "clone",
+            Self::Delta => "delta",
+            Self::Bidirectional => "bidirectional",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, PeerSyncError> {
+        match value {
+            "clone" => Ok(Self::Clone),
+            "delta" => Ok(Self::Delta),
+            "bidirectional" => Ok(Self::Bidirectional),
+            _ => invalid("invalid peer completion receipt lane"),
+        }
+    }
+}
+
 fn outgoing_registry_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -150,8 +176,8 @@ struct IncomingFile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompletionReceipt {
     device_id: String,
-    // Clone exposes one live session, and bidirectional control retains one operation.
-    // A new receipt for the same lane therefore makes the previous proof unreplayable.
+    // The protocol permits at most one active operation per device and lane. Keeping
+    // only that lane's latest proof bounds each device to these three receipt heads.
     lane: String,
     receipt_id: String,
 }
@@ -437,8 +463,26 @@ impl IncomingSourceRegistry {
         bytes: u64,
         seen_at_ms: u64,
     ) -> Result<(), PeerSyncError> {
+        self.record_completed_operation_once_for_lane(
+            source_id,
+            CompletionLane::Clone,
+            receipt_id,
+            bytes,
+            seen_at_ms,
+        )
+    }
+
+    pub(crate) fn record_completed_operation_once_for_lane(
+        &mut self,
+        source_id: &str,
+        lane: CompletionLane,
+        receipt_id: &str,
+        bytes: u64,
+        seen_at_ms: u64,
+    ) -> Result<(), PeerSyncError> {
         validate_id(source_id)?;
         validate_receipt_id(receipt_id)?;
+        let lane = lane.as_str();
         let mut sources = self.sources.clone();
         let mut receipts = self.completed_receipts.clone();
         let source = sources
@@ -450,7 +494,7 @@ impl IncomingSourceRegistry {
         source.last_seen_ms = source.last_seen_ms.max(seen_at_ms);
         let retained = receipts
             .iter_mut()
-            .find(|receipt| receipt.device_id == source_id && receipt.lane == "clone");
+            .find(|receipt| receipt.device_id == source_id && receipt.lane == lane);
         if !retained
             .as_ref()
             .is_some_and(|receipt| receipt.receipt_id == receipt_id)
@@ -464,7 +508,7 @@ impl IncomingSourceRegistry {
             } else {
                 receipts.push(CompletionReceipt {
                     device_id: source_id.to_owned(),
-                    lane: "clone".to_owned(),
+                    lane: lane.to_owned(),
                     receipt_id: receipt_id.to_owned(),
                 });
             }
@@ -487,11 +531,21 @@ impl IncomingSourceRegistry {
         source_id: &str,
         receipt_id: &str,
     ) -> Result<bool, PeerSyncError> {
+        self.has_completed_operation_for_lane(source_id, CompletionLane::Clone, receipt_id)
+    }
+
+    pub(crate) fn has_completed_operation_for_lane(
+        &self,
+        source_id: &str,
+        lane: CompletionLane,
+        receipt_id: &str,
+    ) -> Result<bool, PeerSyncError> {
         validate_id(source_id)?;
         validate_receipt_id(receipt_id)?;
+        let lane = lane.as_str();
         Ok(self.completed_receipts.iter().any(|receipt| {
             receipt.device_id == source_id
-                && receipt.lane == "clone"
+                && receipt.lane == lane
                 && receipt.receipt_id == receipt_id
         }))
     }
@@ -712,10 +766,29 @@ pub(crate) fn record_incoming_completed_operation_once(
     receipt_id: &str,
     bytes: u64,
 ) -> Result<(), PeerSyncError> {
+    record_incoming_completed_operation_once_for_lane(
+        app_root,
+        source_id,
+        CompletionLane::Clone,
+        receipt_id,
+        bytes,
+    )
+}
+
+pub(crate) fn record_incoming_completed_operation_once_for_lane(
+    app_root: &Path,
+    source_id: &str,
+    lane: CompletionLane,
+    receipt_id: &str,
+    bytes: u64,
+) -> Result<(), PeerSyncError> {
     let seen_at_ms = completion_timestamp_ms()?;
-    with_incoming_registry(app_root, |registry| {
-        registry.record_completed_operation_once(source_id, receipt_id, bytes, seen_at_ms)
-    })
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    registry
+        .record_completed_operation_once_for_lane(source_id, lane, receipt_id, bytes, seen_at_ms)
 }
 
 pub(crate) fn incoming_completed_operation_recorded(
@@ -727,6 +800,19 @@ pub(crate) fn incoming_completed_operation_recorded(
         .lock()
         .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
     IncomingSourceRegistry::load(app_root)?.has_completed_operation(source_id, receipt_id)
+}
+
+pub(crate) fn incoming_completed_operation_recorded_for_lane(
+    app_root: &Path,
+    source_id: &str,
+    lane: CompletionLane,
+    receipt_id: &str,
+) -> Result<bool, PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    IncomingSourceRegistry::load(app_root)?
+        .has_completed_operation_for_lane(source_id, lane, receipt_id)
 }
 
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
@@ -908,11 +994,7 @@ fn validate_receipt_id(value: &str) -> Result<(), PeerSyncError> {
 }
 
 fn validate_receipt_lane(value: &str) -> Result<(), PeerSyncError> {
-    if matches!(value, "clone" | "bidirectional") {
-        Ok(())
-    } else {
-        invalid("invalid peer completion receipt lane")
-    }
+    CompletionLane::parse(value).map(|_| ())
 }
 
 fn completion_timestamp_ms() -> Result<u64, PeerSyncError> {
@@ -929,7 +1011,7 @@ fn validate_receipts<'a>(
     registered_ids: impl Iterator<Item = &'a str>,
 ) -> Result<(), PeerSyncError> {
     let registered_ids = registered_ids.collect::<std::collections::BTreeSet<_>>();
-    if receipts.len() > registered_ids.len().saturating_mul(2) {
+    if receipts.len() > registered_ids.len().saturating_mul(3) {
         return invalid("too many peer completion receipts");
     }
     let mut unique = std::collections::BTreeSet::new();
@@ -950,11 +1032,7 @@ fn validate_incoming_receipts<'a>(
     receipts: &[CompletionReceipt],
     registered_ids: impl Iterator<Item = &'a str>,
 ) -> Result<(), PeerSyncError> {
-    validate_receipts(receipts, registered_ids)?;
-    if receipts.iter().any(|receipt| receipt.lane != "clone") {
-        return invalid("invalid incoming peer completion receipt lane");
-    }
-    Ok(())
+    validate_receipts(receipts, registered_ids)
 }
 
 fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncError> {

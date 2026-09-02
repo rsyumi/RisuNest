@@ -5888,6 +5888,7 @@ fn request_remote_apply_from_shared(
         expected_source_generation: context.expected_remote_generation.clone(),
         expected_common_base_manifest_hash: context.previous_shared.manifest_hash.clone(),
         backup_losing_side,
+        completion_deferred_v1: None,
     });
     let reverse_owner = reverse_tunnel.take().map(|tunnel| {
         ReverseTunnelCleanupOwner::Running(Box::new(tunnel) as Box<dyn ReverseTunnelProcess>)
@@ -5953,6 +5954,7 @@ fn request_remote_apply_from_shared(
         expected_source_generation: context.expected_remote_generation.clone(),
         expected_common_base_manifest_hash: context.previous_shared.manifest_hash.clone(),
         backup_losing_side,
+        completion_deferred_v1: None,
     });
     finish_remote_apply_request(
         app_root,

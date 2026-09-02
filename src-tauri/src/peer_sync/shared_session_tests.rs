@@ -2414,6 +2414,112 @@ fn clone_terminal_progress_persists_last_seen_and_counts_a_retry_once() {
 }
 
 #[test]
+fn clone_terminal_progress_with_operation_id_defers_completion_accounting() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+    let pairing = state.pairing_for_test().unwrap();
+    let response = claim(&pairing, "00000000-0000-4000-8000-000000000033");
+    let bearer = response.json::<serde_json::Value>().unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let client = reqwest::blocking::Client::new();
+    let manifest = client
+        .get(format!(
+            "{}/v1/sessions/{}/manifest",
+            pairing.endpoint, pairing.session_id
+        ))
+        .bearer_auth(&bearer)
+        .send()
+        .unwrap()
+        .json::<CloneManifest>()
+        .unwrap();
+    let total_bytes = manifest
+        .objects
+        .values()
+        .map(|object| object.size)
+        .sum::<u64>();
+    let progress_url = format!(
+        "{}/v1/sessions/{}/progress",
+        pairing.endpoint, pairing.session_id
+    );
+
+    assert_eq!(
+        client
+            .post(&progress_url)
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({
+                "verifiedBytes": total_bytes,
+                "currentObject": null,
+                "operationId": "00000000-0000-4000-8000-000000000034"
+            }))
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        OutgoingDeviceRegistry::load(root.path()).unwrap().devices()[0].total_bytes,
+        0
+    );
+    assert_eq!(
+        client
+            .post(&progress_url)
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({
+                "verifiedBytes": total_bytes,
+                "currentObject": null,
+                "operationId": "not-a-uuid"
+            }))
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .post(&progress_url)
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({
+                "verifiedBytes": total_bytes,
+                "currentObject": null
+            }))
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        OutgoingDeviceRegistry::load(root.path()).unwrap().devices()[0].total_bytes,
+        total_bytes
+    );
+    state.stop().unwrap();
+}
+
+#[test]
 fn canonical_registration_uri_has_exact_clone_fields_and_no_bearer() {
     let port = available_port();
     let pairing = SharedPairingData {

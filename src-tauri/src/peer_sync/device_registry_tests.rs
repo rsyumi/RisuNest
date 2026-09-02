@@ -1,8 +1,11 @@
 use super::device_registry::{
-    incoming_source_summaries, outgoing_device_summaries, record_incoming_completed_operation,
-    record_incoming_completed_operation_best_effort, register_incoming_source,
-    register_outgoing_claim, remove_incoming_source, revoke_outgoing_device, DevicePermissions,
-    IncomingSource, IncomingSourceRegistry, OutgoingDevice, OutgoingDeviceRegistry,
+    incoming_completed_operation_recorded_for_lane, incoming_source_summaries,
+    outgoing_device_summaries, record_incoming_completed_operation,
+    record_incoming_completed_operation_best_effort,
+    record_incoming_completed_operation_once_for_lane, register_incoming_source,
+    register_outgoing_claim, remove_incoming_source, revoke_outgoing_device, CompletionLane,
+    DevicePermissions, IncomingSource, IncomingSourceRegistry, OutgoingDevice,
+    OutgoingDeviceRegistry,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -309,6 +312,268 @@ fn incoming_clone_receipt_survives_reregistration_and_counts_a_new_operation() {
         .unwrap();
     assert_eq!(restarted.sources()[0].total_bytes, 24);
     assert_eq!(restarted.sources()[0].last_seen_ms, 32);
+}
+
+#[test]
+fn incoming_lane_receipt_heads_coexist_retry_after_reload_and_replace_sequentially() {
+    let root = tempfile::tempdir().unwrap();
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 25,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+
+    let clone = "1".repeat(64);
+    let delta = "2".repeat(64);
+    let bidirectional = "3".repeat(64);
+    for (lane, receipt, bytes) in [
+        (CompletionLane::Clone, clone.as_str(), 11),
+        (CompletionLane::Delta, delta.as_str(), 13),
+        (CompletionLane::Bidirectional, bidirectional.as_str(), 17),
+    ] {
+        record_incoming_completed_operation_once_for_lane(
+            root.path(),
+            SOURCE_ID,
+            lane,
+            receipt,
+            bytes,
+        )
+        .unwrap();
+    }
+    let registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(registry.sources()[0].total_bytes, 41);
+
+    for (lane, receipt, bytes) in [
+        (CompletionLane::Clone, clone.as_str(), 11),
+        (CompletionLane::Delta, delta.as_str(), 13),
+        (CompletionLane::Bidirectional, bidirectional.as_str(), 17),
+    ] {
+        assert!(incoming_completed_operation_recorded_for_lane(
+            root.path(),
+            SOURCE_ID,
+            lane,
+            receipt,
+        )
+        .unwrap());
+        record_incoming_completed_operation_once_for_lane(
+            root.path(),
+            SOURCE_ID,
+            lane,
+            receipt,
+            bytes,
+        )
+        .unwrap();
+    }
+    let mut restarted = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(restarted.sources()[0].total_bytes, 41);
+
+    let next_delta = "4".repeat(64);
+    restarted
+        .record_completed_operation_once_for_lane(
+            SOURCE_ID,
+            CompletionLane::Delta,
+            &next_delta,
+            19,
+            200,
+        )
+        .unwrap();
+    assert_eq!(restarted.sources()[0].total_bytes, 60);
+    assert!(!restarted
+        .has_completed_operation_for_lane(SOURCE_ID, CompletionLane::Delta, &delta)
+        .unwrap());
+    assert!(restarted
+        .has_completed_operation_for_lane(SOURCE_ID, CompletionLane::Delta, &next_delta)
+        .unwrap());
+
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Renamed Android".into(),
+            endpoint: "http://192.168.0.6:32145".into(),
+            bearer: "d".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 999,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let reregistered = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(reregistered.sources()[0].total_bytes, 60);
+    assert!(reregistered
+        .has_completed_operation_for_lane(SOURCE_ID, CompletionLane::Clone, &clone)
+        .unwrap());
+    assert!(reregistered
+        .has_completed_operation_for_lane(SOURCE_ID, CompletionLane::Bidirectional, &bidirectional,)
+        .unwrap());
+
+    remove_incoming_source(root.path(), SOURCE_ID).unwrap();
+    let file: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("peer-sync/sources.json")).unwrap())
+            .unwrap();
+    assert!(file["completedReceipts"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
+}
+
+#[test]
+fn v1_registries_with_optional_or_clone_only_receipts_remain_loadable() {
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = root.path().join("peer-sync");
+    fs::create_dir_all(&peer_root).unwrap();
+    fs::write(
+        peer_root.join("devices.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "risunest.peer-device-registry/v1",
+            "devices": [{
+                "deviceId": TARGET_ID,
+                "name": "Legacy target",
+                "bearerDigest": "b".repeat(64),
+                "permissions": ["read"],
+                "createdAtMs": 10,
+                "lastSeenMs": 20,
+                "totalBytes": 30
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        peer_root.join("sources.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "risunest.peer-source-registry/v1",
+            "sources": [{
+                "deviceId": SOURCE_ID,
+                "name": "Legacy source",
+                "endpoint": "http://192.168.0.5:32145",
+                "bearer": "c".repeat(64),
+                "permissions": ["read"],
+                "lastSeenMs": 25,
+                "totalBytes": 40
+            }],
+            "completedReceipts": [{
+                "deviceId": SOURCE_ID,
+                "lane": "clone",
+                "receiptId": "a".repeat(64)
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let outgoing = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    let incoming = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(outgoing.devices()[0].total_bytes, 30);
+    assert_eq!(incoming.sources()[0].total_bytes, 40);
+    assert!(incoming
+        .has_completed_operation(SOURCE_ID, &"a".repeat(64))
+        .unwrap());
+    assert!(!incoming
+        .has_completed_operation_for_lane(SOURCE_ID, CompletionLane::Delta, &"a".repeat(64))
+        .unwrap());
+}
+
+#[test]
+fn incoming_v1_registry_without_receipts_remains_loadable() {
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = root.path().join("peer-sync");
+    fs::create_dir_all(&peer_root).unwrap();
+    fs::write(
+        peer_root.join("sources.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "risunest.peer-source-registry/v1",
+            "sources": [{
+                "deviceId": SOURCE_ID,
+                "name": "Legacy source",
+                "endpoint": "http://192.168.0.5:32145",
+                "bearer": "c".repeat(64),
+                "permissions": ["read"],
+                "lastSeenMs": 25,
+                "totalBytes": 40
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let restored = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(restored.sources()[0].total_bytes, 40);
+    assert!(!restored
+        .has_completed_operation(SOURCE_ID, &"a".repeat(64))
+        .unwrap());
+}
+
+#[test]
+fn incoming_lane_receipt_overflow_and_write_failure_are_atomic() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 25,
+            total_bytes: u64::MAX,
+        })
+        .unwrap();
+    registry.save().unwrap();
+    let registry_path = root.path().join("peer-sync/sources.json");
+    let before = fs::read(&registry_path).unwrap();
+
+    assert!(registry
+        .record_completed_operation_once_for_lane(
+            SOURCE_ID,
+            CompletionLane::Delta,
+            &"a".repeat(64),
+            1,
+            30,
+        )
+        .is_err());
+    assert_eq!(registry.sources()[0].total_bytes, u64::MAX);
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+
+    let write_root = tempfile::tempdir().unwrap();
+    let mut writable = IncomingSourceRegistry::load(write_root.path()).unwrap();
+    writable
+        .upsert(IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 25,
+            total_bytes: 0,
+        })
+        .unwrap();
+    writable.save().unwrap();
+    let registry_path = write_root.path().join("peer-sync/sources.json");
+    let before = fs::read(&registry_path).unwrap();
+    let preserved_path = write_root.path().join("peer-sync/sources.preserved.json");
+    fs::rename(&registry_path, &preserved_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+    assert!(writable
+        .record_completed_operation_once_for_lane(
+            SOURCE_ID,
+            CompletionLane::Bidirectional,
+            &"b".repeat(64),
+            9,
+            31,
+        )
+        .is_err());
+    assert_eq!(writable.sources()[0].total_bytes, 0);
+    fs::remove_dir(&registry_path).unwrap();
+    fs::rename(&preserved_path, &registry_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
 }
 
 #[test]

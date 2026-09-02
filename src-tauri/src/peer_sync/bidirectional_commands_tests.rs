@@ -2349,6 +2349,7 @@ fn source_completed_request_requires_the_original_backup_choice() {
         },
         expected_common_base_manifest_hash: binding.previous_shared.manifest_hash.clone(),
         backup_losing_side: false,
+        completion_deferred_v1: None,
     };
 
     assert!(completed_source_request_matches(
@@ -2885,6 +2886,7 @@ fn source_exact_common_base_no_op_reopens_with_the_same_revision() {
         },
         expected_common_base_manifest_hash: previous.manifest_hash.clone(),
         backup_losing_side: false,
+        completion_deferred_v1: None,
     };
     let control = ProductionLanBidirectionalControl::new(
         directory.path().to_path_buf(),
@@ -3106,6 +3108,7 @@ fn source_content_identical_no_op_recovers_original_receipt_after_descendant_edi
         },
         expected_common_base_manifest_hash: previous.manifest_hash,
         backup_losing_side: false,
+        completion_deferred_v1: None,
     };
     let control = ProductionLanBidirectionalControl::new(
         directory.path().to_path_buf(),
@@ -6907,6 +6910,7 @@ fn source_prepared_precommit_descendant_is_abandoned_without_losing_the_edit() {
         },
         expected_common_base_manifest_hash: previous.manifest_hash.clone(),
         backup_losing_side: false,
+        completion_deferred_v1: None,
     };
 
     drop(store);
@@ -7092,6 +7096,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
         },
         expected_common_base_manifest_hash: common.manifest_hash.clone(),
         backup_losing_side: true,
+        completion_deferred_v1: None,
     };
     let session = LanBidirectionalSession {
         session_id: source_session_id.to_owned(),
