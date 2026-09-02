@@ -68,6 +68,13 @@ fn with_store<T>(
     operation(store)
 }
 
+fn finish_storage_command<T>(command: &'static str, result: StoreResult<T>) -> StoreResult<T> {
+    result.map_err(|error| {
+        crate::nlog!("error", "{command} failed: {error}");
+        error
+    })
+}
+
 pub(crate) fn with_store_mut<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
@@ -764,14 +771,20 @@ pub(crate) fn pds_snapshot_delete(
     state: State<'_, PersistentStoreState>,
     path: String,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| store.snapshot_delete(Path::new(&path)))
+    finish_storage_command(
+        "pds_snapshot_delete",
+        with_store(state, |store| store.snapshot_delete(Path::new(&path))),
+    )
 }
 
 #[tauri::command(async)]
 pub(crate) fn pds_storage_stats(
     state: State<'_, PersistentStoreState>,
 ) -> Result<PersistentStorageStats, StoreError> {
-    with_store(state, PersistentStore::storage_stats)
+    finish_storage_command(
+        "pds_storage_stats",
+        with_store(state, PersistentStore::storage_stats),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -800,7 +813,10 @@ fn asset_gc_result(
 pub(crate) fn pds_asset_gc_preview(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
-    with_store(state, pds_asset_gc_preview_all)
+    finish_storage_command(
+        "pds_asset_gc_preview",
+        with_store(state, pds_asset_gc_preview_all),
+    )
 }
 
 fn pds_asset_gc_preview_all(
@@ -833,7 +849,10 @@ fn pds_asset_gc_preview_all(
 pub(crate) fn pds_asset_gc_execute(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
-    with_store_mut(state, pds_asset_gc_execute_all)
+    finish_storage_command(
+        "pds_asset_gc_execute",
+        with_store_mut(state, pds_asset_gc_execute_all),
+    )
 }
 
 fn pds_asset_gc_execute_all(
@@ -913,6 +932,65 @@ mod tests {
     use tempfile::tempdir;
 
     const CANONICAL_STAGING_NAME: &str = "staging-logical-01234567-89ab-4cde-8123-456789abcdef";
+
+    #[test]
+    fn task4_storage_command_errors_are_logged_masked_without_changing_returned_categories() {
+        let cases = [
+            (
+                "pds_snapshot_delete",
+                StoreError::Validation {
+                    message: "snapshot-delete-marker Authorization: Bearer fixture-snapshot-secret"
+                        .to_owned(),
+                },
+                "validation",
+            ),
+            (
+                "pds_storage_stats",
+                StoreError::Store {
+                    message: "storage-stats-marker Authorization: Bearer fixture-stats-secret"
+                        .to_owned(),
+                },
+                "store-error",
+            ),
+            (
+                "pds_asset_gc_preview",
+                StoreError::Store {
+                    message: "gc-preview-marker Authorization: Bearer fixture-preview-secret"
+                        .to_owned(),
+                },
+                "store-error",
+            ),
+            (
+                "pds_asset_gc_execute",
+                StoreError::Store {
+                    message: "gc-execute-marker Authorization: Bearer fixture-execute-secret"
+                        .to_owned(),
+                },
+                "store-error",
+            ),
+        ];
+
+        for (command, error, expected_code) in cases {
+            let returned = finish_storage_command::<()>(command, Err(error))
+                .expect_err("storage command error must be returned");
+            let returned_json = serde_json::to_value(&returned).expect("serialize returned error");
+            assert_eq!(returned_json["code"], expected_code);
+            assert!(returned_json["message"]
+                .as_str()
+                .expect("returned error keeps its detail")
+                .contains("fixture-"));
+
+            let entry = crate::native_log::global_state()
+                .tail(None)
+                .into_iter()
+                .rev()
+                .find(|entry| entry.message.contains(command))
+                .expect("storage command error reaches the native log");
+            assert_eq!(entry.level, "error");
+            assert!(entry.message.contains("Authorization: ***"));
+            assert!(!entry.message.contains("fixture-"));
+        }
+    }
 
     fn create_staging_directory(app_root: &Path, peer_root: &str, name: &str) {
         fs::create_dir_all(app_root.join(peer_root).join("staging").join(name))
