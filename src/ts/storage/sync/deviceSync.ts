@@ -27,10 +27,11 @@ export class DeviceSyncError extends Error {
 export function classifyDeviceSyncFailure(error: unknown): DeviceSyncError {
     if (error instanceof DeviceSyncError) return error
     const message = error instanceof Error ? error.message : String(error)
-    if (message === 'authorizationExpired' || message === 'sourceMissing' || message === 'identityMismatch') {
+    if (message === 'authorizationExpired' || message === 'sourceMissing') {
         return new DeviceSyncError('registration-expired')
     }
-    if (message === 'transportUnavailable') return new DeviceSyncError('transport-changed')
+    if (message === 'identityMismatch') return new DeviceSyncError('transport-changed')
+    if (message === 'transportUnavailable') return new DeviceSyncError('transport-unavailable')
     if (message === 'permissionDenied' || message === 'laneUnavailable') {
         return new DeviceSyncError('operation-failed')
     }

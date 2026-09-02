@@ -185,8 +185,8 @@ describe('device sync facade', () => {
     it.each([
         ['authorizationExpired', 'registration-expired'],
         ['sourceMissing', 'registration-expired'],
-        ['identityMismatch', 'registration-expired'],
-        ['transportUnavailable', 'transport-changed'],
+        ['identityMismatch', 'transport-changed'],
+        ['transportUnavailable', 'transport-unavailable'],
         ['permissionDenied', 'operation-failed'],
         ['laneUnavailable', 'operation-failed'],
         ['private native detail', 'operation-failed'],

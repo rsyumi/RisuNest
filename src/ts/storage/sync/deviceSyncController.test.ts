@@ -182,7 +182,50 @@ describe('device sync controller', () => {
         expect(status).toHaveBeenCalledTimes(4)
     })
 
-    it('starts the saved method without surfacing an automatic startup error', async () => {
+    it('does no startup work when auto-listen is disabled', async () => {
+        const calls: string[] = []
+        const report = vi.fn()
+
+        await startDeviceSyncAutoListen({
+            syncAutoListen: false,
+            syncListenMethod: 'fixed-url',
+            syncFixedPort: 32145,
+            syncPublicBaseUrl: 'https://sync.example.com',
+        }, {
+            controller: {
+                initialize: async () => { calls.push('initialize') },
+                prepare: async () => { calls.push('prepare'); return { phase: 'prepared' as const } },
+                start: async () => { calls.push('start'); return { phase: 'running' as const } },
+            },
+            report,
+        })
+
+        expect(calls).toEqual([])
+        expect(report).not.toHaveBeenCalled()
+    })
+
+    it('initializes, prepares the saved method, then starts auto-listen', async () => {
+        const calls: string[] = []
+        const report = vi.fn()
+        await startDeviceSyncAutoListen({
+            syncAutoListen: true,
+            syncListenMethod: 'fixed-url',
+            syncFixedPort: 32145,
+            syncPublicBaseUrl: 'https://sync.example.com',
+        }, {
+            controller: {
+                initialize: async () => { calls.push('initialize') },
+                prepare: async (request) => { calls.push(`prepare:${request.method}`); return { phase: 'prepared' as const } },
+                start: async () => { calls.push('start'); return { phase: 'running' as const } },
+            },
+            report,
+        })
+
+        expect(calls).toEqual(['initialize', 'prepare:fixed-url', 'start'])
+        expect(report).not.toHaveBeenCalled()
+    })
+
+    it('reports a bounded automatic startup error after attempting the saved method', async () => {
         const start = vi.fn(async () => { throw new Error('private native failure') })
         const report = vi.fn()
         await startDeviceSyncAutoListen({
@@ -706,6 +749,54 @@ describe('device sync controller', () => {
         await controller.claimStagedClone()
         expect(controller.snapshot().expiredSourceIds).toEqual([])
         expect(reconnectRegisteredClone).toHaveBeenCalledWith('source')
+    })
+
+    it('keeps a registered source retryable after a temporary hello transport failure', async () => {
+        const pullRegistered = vi.fn()
+            .mockRejectedValueOnce(new Error('transportUnavailable'))
+            .mockResolvedValueOnce({ kind: 'noChanges' })
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(),
+                incomingSources: async () => [{ deviceId: 'source', name: 'Source', permissions: ['read'] as const }],
+            },
+            targets: {
+                delta: {
+                    snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
+                    initialize: async () => undefined, pullRegistered,
+                },
+            },
+        })
+        await controller.initialize()
+
+        await expect(controller.pullRegisteredDelta('source'))
+            .rejects.toMatchObject({ code: 'transport-unavailable' })
+        expect(controller.snapshot().expiredSourceIds).toEqual([])
+
+        await expect(controller.pullRegisteredDelta('source')).resolves.toEqual({ kind: 'noChanges' })
+        expect(pullRegistered).toHaveBeenCalledTimes(2)
+        expect(controller.snapshot().expiredSourceIds).toEqual([])
+    })
+
+    it('marks an authenticated source identity change for re-registration', async () => {
+        const pullRegistered = vi.fn(async () => { throw new Error('identityMismatch') })
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(),
+                incomingSources: async () => [{ deviceId: 'source', name: 'Source', permissions: ['read'] as const }],
+            },
+            targets: {
+                delta: {
+                    snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
+                    initialize: async () => undefined, pullRegistered,
+                },
+            },
+        })
+        await controller.initialize()
+
+        await expect(controller.pullRegisteredDelta('source'))
+            .rejects.toMatchObject({ code: 'transport-changed' })
+        expect(controller.snapshot().expiredSourceIds).toEqual(['source'])
     })
 
     it.each(['downloadClone', 'resumeClone', 'cancelClone'] as const)(

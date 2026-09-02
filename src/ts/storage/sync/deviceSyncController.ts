@@ -162,7 +162,7 @@ export function createDeviceSyncController(options: {
         update({
             error: safe.code,
             ...(scope === 'source' ? { sourceError: safe.code } : { workError: safe.code }),
-            expiredSourceIds: safe.code === 'registration-expired' && deviceId
+            expiredSourceIds: (safe.code === 'registration-expired' || safe.code === 'transport-changed') && deviceId
                 ? [...new Set([...snapshot.expiredSourceIds, deviceId])]
                 : snapshot.expiredSourceIds,
         })
