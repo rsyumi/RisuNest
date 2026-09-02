@@ -1700,7 +1700,7 @@ fn command_invalid_rotation_preserves_status_and_allows_corrected_rotation() {
     ));
     assert_eq!(
         invalid_result,
-        Err(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+        Err(super::super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
     );
     let after_invalid = state.status().unwrap();
     assert_eq!(after_invalid.phase, DeviceSyncSourcePhase::Running);
@@ -1809,7 +1809,7 @@ fn overlapping_command_rotations_keep_results_bound_to_each_operation() {
 
     assert_eq!(
         invalid.join().unwrap(),
-        Err(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+        Err(super::super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
     );
     let rotated = valid.join().unwrap().unwrap();
     assert_eq!(rotated.phase, DeviceSyncSourcePhase::Running);
@@ -1869,13 +1869,13 @@ fn command_active_host_rotation_failure_enters_error_state() {
 
     assert_eq!(
         result,
-        Err(super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
+        Err(super::super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
     );
     let status = state.status().unwrap();
     assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
     assert_eq!(
         status.latest_error,
-        Some(super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
+        Some(super::super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
     );
     assert_eq!(status.pairing_uri, initial.pairing_uri);
 }
