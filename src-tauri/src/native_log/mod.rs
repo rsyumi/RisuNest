@@ -200,6 +200,8 @@ fn mask(message: &str) -> String {
         "accesstoken",
         "token",
         "x-api-key",
+        "password",
+        "secret",
     ] {
         masked = redact_json_value(&masked, key);
         masked = redact_query_value(&masked, key);
@@ -212,6 +214,22 @@ fn mask(message: &str) -> String {
     masked = redact_after_until(&masked, "bearer ", |character| {
         character.is_whitespace() || character == ',' || character == ';'
     });
+    for label in [
+        "password is ",
+        "secret is ",
+        "password:",
+        "secret:",
+        "password=",
+        "secret=",
+    ] {
+        masked = redact_after_until(&masked, label, |character| {
+            character.is_whitespace()
+                || character == ','
+                || character == ';'
+                || character == '&'
+                || character == '#'
+        });
+    }
     redact_long_runs(&redact_sk_tokens(&masked))
 }
 

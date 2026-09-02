@@ -98,13 +98,28 @@ fn masks_json_and_query_secret_values_without_hiding_safe_fields() {
     state.record(
         "info",
         "test",
-        r#"payload={"authorization":"Custom fixture-json-auth","api_key":"fixture-json-key","access_token":"fixture-json-token","safe":"visible"} url=/path?token=fixture-query-token&x-api-key=fixture-query-key&safe=visible"#,
+        r#"payload={"authorization":"Custom fixture-json-auth","api_key":"fixture-json-key","access_token":"fixture-json-token","password":"fixture-json-password","secret":"fixture-json-secret","safe":"visible"} url=/path?token=fixture-query-token&x-api-key=fixture-query-key&password=fixture-query-password&secret=fixture-query-secret&safe=visible"#,
     );
 
     let masked = state.tail(Some(1)).pop().unwrap().message;
     assert_eq!(
         masked,
-        r#"payload={"authorization":"***","api_key":"***","access_token":"***","safe":"visible"} url=/path?token=***&x-api-key=***&safe=visible"#
+        r#"payload={"authorization":"***","api_key":"***","access_token":"***","password":"***","secret":"***","safe":"visible"} url=/path?token=***&x-api-key=***&password=***&secret=***&safe=visible"#
+    );
+}
+
+#[test]
+fn masks_plain_password_and_secret_values_without_hiding_surrounding_text() {
+    let state = NativeLogState::for_tests();
+    state.record(
+        "info",
+        "test",
+        "database password is fixture-password while retry remains safe; secret=fixture-secret next safe",
+    );
+
+    assert_eq!(
+        state.tail(Some(1)).pop().unwrap().message,
+        "database password is *** while retry remains safe; secret=*** next safe"
     );
 }
 
@@ -423,9 +438,7 @@ fn panic_hook_masks_sensitive_payload_in_native_log_while_preserving_previous_ho
         previous_calls_by_hook.fetch_add(1, Ordering::SeqCst);
     }));
     install_panic_hook_for(state.clone());
-    let _ = std::panic::catch_unwind(|| {
-        panic!("request failed with Authorization: Bearer fixture-panic-secret")
-    });
+    let _ = std::panic::catch_unwind(|| panic!("database password is fixture-panic-secret"));
     let installed = std::panic::take_hook();
     std::panic::set_hook(original);
     drop(installed);
@@ -433,9 +446,7 @@ fn panic_hook_masks_sensitive_payload_in_native_log_while_preserving_previous_ho
     assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
     let entry = state.tail(Some(1)).pop().unwrap();
     assert!(!entry.message.contains("fixture-panic-secret"));
-    assert!(entry
-        .message
-        .contains("request failed with Authorization: ***"));
+    assert!(entry.message.contains("database password is ***"));
     assert!(entry.message.contains("panic captured at"));
 }
 
