@@ -47,6 +47,69 @@ fn masks_sk_secrets_only_at_token_boundaries() {
 }
 
 #[test]
+fn masks_complete_authorization_values_for_every_scheme_case_insensitively() {
+    let state = NativeLogState::for_tests();
+    let cases = [
+        "Authorization: Bearer fixture-bearer-material\r\nmethod=GET",
+        "authorization: Basic fixture-basic-material\r\nmethod=GET",
+        "AUTHORIZATION: Custom fixture-custom-material\r\nmethod=GET",
+    ];
+
+    for message in cases {
+        state.record("info", "test", message);
+        let masked = state.tail(Some(1)).pop().unwrap().message;
+        assert!(!masked.contains("fixture-"), "unmasked message: {masked}");
+        assert!(masked.contains("method=GET"));
+    }
+}
+
+#[test]
+fn masks_json_and_query_secret_values_without_hiding_safe_fields() {
+    let state = NativeLogState::for_tests();
+    state.record(
+        "info",
+        "test",
+        r#"payload={"authorization":"Custom fixture-json-auth","api_key":"fixture-json-key","access_token":"fixture-json-token","safe":"visible"} url=/path?token=fixture-query-token&x-api-key=fixture-query-key&safe=visible"#,
+    );
+
+    let masked = state.tail(Some(1)).pop().unwrap().message;
+    assert!(
+        !masked.contains("fixture-json"),
+        "unmasked message: {masked}"
+    );
+    assert!(
+        !masked.contains("fixture-query"),
+        "unmasked message: {masked}"
+    );
+    assert!(masked.contains(r#""safe":"visible""#));
+    assert!(masked.contains("safe=visible"));
+}
+
+#[test]
+fn formats_debug_console_output_only_after_masking() {
+    let line = format_console_line(
+        "error",
+        "native_log",
+        "Authorization: Basic fixture-console-secret\r\nmethod=GET",
+    );
+
+    assert!(!line.contains("fixture-console-secret"));
+    assert!(line.contains("[REDACTED]"));
+    assert!(line.contains("method=GET"));
+}
+
+#[test]
+fn ring_only_entries_never_reach_the_file_sink() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+
+    state.record_ring_only("error", "native_log", "command detail");
+
+    assert_eq!(state.tail(Some(1)).pop().unwrap().message, "command detail");
+    assert!(!state.file_path().exists());
+}
+
+#[test]
 fn marker_absence_enables_file_logging_and_toggling_reverses_that() {
     let temp = tempfile::tempdir().unwrap();
     let state = NativeLogState::initialize(temp.path());
@@ -69,6 +132,64 @@ fn marker_absence_enables_file_logging_and_toggling_reverses_that() {
         .join("logs")
         .join(FILE_LOG_DISABLED_MARKER)
         .exists());
+}
+
+#[test]
+fn command_failures_log_native_detail_and_return_only_a_bounded_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let invalid_root = temp.path().join("not-a-directory");
+    fs::write(&invalid_root, b"file").unwrap();
+    let state = NativeLogState::initialize(&invalid_root);
+
+    let error = set_file_enabled_for_command(&state, false).unwrap_err();
+
+    assert_eq!(error, NATIVE_LOG_FILE_UPDATE_FAILED);
+    let entry = state.tail(Some(1)).pop().unwrap();
+    assert_eq!(entry.target, "native_log");
+    assert!(entry.message.contains("file logging update failed"));
+    assert!(!entry.message.contains(NATIVE_LOG_FILE_UPDATE_FAILED));
+}
+
+#[test]
+fn unconfigured_file_path_command_returns_only_a_bounded_code() {
+    let state = NativeLogState::for_tests();
+
+    let error = file_path_for_command(&state).unwrap_err();
+
+    assert_eq!(error, NATIVE_LOG_FILE_PATH_UNAVAILABLE);
+    let entry = state.tail(Some(1)).pop().unwrap();
+    assert_eq!(entry.target, "native_log");
+    assert!(entry.message.contains("file path unavailable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_directory_and_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let logs = temp.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o755)).unwrap();
+    let log_path = logs.join("risunest.log");
+    fs::write(&log_path, b"existing").unwrap();
+    fs::set_permissions(&log_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let state = NativeLogState::initialize(temp.path());
+    state.record("info", "test", "permission check");
+
+    assert_eq!(
+        fs::metadata(&logs).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state.file_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+    );
 }
 
 #[test]
@@ -119,7 +240,7 @@ fn panic_capture_includes_payload_and_location() {
 }
 
 #[test]
-fn panic_hook_captures_the_payload_and_preserves_the_previous_hook() {
+fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
     let state = NativeLogState::for_tests();
     let previous = std::panic::take_hook();
     let previous_called = Arc::new(AtomicBool::new(false));
@@ -132,11 +253,31 @@ fn panic_hook_captures_the_payload_and_preserves_the_previous_hook() {
     let installed = std::panic::take_hook();
     std::panic::set_hook(previous);
 
-    assert!(previous_called.load(Ordering::SeqCst));
+    assert!(!previous_called.load(Ordering::SeqCst));
     assert!(state.tail(None).iter().any(|entry| {
         entry.level == "panic"
             && entry.message.contains("captured panic")
             && entry.message.contains("tests.rs")
     }));
+    drop(installed);
+}
+
+#[test]
+fn panic_hook_does_not_forward_sensitive_payloads_to_the_previous_hook() {
+    let state = NativeLogState::for_tests();
+    let original = std::panic::take_hook();
+    let previous_called = Arc::new(AtomicBool::new(false));
+    let previous_called_by_hook = previous_called.clone();
+    std::panic::set_hook(Box::new(move |_| {
+        previous_called_by_hook.store(true, Ordering::SeqCst);
+    }));
+    install_panic_hook_for(state.clone());
+    let _ = std::panic::catch_unwind(|| panic!("Authorization: Bearer fixture-panic-secret"));
+    let installed = std::panic::take_hook();
+    std::panic::set_hook(original);
+
+    assert!(!previous_called.load(Ordering::SeqCst));
+    let entry = state.tail(Some(1)).pop().unwrap();
+    assert!(!entry.message.contains("fixture-panic-secret"));
     drop(installed);
 }

@@ -85,7 +85,7 @@ describe('RisuNestLogViewer', () => {
         await tick()
     }
 
-    it('shows native entries newest first with their time and level', async () => {
+    it('keeps native entries out of the page until the explicit view action', async () => {
         nativeLog.getNativeLogTail.mockResolvedValue([
             { tsMs: 0, level: 'warn', target: 'native', message: 'older' },
             { tsMs: 1_000, level: 'error', target: 'native', message: 'newer' },
@@ -93,9 +93,13 @@ describe('RisuNestLogViewer', () => {
 
         await render()
 
-        const text = target.textContent ?? ''
-        expect(text).toContain('[1970-01-01T00:00:01.000Z] [error] newer')
-        expect(text.indexOf('newer')).toBeLessThan(text.indexOf('older'))
+        expect(target.textContent).not.toContain('newer')
+        expect(target.textContent).not.toContain('older')
+
+        target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
+        expect(alerts.alertMd).toHaveBeenCalledWith(
+            '[1970-01-01T00:00:01.000Z] [error] newer\n[1970-01-01T00:00:00.000Z] [warn] older',
+        )
     })
 
     it('shows the localized empty state', async () => {
@@ -135,7 +139,7 @@ describe('RisuNestLogViewer', () => {
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
         expect(checkbox.classList.contains('sr-only')).toBe(true)
         expect(checkbox.classList.contains('hidden')).toBe(false)
-        expect(checkbox.closest('label')?.className).toContain('focus-within:ring-selected')
+        expect(checkbox.closest('label')?.className).toContain('focus-within:outline-darkborderc')
         checkbox.checked = false
         checkbox.dispatchEvent(new Event('change', { bubbles: true }))
         await Promise.resolve()
@@ -151,10 +155,12 @@ describe('RisuNestLogViewer', () => {
 
     it('shows localized failure copy without rendering raw command details', async () => {
         nativeLog.getNativeLogTail.mockRejectedValue(new Error('native command detail'))
+        const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         await render()
 
         expect(target.textContent).toContain('Localized error')
         expect(target.textContent).not.toContain('native command detail')
+        expect(error).not.toHaveBeenCalled()
         expect(target.querySelector('[role="alert"][aria-live="assertive"]')).not.toBeNull()
     })
 
@@ -185,6 +191,7 @@ describe('RisuNestLogViewer', () => {
         nativeLog.setNativeLogFileEnabled.mockImplementation(() => new Promise<void>((_resolve, reject) => {
             rejectNativeUpdate = reject
         }))
+        const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         await render()
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
 
@@ -199,6 +206,7 @@ describe('RisuNestLogViewer', () => {
         expect(checkbox.disabled).toBe(false)
         expect(checkbox.checked).toBe(true)
         expect(deviceSettings.updateDeviceSettings).not.toHaveBeenCalled()
+        expect(error).not.toHaveBeenCalled()
     })
 
     it('loads the file path once when enabling file logging', async () => {
@@ -213,5 +221,14 @@ describe('RisuNestLogViewer', () => {
         await tick()
 
         expect(nativeLog.getNativeLogFilePath).toHaveBeenCalledOnce()
+    })
+
+    it('provides a visible theme-token focus outline for the custom toggle', async () => {
+        await render()
+
+        const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+        const label = checkbox.closest('label')!
+        expect(label.className).toContain('focus-within:outline')
+        expect(label.className).toContain('focus-within:outline-darkborderc')
     })
 })

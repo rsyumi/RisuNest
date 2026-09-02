@@ -93,15 +93,15 @@
 <section class="flex flex-col gap-2 text-textcolor">
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.diag.title}</h2>
     <div class="flex gap-2 flex-wrap">
-        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2" data-view-log onclick={viewLog}>
+        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-view-log onclick={viewLog}>
             {language.risuNest.diag.viewLog}
         </button>
-        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2" data-copy-log onclick={() => void copyLog()}>
+        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-copy-log onclick={() => void copyLog()}>
             {language.risuNest.diag.copyLog}
         </button>
     </div>
 
-    <label class="flex items-center gap-2 cursor-pointer rounded-md focus-within:ring-2 focus-within:ring-selected">
+    <label class="flex items-center gap-2 cursor-pointer rounded-md focus-within:outline focus-within:outline-2 focus-within:outline-darkborderc focus-within:outline-offset-2">
         <input
             class="sr-only"
             type="checkbox"
@@ -123,7 +123,5 @@
         <span class="text-draculared" role="alert" aria-live="assertive">{errorMessage}</span>
     {:else if entries.length === 0}
         <span class="text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</span>
-    {:else}
-        <pre class="bg-bgcolor border border-darkborderc rounded-md p-3 whitespace-pre-wrap break-all max-h-80 overflow-auto">{formattedLog}</pre>
     {/if}
 </section>
