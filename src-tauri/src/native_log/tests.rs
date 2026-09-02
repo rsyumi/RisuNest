@@ -288,6 +288,25 @@ fn first_file_configuration_flushes_pending_entries_exactly_once() {
 }
 
 #[test]
+fn pending_file_entries_evict_the_oldest_at_ring_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::for_tests();
+    for number in 0..=RING_CAPACITY {
+        state.record("info", "boot", format!("pending-{number:04}"));
+    }
+
+    state.configure_file_path(temp.path());
+
+    let log = fs::read_to_string(state.file_path()).unwrap();
+    let lines = log.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), RING_CAPACITY);
+    assert!(!log.contains("pending-0000"));
+    for (line, expected) in lines.iter().zip(1..=RING_CAPACITY) {
+        assert!(line.ends_with(&format!("pending-{expected:04}")));
+    }
+}
+
+#[test]
 fn file_disabled_marker_drops_pending_and_future_entries() {
     let temp = tempfile::tempdir().unwrap();
     let logs = temp.path().join("logs");
