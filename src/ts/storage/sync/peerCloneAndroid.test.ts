@@ -155,6 +155,72 @@ describe('Android peer clone facade', () => {
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_claim')).toBe(false)
     })
 
+    it('accepts the safe registered transfer failure category', async () => {
+        const registeredStatus = {
+            sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+            jobId: '11111111-1111-4111-8111-111111111111',
+            phase: 'failed' as const,
+            completedBytes: 12,
+            error: 'transferFailed',
+        }
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => registeredStatus as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).resolves.toEqual(registeredStatus)
+    })
+
+    it('rejects a raw registered error before secret details cross IPC', async () => {
+        const secret = 'Bearer raw-secret-token'
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => ({
+                sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+                jobId: '11111111-1111-4111-8111-111111111111',
+                phase: 'failed',
+                completedBytes: 12,
+                error: secret,
+            }) as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).rejects.toThrow('invalid Android peer clone status')
+        expect(JSON.stringify(facade.getState())).not.toContain(secret)
+    })
+
+    it('accepts a canonical non-v4 registered source identity', async () => {
+        const registeredStatus = {
+            sourceDeviceId: '01890f3e-9b4a-7cc2-98c8-4d3f9b6a2e11',
+            jobId: '11111111-1111-4111-8111-111111111111',
+            phase: 'ready' as const,
+            completedBytes: 0,
+        }
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => registeredStatus as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).resolves.toEqual(registeredStatus)
+    })
+
+    it('rejects a malformed registered source identity', async () => {
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => ({
+                sourceDeviceId: '01890f3e-9b4a-7cc2-98c8-4d3f9b6a2e1',
+                jobId: '11111111-1111-4111-8111-111111111111',
+                phase: 'ready',
+                completedBytes: 0,
+            }) as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).rejects.toThrow('invalid Android peer clone status')
+    })
+
     it.each([
         ['missing source identity', {
             jobId: '11111111-1111-4111-8111-111111111111', phase: 'ready', completedBytes: 0,
