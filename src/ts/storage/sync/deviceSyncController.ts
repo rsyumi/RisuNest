@@ -136,6 +136,7 @@ export function createDeviceSyncController(options: {
     let initialized = false
     let initialization: Promise<void> | undefined
     let activeWork: Promise<unknown> | undefined
+    let sourceEpoch = 0
     let disposed = false
 
     const publish = (): void => {
@@ -177,11 +178,14 @@ export function createDeviceSyncController(options: {
     const polling = createPeerSourcePolling({
         intervalMilliseconds: options.sourcePollMilliseconds ?? 1_000,
         poll: async () => {
+            const pollEpoch = sourceEpoch
             try {
                 const source = await options.facade.status()
+                if (pollEpoch !== sourceEpoch) return
                 update({ source, error: source.latestError ?? null })
                 if (!['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.stop()
             } catch (error) {
+                if (pollEpoch !== sourceEpoch) return
                 fail(error)
                 polling.stop()
             }
@@ -191,13 +195,23 @@ export function createDeviceSyncController(options: {
         if (['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.start()
         else polling.stop()
     }
-    const updateSource = async (operation: () => Promise<DeviceSyncStatus>): Promise<DeviceSyncStatus> => {
+    const beginSourceLifecycle = (): number => {
+        sourceEpoch += 1
+        polling.stop()
+        return sourceEpoch
+    }
+    const updateSource = async (
+        operation: () => Promise<DeviceSyncStatus>,
+        epoch = beginSourceLifecycle(),
+    ): Promise<DeviceSyncStatus> => {
         try {
             const source = await operation()
+            if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
             update({ source, error: source.latestError ?? null })
             observeSource(source)
             return source
         } catch (error) {
+            if (epoch === sourceEpoch) observeSource(snapshot.source)
             throw fail(error)
         }
     }
@@ -356,8 +370,12 @@ export function createDeviceSyncController(options: {
         },
         stop(): Promise<DeviceSyncStatus> {
             return runExclusive(async () => {
-                try { await options.facade.stop() } catch (error) { throw fail(error) }
-                return updateSource(() => options.facade.status())
+                const epoch = beginSourceLifecycle()
+                try { await options.facade.stop() } catch (error) {
+                    observeSource(snapshot.source)
+                    throw fail(error)
+                }
+                return updateSource(() => options.facade.status(), epoch)
             })
         },
         rotateLink(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
@@ -503,6 +521,7 @@ export function createDeviceSyncController(options: {
         dispose(): void {
             if (disposed) return
             disposed = true
+            sourceEpoch += 1
             polling.stop()
             unsubscribeDeepLink()
             for (const unsubscribe of targetUnsubscribers) unsubscribe?.()

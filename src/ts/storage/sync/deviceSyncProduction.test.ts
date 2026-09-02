@@ -10,6 +10,7 @@ import {
     createAndroidDeviceSyncCloneTarget,
     createProductionDeviceSyncController,
 } from './deviceSyncProduction'
+import { createDeviceSyncController, startDeviceSyncAutoListen } from './deviceSyncController'
 
 describe('production device sync composition', () => {
     it('selects the Android unified source facade while leaving desktop composition injectable', () => {
@@ -50,7 +51,10 @@ describe('production device sync composition', () => {
         const clone = { kind: 'clone' }
         const delta = { kind: 'delta' }
         const bidirectional = { kind: 'bidirectional' }
-        const createController = vi.fn(() => ({ kind: 'controller' }))
+        const createController = vi.fn((_options: {
+            facade: unknown
+            targets: { clone: unknown; delta: unknown; bidirectional: unknown }
+        }) => ({ kind: 'controller' }))
         const facade = { kind: 'facade' }
 
         const controller = createProductionDeviceSyncController({
@@ -66,10 +70,77 @@ describe('production device sync composition', () => {
         })
 
         expect(controller).toEqual({ kind: 'controller' })
-        expect(createController).toHaveBeenCalledWith({
-            facade,
-            targets: { clone, delta, bidirectional },
+        const composition = createController.mock.calls[0]![0]
+        expect(composition.facade).toBe(facade)
+        expect(composition.targets.clone).toMatchObject(clone)
+        expect(composition.targets.delta).toMatchObject(delta)
+        expect(composition.targets.bidirectional).toMatchObject(bidirectional)
+    })
+
+    it('rejects swallowed desktop target initialization failures until recovery succeeds', async () => {
+        let cloneError = 'private native initialization failure'
+        const initializeClone = vi.fn(async () => undefined)
+        const clone = {
+            snapshot: () => ({
+                sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const },
+                state: {
+                    source: { phase: 'idle' as const, revokedDeviceIds: [] },
+                    target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 },
+                },
+                sourcePairingUri: '', error: cloneError, warning: '',
+            }),
+            subscribe: () => () => undefined,
+            initialize: initializeClone,
+        }
+        const delta = {
+            snapshot: () => ({
+                sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const },
+                sourcePairingUri: '', pullPhase: 'idle' as const, error: '',
+            }),
+            subscribe: () => () => undefined,
+            initialize: vi.fn(async () => undefined),
+        }
+        const bidirectional = {
+            snapshot: () => ({
+                sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '',
+                operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false,
+                sourceError: '', operationError: '',
+            }),
+            subscribe: () => () => undefined,
+            initialize: vi.fn(async () => undefined),
+        }
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        const start = vi.fn(async () => ({ phase: 'running' as const }))
+        const facade = {
+            status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
+            prepare, start, stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
+            revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+        }
+        const controller = createProductionDeviceSyncController({
+            platform: 'desktop', facade: facade as never,
+            factories: {
+                cloneDesktop: () => clone as never, cloneAndroid: vi.fn(),
+                deltaDesktop: () => delta as never, deltaAndroid: vi.fn(),
+                bidirectional: () => bidirectional as never,
+                controller: createDeviceSyncController,
+            },
         })
+        const report = vi.fn()
+
+        await expect(controller.initialize()).rejects.toMatchObject({ code: 'state-unavailable' })
+        await startDeviceSyncAutoListen({
+            syncAutoListen: true, syncListenMethod: 'lan', syncFixedPort: 32145, syncPublicBaseUrl: '',
+        }, { controller, report })
+        expect(prepare).not.toHaveBeenCalled()
+        expect(start).not.toHaveBeenCalled()
+        expect(report).toHaveBeenCalledWith(expect.objectContaining({ code: 'state-unavailable' }))
+
+        cloneError = ''
+        await expect(controller.initialize()).resolves.toBeUndefined()
+        expect(initializeClone).toHaveBeenCalledTimes(3)
+        await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .resolves.toMatchObject({ phase: 'prepared' })
+        expect(prepare).toHaveBeenCalledOnce()
     })
 
     it('adapts the Android registered clone job to the unified target API', async () => {

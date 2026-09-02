@@ -28,4 +28,24 @@ describe('peer source polling', () => {
         expect(poll).toHaveBeenCalledTimes(2)
         polling.stop()
     })
+
+    it('starts a new lifecycle while an old poll remains unresolved', async () => {
+        vi.useFakeTimers()
+        let finishOld!: () => void
+        const poll = vi.fn()
+            .mockReturnValueOnce(new Promise<void>((resolve) => { finishOld = resolve }))
+            .mockResolvedValue(undefined)
+        const polling = createPeerSourcePolling({ intervalMilliseconds: 10, poll })
+
+        polling.start()
+        await vi.advanceTimersByTimeAsync(10)
+        polling.stop()
+        polling.start()
+        await vi.advanceTimersByTimeAsync(10)
+
+        expect(poll).toHaveBeenCalledTimes(2)
+        finishOld()
+        await vi.advanceTimersByTimeAsync(0)
+        polling.stop()
+    })
 })

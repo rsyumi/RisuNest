@@ -4,7 +4,7 @@ import {
     capturePersistentMutationToken,
     flushPendingData,
 } from '../persistentDataRuntime.svelte'
-import { createDeviceSyncFacade } from './deviceSync'
+import { createDeviceSyncFacade, DeviceSyncError } from './deviceSync'
 import { createAndroidDeviceSyncFacade } from './deviceSyncAndroid'
 import {
     createDeviceSyncController,
@@ -193,6 +193,25 @@ function targetOnly<T extends { initializeTarget(): Promise<void> }>(controller:
     return { ...controller, initialize: () => controller.initializeTarget() }
 }
 
+function failClosedTarget<T extends { initialize(): Promise<void>; snapshot(): unknown }>(
+    target: T,
+    hasInitializationError: (snapshot: ReturnType<T['snapshot']>) => boolean,
+): T {
+    return {
+        ...target,
+        initialize: async () => {
+            try {
+                await target.initialize()
+            } catch {
+                throw new DeviceSyncError('state-unavailable')
+            }
+            if (hasInitializationError(target.snapshot() as ReturnType<T['snapshot']>)) {
+                throw new DeviceSyncError('state-unavailable')
+            }
+        },
+    }
+}
+
 const defaultFactories: ProductionFactories = {
     sourceDesktop: () => createDeviceSyncFacade(),
     sourceAndroid: (runtime) => createAndroidDeviceSyncFacade({
@@ -222,13 +241,19 @@ export function createProductionDeviceSyncController(options: {
     const platform = options.platform ?? (isTauriAndroid ? 'android' : 'desktop')
     const runtime = options.runtime ?? productionRuntime
     const factories = options.factories ?? defaultFactories
-    const clone = platform === 'android'
+    const rawClone = platform === 'android'
         ? factories.cloneAndroid(runtime)
         : factories.cloneDesktop(runtime)
-    const delta = platform === 'android'
+    const rawDelta = platform === 'android'
         ? factories.deltaAndroid(runtime)
         : factories.deltaDesktop(runtime)
-    const bidirectional = factories.bidirectional(runtime)
+    const rawBidirectional = factories.bidirectional(runtime)
+    const clone = failClosedTarget(rawClone, (snapshot) => Boolean(snapshot.error))
+    const delta = failClosedTarget(rawDelta, (snapshot) => Boolean(snapshot.error))
+    const bidirectional = failClosedTarget(
+        rawBidirectional,
+        (snapshot) => Boolean(snapshot.sourceError || snapshot.operationError),
+    )
     return factories.controller({
         facade: options.facade ?? (platform === 'android'
             ? factories.sourceAndroid?.(runtime) ?? createAndroidDeviceSyncFacade({

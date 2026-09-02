@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { DeviceSyncError } from './deviceSync'
 import { createDeviceSyncController, startDeviceSyncAutoListen } from './deviceSyncController'
@@ -31,6 +31,10 @@ const sourceFacade = (prepare = vi.fn(async () => ({ phase: 'prepared' as const 
     prepare, start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
     rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
     revokeOutgoing: async () => undefined,
+})
+
+afterEach(() => {
+    vi.useRealTimers()
 })
 
 describe('device sync controller', () => {
@@ -87,6 +91,66 @@ describe('device sync controller', () => {
         await preparing
         await expect(controller.rotateLink({ read: true, bidirectional: false })).rejects.toThrow('operation-failed')
         expect(controller.snapshot().error).toBe('operation-failed')
+    })
+
+    it('ignores an old poll resolution after stop publishes the authoritative idle state', async () => {
+        vi.useFakeTimers()
+        let resolveOld!: (value: { phase: 'running' }) => void
+        const oldPoll = new Promise<{ phase: 'running' }>((resolve) => { resolveOld = resolve })
+        const status = vi.fn()
+            .mockResolvedValueOnce({ phase: 'idle' as const })
+            .mockReturnValueOnce(oldPoll)
+            .mockResolvedValueOnce({ phase: 'idle' as const })
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(), status,
+                start: async () => ({ phase: 'running' as const }),
+            },
+            sourcePollMilliseconds: 10,
+        })
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        await vi.advanceTimersByTimeAsync(10)
+        expect(status).toHaveBeenCalledTimes(2)
+
+        await controller.stop()
+        resolveOld({ phase: 'running' })
+        await vi.advanceTimersByTimeAsync(0)
+        await vi.advanceTimersByTimeAsync(20)
+
+        expect(controller.snapshot().source.phase).toBe('idle')
+        expect(status).toHaveBeenCalledTimes(3)
+    })
+
+    it('ignores an old poll rejection after a later source lifecycle starts', async () => {
+        vi.useFakeTimers()
+        let rejectOld!: (error: Error) => void
+        const oldPoll = new Promise<never>((_resolve, reject) => { rejectOld = reject })
+        const status = vi.fn()
+            .mockResolvedValueOnce({ phase: 'idle' as const })
+            .mockReturnValueOnce(oldPoll)
+            .mockResolvedValueOnce({ phase: 'idle' as const })
+            .mockResolvedValue({ phase: 'running' as const })
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(), status,
+                start: async () => ({ phase: 'running' as const }),
+            },
+            sourcePollMilliseconds: 10,
+        })
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        await vi.advanceTimersByTimeAsync(10)
+        await controller.stop()
+        await controller.start({ read: true, bidirectional: false })
+
+        rejectOld(new Error('stale private poll failure'))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(controller.snapshot()).toMatchObject({ source: { phase: 'running' }, error: null })
+        await vi.advanceTimersByTimeAsync(10)
+
+        expect(controller.snapshot()).toMatchObject({ source: { phase: 'running' }, error: null })
+        expect(status).toHaveBeenCalledTimes(4)
     })
 
     it('starts the saved method without surfacing an automatic startup error', async () => {
