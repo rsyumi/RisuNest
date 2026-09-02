@@ -4,7 +4,10 @@ use image::codecs::png::PngDecoder;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -23,6 +26,7 @@ use tauri::{AppHandle, Manager};
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
 static INLAY_WRITE_LOCK: Mutex<()> = Mutex::new(());
+const MAX_INLAY_DIMENSION: u32 = u32::MAX;
 
 #[derive(Deserialize)]
 struct BlobMetadata {
@@ -58,8 +62,50 @@ pub(crate) struct EncodedInlayImage {
 pub(crate) struct InlayEncodeOptions {
     format: InlayEncodeFormat,
     quality: u8,
+    #[serde(deserialize_with = "deserialize_inlay_max_dimension")]
     max_dimension: u32,
     skip_reencode: bool,
+}
+
+fn deserialize_inlay_max_dimension<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct MaxDimensionVisitor;
+
+    impl Visitor<'_> for MaxDimensionVisitor {
+        type Value = u32;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a numeric Inlay maximum dimension")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.clamp(0, i64::from(MAX_INLAY_DIMENSION)) as u32)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.min(u64::from(MAX_INLAY_DIMENSION)) as u32)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if !value.is_finite() {
+                return Ok(0);
+            }
+            Ok(value.round().clamp(0.0, f64::from(MAX_INLAY_DIMENSION)) as u32)
+        }
+    }
+
+    deserializer.deserialize_any(MaxDimensionVisitor)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

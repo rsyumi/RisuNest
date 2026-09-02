@@ -23,6 +23,7 @@ import {
     createPresetWorkingSetController,
     readPersistentPresetBodies,
 } from './presetWorkingSetOperations';
+import { normalizeInlayEncodeOptions } from './blobStore';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.8.250" //<APP_VERSION_POINT>
@@ -695,13 +696,15 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.risunestInlayFormat = data.risunestInlayFormat === 'png' || data.risunestInlayFormat === 'original'
         ? data.risunestInlayFormat
         : 'webp'
-    data.risunestInlayWebpQuality = Math.min(100, Math.max(1, Math.round(
-        Number.isFinite(data.risunestInlayWebpQuality) ? data.risunestInlayWebpQuality : 85,
-    )))
-    data.risunestInlayMaxDimension = Math.max(0, Math.round(
-        Number.isFinite(data.risunestInlayMaxDimension) ? data.risunestInlayMaxDimension : 0,
-    ))
-    data.risunestInlaySkipReencode = data.risunestInlaySkipReencode === true
+    const normalizedInlayOptions = normalizeInlayEncodeOptions({
+        format: data.risunestInlayFormat,
+        quality: data.risunestInlayWebpQuality,
+        maxDimension: data.risunestInlayMaxDimension,
+        skipReencode: data.risunestInlaySkipReencode,
+    })
+    data.risunestInlayWebpQuality = normalizedInlayOptions.quality
+    data.risunestInlayMaxDimension = normalizedInlayOptions.maxDimension
+    data.risunestInlaySkipReencode = normalizedInlayOptions.skipReencode
     data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
     delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.echoMessage ??= "Echo Message"

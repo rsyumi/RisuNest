@@ -44,4 +44,19 @@ describe('RisuNest inlay database defaults', () => {
         expect(database.risunestInlayWebpQuality).toBe(100)
         expect(database.risunestInlayMaxDimension).toBe(0)
     })
+
+    it.each([
+        [Number.NaN, 0],
+        [-1, 0],
+        [12.6, 13],
+        [4_294_967_296, 4_294_967_295],
+        [Number.MAX_SAFE_INTEGER, 4_294_967_295],
+    ])('normalizes persisted maximum dimension %s into the native u32 range', (input, expected) => {
+        const database = normalizeDatabaseDefaults({
+            characters: [],
+            risunestInlayMaxDimension: input,
+        } as Database)
+
+        expect(database.risunestInlayMaxDimension).toBe(expected)
+    })
 })

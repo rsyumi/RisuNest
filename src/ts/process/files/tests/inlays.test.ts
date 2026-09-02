@@ -199,6 +199,18 @@ describe('setInlayAsset', () => {
         })
     })
 
+    test.each([
+        [Number.NaN, 0],
+        [-1, 0],
+        [12.6, 13],
+        [4_294_967_296, 4_294_967_295],
+        [Number.MAX_SAFE_INTEGER, 4_294_967_295],
+    ])('normalizes maximum dimension %s before encoding', (input, expected) => {
+        vi.mocked(getDatabase).mockReturnValue({ risunestInlayMaxDimension: input } as any)
+
+        expect(getInlayEncodeOptions().maxDimension).toBe(expected)
+    })
+
     test('encodes configured browser PNG with PNG metadata', async () => {
         canvasOutputMime = 'image/png'
         vi.mocked(getDatabase).mockReturnValue({

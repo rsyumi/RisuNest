@@ -11,6 +11,7 @@ import {
     type BlobPhysicalKeyMapper,
     type BlobReadRange,
     type BlobStore,
+    normalizeInlayEncodeOptions,
 } from './blobStore'
 import type { StorageMutationGate } from './storageMutationGate'
 import { objectPhysicalKey } from './payloadCas'
@@ -69,11 +70,14 @@ export function createTauriBlobStore(
     return {
         ...createBackedBlobStore(backend),
         async putNewInlayImage(key, data, input) {
+            const options = input.options === undefined
+                ? undefined
+                : normalizeInlayEncodeOptions(input.options)
             return await invokeCommand('native_media_write_inlay_image', {
                 id: key,
                 data: Array.from(data),
                 name: input.name,
-                ...(input.options === undefined ? {} : { options: input.options }),
+                ...(options === undefined ? {} : { options }),
             }) as InlayBlobMetadata
         },
     }

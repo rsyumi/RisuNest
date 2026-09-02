@@ -482,6 +482,12 @@ fn apng_fixture() -> Vec<u8> {
     apng
 }
 
+fn animated_webp_header() -> Vec<u8> {
+    let mut bytes = b"RIFF\x16\0\0\0WEBPVP8X\x0a\0\0\0".to_vec();
+    bytes.extend_from_slice(&[0x02, 0, 0, 0, 1, 0, 0, 1, 0, 0]);
+    bytes
+}
+
 #[test]
 fn writes_png_inlay_as_full_dimension_webp_with_truthful_metadata() {
     let temp = TempDir::new().unwrap();
@@ -604,6 +610,103 @@ fn configurable_inlay_encoding_resizes_before_webp_encoding() {
     .unwrap();
     assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
     assert_eq!(result.metadata.mime, "image/webp");
+}
+
+#[test]
+fn configured_webp_quality_is_forwarded_instead_of_using_the_default() {
+    let source = encoded_fixture(ImageFormat::Png, 32, 24);
+    let configured = encode_inlay_image(
+        "quality-70",
+        &source,
+        "source.png",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Webp,
+            quality: 70,
+            max_dimension: 0,
+            skip_reencode: false,
+        }),
+    )
+    .unwrap();
+    let defaulted = encode_inlay_image("quality-85", &source, "source.png", None).unwrap();
+
+    assert_ne!(configured.data, defaulted.data);
+    for encoded in [&configured.data, &defaulted.data] {
+        let decoded = image::load_from_memory_with_format(encoded, ImageFormat::WebP).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (32, 24));
+    }
+}
+
+#[test]
+fn configured_png_resizes_losslessly_with_truthful_dimensions() {
+    let source = encoded_fixture(ImageFormat::Jpeg, 20, 10);
+    let result = encode_inlay_image(
+        "png-resize",
+        &source,
+        "source.jpg",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Png,
+            quality: 1,
+            max_dimension: 5,
+            skip_reencode: true,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(&result.data[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
+    let decoded = image::load_from_memory_with_format(&result.data, ImageFormat::Png).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (5, 3));
+}
+
+#[test]
+fn rejects_animated_webp_before_any_reencode_or_preservation() {
+    for format in [
+        InlayEncodeFormat::Original,
+        InlayEncodeFormat::Webp,
+        InlayEncodeFormat::Png,
+    ] {
+        for skip_reencode in [false, true] {
+            let error = match encode_inlay_image(
+                "animated",
+                &animated_webp_header(),
+                "animated.webp",
+                Some(InlayEncodeOptions {
+                    format: format.clone(),
+                    quality: 85,
+                    max_dimension: 0,
+                    skip_reencode,
+                }),
+            ) {
+                Ok(_) => panic!("animated WebP unexpectedly accepted"),
+                Err(error) => error,
+            };
+
+            assert!(error.contains("animated WebP"), "unexpected error: {error}");
+        }
+    }
+}
+
+#[test]
+fn native_options_clamp_max_dimension_before_original_mode_ignores_it() {
+    for (input, expected) in [
+        (json!(-1), 0),
+        (json!(12.6), 13),
+        (json!(4_294_967_296_u64), u32::MAX),
+        (json!(u64::MAX), u32::MAX),
+    ] {
+        let options: InlayEncodeOptions = serde_json::from_value(json!({
+            "format": "original",
+            "quality": 85,
+            "maxDimension": input,
+            "skipReencode": false,
+        }))
+        .unwrap();
+        assert_eq!(options.max_dimension, expected);
+
+        let source = encoded_fixture(ImageFormat::Png, 8, 4);
+        let result = encode_inlay_image("original", &source, "source.png", Some(options)).unwrap();
+        assert_eq!(result.data, source);
+    }
 }
 
 #[test]

@@ -5,7 +5,7 @@ import { getDatabase, type Database } from "../../storage/database.svelte";
 import { getModelInfo, LLMFlags, LLMFormat } from "src/ts/model/modellist";
 import { asBuffer } from "../../util";
 import {
-    defaultInlayEncodeOptions,
+    normalizeInlayEncodeOptions,
     type BlobMetadata,
     type BlobStore,
     type BlobWriteMetadata,
@@ -52,13 +52,12 @@ const inlayStorage = localforage.createInstance({
 export function getInlayEncodeOptions(): InlayEncodeOptions {
     const db = (getDatabase() ?? {}) as Partial<Pick<Database,
         'risunestInlayFormat' | 'risunestInlayWebpQuality' | 'risunestInlayMaxDimension' | 'risunestInlaySkipReencode'>>
-    const format = db.risunestInlayFormat === 'png' || db.risunestInlayFormat === 'original'
-        ? db.risunestInlayFormat : defaultInlayEncodeOptions.format
-    const quality = Math.min(100, Math.max(1, Math.round(Number.isFinite(db.risunestInlayWebpQuality)
-        ? db.risunestInlayWebpQuality! : defaultInlayEncodeOptions.quality)))
-    const maxDimension = Math.max(0, Math.round(Number.isFinite(db.risunestInlayMaxDimension)
-        ? db.risunestInlayMaxDimension! : defaultInlayEncodeOptions.maxDimension))
-    return { format, quality, maxDimension, skipReencode: db.risunestInlaySkipReencode === true }
+    return normalizeInlayEncodeOptions({
+        format: db.risunestInlayFormat,
+        quality: db.risunestInlayWebpQuality,
+        maxDimension: db.risunestInlayMaxDimension,
+        skipReencode: db.risunestInlaySkipReencode,
+    })
 }
 
 function sourceImageOutput(data: Uint8Array): { mime: string, ext: string } | null {

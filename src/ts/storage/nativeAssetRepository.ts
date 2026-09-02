@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import { defaultInlayEncodeOptions, type InlayBlobMetadata, type InlayEncodeOptions } from './blobStore'
+import {
+    defaultInlayEncodeOptions,
+    normalizeInlayEncodeOptions,
+    type InlayBlobMetadata,
+    type InlayEncodeOptions,
+} from './blobStore'
 import { validateBlobReadRange } from './blobStore'
 import type {
     AssetObjectUrlResolver,
@@ -236,7 +241,7 @@ export function createNativeNewInlayImageEncoder(
 ): NewInlayImageEncoder {
     return {
         async encodeNewInlayImage(key, data, input) {
-            const options = input.options ?? defaultInlayEncodeOptions
+            const options = normalizeInlayEncodeOptions(input.options ?? defaultInlayEncodeOptions)
             const result = await invokeCommand(
                 'native_media_encode_inlay_image',
                 {

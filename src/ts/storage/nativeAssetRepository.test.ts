@@ -79,6 +79,32 @@ describe('native asset repository adapters', () => {
         })
     })
 
+    it('normalizes ignored original conversion options before invoking native code', async () => {
+        const source = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+        const invoke = vi.fn(async () => ({
+            data: Array.from(source),
+            metadata: {
+                key: 'original-id', kind: 'inlay', size: source.byteLength,
+                mime: 'image/png', name: 'original.png', ext: 'png', inlayType: 'image',
+                width: 1, height: 1,
+            },
+        }))
+        const encoder = createNativeNewInlayImageEncoder(invoke)
+
+        await encoder.encodeNewInlayImage('original-id', source, {
+            name: 'original.png',
+            options: {
+                format: 'original', quality: Number.NaN,
+                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: true,
+            },
+        })
+
+        expect(invoke).toHaveBeenCalledWith('native_media_encode_inlay_image', {
+            id: 'original-id', data: Array.from(source), name: 'original.png',
+            options: { format: 'original', quality: 85, maxDimension: 4_294_967_295, skipReencode: true },
+        })
+    })
+
     it.each([
         ['webp', 'image/png', 'png'],
         ['png', 'image/webp', 'webp'],

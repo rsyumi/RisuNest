@@ -117,6 +117,29 @@ describe('platform BlobStore', () => {
         })
     })
 
+    test('normalizes maximum dimension before native write invocation', async () => {
+        const { backend } = memoryBackend()
+        const metadata = {
+            key: 'image-id', kind: 'inlay' as const, size: 3, mime: 'image/png',
+            name: 'source.png', ext: 'png', inlayType: 'image' as const, width: 1, height: 1,
+        }
+        const invoke = vi.fn(async () => metadata)
+        const store = createTauriBlobStore(backend, invoke)
+
+        await store.putNewInlayImage!('image-id', Uint8Array.of(1, 2, 3), {
+            name: 'source.png',
+            options: {
+                format: 'original', quality: 85,
+                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: false,
+            },
+        })
+
+        expect(invoke).toHaveBeenCalledWith('native_media_write_inlay_image', {
+            id: 'image-id', data: [1, 2, 3], name: 'source.png',
+            options: { format: 'original', quality: 85, maxDimension: 4_294_967_295, skipReencode: false },
+        })
+    })
+
     test('gates writes and removals while leaving reads ungated', async () => {
         const { backend } = memoryBackend()
         const events: string[] = []
