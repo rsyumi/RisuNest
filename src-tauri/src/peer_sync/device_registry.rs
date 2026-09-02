@@ -339,19 +339,32 @@ impl OutgoingDeviceRegistry {
         mut device: OutgoingDevice,
     ) -> Result<(), PeerSyncError> {
         validate_outgoing(std::slice::from_ref(&device))?;
-        if let Some(existing) = self
+        if let Some(index) = self
             .devices
-            .iter_mut()
-            .find(|item| item.device_id == device.device_id)
+            .iter()
+            .position(|item| item.device_id == device.device_id)
         {
+            let existing = &self.devices[index];
             let credential_changed = existing.bearer_digest != device.bearer_digest;
+            if credential_changed
+                && (self
+                    .completion_offers
+                    .iter()
+                    .any(|offer| offer.device_id == existing.device_id)
+                    || self
+                        .completed_receipts
+                        .iter()
+                        .any(|receipt| receipt.device_id == existing.device_id))
+            {
+                return invalid("peer completion state blocks credential rotation");
+            }
             device.created_at_ms = existing.created_at_ms;
             device.last_seen_ms = existing.last_seen_ms;
             device.total_bytes = existing.total_bytes;
-            *existing = device;
+            self.devices[index] = device;
             if credential_changed {
                 self.completion_offers
-                    .retain(|offer| offer.device_id != existing.device_id);
+                    .retain(|offer| offer.device_id != self.devices[index].device_id);
             }
         } else {
             self.devices.push(device);
@@ -465,7 +478,11 @@ impl OutgoingDeviceRegistry {
         }
         if resume_lease_id.is_some_and(|lease_id| {
             uuid::Uuid::parse_str(lease_id)
-                .map(|parsed| parsed.get_version_num() != 4 || parsed.to_string() != lease_id)
+                .map(|parsed| {
+                    parsed.get_version_num() != 4
+                        || parsed.get_variant() != uuid::Variant::RFC4122
+                        || parsed.to_string() != lease_id
+                })
                 .unwrap_or(true)
         }) {
             return invalid("invalid peer completion resume lease");
@@ -556,6 +573,61 @@ impl OutgoingDeviceRegistry {
             .completion_offers
             .iter()
             .any(|offer| offer.device_id == device_id && offer.lane == lane.as_str()))
+    }
+
+    pub(crate) fn has_exact_completion_lease(
+        &self,
+        device_id: &str,
+        lane: CompletionLane,
+        lease_id: &str,
+        manifest_id: &str,
+    ) -> Result<bool, PeerSyncError> {
+        validate_completion_tuple(device_id, lane, lease_id, manifest_id)?;
+        Ok(self.completion_offers.iter().any(|offer| {
+            offer.device_id == device_id
+                && offer.lane == lane.as_str()
+                && offer.lease_id == lease_id
+                && offer.manifest_id == manifest_id
+        }))
+    }
+
+    pub(crate) fn completion_lease_ready_bytes(
+        &self,
+        device_id: &str,
+        lane: CompletionLane,
+        lease_id: &str,
+        manifest_id: &str,
+    ) -> Result<Option<u64>, PeerSyncError> {
+        validate_completion_tuple(device_id, lane, lease_id, manifest_id)?;
+        Ok(self
+            .completion_offers
+            .iter()
+            .find(|offer| {
+                offer.device_id == device_id
+                    && offer.lane == lane.as_str()
+                    && offer.lease_id == lease_id
+                    && offer.manifest_id == manifest_id
+                    && offer.ready
+            })
+            .and_then(|offer| offer.transferred_bytes))
+    }
+
+    pub(crate) fn has_exact_completion_receipt(
+        &self,
+        device_id: &str,
+        lane: CompletionLane,
+        lease_id: &str,
+        manifest_id: &str,
+        transferred_bytes: u64,
+    ) -> Result<bool, PeerSyncError> {
+        validate_completion_tuple(device_id, lane, lease_id, manifest_id)?;
+        let receipt_id = completion_receipt_id(lane.as_str(), lease_id, manifest_id);
+        Ok(self.completed_receipts.iter().any(|receipt| {
+            receipt.device_id == device_id
+                && receipt.lane == lane.as_str()
+                && receipt.receipt_id == receipt_id
+                && receipt.transferred_bytes == Some(transferred_bytes)
+        }))
     }
 
     pub(crate) fn completion_lease_allows_remote_apply(
@@ -1379,6 +1451,62 @@ pub(crate) fn outgoing_completion_offer_active(
     OutgoingDeviceRegistry::load(app_root)?.has_completion_lease(device_id, lane)
 }
 
+pub(crate) fn outgoing_completion_lease_matches(
+    app_root: &Path,
+    device_id: &str,
+    lane: CompletionLane,
+    lease_id: &str,
+    manifest_id: &str,
+) -> Result<bool, PeerSyncError> {
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    OutgoingDeviceRegistry::load(app_root)?.has_exact_completion_lease(
+        device_id,
+        lane,
+        lease_id,
+        manifest_id,
+    )
+}
+
+pub(crate) fn outgoing_completion_lease_ready_bytes(
+    app_root: &Path,
+    device_id: &str,
+    lane: CompletionLane,
+    lease_id: &str,
+    manifest_id: &str,
+) -> Result<Option<u64>, PeerSyncError> {
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    OutgoingDeviceRegistry::load(app_root)?.completion_lease_ready_bytes(
+        device_id,
+        lane,
+        lease_id,
+        manifest_id,
+    )
+}
+
+pub(crate) fn outgoing_completion_receipt_matches(
+    app_root: &Path,
+    device_id: &str,
+    lane: CompletionLane,
+    lease_id: &str,
+    manifest_id: &str,
+    transferred_bytes: u64,
+) -> Result<bool, PeerSyncError> {
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    OutgoingDeviceRegistry::load(app_root)?.has_exact_completion_receipt(
+        device_id,
+        lane,
+        lease_id,
+        manifest_id,
+        transferred_bytes,
+    )
+}
+
 pub(crate) fn outgoing_bidirectional_completion_lease_allows_remote_apply(
     app_root: &Path,
     device_id: &str,
@@ -1911,6 +2039,15 @@ fn validate_completion_offers<'a>(
 }
 
 fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncError> {
+    #[cfg(test)]
+    {
+        let failure_marker = path.with_extension("fail-next-write");
+        if fs::remove_file(failure_marker).is_ok() {
+            return Err(PeerSyncError::Storage(
+                "injected outgoing registry write failure".to_owned(),
+            ));
+        }
+    }
     let bytes =
         serde_json::to_vec(value).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
     if bytes.len() > MAX_REGISTRY_BYTES {
@@ -1940,6 +2077,18 @@ fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncEr
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_outgoing_registry_write_for_test(
+    app_root: &Path,
+) -> Result<(), PeerSyncError> {
+    let root = ensure_peer_root(app_root)?;
+    let marker = root.join("devices.fail-next-write");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    options.open(marker)?.sync_all()?;
+    Ok(())
 }
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), PeerSyncError> {
     let mut file = create_owner_only_file(path)?;

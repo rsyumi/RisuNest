@@ -1,15 +1,23 @@
 use super::{
     device_registry::{
         accept_outgoing_completion_offer, completion_receipt_id,
-        issue_outgoing_measured_completion_offer, issue_outgoing_unmeasured_completion_offer,
-        load_or_create_device_id, outgoing_bidirectional_completion_lease_allows_remote_apply,
-        outgoing_completion_offer_active, outgoing_device_is_registered,
-        record_outgoing_completed_operation, record_outgoing_seen, register_incoming_source,
-        register_outgoing_claim, revoke_outgoing_device, seal_outgoing_completion_lease,
-        CompletionAcceptance, CompletionLane, CompletionLeaseId, CompletionSealStatus,
-        DevicePermissions, IncomingSource, OutgoingDevice, OutgoingDeviceRegistry,
+        issue_outgoing_measured_completion_offer, load_or_create_device_id,
+        outgoing_bidirectional_completion_lease_allows_remote_apply,
+        outgoing_completion_lease_ready_bytes, outgoing_completion_offer_active,
+        outgoing_device_is_registered, record_outgoing_completed_operation, record_outgoing_seen,
+        register_incoming_source, register_outgoing_claim, revoke_outgoing_device,
+        seal_outgoing_completion_lease, CompletionAcceptance, CompletionLane, CompletionLeaseId,
+        CompletionSealStatus, DevicePermissions, IncomingSource, OutgoingDevice,
+        OutgoingDeviceRegistry,
     },
     http_stream::HttpRangeStream,
+    logical_completion::{
+        begin_outgoing_logical_object_issue, freeze_outgoing_logical_completion_proof,
+        invalidate_outgoing_logical_completion_state, issue_outgoing_logical_completion_lease,
+        record_outgoing_logical_progress, seal_outgoing_bidirectional_logical_completion,
+        seal_outgoing_delta_logical_completion, LogicalCompletionManifest,
+        OutgoingLogicalIssuedObjects,
+    },
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
     PeerSyncError,
 };
@@ -25,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(any(desktop, target_os = "android"))]
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     io::{self, Seek, SeekFrom},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -129,6 +137,8 @@ const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PEER_COMPLETION_SCHEMA: &str = "risunest.peer-completion/v1";
+const PEER_COMPLETION_PREPARED_SCHEMA: &str = "risunest.peer-completion-prepared/v1";
+const MAX_COMPLETION_PREPARED_RESPONSE_BYTES: usize = 256;
 pub(crate) const PEER_COMPLETION_CAPABILITY_HEADER: &str = "RisuNest-Peer-Completion";
 pub(crate) const PEER_COMPLETION_CAPABILITY_V1: &str = "v1";
 pub(crate) const PEER_COMPLETION_LEASE_HEADER: &str = "RisuNest-Peer-Completion-Lease";
@@ -913,6 +923,8 @@ impl LanCloneClient {
                         verified_bytes,
                         current_object: current_object.map(str::to_owned),
                         operation_id: operation_id.map(str::to_owned),
+                        manifest_id: None,
+                        verified_object: None,
                     }),
             )
             .send()
@@ -1101,6 +1113,7 @@ struct LanShared {
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
     devices: Mutex<BTreeMap<String, DeviceState>>,
     v2_registration: Mutex<Option<HostV2Registration>>,
+    issued_logical_objects: OutgoingLogicalIssuedObjects,
     #[cfg(test)]
     after_v2_registry_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -1111,7 +1124,7 @@ pub struct PreparedLogicalLanSession {
     source_device_id: String,
     manifest_id: String,
     manifest_bytes: Arc<[u8]>,
-    objects: BTreeMap<String, u64>,
+    objects: LogicalCompletionManifest,
     source: Mutex<Box<dyn LogicalDeltaObjectSource + Send>>,
 }
 
@@ -1197,7 +1210,7 @@ impl PreparedLogicalLanSession {
             source_device_id: source_device_id.to_owned(),
             manifest_id,
             manifest_bytes,
-            objects: object_sizes,
+            objects: LogicalCompletionManifest::new(object_sizes)?,
             source: Mutex::new(source),
         })
     }
@@ -1254,8 +1267,18 @@ impl LanSession {
     fn object_size(&self, hash: &str) -> Option<u64> {
         match self {
             Self::Clone(session) => session.manifest().objects.get(hash).map(|value| value.size),
-            Self::Logical(session) => session.objects.get(hash).copied(),
-            Self::BidirectionalLogical(session) => session.logical.objects.get(hash).copied(),
+            Self::Logical(session) => session.objects.object_size(hash),
+            Self::BidirectionalLogical(session) => session.logical.objects.object_size(hash),
+        }
+    }
+
+    fn logical_completion(&self) -> Option<(CompletionLane, &LogicalCompletionManifest)> {
+        match self {
+            Self::Clone(_) => None,
+            Self::Logical(session) => Some((CompletionLane::Delta, &session.objects)),
+            Self::BidirectionalLogical(session) => {
+                Some((CompletionLane::Bidirectional, &session.logical.objects))
+            }
         }
     }
 
@@ -1312,6 +1335,13 @@ impl LanCloneHostControl {
                     "redundant live peer registry revoke failed: {error}"
                 );
             }
+            if let Err(error) = invalidate_outgoing_logical_completion_state(
+                &registration.app_root,
+                device_id,
+                &shared.issued_logical_objects,
+            ) {
+                crate::nlog!("warn", "logical completion proof revoke failed: {error}");
+            }
             return removed;
         }
         let mut devices = recovered_lock(&shared.devices);
@@ -1348,6 +1378,7 @@ impl LanCloneHost {
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
                 v2_registration: Mutex::new(None),
+                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
                 #[cfg(test)]
                 after_v2_registry_claim: Mutex::new(None),
             }),
@@ -1367,6 +1398,7 @@ impl LanCloneHost {
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
                 v2_registration: Mutex::new(None),
+                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
                 #[cfg(test)]
                 after_v2_registry_claim: Mutex::new(None),
             }),
@@ -1388,6 +1420,7 @@ impl LanCloneHost {
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
                 v2_registration: Mutex::new(None),
+                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
                 #[cfg(test)]
                 after_v2_registry_claim: Mutex::new(None),
             }),
@@ -1427,6 +1460,7 @@ impl LanCloneHost {
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
                 v2_registration: Mutex::new(None),
+                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
                 #[cfg(test)]
                 after_v2_registry_claim: Mutex::new(None),
             }),
@@ -1822,6 +1856,7 @@ struct HttpRequest {
     authorization: Option<String>,
     content_type: Option<String>,
     peer_completion: Option<String>,
+    peer_completion_lease: Option<String>,
     peer_completion_resume: Option<String>,
     range: Option<String>,
     range_count: usize,
@@ -1937,6 +1972,7 @@ fn read_request_with_elapsed(
     let mut authorization = None;
     let mut content_type = None;
     let mut peer_completion = None;
+    let mut peer_completion_lease = None;
     let mut peer_completion_resume = None;
     let mut range = None;
     let mut range_count = 0_usize;
@@ -1962,6 +1998,10 @@ fn read_request_with_elapsed(
             }
         } else if name.eq_ignore_ascii_case(PEER_COMPLETION_CAPABILITY_HEADER) {
             if peer_completion.replace(value.to_owned()).is_some() {
+                return Err(RequestReadError::Http(400));
+            }
+        } else if name.eq_ignore_ascii_case(PEER_COMPLETION_LEASE_HEADER) {
+            if peer_completion_lease.replace(value.to_owned()).is_some() {
                 return Err(RequestReadError::Http(400));
             }
         } else if name.eq_ignore_ascii_case(PEER_COMPLETION_RESUME_HEADER) {
@@ -2029,6 +2069,7 @@ fn read_request_with_elapsed(
         authorization,
         content_type,
         peer_completion,
+        peer_completion_lease,
         peer_completion_resume,
         range,
         range_count,
@@ -2131,20 +2172,24 @@ fn handle_request(
                             request.peer_completion_resume.as_deref(),
                         )
                     }
-                    LanSession::Logical(_) => issue_outgoing_unmeasured_completion_offer(
+                    LanSession::Logical(session) => issue_outgoing_logical_completion_lease(
                         &registration.app_root,
                         &device.device_id,
                         CompletionLane::Delta,
-                        session.manifest_id(),
+                        &session.manifest_id,
                         request.peer_completion_resume.as_deref(),
+                        &session.objects,
+                        &shared.issued_logical_objects,
                     ),
-                    LanSession::BidirectionalLogical(_) => {
-                        issue_outgoing_unmeasured_completion_offer(
+                    LanSession::BidirectionalLogical(session) => {
+                        issue_outgoing_logical_completion_lease(
                             &registration.app_root,
                             &device.device_id,
                             CompletionLane::Bidirectional,
-                            session.manifest_id(),
+                            &session.logical.manifest_id,
                             request.peer_completion_resume.as_deref(),
+                            &session.logical.objects,
+                            &shared.issued_logical_objects,
                         )
                     }
                 };
@@ -2223,7 +2268,45 @@ fn handle_request(
             if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
                 return respond_empty(stream, 400);
             }
-            logical_object(stream, shared, session, &device.device_id, &object, stopped)
+            let completion_issue_guard = match request.peer_completion_lease.as_deref() {
+                None => None,
+                Some(lease) => {
+                    let Ok(lease) = CompletionLeaseId::parse(lease) else {
+                        return respond_empty(stream, 400);
+                    };
+                    let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+                        return respond_empty(stream, 409);
+                    };
+                    let Some((lane, manifest)) = session.logical_completion() else {
+                        return respond_empty(stream, 409);
+                    };
+                    match begin_outgoing_logical_object_issue(
+                        &registration.app_root,
+                        &device.device_id,
+                        lane,
+                        lease.as_str(),
+                        session.manifest_id(),
+                        &object,
+                        manifest,
+                        &shared.issued_logical_objects,
+                    ) {
+                        Ok(guard) => Some(guard),
+                        Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                            return respond_empty(stream, 409);
+                        }
+                        Err(_) => return respond_empty(stream, 500),
+                    }
+                }
+            };
+            logical_object(
+                stream,
+                shared,
+                session,
+                &device.device_id,
+                &object,
+                completion_issue_guard,
+                stopped,
+            )
         }
         _ => respond_empty(stream, 405),
     }
@@ -2453,6 +2536,63 @@ fn progress(
     {
         return respond_empty(stream, 400);
     }
+    if matches!(session, LanSession::Clone(_))
+        && (progress.manifest_id.is_some() || progress.verified_object.is_some())
+    {
+        return respond_empty(stream, 400);
+    }
+    let strict_logical = !matches!(session, LanSession::Clone(_))
+        && (progress.operation_id.is_some()
+            || progress.manifest_id.is_some()
+            || progress.verified_object.is_some());
+    if strict_logical {
+        if progress.current_object.is_some()
+            || progress.verified_object.is_none()
+            || progress
+                .verified_object
+                .as_deref()
+                .is_some_and(|object| validate_object_hash(object).is_err())
+        {
+            return respond_empty(stream, 400);
+        }
+        let (Some(lease_id), Some(manifest_id)) = (
+            progress.operation_id.as_deref(),
+            progress.manifest_id.as_deref(),
+        ) else {
+            return respond_empty(stream, 409);
+        };
+        if manifest_id != session.manifest_id() {
+            return respond_empty(stream, 409);
+        }
+        let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+            return respond_empty(stream, 409);
+        };
+        let Some((lane, manifest)) = session.logical_completion() else {
+            return respond_empty(stream, 409);
+        };
+        let verified_bytes = match record_outgoing_logical_progress(
+            &registration.app_root,
+            device_id,
+            lane,
+            lease_id,
+            manifest_id,
+            progress.verified_object.as_deref(),
+            manifest,
+            &shared.issued_logical_objects,
+        ) {
+            Ok(result) => result.verified_bytes(),
+            Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                return respond_empty(stream, 409);
+            }
+            Err(_) => return respond_empty(stream, 500),
+        };
+        if let Some(device) = recovered_lock(&shared.devices).get_mut(device_id) {
+            device.info.verified_bytes = verified_bytes;
+            device.info.current_object = None;
+            device.info.last_seen_unix_ms = now_ms();
+        }
+        return respond_empty(stream, 204);
+    }
     if progress
         .current_object
         .as_deref()
@@ -2605,6 +2745,7 @@ fn bidirectional_remote_apply(
         return respond_empty(stream, 400);
     }
     let operation_id = request.operation_id.clone();
+    let completion_manifest_id = request.expected_source_generation.manifest_hash.clone();
     let completion_deferred = request.completion_deferred_v1 == Some(true);
     if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
         let valid_completion_mode = if completion_deferred {
@@ -2612,7 +2753,7 @@ fn bidirectional_remote_apply(
                 &registration.app_root,
                 &device.device_id,
                 &operation_id,
-                session.manifest_id(),
+                &completion_manifest_id,
             )
         } else {
             outgoing_completion_offer_active(
@@ -2639,7 +2780,26 @@ fn bidirectional_remote_apply(
     let cancellation = AtomicCancellation::new(Arc::clone(stopped));
     match control.remote_apply(bidirectional_session, request, &cancellation) {
         Ok(receipt) if receipt.is_valid() => {
-            if !completion_deferred {
+            if completion_deferred {
+                let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+                    return respond_empty(stream, 409);
+                };
+                match seal_outgoing_bidirectional_logical_completion(
+                    &registration.app_root,
+                    &device.device_id,
+                    &operation_id,
+                    &completion_manifest_id,
+                    receipt.transferred_bytes,
+                    &shared.issued_logical_objects,
+                ) {
+                    Ok(CompletionSealStatus::Sealed | CompletionSealStatus::AlreadyCompleted) => {}
+                    Ok(CompletionSealStatus::Conflict)
+                    | Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                        return respond_empty(stream, 409);
+                    }
+                    Err(_) => return respond_empty(stream, 500),
+                }
+            } else {
                 if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
                     let receipt_id = completion_receipt_id("bidirectional", &operation_id, "");
                     if record_outgoing_completed_operation(
@@ -2737,6 +2897,7 @@ fn logical_object(
     selected: &LanSession,
     device_id: &str,
     object: &str,
+    completion_issue_guard: Option<super::logical_completion::OutgoingLogicalObjectIssueGuard>,
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
     let session = match selected {
@@ -2744,7 +2905,7 @@ fn logical_object(
         LanSession::BidirectionalLogical(session) => &session.logical,
         LanSession::Clone(_) => return respond_empty(stream, 405),
     };
-    let size = *session.objects.get(object).ok_or_else(|| {
+    let size = session.objects.object_size(object).ok_or_else(|| {
         PeerSyncError::Storage("logical session object descriptor is missing".to_owned())
     })?;
     let mut source = session.source.lock().map_err(|error| {
@@ -2758,7 +2919,15 @@ fn logical_object(
     let result = write_response_head(stream, 200, &[("ETag", &quoted(object))], size)
         .and_then(|_| copy_exact_response(stream, reader.as_mut(), size, stopped));
     set_current_object(shared, device_id, None);
-    result
+    result?;
+    drop(reader);
+    drop(source);
+    if !stopped.load(Ordering::SeqCst) {
+        if let Some(guard) = completion_issue_guard {
+            guard.mark_after_full_response()?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -2791,6 +2960,15 @@ struct PeerCompletionRequest {
     lane: String,
     operation_id: String,
     manifest_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transferred_bytes: Option<u64>,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerCompletionPreparedResponse {
+    schema: String,
     transferred_bytes: u64,
 }
 
@@ -2840,13 +3018,95 @@ fn completion(
     let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
         return respond_empty(stream, 404);
     };
+    if completion.transferred_bytes.is_none() {
+        if lane == CompletionLane::Clone {
+            return respond_empty(stream, 400);
+        }
+        let transferred_bytes = match lane {
+            CompletionLane::Delta => {
+                let bytes = match freeze_outgoing_logical_completion_proof(
+                    &registration.app_root,
+                    &device.device_id,
+                    lane,
+                    &completion.operation_id,
+                    &completion.manifest_id,
+                    &shared.issued_logical_objects,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                        return respond_empty(stream, 409);
+                    }
+                    Err(_) => return respond_empty(stream, 500),
+                };
+                match seal_outgoing_delta_logical_completion(
+                    &registration.app_root,
+                    &device.device_id,
+                    &completion.operation_id,
+                    &completion.manifest_id,
+                    bytes,
+                ) {
+                    Ok(CompletionSealStatus::Sealed | CompletionSealStatus::AlreadyCompleted) => {
+                        bytes
+                    }
+                    Ok(CompletionSealStatus::Conflict)
+                    | Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                        return respond_empty(stream, 409);
+                    }
+                    Err(_) => return respond_empty(stream, 500),
+                }
+            }
+            CompletionLane::Bidirectional => {
+                match outgoing_completion_lease_ready_bytes(
+                    &registration.app_root,
+                    &device.device_id,
+                    lane,
+                    &completion.operation_id,
+                    &completion.manifest_id,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) | Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                        return respond_empty(stream, 409);
+                    }
+                    Err(_) => return respond_empty(stream, 500),
+                }
+            }
+            CompletionLane::Clone => unreachable!("clone preparation rejected above"),
+        };
+        return respond_json(
+            stream,
+            200,
+            &PeerCompletionPreparedResponse {
+                schema: PEER_COMPLETION_PREPARED_SCHEMA.to_owned(),
+                transferred_bytes,
+            },
+        );
+    }
+    let transferred_bytes = completion
+        .transferred_bytes
+        .expect("checked completion byte count");
+    if lane == CompletionLane::Delta {
+        match seal_outgoing_delta_logical_completion(
+            &registration.app_root,
+            &device.device_id,
+            &completion.operation_id,
+            &completion.manifest_id,
+            transferred_bytes,
+        ) {
+            Ok(CompletionSealStatus::Sealed | CompletionSealStatus::AlreadyCompleted) => {}
+            Ok(CompletionSealStatus::Conflict)
+            | Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+                return respond_empty(stream, 409);
+            }
+            Err(_) => return respond_empty(stream, 500),
+        }
+    }
     match accept_outgoing_completion_offer(
         &registration.app_root,
         &device.device_id,
         lane,
         &completion.operation_id,
         &completion.manifest_id,
-        completion.transferred_bytes,
+        transferred_bytes,
     ) {
         Ok(CompletionAcceptance::Recorded | CompletionAcceptance::AlreadyRecorded) => {
             respond_empty(stream, 204)
@@ -3327,7 +3587,7 @@ pub(crate) fn deliver_peer_completion(
         lane: lane.as_str().to_owned(),
         operation_id: operation_id.to_owned(),
         manifest_id: manifest_id.to_owned(),
-        transferred_bytes,
+        transferred_bytes: Some(transferred_bytes),
     };
     let response = build_clone_http_client(CONTROL_REQUEST_TIMEOUT)?
         .post(format!("{endpoint}/v1/peer/completion"))
@@ -3352,6 +3612,79 @@ pub(crate) fn deliver_peer_completion(
         ));
     }
     Ok(PeerCompletionDelivery::Delivered)
+}
+
+pub(crate) fn prepare_peer_logical_completion(
+    endpoint: &str,
+    bearer: &str,
+    lane: CompletionLane,
+    operation_id: &str,
+    manifest_id: &str,
+) -> Result<u64, PeerSyncError> {
+    let endpoint = validate_lan_endpoint(endpoint)?;
+    if !is_lower_hex_256(bearer)
+        || !matches!(lane, CompletionLane::Delta | CompletionLane::Bidirectional)
+        || !is_canonical_v4_uuid(operation_id)
+        || validate_object_hash(manifest_id).is_err()
+    {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer completion preparation request".to_owned(),
+        ));
+    }
+    let request = PeerCompletionRequest {
+        schema: PEER_COMPLETION_SCHEMA.to_owned(),
+        lane: lane.as_str().to_owned(),
+        operation_id: operation_id.to_owned(),
+        manifest_id: manifest_id.to_owned(),
+        transferred_bytes: None,
+    };
+    let response = build_clone_http_client(CONTROL_REQUEST_TIMEOUT)?
+        .post(format!("{endpoint}/v1/peer/completion"))
+        .bearer_auth(bearer)
+        .json(&request)
+        .send()
+        .map_err(transport)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(PeerSyncError::Transport(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    if response.content_length().unwrap_or(u64::MAX) > MAX_COMPLETION_PREPARED_RESPONSE_BYTES as u64
+    {
+        return Err(PeerSyncError::Protocol(
+            "peer completion preparation response is too large".to_owned(),
+        ));
+    }
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        != Some("application/json")
+    {
+        return Err(PeerSyncError::Protocol(
+            "peer completion preparation response is not JSON".to_owned(),
+        ));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_COMPLETION_PREPARED_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(transport)?;
+    if body.len() > MAX_COMPLETION_PREPARED_RESPONSE_BYTES {
+        return Err(PeerSyncError::Protocol(
+            "peer completion preparation response is too large".to_owned(),
+        ));
+    }
+    let prepared: PeerCompletionPreparedResponse = serde_json::from_slice(&body)
+        .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+    if prepared.schema != PEER_COMPLETION_PREPARED_SCHEMA {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer completion preparation response".to_owned(),
+        ));
+    }
+    Ok(prepared.transferred_bytes)
 }
 
 fn valid_hello_lanes(lanes: &PeerHelloLanes) -> bool {
@@ -3379,6 +3712,10 @@ struct ProgressRequest {
     current_object: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_object: Option<String>,
 }
 
 fn validate_object_hash(object: &str) -> Result<(), PeerSyncError> {
@@ -3716,7 +4053,11 @@ fn is_canonical_uuid(value: &str) -> bool {
 
 fn is_canonical_v4_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value)
-        .map(|parsed| parsed.get_version_num() == 4 && parsed.to_string() == value)
+        .map(|parsed| {
+            parsed.get_version_num() == 4
+                && parsed.get_variant() == uuid::Variant::RFC4122
+                && parsed.to_string() == value
+        })
         .unwrap_or(false)
 }
 
@@ -4093,9 +4434,10 @@ fn copy_exact_response(
 mod timeout_tests {
     use super::*;
     use crate::peer_sync::device_registry::{
-        seal_outgoing_completion_lease, CompletionLane, CompletionSealStatus, DevicePermissions,
-        IncomingSourceRegistry, OutgoingDeviceRegistry,
+        issue_outgoing_measured_completion_offer, seal_outgoing_completion_lease, CompletionLane,
+        CompletionSealStatus, DevicePermissions, IncomingSourceRegistry, OutgoingDeviceRegistry,
     };
+    use crate::peer_sync::logical_completion::fail_next_logical_completion_proof_write_for_test;
     use crate::peer_sync::{
         logical_delta::{
             build_logical_manifest, LogicalManifestBuilderInput, LogicalRecordEnvelope,
@@ -4111,6 +4453,13 @@ mod timeout_tests {
     const TEST_BEARER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const TEST_P5_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
     const TEST_P5_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn completion_operation_ids_require_the_rfc4122_variant() {
+        assert!(!is_canonical_v4_uuid(
+            "00000000-0000-4000-0000-000000000001"
+        ));
+    }
 
     fn read_request_head(stream: &mut TcpStream) -> String {
         let mut request = Vec::new();
@@ -4167,7 +4516,7 @@ mod timeout_tests {
             source_device_id: "00000000-0000-4000-8000-000000000002".to_owned(),
             manifest_id: "a".repeat(64),
             registered_v2: false,
-            verified_bytes: Arc::new(Mutex::new(0)),
+            progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
         }
     }
 
@@ -5003,6 +5352,8 @@ mod timeout_tests {
         remote_apply_started: Mutex<Option<mpsc::Sender<()>>>,
         remote_apply_bytes: Mutex<u64>,
         remote_apply_calls: Mutex<usize>,
+        remote_apply_commits: Mutex<usize>,
+        remote_apply_receipts: Mutex<BTreeMap<String, LanBidirectionalRemoteApplyReceipt>>,
     }
 
     impl LanBidirectionalControl for BidirectionalControlFixture {
@@ -5022,6 +5373,15 @@ mod timeout_tests {
             cancellation: &dyn CancellationProbe,
         ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
             *self.remote_apply_calls.lock().unwrap() += 1;
+            if let Some(receipt) = self
+                .remote_apply_receipts
+                .lock()
+                .unwrap()
+                .get(&request.operation_id)
+                .cloned()
+            {
+                return Ok(receipt);
+            }
             if let Some(started) = self.remote_apply_started.lock().unwrap().take() {
                 started.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -5041,13 +5401,19 @@ mod timeout_tests {
             if let Some(error) = self.remote_apply_error.lock().unwrap().take() {
                 return Err(error);
             }
-            Ok(LanBidirectionalRemoteApplyReceipt {
+            let receipt = LanBidirectionalRemoteApplyReceipt {
                 committed_revision: request.expected_source_revision,
                 committed_generation: request.expected_source_generation,
                 transferred_objects: 0,
                 transferred_bytes: *self.remote_apply_bytes.lock().unwrap(),
                 backup: None,
-            })
+            };
+            *self.remote_apply_commits.lock().unwrap() += 1;
+            self.remote_apply_receipts
+                .lock()
+                .unwrap()
+                .insert(request.operation_id, receipt.clone());
+            Ok(receipt)
         }
     }
 
@@ -5525,16 +5891,10 @@ mod timeout_tests {
             .completion_lease_id
             .unwrap();
         assert_eq!(
-            seal_outgoing_completion_lease(
-                source_root.path(),
-                &target_id,
-                CompletionLane::Delta,
-                completion_lease.as_str(),
-                &pending_manifest,
-                31,
-            )
-            .unwrap(),
-            CompletionSealStatus::Sealed
+            client
+                .prepare_delta_completion(completion_lease.as_str())
+                .unwrap(),
+            0
         );
         assert!(client.fetch_manifest_with_completion_lease(None).is_err());
         assert_eq!(
@@ -5572,7 +5932,7 @@ mod timeout_tests {
                 CompletionLane::Delta,
                 completion_lease.as_str(),
                 &pending_manifest,
-                31,
+                0,
             )
             .unwrap(),
             PeerCompletionDelivery::Delivered
@@ -5582,7 +5942,7 @@ mod timeout_tests {
                 .unwrap()
                 .devices()[0]
                 .total_bytes,
-            31
+            0
         );
         restarted.stop().unwrap();
     }
@@ -5694,6 +6054,9 @@ mod timeout_tests {
             completion_deferred_v1: Some(true),
         };
 
+        assert!(client
+            .prepare_bidirectional_completion(completion_lease.as_str())
+            .is_err());
         client.request_remote_apply(request.clone()).unwrap();
         assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         assert_eq!(
@@ -5703,21 +6066,13 @@ mod timeout_tests {
                 .total_bytes,
             0
         );
-        let capability = client.hello_with_capabilities().unwrap().completion;
         assert_eq!(
-            seal_outgoing_completion_lease(
-                source_root.path(),
-                &client.inner.device_id,
-                CompletionLane::Bidirectional,
-                completion_lease.as_str(),
-                &client.inner.manifest_id,
-                17,
-            )
-            .unwrap(),
-            CompletionSealStatus::Sealed
+            client
+                .prepare_bidirectional_completion(completion_lease.as_str())
+                .unwrap(),
+            17
         );
-        client.request_remote_apply(request.clone()).unwrap();
-        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
+        let capability = client.hello_with_capabilities().unwrap().completion;
         assert_eq!(
             client
                 .deliver_completion(capability, completion_lease.as_str(), 17)
@@ -5725,12 +6080,12 @@ mod timeout_tests {
             PeerCompletionDelivery::Delivered
         );
         assert!(client.request_remote_apply(request.clone()).is_err());
-        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         let mut legacy = request;
         legacy.operation_id = "00000000-0000-4000-8000-000000000111".to_owned();
         legacy.completion_deferred_v1 = None;
         assert!(client.request_remote_apply(legacy).is_err());
-        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
@@ -5837,6 +6192,126 @@ mod timeout_tests {
     }
 
     #[test]
+    fn bidirectional_deferred_receipt_replay_seals_old_manifest_after_restart() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        *control.remote_apply_bytes.lock().unwrap() = 17;
+        let mut first_host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000116",
+                &source_device_id,
+                Arc::clone(&control),
+            ));
+        first_host
+            .enable_v2_registry(
+                source_root.path(),
+                "Windows",
+                DevicePermissions::read_and_bidirectional(),
+            )
+            .unwrap();
+        let first_pairing = first_host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let first_endpoint = format!("http://{}", first_host.address().unwrap());
+        let first_client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &first_endpoint,
+            &first_pairing.session_id,
+            &first_pairing.manifest_id,
+            &first_pairing.claim,
+        )
+        .unwrap();
+        let lease = first_client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        let target_device_id = first_client.inner.device_id.clone();
+        let bearer = first_client.inner.bearer.clone();
+        let old_manifest_id = first_pairing.manifest_id.clone();
+        let old_generation = LanBidirectionalGeneration {
+            generation_id: "generation-1".to_owned(),
+            manifest_hash: old_manifest_id.clone(),
+            generation_sequence: "1".to_owned(),
+        };
+        let mut request = LanBidirectionalRemoteApplyRequest {
+            operation_id: lease.as_str().to_owned(),
+            source_endpoint: first_endpoint,
+            source_session_id: first_pairing.session_id,
+            source_manifest_id: old_manifest_id.clone(),
+            source_claim: first_pairing.claim,
+            expected_source_revision: 0,
+            expected_source_generation: old_generation.clone(),
+            expected_common_base_manifest_hash: old_manifest_id.clone(),
+            backup_losing_side: false,
+            completion_deferred_v1: Some(true),
+        };
+        fail_next_logical_completion_proof_write_for_test(
+            source_root.path(),
+            &target_device_id,
+            CompletionLane::Bidirectional,
+        )
+        .unwrap();
+        assert!(first_client.request_remote_apply(request.clone()).is_err());
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
+        assert_eq!(*control.remote_apply_commits.lock().unwrap(), 1);
+        first_host.stop().unwrap();
+
+        let mut restarted_host = LanCloneHost::prepare_bidirectional_logical(
+            prepared_bidirectional_logical_session_with_generation(
+                "00000000-0000-4000-8000-000000000117",
+                &source_device_id,
+                "generation-2",
+                Arc::clone(&control),
+            ),
+        );
+        restarted_host
+            .enable_v2_registry(
+                source_root.path(),
+                "Windows",
+                DevicePermissions::read_and_bidirectional(),
+            )
+            .unwrap();
+        let restarted_pairing = restarted_host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        assert_ne!(restarted_pairing.manifest_id, old_manifest_id);
+        let restarted_endpoint = format!("http://{}", restarted_host.address().unwrap());
+        let restarted_client = LanBidirectionalLogicalClient::from_registered(
+            &restarted_endpoint,
+            &restarted_pairing.session_id,
+            &restarted_pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &bearer,
+        )
+        .unwrap();
+        request.source_endpoint = restarted_endpoint.clone();
+        request.source_session_id = restarted_pairing.session_id;
+        request.source_manifest_id = restarted_pairing.manifest_id;
+        request.source_claim = restarted_pairing.claim;
+
+        restarted_client.request_remote_apply(request).unwrap();
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
+        assert_eq!(*control.remote_apply_commits.lock().unwrap(), 1);
+        assert_eq!(
+            prepare_peer_logical_completion(
+                &restarted_endpoint,
+                &bearer,
+                CompletionLane::Bidirectional,
+                lease.as_str(),
+                &old_manifest_id,
+            )
+            .unwrap(),
+            17
+        );
+        restarted_host.stop().unwrap();
+    }
+
+    #[test]
     fn completion_endpoint_authenticates_validates_permissions_and_counts_exact_retry_once() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -5866,7 +6341,7 @@ mod timeout_tests {
         let operation_id = "00000000-0000-4000-8000-000000000103";
         let valid = serde_json::json!({
             "schema": PEER_COMPLETION_SCHEMA,
-            "lane": "delta",
+            "lane": "clone",
             "operationId": operation_id,
             "manifestId": pairing.manifest_id,
             "transferredBytes": 23
@@ -5948,21 +6423,29 @@ mod timeout_tests {
                 .status(),
             reqwest::StatusCode::CONFLICT
         );
-        let completion_lease = client
-            .fetch_manifest_with_completion_lease(None)
-            .unwrap()
-            .completion_lease_id
-            .unwrap();
-        let pending_retry = client
-            .fetch_manifest_with_completion_lease(None)
-            .unwrap()
-            .completion_lease_id
-            .unwrap();
+        let completion_lease = issue_outgoing_measured_completion_offer(
+            source_root.path(),
+            &client.device_id,
+            CompletionLane::Clone,
+            &pairing.manifest_id,
+            23,
+            None,
+        )
+        .unwrap();
+        let pending_retry = issue_outgoing_measured_completion_offer(
+            source_root.path(),
+            &client.device_id,
+            CompletionLane::Clone,
+            &pairing.manifest_id,
+            23,
+            None,
+        )
+        .unwrap();
         assert_eq!(pending_retry, completion_lease);
         let operation_id = completion_lease.as_str();
         let valid = serde_json::json!({
             "schema": PEER_COMPLETION_SCHEMA,
-            "lane": "delta",
+            "lane": "clone",
             "operationId": operation_id,
             "manifestId": pairing.manifest_id,
             "transferredBytes": 23
@@ -5980,7 +6463,7 @@ mod timeout_tests {
             seal_outgoing_completion_lease(
                 source_root.path(),
                 &client.device_id,
-                CompletionLane::Delta,
+                CompletionLane::Clone,
                 operation_id,
                 &pairing.manifest_id,
                 23,
@@ -5989,9 +6472,9 @@ mod timeout_tests {
             CompletionSealStatus::Sealed
         );
         for forged in [
-            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":operation_id,"manifestId":pairing.manifest_id,"transferredBytes":24}),
-            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":"00000000-0000-4000-8000-000000000113","manifestId":pairing.manifest_id,"transferredBytes":23}),
-            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"delta","operationId":operation_id,"manifestId":"f".repeat(64),"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"clone","operationId":operation_id,"manifestId":pairing.manifest_id,"transferredBytes":24}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"clone","operationId":"00000000-0000-4000-8000-000000000113","manifestId":pairing.manifest_id,"transferredBytes":23}),
+            serde_json::json!({"schema":PEER_COMPLETION_SCHEMA,"lane":"clone","operationId":operation_id,"manifestId":"f".repeat(64),"transferredBytes":23}),
         ] {
             assert_eq!(
                 raw.post(&url)
@@ -6012,19 +6495,18 @@ mod timeout_tests {
                 .status(),
             reqwest::StatusCode::NO_CONTENT
         );
-        assert_eq!(
-            client
-                .fetch_manifest_with_completion_lease(Some(&completion_lease))
-                .unwrap()
-                .completion_lease_id
-                .unwrap(),
-            completion_lease
-        );
         let capability = client.hello_with_capabilities().unwrap().completion;
         assert_eq!(
-            client
-                .deliver_completion(capability, operation_id, 23)
-                .unwrap(),
+            deliver_peer_completion(
+                &endpoint,
+                &client.bearer,
+                capability,
+                CompletionLane::Clone,
+                operation_id,
+                &pairing.manifest_id,
+                23,
+            )
+            .unwrap(),
             PeerCompletionDelivery::Delivered
         );
         let mismatched_retry = serde_json::json!({
@@ -6044,17 +6526,21 @@ mod timeout_tests {
             reqwest::StatusCode::CONFLICT
         );
 
-        let next_completion_lease = client
-            .fetch_manifest_with_completion_lease(None)
-            .unwrap()
-            .completion_lease_id
-            .unwrap();
+        let next_completion_lease = issue_outgoing_measured_completion_offer(
+            source_root.path(),
+            &client.device_id,
+            CompletionLane::Clone,
+            &pairing.manifest_id,
+            7,
+            None,
+        )
+        .unwrap();
         let next_operation_id = next_completion_lease.as_str();
         assert_eq!(
             seal_outgoing_completion_lease(
                 source_root.path(),
                 &client.device_id,
-                CompletionLane::Delta,
+                CompletionLane::Clone,
                 next_operation_id,
                 &pairing.manifest_id,
                 7,
@@ -6064,7 +6550,7 @@ mod timeout_tests {
         );
         let next = serde_json::json!({
             "schema": PEER_COMPLETION_SCHEMA,
-            "lane": "delta",
+            "lane": "clone",
             "operationId": next_operation_id,
             "manifestId": pairing.manifest_id,
             "transferredBytes": 7
@@ -6123,16 +6609,20 @@ mod timeout_tests {
         device.total_bytes = u64::MAX;
         registry.upsert(device).unwrap();
         registry.save().unwrap();
-        let completion_lease = client
-            .fetch_manifest_with_completion_lease(None)
-            .unwrap()
-            .completion_lease_id
-            .unwrap();
+        let completion_lease = issue_outgoing_measured_completion_offer(
+            source_root.path(),
+            &client.device_id,
+            CompletionLane::Clone,
+            &pairing.manifest_id,
+            1,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             seal_outgoing_completion_lease(
                 source_root.path(),
                 &client.device_id,
-                CompletionLane::Delta,
+                CompletionLane::Clone,
                 completion_lease.as_str(),
                 &pairing.manifest_id,
                 1,
@@ -6145,7 +6635,7 @@ mod timeout_tests {
             &endpoint,
             &client.bearer,
             PeerCompletionCapability::V1,
-            CompletionLane::Delta,
+            CompletionLane::Clone,
             completion_lease.as_str(),
             &pairing.manifest_id,
             1,
@@ -6162,7 +6652,7 @@ mod timeout_tests {
                 &endpoint,
                 &client.bearer,
                 PeerCompletionCapability::V1,
-                CompletionLane::Delta,
+                CompletionLane::Clone,
                 completion_lease.as_str(),
                 &pairing.manifest_id,
                 1,
@@ -6558,6 +7048,83 @@ mod timeout_tests {
     }
 
     #[test]
+    fn changed_bearer_claim_requires_revoke_and_preserves_completion_replay() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000118",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let first_pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &first_pairing.session_id,
+            &first_pairing.manifest_id,
+            &first_pairing.claim,
+        )
+        .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        let old_bearer = client.bearer.clone();
+        let target_id = client.device_id.clone();
+        let next_pairing = host.rotate_pairing_link().unwrap();
+        let claim_url = format!("{endpoint}/v1/sessions/{}/claim", next_pairing.session_id);
+        let body = serde_json::json!({
+            "claim": next_pairing.claim,
+            "protocolVersion": 2,
+            "deviceId": target_id,
+            "deviceName": "Android"
+        });
+        let raw = reqwest::blocking::Client::new();
+
+        assert_eq!(
+            raw.post(&claim_url).json(&body).send().unwrap().status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(client.hello().unwrap().device_id, source_id);
+        assert_eq!(client.prepare_delta_completion(lease.as_str()).unwrap(), 0);
+        assert_eq!(
+            client
+                .deliver_completion(PeerCompletionCapability::V1, lease.as_str(), 0)
+                .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        assert_eq!(
+            raw.post(&claim_url).json(&body).send().unwrap().status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            client
+                .deliver_completion(PeerCompletionCapability::V1, lease.as_str(), 0)
+                .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        assert!(host.revoke(&target_id));
+        let response = raw.post(&claim_url).json(&body).send().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response: serde_json::Value = response.json().unwrap();
+        assert_ne!(response["bearer"].as_str().unwrap(), old_bearer);
+        assert!(!OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .has_completion_lease(&target_id, CompletionLane::Delta)
+            .unwrap());
+        host.stop().unwrap();
+    }
+
+    #[test]
     fn v2_read_only_claim_cannot_invoke_bidirectional_handlers() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -6809,6 +7376,538 @@ mod timeout_tests {
     }
 
     #[test]
+    fn strict_logical_progress_requires_an_issued_object_and_seals_source_derived_bytes() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "strict-proof".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let object = built.manifest.objects[0].clone();
+        let object_bytes = built.record_objects[0].object.bytes.clone();
+        let logical = PreparedLogicalLanSession::new(
+            "00000000-0000-4000-8000-000000000205",
+            &source_device_id,
+            built.manifest_hash.clone(),
+            built.manifest_bytes.clone(),
+            vec![LogicalDeltaObject {
+                hash: object.hash.clone(),
+                size: object.size,
+            }],
+            Box::new(LogicalFixtureSource(BTreeMap::from([(
+                object.hash.clone(),
+                object_bytes.clone(),
+            )]))),
+        )
+        .unwrap();
+        let mut host = LanCloneHost::prepare_logical(logical);
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let mut client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let manifest = client.fetch_manifest_with_completion_lease(None).unwrap();
+        let lease = manifest.completion_lease_id.unwrap();
+        let completion_url = format!("{endpoint}/v1/peer/completion");
+        for wrong in [
+            serde_json::json!({
+                "schema": PEER_COMPLETION_SCHEMA,
+                "lane": "delta",
+                "operationId": "00000000-0000-4000-8000-000000000211",
+                "manifestId": pairing.manifest_id,
+            }),
+            serde_json::json!({
+                "schema": PEER_COMPLETION_SCHEMA,
+                "lane": "delta",
+                "operationId": lease.as_str(),
+                "manifestId": "f".repeat(64),
+            }),
+        ] {
+            assert_eq!(
+                reqwest::blocking::Client::new()
+                    .post(&completion_url)
+                    .bearer_auth(&client.bearer)
+                    .json(&wrong)
+                    .send()
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::CONFLICT
+            );
+        }
+        let progress_url = format!("{endpoint}/v1/sessions/{}/progress", pairing.session_id);
+        let strict_progress = ProgressRequest {
+            verified_bytes: u64::MAX,
+            current_object: None,
+            operation_id: Some(lease.as_str().to_owned()),
+            manifest_id: Some(pairing.manifest_id.clone()),
+            verified_object: Some(object.hash.clone()),
+        };
+
+        assert_eq!(
+            reqwest::blocking::Client::new()
+                .post(&progress_url)
+                .bearer_auth(&client.bearer)
+                .json(&strict_progress)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: object.hash,
+                size: object.size,
+            })
+            .unwrap();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, object_bytes);
+        assert_eq!(
+            client.prepare_delta_completion(lease.as_str()).unwrap(),
+            object.size
+        );
+        assert_eq!(
+            client.prepare_delta_completion(lease.as_str()).unwrap(),
+            object.size
+        );
+        assert_eq!(host.devices()[0].verified_bytes, object.size);
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            0
+        );
+        let capability = client.hello_with_capabilities().unwrap().completion;
+        assert!(client
+            .deliver_completion(capability, lease.as_str(), object.size + 1)
+            .is_err());
+        assert_eq!(
+            client
+                .deliver_completion(capability, lease.as_str(), object.size)
+                .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            object.size
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn logical_completion_prepare_omits_target_bytes_and_rejects_extra_response_fields() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            assert!(request.starts_with("POST /v1/peer/completion "));
+            assert!(!request.contains("transferredBytes"));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "schema": PEER_COMPLETION_PREPARED_SCHEMA,
+                "transferredBytes": 9,
+                "extra": true,
+            }))
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            finish_response(&mut stream);
+        });
+
+        assert!(prepare_peer_logical_completion(
+            &endpoint,
+            TEST_BEARER,
+            CompletionLane::Delta,
+            "00000000-0000-4000-8000-000000000210",
+            &"a".repeat(64),
+        )
+        .is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn global_delta_prepare_recovers_after_source_restart_and_manifest_change() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-before-restart".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "restart-proof".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"before"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let old_manifest_id = built.manifest_hash.clone();
+        let object = built.manifest.objects[0].clone();
+        let object_bytes = built.record_objects[0].object.bytes.clone();
+        let old_session = PreparedLogicalLanSession::new(
+            "00000000-0000-4000-8000-000000000208",
+            &source_device_id,
+            old_manifest_id.clone(),
+            built.manifest_bytes,
+            vec![LogicalDeltaObject {
+                hash: object.hash.clone(),
+                size: object.size,
+            }],
+            Box::new(LogicalFixtureSource(BTreeMap::from([(
+                object.hash.clone(),
+                object_bytes,
+            )]))),
+        )
+        .unwrap();
+        let mut old_host = LanCloneHost::prepare_logical(old_session);
+        old_host
+            .enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let old_pairing = old_host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let old_endpoint = format!("http://{}", old_host.address().unwrap());
+        let mut client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &old_endpoint,
+            &old_pairing.session_id,
+            &old_pairing.manifest_id,
+            &old_pairing.claim,
+        )
+        .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        client
+            .open_object(&LogicalDeltaObject {
+                hash: object.hash,
+                size: object.size,
+            })
+            .unwrap()
+            .read_to_end(&mut Vec::new())
+            .unwrap();
+        let bearer = client.bearer.clone();
+        let target_device_id = client.device_id.clone();
+        old_host.stop().unwrap();
+
+        let changed_session =
+            prepared_logical_session("00000000-0000-4000-8000-000000000209", &source_device_id);
+        assert_ne!(changed_session.manifest_id, old_manifest_id);
+        let mut restarted_host = LanCloneHost::prepare_logical(changed_session);
+        restarted_host
+            .enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        restarted_host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let restarted_endpoint = format!("http://{}", restarted_host.address().unwrap());
+
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_peer_logical_completion(
+                    &restarted_endpoint,
+                    &bearer,
+                    CompletionLane::Delta,
+                    lease.as_str(),
+                    &old_manifest_id,
+                )
+                .unwrap(),
+                object.size
+            );
+        }
+        assert_eq!(
+            deliver_peer_completion(
+                &restarted_endpoint,
+                &bearer,
+                PeerCompletionCapability::V1,
+                CompletionLane::Delta,
+                lease.as_str(),
+                &old_manifest_id,
+                object.size,
+            )
+            .unwrap(),
+            PeerCompletionDelivery::Delivered
+        );
+        let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
+        let device = registry
+            .devices()
+            .iter()
+            .find(|device| device.device_id == target_device_id)
+            .unwrap();
+        assert_eq!(device.total_bytes, object.size);
+        restarted_host.stop().unwrap();
+    }
+
+    #[test]
+    fn strict_partial_object_stream_is_never_issued_for_progress() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "partial-proof".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let object = built.manifest.objects[0].clone();
+        let mut partial = built.record_objects[0].object.bytes.clone();
+        partial.pop();
+        let logical = PreparedLogicalLanSession::new(
+            "00000000-0000-4000-8000-000000000207",
+            &source_device_id,
+            built.manifest_hash.clone(),
+            built.manifest_bytes,
+            vec![LogicalDeltaObject {
+                hash: object.hash.clone(),
+                size: object.size,
+            }],
+            Box::new(LogicalFixtureSource(BTreeMap::from([(
+                object.hash.clone(),
+                partial,
+            )]))),
+        )
+        .unwrap();
+        let mut host = LanCloneHost::prepare_logical(logical);
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let mut client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: object.hash.clone(),
+                size: object.size,
+            })
+            .unwrap();
+        assert!(reader.read_to_end(&mut Vec::new()).is_err());
+        assert_eq!(
+            reqwest::blocking::Client::new()
+                .post(format!(
+                    "{endpoint}/v1/sessions/{}/progress",
+                    pairing.session_id
+                ))
+                .bearer_auth(&client.bearer)
+                .json(&ProgressRequest {
+                    verified_bytes: object.size,
+                    current_object: None,
+                    operation_id: Some(lease.as_str().to_owned()),
+                    manifest_id: Some(pairing.manifest_id),
+                    verified_object: Some(object.hash),
+                })
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn strict_logical_progress_failure_is_a_read_error_while_legacy_stays_best_effort() {
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "strict-failure".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let manifest_id = built.manifest_hash.clone();
+        let manifest_bytes = built.manifest_bytes;
+        let object = built.manifest.objects[0].clone();
+        let object_bytes = built.record_objects[0].object.bytes.clone();
+        let lease = "00000000-0000-4000-8000-000000000206";
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_manifest = manifest_id.clone();
+        let response_object = object.hash.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            assert!(request.starts_with("GET "));
+            assert!(request.to_ascii_lowercase().contains(
+                &format!("{PEER_COMPLETION_CAPABILITY_HEADER}: {PEER_COMPLETION_CAPABILITY_V1}")
+                    .to_ascii_lowercase()
+            ));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {}\r\n{}: {}\r\n{}: {}\r\nConnection: close\r\n\r\n",
+                manifest_bytes.len(),
+                quoted(&response_manifest),
+                PEER_COMPLETION_CAPABILITY_HEADER,
+                PEER_COMPLETION_CAPABILITY_V1,
+                PEER_COMPLETION_LEASE_HEADER,
+                lease,
+            )
+            .unwrap();
+            stream.write_all(&manifest_bytes).unwrap();
+            finish_response(&mut stream);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            assert!(request.to_ascii_lowercase().contains(
+                &format!("{PEER_COMPLETION_LEASE_HEADER}: {lease}").to_ascii_lowercase()
+            ));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {}\r\nConnection: close\r\n\r\n",
+                object_bytes.len(),
+                quoted(&response_object),
+            )
+            .unwrap();
+            stream.write_all(&object_bytes).unwrap();
+            finish_response(&mut stream);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            assert!(request.starts_with("POST "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            finish_response(&mut stream);
+        });
+        let mut client =
+            direct_logical_client(address, Duration::from_secs(2), Duration::from_secs(2));
+        client.manifest_id = manifest_id;
+        client.fetch_manifest_with_completion_lease(None).unwrap();
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: object.hash,
+                size: object.size,
+            })
+            .unwrap();
+        assert!(reader.read_to_end(&mut Vec::new()).is_err());
+        server.join().unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let legacy_bytes = b"legacy".to_vec();
+        let legacy_hash = sha256_hex(&legacy_bytes);
+        let legacy_etag = quoted(&legacy_hash);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            assert!(!request.contains(PEER_COMPLETION_LEASE_HEADER));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {}\r\nConnection: close\r\n\r\n",
+                legacy_bytes.len(),
+                legacy_etag,
+            )
+            .unwrap();
+            stream.write_all(&legacy_bytes).unwrap();
+            finish_response(&mut stream);
+            let (mut progress, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut progress).starts_with("POST "));
+            progress
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            finish_response(&mut progress);
+        });
+        let mut legacy =
+            direct_logical_client(address, Duration::from_secs(2), Duration::from_secs(2));
+        let mut reader = legacy
+            .open_object(&LogicalDeltaObject {
+                hash: legacy_hash,
+                size: 6,
+            })
+            .unwrap();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"legacy");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn backpressured_logical_object_opens_without_waiting_for_control_progress() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -6951,7 +8050,15 @@ pub struct LanLogicalDeltaClient {
     source_device_id: String,
     manifest_id: String,
     registered_v2: bool,
-    verified_bytes: Arc<Mutex<u64>>,
+    progress: Arc<Mutex<LogicalClientProgress>>,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+#[derive(Default)]
+struct LogicalClientProgress {
+    verified_bytes: u64,
+    verified_objects: BTreeSet<String>,
+    completion_lease_id: Option<CompletionLeaseId>,
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -7041,7 +8148,7 @@ impl LanLogicalDeltaClient {
             source_device_id: source_device_id.to_owned(),
             manifest_id: manifest_id.to_owned(),
             registered_v2: true,
-            verified_bytes: Arc::new(Mutex::new(0)),
+            progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
         })
     }
 
@@ -7104,6 +8211,25 @@ impl LanLogicalDeltaClient {
             operation_id,
             &self.manifest_id,
             transferred_bytes,
+        )
+    }
+
+    pub(crate) fn prepare_delta_completion(
+        &self,
+        operation_id: &str,
+    ) -> Result<u64, PeerSyncError> {
+        let endpoint = self
+            .session_url
+            .split("/v1/sessions/")
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PeerSyncError::Protocol("invalid logical session URL".to_owned()))?;
+        prepare_peer_logical_completion(
+            endpoint,
+            &self.bearer,
+            CompletionLane::Delta,
+            operation_id,
+            &self.manifest_id,
         )
     }
 
@@ -7210,7 +8336,7 @@ impl LanLogicalDeltaClient {
                     source_device_id,
                     manifest_id: manifest_id.to_owned(),
                     registered_v2: false,
-                    verified_bytes: Arc::new(Mutex::new(0)),
+                    progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
                 },
                 false,
             ));
@@ -7264,7 +8390,7 @@ impl LanLogicalDeltaClient {
                 source_device_id,
                 manifest_id: manifest_id.to_owned(),
                 registered_v2: true,
-                verified_bytes: Arc::new(Mutex::new(0)),
+                progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
             },
             true,
         ))
@@ -7436,7 +8562,7 @@ impl LanLogicalDeltaClient {
             source_device_id,
             manifest_id: manifest_id.to_owned(),
             registered_v2: false,
-            verified_bytes: Arc::new(Mutex::new(0)),
+            progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
         })
     }
 
@@ -7518,6 +8644,16 @@ impl LanLogicalDeltaClient {
                 received,
             });
         }
+        if completion_v1 {
+            let mut progress = self.progress.lock().map_err(|error| {
+                PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
+            })?;
+            if progress.completion_lease_id != completion_lease_id {
+                progress.verified_bytes = 0;
+                progress.verified_objects.clear();
+            }
+            progress.completion_lease_id = completion_lease_id.clone();
+        }
         Ok(LanCompletionManifestResponse {
             bytes,
             completion_lease_id,
@@ -7539,7 +8675,8 @@ impl LanLogicalDeltaClient {
             control_timeout: self.control_timeout,
             session_url: self.session_url.clone(),
             bearer: self.bearer.clone(),
-            verified_bytes: Arc::clone(&self.verified_bytes),
+            manifest_id: self.manifest_id.clone(),
+            progress: Arc::clone(&self.progress),
         }
     }
 }
@@ -7548,12 +8685,22 @@ impl LanLogicalDeltaClient {
 impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
     fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
         validate_object_hash(&object.hash)?;
-        let response = self
+        let completion_lease_id = self
+            .progress
+            .lock()
+            .map_err(|error| {
+                PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
+            })?
+            .completion_lease_id
+            .clone();
+        let mut request = self
             .object_client
             .get(format!("{}/objects/{}", self.session_url, object.hash))
-            .bearer_auth(&self.bearer)
-            .send()
-            .map_err(transport)?;
+            .bearer_auth(&self.bearer);
+        if let Some(lease_id) = completion_lease_id {
+            request = request.header(PEER_COMPLETION_LEASE_HEADER, lease_id.as_str());
+        }
+        let response = request.send().map_err(transport)?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
@@ -7710,6 +8857,19 @@ impl LanBidirectionalLogicalClient {
         )
     }
 
+    pub(crate) fn prepare_bidirectional_completion(
+        &self,
+        operation_id: &str,
+    ) -> Result<u64, PeerSyncError> {
+        prepare_peer_logical_completion(
+            &self.endpoint,
+            &self.inner.bearer,
+            CompletionLane::Bidirectional,
+            operation_id,
+            &self.inner.manifest_id,
+        )
+    }
+
     // Android targets claim over trusted-LAN endpoints.
     #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub(crate) fn claim(
@@ -7810,7 +8970,7 @@ impl LanBidirectionalLogicalClient {
                 source_device_id: credential.source_device_id,
                 manifest_id: credential.manifest_id,
                 registered_v2: false,
-                verified_bytes: Arc::new(Mutex::new(0)),
+                progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
             },
             endpoint,
             session_id: credential.session_id,
@@ -7955,30 +9115,18 @@ struct LogicalProgressReporter {
     control_timeout: Duration,
     session_url: String,
     bearer: String,
-    verified_bytes: Arc<Mutex<u64>>,
+    manifest_id: String,
+    progress: Arc<Mutex<LogicalClientProgress>>,
 }
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LogicalProgressReporter {
-    fn verified_bytes(&self) -> Result<u64, PeerSyncError> {
-        self.verified_bytes
-            .lock()
-            .map(|value| *value)
-            .map_err(|error| {
-                PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
-            })
-    }
-
-    fn report_current(&self, current_object: Option<&str>) -> Result<(), PeerSyncError> {
+    fn post(&self, request: &ProgressRequest) -> Result<(), PeerSyncError> {
         let response = self
             .client
             .post(format!("{}/progress", self.session_url))
             .bearer_auth(&self.bearer)
-            .json(&ProgressRequest {
-                verified_bytes: self.verified_bytes()?,
-                current_object: current_object.map(str::to_owned),
-                operation_id: None,
-            })
+            .json(request)
             .timeout(self.control_timeout)
             .send()
             .map_err(transport)?;
@@ -7991,16 +9139,46 @@ impl LogicalProgressReporter {
         Ok(())
     }
 
-    fn complete_object(&self, size: u64) -> Result<(), PeerSyncError> {
-        {
-            let mut verified = self.verified_bytes.lock().map_err(|error| {
-                PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
+    fn complete_object(&self, object: &str, size: u64) -> Result<(), PeerSyncError> {
+        let mut progress = self.progress.lock().map_err(|error| {
+            PeerSyncError::Storage(format!("logical progress mutex poisoned: {error}"))
+        })?;
+        if let Some(lease_id) = progress.completion_lease_id.clone() {
+            let already_verified = progress.verified_objects.contains(object);
+            let candidate = if already_verified {
+                progress.verified_bytes
+            } else {
+                progress.verified_bytes.checked_add(size).ok_or_else(|| {
+                    PeerSyncError::Validation("logical progress byte count overflow".to_owned())
+                })?
+            };
+            self.post(&ProgressRequest {
+                verified_bytes: candidate,
+                current_object: None,
+                operation_id: Some(lease_id.as_str().to_owned()),
+                manifest_id: Some(self.manifest_id.clone()),
+                verified_object: Some(object.to_owned()),
             })?;
-            *verified = verified.checked_add(size).ok_or_else(|| {
-                PeerSyncError::Validation("logical progress byte count overflow".to_owned())
-            })?;
+            if !already_verified {
+                progress.verified_bytes = candidate;
+                progress.verified_objects.insert(object.to_owned());
+            }
+            return Ok(());
         }
-        self.report_current(None)
+
+        progress.verified_bytes = progress.verified_bytes.checked_add(size).ok_or_else(|| {
+            PeerSyncError::Validation("logical progress byte count overflow".to_owned())
+        })?;
+        let verified_bytes = progress.verified_bytes;
+        drop(progress);
+        let _ = self.post(&ProgressRequest {
+            verified_bytes,
+            current_object: None,
+            operation_id: None,
+            manifest_id: None,
+            verified_object: None,
+        });
+        Ok(())
     }
 }
 
@@ -8017,15 +9195,18 @@ struct LogicalProgressReader {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LogicalProgressReader {
-    fn finish_if_verified(&mut self) {
+    fn finish_if_verified(&mut self) -> io::Result<()> {
         if self.completed {
-            return;
+            return Ok(());
         }
         let hash = hex::encode(self.hasher.clone().finalize());
         if self.received_size == self.expected_size && hash == self.expected_hash {
+            self.reporter
+                .complete_object(&self.expected_hash, self.expected_size)
+                .map_err(|error| io::Error::other(error.to_string()))?;
             self.completed = true;
-            let _ = self.reporter.complete_object(self.expected_size);
         }
+        Ok(())
     }
 }
 
@@ -8037,7 +9218,7 @@ impl Read for LogicalProgressReader {
         }
         match self.inner.read(output) {
             Ok(0) => {
-                self.finish_if_verified();
+                self.finish_if_verified()?;
                 Ok(0)
             }
             Ok(read) => {

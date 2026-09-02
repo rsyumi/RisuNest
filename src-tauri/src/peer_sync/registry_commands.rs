@@ -9,10 +9,12 @@ use super::{
         incoming_source_summaries, outgoing_device_summaries, remove_incoming_source,
         revoke_outgoing_device, IncomingSourceSummary, OutgoingDeviceSummary,
     },
+    logical_completion::invalidate_outgoing_logical_completion_proofs,
+    PeerSyncError,
 };
 #[cfg(desktop)]
 use super::{commands::PeerCloneCommandState, shared_session::DeviceSyncSourceState};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 
 trait RegistryAppRootResolver {
@@ -42,6 +44,17 @@ where
         crate::nlog!("error", "peer sync registry {operation} failed: {error}");
         error.to_string()
     })
+}
+
+fn revoke_outgoing_device_with_logical_cleanup(
+    app_root: &Path,
+    device_id: &str,
+    revoke_live: impl FnOnce(&str),
+) -> Result<(), PeerSyncError> {
+    // Revoke the credential and completion offers first. If proof cleanup then
+    // fails, the stale proof remains unusable and the caller still sees error.
+    revoke_outgoing_device(app_root, device_id, revoke_live)?;
+    invalidate_outgoing_logical_completion_proofs(app_root, device_id)
 }
 
 #[tauri::command]
@@ -82,7 +95,7 @@ pub fn peer_sync_revoke_outgoing_device(
     let shared = shared.inner().clone();
     finish_registry_command(
         "outgoing device revocation",
-        revoke_outgoing_device(&app_root(&app)?, &device_id, move |id| {
+        revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
             clone.revoke_registered_device(id);
             delta.revoke_registered_device(id);
             bidirectional.revoke_registered_device(id);
@@ -94,7 +107,54 @@ pub fn peer_sync_revoke_outgoing_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::peer_sync::{
+        device_registry::{
+            issue_outgoing_unmeasured_completion_offer, CompletionLane, DevicePermissions,
+            OutgoingDevice, OutgoingDeviceRegistry,
+        },
+        logical_completion::{
+            prepare_outgoing_logical_completion_proof, LogicalCompletionManifest,
+        },
+    };
+    use std::{collections::BTreeMap, fs};
+
+    const DEVICE_ID: &str = "00000000-0000-4000-8000-000000000205";
+    const MANIFEST_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn root_with_logical_proof() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+        registry
+            .upsert(OutgoingDevice {
+                device_id: DEVICE_ID.to_owned(),
+                name: "Target".to_owned(),
+                bearer_digest: "b".repeat(64),
+                permissions: DevicePermissions::read(),
+                created_at_ms: 1,
+                last_seen_ms: 1,
+                total_bytes: 0,
+            })
+            .unwrap();
+        registry.save().unwrap();
+        let lease = issue_outgoing_unmeasured_completion_offer(
+            root.path(),
+            DEVICE_ID,
+            CompletionLane::Delta,
+            MANIFEST_ID,
+            None,
+        )
+        .unwrap();
+        prepare_outgoing_logical_completion_proof(
+            root.path(),
+            DEVICE_ID,
+            CompletionLane::Delta,
+            lease.as_str(),
+            MANIFEST_ID,
+            &LogicalCompletionManifest::new(BTreeMap::from([("1".repeat(64), 5)])).unwrap(),
+        )
+        .unwrap();
+        root
+    }
 
     fn latest_registry_log_containing(marker: &str) -> crate::native_log::LogEntry {
         crate::native_log::global_state()
@@ -164,6 +224,47 @@ mod tests {
         let entry = latest_registry_log_containing("registry-fixture-app-root");
         assert!(entry.message.contains("path resolver unavailable"));
     }
+
+    #[test]
+    fn revoke_removes_core_state_and_logical_proof_in_one_request() {
+        let root = root_with_logical_proof();
+        let proof = root
+            .path()
+            .join("peer-sync/logical-completion-proofs")
+            .join(format!("{DEVICE_ID}-delta.json"));
+        let mut revoked_live = false;
+
+        revoke_outgoing_device_with_logical_cleanup(root.path(), DEVICE_ID, |_| {
+            revoked_live = true
+        })
+        .unwrap();
+
+        assert!(revoked_live);
+        assert!(OutgoingDeviceRegistry::load(root.path())
+            .unwrap()
+            .devices()
+            .is_empty());
+        assert!(!proof.exists());
+    }
+
+    #[test]
+    fn cleanup_failure_still_leaves_the_core_credential_revoked() {
+        let root = root_with_logical_proof();
+        let proof = root
+            .path()
+            .join("peer-sync/logical-completion-proofs")
+            .join(format!("{DEVICE_ID}-delta.json"));
+        fs::remove_file(&proof).unwrap();
+        fs::create_dir(&proof).unwrap();
+
+        assert!(
+            revoke_outgoing_device_with_logical_cleanup(root.path(), DEVICE_ID, |_| {}).is_err()
+        );
+        assert!(OutgoingDeviceRegistry::load(root.path())
+            .unwrap()
+            .devices()
+            .is_empty());
+    }
 }
 #[cfg(target_os = "android")]
 #[tauri::command]
@@ -181,7 +282,7 @@ pub fn peer_sync_revoke_outgoing_device(
     let shared = shared.inner().clone();
     finish_registry_command(
         "outgoing device revocation",
-        revoke_outgoing_device(&app_root(&app)?, &device_id, move |id| {
+        revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
             clone.revoke_registered_device(id);
             delta.revoke_registered_device(id);
             bidirectional.revoke_registered_device(id);

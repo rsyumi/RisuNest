@@ -32,6 +32,7 @@ pub(crate) mod registry_commands;
 mod host;
 mod http_stream;
 mod lan;
+mod logical_completion;
 pub(crate) mod logical_delta;
 mod logical_delta_transfer;
 pub(crate) mod maintenance;
@@ -52,6 +53,8 @@ mod tunnel;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod tunnel_lifecycle;
 
+#[cfg(test)]
+mod logical_completion_tests;
 #[cfg(test)]
 mod maintenance_tests;
 #[cfg(all(test, desktop))]

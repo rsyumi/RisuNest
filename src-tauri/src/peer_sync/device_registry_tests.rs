@@ -4,12 +4,12 @@ use super::device_registry::{
     incoming_source_summaries, issue_outgoing_unmeasured_completion_offer,
     outgoing_device_summaries, prepare_incoming_completion_delivery,
     record_incoming_completed_operation, record_incoming_completed_operation_best_effort,
-    record_incoming_completed_operation_once_for_lane, record_outgoing_completed_operation,
-    register_incoming_source, register_outgoing_claim, remove_incoming_source,
-    revoke_outgoing_device, seal_outgoing_completion_lease, snapshot_incoming_completion_delivery,
-    CompletionAcceptance, CompletionDeliveryFinalizeStatus, CompletionDeliveryPrepareStatus,
-    CompletionLane, CompletionSealStatus, DevicePermissions, IncomingSource,
-    IncomingSourceRegistry, OutgoingDevice, OutgoingDeviceRegistry, PendingCompletionDelivery,
+    record_incoming_completed_operation_once_for_lane, register_incoming_source,
+    register_outgoing_claim, remove_incoming_source, revoke_outgoing_device,
+    seal_outgoing_completion_lease, snapshot_incoming_completion_delivery, CompletionAcceptance,
+    CompletionDeliveryFinalizeStatus, CompletionDeliveryPrepareStatus, CompletionLane,
+    CompletionSealStatus, DevicePermissions, IncomingSource, IncomingSourceRegistry,
+    OutgoingDevice, OutgoingDeviceRegistry, PendingCompletionDelivery,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -620,8 +620,8 @@ fn source_issued_completion_lease_blocks_a_b_a_replay_after_reload() {
         root.path(),
         OutgoingDevice {
             device_id: TARGET_ID.into(),
-            name: "Re-paired desktop".into(),
-            bearer_digest: "c".repeat(64),
+            name: "Renamed again".into(),
+            bearer_digest: "a".repeat(64),
             permissions: DevicePermissions::read(),
             created_at_ms: 100,
             last_seen_ms: 100,
@@ -639,13 +639,11 @@ fn source_issued_completion_lease_blocks_a_b_a_replay_after_reload() {
             7,
         )
         .unwrap(),
-        CompletionAcceptance::Rejected
+        CompletionAcceptance::AlreadyRecorded
     );
-    record_outgoing_completed_operation(root.path(), TARGET_ID, "delta", &"d".repeat(64), 5)
-        .unwrap();
     assert_eq!(
         outgoing_device_summaries(root.path()).unwrap()[0].total_bytes,
-        23
+        18
     );
 }
 
@@ -981,6 +979,83 @@ fn reregistering_a_claim_preserves_created_at_last_seen_and_total_bytes() {
     assert_eq!(registered.created_at_ms, 10);
     assert_eq!(registered.last_seen_ms, 20);
     assert_eq!(registered.total_bytes, 30);
+}
+
+#[test]
+fn credential_rotation_requires_explicit_revoke_for_any_completion_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Old name".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 20,
+            total_bytes: 30,
+        })
+        .unwrap();
+    let manifest_id = "b".repeat(64);
+    let lease = registry
+        .issue_completion_lease(TARGET_ID, CompletionLane::Delta, &manifest_id, None, None)
+        .unwrap();
+    let rotated = OutgoingDevice {
+        device_id: TARGET_ID.into(),
+        name: "New name".into(),
+        bearer_digest: "c".repeat(64),
+        permissions: DevicePermissions::read(),
+        created_at_ms: 99,
+        last_seen_ms: 99,
+        total_bytes: 99,
+    };
+
+    assert!(registry.register_claim(rotated.clone()).is_err());
+    assert_eq!(registry.devices()[0].bearer_digest, "a".repeat(64));
+    assert_eq!(
+        registry
+            .issue_completion_lease(
+                TARGET_ID,
+                CompletionLane::Delta,
+                &manifest_id,
+                None,
+                Some(lease.as_str()),
+            )
+            .unwrap(),
+        lease
+    );
+
+    assert_eq!(
+        registry
+            .seal_completion_lease(
+                TARGET_ID,
+                CompletionLane::Delta,
+                lease.as_str(),
+                &manifest_id,
+                7,
+            )
+            .unwrap(),
+        CompletionSealStatus::Sealed
+    );
+    assert_eq!(
+        registry
+            .accept_completion_offer(
+                TARGET_ID,
+                CompletionLane::Delta,
+                lease.as_str(),
+                &manifest_id,
+                7,
+                21,
+            )
+            .unwrap(),
+        CompletionAcceptance::Recorded
+    );
+    assert!(registry.register_claim(rotated.clone()).is_err());
+    assert_eq!(registry.devices()[0].bearer_digest, "a".repeat(64));
+    assert_eq!(registry.devices()[0].total_bytes, 37);
+    registry.remove(TARGET_ID).unwrap();
+    registry.register_claim(rotated).unwrap();
+    assert_eq!(registry.devices()[0].bearer_digest, "c".repeat(64));
 }
 
 #[test]
