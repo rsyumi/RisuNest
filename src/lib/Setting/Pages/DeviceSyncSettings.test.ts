@@ -16,8 +16,10 @@ const database = vi.hoisted(() => ({
 const qrCode = vi.hoisted(() => ({ toDataURL: vi.fn<(uri: string) => Promise<string>>() }))
 const deepLinks = vi.hoisted(() => {
     let listener: ((uri: string) => void) | undefined
+    const unsubscribe = vi.fn(() => { listener = undefined })
     return {
-        subscribe: vi.fn((next: (uri: string) => void) => { listener = next; return () => { listener = undefined } }),
+        subscribe: vi.fn((next: (uri: string) => void) => { listener = next; return unsubscribe }),
+        unsubscribe,
         emit: (uri: string) => listener?.(uri),
     }
 })
@@ -137,7 +139,8 @@ describe('DeviceSyncSettings', () => {
         controllerState.controller.stop.mockRejectedValueOnce(new Error('raw native secret'))
         await render(snapshot({ source: { phase: 'running' } }))
         button('Stop sharing')!.click()
-        await vi.waitFor(() => expect(target.querySelector('[data-page-error]')?.textContent).toBe('Error'))
+        await vi.waitFor(() => expect(target.querySelector('[data-share-error]')?.textContent).toBe('Error'))
+        expect(target.querySelector('[data-sync-card="sharing"]')?.contains(target.querySelector('[data-share-error]'))).toBe(true)
         expect(target.textContent).not.toContain('raw native secret')
     })
 
@@ -147,8 +150,20 @@ describe('DeviceSyncSettings', () => {
 
         button('Start sharing')!.click()
 
-        await vi.waitFor(() => expect(target.querySelector('[data-page-error]')?.textContent)
+        await vi.waitFor(() => expect(target.querySelector('[data-share-error]')?.textContent)
             .toBe('That port is already in use. Choose another port.'))
+    })
+
+    it('keeps a receive action error inside the work card', async () => {
+        controllerState.controller.pullStagedDelta.mockRejectedValueOnce(new Error('private target detail'))
+        await render()
+
+        button('Get changes only')!.click()
+
+        await vi.waitFor(() => expect(target.querySelector('[data-work-error]')?.textContent).toBe('Error'))
+        expect(target.querySelector('[data-sync-card="work"]')?.contains(target.querySelector('[data-work-error]'))).toBe(true)
+        expect(target.querySelector('[data-share-error]')).toBeNull()
+        expect(target.textContent).not.toContain('private target detail')
     })
 
     it('selects only incoming targets without contacting them and revokes each direction separately', async () => {
@@ -178,11 +193,14 @@ describe('DeviceSyncSettings', () => {
 
         expect(select.value).toBe('new-link')
         expect(target.querySelector<HTMLInputElement>('#device-sync-link')?.value).toBe(uri)
+        await unmount(mounted!); mounted = undefined
+        expect(deepLinks.unsubscribe).toHaveBeenCalledOnce()
     })
 
     it('enforces the selected incoming permissions and blocks an expired registration', async () => {
         const sources = [
             { deviceId: 'read-only', name: 'Read only', permissions: ['read'] as const },
+            { deviceId: 'no-read', name: 'No read', permissions: [] as const },
             { deviceId: 'expired', name: 'Expired', permissions: ['read', 'bidirectional'] as const },
         ]
         await render(snapshot({ sources, expiredSourceIds: ['expired'] }))
@@ -190,6 +208,10 @@ describe('DeviceSyncSettings', () => {
         select.value = 'read-only'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
         expect(['Copy everything', 'Get changes only', 'Two-way sync'].map((name) => button(name)?.disabled))
             .toEqual([false, false, true])
+
+        select.value = 'no-read'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+        expect(['Copy everything', 'Get changes only', 'Two-way sync'].map((name) => button(name)?.disabled))
+            .toEqual([true, true, true])
 
         select.value = 'expired'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
         expect(['Copy everything', 'Get changes only', 'Two-way sync'].map((name) => button(name)?.disabled))
@@ -201,6 +223,7 @@ describe('DeviceSyncSettings', () => {
         ['port-unavailable', 'That port is already in use. Choose another port.'],
         ['invalid-configuration', 'Check the sharing method, port, and public address.'],
         ['cleanup-failed', 'Sharing stopped, but cleanup did not finish. Try stopping again.'],
+        ['transport-changed', 'Registration expired. Register again with a new link.'],
     ] as const)('maps the safe sharing error %s to concrete localized copy', async (code, message) => {
         await render(snapshot({ source: { phase: 'error', latestError: code } }))
         expect(target.querySelector('[data-sync-card="sharing"]')?.textContent).toContain(message)

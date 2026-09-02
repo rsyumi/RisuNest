@@ -283,6 +283,68 @@ describe('device sync controller', () => {
         },
     )
 
+    it.each(['clone', 'delta', 'bidirectional'] as const)(
+        'fences an in-flight staged %s claim when an invalid link replaces it',
+        async (lane) => {
+            let resolveClaim!: (value: {
+                sourceDeviceId: string, endpoint: string, sessionId: string, manifestId: string,
+            }) => void
+            const claimStagedClone = vi.fn(() => new Promise<{
+                sourceDeviceId: string, endpoint: string, sessionId: string, manifestId: string,
+            }>((resolve) => { resolveClaim = resolve }))
+            const joinRegistered = vi.fn(async () => undefined)
+            const pullRegistered = vi.fn(async () => ({ kind: 'noChanges' }))
+            const syncRegistered = vi.fn(async () => ({ kind: 'noChanges' }))
+            const controller = createDeviceSyncController({
+                facade: {
+                    ...sourceFacade(),
+                    incomingSources: async () => [{
+                        deviceId: 'old-source', name: 'Old', permissions: ['read', 'bidirectional'] as const,
+                    }],
+                    claimStagedClone,
+                },
+                targets: {
+                    clone: {
+                        snapshot: () => cloneSnapshot(), subscribe: () => () => undefined,
+                        initialize: async () => undefined, joinClaimed: vi.fn(), joinRegistered,
+                        confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn(),
+                    },
+                    delta: {
+                        snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
+                        initialize: async () => undefined, pullRegistered,
+                    },
+                    bidirectional: {
+                        snapshot: () => bidirectionalSnapshot(), subscribe: () => () => undefined,
+                        initialize: async () => undefined, syncRegistered, resolveRegistered: vi.fn(),
+                        resume: vi.fn(), acknowledge: vi.fn(), abandon: vi.fn(),
+                    },
+                },
+            })
+            await controller.initialize()
+            const valid = `risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+            const run = lane === 'clone'
+                ? () => controller.claimStagedClone()
+                : lane === 'delta'
+                    ? () => controller.pullStagedDelta()
+                    : () => controller.syncStagedBidirectional()
+            controller.stageLink(valid)
+            const pending = run()
+            await vi.waitFor(() => expect(claimStagedClone).toHaveBeenCalledOnce())
+
+            controller.stageLink('invalid replacement')
+            resolveClaim({
+                sourceDeviceId: 'old-source', endpoint: 'http://old/',
+                sessionId: 'old-session', manifestId: 'a'.repeat(64),
+            })
+
+            await expect(pending).rejects.toMatchObject({ code: 'unavailable' })
+            expect(controller.snapshot()).toMatchObject({ stagedLink: null, stagedSourceDeviceId: null })
+            expect(joinRegistered).not.toHaveBeenCalled()
+            expect(pullRegistered).not.toHaveBeenCalled()
+            expect(syncRegistered).not.toHaveBeenCalled()
+        },
+    )
+
     it('initializes every target before completing unified initialization', async () => {
         const events: string[] = []
         const target = <T>(name: string, snapshot: T) => ({

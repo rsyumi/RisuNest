@@ -113,7 +113,12 @@
     }
     function safeError(code: unknown): string {
         const safeCode = classifyDeviceSyncFailure(code).code
-        if (safeCode === 'registration-expired') return sync.registrationExpired
+        if (
+            code === 'registration-expired'
+            || code === 'transport-changed'
+            || safeCode === 'registration-expired'
+            || safeCode === 'transport-changed'
+        ) return sync.registrationExpired
         if (safeCode === 'port-unavailable') return sync.share.errorPortUnavailable
         if (safeCode === 'invalid-configuration') return sync.share.errorInvalidConfiguration
         if (safeCode === 'cleanup-failed') return sync.share.errorCleanupFailed
@@ -308,8 +313,6 @@
     {#if isTauriAndroid && notificationsEnabled === false}
         <p data-notification-warning class="mt-3 rounded-md border border-draculared bg-darkbg p-3 text-sm text-draculared">{language.peerClone.notificationsDisabledWarning}</p>
     {/if}
-    {#if actionError && !activeWork}<p data-page-error role="alert" class="mt-3 text-sm text-draculared">{actionError}</p>{/if}
-
     <div data-sync-card="sharing" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
         <div class="flex items-center justify-between gap-3">
             <h4 class="font-bold">{sync.share.title}</h4>
@@ -357,7 +360,8 @@
                 </div>
             </div>
         {/if}
-        {#if sourceError && !actionError}<p role="alert" class="mt-3 text-sm text-draculared">{safeError(sourceError)}</p>{/if}
+        {#if actionError && !activeWork}<p data-share-error role="alert" class="mt-3 text-sm text-draculared">{actionError}</p>
+        {:else if sourceError}<p role="alert" class="mt-3 text-sm text-draculared">{safeError(sourceError)}</p>{/if}
     </div>
 
     <div data-sync-card="devices" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
@@ -439,7 +443,7 @@
                         <Button className="mt-2" size="sm" onclick={acknowledgeBidi}>{sync.work.dismiss}</Button>
                     {/if}
                 {/if}
-                {#if actionError}<p role="alert" class="mt-2 text-sm text-draculared">{actionError}</p>{/if}
+                {#if actionError}<p data-work-error role="alert" class="mt-2 text-sm text-draculared">{actionError}</p>{/if}
             </div>
         {/if}
     </div>

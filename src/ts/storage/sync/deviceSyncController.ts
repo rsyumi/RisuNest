@@ -137,6 +137,7 @@ export function createDeviceSyncController(options: {
     let initialization: Promise<void> | undefined
     let activeWork: Promise<unknown> | undefined
     let sourceEpoch = 0
+    let stagedLinkEpoch = 0
     let disposed = false
 
     const publish = (): void => {
@@ -270,12 +271,14 @@ export function createDeviceSyncController(options: {
         if (snapshot.stagedSourceDeviceId) return snapshot.stagedSourceDeviceId
         const link = snapshot.stagedLink
         if (!link || !options.facade.claimStagedClone) throw new DeviceSyncError('unavailable')
+        const claimEpoch = stagedLinkEpoch
         let claimed: RegisteredCloneSession
         try {
             claimed = await options.facade.claimStagedClone(link)
         } catch (error) {
             throw fail(error)
         }
+        if (claimEpoch !== stagedLinkEpoch) throw new DeviceSyncError('unavailable')
         update({
             stagedLink: null,
             stagedSourceDeviceId: claimed.sourceDeviceId,
@@ -304,6 +307,7 @@ export function createDeviceSyncController(options: {
         })
     }
     const stageLink = (uri: string): void => {
+        stagedLinkEpoch += 1
         try {
             update({ stagedLink: parseDeviceSyncUri(uri), stagedSourceDeviceId: null, error: null })
         } catch (error) {
@@ -403,7 +407,10 @@ export function createDeviceSyncController(options: {
             return runExclusive(() => receive(operation))
         },
         stageLink,
-        clearStagedLink(): void { update({ stagedLink: null, stagedSourceDeviceId: null }) },
+        clearStagedLink(): void {
+            stagedLinkEpoch += 1
+            update({ stagedLink: null, stagedSourceDeviceId: null })
+        },
         claimStagedClone(): Promise<void> {
             return runExclusive(async () => {
                 ensureReceiveAllowed()
