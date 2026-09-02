@@ -899,4 +899,82 @@ describe('device sync controller', () => {
 
         expect(unsubscribe).toHaveBeenCalledOnce()
     })
+
+    it('owns the raw pending link and retries a post-claim failure without claiming again', async () => {
+        const uri = `risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const claimStagedClone = vi.fn(async () => ({
+            sourceDeviceId: 'source', endpoint: 'http://192.168.1.2:32145/',
+            sessionId: 'session', manifestId: 'a'.repeat(64),
+        }))
+        const pullRegistered = vi.fn()
+            .mockRejectedValueOnce(new Error('transfer failed after claim'))
+            .mockResolvedValueOnce({ kind: 'noChanges' })
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(),
+                incomingSources: async () => [{ deviceId: 'source', name: 'Source', permissions: ['read'] as const }],
+                claimStagedClone,
+            },
+            targets: {
+                delta: {
+                    snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
+                    initialize: async () => undefined, pullRegistered,
+                },
+            },
+            deepLinks: { consumePending: () => uri, subscribe: () => () => undefined },
+        })
+
+        expect(controller.snapshot().stagedUri).toBe(uri)
+        await expect(controller.pullStagedDelta()).rejects.toMatchObject({ code: 'operation-failed' })
+        expect(controller.snapshot()).toMatchObject({ stagedUri: null, stagedLink: null, stagedSourceDeviceId: 'source' })
+
+        await controller.pullStagedDelta()
+
+        expect(claimStagedClone).toHaveBeenCalledOnce()
+        expect(pullRegistered).toHaveBeenCalledTimes(2)
+    })
+
+    it.each([
+        ['idle', ['prepare', 'start']],
+        ['prepared', ['start']],
+    ] as const)('rehosts a sourcePrepared operation from %s without resuming the target', async (phase, expected) => {
+        const calls: string[] = []
+        const prepare = vi.fn(async () => { calls.push('prepare'); return { phase: 'prepared' as const } })
+        const start = vi.fn(async () => { calls.push('start'); return { phase: 'running' as const } })
+        const resume = vi.fn(async () => { calls.push('resume') })
+        const bidirectional = {
+            snapshot: () => ({ ...bidirectionalSnapshot(), operationPhase: 'sourcePrepared' as const, operationRetained: true }),
+            subscribe: () => () => undefined, initialize: async () => undefined,
+            syncRegistered: vi.fn(), resolveRegistered: vi.fn(), resume,
+            acknowledge: vi.fn(), abandon: vi.fn(),
+        }
+        const controller = createDeviceSyncController({
+            facade: { ...sourceFacade(prepare), status: async () => ({ phase }), start },
+            targets: { bidirectional },
+        })
+        await controller.initialize()
+
+        await controller.rehostBidirectionalSource(
+            { method: 'lan', fixedPort: 32145, publicBaseUrl: '' },
+            { read: true, bidirectional: false },
+        )
+
+        expect(calls).toEqual(expected)
+        expect(resume).not.toHaveBeenCalled()
+        expect(controller.snapshot().source.phase).toBe('running')
+    })
+
+    it('keeps source and receive errors in distinct snapshot scopes', async () => {
+        const controller = createDeviceSyncController({
+            facade: sourceFacade(vi.fn(async () => { throw new Error('private source failure') })),
+        })
+
+        await expect(controller.completeReceive(async () => { throw new Error('private receive failure') }))
+            .rejects.toMatchObject({ code: 'operation-failed' })
+        expect(controller.snapshot()).toMatchObject({ sourceError: null, workError: 'operation-failed' })
+
+        await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .rejects.toMatchObject({ code: 'operation-failed' })
+        expect(controller.snapshot()).toMatchObject({ sourceError: 'operation-failed', workError: 'operation-failed' })
+    })
 })

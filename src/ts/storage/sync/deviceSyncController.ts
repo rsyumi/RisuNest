@@ -83,7 +83,10 @@ export interface DeviceSyncControllerSnapshot {
     sources: RegisteredDevice[]
     devices: RegisteredDevice[]
     error: DeviceSyncErrorCode | null
+    sourceError: DeviceSyncErrorCode | null
+    workError: DeviceSyncErrorCode | null
     stagedLink: StagedDeviceSyncLink | null
+    stagedUri: string | null
     stagedSourceDeviceId: string | null
     activeCloneSourceDeviceId: string | null
     activeBidirectionalSourceDeviceId: string | null
@@ -98,7 +101,8 @@ export interface DeviceSyncControllerSnapshot {
 function createInitialSnapshot(): DeviceSyncControllerSnapshot {
     return {
         source: { phase: 'idle' }, sources: [], devices: [], error: null,
-        stagedLink: null, stagedSourceDeviceId: null,
+        sourceError: null, workError: null,
+        stagedLink: null, stagedUri: null, stagedSourceDeviceId: null,
         activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null,
         expiredSourceIds: [], targets: {},
     }
@@ -148,18 +152,28 @@ export function createDeviceSyncController(options: {
         snapshot = { ...snapshot, ...next }
         publish()
     }
-    const fail = (error: unknown, deviceId?: string): DeviceSyncError => {
+    const fail = (
+        error: unknown,
+        scope: 'source' | 'work',
+        deviceId?: string,
+    ): DeviceSyncError => {
         const safe = classifyDeviceSyncFailure(error)
         update({
             error: safe.code,
+            ...(scope === 'source' ? { sourceError: safe.code } : { workError: safe.code }),
             expiredSourceIds: safe.code === 'registration-expired' && deviceId
                 ? [...new Set([...snapshot.expiredSourceIds, deviceId])]
                 : snapshot.expiredSourceIds,
         })
         return safe
     }
-    const clearExpired = (deviceId: string): void => update({
-        error: null,
+    const clearScopedError = (scope: 'source' | 'work'): void => update({
+        error: scope === 'source' ? snapshot.workError : snapshot.sourceError,
+        ...(scope === 'source' ? { sourceError: null } : { workError: null }),
+    })
+    const clearExpired = (deviceId: string, scope: 'source' | 'work'): void => update({
+        error: scope === 'source' ? snapshot.workError : snapshot.sourceError,
+        ...(scope === 'source' ? { sourceError: null } : { workError: null }),
         expiredSourceIds: snapshot.expiredSourceIds.filter((candidate) => candidate !== deviceId),
     })
     const runExclusive = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -183,11 +197,15 @@ export function createDeviceSyncController(options: {
             try {
                 const source = await options.facade.status()
                 if (pollEpoch !== sourceEpoch) return
-                update({ source, error: source.latestError ?? null })
+                update({
+                    source,
+                    sourceError: source.latestError ?? null,
+                    error: source.latestError ?? snapshot.workError,
+                })
                 if (!['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.stop()
             } catch (error) {
                 if (pollEpoch !== sourceEpoch) return
-                fail(error)
+                fail(error, 'source')
                 polling.stop()
             }
         },
@@ -208,12 +226,16 @@ export function createDeviceSyncController(options: {
         try {
             const source = await operation()
             if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
-            update({ source, error: source.latestError ?? null })
+            update({
+                source,
+                sourceError: source.latestError ?? null,
+                error: source.latestError ?? snapshot.workError,
+            })
             observeSource(source)
             return source
         } catch (error) {
             if (epoch === sourceEpoch) observeSource(snapshot.source)
-            throw fail(error)
+            throw fail(error, 'source')
         }
     }
     const ensureReceiveAllowed = (): void => {
@@ -249,10 +271,10 @@ export function createDeviceSyncController(options: {
         try {
             const result = await operation()
             await refreshRegistries()
-            update({ error: null })
+            clearScopedError('work')
             return result
         } catch (error) {
-            throw fail(error, deviceId)
+            throw fail(error, 'work', deviceId)
         }
     }
     const requireSource = (deviceId: string, permission: 'read' | 'bidirectional'): void => {
@@ -276,13 +298,15 @@ export function createDeviceSyncController(options: {
         try {
             claimed = await options.facade.claimStagedClone(link)
         } catch (error) {
-            throw fail(error)
+            throw fail(error, 'work')
         }
         if (claimEpoch !== stagedLinkEpoch) throw new DeviceSyncError('unavailable')
         update({
             stagedLink: null,
+            stagedUri: null,
             stagedSourceDeviceId: claimed.sourceDeviceId,
-            error: null,
+            error: snapshot.sourceError,
+            workError: null,
             expiredSourceIds: snapshot.expiredSourceIds.filter(
                 (candidate) => candidate !== claimed.sourceDeviceId,
             ),
@@ -310,10 +334,13 @@ export function createDeviceSyncController(options: {
     const stageLink = (uri: string): void => {
         stagedLinkEpoch += 1
         try {
-            update({ stagedLink: parseDeviceSyncUri(uri), stagedSourceDeviceId: null, error: null })
+            update({
+                stagedLink: parseDeviceSyncUri(uri), stagedUri: uri,
+                stagedSourceDeviceId: null, error: snapshot.sourceError, workError: null,
+            })
         } catch (error) {
-            update({ stagedLink: null, stagedSourceDeviceId: null })
-            fail(error)
+            update({ stagedLink: null, stagedUri: null, stagedSourceDeviceId: null })
+            fail(error, 'work')
         }
     }
 
@@ -353,12 +380,16 @@ export function createDeviceSyncController(options: {
                 options.facade.status(),
                 refreshRegistries(),
             ]).then(([, , , source]) => {
-                update({ source, error: source.latestError ?? null })
+                update({
+                    source,
+                    sourceError: source.latestError ?? null,
+                    error: source.latestError ?? snapshot.workError,
+                })
                 observeSource(source)
             }).catch((error) => {
                 initialized = false
                 initialization = undefined
-                throw fail(error)
+                throw fail(error, 'source')
             })
             return initialization
         },
@@ -379,7 +410,7 @@ export function createDeviceSyncController(options: {
                 const epoch = beginSourceLifecycle()
                 try { await options.facade.stop() } catch (error) {
                     observeSource(snapshot.source)
-                    throw fail(error)
+                    throw fail(error, 'source')
                 }
                 return updateSource(() => options.facade.status(), epoch)
             })
@@ -387,13 +418,42 @@ export function createDeviceSyncController(options: {
         rotateLink(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
             return runExclusive(() => updateSource(() => options.facade.rotateLink(permissions)))
         },
+        rehostBidirectionalSource(
+            settings: DeviceSyncSettingsInput,
+            permissions: DeviceSyncLinkPermissions,
+        ): Promise<DeviceSyncStatus> {
+            return runExclusive(async () => {
+                const bidirectional = options.targets?.bidirectional?.snapshot()
+                if (bidirectional?.operationPhase !== 'sourcePrepared') {
+                    throw fail(new DeviceSyncError('unavailable'), 'work')
+                }
+                ensureSourceAllowed()
+                const epoch = beginSourceLifecycle()
+                try {
+                    let source = snapshot.source
+                    if (source.phase === 'idle' || source.phase === 'error') {
+                        source = await options.facade.prepare(settings)
+                        if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
+                    }
+                    if (source.phase !== 'prepared') throw new DeviceSyncError('unavailable')
+                    source = await options.facade.start(permissions)
+                    if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
+                    update({ source, sourceError: null, workError: null, error: null })
+                    observeSource(source)
+                    return source
+                } catch (error) {
+                    if (epoch === sourceEpoch) observeSource(snapshot.source)
+                    throw fail(error, 'work')
+                }
+            })
+        },
         revokeIncoming(deviceId: string): Promise<void> {
             return runExclusive(async () => {
                 try {
                     await options.facade.revokeIncoming(deviceId)
                     await refreshRegistries()
-                    clearExpired(deviceId)
-                } catch (error) { throw fail(error) }
+                    clearExpired(deviceId, 'source')
+                } catch (error) { throw fail(error, 'source') }
             })
         },
         revokeOutgoing(deviceId: string): Promise<void> {
@@ -401,7 +461,8 @@ export function createDeviceSyncController(options: {
                 try {
                     await options.facade.revokeOutgoing(deviceId)
                     await refreshRegistries()
-                } catch (error) { throw fail(error) }
+                    clearScopedError('source')
+                } catch (error) { throw fail(error, 'source') }
             })
         },
         completeReceive<T>(operation: () => Promise<T>): Promise<T> {
@@ -410,7 +471,7 @@ export function createDeviceSyncController(options: {
         stageLink,
         clearStagedLink(): void {
             stagedLinkEpoch += 1
-            update({ stagedLink: null, stagedSourceDeviceId: null })
+            update({ stagedLink: null, stagedUri: null, stagedSourceDeviceId: null })
         },
         claimStagedClone(): Promise<void> {
             return runExclusive(async () => {
@@ -419,8 +480,8 @@ export function createDeviceSyncController(options: {
                 try {
                     await joinRegisteredClone(deviceId)
                     update({ activeCloneSourceDeviceId: deviceId })
-                    clearExpired(deviceId)
-                } catch (error) { throw fail(error, deviceId) }
+                    clearExpired(deviceId, 'work')
+                } catch (error) { throw fail(error, 'work', deviceId) }
             })
         },
         selectRegisteredClone(deviceId: string): Promise<void> {
@@ -429,8 +490,8 @@ export function createDeviceSyncController(options: {
                 try {
                     await joinRegisteredClone(deviceId)
                     update({ activeCloneSourceDeviceId: deviceId })
-                    clearExpired(deviceId)
-                } catch (error) { throw fail(error, deviceId) }
+                    clearExpired(deviceId, 'work')
+                } catch (error) { throw fail(error, 'work', deviceId) }
             })
         },
         confirmCloneReplace(): Promise<void> {
@@ -439,7 +500,7 @@ export function createDeviceSyncController(options: {
                 try {
                     if (!options.targets?.clone) throw new DeviceSyncError('unavailable')
                     options.targets.clone.confirmDestructiveReplace()
-                } catch (error) { throw fail(error) }
+                } catch (error) { throw fail(error, 'work') }
             })
         },
         downloadClone(): Promise<void> {
