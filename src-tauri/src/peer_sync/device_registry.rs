@@ -1,5 +1,5 @@
 use super::PeerSyncError;
-use crate::trust_boundary::{is_link_like, is_lower_hex_256};
+use crate::trust_boundary::{is_link_like, is_lower_hex_256, sync_directory};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -55,7 +55,10 @@ impl CompletionLeaseId {
     pub(crate) fn parse(value: &str) -> Result<Self, PeerSyncError> {
         let parsed = uuid::Uuid::parse_str(value)
             .map_err(|_| PeerSyncError::Protocol("invalid peer completion lease".to_owned()))?;
-        if parsed.get_version_num() != 4 || parsed.to_string() != value {
+        if parsed.get_version_num() != 4
+            || parsed.get_variant() != uuid::Variant::RFC4122
+            || parsed.to_string() != value
+        {
             return Err(PeerSyncError::Protocol(
                 "invalid peer completion lease".to_owned(),
             ));
@@ -1768,6 +1771,7 @@ fn validate_completion_tuple(
     let parsed_operation_id = uuid::Uuid::parse_str(operation_id)
         .map_err(|_| PeerSyncError::Validation("invalid completion operation ID".to_owned()))?;
     if parsed_operation_id.get_version_num() != 4
+        || parsed_operation_id.get_variant() != uuid::Variant::RFC4122
         || parsed_operation_id.to_string() != operation_id
         || !is_lower_hex_256(manifest_id)
     {
@@ -1929,6 +1933,7 @@ fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncEr
     let temporary = parent.join(format!(".{name}-{}.tmp", uuid::Uuid::new_v4()));
     let result = write_owner_only(&temporary, &bytes).and_then(|_| {
         fs::rename(&temporary, path)?;
+        let _ = sync_directory(parent)?;
         Ok(())
     });
     if result.is_err() {

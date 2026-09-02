@@ -347,6 +347,16 @@ fn malformed_pending_completion_deliveries_are_rejected() {
         invalid[field] = value;
         cases.push(vec![invalid]);
     }
+    let invalid_variant_lease = "00000000-0000-4000-0000-000000000001";
+    let mut invalid_variant = valid_json.clone();
+    invalid_variant["completionLeaseId"] = serde_json::json!(invalid_variant_lease);
+    invalid_variant["receiptId"] =
+        serde_json::json!(super::device_registry::completion_receipt_id(
+            CompletionLane::Delta.as_str(),
+            invalid_variant_lease,
+            &"a".repeat(64),
+        ));
+    cases.push(vec![invalid_variant]);
     cases.push(vec![valid_json.clone(), valid_json.clone()]);
     let mut unknown = valid_json;
     unknown["unexpected"] = serde_json::json!(true);
