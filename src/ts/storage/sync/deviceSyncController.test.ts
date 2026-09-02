@@ -964,6 +964,34 @@ describe('device sync controller', () => {
         expect(controller.snapshot().source.phase).toBe('running')
     })
 
+    it('retains the prepared source after rehost start fails so retry does not prepare twice', async () => {
+        const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
+        const start = vi.fn()
+            .mockRejectedValueOnce(new Error('start failed'))
+            .mockResolvedValueOnce({ phase: 'running' as const })
+        const bidirectional = {
+            snapshot: () => ({ ...bidirectionalSnapshot(), operationPhase: 'sourcePrepared' as const, operationRetained: true }),
+            subscribe: () => () => undefined, initialize: async () => undefined,
+            syncRegistered: vi.fn(), resolveRegistered: vi.fn(), resume: vi.fn(),
+            acknowledge: vi.fn(), abandon: vi.fn(),
+        }
+        const controller = createDeviceSyncController({
+            facade: { ...sourceFacade(prepare), start },
+            targets: { bidirectional },
+        })
+        const settings = { method: 'lan' as const, fixedPort: 32145, publicBaseUrl: '' }
+        const permissions = { read: true, bidirectional: false }
+
+        await expect(controller.rehostBidirectionalSource(settings, permissions))
+            .rejects.toMatchObject({ code: 'operation-failed' })
+        expect(controller.snapshot().source.phase).toBe('prepared')
+
+        await controller.rehostBidirectionalSource(settings, permissions)
+
+        expect(prepare).toHaveBeenCalledOnce()
+        expect(start).toHaveBeenCalledTimes(2)
+    })
+
     it('keeps source and receive errors in distinct snapshot scopes', async () => {
         const controller = createDeviceSyncController({
             facade: sourceFacade(vi.fn(async () => { throw new Error('private source failure') })),

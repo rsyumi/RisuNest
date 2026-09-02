@@ -434,6 +434,11 @@ export function createDeviceSyncController(options: {
                     if (source.phase === 'idle' || source.phase === 'error') {
                         source = await options.facade.prepare(settings)
                         if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
+                        update({
+                            source,
+                            sourceError: source.latestError ?? null,
+                            error: source.latestError ?? snapshot.workError,
+                        })
                     }
                     if (source.phase !== 'prepared') throw new DeviceSyncError('unavailable')
                     source = await options.facade.start(permissions)
