@@ -97,7 +97,10 @@ describe('RisuNest storage dashboard view model', () => {
         const executeGc = vi.fn().mockResolvedValue({ candidateCount: 2, candidateBytes: 1024, deletedCount: 2, deletedBytes: 1024, blockers: [] })
         const dashboard = createRisuNestStorageDashboard({
             getStats: vi.fn().mockResolvedValue(stats), listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
-            getTemp: vi.fn().mockResolvedValue({ count: 1, bytes: 1024 }), cleanupTemp, previewGc, executeGc,
+            getTemp: vi.fn()
+                .mockResolvedValueOnce({ count: 1, bytes: 1024 })
+                .mockResolvedValueOnce({ count: 0, bytes: 0 }),
+            cleanupTemp, previewGc, executeGc,
             deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
         })
         await dashboard.load()
@@ -115,6 +118,55 @@ describe('RisuNest storage dashboard view model', () => {
         expect(dashboard.snapshot().gcPreview).toMatchObject({ candidateCount: 2, candidateBytes: 1024 })
         await dashboard.executeGc()
         expect(executeGc).toHaveBeenCalledOnce()
+        expect(dashboard.snapshot()).toMatchObject({
+            gcPreview: null,
+            gcResult: { deletedCount: 2, deletedBytes: 1024 },
+        })
+    })
+
+    it('refreshes remaining temp usage after cleanup instead of displaying removed bytes as current usage', async () => {
+        const getTemp = vi.fn()
+            .mockResolvedValueOnce({ count: 3, bytes: 4096 })
+            .mockResolvedValueOnce({ count: 1, bytes: 512 })
+        const cleanupTemp = vi.fn().mockResolvedValue({ count: 2, bytes: 3584 })
+        const dashboard = createRisuNestStorageDashboard({
+            getStats: vi.fn().mockResolvedValue(stats), listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp, cleanupTemp, previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
+        })
+
+        await dashboard.calculateTempSize()
+        await dashboard.cleanupTemp()
+
+        expect(cleanupTemp).toHaveBeenCalledOnce()
+        expect(getTemp).toHaveBeenCalledTimes(2)
+        expect(dashboard.snapshot().tempUsage).toEqual({ count: 1, bytes: 512 })
+    })
+
+    it('does not retain pre-cleanup usage when refreshing remaining temp usage fails', async () => {
+        const getTemp = vi.fn()
+            .mockResolvedValueOnce({ count: 3, bytes: 4096 })
+            .mockRejectedValueOnce(new Error('usage refresh failed'))
+        const dashboard = createRisuNestStorageDashboard({
+            getStats: vi.fn().mockResolvedValue(stats), listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp, cleanupTemp: vi.fn().mockResolvedValue({ count: 3, bytes: 4096 }), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
+        })
+
+        await dashboard.calculateTempSize()
+        await expect(dashboard.cleanupTemp()).rejects.toThrow('usage refresh failed')
+
+        expect(dashboard.snapshot().tempUsage).toBeNull()
+    })
+
+    it('clears pre-cleanup usage when native cleanup fails after a possible partial deletion', async () => {
+        const dashboard = createRisuNestStorageDashboard({
+            getStats: vi.fn().mockResolvedValue(stats), listSnapshots: vi.fn().mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getTemp: vi.fn().mockResolvedValue({ count: 3, bytes: 4096 }), cleanupTemp: vi.fn().mockRejectedValue(new Error('partial cleanup failed')), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot: vi.fn(), deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
+        })
+
+        await dashboard.calculateTempSize()
+        await expect(dashboard.cleanupTemp()).rejects.toThrow('partial cleanup failed')
+
+        expect(dashboard.snapshot().tempUsage).toBeNull()
     })
 
     it('blocks duplicate actions while allowing a different action to run', async () => {

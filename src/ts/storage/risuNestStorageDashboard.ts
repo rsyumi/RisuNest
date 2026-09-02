@@ -20,6 +20,7 @@ export interface RisuNestStorageDashboardSnapshot {
     peerBackups: NativePeerBackupInfo[]
     tempUsage: NativePeerTempUsage | null
     gcPreview: NativeAssetGcResult | null
+    gcResult: NativeAssetGcResult | null
 }
 
 export interface RisuNestStorageDashboardDependencies {
@@ -92,7 +93,7 @@ export function storageDashboardRollup(
 export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDependencies) {
     let state: RisuNestStorageDashboardSnapshot = {
         loading: false, loadFailed: false, busy: [], stats: null,
-        snapshots: [], conflictBackups: [], peerBackups: [], tempUsage: null, gcPreview: null,
+        snapshots: [], conflictBackups: [], peerBackups: [], tempUsage: null, gcPreview: null, gcResult: null,
     }
     const listeners = new Set<(snapshot: RisuNestStorageDashboardSnapshot) => void>()
     const publish = () => listeners.forEach((listener) => listener(state))
@@ -157,7 +158,9 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
         },
         async cleanupTemp() {
             return run('cleanup-temp', async () => {
-                const tempUsage = await deps.cleanupTemp()
+                update({ tempUsage: null })
+                await deps.cleanupTemp()
+                const tempUsage = await deps.getTemp()
                 update({ tempUsage })
                 return tempUsage
             })
@@ -165,14 +168,14 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
         async previewGc() {
             return run('preview-gc', async () => {
                 const gcPreview = await deps.previewGc()
-                update({ gcPreview })
+                update({ gcPreview, gcResult: null })
                 return gcPreview
             })
         },
         async executeGc() {
             return run('execute-gc', async () => {
                 const result = await deps.executeGc()
-                update({ gcPreview: null })
+                update({ gcPreview: null, gcResult: result })
                 await reload()
                 return result
             })

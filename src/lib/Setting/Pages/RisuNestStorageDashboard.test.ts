@@ -39,8 +39,8 @@ describe('RisuNestStorageDashboard', () => {
         vi.clearAllMocks()
     })
 
-    function setup(): HTMLElement {
-        maintenance.getNativePersistentStorageStats.mockResolvedValue(stats)
+    function setup(statsPromise: Promise<typeof stats> = Promise.resolve(stats)): HTMLElement {
+        maintenance.getNativePersistentStorageStats.mockImplementation(() => statsPromise)
         maintenance.listNativePersistentSnapshots.mockResolvedValue([{ path: 'snapshot.db', bytes: 1024, modifiedAt: 1 }])
         maintenance.listPeerBackups.mockResolvedValue([{ path: 'peer.risudat', bytes: 2048, modifiedAt: 2 }])
         backups.list.mockResolvedValue([{ id: 'conflict', createdAt: 3, side: 'local', characterCount: 2, byteLength: 4096, scope: 'database-only' }])
@@ -65,6 +65,18 @@ describe('RisuNestStorageDashboard', () => {
         expect(maintenance.getPeerTempUsage).not.toHaveBeenCalled()
     })
 
+    it('renders six gray card-position placeholders during the initial load', async () => {
+        let resolveStats: ((value: typeof stats) => void) | undefined
+        const target = setup(new Promise((resolve) => { resolveStats = resolve }))
+
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-card-placeholder]')).toHaveLength(6))
+        const placeholders = [...target.querySelectorAll<HTMLElement>('[data-storage-card-placeholder]')]
+        expect(placeholders.every((placeholder) => placeholder.classList.contains('bg-darkbutton'))).toBe(true)
+
+        resolveStats?.(stats)
+        await vi.waitFor(() => expect(target.textContent).toContain('Total data'))
+    })
+
     it('calculates and cleans temporary data, then previews, confirms, and runs GC', async () => {
         const target = setup()
         maintenance.getPeerTempUsage.mockResolvedValue({ count: 2, bytes: 1024 })
@@ -86,6 +98,7 @@ describe('RisuNestStorageDashboard', () => {
         button('Clean up unused images')?.click()
         await vi.waitFor(() => expect(maintenance.executeNativePersistentAssetGc).toHaveBeenCalledOnce())
         expect(alerts.alertConfirm).toHaveBeenCalledWith('This will delete 2 unused images (2.0 KiB). Continue?')
+        expect(target.textContent).toContain('Deleted: 2 items (2.0 KiB)')
     })
 
     it('uses localized safe errors for a backup that is in use', async () => {
@@ -118,14 +131,25 @@ describe('RisuNestStorageDashboard', () => {
 
         button('Calculate size')?.click()
         await tick()
-        expect(button('Calculate size')?.disabled).toBe(true)
+        expect(button('Loading')?.disabled).toBe(true)
         expect(button('Create snapshot now')?.disabled).toBe(false)
         expect(button('Clean up unused images')?.disabled).toBe(false)
-        button('Calculate size')?.click()
+        button('Loading')?.click()
         expect(maintenance.getPeerTempUsage).toHaveBeenCalledOnce()
 
         resolveTemp?.({ count: 1, bytes: 1024 })
         await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB used'))
+    })
+
+    it('orders all backup lists before the storage action row', async () => {
+        const target = setup()
+        await vi.waitFor(() => expect(target.textContent).toContain('Create snapshot now'))
+
+        const actionRow = target.querySelector<HTMLElement>('[data-storage-action-row]')
+        const lists = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list]')]
+        expect(actionRow).not.toBeNull()
+        expect(lists).toHaveLength(3)
+        expect(lists.every((list) => Boolean(list.compareDocumentPosition(actionRow!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true)
     })
 
     it('keeps stale totals visible and offers retry after a post-snapshot reload fails', async () => {
