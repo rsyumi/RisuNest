@@ -460,6 +460,10 @@ pub(crate) trait AndroidDeviceSyncHost {
         address: Ipv4Addr,
         port: u16,
     ) -> Result<SharedPairingData, PeerSyncError>;
+    fn rotate_link(
+        &mut self,
+        permissions: DevicePermissions,
+    ) -> Result<SharedPairingData, PeerSyncError>;
     fn stop_listener(&mut self) -> Result<(), PeerSyncError>;
     fn revoke_registered_device(&mut self, _device_id: &str) {}
 }
@@ -485,6 +489,14 @@ impl AndroidDeviceSyncHost for SharedSessionHost {
 
     fn stop_listener(&mut self) -> Result<(), PeerSyncError> {
         self.stop()
+    }
+
+    fn rotate_link(
+        &mut self,
+        permissions: DevicePermissions,
+    ) -> Result<SharedPairingData, PeerSyncError> {
+        self.set_pairing_permissions(permissions)?;
+        SharedSessionHost::rotate_link(self)
     }
 
     fn revoke_registered_device(&mut self, device_id: &str) {
@@ -598,6 +610,14 @@ where
         self.stop()
     }
 
+    #[cfg(test)]
+    pub(crate) fn rotate_link_for_test(
+        &self,
+        permissions: DeviceSyncLinkPermissions,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        self.rotate_link(permissions)
+    }
+
     pub(crate) fn prepare<C>(
         &self,
         context: &mut C,
@@ -642,7 +662,6 @@ where
     ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
         use super::android_foreground::{registry, AndroidForegroundLane};
 
-        let _operation = self.operation()?;
         if foreground.lane != AndroidForegroundLane::DeviceSyncSource
             || registry().acquire_exact(&foreground).is_none()
         {
@@ -650,84 +669,95 @@ where
                 "Android device sync foreground identity is not attached".to_owned(),
             ));
         }
-        if !permissions.read {
-            let error = PeerSyncError::Validation(
-                "device sync sharing requires read permission".to_owned(),
-            );
-            self.release_failed_foreground(&foreground);
-            return self.fail(DeviceSyncErrorCategory::InvalidConfiguration, error);
+        let _operation = self.operation()?;
+        if self.runtime()?.phase == DeviceSyncSourcePhase::Running
+            && self.runtime()?.foreground.as_ref() == Some(&foreground)
+        {
+            return self.status();
         }
-        let configuration = match self.runtime()?.configuration.clone() {
-            Some(configuration) => configuration,
-            None => {
-                self.release_failed_foreground(&foreground);
+        let start_result = (|| {
+            if !permissions.read {
+                return self.fail(
+                    DeviceSyncErrorCategory::InvalidConfiguration,
+                    PeerSyncError::Validation(
+                        "device sync sharing requires read permission".to_owned(),
+                    ),
+                );
+            }
+            let configuration = self.runtime()?.configuration.clone().ok_or_else(|| {
+                PeerSyncError::Protocol("device sync source is not prepared".to_owned())
+            })?;
+            if self.runtime()?.phase != DeviceSyncSourcePhase::Prepared {
                 return Err(PeerSyncError::Protocol(
                     "device sync source is not prepared".to_owned(),
                 ));
             }
-        };
-        if self.runtime()?.phase != DeviceSyncSourcePhase::Prepared {
-            self.release_failed_foreground(&foreground);
-            return Err(PeerSyncError::Protocol(
-                "device sync source is not prepared".to_owned(),
-            ));
-        }
-        let address = match self.lan_address_override {
-            Some(address) => address,
-            None => match super::lan::discover_lan_ipv4() {
-                Ok(address) => address,
+            let address = match self.lan_address_override {
+                Some(address) => address,
+                None => super::lan::discover_lan_ipv4().map_err(|error| {
+                    if let Ok(mut runtime) = self.runtime() {
+                        runtime.latest_error = Some(DeviceSyncErrorCategory::TransportUnavailable);
+                    }
+                    error
+                })?,
+            };
+            self.set_phase(DeviceSyncSourcePhase::Starting)?;
+            let host_permissions = if permissions.bidirectional {
+                DevicePermissions::read_and_bidirectional()
+            } else {
+                DevicePermissions::read()
+            };
+            let start = self.lifecycle.with_host_mut(|host| {
+                host.enable_registry(
+                    &configuration.app_root,
+                    super::device_registry::platform_device_name(),
+                    host_permissions,
+                )?;
+                host.start_private_lan(address, configuration.fixed_port)
+            });
+            let pairing = match start.and_then(|result| result) {
+                Ok(pairing) => pairing,
                 Err(error) => {
-                    self.release_failed_foreground(&foreground);
-                    return self.fail(DeviceSyncErrorCategory::TransportUnavailable, error);
+                    let cleanup = self
+                        .lifecycle
+                        .with_host_mut(AndroidDeviceSyncHost::stop_listener)
+                        .and_then(|result| result);
+                    let mut runtime = self.runtime()?;
+                    runtime.pairing = None;
+                    runtime.foreground = None;
+                    if let Err(cleanup_error) = cleanup {
+                        crate::nlog!(
+                            "error",
+                            "Android shared listener start cleanup failed: {cleanup_error}"
+                        );
+                        runtime.phase = DeviceSyncSourcePhase::Error;
+                        runtime.latest_error = Some(DeviceSyncErrorCategory::CleanupFailed);
+                    } else {
+                        runtime.phase = DeviceSyncSourcePhase::Prepared;
+                        runtime.latest_error = Some(if is_shared_port_unavailable(&error) {
+                            DeviceSyncErrorCategory::PortUnavailable
+                        } else {
+                            DeviceSyncErrorCategory::TransportUnavailable
+                        });
+                    }
+                    return Err(error);
                 }
-            },
-        };
-        self.set_phase(DeviceSyncSourcePhase::Starting)?;
-        let host_permissions = if permissions.bidirectional {
-            DevicePermissions::read_and_bidirectional()
-        } else {
-            DevicePermissions::read()
-        };
-        let start = self.lifecycle.with_host_mut(|host| {
-            host.enable_registry(
-                &configuration.app_root,
-                super::device_registry::platform_device_name(),
-                host_permissions,
-            )?;
-            host.start_private_lan(address, configuration.fixed_port)
-        });
-        let pairing = match start.and_then(|result| result) {
-            Ok(pairing) => pairing,
-            Err(error) => {
-                let cleanup = self
-                    .lifecycle
-                    .with_host_mut(AndroidDeviceSyncHost::stop_listener)
-                    .and_then(|result| result);
-                self.release_failed_foreground(&foreground);
-                let mut runtime = self.runtime()?;
-                runtime.pairing = None;
-                runtime.foreground = None;
-                if let Err(cleanup_error) = cleanup {
-                    crate::nlog!(
-                        "error",
-                        "Android shared listener start cleanup failed: {cleanup_error}"
-                    );
-                    runtime.phase = DeviceSyncSourcePhase::Error;
-                    runtime.latest_error = Some(DeviceSyncErrorCategory::CleanupFailed);
-                } else {
-                    runtime.phase = DeviceSyncSourcePhase::Prepared;
-                    runtime.latest_error = Some(DeviceSyncErrorCategory::TransportUnavailable);
-                }
-                return Err(error);
-            }
-        };
-        {
+            };
             let mut runtime = self.runtime()?;
             runtime.phase = DeviceSyncSourcePhase::Running;
             runtime.pairing = Some(pairing);
             runtime.foreground = Some(foreground.clone());
             runtime.latest_error = None;
-        }
+            Ok(Self::status_from_runtime(&runtime))
+        })();
+        drop(_operation);
+        let status = match start_result {
+            Ok(status) => status,
+            Err(error) => {
+                self.release_failed_foreground(&foreground);
+                return Err(error);
+            }
+        };
         let callback_state = self.clone();
         let callback_key = foreground.clone();
         if !registry().set_source_stop_callback_exact(&foreground, move || {
@@ -739,7 +769,40 @@ where
                 "Android foreground service detached before source start".to_owned(),
             ));
         }
-        self.status()
+        Ok(status)
+    }
+
+    pub(crate) fn rotate_link(
+        &self,
+        permissions: DeviceSyncLinkPermissions,
+    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
+        let _operation = self.operation()?;
+        if !permissions.read {
+            return self.fail(
+                DeviceSyncErrorCategory::InvalidConfiguration,
+                PeerSyncError::Validation(
+                    "device sync sharing requires read permission".to_owned(),
+                ),
+            );
+        }
+        if self.runtime()?.phase != DeviceSyncSourcePhase::Running {
+            return self.fail(
+                DeviceSyncErrorCategory::StateUnavailable,
+                PeerSyncError::Protocol("device sync source is not running".to_owned()),
+            );
+        }
+        let host_permissions = if permissions.bidirectional {
+            DevicePermissions::read_and_bidirectional()
+        } else {
+            DevicePermissions::read()
+        };
+        let pairing = self
+            .lifecycle
+            .with_host_mut(|host| host.rotate_link(host_permissions))??;
+        let mut runtime = self.runtime()?;
+        runtime.pairing = Some(pairing);
+        runtime.latest_error = None;
+        Ok(Self::status_from_runtime(&runtime))
     }
 
     pub(crate) fn status(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
@@ -1525,7 +1588,7 @@ fn validate_fixed_public_base_url(value: &str) -> Result<url::Url, PeerSyncError
         .ok_or_else(|| PeerSyncError::Validation("device sync public URL is invalid".to_owned()))
 }
 
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 fn is_shared_port_unavailable(error: &PeerSyncError) -> bool {
     matches!(error, PeerSyncError::Transport(message) if message == "shared fixed port is unavailable")
 }
@@ -1709,6 +1772,32 @@ pub async fn device_sync_rotate_link(
     permissions: DeviceSyncLinkPermissions,
 ) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
     run_device_sync_rotate_link(state.inner().clone(), permissions).await
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub(crate) async fn device_sync_rotate_link(
+    state: State<'_, AndroidDeviceSyncSourceState>,
+    permissions: DeviceSyncLinkPermissions,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
+    let state = state.inner().clone();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || worker_state.rotate_link(permissions)).await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(android_device_sync_failure(
+            &state,
+            "link rotation",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+        Err(error) => Err(android_device_sync_failure(
+            &state,
+            "link rotation worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
 }
 
 #[cfg(target_os = "android")]

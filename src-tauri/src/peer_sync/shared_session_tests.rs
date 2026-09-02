@@ -58,9 +58,11 @@ use std::{
 #[derive(Default)]
 struct AndroidHostEvents {
     starts: usize,
+    rotations: usize,
     stops: usize,
     cleanups: Vec<SharedSourceLane>,
     fail_start_once: bool,
+    fail_port_once: bool,
     fail_stop_once: bool,
 }
 
@@ -85,6 +87,11 @@ impl AndroidDeviceSyncHost for AndroidHostFixture {
     ) -> Result<SharedPairingData, PeerSyncError> {
         let mut events = self.events.lock().unwrap();
         events.starts += 1;
+        if std::mem::take(&mut events.fail_port_once) {
+            return Err(PeerSyncError::Transport(
+                "shared fixed port is unavailable".to_owned(),
+            ));
+        }
         if std::mem::take(&mut events.fail_start_once) {
             return Err(PeerSyncError::Transport(
                 "injected listener failure".to_owned(),
@@ -108,6 +115,18 @@ impl AndroidDeviceSyncHost for AndroidHostFixture {
             ));
         }
         Ok(())
+    }
+
+    fn rotate_link(&mut self, _: DevicePermissions) -> Result<SharedPairingData, PeerSyncError> {
+        let mut events = self.events.lock().unwrap();
+        events.rotations += 1;
+        Ok(SharedPairingData {
+            endpoint: "http://192.168.4.8:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000062".to_owned(),
+            manifest_id: "62".repeat(32),
+            claim: "rotated-claim".to_owned(),
+            expires_at_ms: 10_999,
+        })
     }
 }
 
@@ -314,6 +333,109 @@ fn android_start_failure_releases_only_its_exact_foreground_generation() {
         DeviceSyncSourcePhase::Running
     );
     assert_eq!(state.stop_for_test().unwrap(), Some(current));
+}
+
+#[test]
+fn android_fixed_port_collision_reports_port_unavailable() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents {
+        fail_port_once: true,
+        ..Default::default()
+    }));
+    let state = android_state(events);
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let foreground = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&foreground));
+
+    assert!(state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            },
+            foreground,
+        )
+        .is_err());
+    assert_eq!(
+        state.status().unwrap().latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::PortUnavailable)
+    );
+}
+
+#[test]
+fn android_running_source_rotates_pairing_without_restarting_or_replacing_foreground() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents::default()));
+    let state = android_state(Arc::clone(&events));
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let foreground = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&foreground));
+    let initial = state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            },
+            foreground.clone(),
+        )
+        .unwrap();
+
+    let rotated = state
+        .rotate_link_for_test(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: true,
+        })
+        .unwrap();
+
+    assert_eq!(rotated.phase, DeviceSyncSourcePhase::Running);
+    assert_ne!(rotated.pairing_uri, initial.pairing_uri);
+    assert_eq!(events.lock().unwrap().starts, 1);
+    assert_eq!(events.lock().unwrap().rotations, 1);
+    assert_eq!(state.stop_for_test().unwrap(), Some(foreground));
+}
+
+#[test]
+fn android_duplicate_start_is_idempotent_and_keeps_notification_stop_restartable() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents::default()));
+    let state = android_state(Arc::clone(&events));
+    let root = tempfile::tempdir().unwrap();
+    state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    let foreground = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&foreground));
+    let permissions = DeviceSyncLinkPermissions {
+        read: true,
+        bidirectional: false,
+    };
+    let first = state
+        .start_attached_for_test(permissions, foreground.clone())
+        .unwrap();
+    let duplicate = state
+        .start_attached_for_test(permissions, foreground.clone())
+        .unwrap();
+
+    assert_eq!(duplicate, first);
+    assert_eq!(events.lock().unwrap().starts, 1);
+    assert!(android_foreground_registry().cancel_exact(&foreground));
+    assert_eq!(
+        state.status().unwrap().phase,
+        DeviceSyncSourcePhase::Prepared
+    );
+    assert!(android_foreground_registry().detach_if_generation(&foreground));
 }
 
 #[test]
