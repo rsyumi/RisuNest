@@ -1,8 +1,11 @@
 use super::PeerSyncError;
 use serde::Serialize;
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    collections::HashMap,
+    ffi::OsString,
+    fs, io,
+    path::{Component, Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::UNIX_EPOCH,
 };
 use tauri::{AppHandle, Manager};
@@ -38,6 +41,81 @@ impl From<PeerSyncError> for PeerBackupDeleteError {
     }
 }
 
+fn active_temp_paths() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_temp_registry_path(path: &Path) -> Result<PathBuf, PeerSyncError> {
+    let mut current = path;
+    let mut suffix = Vec::<OsString>::new();
+    loop {
+        match fs::canonicalize(current) {
+            Ok(mut normalized) => {
+                for component in suffix.iter().rev() {
+                    normalized.push(component);
+                }
+                return Ok(normalized);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = current.file_name().ok_or_else(|| {
+                    PeerSyncError::Storage(
+                        "active peer temp path has no existing ancestor".to_owned(),
+                    )
+                })?;
+                suffix.push(component.to_os_string());
+                current = current.parent().ok_or_else(|| {
+                    PeerSyncError::Storage(
+                        "active peer temp path has no existing ancestor".to_owned(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+pub(crate) struct ActiveTempGuard {
+    path: PathBuf,
+}
+
+impl ActiveTempGuard {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, PeerSyncError> {
+        let path = normalize_temp_registry_path(path)?;
+        let mut active = active_temp_paths().lock().map_err(|error| {
+            PeerSyncError::Storage(format!("active peer temp registry is poisoned: {error}"))
+        })?;
+        let count = active.entry(path.clone()).or_default();
+        *count = count.saturating_add(1);
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ActiveTempGuard {
+    fn drop(&mut self) {
+        let Ok(mut active) = active_temp_paths().lock() else {
+            return;
+        };
+        let Some(count) = active.get_mut(&self.path) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(&self.path);
+        }
+    }
+}
+
+fn temp_path_is_active(path: &Path) -> Result<bool, PeerSyncError> {
+    let path = normalize_temp_registry_path(path)?;
+    active_temp_paths()
+        .lock()
+        .map(|active| active.contains_key(&path))
+        .map_err(|error| {
+            PeerSyncError::Storage(format!("active peer temp registry is poisoned: {error}"))
+        })
+}
+
 fn link_like(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -65,6 +143,78 @@ fn ordinary_directory(path: &Path) -> Option<fs::Metadata> {
     (metadata.is_dir() && !link_like(&metadata)).then_some(metadata)
 }
 
+#[derive(Clone, Copy)]
+enum ExpectedPathKind {
+    Directory,
+    File,
+}
+
+fn validate_existing_plain_path(
+    app_root: &Path,
+    target: &Path,
+    expected: ExpectedPathKind,
+) -> Result<Option<PathBuf>, PeerSyncError> {
+    let app_metadata = fs::symlink_metadata(app_root)
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    if !app_metadata.is_dir() || link_like(&app_metadata) {
+        return Err(PeerSyncError::Validation(
+            "maintenance app root is not a plain directory".to_owned(),
+        ));
+    }
+    let canonical_app =
+        fs::canonicalize(app_root).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    let relative = target.strip_prefix(app_root).map_err(|_| {
+        PeerSyncError::Validation("maintenance path is outside the app root".to_owned())
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(PeerSyncError::Validation(
+            "maintenance path is not a plain descendant".to_owned(),
+        ));
+    }
+
+    let mut current = app_root.to_path_buf();
+    let component_count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        let Component::Normal(component) = component else {
+            unreachable!();
+        };
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if link_like(&metadata) {
+            return Err(PeerSyncError::Validation(
+                "maintenance path traverses a link or reparse point".to_owned(),
+            ));
+        }
+        let final_component = index + 1 == component_count;
+        if (!final_component && !metadata.is_dir())
+            || (final_component
+                && match expected {
+                    ExpectedPathKind::Directory => !metadata.is_dir(),
+                    ExpectedPathKind::File => !metadata.is_file(),
+                })
+        {
+            return Err(PeerSyncError::Validation(
+                "maintenance path has an unexpected file type".to_owned(),
+            ));
+        }
+        let canonical = fs::canonicalize(&current)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        if !canonical.starts_with(&canonical_app) {
+            return Err(PeerSyncError::Validation(
+                "maintenance path escapes the app root".to_owned(),
+            ));
+        }
+    }
+    Ok(Some(target.to_path_buf()))
+}
+
 fn backup_roots(app_root: &Path) -> [PathBuf; 3] {
     [
         app_root.join("peer-clone/activation/backups"),
@@ -76,9 +226,11 @@ fn backup_roots(app_root: &Path) -> [PathBuf; 3] {
 pub(crate) fn list_backups(app_root: &Path) -> Result<Vec<PeerBackupInfo>, PeerSyncError> {
     let mut backups = Vec::new();
     for root in backup_roots(app_root) {
-        if ordinary_directory(&root).is_none() {
+        let Some(root) =
+            validate_existing_plain_path(app_root, &root, ExpectedPathKind::Directory)?
+        else {
             continue;
-        }
+        };
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             let path = entry.path();
@@ -112,12 +264,36 @@ fn normalize_operation_path(app_root: &Path, path: &str) -> Result<PathBuf, Peer
     } else {
         app_root.join(path)
     };
+    let candidate = validate_existing_plain_path(app_root, &candidate, ExpectedPathKind::File)?
+        .ok_or_else(|| {
+            PeerSyncError::Storage("bidirectional backup reference is missing".to_owned())
+        })?;
     fs::canonicalize(candidate).map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
-fn operation_references(app_root: &Path, candidate: &Path) -> Result<bool, PeerSyncError> {
+fn load_bidirectional_operation(
+    app_root: &Path,
+) -> Result<Option<super::bidirectional_commands::PeerBidirectionalDurableOperation>, PeerSyncError>
+{
+    let operation_root = app_root.join("peer-bidirectional");
+    let Some(_) =
+        validate_existing_plain_path(app_root, &operation_root, ExpectedPathKind::Directory)?
+    else {
+        return Ok(None);
+    };
+    let operation_path = operation_root.join("operation.json");
+    if operation_path.exists() {
+        validate_existing_plain_path(app_root, &operation_path, ExpectedPathKind::File)?
+            .ok_or_else(|| {
+                PeerSyncError::Storage("bidirectional operation journal is missing".to_owned())
+            })?;
+    }
     let journal = super::bidirectional_commands::PeerBidirectionalOperationJournal::new(app_root);
-    let Some(operation) = journal.load()? else {
+    journal.load()
+}
+
+fn operation_references(app_root: &Path, candidate: &Path) -> Result<bool, PeerSyncError> {
+    let Some(operation) = load_bidirectional_operation(app_root)? else {
         return Ok(false);
     };
     let candidate =
@@ -131,31 +307,23 @@ fn operation_references(app_root: &Path, candidate: &Path) -> Result<bool, PeerS
 }
 
 fn validated_direct_child(
+    app_root: &Path,
     root: &Path,
     target: &Path,
     file: bool,
 ) -> Result<PathBuf, PeerSyncError> {
-    if ordinary_directory(root).is_none() {
-        return Err(PeerSyncError::Validation(
-            "maintenance root is not a plain directory".to_owned(),
-        ));
-    }
-    let root = fs::canonicalize(root).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
-    let metadata =
-        fs::symlink_metadata(target).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
-    if link_like(&metadata)
-        || if file {
-            !metadata.is_file()
+    let root = validate_existing_plain_path(app_root, root, ExpectedPathKind::Directory)?
+        .ok_or_else(|| PeerSyncError::Validation("maintenance root is missing".to_owned()))?;
+    let target = validate_existing_plain_path(
+        app_root,
+        target,
+        if file {
+            ExpectedPathKind::File
         } else {
-            !metadata.is_dir()
-        }
-    {
-        return Err(PeerSyncError::Validation(
-            "maintenance target is not a plain direct child".to_owned(),
-        ));
-    }
-    let target =
-        fs::canonicalize(target).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+            ExpectedPathKind::Directory
+        },
+    )?
+    .ok_or_else(|| PeerSyncError::Validation("maintenance target is missing".to_owned()))?;
     if target.parent() != Some(root.as_path()) {
         return Err(PeerSyncError::Validation(
             "maintenance target escapes its root".to_owned(),
@@ -235,9 +403,10 @@ fn delete_backup_with_predelete_hook_inner(
     let selected = listed
         .into_iter()
         .find_map(|item| {
-            fs::canonicalize(item.path)
+            fs::canonicalize(&item.path)
                 .ok()
                 .filter(|path| path == &requested)
+                .map(|_| PathBuf::from(item.path))
         })
         .ok_or_else(|| {
             PeerSyncError::Validation("peer backup is not currently listed".to_owned())
@@ -247,21 +416,21 @@ fn delete_backup_with_predelete_hook_inner(
     }
     let root = backup_roots(app_root)
         .into_iter()
-        .find(|root| validated_direct_child(root, &selected, true).is_ok())
+        .find(|root| validated_direct_child(app_root, root, &selected, true).is_ok())
         .ok_or_else(|| {
             PeerSyncError::Validation("peer backup root is no longer allowed".to_owned())
         })?;
-    let selected = validated_direct_child(&root, &selected, true)?;
+    let selected = validated_direct_child(app_root, &root, &selected, true)?;
     if operation_references(app_root, &selected)? {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
-    let selected = validated_direct_child(&root, &selected, true)?;
+    let selected = validated_direct_child(app_root, &root, &selected, true)?;
     if clone_backup_root(app_root, &root) && desktop_clone_backup_job_is_active(app_root, &selected)
     {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
     hook()?;
-    let selected = validated_direct_child(&root, &selected, true)?;
+    let selected = validated_direct_child(app_root, &root, &selected, true)?;
     if operation_references(app_root, &selected)? {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
@@ -286,10 +455,12 @@ fn temp_roots(app_root: &Path) -> Vec<(PathBuf, bool)> {
 fn temp_candidates(app_root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, PeerSyncError> {
     let mut candidates = Vec::new();
     for (root, clone_activation) in temp_roots(app_root) {
-        if ordinary_directory(&root).is_none() {
+        let Some(validated_root) =
+            validate_existing_plain_path(app_root, &root, ExpectedPathKind::Directory)?
+        else {
             continue;
-        }
-        for entry in fs::read_dir(&root)? {
+        };
+        for entry in fs::read_dir(&validated_root)? {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name();
@@ -297,6 +468,7 @@ fn temp_candidates(app_root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, PeerSyncE
                 continue;
             }
             if ordinary_directory(&path).is_none()
+                || temp_path_is_active(&root.join(&name))?
                 || path.join("operation.json").exists()
                 || operation_references(app_root, &path)?
                 || (clone_activation && clone_activation_stage_job_is_active(app_root, &path))
@@ -342,7 +514,7 @@ pub(crate) fn temp_usage(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError
 }
 
 pub(crate) fn cleanup_temp(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError> {
-    cleanup_temp_with_predelete_hook_inner(app_root, |_, _| Ok(()))
+    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), |_, _| Ok(()))
 }
 
 #[cfg(test)]
@@ -350,30 +522,55 @@ pub(crate) fn cleanup_temp_with_predelete_hook(
     app_root: &Path,
     hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
 ) -> Result<PeerTempUsage, PeerSyncError> {
-    cleanup_temp_with_predelete_hook_inner(app_root, hook)
+    cleanup_temp_with_predelete_hooks_inner(app_root, hook, |_, _| Ok(()))
 }
 
-fn cleanup_temp_with_predelete_hook_inner(
+#[cfg(test)]
+pub(crate) fn cleanup_temp_with_locked_predelete_hook(
+    app_root: &Path,
+    hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
+) -> Result<PeerTempUsage, PeerSyncError> {
+    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), hook)
+}
+
+fn cleanup_temp_with_predelete_hooks_inner(
     app_root: &Path,
     mut hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
+    mut locked_hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
 ) -> Result<PeerTempUsage, PeerSyncError> {
     let candidates = temp_candidates(app_root)?;
     let mut removed = PeerTempUsage::default();
     for (root, path) in candidates {
         let usage = tree_usage(&path)?;
-        let path = validated_direct_child(&root, &path, false)?;
-        if operation_references(app_root, &path)? {
+        let original_path = root.join(path.file_name().ok_or_else(|| {
+            PeerSyncError::Validation("maintenance target has no name".to_owned())
+        })?);
+        if temp_path_is_active(&original_path)? {
+            continue;
+        }
+        let path = validated_direct_child(app_root, &root, &path, false)?;
+        if operation_references(app_root, &path)? || temp_path_is_active(&original_path)? {
             continue;
         }
         hook(&root, &path)?;
-        let path = validated_direct_child(&root, &path, false)?;
-        if operation_references(app_root, &path)? {
+        let path = validated_direct_child(app_root, &root, &path, false)?;
+        if operation_references(app_root, &path)? || temp_path_is_active(&original_path)? {
             continue;
         }
         if clone_activation_stage_job_is_active(app_root, &path) {
             continue;
         }
+        let registry_path = normalize_temp_registry_path(&original_path)?;
+        let active = active_temp_paths().lock().map_err(|error| {
+            PeerSyncError::Storage(format!("active peer temp registry is poisoned: {error}"))
+        })?;
+        if active.contains_key(&registry_path) {
+            continue;
+        }
+        locked_hook(&root, &path)?;
+        let path = validated_direct_child(app_root, &root, &path, false)?;
         fs::remove_dir_all(&path)?;
+        drop(active);
         removed.count += usage.count;
         removed.bytes = removed.bytes.saturating_add(usage.bytes);
     }

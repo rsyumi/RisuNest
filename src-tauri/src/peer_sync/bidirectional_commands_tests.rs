@@ -878,6 +878,18 @@ fn bidirectional_backup_recovers_after_a_truncated_operation_temp() {
     fs::create_dir_all(&staging).unwrap();
     fs::write(&temporary, b"truncated backup").unwrap();
     BACKUP_FULL_VERIFICATION_COUNT.with(|count| count.set(0));
+    let maintenance_root = directory.path().to_path_buf();
+    BACKUP_STAGING_MAINTENANCE_HOOK.with(|slot| {
+        slot.replace(Some(Box::new(move |active_staging| {
+            assert_eq!(
+                super::super::maintenance::cleanup_temp(&maintenance_root)
+                    .unwrap()
+                    .count,
+                0
+            );
+            assert!(active_staging.exists());
+        })));
+    });
 
     let receipt = ensure_bidirectional_backup_receipt(
         &mut store,

@@ -1,7 +1,7 @@
 use super::maintenance::{
-    cleanup_temp, cleanup_temp_with_predelete_hook, delete_backup,
-    delete_backup_with_predelete_hook, desktop_clone_backup_job_is_active, list_backups,
-    temp_usage, PeerBackupDeleteError,
+    cleanup_temp, cleanup_temp_with_locked_predelete_hook, cleanup_temp_with_predelete_hook,
+    delete_backup, delete_backup_with_predelete_hook, desktop_clone_backup_job_is_active,
+    list_backups, temp_usage, ActiveTempGuard, PeerBackupDeleteError,
 };
 use super::PeerSyncError;
 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
@@ -161,6 +161,132 @@ fn final_temp_cleanup_recheck_preserves_a_matching_job_created_after_listing() {
     assert!(late_job.is_some());
     assert_eq!(removed.count, 0);
     assert!(stage.exists());
+}
+
+#[test]
+fn active_clone_stage_before_durable_job_creation_is_not_temp_cleanup() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let id = "00000000-0000-4000-8000-000000000106";
+    let stage = root.join(format!("peer-clone/activation/{}_{id}", "a".repeat(64)));
+    let active = ActiveTempGuard::acquire(&stage).expect("protect active clone stage");
+    fs::create_dir_all(&stage).expect("create active clone stage");
+    fs::write(stage.join("incoming.lossless.tmp"), b"partial clone")
+        .expect("write active clone payload");
+
+    assert_eq!(temp_usage(root).expect("calculate usage").count, 0);
+    assert_eq!(cleanup_temp(root).expect("clean temp").count, 0);
+    assert!(stage.exists());
+
+    drop(active);
+    assert_eq!(
+        cleanup_temp(root)
+            .expect("clean abandoned clone stage")
+            .count,
+        1
+    );
+    assert!(!stage.exists());
+}
+
+#[test]
+fn active_delta_and_bidirectional_staging_are_not_temp_cleanup() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let delta = root
+        .join("peer-delta")
+        .join("staging")
+        .join("staging-logical-active-delta");
+    let bidirectional = root
+        .join("peer-bidirectional")
+        .join("staging")
+        .join("staging-logical-active-bidi");
+    let backup = root
+        .join("peer-bidirectional")
+        .join("backup-staging")
+        .join("00000000-0000-4000-8000-000000000107-local");
+    let delta_active = ActiveTempGuard::acquire(&delta).expect("protect active delta stage");
+    let bidirectional_active =
+        ActiveTempGuard::acquire(&bidirectional).expect("protect active bidirectional stage");
+    let backup_active = ActiveTempGuard::acquire(&backup).expect("protect active backup stage");
+    for stage in [&delta, &bidirectional, &backup] {
+        fs::create_dir_all(stage).expect("create active stage");
+        fs::write(stage.join("payload"), b"active").expect("write active stage payload");
+    }
+
+    assert_eq!(temp_usage(root).expect("calculate usage").count, 0);
+    assert_eq!(cleanup_temp(root).expect("clean temp").count, 0);
+    assert!(delta.exists());
+    assert!(bidirectional.exists());
+    assert!(backup.exists());
+
+    drop((delta_active, bidirectional_active, backup_active));
+    assert_eq!(cleanup_temp(root).expect("clean abandoned stages").count, 3);
+    assert!(!delta.exists());
+    assert!(!bidirectional.exists());
+    assert!(!backup.exists());
+}
+
+#[test]
+fn guard_acquisition_waits_for_cleanup_deletion_and_recreated_stage_stays_active() {
+    use std::{
+        sync::mpsc::{self, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let stage = root
+        .join("peer-bidirectional")
+        .join("backup-staging")
+        .join("00000000-0000-4000-8000-000000000108-local");
+    fs::create_dir_all(&stage).expect("create abandoned stage");
+    fs::write(stage.join("abandoned"), b"abandoned").expect("write abandoned payload");
+
+    let (start_tx, start_rx) = mpsc::channel();
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker_stage = stage.clone();
+    let worker = thread::spawn(move || {
+        start_rx.recv().expect("wait for cleanup deletion lock");
+        let guard = ActiveTempGuard::acquire(&worker_stage).expect("acquire resumed stage");
+        fs::create_dir_all(&worker_stage).expect("recreate resumed stage");
+        fs::write(worker_stage.join("active"), b"active").expect("write active payload");
+        acquired_tx.send(()).expect("report resumed stage");
+        release_rx.recv().expect("hold resumed stage active");
+        drop(guard);
+    });
+
+    let removed = cleanup_temp_with_locked_predelete_hook(root, |_, candidate| {
+        assert_eq!(candidate, stage);
+        start_tx.send(()).expect("start resumed stage acquisition");
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        Ok(())
+    })
+    .expect("delete only the abandoned stage");
+
+    assert_eq!(removed.count, 1);
+    acquired_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resumed stage acquires after deletion");
+    assert_eq!(cleanup_temp(root).expect("preserve resumed stage").count, 0);
+    assert_eq!(
+        fs::read(stage.join("active")).expect("read active payload"),
+        b"active"
+    );
+
+    release_tx.send(()).expect("release resumed stage");
+    worker.join().expect("join resumed stage worker");
+    assert_eq!(
+        cleanup_temp(root)
+            .expect("remove abandoned resumed stage")
+            .count,
+        1
+    );
+    assert!(!stage.exists());
 }
 
 #[test]
@@ -432,7 +558,7 @@ fn final_temp_cleanup_validation_rejects_a_replaced_staging_reparse_root() {
     let error = cleanup_temp_with_predelete_hook(app_root, |root, candidate| {
         assert_eq!(root, staging_root);
         assert_eq!(
-            candidate,
+            fs::canonicalize(candidate).expect("canonicalize cleanup candidate"),
             fs::canonicalize(&abandoned).expect("canonicalize abandoned stage")
         );
         fs::remove_dir_all(candidate).expect("remove local stage");
@@ -446,5 +572,47 @@ fn final_temp_cleanup_validation_rejects_a_replaced_staging_reparse_root() {
     assert_eq!(
         fs::read(external_stage.join("sentinel")).expect("read external payload"),
         b"external payload"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn intermediate_directory_link_escape_is_rejected_without_external_modification() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let app_root = directory.path().join("app");
+    let external_root = directory.path().join("external");
+    fs::create_dir(&app_root).expect("create app root");
+    fs::create_dir(&external_root).expect("create external root");
+
+    let external_delta = external_root.join("delta");
+    let external_stage = external_delta.join("staging/escaped");
+    fs::create_dir_all(&external_stage).expect("create external delta stage");
+    let delta_sentinel = external_stage.join("sentinel");
+    fs::write(&delta_sentinel, b"external delta").expect("write external delta sentinel");
+    create_directory_link(&external_delta, &app_root.join("peer-delta"));
+
+    assert!(temp_usage(&app_root).is_err());
+    assert!(cleanup_temp(&app_root).is_err());
+    assert_eq!(
+        fs::read(&delta_sentinel).expect("read external delta sentinel"),
+        b"external delta"
+    );
+
+    let external_clone = external_root.join("clone");
+    let external_backup = external_clone.join("activation/backups/escaped.lossless");
+    fs::create_dir_all(external_backup.parent().expect("external backup parent"))
+        .expect("create external backup root");
+    fs::write(&external_backup, b"external backup").expect("write external backup");
+    create_directory_link(&external_clone, &app_root.join("peer-clone"));
+
+    assert!(list_backups(&app_root).is_err());
+    assert!(delete_backup(
+        &app_root,
+        &app_root.join("peer-clone/activation/backups/escaped.lossless")
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(&external_backup).expect("read external backup"),
+        b"external backup"
     );
 }

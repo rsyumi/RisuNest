@@ -208,6 +208,7 @@ fn stage_payload_rejects_trailing_bytes_without_reading_past_the_first_extra_byt
         merged_generation_sequence: "2".to_owned(),
         pin_lease_id: "logical-delta-pin-bounded-reader".to_owned(),
         staging_directory,
+        maintenance_guard: None,
         staged_objects: BTreeMap::new(),
         database_staged: false,
         initialized: true,
@@ -285,6 +286,7 @@ fn durable_stage_payload_publishes_only_complete_exact_objects() {
         merged_generation_sequence: "2".to_owned(),
         pin_lease_id: "logical-delta-pin-durable-reader".to_owned(),
         staging_directory: staging_root.join("staging-logical-durable-reader"),
+        maintenance_guard: None,
         staged_objects: BTreeMap::new(),
         database_staged: false,
         initialized: true,
@@ -1254,7 +1256,7 @@ fn structured_records_are_applied_to_invisible_staging_one_at_a_time() {
         next_base_manifest_hash: remote_hash,
         next_base_generation_sequence: "1".to_owned(),
     };
-    let staging_root = directory.path().join("logical-delta-staging");
+    let staging_root = directory.path().join("peer-delta").join("staging");
     let mut target = PersistentLogicalDeltaTarget::new(
         &mut store,
         &cas,
@@ -1278,6 +1280,19 @@ fn structured_records_are_applied_to_invisible_staging_one_at_a_time() {
             )
             .unwrap();
     }
+    let active_stage = match &stage {
+        PersistentLogicalDeltaStage::Changed {
+            staging_directory, ..
+        } => staging_directory.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        crate::peer_sync::maintenance::cleanup_temp(directory.path())
+            .unwrap()
+            .count,
+        0
+    );
+    assert!(active_stage.exists());
 
     assert!(matches!(
         target.stage_database_changes(&mut stage, &plan),
@@ -3533,7 +3548,7 @@ fn activation_conflict_aborts_staging_without_changing_the_active_generation() {
         next_base_manifest_hash: remote.manifest_hash.clone(),
         next_base_generation_sequence: "1".to_owned(),
     };
-    let staging_root = directory.path().join("logical-delta-staging");
+    let staging_root = directory.path().join("peer-bidirectional").join("staging");
     let mut target = PersistentLogicalDeltaTarget::new(
         &mut store,
         &cas,
@@ -3555,6 +3570,19 @@ fn activation_conflict_aborts_staging_without_changing_the_active_generation() {
             &mut Cursor::new(record.object.bytes.clone()),
         )
         .unwrap();
+    let active_stage = match &stage {
+        PersistentLogicalDeltaStage::Changed {
+            staging_directory, ..
+        } => staging_directory.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        crate::peer_sync::maintenance::cleanup_temp(directory.path())
+            .unwrap()
+            .count,
+        0
+    );
+    assert!(active_stage.exists());
     target.stage_database_changes(&mut stage, &plan).unwrap();
     let competing_hash = "f".repeat(64);
     target

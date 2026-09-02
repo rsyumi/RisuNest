@@ -17,6 +17,7 @@ use crate::{
             LogicalOwnerHead, LogicalOwnerLocator, LogicalRecordEnvelope, LogicalRecordLocator,
             LOGICAL_MESSAGE_PAGE_SIZE, MAX_LOGICAL_MANIFEST_BYTES,
         },
+        maintenance::ActiveTempGuard,
         LogicalDeltaActivation, LogicalDeltaApplyOperation, LogicalDeltaObject,
         LogicalDeltaStagedTarget, PeerSyncError, ReadyLogicalDeltaPlan,
     },
@@ -88,6 +89,7 @@ pub(crate) enum PersistentLogicalDeltaStage {
         merged_generation_sequence: String,
         pin_lease_id: String,
         staging_directory: PathBuf,
+        maintenance_guard: Option<ActiveTempGuard>,
         staged_objects: BTreeMap<String, PathBuf>,
         database_staged: bool,
         initialized: bool,
@@ -1562,6 +1564,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         if *initialized {
             return Ok(());
         }
+        let maintenance_guard = ActiveTempGuard::acquire(&staging_directory)?;
         fs::create_dir_all(&self.staging_root)?;
         if let Err(error) = fs::create_dir(&staging_directory) {
             let _ = fs::remove_dir(&self.staging_root);
@@ -1603,6 +1606,15 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             let _ = remove_staging_directory(&self.staging_root, &staging_directory);
             return Err(error);
         }
+        let PersistentLogicalDeltaStage::Changed {
+            initialized,
+            maintenance_guard: stage_guard,
+            ..
+        } = stage
+        else {
+            unreachable!();
+        };
+        *stage_guard = Some(maintenance_guard);
         *initialized = true;
         Ok(())
     }
@@ -1723,6 +1735,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             merged_generation_sequence,
             pin_lease_id,
             staging_directory,
+            maintenance_guard: None,
             staged_objects: BTreeMap::new(),
             database_staged: false,
             initialized: false,
@@ -2242,6 +2255,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             logical_generation_id,
             pin_lease_id,
             staging_directory,
+            maintenance_guard: _maintenance_guard,
             initialized,
             ..
         } = stage

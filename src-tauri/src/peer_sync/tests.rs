@@ -1832,6 +1832,48 @@ fn android_clone_registry_retains_live_cancelled_ownership_until_native_cleanup(
 }
 
 #[test]
+fn lossless_clone_stage_holds_maintenance_ownership_until_stage_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let mut store = crate::persistent_store::PersistentStore::open(directory.path()).unwrap();
+    let expected_revision = store.revision().unwrap();
+    let activation_root = directory.path().join("peer-clone").join("activation");
+    let mut target = LosslessCloneTargetAdapter::new(
+        &mut store,
+        &cas,
+        &activation_root,
+        expected_revision,
+        &crate::local_backup::NeverCancelled,
+    )
+    .unwrap();
+    let stage = target.begin(&"a".repeat(64)).unwrap();
+    let stage_path = fs::read_dir(&activation_root)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name() != "backups")
+        .unwrap()
+        .path();
+    fs::write(stage_path.join("payload"), b"active").unwrap();
+
+    assert_eq!(
+        super::maintenance::cleanup_temp(directory.path())
+            .unwrap()
+            .count,
+        0
+    );
+    assert!(stage_path.exists());
+
+    drop(stage);
+    assert_eq!(
+        super::maintenance::cleanup_temp(directory.path())
+            .unwrap()
+            .count,
+        1
+    );
+    assert!(!stage_path.exists());
+}
+
+#[test]
 fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_evidence() {
     let source_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();

@@ -25,6 +25,7 @@ use super::{
     logical_delta_transfer::{
         execute_logical_delta_pull_with_pre_activation, select_missing_logical_delta_objects,
     },
+    maintenance::ActiveTempGuard,
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     LogicalDeltaStagedTarget, PeerSyncError,
 };
@@ -83,6 +84,7 @@ thread_local! {
     static SOURCE_AFTER_PREPARED_CALLBACK_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static SOURCE_AFTER_BACKUP_PUBLISH_CANCEL_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static BACKUP_CREATE_RACE_CANCEL_FAILPOINT: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
+    static BACKUP_STAGING_MAINTENANCE_HOOK: RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { RefCell::new(None) };
     static TARGET_PREPARED_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static TARGET_AFTER_PREPARED_STORE_FAILPOINT: Cell<bool> = const { Cell::new(false) };
     static TARGET_AFTER_ACTIVATION_FAILPOINT: Cell<bool> = const { Cell::new(false) };
@@ -1108,7 +1110,14 @@ fn ensure_bidirectional_backup_receipt(
     }
     let (backup_staging, temporary) =
         bidirectional_backup_staging_paths(app_root, operation_id, side.clone());
+    let _maintenance_guard = ActiveTempGuard::acquire(&backup_staging)?;
     fs::create_dir_all(&backup_staging)?;
+    #[cfg(test)]
+    BACKUP_STAGING_MAINTENANCE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(&backup_staging);
+        }
+    });
     let temporary_created_by_invocation = match fs::symlink_metadata(&temporary) {
         Ok(_) => match verify_bidirectional_backup_receipt(
             &temporary,

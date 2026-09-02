@@ -1,4 +1,5 @@
 use super::{
+    maintenance::ActiveTempGuard,
     prepare_clone_session,
     protocol::{validate_hash, CloneObjectKind},
     CloneActivation, CloneSource, CloneTargetAdapter, PeerSyncError, PinnedCloneRevision,
@@ -450,6 +451,7 @@ fn sync_unified_marker_parent(_path: &Path) -> Result<(), PeerSyncError> {
 
 pub(crate) struct LosslessCloneStage {
     directory: PathBuf,
+    _maintenance_guard: ActiveTempGuard,
     package: Option<PathBuf>,
     pre_replacement_backup: PathBuf,
     manifest_id: String,
@@ -747,10 +749,12 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
         let directory = self.root.join(format!(
             "{manifest_id}{ACTIVATION_STAGE_SEPARATOR}{stage_id}"
         ));
+        let maintenance_guard = ActiveTempGuard::acquire(&directory)?;
         fs::create_dir(&directory)?;
         crate::trust_boundary::sync_directory(&self.root)?;
         Ok(LosslessCloneStage {
             directory,
+            _maintenance_guard: maintenance_guard,
             package: None,
             pre_replacement_backup: self
                 .root
