@@ -32,7 +32,7 @@ pub(crate) struct PeerBackupDeleteError {
 
 impl From<PeerSyncError> for PeerBackupDeleteError {
     fn from(error: PeerSyncError) -> Self {
-        eprintln!("peer backup delete failed: {error}");
+        crate::nlog!("error", "peer_backup_delete failed: {error}");
         let code =
             matches!(error, PeerSyncError::Validation(message) if message == "peer-backup-in-use")
                 .then_some("peer-backup-in-use")
@@ -44,6 +44,14 @@ impl From<PeerSyncError> for PeerBackupDeleteError {
 fn active_temp_paths() -> &'static Mutex<HashMap<PathBuf, usize>> {
     static PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     PATHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn active_temp_registry_is_locked() -> bool {
+    matches!(
+        active_temp_paths().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
 }
 
 fn normalize_temp_registry_path(path: &Path) -> Result<PathBuf, PeerSyncError> {
@@ -116,7 +124,7 @@ fn temp_path_is_active(path: &Path) -> Result<bool, PeerSyncError> {
         })
 }
 
-fn link_like(metadata: &fs::Metadata) -> bool {
+pub(crate) fn link_like(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
@@ -149,6 +157,100 @@ enum ExpectedPathKind {
     File,
 }
 
+struct DestructivePathBoundary {
+    parent: fs::File,
+    name: OsString,
+}
+
+impl DestructivePathBoundary {
+    fn acquire(app_root: &Path, parent: &Path, target: &Path) -> Result<Self, PeerSyncError> {
+        let parent_relative = plain_relative_path(app_root, parent)?;
+        let name = target.strip_prefix(parent).map_err(|_| {
+            PeerSyncError::Validation("maintenance target is outside its allowed root".to_owned())
+        })?;
+        if name.components().count() != 1
+            || !matches!(name.components().next(), Some(Component::Normal(_)))
+        {
+            return Err(PeerSyncError::Validation(
+                "maintenance target is not a direct child".to_owned(),
+            ));
+        }
+        let name = name.as_os_str().to_os_string();
+        let root = open_destructive_app_root(app_root)?;
+        let metadata = root.metadata()?;
+        if !metadata.is_dir() || link_like(&metadata) {
+            return Err(PeerSyncError::Validation(
+                "maintenance app root is not a plain directory".to_owned(),
+            ));
+        }
+        let parent = cap_primitives::fs::open_dir_nofollow(&root, &parent_relative)?;
+        let metadata = parent.metadata()?;
+        if !metadata.is_dir() || link_like(&metadata) {
+            return Err(PeerSyncError::Validation(
+                "maintenance path traverses a link or reparse point".to_owned(),
+            ));
+        }
+        Ok(Self { parent, name })
+    }
+
+    fn remove_file(&self) -> Result<(), PeerSyncError> {
+        cap_primitives::fs::remove_file(&self.parent, Path::new(&self.name))?;
+        Ok(())
+    }
+
+    fn remove_dir_all(&self) -> Result<(), PeerSyncError> {
+        cap_primitives::fs::remove_dir_all(&self.parent, Path::new(&self.name))?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_destructive_app_root(app_root: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    options.open(app_root)
+}
+
+#[cfg(windows)]
+fn open_destructive_app_root(app_root: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(app_root)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_destructive_app_root(app_root: &Path) -> io::Result<fs::File> {
+    fs::File::open(app_root)
+}
+
+fn plain_relative_path(app_root: &Path, target: &Path) -> Result<PathBuf, PeerSyncError> {
+    let relative = target.strip_prefix(app_root).map_err(|_| {
+        PeerSyncError::Validation("maintenance path is outside the app root".to_owned())
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(PeerSyncError::Validation(
+            "maintenance path is not a plain descendant".to_owned(),
+        ));
+    }
+    Ok(relative.to_path_buf())
+}
+
 fn validate_existing_plain_path(
     app_root: &Path,
     target: &Path,
@@ -163,17 +265,7 @@ fn validate_existing_plain_path(
     }
     let canonical_app =
         fs::canonicalize(app_root).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
-    let relative = target.strip_prefix(app_root).map_err(|_| {
-        PeerSyncError::Validation("maintenance path is outside the app root".to_owned())
-    })?;
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(PeerSyncError::Validation(
-            "maintenance path is not a plain descendant".to_owned(),
-        ));
-    }
+    let relative = plain_relative_path(app_root, target)?;
 
     let mut current = app_root.to_path_buf();
     let component_count = relative.components().count();
@@ -369,6 +461,39 @@ fn clone_backup_root(app_root: &Path, root: &Path) -> bool {
         || root == app_root.join("peer-clone-activation/backups")
 }
 
+fn clone_backup_is_in_use(
+    app_root: &Path,
+    root: &Path,
+    backup: &Path,
+) -> Result<bool, PeerSyncError> {
+    if !clone_backup_root(app_root, root) {
+        return Ok(false);
+    }
+    if desktop_clone_backup_job_is_active(app_root, backup) {
+        return Ok(true);
+    }
+    #[cfg(any(desktop, test))]
+    {
+        if root == app_root.join("peer-clone/activation/backups")
+            && super::commands::retryable_target_operation_references_backup(
+                &app_root.join("peer-clone"),
+                backup,
+            )?
+        {
+            return Ok(true);
+        }
+    }
+    #[cfg(any(target_os = "android", test))]
+    {
+        if root == app_root.join("peer-clone-activation/backups")
+            && super::android_client::current_android_clone_job_references_backup(app_root, backup)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn clone_activation_stage_job_is_active(app_root: &Path, stage: &Path) -> bool {
     let Some((_, job_id)) = super::production::activation_stage_identity(stage) else {
         return false;
@@ -380,7 +505,7 @@ fn clone_activation_stage_job_is_active(app_root: &Path, stage: &Path) -> bool {
 }
 
 pub(crate) fn delete_backup(app_root: &Path, requested: &Path) -> Result<(), PeerSyncError> {
-    delete_backup_with_predelete_hook_inner(app_root, requested, || Ok(()))
+    delete_backup_with_predelete_hooks_inner(app_root, requested, || Ok(()), || Ok(()))
 }
 
 #[cfg(test)]
@@ -389,13 +514,23 @@ pub(crate) fn delete_backup_with_predelete_hook(
     requested: &Path,
     hook: impl FnMut() -> Result<(), PeerSyncError>,
 ) -> Result<(), PeerSyncError> {
-    delete_backup_with_predelete_hook_inner(app_root, requested, hook)
+    delete_backup_with_predelete_hooks_inner(app_root, requested, hook, || Ok(()))
 }
 
-fn delete_backup_with_predelete_hook_inner(
+#[cfg(test)]
+pub(crate) fn delete_backup_with_postvalidation_hook(
+    app_root: &Path,
+    requested: &Path,
+    hook: impl FnMut() -> Result<(), PeerSyncError>,
+) -> Result<(), PeerSyncError> {
+    delete_backup_with_predelete_hooks_inner(app_root, requested, || Ok(()), hook)
+}
+
+fn delete_backup_with_predelete_hooks_inner(
     app_root: &Path,
     requested: &Path,
     mut hook: impl FnMut() -> Result<(), PeerSyncError>,
+    mut postvalidation_hook: impl FnMut() -> Result<(), PeerSyncError>,
 ) -> Result<(), PeerSyncError> {
     let requested = fs::canonicalize(requested)
         .map_err(|_| PeerSyncError::Validation("peer backup is not currently listed".to_owned()))?;
@@ -425,20 +560,21 @@ fn delete_backup_with_predelete_hook_inner(
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
     let selected = validated_direct_child(app_root, &root, &selected, true)?;
-    if clone_backup_root(app_root, &root) && desktop_clone_backup_job_is_active(app_root, &selected)
-    {
+    if clone_backup_is_in_use(app_root, &root, &selected)? {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
     hook()?;
     let selected = validated_direct_child(app_root, &root, &selected, true)?;
+    let boundary = DestructivePathBoundary::acquire(app_root, &root, &selected)?;
+    let selected = validated_direct_child(app_root, &root, &selected, true)?;
     if operation_references(app_root, &selected)? {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
-    if clone_backup_root(app_root, &root) && desktop_clone_backup_job_is_active(app_root, &selected)
-    {
+    if clone_backup_is_in_use(app_root, &root, &selected)? {
         return Err(PeerSyncError::Validation("peer-backup-in-use".to_owned()));
     }
-    fs::remove_file(selected)?;
+    postvalidation_hook()?;
+    boundary.remove_file()?;
     Ok(())
 }
 
@@ -514,7 +650,7 @@ pub(crate) fn temp_usage(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError
 }
 
 pub(crate) fn cleanup_temp(app_root: &Path) -> Result<PeerTempUsage, PeerSyncError> {
-    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), |_, _| Ok(()))
+    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), |_, _| Ok(()), |_, _| Ok(()))
 }
 
 #[cfg(test)]
@@ -522,7 +658,7 @@ pub(crate) fn cleanup_temp_with_predelete_hook(
     app_root: &Path,
     hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
 ) -> Result<PeerTempUsage, PeerSyncError> {
-    cleanup_temp_with_predelete_hooks_inner(app_root, hook, |_, _| Ok(()))
+    cleanup_temp_with_predelete_hooks_inner(app_root, hook, |_, _| Ok(()), |_, _| Ok(()))
 }
 
 #[cfg(test)]
@@ -530,13 +666,22 @@ pub(crate) fn cleanup_temp_with_locked_predelete_hook(
     app_root: &Path,
     hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
 ) -> Result<PeerTempUsage, PeerSyncError> {
-    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), hook)
+    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), hook, |_, _| Ok(()))
+}
+
+#[cfg(test)]
+pub(crate) fn cleanup_temp_with_postvalidation_hook(
+    app_root: &Path,
+    hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
+) -> Result<PeerTempUsage, PeerSyncError> {
+    cleanup_temp_with_predelete_hooks_inner(app_root, |_, _| Ok(()), |_, _| Ok(()), hook)
 }
 
 fn cleanup_temp_with_predelete_hooks_inner(
     app_root: &Path,
     mut hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
     mut locked_hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
+    mut postvalidation_hook: impl FnMut(&Path, &Path) -> Result<(), PeerSyncError>,
 ) -> Result<PeerTempUsage, PeerSyncError> {
     let candidates = temp_candidates(app_root)?;
     let mut removed = PeerTempUsage::default();
@@ -569,7 +714,10 @@ fn cleanup_temp_with_predelete_hooks_inner(
         }
         locked_hook(&root, &path)?;
         let path = validated_direct_child(app_root, &root, &path, false)?;
-        fs::remove_dir_all(&path)?;
+        let boundary = DestructivePathBoundary::acquire(app_root, &root, &path)?;
+        let path = validated_direct_child(app_root, &root, &path, false)?;
+        postvalidation_hook(&root, &path)?;
+        boundary.remove_dir_all()?;
         drop(active);
         removed.count += usage.count;
         removed.bytes = removed.bytes.saturating_add(usage.bytes);
@@ -583,11 +731,51 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, PeerSyncError> {
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
+fn finish_string_command<T>(
+    command: &'static str,
+    result: Result<T, PeerSyncError>,
+) -> Result<T, String> {
+    result.map_err(|error| {
+        crate::nlog!("error", "{command} failed: {error}");
+        error.to_string()
+    })
+}
+
+pub(crate) fn peer_backup_list_from_root(
+    root: Result<PathBuf, PeerSyncError>,
+) -> Result<Vec<PeerBackupInfo>, String> {
+    finish_string_command(
+        "peer_backup_list",
+        root.and_then(|root| list_backups(&root)),
+    )
+}
+
+pub(crate) fn peer_backup_delete_from_root(
+    root: Result<PathBuf, PeerSyncError>,
+    path: &Path,
+) -> Result<(), PeerBackupDeleteError> {
+    root.and_then(|root| delete_backup(&root, path))
+        .map_err(PeerBackupDeleteError::from)
+}
+
+pub(crate) fn peer_temp_usage_from_root(
+    root: Result<PathBuf, PeerSyncError>,
+) -> Result<PeerTempUsage, String> {
+    finish_string_command("peer_temp_usage", root.and_then(|root| temp_usage(&root)))
+}
+
+pub(crate) fn peer_temp_cleanup_from_root(
+    root: Result<PathBuf, PeerSyncError>,
+) -> Result<PeerTempUsage, String> {
+    finish_string_command(
+        "peer_temp_cleanup",
+        root.and_then(|root| cleanup_temp(&root)),
+    )
+}
+
 #[tauri::command(async)]
 pub(crate) fn peer_backup_list(app: AppHandle) -> Result<Vec<PeerBackupInfo>, String> {
-    app_root(&app)
-        .and_then(|root| list_backups(&root))
-        .map_err(|error| error.to_string())
+    peer_backup_list_from_root(app_root(&app))
 }
 
 #[tauri::command(async)]
@@ -595,20 +783,15 @@ pub(crate) fn peer_backup_delete(
     app: AppHandle,
     path: String,
 ) -> Result<(), PeerBackupDeleteError> {
-    let root = app_root(&app).map_err(PeerBackupDeleteError::from)?;
-    delete_backup(&root, Path::new(&path)).map_err(PeerBackupDeleteError::from)
+    peer_backup_delete_from_root(app_root(&app), Path::new(&path))
 }
 
 #[tauri::command(async)]
 pub(crate) fn peer_temp_usage(app: AppHandle) -> Result<PeerTempUsage, String> {
-    app_root(&app)
-        .and_then(|root| temp_usage(&root))
-        .map_err(|error| error.to_string())
+    peer_temp_usage_from_root(app_root(&app))
 }
 
 #[tauri::command(async)]
 pub(crate) fn peer_temp_cleanup(app: AppHandle) -> Result<PeerTempUsage, String> {
-    app_root(&app)
-        .and_then(|root| cleanup_temp(&root))
-        .map_err(|error| error.to_string())
+    peer_temp_cleanup_from_root(app_root(&app))
 }

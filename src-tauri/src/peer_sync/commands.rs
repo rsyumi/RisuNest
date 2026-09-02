@@ -2092,6 +2092,62 @@ fn target_backup_path(peer_root: &Path, operation_id: &str) -> PathBuf {
     peer_root.join(target_backup_relative_path(operation_id))
 }
 
+pub(crate) fn retryable_target_operation_references_backup(
+    peer_root: &Path,
+    backup: &Path,
+) -> Result<bool, PeerSyncError> {
+    let targets_root = peer_root.join("targets");
+    let metadata = match fs::symlink_metadata(&targets_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata_is_symlink_or_reparse(&metadata) {
+        return Err(PeerSyncError::Validation(
+            "peer clone target root is not a plain directory".to_owned(),
+        ));
+    }
+    let backup = fs::canonicalize(backup)?;
+    for entry in fs::read_dir(targets_root)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata_is_symlink_or_reparse(&metadata) {
+            return Err(PeerSyncError::Validation(
+                "peer clone target job root is not a plain directory".to_owned(),
+            ));
+        }
+        let marker_path = entry.path().join(TARGET_OPERATION_MARKER_FILE);
+        let Some(bytes) = read_target_operation_marker_bytes(&marker_path)? else {
+            continue;
+        };
+        let marker: TargetOperationMarker = serde_json::from_slice(&bytes)
+            .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+        let request = PeerCloneTargetRequest {
+            endpoint: String::new(),
+            session_id: marker.session_id.clone(),
+            manifest_id: marker.manifest_id.clone(),
+        };
+        marker.validate_for(&request)?;
+        if entry.file_name() != marker.session_id.as_str() {
+            return Err(PeerSyncError::Validation(
+                "peer clone target operation is outside its session root".to_owned(),
+            ));
+        }
+        let expected = target_backup_path(peer_root, &marker.operation_id);
+        let expected = match fs::canonicalize(expected) {
+            Ok(expected) => expected,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if expected == backup {
+            let exact_receipt = marker.backup_path.as_deref()
+                == Some(target_backup_relative_path(&marker.operation_id).as_str());
+            return Ok(!exact_receipt || !marker.completion_acknowledged);
+        }
+    }
+    Ok(false)
+}
+
 fn persist_target_backup_receipt(
     job_root: &Path,
     peer_root: &Path,
@@ -4237,6 +4293,7 @@ mod tests {
         assert_eq!(target_store.revision().unwrap(), 2);
         let backup_path = fs::canonicalize(target_backup_path(&peer_root, &operation_id)).unwrap();
         assert!(backup_path.is_file());
+        assert!(retryable_target_operation_references_backup(&peer_root, &backup_path).unwrap());
         assert_eq!(
             backup_path.parent(),
             Some(
@@ -4320,6 +4377,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marker_after_retry["completionAcknowledged"], true);
+        assert!(!retryable_target_operation_references_backup(&peer_root, &backup_path).unwrap());
         drop(recovered);
         let _restarted = PeerCloneCommandState::initialize(&peer_root);
         assert!(!peer_root.join("targets").join(&request.session_id).exists());

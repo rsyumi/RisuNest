@@ -2187,6 +2187,13 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
         registry.current().unwrap().unwrap().backup_path.as_ref(),
         Some(backup_path)
     );
+    assert!(
+        super::android_client::current_android_clone_job_references_backup(
+            target_root.path(),
+            backup_path
+        )
+        .unwrap()
+    );
     assert_eq!(
         registry
             .finalize(
@@ -2226,6 +2233,13 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
     registry.release(&claimed.job_id, &target_store).unwrap();
 
     assert!(registry.current().unwrap().is_none());
+    assert!(
+        !super::android_client::current_android_clone_job_references_backup(
+            target_root.path(),
+            backup_path
+        )
+        .unwrap()
+    );
     assert!(!target_root
         .path()
         .join("peer-clone-jobs")

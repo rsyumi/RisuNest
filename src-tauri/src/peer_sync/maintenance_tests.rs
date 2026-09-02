@@ -1,7 +1,10 @@
 use super::maintenance::{
-    cleanup_temp, cleanup_temp_with_locked_predelete_hook, cleanup_temp_with_predelete_hook,
-    delete_backup, delete_backup_with_predelete_hook, desktop_clone_backup_job_is_active,
-    list_backups, temp_usage, ActiveTempGuard, PeerBackupDeleteError,
+    active_temp_registry_is_locked, cleanup_temp, cleanup_temp_with_locked_predelete_hook,
+    cleanup_temp_with_postvalidation_hook, cleanup_temp_with_predelete_hook, delete_backup,
+    delete_backup_with_postvalidation_hook, delete_backup_with_predelete_hook,
+    desktop_clone_backup_job_is_active, list_backups, peer_backup_delete_from_root,
+    peer_backup_list_from_root, peer_temp_cleanup_from_root, peer_temp_usage_from_root, temp_usage,
+    ActiveTempGuard, PeerBackupDeleteError,
 };
 use super::PeerSyncError;
 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
@@ -25,6 +28,104 @@ fn peer_backup_delete_error_serializes_only_a_safe_code() {
         generic,
         serde_json::json!({ "code": "peer-backup-delete-failed" })
     );
+}
+
+#[test]
+fn maintenance_invokes_log_app_root_and_operation_failures_without_changing_contracts() {
+    let log_count = |needle: &str| {
+        crate::native_log::global_state()
+            .tail(None)
+            .into_iter()
+            .filter(|entry| entry.message.contains(needle))
+            .count()
+    };
+    let assert_masked_app_root_failure = |needle: &str, marker: &str| {
+        let entry = crate::native_log::global_state()
+            .tail(None)
+            .into_iter()
+            .rev()
+            .find(|entry| entry.message.contains(needle) && entry.message.contains(marker))
+            .expect("find maintenance app-root failure log");
+        assert!(entry.message.contains("Authorization: ***"));
+        assert!(!entry.message.contains("fixture-maintenance-secret"));
+    };
+
+    let list_marker = format!("maintenance-list-root-{}", uuid::Uuid::new_v4());
+    let list_detail =
+        format!("{list_marker} Authorization: Bearer fixture-maintenance-secret\napp root failed");
+    let list_contract = PeerSyncError::Storage(list_detail.clone()).to_string();
+    assert_eq!(
+        peer_backup_list_from_root(Err(PeerSyncError::Storage(list_detail)))
+            .expect_err("list app-root failure"),
+        list_contract
+    );
+    assert_masked_app_root_failure("peer_backup_list failed", &list_marker);
+
+    let delete_marker = format!("maintenance-delete-root-{}", uuid::Uuid::new_v4());
+    let delete_detail = format!(
+        "{delete_marker} Authorization: Bearer fixture-maintenance-secret\napp root failed"
+    );
+    assert_eq!(
+        peer_backup_delete_from_root(
+            Err(PeerSyncError::Storage(delete_detail)),
+            Path::new("unused")
+        )
+        .expect_err("delete app-root failure")
+        .code,
+        "peer-backup-delete-failed"
+    );
+    assert_masked_app_root_failure("peer_backup_delete failed", &delete_marker);
+
+    let usage_marker = format!("maintenance-usage-root-{}", uuid::Uuid::new_v4());
+    let usage_detail =
+        format!("{usage_marker} Authorization: Bearer fixture-maintenance-secret\napp root failed");
+    let usage_contract = PeerSyncError::Storage(usage_detail.clone()).to_string();
+    assert_eq!(
+        peer_temp_usage_from_root(Err(PeerSyncError::Storage(usage_detail)))
+            .expect_err("usage app-root failure"),
+        usage_contract
+    );
+    assert_masked_app_root_failure("peer_temp_usage failed", &usage_marker);
+
+    let cleanup_marker = format!("maintenance-cleanup-root-{}", uuid::Uuid::new_v4());
+    let cleanup_detail = format!(
+        "{cleanup_marker} Authorization: Bearer fixture-maintenance-secret\napp root failed"
+    );
+    let cleanup_contract = PeerSyncError::Storage(cleanup_detail.clone()).to_string();
+    assert_eq!(
+        peer_temp_cleanup_from_root(Err(PeerSyncError::Storage(cleanup_detail)))
+            .expect_err("cleanup app-root failure"),
+        cleanup_contract
+    );
+    assert_masked_app_root_failure("peer_temp_cleanup failed", &cleanup_marker);
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let invalid_root = directory.path().join("not-a-directory");
+    fs::write(&invalid_root, b"file").expect("create invalid app root");
+
+    let list_before = log_count("peer_backup_list failed");
+    assert!(peer_backup_list_from_root(Ok(invalid_root.clone())).is_err());
+    assert_eq!(log_count("peer_backup_list failed"), list_before + 1);
+
+    let delete_before = log_count("peer_backup_delete failed");
+    assert_eq!(
+        peer_backup_delete_from_root(
+            Ok(directory.path().to_path_buf()),
+            &directory.path().join("missing.lossless")
+        )
+        .expect_err("delete operation failure")
+        .code,
+        "peer-backup-delete-failed"
+    );
+    assert_eq!(log_count("peer_backup_delete failed"), delete_before + 1);
+
+    let usage_before = log_count("peer_temp_usage failed");
+    assert!(peer_temp_usage_from_root(Ok(invalid_root.clone())).is_err());
+    assert_eq!(log_count("peer_temp_usage failed"), usage_before + 1);
+
+    let cleanup_before = log_count("peer_temp_cleanup failed");
+    assert!(peer_temp_cleanup_from_root(Ok(invalid_root)).is_err());
+    assert_eq!(log_count("peer_temp_cleanup failed"), cleanup_before + 1);
 }
 
 #[cfg(unix)]
@@ -228,11 +329,7 @@ fn active_delta_and_bidirectional_staging_are_not_temp_cleanup() {
 
 #[test]
 fn guard_acquisition_waits_for_cleanup_deletion_and_recreated_stage_stays_active() {
-    use std::{
-        sync::mpsc::{self, RecvTimeoutError},
-        thread,
-        time::Duration,
-    };
+    use std::{sync::mpsc, thread, time::Duration};
 
     let directory = tempfile::tempdir().expect("temporary directory");
     let root = directory.path();
@@ -244,11 +341,15 @@ fn guard_acquisition_waits_for_cleanup_deletion_and_recreated_stage_stays_active
     fs::write(stage.join("abandoned"), b"abandoned").expect("write abandoned payload");
 
     let (start_tx, start_rx) = mpsc::channel();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
     let (acquired_tx, acquired_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let worker_stage = stage.clone();
     let worker = thread::spawn(move || {
         start_rx.recv().expect("wait for cleanup deletion lock");
+        attempt_tx
+            .send(())
+            .expect("report guard acquisition attempt");
         let guard = ActiveTempGuard::acquire(&worker_stage).expect("acquire resumed stage");
         fs::create_dir_all(&worker_stage).expect("recreate resumed stage");
         fs::write(worker_stage.join("active"), b"active").expect("write active payload");
@@ -260,10 +361,10 @@ fn guard_acquisition_waits_for_cleanup_deletion_and_recreated_stage_stays_active
     let removed = cleanup_temp_with_locked_predelete_hook(root, |_, candidate| {
         assert_eq!(candidate, stage);
         start_tx.send(()).expect("start resumed stage acquisition");
-        assert_eq!(
-            acquired_rx.recv_timeout(Duration::from_millis(100)),
-            Err(RecvTimeoutError::Timeout)
-        );
+        attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker reaches guard acquisition attempt");
+        assert!(active_temp_registry_is_locked());
         Ok(())
     })
     .expect("delete only the abandoned stage");
@@ -356,6 +457,250 @@ fn android_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
         .release(CasReleaseOutcome::Aborted)
         .expect("release matching job");
     delete_backup(root, &backup).expect("released matching job does not block backup");
+}
+
+#[test]
+fn released_legacy_android_clone_backup_remains_deletable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let id = "00000000-0000-4000-8000-000000000204";
+    let backup = root.join(format!(
+        "peer-clone-activation/backups/pre-clone-{}-{id}.lossless",
+        "a".repeat(64)
+    ));
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(&backup, b"legacy Android backup").expect("write legacy Android backup");
+    let mut matching =
+        DurableCasJob::begin(root, id, CasJobKind::PeerClone, 0).expect("matching job");
+    matching
+        .release(CasReleaseOutcome::Aborted)
+        .expect("release matching job");
+
+    delete_backup(root, &backup).expect("released legacy Android backup can be deleted");
+    assert!(!backup.exists());
+}
+
+#[test]
+fn current_legacy_android_clone_backup_remains_protected_after_cas_release() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let job_id = "00000000-0000-4000-8000-000000000205";
+    let manifest_id = "b".repeat(64);
+    let backup = root.join(format!(
+        "peer-clone-activation/backups/pre-clone-{}-{job_id}.lossless",
+        "c".repeat(64)
+    ));
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(&backup, b"current legacy Android backup").expect("write legacy backup");
+    let mut matching =
+        DurableCasJob::begin(root, job_id, CasJobKind::PeerClone, 0).expect("matching job");
+    matching
+        .release(CasReleaseOutcome::Aborted)
+        .expect("release CAS job after activation");
+
+    let jobs_root = root.join("peer-clone-jobs");
+    let job_root = jobs_root.join(job_id);
+    fs::create_dir_all(&job_root).expect("create Android job root");
+    let write_json = |path: &Path, value: serde_json::Value| {
+        fs::write(
+            path,
+            serde_json::to_vec(&value).expect("serialize Android job record"),
+        )
+        .expect("write Android job record");
+    };
+    write_json(
+        &jobs_root.join("current.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-registry/v1",
+            "jobId": job_id,
+        }),
+    );
+    write_json(
+        &job_root.join("ownership.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-ownership/v1",
+            "jobId": job_id,
+        }),
+    );
+    write_json(
+        &job_root.join("job.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-job/v1",
+            "jobId": job_id,
+            "manifestId": manifest_id,
+        }),
+    );
+    write_json(
+        &job_root.join("status.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-status/v1",
+            "phase": "awaitingActivation",
+            "completedBytes": 1,
+            "totalBytes": 1,
+            "error": null,
+            "committedRevision": 2,
+            "backupPath": null,
+        }),
+    );
+
+    delete_backup(root, &backup).expect("source-less legacy job does not own stale backup");
+    fs::write(&backup, b"current legacy Android backup").expect("recreate legacy backup");
+    write_json(
+        &job_root.join("status.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-status/v1",
+            "phase": "awaitingActivation",
+            "completedBytes": 1,
+            "totalBytes": 1,
+            "error": null,
+            "committedRevision": 2,
+            "backupPath": backup,
+            "completionAcknowledged": false,
+        }),
+    );
+
+    assert_eq!(
+        delete_backup(root, &backup).expect_err("current legacy backup must remain"),
+        PeerSyncError::Validation("peer-backup-in-use".to_owned())
+    );
+    assert!(backup.is_file());
+
+    fs::remove_file(jobs_root.join("current.json")).expect("release current Android job");
+    delete_backup(root, &backup).expect("released legacy backup can be deleted");
+    assert!(!backup.exists());
+}
+
+#[test]
+fn desktop_clone_backup_remains_protected_until_its_exact_receipt_and_ack() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let operation_id = "00000000-0000-4000-8000-000000000201";
+    let session_id = "00000000-0000-4000-8000-000000000202";
+    let backup = root.join(format!(
+        "peer-clone/activation/backups/pre-clone-{operation_id}.lossless"
+    ));
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backup root");
+    fs::write(&backup, b"retryable desktop backup").expect("write desktop backup");
+    let marker = root
+        .join("peer-clone/targets")
+        .join(session_id)
+        .join("activation-operation.json");
+    fs::create_dir_all(marker.parent().expect("marker parent")).expect("create target job root");
+    let write_marker = |completion_acknowledged: bool| {
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "risunest.peer-clone-target-operation/v1",
+                "sessionId": session_id,
+                "manifestId": "0".repeat(64),
+                "operationId": operation_id,
+                "backupPath": format!(
+                    "activation/backups/pre-clone-{operation_id}.lossless"
+                ),
+                "completionAcknowledged": completion_acknowledged,
+            }))
+            .expect("serialize operation marker"),
+        )
+        .expect("write operation marker");
+    };
+
+    write_marker(false);
+    assert_eq!(
+        delete_backup(root, &backup).expect_err("unacknowledged backup must remain"),
+        PeerSyncError::Validation("peer-backup-in-use".to_owned())
+    );
+    assert!(backup.is_file());
+
+    write_marker(true);
+    delete_backup(root, &backup).expect("acknowledged backup can be deleted");
+    assert!(!backup.exists());
+}
+
+#[test]
+fn android_clone_backup_remains_protected_until_its_current_job_is_released() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let job_id = "00000000-0000-4000-8000-000000000203";
+    let manifest_id = "1".repeat(64);
+    let backup = root.join(format!(
+        "peer-clone-activation/backups/pre-clone-{job_id}.lossless"
+    ));
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backup root");
+    fs::write(&backup, b"retryable Android backup").expect("write Android backup");
+    let jobs_root = root.join("peer-clone-jobs");
+    let job_root = jobs_root.join(job_id);
+    fs::create_dir_all(&job_root).expect("create Android job root");
+    let write_json = |path: &Path, value: serde_json::Value| {
+        fs::write(
+            path,
+            serde_json::to_vec(&value).expect("serialize Android job record"),
+        )
+        .expect("write Android job record");
+    };
+    write_json(
+        &jobs_root.join("current.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-registry/v1",
+            "jobId": job_id,
+        }),
+    );
+    write_json(
+        &job_root.join("ownership.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-ownership/v1",
+            "jobId": job_id,
+        }),
+    );
+    write_json(
+        &job_root.join("job.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-job/v1",
+            "jobId": job_id,
+            "manifestId": manifest_id,
+        }),
+    );
+    write_json(
+        &job_root.join("status.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-status/v1",
+            "phase": "awaitingActivation",
+            "completedBytes": 1,
+            "totalBytes": 1,
+            "error": null,
+            "committedRevision": 2,
+            "backupPath": backup,
+        }),
+    );
+
+    assert_eq!(
+        delete_backup(root, &backup).expect_err("current Android backup must remain"),
+        PeerSyncError::Validation("peer-backup-in-use".to_owned())
+    );
+    assert!(backup.is_file());
+
+    let mismatched_receipt = backup
+        .parent()
+        .expect("backup parent")
+        .join("pre-clone-00000000-0000-4000-8000-000000000299.lossless");
+    fs::write(&mismatched_receipt, b"other backup").expect("write mismatched receipt backup");
+    write_json(
+        &job_root.join("status.json"),
+        serde_json::json!({
+            "schema": "risunest.android-peer-clone-status/v1",
+            "phase": "awaitingActivation",
+            "completedBytes": 1,
+            "totalBytes": 1,
+            "error": null,
+            "committedRevision": 2,
+            "backupPath": mismatched_receipt,
+        }),
+    );
+    assert!(delete_backup(root, &backup).is_err());
+    assert!(backup.is_file());
+
+    fs::remove_file(jobs_root.join("current.json")).expect("release current Android job");
+    delete_backup(root, &backup).expect("released Android backup can be deleted");
+    assert!(!backup.exists());
 }
 
 #[test]
@@ -571,6 +916,67 @@ fn final_temp_cleanup_validation_rejects_a_replaced_staging_reparse_root() {
     assert!(matches!(error, PeerSyncError::Validation { .. }));
     assert_eq!(
         fs::read(external_stage.join("sentinel")).expect("read external payload"),
+        b"external payload"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn deletion_boundary_does_not_follow_a_backup_ancestor_replaced_after_validation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let app_root = directory.path().join("app");
+    let external_root = directory.path().join("external-backups");
+    let backup = app_root.join("peer-clone/activation/backups/replace-me.lossless");
+    let backup_root = backup.parent().expect("backup parent").to_path_buf();
+    let external_backup = external_root.join("replace-me.lossless");
+    fs::create_dir_all(&backup_root).expect("create backup root");
+    fs::write(&backup, b"local backup").expect("write local backup");
+    fs::create_dir(&external_root).expect("create external backup root");
+    fs::write(&external_backup, b"external backup").expect("write external backup");
+
+    let outcome = delete_backup_with_postvalidation_hook(&app_root, &backup, || {
+        fs::remove_file(&backup).expect("remove validated local backup");
+        if fs::remove_dir(&backup_root).is_ok() {
+            create_directory_link(&external_root, &backup_root);
+        }
+        Ok(())
+    });
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        fs::read(&external_backup).expect("external backup must remain"),
+        b"external backup"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn deletion_boundary_does_not_follow_a_temp_ancestor_replaced_after_validation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let app_root = directory.path().join("app");
+    let staging_root = app_root.join("peer-delta/staging");
+    let abandoned = staging_root.join("abandoned");
+    let external_root = directory.path().join("external-staging");
+    let external_stage = external_root.join("abandoned");
+    let external_sentinel = external_stage.join("sentinel");
+    fs::create_dir_all(&abandoned).expect("create abandoned stage");
+    fs::write(abandoned.join("payload"), b"local payload").expect("write local payload");
+    fs::create_dir_all(&external_stage).expect("create external stage");
+    fs::write(&external_sentinel, b"external payload").expect("write external payload");
+
+    let outcome = cleanup_temp_with_postvalidation_hook(&app_root, |root, candidate| {
+        assert_eq!(root, staging_root);
+        assert_eq!(candidate, abandoned);
+        fs::remove_dir_all(candidate).expect("remove validated local stage");
+        if fs::remove_dir(root).is_ok() {
+            create_directory_link(&external_root, root);
+        }
+        Ok(())
+    });
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        fs::read(&external_sentinel).expect("external stage must remain"),
         b"external payload"
     );
 }

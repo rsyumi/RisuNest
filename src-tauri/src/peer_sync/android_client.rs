@@ -199,6 +199,81 @@ impl AndroidClonePersistedStatus {
     }
 }
 
+pub(crate) fn current_android_clone_job_references_backup(
+    app_root: &Path,
+    backup: &Path,
+) -> Result<bool, PeerSyncError> {
+    let Some(name) = backup.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let Some(stem) = name
+        .strip_prefix("pre-clone-")
+        .and_then(|name| name.strip_suffix(".lossless"))
+    else {
+        return Ok(false);
+    };
+    let (job_id, legacy_name) = if validate_job_id(stem).is_ok() {
+        (stem, false)
+    } else {
+        let Some((manifest_id, job_id)) = stem.split_once('-') else {
+            return Ok(false);
+        };
+        if !is_sha256(manifest_id) || validate_job_id(job_id).is_err() {
+            return Ok(false);
+        }
+        (job_id, true)
+    };
+
+    let backup_root = fs::canonicalize(app_root.join("peer-clone-activation/backups"))?;
+    let backup = fs::canonicalize(backup)?;
+    if backup.parent() != Some(backup_root.as_path()) {
+        return Ok(false);
+    }
+
+    let jobs_root = app_root.join("peer-clone-jobs");
+    let current_path = jobs_root.join("current.json");
+    let metadata = match fs::symlink_metadata(&current_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || super::maintenance::link_like(&metadata) {
+        return Err(PeerSyncError::Validation(
+            "Android clone current job record is not a plain file".to_owned(),
+        ));
+    }
+    let current: AndroidCloneRegistryOwnership =
+        read_bounded_json(&current_path, MAX_JOB_RECORD_BYTES)?;
+    if current.schema != REGISTRY_SCHEMA {
+        return Err(PeerSyncError::Validation(
+            "Android clone current job record is invalid".to_owned(),
+        ));
+    }
+    validate_job_id(&current.job_id)?;
+    if current.job_id != job_id {
+        return Ok(false);
+    }
+
+    let (job_root, descriptor) = validate_job(&jobs_root.join(job_id))?;
+    if descriptor.job_id != job_id {
+        return Err(PeerSyncError::Validation(
+            "Android clone current job identity changed".to_owned(),
+        ));
+    }
+    let status: AndroidClonePersistedStatus =
+        read_bounded_json(&job_root.join("status.json"), MAX_JOB_RECORD_BYTES)?;
+    status.validate()?;
+    let Some(receipt) = status.backup_path else {
+        return Ok(!legacy_name);
+    };
+    if fs::canonicalize(receipt)? != backup {
+        return Err(PeerSyncError::Validation(
+            "Android clone current job backup receipt changed".to_owned(),
+        ));
+    }
+    Ok(true)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AndroidCloneRegistryOwnership {
