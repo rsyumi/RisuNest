@@ -13,101 +13,125 @@ internal const val GENERATION_FOREGROUND_START_MODE = Service.START_NOT_STICKY
 private const val GENERATION_FOREGROUND_CHANNEL = "risunest-generation"
 private const val GENERATION_FOREGROUND_NOTIFICATION_ID = 0x52474e31
 private const val GENERATION_FOREGROUND_BEGIN = "co.aiclient.risu.GENERATION_FOREGROUND_BEGIN"
-private const val GENERATION_FOREGROUND_END = "co.aiclient.risu.GENERATION_FOREGROUND_END"
+private const val GENERATION_FOREGROUND_TOKEN = "co.aiclient.risu.GENERATION_FOREGROUND_TOKEN"
+private const val INVALID_GENERATION_FOREGROUND_TOKEN = -1L
 
-internal enum class GenerationForegroundCommand { START, STOP, NONE }
-
-internal class GenerationForegroundDispatchGate {
+internal class GenerationForegroundLifecycle {
   private var count = 0
+  private var activeToken = INVALID_GENERATION_FOREGROUND_TOKEN
+  private var activeStartId: Int? = null
+  private var nextToken = 0L
 
   @Synchronized
-  fun begin(dispatch: () -> Boolean): Boolean {
-    count += 1
-    if (dispatch()) return true
-    count -= 1
-    return false
+  fun begin(dispatchStart: (Long) -> Boolean): Boolean {
+    if (count > 0) {
+      count += 1
+      return true
+    }
+
+    nextToken += 1
+    val token = nextToken
+    if (!dispatchStart(token)) return false
+    activeToken = token
+    count = 1
+    return true
   }
 
   @Synchronized
-  fun end(dispatch: () -> Boolean): Boolean {
+  fun end(stopService: () -> Boolean): Boolean {
     if (count == 0) return false
     count -= 1
-    if (dispatch()) return true
-    count += 1
-    return false
+    if (count > 0) return true
+
+    activeToken = INVALID_GENERATION_FOREGROUND_TOKEN
+    activeStartId = null
+    return stopService()
   }
 
   @Synchronized
-  fun timeout() {
+  fun timeout(
+    token: Long,
+    startId: Int,
+    stopTimedOut: () -> Unit,
+    stopStaleTimeout: () -> Unit,
+  ): Boolean {
+    if (token != activeToken || startId != activeStartId) {
+      stopStaleTimeout()
+      return false
+    }
     count = 0
-  }
-}
-
-internal class GenerationForegroundController {
-  private var count = 0
-
-  fun begin(notificationsEnabled: Boolean): GenerationForegroundCommand {
-    if (!notificationsEnabled) return GenerationForegroundCommand.NONE
-    count += 1
-    return if (count == 1) GenerationForegroundCommand.START else GenerationForegroundCommand.NONE
+    activeToken = INVALID_GENERATION_FOREGROUND_TOKEN
+    activeStartId = null
+    stopTimedOut()
+    return true
   }
 
-  fun end(): GenerationForegroundCommand {
-    if (count == 0) return GenerationForegroundCommand.NONE
-    count -= 1
-    return if (count == 0) GenerationForegroundCommand.STOP else GenerationForegroundCommand.NONE
-  }
-
-  fun timeout(): GenerationForegroundCommand {
-    if (count == 0) return GenerationForegroundCommand.NONE
-    count = 0
-    return GenerationForegroundCommand.STOP
+  @Synchronized
+  fun activate(
+    token: Long,
+    startId: Int,
+    startForeground: () -> Unit,
+    stopStaleStart: () -> Unit,
+  ): Boolean {
+    if (count > 0 && token == activeToken) {
+      activeStartId = startId
+      startForeground()
+      return true
+    }
+    stopStaleStart()
+    return false
   }
 }
 
 class GenerationForegroundService : Service() {
-  private val controller = GenerationForegroundController()
+  private var activatedToken = INVALID_GENERATION_FOREGROUND_TOKEN
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    val command = when (intent?.action) {
-      GENERATION_FOREGROUND_BEGIN -> controller.begin(notificationsEnabled(this))
-      GENERATION_FOREGROUND_END -> controller.end()
-      else -> GenerationForegroundCommand.STOP
+    val token = if (intent?.action == GENERATION_FOREGROUND_BEGIN) {
+      intent.getLongExtra(GENERATION_FOREGROUND_TOKEN, INVALID_GENERATION_FOREGROUND_TOKEN)
+    } else {
+      INVALID_GENERATION_FOREGROUND_TOKEN
     }
-    apply(command, startId)
+    lifecycle.activate(
+      token = token,
+      startId = startId,
+      startForeground = {
+        activatedToken = token
+        startInForeground()
+      },
+      stopStaleStart = {
+        stopSelfResult(startId)
+      },
+    )
     return GENERATION_FOREGROUND_START_MODE
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {
-    controller.timeout()
-    dispatchGate.timeout()
-    stopForeground(STOP_FOREGROUND_REMOVE)
-    stopSelf()
-  }
-
-  private fun apply(command: GenerationForegroundCommand, startId: Int) {
-    when (command) {
-      GenerationForegroundCommand.START -> {
-        createNotificationChannel()
-        startForeground(
-          GENERATION_FOREGROUND_NOTIFICATION_ID,
-          androidx.core.app.NotificationCompat.Builder(this, GENERATION_FOREGROUND_CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle(getString(R.string.generation_notification_title))
-            .setContentText(getString(R.string.generation_notification_text))
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .build(),
-        )
-      }
-      GenerationForegroundCommand.STOP -> {
+    lifecycle.timeout(
+      token = activatedToken,
+      startId = startId,
+      stopTimedOut = {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelfResult(startId)
-      }
-      GenerationForegroundCommand.NONE -> Unit
-    }
+      },
+      stopStaleTimeout = { stopSelfResult(startId) },
+    )
+  }
+
+  private fun startInForeground() {
+    createNotificationChannel()
+    startForeground(
+      GENERATION_FOREGROUND_NOTIFICATION_ID,
+      androidx.core.app.NotificationCompat.Builder(this, GENERATION_FOREGROUND_CHANNEL)
+        .setSmallIcon(android.R.drawable.stat_sys_download)
+        .setContentTitle(getString(R.string.generation_notification_title))
+        .setContentText(getString(R.string.generation_notification_text))
+        .setOngoing(true)
+        .setOnlyAlertOnce(true)
+        .build(),
+    )
   }
 
   private fun createNotificationChannel() {
@@ -121,23 +145,23 @@ class GenerationForegroundService : Service() {
   }
 
   companion object {
-    private val dispatchGate = GenerationForegroundDispatchGate()
+    private val lifecycle = GenerationForegroundLifecycle()
 
-    internal fun start(context: Context): Boolean = dispatchGate.begin {
+    internal fun start(context: Context): Boolean = lifecycle.begin { token ->
       runCatching {
         ContextCompat.startForegroundService(
           context,
-          Intent(context, GenerationForegroundService::class.java).setAction(GENERATION_FOREGROUND_BEGIN),
+          Intent(context, GenerationForegroundService::class.java)
+            .setAction(GENERATION_FOREGROUND_BEGIN)
+            .putExtra(GENERATION_FOREGROUND_TOKEN, token),
         )
         true
       }.getOrDefault(false)
     }
 
-    internal fun stop(context: Context): Boolean = dispatchGate.end {
+    internal fun stop(context: Context): Boolean = lifecycle.end {
       runCatching {
-        context.startService(
-          Intent(context, GenerationForegroundService::class.java).setAction(GENERATION_FOREGROUND_END),
-        ) != null
+        context.stopService(Intent(context, GenerationForegroundService::class.java))
       }.getOrDefault(false)
     }
 

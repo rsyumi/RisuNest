@@ -435,8 +435,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val postNotificationsPermissionLauncher = registerForActivityResult(
     ActivityResultContracts.RequestPermission(),
   ) {
-    // The peer-sync foreground service must run whether or not the permission is
-    // granted; denial only hides the Stop notification on Android 13+.
+    // Peer sync can proceed after denial. Generation keep-alive checks notification
+    // availability on each begin and declines to start until it is granted.
   }
   private val rendererRecoveryMarker by lazy {
     val preferences = getSharedPreferences(NATIVE_RESILIENCE_PREFERENCES, MODE_PRIVATE)
@@ -774,10 +774,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     sdkInt = Build.VERSION.SDK_INT,
   )
 
-  // Android 13+ suppresses the peer-sync foreground notification (the user's Stop
-  // affordance) unless POST_NOTIFICATIONS was requested at runtime. Request it at
-  // most once per process before the first foreground lane starts; the service
-  // itself never depends on the outcome.
+  // Android 13+ can hide foreground-service notifications unless POST_NOTIFICATIONS
+  // is granted. Request it at most once per process before peer sync or generation
+  // keep-alive starts. Peer sync proceeds without it, while generation keep-alive
+  // declines to start until notifications and its channel are available.
   private fun requestPostNotificationsForForegroundService() {
     requestPostNotificationsIfNeeded(
       gate = postNotificationsGate,
