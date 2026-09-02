@@ -1,6 +1,8 @@
 use super::lan::validate_lan_endpoint;
 #[cfg(desktop)]
-use super::shared_session::{SharedSourceEngines, SharedSourcePreparationContext};
+use super::shared_session::{
+    run_device_sync_rotate_link, SharedSourceEngines, SharedSourcePreparationContext,
+};
 use super::{
     device_registry::DevicePermissions,
     lan::{
@@ -1055,7 +1057,7 @@ fn invalid_fixed_url_records_only_the_safe_configuration_category() {
 }
 
 #[test]
-fn invalid_rotation_preserves_the_running_session_and_next_rotation_succeeds() {
+fn command_invalid_rotation_preserves_status_and_allows_corrected_rotation() {
     let (root, host) = host();
     let state = DeviceSyncSourceState::new_for_test(
         TransportPreparation {
@@ -1090,12 +1092,17 @@ fn invalid_rotation_preserves_the_running_session_and_next_rotation_succeeds() {
         .to_owned();
     let client = reqwest::blocking::Client::new();
 
-    assert!(state
-        .rotate_link(DeviceSyncLinkPermissions {
+    let invalid_result = tauri::async_runtime::block_on(run_device_sync_rotate_link(
+        state.clone(),
+        DeviceSyncLinkPermissions {
             read: false,
             bidirectional: false,
-        })
-        .is_err());
+        },
+    ));
+    assert_eq!(
+        invalid_result,
+        Err(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+    );
     let after_invalid = state.status().unwrap();
     assert_eq!(after_invalid.phase, DeviceSyncSourcePhase::Running);
     assert_eq!(after_invalid.endpoint, initial.endpoint);
@@ -1114,12 +1121,14 @@ fn invalid_rotation_preserves_the_running_session_and_next_rotation_succeeds() {
         reqwest::StatusCode::OK
     );
 
-    let rotated = state
-        .rotate_link(DeviceSyncLinkPermissions {
+    let rotated = tauri::async_runtime::block_on(run_device_sync_rotate_link(
+        state.clone(),
+        DeviceSyncLinkPermissions {
             read: true,
             bidirectional: true,
-        })
-        .unwrap();
+        },
+    ))
+    .unwrap();
 
     assert_eq!(rotated.phase, DeviceSyncSourcePhase::Running);
     assert_eq!(rotated.endpoint, initial.endpoint);
@@ -1135,6 +1144,38 @@ fn invalid_rotation_preserves_the_running_session_and_next_rotation_succeeds() {
         reqwest::StatusCode::OK
     );
     state.stop().unwrap();
+}
+
+#[test]
+fn command_fatal_rotation_failure_still_enters_error_state() {
+    let (_root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+
+    let result = tauri::async_runtime::block_on(run_device_sync_rotate_link(
+        state.clone(),
+        DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        },
+    ));
+
+    assert_eq!(
+        result,
+        Err(super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
+    );
+    let status = state.status().unwrap();
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(
+        status.latest_error,
+        Some(super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
+    );
+    assert_eq!(status.pairing_uri, None);
 }
 
 struct FailingSharedTunnelLauncher;

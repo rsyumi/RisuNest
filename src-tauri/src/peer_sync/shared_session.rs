@@ -1030,12 +1030,15 @@ fn device_sync_store_error(error: PeerSyncError) -> StoreError {
 }
 
 #[cfg(desktop)]
-fn device_sync_command_failure(
-    state: &DeviceSyncSourceState,
+fn device_sync_command_failure<P>(
+    state: &DeviceSyncSourceState<P>,
     operation: &str,
     fallback: DeviceSyncErrorCategory,
     error: impl std::fmt::Display,
-) -> DeviceSyncErrorCategory {
+) -> DeviceSyncErrorCategory
+where
+    P: SharedSourceOwnership<Host = SharedSessionHost>,
+{
     crate::nlog!("error", "device sync {operation} failed: {error}");
     let category = state
         .status()
@@ -1044,6 +1047,54 @@ fn device_sync_command_failure(
         .unwrap_or(fallback);
     state.record_error_category(category);
     category
+}
+
+#[cfg(desktop)]
+fn device_sync_rotate_link_failure<P>(
+    state: &DeviceSyncSourceState<P>,
+    error: PeerSyncError,
+) -> DeviceSyncErrorCategory
+where
+    P: SharedSourceOwnership<Host = SharedSessionHost>,
+{
+    crate::nlog!("error", "device sync link rotation failed: {error}");
+    let status = state.status().ok();
+    let category = status
+        .as_ref()
+        .and_then(|status| status.latest_error)
+        .unwrap_or(DeviceSyncErrorCategory::StateUnavailable);
+    let is_recoverable_configuration_error = category
+        == DeviceSyncErrorCategory::InvalidConfiguration
+        && status.as_ref().is_some_and(|status| {
+            status.phase == DeviceSyncSourcePhase::Running && status.pairing_uri.is_some()
+        });
+    if !is_recoverable_configuration_error {
+        state.record_error_category(category);
+    }
+    category
+}
+
+#[cfg(desktop)]
+pub(crate) async fn run_device_sync_rotate_link<P>(
+    state: DeviceSyncSourceState<P>,
+    permissions: DeviceSyncLinkPermissions,
+) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory>
+where
+    P: SharedSourceOwnership<Host = SharedSessionHost> + Send + 'static,
+{
+    state.clear_error_category();
+    let worker_state = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || worker_state.rotate_link(permissions)).await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(device_sync_rotate_link_failure(&state, error)),
+        Err(error) => Err(device_sync_command_failure(
+            &state,
+            "link rotation worker",
+            DeviceSyncErrorCategory::StateUnavailable,
+            error,
+        )),
+    }
 }
 
 #[cfg(desktop)]
@@ -1168,25 +1219,7 @@ pub async fn device_sync_rotate_link(
     state: State<'_, DeviceSyncSourceState>,
     permissions: DeviceSyncLinkPermissions,
 ) -> Result<DeviceSyncSourceStatus, DeviceSyncErrorCategory> {
-    let state = state.inner().clone();
-    state.clear_error_category();
-    let worker_state = state.clone();
-    match tauri::async_runtime::spawn_blocking(move || worker_state.rotate_link(permissions)).await
-    {
-        Ok(Ok(status)) => Ok(status),
-        Ok(Err(error)) => Err(device_sync_command_failure(
-            &state,
-            "link rotation",
-            DeviceSyncErrorCategory::StateUnavailable,
-            error,
-        )),
-        Err(error) => Err(device_sync_command_failure(
-            &state,
-            "link rotation worker",
-            DeviceSyncErrorCategory::StateUnavailable,
-            error,
-        )),
-    }
+    run_device_sync_rotate_link(state.inner().clone(), permissions).await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
