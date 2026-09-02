@@ -102,6 +102,13 @@ pub(crate) fn remove_incoming_source_if_inactive(
             "registered clone source is used by an active target".to_owned(),
         ));
     }
+    if super::bidirectional_commands::registered_bidirectional_source_is_active(
+        app_root, device_id,
+    )? {
+        return Err(super::PeerSyncError::Validation(
+            "registered bidirectional source is used by an active target".to_owned(),
+        ));
+    }
     #[cfg(target_os = "android")]
     if super::android_client::registered_clone_source_is_active(app_root, device_id)? {
         return Err(super::PeerSyncError::Validation(

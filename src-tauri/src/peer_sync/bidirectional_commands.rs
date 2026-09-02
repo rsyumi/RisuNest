@@ -14,12 +14,12 @@ use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase 
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
     lan::{
-        validate_p5_desktop_endpoint, LanBidirectionalBackupReceipt, LanBidirectionalControl,
-        LanBidirectionalGeneration, LanBidirectionalLogicalClient,
-        LanBidirectionalLogicalCredential, LanBidirectionalRegistrationRequest,
-        LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
-        LanBidirectionalSession, LanCloneHostControl, LanLogicalDeltaClient,
-        PreparedBidirectionalLogicalLanSession,
+        deliver_peer_completion, prepare_peer_logical_completion, validate_p5_desktop_endpoint,
+        LanBidirectionalBackupReceipt, LanBidirectionalControl, LanBidirectionalGeneration,
+        LanBidirectionalLogicalClient, LanBidirectionalLogicalCredential,
+        LanBidirectionalRegistrationRequest, LanBidirectionalRemoteApplyReceipt,
+        LanBidirectionalRemoteApplyRequest, LanBidirectionalSession, LanCloneHostControl,
+        LanLogicalDeltaClient, PreparedBidirectionalLogicalLanSession,
     },
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
     logical_delta_transfer::{
@@ -137,6 +137,15 @@ pub struct PeerBidirectionalCompletedResult {
     pub(crate) backups: Vec<PeerBidirectionalBackupReceipt>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PeerBidirectionalCompletionMode {
+    #[default]
+    Legacy,
+    Unsupported,
+    V1,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerBidirectionalOperationContext {
@@ -149,6 +158,10 @@ pub(crate) struct PeerBidirectionalOperationContext {
     pub(crate) previous_shared: SyncGenerationIdentity,
     pub(crate) previous_local: SyncGenerationIdentity,
     pub(crate) durable_job_id: String,
+    #[serde(default)]
+    pub(crate) completion_mode: PeerBidirectionalCompletionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completion_delivery: Option<super::device_registry::PendingCompletionDelivery>,
 }
 
 fn conservative_remote_backup_required() -> bool {
@@ -331,6 +344,11 @@ impl PeerBidirectionalDurableOperation {
         | Self::AwaitingConflict { context, .. }
         | Self::LocalCommitted { context, .. } = self
         {
+            if !valid_completion_context(context) {
+                return Err(PeerSyncError::Storage(
+                    "bidirectional operation has invalid completion evidence".to_owned(),
+                ));
+            }
             if !context.credential.endpoint.is_empty() {
                 validate_p5_desktop_endpoint(&context.credential.endpoint).map_err(|_| {
                     PeerSyncError::Storage(
@@ -498,6 +516,32 @@ impl PeerBidirectionalDurableOperation {
                 }
                 Some(PeerBidirectionalStatusOperation::Completed { result })
             }
+        }
+    }
+}
+
+fn valid_completion_context(context: &PeerBidirectionalOperationContext) -> bool {
+    match context.completion_mode {
+        PeerBidirectionalCompletionMode::Legacy | PeerBidirectionalCompletionMode::Unsupported => {
+            context.completion_delivery.is_none()
+        }
+        PeerBidirectionalCompletionMode::V1 => {
+            if super::device_registry::CompletionLeaseId::parse(&context.operation_id).is_err() {
+                return false;
+            }
+            context.completion_delivery.as_ref().is_none_or(|delivery| {
+                delivery.source_device_id == context.credential.source_device_id
+                    && delivery.lane
+                        == super::device_registry::CompletionLane::Bidirectional.as_str()
+                    && delivery.completion_lease_id == context.operation_id
+                    && delivery.manifest_id == context.credential.manifest_id
+                    && delivery.receipt_id
+                        == super::device_registry::completion_receipt_id(
+                            "bidirectional",
+                            &context.operation_id,
+                            &context.credential.manifest_id,
+                        )
+            })
         }
     }
 }
@@ -1880,6 +1924,8 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
         remote_manifest_bytes,
         remote_source,
         &NeverCancelled,
+        None,
+        PeerBidirectionalCompletionMode::Legacy,
     )
 }
 
@@ -1893,10 +1939,15 @@ fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource
     remote_manifest_bytes: &[u8],
     remote_source: &mut S,
     cancellation: &dyn CancellationProbe,
+    completion_operation_id: Option<String>,
+    completion_mode: PeerBidirectionalCompletionMode,
 ) -> Result<LocalMergeOutcome, PeerSyncError> {
     if cancellation.is_cancelled() {
         return Err(PeerSyncError::Cancelled);
     }
+    let source_lifecycle = (completion_mode != PeerBidirectionalCompletionMode::Legacy)
+        .then(super::registry_commands::lock_registered_source_lifecycle)
+        .transpose()?;
     let journal = PeerBidirectionalOperationJournal::new(app_root);
     if journal.load()?.is_some() {
         return Err(PeerSyncError::Validation(
@@ -1927,7 +1978,7 @@ fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource
     let previous = store
         .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, &credential.source_device_id)
         .map_err(store_error)?;
-    let operation_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = completion_operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let durable_job_id = operation_id.clone();
     let context = PeerBidirectionalOperationContext {
         operation_id: operation_id.clone(),
@@ -1943,7 +1994,14 @@ fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource
         previous_shared: previous.shared_identity,
         previous_local: previous.local_identity,
         durable_job_id,
+        completion_mode,
+        completion_delivery: None,
     };
+    if completion_mode != PeerBidirectionalCompletionMode::Legacy {
+        registered_bidirectional_completion_source(app_root, &context)?.ok_or_else(|| {
+            PeerSyncError::Validation("registered bidirectional source is missing".to_owned())
+        })?;
+    }
     let target = PersistentLogicalDeltaTarget::new_p5_deferred(
         store,
         cas,
@@ -1989,6 +2047,7 @@ fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource
                 ));
             }
             journal.store(&durable)?;
+            drop(source_lifecycle);
             let PeerBidirectionalDurableOperation::AwaitingConflict { context, .. } = &durable
             else {
                 unreachable!();
@@ -2052,6 +2111,7 @@ fn begin_bidirectional_local_merge_with_cancellation<S: LogicalDeltaObjectSource
                 ));
             }
             journal.store(&prepared)?;
+            drop(source_lifecycle);
             #[cfg(test)]
             if TARGET_AFTER_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.replace(false)) {
                 return Err(PeerSyncError::Storage(
@@ -3324,7 +3384,7 @@ fn complete_bidirectional_local_after_remote_apply(
         PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
     })?;
     let (
-        context,
+        mut context,
         committed_revision,
         shared_generation,
         changed,
@@ -3477,7 +3537,8 @@ fn complete_bidirectional_local_after_remote_apply(
         ));
     }
     let completed_revision = store.revision().map_err(store_error)?;
-    if let Some(backup) = remote.backup {
+    let retained_backups = backups.clone();
+    if let Some(backup) = remote.backup.clone() {
         backups.push(PeerBidirectionalBackupReceipt {
             package_id: backup.package_id,
             side: PeerBidirectionalBackupSide::Remote,
@@ -3505,8 +3566,26 @@ fn complete_bidirectional_local_after_remote_apply(
         remote_revision: remote.committed_revision,
         transferred_objects,
         transferred_bytes,
-        backups,
+        backups: backups.clone(),
     };
+    match context.completion_mode {
+        PeerBidirectionalCompletionMode::V1 => complete_v1_bidirectional_accounting(
+            app_root,
+            &journal,
+            &mut context,
+            committed_revision,
+            &shared_generation,
+            changed,
+            remote_backup_required,
+            &remote,
+            local_transferred_objects,
+            local_transferred_bytes,
+            &retained_backups,
+        )?,
+        PeerBidirectionalCompletionMode::Unsupported | PeerBidirectionalCompletionMode::Legacy => {
+            record_bidirectional_completion(app_root, &context, &result)?
+        }
+    }
     release_retained_target_job(
         app_root,
         &context.durable_job_id,
@@ -3518,20 +3597,172 @@ fn complete_bidirectional_local_after_remote_apply(
         source_binding: None,
         result: result.clone(),
     })?;
-    record_bidirectional_completion(app_root, &context.credential.source_device_id, &result);
     Ok(result)
 }
 
 fn record_bidirectional_completion(
     app_root: &Path,
-    source_device_id: &str,
+    context: &PeerBidirectionalOperationContext,
     result: &PeerBidirectionalCompletedResult,
-) {
-    super::device_registry::record_incoming_completed_operation_best_effort(
-        app_root,
-        source_device_id,
-        result.transferred_bytes,
+) -> Result<(), PeerSyncError> {
+    let Some(source) = registered_bidirectional_completion_source(app_root, context)? else {
+        return Ok(());
+    };
+    let receipt_id = super::device_registry::completion_receipt_id(
+        "bidirectional",
+        &result.operation_id,
+        &context.credential.manifest_id,
     );
+    super::device_registry::record_incoming_completed_operation_once_for_lane(
+        app_root,
+        &source.device_id,
+        super::device_registry::CompletionLane::Bidirectional,
+        &receipt_id,
+        result.transferred_bytes,
+    )
+}
+
+fn registered_bidirectional_completion_source(
+    app_root: &Path,
+    context: &PeerBidirectionalOperationContext,
+) -> Result<Option<super::device_registry::IncomingSource>, PeerSyncError> {
+    if context.completion_mode == PeerBidirectionalCompletionMode::Legacy {
+        return Ok(None);
+    }
+    let Some(source) = super::device_registry::incoming_source_by_id(
+        app_root,
+        &context.credential.source_device_id,
+    )?
+    else {
+        return Err(PeerSyncError::Validation(
+            "registered bidirectional source is missing".to_owned(),
+        ));
+    };
+    if source.bearer != context.credential.bearer || !source.permissions.allows_bidirectional() {
+        return Err(PeerSyncError::Validation(
+            "registered bidirectional source credential or permission changed".to_owned(),
+        ));
+    }
+    Ok(Some(source))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_v1_bidirectional_accounting(
+    app_root: &Path,
+    journal: &PeerBidirectionalOperationJournal,
+    context: &mut PeerBidirectionalOperationContext,
+    committed_revision: i64,
+    shared_generation: &SyncGenerationIdentity,
+    changed: bool,
+    remote_backup_required: bool,
+    remote: &LanBidirectionalRemoteApplyReceipt,
+    local_transferred_objects: u64,
+    local_transferred_bytes: u64,
+    backups: &[PeerBidirectionalBackupReceipt],
+) -> Result<(), PeerSyncError> {
+    let source =
+        registered_bidirectional_completion_source(app_root, context)?.ok_or_else(|| {
+            PeerSyncError::Validation("registered bidirectional V1 source is missing".to_owned())
+        })?;
+    let delivery = if let Some(delivery) = context.completion_delivery.clone() {
+        delivery
+    } else {
+        let hello = super::lan::authenticated_peer_hello_with_capabilities(
+            &source.endpoint,
+            &source.bearer,
+        )?;
+        if hello.completion != super::lan::PeerCompletionCapability::V1
+            || hello.hello.device_id != source.device_id
+            || !hello.hello.permissions.allows_bidirectional()
+        {
+            return Err(PeerSyncError::Validation(
+                "registered bidirectional source no longer advertises completion V1".to_owned(),
+            ));
+        }
+        let useful_bytes = prepare_peer_logical_completion(
+            &source.endpoint,
+            &source.bearer,
+            super::device_registry::CompletionLane::Bidirectional,
+            &context.operation_id,
+            &context.credential.manifest_id,
+        )?;
+        let delivery = super::device_registry::PendingCompletionDelivery {
+            source_device_id: source.device_id.clone(),
+            lane: super::device_registry::CompletionLane::Bidirectional
+                .as_str()
+                .to_owned(),
+            completion_lease_id: context.operation_id.clone(),
+            manifest_id: context.credential.manifest_id.clone(),
+            useful_bytes,
+            receipt_id: super::device_registry::completion_receipt_id(
+                "bidirectional",
+                &context.operation_id,
+                &context.credential.manifest_id,
+            ),
+        };
+        context.completion_delivery = Some(delivery.clone());
+        journal.store(&PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: context.clone(),
+            committed_revision,
+            shared_generation: shared_generation.clone(),
+            changed,
+            remote_backup_required,
+            remote_apply_receipt: Some(remote.clone()),
+            transferred_objects: local_transferred_objects,
+            transferred_bytes: local_transferred_bytes,
+            backups: backups.to_vec(),
+        })?;
+        delivery
+    };
+    let prepare =
+        super::device_registry::prepare_incoming_completion_delivery(app_root, delivery.clone())?;
+    if prepare == super::device_registry::CompletionDeliveryPrepareStatus::Pending {
+        let snapshot = super::device_registry::snapshot_incoming_completion_delivery(
+            app_root,
+            &source.device_id,
+            super::device_registry::CompletionLane::Bidirectional,
+        )?
+        .ok_or_else(|| {
+            PeerSyncError::Storage("bidirectional completion outbox disappeared".to_owned())
+        })?;
+        if snapshot.delivery != delivery
+            || snapshot.source.bearer != context.credential.bearer
+            || !snapshot.source.permissions.allows_bidirectional()
+        {
+            return Err(PeerSyncError::Validation(
+                "bidirectional completion outbox source changed".to_owned(),
+            ));
+        }
+        let hello = super::lan::authenticated_peer_hello_with_capabilities(
+            &snapshot.source.endpoint,
+            &snapshot.source.bearer,
+        )?;
+        if hello.completion != super::lan::PeerCompletionCapability::V1
+            || hello.hello.device_id != snapshot.source.device_id
+            || !hello.hello.permissions.allows_bidirectional()
+        {
+            return Err(PeerSyncError::Validation(
+                "registered bidirectional source no longer advertises completion V1".to_owned(),
+            ));
+        }
+        deliver_peer_completion(
+            &snapshot.source.endpoint,
+            &snapshot.source.bearer,
+            hello.completion,
+            super::device_registry::CompletionLane::Bidirectional,
+            &delivery.completion_lease_id,
+            &delivery.manifest_id,
+            delivery.useful_bytes,
+        )?;
+        super::device_registry::finalize_incoming_completion_delivery(app_root, &delivery)?;
+    }
+    if !super::device_registry::incoming_completion_is_durable(app_root, &delivery)? {
+        return Err(PeerSyncError::Storage(
+            "bidirectional completion receipt is not durable".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn retain_remote_apply_receipt(
@@ -3680,7 +3911,13 @@ where
                 committed_revision,
             });
         }
-        Err(PeerSyncError::ActivationConflict { .. } | PeerSyncError::StaleManifest { .. }) => {
+        Err(
+            error
+            @ (PeerSyncError::ActivationConflict { .. } | PeerSyncError::StaleManifest { .. }),
+        ) => {
+            if context.completion_mode == PeerBidirectionalCompletionMode::V1 {
+                return Err(error);
+            }
             journal.abandon(operation_id)?;
             return Ok(ResumeLocalCommittedOutcome::Stale {
                 operation_id: operation_id.to_owned(),
@@ -5463,6 +5700,13 @@ impl PeerBidirectionalCommandState {
                     )),
                 }
             }
+            PeerBidirectionalDurableOperation::TargetPrepared { context, .. }
+                if context.completion_mode == PeerBidirectionalCompletionMode::V1 =>
+            {
+                Err(PeerSyncError::Protocol(
+                    "bidirectional V1 completion must finish or be explicitly revoked".to_owned(),
+                ))
+            }
             PeerBidirectionalDurableOperation::TargetPrepared { .. } => {
                 journal.abandon(operation_id)
             }
@@ -5479,11 +5723,25 @@ impl PeerBidirectionalCommandState {
                 )?;
                 journal.acknowledge_completed(operation_id)
             }
+            PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
+                if context.completion_mode == PeerBidirectionalCompletionMode::V1 =>
+            {
+                Err(PeerSyncError::Protocol(
+                    "bidirectional V1 remote completion is not yet confirmed".to_owned(),
+                ))
+            }
             PeerBidirectionalDurableOperation::LocalCommitted { .. } => {
                 journal.abandon(operation_id)
             }
             PeerBidirectionalDurableOperation::Completed { .. } => {
                 journal.acknowledge_completed(operation_id)
+            }
+            PeerBidirectionalDurableOperation::AwaitingConflict { context, .. }
+                if context.completion_mode == PeerBidirectionalCompletionMode::V1 =>
+            {
+                Err(PeerSyncError::Protocol(
+                    "bidirectional V1 completion must finish or be explicitly revoked".to_owned(),
+                ))
             }
             PeerBidirectionalDurableOperation::AwaitingConflict { .. } => {
                 journal.abandon_awaiting_conflict(operation_id)
@@ -5816,6 +6074,9 @@ fn request_remote_apply_from_shared(
     shared_manifest_bytes: &[u8],
     backup_losing_side: bool,
 ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+    if context.completion_mode == PeerBidirectionalCompletionMode::V1 {
+        require_retained_v1_source(context, client)?;
+    }
     retry_reverse_tunnel_cleanup(&context.operation_id)?;
     let source = LogicalDeltaSourceSession::open(
         session_store,
@@ -5888,7 +6149,8 @@ fn request_remote_apply_from_shared(
         expected_source_generation: context.expected_remote_generation.clone(),
         expected_common_base_manifest_hash: context.previous_shared.manifest_hash.clone(),
         backup_losing_side,
-        completion_deferred_v1: None,
+        completion_deferred_v1: (context.completion_mode == PeerBidirectionalCompletionMode::V1)
+            .then_some(true),
     });
     let reverse_owner = reverse_tunnel.take().map(|tunnel| {
         ReverseTunnelCleanupOwner::Running(Box::new(tunnel) as Box<dyn ReverseTunnelProcess>)
@@ -5919,6 +6181,9 @@ fn request_remote_apply_from_shared(
     shared_manifest_bytes: &[u8],
     backup_losing_side: bool,
 ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+    if context.completion_mode == PeerBidirectionalCompletionMode::V1 {
+        require_retained_v1_source(context, client)?;
+    }
     let source = LogicalDeltaSourceSession::open(
         session_store,
         app_root,
@@ -5954,7 +6219,8 @@ fn request_remote_apply_from_shared(
         expected_source_generation: context.expected_remote_generation.clone(),
         expected_common_base_manifest_hash: context.previous_shared.manifest_hash.clone(),
         backup_losing_side,
-        completion_deferred_v1: None,
+        completion_deferred_v1: (context.completion_mode == PeerBidirectionalCompletionMode::V1)
+            .then_some(true),
     });
     finish_remote_apply_request(
         app_root,
@@ -6089,7 +6355,20 @@ fn recover_target_prepared_with_client(
     client: &mut LanBidirectionalLogicalClient,
     cancellation: &dyn CancellationProbe,
 ) -> Result<PeerBidirectionalSyncResult, PeerSyncError> {
-    let manifest = client.fetch_manifest()?;
+    let operation = PeerBidirectionalOperationJournal::new(app_root)
+        .load()?
+        .ok_or_else(|| {
+            PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
+        })?;
+    let PeerBidirectionalDurableOperation::TargetPrepared { context, .. } = &operation else {
+        return retained_result(&operation);
+    };
+    if context.operation_id != operation_id {
+        return Err(PeerSyncError::Validation(
+            "another bidirectional operation is retained".to_owned(),
+        ));
+    }
+    let manifest = fetch_retained_bidirectional_manifest(context, client)?;
     let replacement_credential = rebind_credential.then(|| client.credential());
     resume_bidirectional_target_prepared_with_cancellation(
         store,
@@ -6119,6 +6398,47 @@ fn recover_target_prepared_with_client(
         committed_revision,
         Some(client),
     )
+}
+
+fn fetch_retained_bidirectional_manifest(
+    context: &PeerBidirectionalOperationContext,
+    client: &LanBidirectionalLogicalClient,
+) -> Result<Vec<u8>, PeerSyncError> {
+    if client.source_device_id() != context.credential.source_device_id
+        || client.device_id() != context.credential.device_id
+    {
+        return Err(PeerSyncError::Validation(
+            "fresh bidirectional source differs from the retained operation".to_owned(),
+        ));
+    }
+    if context.completion_mode != PeerBidirectionalCompletionMode::V1 {
+        return client.fetch_manifest();
+    }
+    require_retained_v1_source(context, client)?;
+    let lease = super::device_registry::CompletionLeaseId::parse(&context.operation_id)?;
+    let response = client.fetch_manifest_with_completion_lease(Some(&lease))?;
+    if response.completion_lease_id.as_ref() != Some(&lease) {
+        return Err(PeerSyncError::Protocol(
+            "registered bidirectional source changed the retained completion lease".to_owned(),
+        ));
+    }
+    Ok(response.bytes)
+}
+
+fn require_retained_v1_source(
+    context: &PeerBidirectionalOperationContext,
+    client: &LanBidirectionalLogicalClient,
+) -> Result<(), PeerSyncError> {
+    let observed = client.hello_with_capabilities()?;
+    if observed.completion != super::lan::PeerCompletionCapability::V1
+        || observed.hello.device_id != context.credential.source_device_id
+        || !observed.hello.permissions.allows_bidirectional()
+    {
+        return Err(PeerSyncError::Validation(
+            "registered bidirectional source no longer advertises completion V1".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn retained_allows_source_prepare(
@@ -6581,19 +6901,21 @@ async fn peer_bidirectional_sync_with_factory<
                             "fresh bidirectional source belongs to another device".to_owned()
                         );
                     }
-                    let manifest = client.fetch_manifest().map_err(|error| {
-                        bidirectional_peer_operation_failure(
-                            "bidirectional manifest",
-                            error,
-                            registered,
-                        )
-                    })?;
-                    let decoded =
-                        decode_logical_manifest(&manifest).map_err(|error| error.to_string())?;
-                    if decoded.library_id != context.library_id {
-                        return Err(
-                            "fresh bidirectional source belongs to another library".to_owned()
-                        );
+                    if context.completion_mode != PeerBidirectionalCompletionMode::V1 {
+                        let manifest = client.fetch_manifest().map_err(|error| {
+                            bidirectional_peer_operation_failure(
+                                "bidirectional manifest",
+                                error,
+                                registered,
+                            )
+                        })?;
+                        let decoded = decode_logical_manifest(&manifest)
+                            .map_err(|error| error.to_string())?;
+                        if decoded.library_id != context.library_id {
+                            return Err(
+                                "fresh bidirectional source belongs to another library".to_owned()
+                            );
+                        }
                     }
                     let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
                     return run_retained_remote_completion(
@@ -6625,13 +6947,14 @@ async fn peer_bidirectional_sync_with_factory<
                             registered,
                         )
                     })?;
-                    let manifest_bytes = client.fetch_manifest().map_err(|error| {
-                        bidirectional_peer_operation_failure(
-                            "bidirectional manifest",
-                            error,
-                            registered,
-                        )
-                    })?;
+                    let manifest_bytes = fetch_retained_bidirectional_manifest(context, &client)
+                        .map_err(|error| {
+                            bidirectional_peer_operation_failure(
+                                "bidirectional manifest",
+                                error,
+                                registered,
+                            )
+                        })?;
                     let manifest = decode_logical_manifest(&manifest_bytes)
                         .map_err(|error| error.to_string())?;
                     let remote_revision =
@@ -6668,9 +6991,62 @@ async fn peer_bidirectional_sync_with_factory<
         let mut client = client_factory(&root, &local_device_id).map_err(|error| {
             bidirectional_peer_operation_failure("bidirectional client", error, registered)
         })?;
-        let remote_manifest_bytes = client.fetch_manifest().map_err(|error| {
-            bidirectional_peer_operation_failure("bidirectional manifest", error, registered)
-        })?;
+        let completion_capability = if registered {
+            let observed = client.hello_with_capabilities().map_err(|error| {
+                bidirectional_peer_operation_failure(
+                    "bidirectional capabilities",
+                    error,
+                    registered,
+                )
+            })?;
+            if observed.hello.device_id != client.source_device_id()
+                || !observed.hello.permissions.allows_bidirectional()
+            {
+                return Err(
+                    "registered bidirectional source identity or permission changed".to_owned(),
+                );
+            }
+            observed.completion
+        } else {
+            super::lan::PeerCompletionCapability::Unsupported
+        };
+        let (remote_manifest_bytes, completion_operation_id, completion_mode) =
+            if registered && completion_capability == super::lan::PeerCompletionCapability::V1 {
+                let completion =
+                    client
+                        .fetch_manifest_with_completion_lease(None)
+                        .map_err(|error| {
+                            bidirectional_peer_operation_failure(
+                                "bidirectional completion manifest",
+                                error,
+                                registered,
+                            )
+                        })?;
+                let lease = completion.completion_lease_id.ok_or_else(|| {
+                    "registered bidirectional V1 source omitted completion lease".to_owned()
+                })?;
+                (
+                    completion.bytes,
+                    Some(lease.as_str().to_owned()),
+                    PeerBidirectionalCompletionMode::V1,
+                )
+            } else {
+                (
+                    client.fetch_manifest().map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional manifest",
+                            error,
+                            registered,
+                        )
+                    })?,
+                    None,
+                    if registered {
+                        PeerBidirectionalCompletionMode::Unsupported
+                    } else {
+                        PeerBidirectionalCompletionMode::Legacy
+                    },
+                )
+            };
         let remote_manifest =
             decode_logical_manifest(&remote_manifest_bytes).map_err(|error| error.to_string())?;
         let remote_revision = i64::try_from(remote_manifest.source_revision)
@@ -6708,6 +7084,8 @@ async fn peer_bidirectional_sync_with_factory<
             &remote_manifest_bytes,
             &mut client,
             &cancellation,
+            completion_operation_id,
+            completion_mode,
         )
         .map_err(|error| {
             bidirectional_peer_operation_failure("bidirectional local merge", error, registered)
@@ -6805,15 +7183,14 @@ pub async fn peer_bidirectional_resolve(
         if operation.operation_id() != operation_id {
             return Err("another bidirectional operation is retained".to_owned());
         }
-        let credential = match operation {
-            PeerBidirectionalDurableOperation::AwaitingConflict { context, .. } => {
-                context.credential
-            }
+        let context = match &operation {
+            PeerBidirectionalDurableOperation::AwaitingConflict { context, .. } => context.clone(),
             operation => return retained_result(&operation).map_err(|error| error.to_string()),
         };
-        let mut client =
-            LanBidirectionalLogicalClient::resume(credential).map_err(|error| error.to_string())?;
-        let remote_manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
+        let mut client = LanBidirectionalLogicalClient::resume(context.credential.clone())
+            .map_err(|error| error.to_string())?;
+        let remote_manifest = fetch_retained_bidirectional_manifest(&context, &client)
+            .map_err(|error| error.to_string())?;
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
         let outcome = resolve_bidirectional_conflict_with_cancellation(
             &mut store,
@@ -7018,9 +7395,10 @@ async fn peer_bidirectional_resolve_with_factory<
         let mut client = client_factory(&root, &local_device_id).map_err(|error| {
             bidirectional_peer_operation_failure("bidirectional client", error, registered)
         })?;
-        let remote_manifest = client.fetch_manifest().map_err(|error| {
-            bidirectional_peer_operation_failure("bidirectional manifest", error, registered)
-        })?;
+        let remote_manifest =
+            fetch_retained_bidirectional_manifest(context, &client).map_err(|error| {
+                bidirectional_peer_operation_failure("bidirectional manifest", error, registered)
+            })?;
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
         let outcome = resolve_awaiting_conflict_with_fresh_source_and_cancellation(
             &mut store,
@@ -7216,6 +7594,20 @@ fn store_error(error: crate::persistent_store::StoreError) -> PeerSyncError {
 
 pub(crate) struct PeerBidirectionalOperationJournal {
     root: PathBuf,
+}
+
+pub(crate) fn registered_bidirectional_source_is_active(
+    app_root: &Path,
+    source_device_id: &str,
+) -> Result<bool, PeerSyncError> {
+    Ok(matches!(
+        PeerBidirectionalOperationJournal::new(app_root).load()?,
+        Some(
+            PeerBidirectionalDurableOperation::TargetPrepared { context, .. }
+            | PeerBidirectionalDurableOperation::AwaitingConflict { context, .. }
+            | PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
+        ) if context.credential.source_device_id == source_device_id
+    ))
 }
 
 enum AcknowledgeOperationLoad {
@@ -7533,7 +7925,8 @@ impl PeerBidirectionalOperationJournal {
             PeerBidirectionalDurableOperation::TargetPrepared { context, .. }
             | PeerBidirectionalDurableOperation::AwaitingConflict { context, .. }
             | PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
-                if context.credential.endpoint.starts_with("https://") =>
+                if context.completion_mode == PeerBidirectionalCompletionMode::Legacy
+                    && context.credential.endpoint.starts_with("https://") =>
             {
                 context.credential.endpoint.clear();
                 context.credential.session_id.clear();

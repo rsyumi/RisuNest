@@ -405,6 +405,8 @@ fn context(operation_id: &str) -> PeerBidirectionalOperationContext {
         previous_shared: previous.clone(),
         previous_local: previous,
         durable_job_id: "123e4567-e89b-42d3-a456-426614174003".to_owned(),
+        completion_mode: PeerBidirectionalCompletionMode::Legacy,
+        completion_delivery: None,
     }
 }
 
@@ -417,7 +419,7 @@ fn register_bidirectional_accounting_source(root: &Path, total_bytes: u64, last_
             device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
             name: "bidirectional source".to_owned(),
             endpoint: "http://192.168.0.98:32146".to_owned(),
-            bearer: "a".repeat(64),
+            bearer: "c".repeat(64),
             permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
             last_seen_ms,
             total_bytes,
@@ -1831,6 +1833,8 @@ fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable
             &remote.manifest_bytes,
             &mut source,
             &before_journal,
+            None,
+            PeerBidirectionalCompletionMode::Legacy,
         ),
         Err(PeerSyncError::Cancelled),
     );
@@ -1856,6 +1860,8 @@ fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable
             &remote.manifest_bytes,
             &mut source,
             &after_prepared,
+            None,
+            PeerBidirectionalCompletionMode::Legacy,
         ),
         Err(PeerSyncError::Cancelled),
     );
@@ -2030,14 +2036,33 @@ fn bidirectional_durable_completion_accounts_once_and_retained_retry_does_not() 
     PeerBidirectionalOperationJournal::new(directory.path())
         .store(&completed)
         .unwrap();
-    record_bidirectional_completion(
-        directory.path(),
-        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
-        &result,
-    );
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::Unsupported;
+    record_bidirectional_completion(directory.path(), &retained_context, &result).unwrap();
     let after_completed = bidirectional_accounting_source(directory.path());
     assert_eq!(after_completed.total_bytes, 67);
     assert!(after_completed.last_seen_ms > 7);
+    let receipt_id = super::super::device_registry::completion_receipt_id(
+        "bidirectional",
+        operation_id,
+        &retained_context.credential.manifest_id,
+    );
+    assert!(
+        super::super::device_registry::incoming_completed_operation_recorded_for_lane(
+            directory.path(),
+            BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+            super::super::device_registry::CompletionLane::Bidirectional,
+            &receipt_id,
+        )
+        .unwrap()
+    );
+
+    record_bidirectional_completion(directory.path(), &retained_context, &result).unwrap();
+    assert_eq!(
+        bidirectional_accounting_source(directory.path()).total_bytes,
+        after_completed.total_bytes,
+        "a retained retry must reuse the deterministic bidirectional receipt"
+    );
 
     assert!(matches!(
         retained_result(&completed).unwrap(),
@@ -2048,8 +2073,220 @@ fn bidirectional_durable_completion_accounts_once_and_retained_retry_does_not() 
         PeerBidirectionalSyncResult::Updated { .. }
     ));
     assert_eq!(
-        bidirectional_accounting_source(directory.path()),
-        after_completed
+        bidirectional_accounting_source(directory.path()).total_bytes,
+        after_completed.total_bytes
+    );
+}
+
+#[test]
+fn migrated_legacy_completion_does_not_create_new_accounting() {
+    let directory = tempfile::tempdir().unwrap();
+    register_bidirectional_accounting_source(directory.path(), 40, 7);
+    let operation_id = "123e4567-e89b-42d3-a456-426614174093";
+    let result = PeerBidirectionalCompletedResult {
+        kind: "updated".to_owned(),
+        operation_id: operation_id.to_owned(),
+        revision: 8,
+        remote_revision: 4,
+        transferred_objects: 1,
+        transferred_bytes: 27,
+        backups: vec![],
+    };
+
+    record_bidirectional_completion(directory.path(), &context(operation_id), &result).unwrap();
+
+    assert_eq!(
+        bidirectional_accounting_source(directory.path()).total_bytes,
+        40
+    );
+}
+
+#[test]
+fn registered_source_removal_waits_for_the_bidirectional_target_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    register_bidirectional_accounting_source(directory.path(), 0, 7);
+    let operation_id = "123e4567-e89b-42d3-a456-426614174094";
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::Unsupported;
+    retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+    retained_context.expected_remote_generation.manifest_hash =
+        retained_context.credential.manifest_id.clone();
+    let journal = PeerBidirectionalOperationJournal::new(directory.path());
+    journal
+        .store(&PeerBidirectionalDurableOperation::TargetPrepared {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: retained_context,
+            local_generation: generation("local", "1", 'e'),
+            conflict_policy: TargetPreparedConflictPolicy::Reject,
+            changed: false,
+            remote_backup_required: false,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        })
+        .unwrap();
+
+    assert!(
+        super::super::registry_commands::remove_incoming_source_if_inactive(
+            directory.path(),
+            BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+        )
+        .is_err()
+    );
+    assert!(super::super::device_registry::incoming_source_by_id(
+        directory.path(),
+        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+    )
+    .unwrap()
+    .is_some());
+
+    journal
+        .store(&PeerBidirectionalDurableOperation::Completed {
+            schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: None,
+            source_binding: None,
+            result: PeerBidirectionalCompletedResult {
+                kind: "noChanges".to_owned(),
+                operation_id: operation_id.to_owned(),
+                revision: 0,
+                remote_revision: 0,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups: vec![],
+            },
+        })
+        .unwrap();
+    super::super::registry_commands::remove_incoming_source_if_inactive(
+        directory.path(),
+        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+    )
+    .unwrap();
+}
+
+#[test]
+fn v1_local_commit_persists_the_exact_pending_completion_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let operation_id = "123e4567-e89b-42d3-a456-426614174097";
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::V1;
+    let delivery = super::super::device_registry::PendingCompletionDelivery {
+        source_device_id: retained_context.credential.source_device_id.clone(),
+        lane: "bidirectional".to_owned(),
+        completion_lease_id: operation_id.to_owned(),
+        manifest_id: retained_context.credential.manifest_id.clone(),
+        useful_bytes: 0,
+        receipt_id: super::super::device_registry::completion_receipt_id(
+            "bidirectional",
+            operation_id,
+            &retained_context.credential.manifest_id,
+        ),
+    };
+    retained_context.completion_delivery = Some(delivery.clone());
+    let operation = PeerBidirectionalDurableOperation::LocalCommitted {
+        schema: OPERATION_SCHEMA.to_owned(),
+        context: retained_context,
+        committed_revision: 8,
+        shared_generation: generation("shared-zero", "3", 'e'),
+        changed: false,
+        remote_backup_required: false,
+        remote_apply_receipt: Some(LanBidirectionalRemoteApplyReceipt {
+            committed_revision: 7,
+            committed_generation: LanBidirectionalGeneration {
+                generation_id: "shared-zero".to_owned(),
+                manifest_hash: "e".repeat(64),
+                generation_sequence: "3".to_owned(),
+            },
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backup: None,
+        }),
+        transferred_objects: 0,
+        transferred_bytes: 0,
+        backups: vec![],
+    };
+
+    let journal = PeerBidirectionalOperationJournal::new(directory.path());
+    journal.store(&operation).unwrap();
+    let Some(PeerBidirectionalDurableOperation::LocalCommitted { context, .. }) =
+        journal.load().unwrap()
+    else {
+        panic!("expected retained V1 local commit");
+    };
+    assert_eq!(context.completion_mode, PeerBidirectionalCompletionMode::V1);
+    assert_eq!(context.completion_delivery, Some(delivery));
+}
+
+#[test]
+fn v1_zero_byte_completion_retains_a_target_receipt_without_changing_its_total() {
+    let directory = tempfile::tempdir().unwrap();
+    register_bidirectional_accounting_source(directory.path(), 0, 7);
+    let operation_id = "123e4567-e89b-42d3-a456-426614174095";
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::V1;
+    let delivery = super::super::device_registry::PendingCompletionDelivery {
+        source_device_id: retained_context.credential.source_device_id.clone(),
+        lane: "bidirectional".to_owned(),
+        completion_lease_id: operation_id.to_owned(),
+        manifest_id: retained_context.credential.manifest_id.clone(),
+        useful_bytes: 0,
+        receipt_id: super::super::device_registry::completion_receipt_id(
+            "bidirectional",
+            operation_id,
+            &retained_context.credential.manifest_id,
+        ),
+    };
+    retained_context.completion_delivery = Some(delivery.clone());
+    assert_eq!(
+        super::super::device_registry::prepare_incoming_completion_delivery(
+            directory.path(),
+            delivery.clone(),
+        )
+        .unwrap(),
+        super::super::device_registry::CompletionDeliveryPrepareStatus::Pending,
+    );
+    super::super::device_registry::finalize_incoming_completion_delivery(
+        directory.path(),
+        &delivery,
+    )
+    .unwrap();
+    let remote = LanBidirectionalRemoteApplyReceipt {
+        committed_revision: 7,
+        committed_generation: LanBidirectionalGeneration {
+            generation_id: "shared-zero".to_owned(),
+            manifest_hash: "e".repeat(64),
+            generation_sequence: "3".to_owned(),
+        },
+        transferred_objects: 0,
+        transferred_bytes: 0,
+        backup: None,
+    };
+    complete_v1_bidirectional_accounting(
+        directory.path(),
+        &PeerBidirectionalOperationJournal::new(directory.path()),
+        &mut retained_context,
+        8,
+        &generation("shared-zero", "3", 'e'),
+        false,
+        false,
+        &remote,
+        0,
+        0,
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        bidirectional_accounting_source(directory.path()).total_bytes,
+        0
+    );
+    assert!(
+        super::super::device_registry::incoming_completed_operation_recorded_for_lane(
+            directory.path(),
+            BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+            super::super::device_registry::CompletionLane::Bidirectional,
+            &delivery.receipt_id,
+        )
+        .unwrap()
     );
 }
 
@@ -2077,11 +2314,9 @@ fn bidirectional_completion_accounting_overflow_preserves_the_terminal_journal()
         .unwrap();
     let before = std::fs::read(directory.path().join("peer-sync/sources.json")).unwrap();
 
-    record_bidirectional_completion(
-        directory.path(),
-        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
-        &result,
-    );
+    let mut retained_context = context(&result.operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::Unsupported;
+    assert!(record_bidirectional_completion(directory.path(), &retained_context, &result).is_err());
 
     assert_eq!(
         retained_result(
@@ -3404,7 +3639,7 @@ fn source_unavailable_preserves_local_committed_operation() {
             committed_revision: 0,
         }
     );
-    assert_eq!(journal.load().unwrap(), Some(retained));
+    assert_eq!(journal.load().unwrap(), Some(retained.clone()));
     assert_eq!(
         reopened
             .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
@@ -3436,6 +3671,28 @@ fn source_unavailable_preserves_local_committed_operation() {
         }
     );
     assert!(journal.load().unwrap().is_none());
+
+    let mut v1_retained = retained;
+    let PeerBidirectionalDurableOperation::LocalCommitted { context, .. } = &mut v1_retained else {
+        unreachable!();
+    };
+    context.completion_mode = PeerBidirectionalCompletionMode::V1;
+    journal.store(&v1_retained).unwrap();
+    let error = resume_bidirectional_local_committed_with_remote(
+        &mut reopened,
+        &cas,
+        directory.path(),
+        operation_id,
+        |_context, _revision, _shared, _manifest, _backup_required| {
+            Err(PeerSyncError::ActivationConflict {
+                expected: None,
+                actual: None,
+            })
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, PeerSyncError::ActivationConflict { .. }));
+    assert_eq!(journal.load().unwrap(), Some(v1_retained));
 }
 
 #[test]
@@ -3952,6 +4209,39 @@ fn acknowledge_abandons_local_commit_and_allows_a_new_authenticated_target() {
     );
     attach_local_device_at_existing_base(&mut store, peer_id, 1).unwrap();
     assert!(state.begin_target().is_ok());
+}
+
+#[test]
+fn acknowledge_preserves_v1_local_commit_until_remote_completion_is_confirmed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let operation_id = "123e4567-e89b-42d3-a456-426614174096";
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::V1;
+    let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+        schema: OPERATION_SCHEMA.to_owned(),
+        context: retained_context,
+        committed_revision: 0,
+        shared_generation: generation("shared-v1", "1", 'e'),
+        changed: false,
+        remote_backup_required: false,
+        remote_apply_receipt: None,
+        transferred_objects: 0,
+        transferred_bytes: 0,
+        backups: vec![],
+    };
+    let journal = PeerBidirectionalOperationJournal::new(directory.path());
+    journal.store(&retained).unwrap();
+
+    assert!(matches!(
+        PeerBidirectionalCommandState::default().acknowledge(
+            directory.path(),
+            &mut store,
+            operation_id,
+        ),
+        Err(PeerSyncError::Protocol(_))
+    ));
+    assert_eq!(journal.load().unwrap(), Some(retained));
 }
 
 #[test]
@@ -7706,6 +7996,8 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
                 previous_shared: common,
                 previous_local: target_previous.local_identity,
                 durable_job_id: durable_job_id.to_owned(),
+                completion_mode: PeerBidirectionalCompletionMode::Legacy,
+                completion_delivery: None,
             },
             committed_revision: target_revision,
             shared_generation: shared.clone(),

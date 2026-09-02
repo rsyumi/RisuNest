@@ -2786,21 +2786,6 @@ fn bidirectional_remote_apply(
                     }
                     Err(_) => return respond_empty(stream, 500),
                 }
-            } else {
-                if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
-                    let receipt_id = completion_receipt_id("bidirectional", &operation_id, "");
-                    if record_outgoing_completed_operation(
-                        &registration.app_root,
-                        &device.device_id,
-                        "bidirectional",
-                        &receipt_id,
-                        receipt.transferred_bytes,
-                    )
-                    .is_err()
-                    {
-                        return respond_empty(stream, 500);
-                    }
-                }
             }
             respond_json(stream, 200, &receipt)
         }
@@ -5605,7 +5590,8 @@ mod timeout_tests {
     }
 
     #[test]
-    fn v2_bidirectional_terminal_receipt_counts_an_operation_once_after_retry() {
+    fn v2_bidirectional_legacy_remote_apply_preserves_http_compatibility_without_early_accounting()
+    {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5660,7 +5646,7 @@ mod timeout_tests {
         client.request_remote_apply(request).unwrap();
 
         let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
-        assert_eq!(registry.devices()[0].total_bytes, 17);
+        assert_eq!(registry.devices()[0].total_bytes, 0);
         assert!(registry.devices()[0].last_seen_ms > 0);
         host.stop().unwrap();
     }
@@ -6079,6 +6065,94 @@ mod timeout_tests {
                 .devices()[0]
                 .total_bytes,
             17
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn v2_zero_byte_bidirectional_completion_retains_the_source_receipt() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000112",
+                &source_device_id,
+                Arc::clone(&control),
+            ));
+        host.enable_v2_registry(
+            source_root.path(),
+            "Windows",
+            DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        client
+            .request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: lease.as_str().to_owned(),
+                source_endpoint: endpoint,
+                source_session_id: pairing.session_id,
+                source_manifest_id: pairing.manifest_id.clone(),
+                source_claim: pairing.claim,
+                expected_source_revision: 0,
+                expected_source_generation: LanBidirectionalGeneration {
+                    generation_id: "generation-1".to_owned(),
+                    manifest_hash: pairing.manifest_id.clone(),
+                    generation_sequence: "1".to_owned(),
+                },
+                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
+                backup_losing_side: false,
+                completion_deferred_v1: Some(true),
+            })
+            .unwrap();
+        assert_eq!(
+            client
+                .prepare_bidirectional_completion(lease.as_str())
+                .unwrap(),
+            0
+        );
+        let capability = client.hello_with_capabilities().unwrap().completion;
+        client
+            .deliver_completion(capability, lease.as_str(), 0)
+            .unwrap();
+
+        assert_eq!(
+            OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            0
+        );
+        assert!(
+            super::super::device_registry::outgoing_completion_receipt_matches(
+                source_root.path(),
+                &client.inner.device_id,
+                CompletionLane::Bidirectional,
+                lease.as_str(),
+                &pairing.manifest_id,
+                0,
+            )
+            .unwrap()
         );
         host.stop().unwrap();
     }
