@@ -17,15 +17,6 @@ const database = vi.hoisted(() => ({
     characters: [{ chaId: 'char-a', name: 'Aster', chats: [{ id: 'chat-a', name: 'First meeting' }] }],
 }))
 const qrCode = vi.hoisted(() => ({ toDataURL: vi.fn<(uri: string) => Promise<string>>() }))
-const deepLinks = vi.hoisted(() => {
-    let listener: ((uri: string) => void) | undefined
-    const unsubscribe = vi.fn(() => { listener = undefined })
-    return {
-        subscribe: vi.fn((next: (uri: string) => void) => { listener = next; return unsubscribe }),
-        unsubscribe,
-        emit: (uri: string) => listener?.(uri),
-    }
-})
 const controllerState = vi.hoisted(() => {
     let listener: ((snapshot: unknown) => void) | undefined
     const controller = {
@@ -34,7 +25,7 @@ const controllerState = vi.hoisted(() => {
         revokeIncoming: vi.fn(async () => undefined), revokeOutgoing: vi.fn(async () => undefined), stageLink: vi.fn(), claimStagedClone: vi.fn(async () => undefined), selectRegisteredClone: vi.fn(async () => undefined),
         confirmCloneReplace: vi.fn(async () => undefined), downloadClone: vi.fn(async () => undefined), resumeClone: vi.fn(async () => undefined), cancelClone: vi.fn(async () => undefined),
         pullStagedDelta: vi.fn(async () => undefined), pullRegisteredDelta: vi.fn(async () => undefined), syncStagedBidirectional: vi.fn(async () => undefined), syncRegisteredBidirectional: vi.fn(async () => undefined),
-        resolveRegisteredBidirectional: vi.fn(async () => undefined), resumeBidirectional: vi.fn(async () => undefined), acknowledgeBidirectional: vi.fn(async () => undefined), abandonBidirectional: vi.fn(async () => undefined),
+        resolveRegisteredBidirectional: vi.fn(async () => undefined), resumeBidirectional: vi.fn(async () => undefined), rehostBidirectionalSource: vi.fn(async () => undefined), acknowledgeBidirectional: vi.fn(async () => undefined), abandonBidirectional: vi.fn(async () => undefined),
     }
     return { controller, emit: (snapshot: unknown) => listener?.(snapshot) }
 })
@@ -46,7 +37,6 @@ vi.mock('src/ts/storage/deviceSettings', () => ({
     updateDeviceSettings: (partial: Record<string, unknown>) => Object.assign(settingsState.value, partial),
 }))
 vi.mock('src/ts/storage/sync/deviceSyncProduction', () => ({ getProductionDeviceSyncController: () => controllerState.controller }))
-vi.mock('src/ts/storage/sync/peerCloneDeepLink', () => ({ subscribeDeviceSyncUri: deepLinks.subscribe }))
 vi.mock('src/ts/storage/sync/peerSyncShared', () => ({ androidPeerSyncNotificationsEnabled: () => environment.notifications }))
 vi.mock('src/ts/storage/database.svelte', () => ({ getDatabase: () => database }))
 vi.mock('src/lang', async () => {
@@ -66,7 +56,7 @@ const deltaBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, tunne
 const bidiBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '', operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false, sourceError: null, operationError: null }
 
 function snapshot(partial: Partial<DeviceSyncControllerSnapshot> = {}): DeviceSyncControllerSnapshot {
-    return { source: { phase: 'idle' }, sources: [], devices: [], error: null, stagedLink: null, stagedSourceDeviceId: null, activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null, expiredSourceIds: [], targets: { clone: cloneBase, delta: deltaBase, bidirectional: bidiBase }, ...partial }
+    return { source: { phase: 'idle' }, sources: [], devices: [], error: null, sourceError: null, workError: null, stagedLink: null, stagedUri: null, stagedSourceDeviceId: null, activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null, expiredSourceIds: [], targets: { clone: cloneBase, delta: deltaBase, bidirectional: bidiBase }, ...partial }
 }
 
 describe('DeviceSyncSettings', () => {
@@ -207,25 +197,50 @@ describe('DeviceSyncSettings', () => {
         select.value = 'in-a'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
         expect(controllerState.controller.selectRegisteredClone).not.toHaveBeenCalled()
         const removeButtons = [...target.querySelectorAll<HTMLButtonElement>('button')].filter((candidate) => candidate.textContent?.trim() === 'Remove')
+        expect(removeButtons.map((candidate) => candidate.getAttribute('aria-label'))).toEqual([
+            'Remove: Outgoing, Devices that copy from this device',
+            'Remove: Incoming, Devices this device copies from',
+        ])
         removeButtons[0].click(); await vi.waitFor(() => expect(controllerState.controller.revokeOutgoing).toHaveBeenCalledWith('out-a'))
         removeButtons[1].click(); await vi.waitFor(() => expect(controllerState.controller.revokeIncoming).toHaveBeenCalledWith('in-a'))
         expect(target.textContent).toContain('2.0 KiB total')
         expect(target.querySelectorAll('[data-device-icon]')).toHaveLength(2)
     })
 
-    it('switches to a newly received registration link and fills the mounted input', async () => {
+    it('shows a pending registration link that the controller consumed before page mount', async () => {
         const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
-        await render(snapshot({ sources: [{ deviceId: 'source-a', name: 'Source A', permissions: ['read'] }] }))
-        const select = target.querySelector<HTMLSelectElement>('#device-sync-target')!
-        select.value = 'source-a'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+        await render(snapshot({ stagedUri: uri, stagedLink: { endpoint: 'http://127.0.0.1:32145', sessionId: 'session', manifestId: 'a'.repeat(64), claim: 'b'.repeat(64) } }))
 
-        deepLinks.emit(uri)
-        await tick()
-
-        expect(select.value).toBe('new-link')
+        expect(target.querySelector<HTMLSelectElement>('#device-sync-target')?.value).toBe('new-link')
         expect(target.querySelector<HTMLInputElement>('#device-sync-link')?.value).toBe(uri)
-        await unmount(mounted!); mounted = undefined
-        expect(deepLinks.unsubscribe).toHaveBeenCalledOnce()
+        expect(controllerState.controller.stageLink).not.toHaveBeenCalled()
+    })
+
+    it('updates the mounted input from controller-owned links and stages only a genuine manual replacement', async () => {
+        const pending = 'risuailocal://peer-clone/v2?pending'
+        const replacement = 'risuailocal://peer-clone/v2?replacement'
+        await render(snapshot())
+
+        controllerState.emit(snapshot({ stagedUri: pending }))
+        await tick()
+        expect(target.querySelector<HTMLInputElement>('#device-sync-link')?.value).toBe(pending)
+
+        const link = target.querySelector<HTMLInputElement>('#device-sync-link')!
+        link.value = replacement
+        link.dispatchEvent(new Event('input', { bubbles: true }))
+        button('Get changes only')!.click()
+
+        await vi.waitFor(() => expect(controllerState.controller.pullStagedDelta).toHaveBeenCalledOnce())
+        expect(controllerState.controller.stageLink).toHaveBeenCalledExactlyOnceWith(replacement)
+    })
+
+    it('retries a failed post-claim receive without replacing the retained source', async () => {
+        await render(snapshot({ stagedSourceDeviceId: 'source-a' }))
+
+        button('Get changes only')!.click()
+
+        await vi.waitFor(() => expect(controllerState.controller.pullStagedDelta).toHaveBeenCalledOnce())
+        expect(controllerState.controller.stageLink).not.toHaveBeenCalled()
     })
 
     it('enforces the selected incoming permissions and blocks an expired registration', async () => {
@@ -405,13 +420,23 @@ describe('DeviceSyncSettings', () => {
         ['downloading', false, 'Receiving 50%', 'Cancel'],
         ['cancelled', false, 'Continue', 'Continue'],
         ['joined', true, 'Continue', 'Continue'],
-        ['failed', false, 'Error', ''],
+        ['failed', false, 'Error', 'Continue'],
     ] as const)('maps clone %s with resumeAvailable=%s', async (phase, resumeAvailable, expected, action) => {
         const clone = { ...cloneBase, resumeAvailable, platform: phase === 'joined' ? 'android' as const : 'desktop' as const, error: phase === 'failed' ? 'operation-failed' as const : null, state: { ...cloneBase.state, target: { ...cloneBase.state.target, phase, completedBytes: 50, totalBytes: 100 } } }
         await render(snapshot({ targets: { clone, delta: deltaBase, bidirectional: bidiBase } }))
         expect(target.querySelector('[data-work-status]')?.textContent).toContain(expected)
         if (action) expect(button(action)).not.toBeUndefined()
-        if (phase === 'failed') expect(button('Continue')).toBeUndefined()
+    })
+
+    it.each(['failed', 'cancelled'] as const)('releases or dismisses an Android %s clone', async (phase) => {
+        environment.android = true
+        const clone = { ...cloneBase, platform: 'android' as const, error: phase === 'failed' ? 'operation-failed' as const : null, state: { ...cloneBase.state, target: { ...cloneBase.state.target, phase } } }
+        await render(snapshot({ targets: { clone, delta: deltaBase, bidirectional: bidiBase } }))
+
+        button('Dismiss')!.click()
+        await vi.waitFor(() => expect(target.querySelector('[data-work-status]')).toBeNull())
+
+        expect(controllerState.controller.cancelClone).toHaveBeenCalledTimes(phase === 'failed' ? 1 : 0)
     })
 
     it('uses indeterminate clone progress when the total size is unknown', async () => {
@@ -421,6 +446,7 @@ describe('DeviceSyncSettings', () => {
         expect(status).toContain('Progress')
         expect(status).not.toContain('Receiving 100%')
         expect(target.querySelector('progress')?.hasAttribute('value')).toBe(false)
+        expect(target.querySelector('progress')?.getAttribute('aria-label')).toBe('Progress')
     })
 
     it.each([
@@ -454,19 +480,40 @@ describe('DeviceSyncSettings', () => {
         if (phase === 'stale') expect(target.querySelector('[data-work-status]')?.textContent).toContain('changed after sync started')
     })
 
-    it.each([
-        ['idle', ['prepare', 'start', 'resume']],
-        ['prepared', ['start', 'resume']],
-        ['running', ['resume']],
-    ] as const)('continues sourcePrepared from a %s sharing phase', async (sourcePhase, expected) => {
-        const calls: string[] = []
-        controllerState.controller.prepare.mockImplementationOnce(async () => { calls.push('prepare') })
-        controllerState.controller.start.mockImplementationOnce(async () => { calls.push('start') })
-        controllerState.controller.resumeBidirectional.mockImplementationOnce(async () => { calls.push('resume') })
+    it.each(['idle', 'prepared'] as const)('delegates sourcePrepared rehosting from a %s sharing phase', async (sourcePhase) => {
         await render(snapshot({ source: { phase: sourcePhase }, targets: { clone: cloneBase, delta: deltaBase, bidirectional: { ...bidiBase, operationPhase: 'sourcePrepared', operationRetained: true } } }))
         button('Continue')!.click()
-        await vi.waitFor(() => expect(calls).toEqual(expected))
-        if (sourcePhase === 'idle') expect(controllerState.controller.prepare).toHaveBeenCalledWith({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
+        await vi.waitFor(() => expect(controllerState.controller.rehostBidirectionalSource).toHaveBeenCalledWith(
+            { method: 'lan', fixedPort: 32145, publicBaseUrl: '' },
+            { read: true, bidirectional: false },
+        ))
+        expect(controllerState.controller.prepare).not.toHaveBeenCalled()
+        expect(controllerState.controller.start).not.toHaveBeenCalled()
+        expect(controllerState.controller.resumeBidirectional).not.toHaveBeenCalled()
+    })
+
+    it('disables sourcePrepared Continue while the rehosted source is already running', async () => {
+        await render(snapshot({ source: { phase: 'running' }, targets: { clone: cloneBase, delta: deltaBase, bidirectional: { ...bidiBase, operationPhase: 'sourcePrepared', operationRetained: true } } }))
+        expect(button('Continue')?.disabled).toBe(true)
+    })
+
+    it('does not move a dismissed receive error into the sharing card', async () => {
+        await render(snapshot({
+            error: 'operation-failed', workError: 'operation-failed',
+            targets: { clone: cloneBase, delta: { ...deltaBase, pullPhase: 'failed', error: 'operation-failed' }, bidirectional: bidiBase },
+        }))
+
+        button('Dismiss')!.click()
+        await tick()
+
+        expect(target.querySelector('[data-sync-card="sharing"]')?.querySelector('[role="alert"]')).toBeNull()
+    })
+
+    it('uses a yellow warning treatment for the LAN trust boundary', async () => {
+        await render()
+        const warning = target.querySelector('[data-lan-warning]')!
+        expect(warning.className).toContain('border-yellow')
+        expect(warning.className).toContain('bg-yellow')
     })
 
     it('gates conflict resolution while the first winner is pending', async () => {

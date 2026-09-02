@@ -11,7 +11,6 @@
     import { getProductionDeviceSyncController } from 'src/ts/storage/sync/deviceSyncProduction'
     import type { DeviceSyncControllerSnapshot } from 'src/ts/storage/sync/deviceSyncController'
     import { classifyDeviceSyncFailure } from 'src/ts/storage/sync/deviceSync'
-    import { subscribeDeviceSyncUri } from 'src/ts/storage/sync/peerCloneDeepLink'
     import { androidPeerSyncNotificationsEnabled } from 'src/ts/storage/sync/peerSyncShared'
     import Button from 'src/lib/UI/GUI/Button.svelte'
 
@@ -19,11 +18,13 @@
 
     const controller = getProductionDeviceSyncController()
     const sync = language.risuNest.sync
-    let snapshot = $state<DeviceSyncControllerSnapshot>(controller.snapshot())
+    const initialSnapshot = controller.snapshot()
+    let snapshot = $state<DeviceSyncControllerSnapshot>(initialSnapshot)
     let settings = $state(getDeviceSettings())
     let permissions = $state({ read: true, bidirectional: false })
     let targetId = $state('new-link')
-    let stagedUri = $state('')
+    let stagedUri = $state(initialSnapshot.stagedUri ?? '')
+    let observedStagedUri = initialSnapshot.stagedUri
     let qrDataUrl = $state('')
     let qrUri = ''
     let now = $state(Date.now())
@@ -36,7 +37,7 @@
     let workActionError = $state<string | null>(null)
 
     const sourceBusy = $derived(['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(snapshot.source.phase))
-    const sourceError = $derived(snapshot.source.latestError ?? (activeWork ? null : snapshot.error))
+    const sourceError = $derived(snapshot.source.latestError ?? snapshot.sourceError)
     const pairUri = $derived(snapshot.source.pairingUri ?? '')
     const expired = $derived(!snapshot.source.expiresAtMs || snapshot.source.expiresAtMs <= now)
     const remaining = $derived(snapshot.source.expiresAtMs ? Math.max(0, snapshot.source.expiresAtMs - now) : 0)
@@ -47,12 +48,14 @@
     const bidiPhase = $derived(bidi?.operationPhase ?? 'idle')
     const selectedIncoming = $derived(snapshot.sources.find((source) => source.deviceId === targetId))
     const selectedExpired = $derived(targetId !== 'new-link' && snapshot.expiredSourceIds.includes(targetId))
+    const cloneRetryable = $derived(Boolean(clone?.resumeAvailable) || (
+        !isTauriAndroid && (cloneTarget?.phase === 'cancelled' || cloneTarget?.phase === 'failed')
+    ))
     const cloneBusy = $derived(
         workActionPending && activeWork === 'clone'
         || cloneTarget?.phase === 'downloading'
         || cloneTarget?.phase === 'confirmed'
-        || Boolean(clone?.resumeAvailable)
-        || (clone?.platform === 'desktop' && cloneTarget?.phase === 'cancelled')
+        || cloneRetryable
     )
     const deltaBusy = $derived(workActionPending && activeWork === 'delta' || delta?.pullPhase === 'running')
     const bidiBusy = $derived(
@@ -202,7 +205,11 @@
         return completed
     }
     function stageSelectedLink(): void {
-        if (targetId === 'new-link') controller.stageLink(stagedUri)
+        if (
+            targetId === 'new-link'
+            && stagedUri.trim().length > 0
+            && stagedUri !== snapshot.stagedUri
+        ) controller.stageLink(stagedUri)
     }
     async function startClone(): Promise<void> {
         if (!await alertConfirm(sync.work.cloneConfirm)) return
@@ -234,17 +241,7 @@
     }
     async function resumeBidi(): Promise<void> {
         if (bidiPhase === 'sourcePrepared') {
-            await runWorkAction(async () => {
-                if (snapshot.source.phase === 'idle' || snapshot.source.phase === 'error') {
-                    await controller.prepare(sourceRequest())
-                    await controller.start(permissions)
-                } else if (snapshot.source.phase === 'prepared') {
-                    await controller.start(permissions)
-                } else if (snapshot.source.phase !== 'running') {
-                    return
-                }
-                await controller.resumeBidirectional()
-            })
+            await runWorkAction(() => controller.rehostBidirectionalSource(sourceRequest(), permissions))
             return
         }
         await runWorkAction(() => controller.resumeBidirectional())
@@ -265,6 +262,12 @@
     function dismissWork(): void {
         suppressWorkInference = true
         activeWork = null
+    }
+    async function dismissClone(): Promise<void> {
+        if (isTauriAndroid && cloneTarget?.phase === 'failed') {
+            if (!await runWorkAction(() => controller.cancelClone())) return
+        }
+        dismissWork()
     }
     function conflictNames(): { names: string[], otherCount: number } {
         const result = bidi?.operationResult
@@ -295,18 +298,19 @@
         activeWork ??= inferWork(snapshot)
         const unsubscribe = controller.subscribe((next) => {
             snapshot = next
+            if (next.stagedUri !== observedStagedUri) {
+                observedStagedUri = next.stagedUri
+                stagedUri = next.stagedUri ?? ''
+                if (next.stagedUri) targetId = 'new-link'
+            }
             if (!activeWork && !suppressWorkInference) activeWork = inferWork(next)
             void createQr()
-        })
-        const unsubscribeDeepLink = subscribeDeviceSyncUri((uri) => {
-            targetId = 'new-link'
-            stagedUri = uri
         })
         void controller.initialize().catch(() => { shareActionError = sync.share.stateError })
         notificationsEnabled = androidPeerSyncNotificationsEnabled()
         const timer = setInterval(() => { now = Date.now() }, 1000)
         void createQr()
-        return () => { clearInterval(timer); unsubscribe(); unsubscribeDeepLink() }
+        return () => { clearInterval(timer); unsubscribe() }
     })
 </script>
 
@@ -374,7 +378,7 @@
                 {#each snapshot.devices as device (device.deviceId)}
                     <div class="mt-2 flex items-center justify-between gap-3 border-t border-darkborderc pt-2 text-sm">
                         <div class="flex min-w-0 items-center gap-3"><span data-device-icon aria-hidden="true"><MonitorSmartphone size={18} /></span><div><p>{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
-                        <Button size="sm" styled="danger" onclick={() => revoke('outgoing', device.deviceId)}>{sync.devices.revoke}</Button>
+                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.outgoingTitle}`} class="rounded-md border border-red-600 bg-red-700 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-red-500 focus:outline-hidden focus:ring-2 focus:ring-red-600" onclick={() => revoke('outgoing', device.deviceId)}>{sync.devices.revoke}</button>
                     </div>
                 {/each}
             {/if}
@@ -384,7 +388,7 @@
                 {#each snapshot.sources as device (device.deviceId)}
                     <div class="mt-2 flex items-center justify-between gap-3 border-t border-darkborderc pt-2 text-sm">
                         <div class="flex min-w-0 items-center gap-3"><span data-device-icon aria-hidden="true"><MonitorSmartphone size={18} /></span><div><p>{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
-                        <Button size="sm" styled="danger" onclick={() => revoke('incoming', device.deviceId)}>{sync.devices.revoke}</Button>
+                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.incomingTitle}`} class="rounded-md border border-red-600 bg-red-700 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-red-500 focus:outline-hidden focus:ring-2 focus:ring-red-600" onclick={() => revoke('incoming', device.deviceId)}>{sync.devices.revoke}</button>
                     </div>
                 {/each}
             {/if}
@@ -409,13 +413,13 @@
                     {:else if cloneTarget?.phase === 'downloading'}
                         {#if cloneTarget.totalBytes !== undefined}
                             {@const percent = Math.round((cloneTarget.completedBytes / Math.max(1, cloneTarget.totalBytes)) * 100)}
-                            <progress class="w-full" value={cloneTarget.completedBytes} max={Math.max(1, cloneTarget.totalBytes)}></progress><p class="mt-1 text-sm">{format(sync.work.progress, percent)}</p>
-                        {:else}<progress class="w-full"></progress><p class="mt-1 text-sm">{language.peerClone.progress}</p>{/if}
+                            <progress class="w-full" aria-label={format(sync.work.progress, percent)} value={cloneTarget.completedBytes} max={Math.max(1, cloneTarget.totalBytes)}></progress><p class="mt-1 text-sm">{format(sync.work.progress, percent)}</p>
+                        {:else}<progress class="w-full" aria-label={language.peerClone.progress}></progress><p class="mt-1 text-sm">{language.peerClone.progress}</p>{/if}
                         <Button className="mt-2" size="sm" styled="danger" disabled={workActionPending} onclick={() => runWorkAction(() => controller.cancelClone())}>{sync.work.cancel}</Button>
-                    {:else if clone?.resumeAvailable || (clone?.platform === 'desktop' && cloneTarget?.phase === 'cancelled')}
+                    {:else if cloneRetryable}
                         {#if clone?.error}<p role="alert" class="mb-2 text-sm text-draculared">{safeError(clone.error)}</p>{/if}<Button size="sm" disabled={workActionPending} onclick={() => runWorkAction(() => controller.resumeClone())}>{sync.work.resume}</Button>
-                    {:else if cloneTarget?.phase === 'failed'}
-                        <p role="alert" class="text-sm text-draculared">{safeError(clone?.error)}</p>{#if clone?.resumeAvailable}<Button className="mt-2" size="sm" disabled={workActionPending} onclick={() => runWorkAction(() => controller.resumeClone())}>{sync.work.resume}</Button>{/if}
+                    {:else if cloneTarget?.phase === 'failed' || cloneTarget?.phase === 'cancelled'}
+                        {#if clone?.error}<p role="alert" class="text-sm text-draculared">{safeError(clone.error)}</p>{/if}<Button className="mt-2" size="sm" disabled={workActionPending} onclick={dismissClone}>{sync.work.dismiss}</Button>
                     {:else if cloneTarget?.phase === 'completed'}
                         {@const backupPaths = cloneBackupPaths()}
                         <p class="text-sm">{format(sync.work.doneUpdated, 1, formatRisuNestStorageBytes(cloneTarget.totalBytes ?? cloneTarget.completedBytes))}</p>
@@ -434,7 +438,7 @@
                     {:else if bidiPhase === 'awaitingConflict'}
                         {@const conflict = conflictNames()}
                         <div class="rounded-md border border-draculared p-3"><p class="font-bold text-draculared">{sync.work.conflictTitle}</p><p class="mt-1 text-sm text-textcolor2">{sync.work.conflictBody}</p><ul class="mt-2 list-inside list-disc text-sm">{#each conflict.names as name}<li>{name}</li>{/each}{#if conflict.otherCount > 0}<li>{format(sync.work.conflictOthers, conflict.otherCount)}</li>{/if}</ul><div class="mt-2 flex flex-wrap gap-2"><Button size="sm" onclick={() => resolve('local')}>{sync.work.keepThis}</Button><Button size="sm" onclick={() => resolve('remote')}>{sync.work.keepOther}</Button></div></div>
-                    {:else if bidiPhase === 'sourcePrepared'}<p class="text-sm text-textcolor2">{sync.share.start}: {language.peerBidirectional.resumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={!['idle', 'error', 'prepared', 'running'].includes(snapshot.source.phase)} onclick={resumeBidi}>{sync.work.resume}</Button>{#if snapshot.source.phase === 'idle'}<Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button>{/if}</div>
+                    {:else if bidiPhase === 'sourcePrepared'}<p class="text-sm text-textcolor2">{sync.share.start}: {language.peerBidirectional.resumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={!['idle', 'error', 'prepared'].includes(snapshot.source.phase)} onclick={resumeBidi}>{sync.work.resume}</Button>{#if snapshot.source.phase === 'idle'}<Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button>{/if}</div>
                     {:else if ['sourceUnavailable', 'localCommitted', 'targetPrepared'].includes(bidiPhase)}<p class="text-sm text-textcolor2">{bidiPhase === 'sourceUnavailable' ? language.peerBidirectional.sourceUnavailable : language.peerBidirectional.resumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" onclick={resumeBidi}>{sync.work.resume}</Button><Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button></div>
                     {:else if bidiPhase === 'refreshPending'}<p class="text-sm text-textcolor2">{language.peerBidirectional.refreshPending}</p><Button className="mt-2" size="sm" onclick={resumeBidi}>{sync.work.resume}</Button>
                     {:else if bidiPhase === 'failed'}<p class="text-sm text-draculared">{safeError(bidi?.operationError)}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
@@ -446,9 +450,9 @@
                         <Button className="mt-2" size="sm" onclick={acknowledgeBidi}>{sync.work.dismiss}</Button>
                     {/if}
                 {/if}
-                {#if workActionError}<p data-work-error role="alert" class="mt-2 text-sm text-draculared">{workActionError}</p>{/if}
+                {#if workActionError || snapshot.workError}<p data-work-error role="alert" class="mt-2 text-sm text-draculared">{workActionError ?? safeError(snapshot.workError)}</p>{/if}
             </div>
         {/if}
     </div>
-    <p class="mt-4 rounded-md border border-darkborderc bg-darkbg p-3 text-sm text-textcolor2">{sync.lanWarning}</p>
+    <p data-lan-warning class="mt-4 rounded-md border border-yellow-600/70 bg-yellow-500/10 p-3 text-sm text-textcolor">{sync.lanWarning}</p>
 </section>
