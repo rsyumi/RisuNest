@@ -259,6 +259,65 @@ fn panic_capture_includes_payload_and_location() {
 }
 
 #[test]
+fn configured_panic_hook_writes_the_first_setup_panic_immediately() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let original = std::panic::take_hook();
+    install_panic_hook_for(state.clone());
+    let _ = std::panic::catch_unwind(|| panic!("Authorization: Bearer fixture-pre-setup-secret"));
+    let installed = std::panic::take_hook();
+    std::panic::set_hook(original);
+    drop(installed);
+
+    let log = fs::read_to_string(state.file_path()).unwrap();
+    assert!(log.contains("Authorization: ***"));
+    assert!(!log.contains("fixture-pre-setup-secret"));
+}
+
+#[test]
+fn first_file_configuration_flushes_pending_entries_exactly_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::for_tests();
+    state.record("info", "boot", "pending boot entry");
+
+    state.configure_file_path(temp.path());
+    state.configure_file_path(temp.path());
+
+    let log = fs::read_to_string(state.file_path()).unwrap();
+    assert_eq!(log.matches("pending boot entry").count(), 1);
+}
+
+#[test]
+fn file_disabled_marker_drops_pending_and_future_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = temp.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(logs.join(FILE_LOG_DISABLED_MARKER), b"disabled").unwrap();
+    let state = NativeLogState::for_tests();
+    state.record("info", "boot", "pending marker entry");
+
+    state.configure_file_path(temp.path());
+    state.record("info", "setup", "future marker entry");
+
+    assert!(!state.file_path().exists());
+}
+
+#[test]
+fn ring_only_entries_before_configuration_never_reach_the_file_sink() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::for_tests();
+    state.record_ring_only("error", "native_log", "early command detail");
+
+    state.configure_file_path(temp.path());
+
+    assert_eq!(
+        state.tail(Some(1)).pop().unwrap().message,
+        "early command detail"
+    );
+    assert!(!state.file_path().exists());
+}
+
+#[test]
 fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
     let state = NativeLogState::for_tests();
     let original = std::panic::take_hook();

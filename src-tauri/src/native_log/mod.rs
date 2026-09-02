@@ -24,6 +24,7 @@ pub(crate) struct LogEntry {
 
 struct Inner {
     entries: VecDeque<LogEntry>,
+    pending_file_entries: VecDeque<LogEntry>,
     root: Option<PathBuf>,
 }
 
@@ -42,6 +43,7 @@ impl NativeLogState {
     pub(crate) fn for_tests() -> Self {
         Self(Arc::new(Mutex::new(Inner {
             entries: VecDeque::with_capacity(RING_CAPACITY),
+            pending_file_entries: VecDeque::with_capacity(RING_CAPACITY),
             root: None,
         })))
     }
@@ -51,7 +53,14 @@ impl NativeLogState {
         let _ = create_private_dir_all(&root);
         tighten_known_files(&root);
         if let Ok(mut inner) = self.0.lock() {
+            if inner.root.as_ref() == Some(&root) {
+                return;
+            }
             inner.root = Some(root);
+            let pending = std::mem::take(&mut inner.pending_file_entries);
+            for entry in pending {
+                write_file(&inner, &entry);
+            }
         }
     }
 
@@ -79,7 +88,14 @@ impl NativeLogState {
             }
             inner.entries.push_back(entry.clone());
             if write_to_file {
-                write_file(&inner, &entry);
+                if inner.root.is_some() {
+                    write_file(&inner, &entry);
+                } else {
+                    if inner.pending_file_entries.len() == RING_CAPACITY {
+                        inner.pending_file_entries.pop_front();
+                    }
+                    inner.pending_file_entries.push_back(entry);
+                }
             }
         }
     }

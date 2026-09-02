@@ -453,6 +453,7 @@ fn run_py_server(handle: tauri::AppHandle, py_path: String) {
 pub fn run() {
     native_log::install_panic_hook();
     let native_log_state = native_log::global_state();
+    let setup_native_log_state = native_log_state.clone();
     let mut builder = tauri::Builder::default();
 
     #[cfg(desktop)]
@@ -470,8 +471,8 @@ pub fn run() {
     let app = builder
         .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
-            native_log_state.configure_file_path(&app_data_dir);
-            app.manage(native_log_state.clone());
+            setup_native_log_state.configure_file_path(&app_data_dir);
+            app.manage(setup_native_log_state.clone());
             native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
             let state = native_file_jobs::NativeFileJobState::initialize(
                 app_data_dir.join("native-file-jobs"),
@@ -806,6 +807,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .expect("error while resolving tauri app data directory");
+    native_log_state.configure_file_path(&app_data_dir);
     app.run(|app, event| {
         #[cfg(desktop)]
         if run_event_requires_peer_clone_shutdown(&event) {
