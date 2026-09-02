@@ -51,7 +51,7 @@
 
 {#if notificationStatus !== null}
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.platform.title}</h2>
-    <div class="flex flex-col gap-2 text-textcolor">
+    <div class="flex flex-col gap-2 text-textcolor" role="status" aria-live="polite">
         <span>{language.risuNest.platform.notifications}: {notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}</span>
         <Button onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
         <Check bind:check={keepAlive} name={language.risuNest.platform.keepAlive} />

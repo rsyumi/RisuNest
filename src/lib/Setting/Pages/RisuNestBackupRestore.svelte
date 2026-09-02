@@ -21,13 +21,19 @@
 
     function risuSaveProgressText(status: NativeFileJobStatus | undefined): string {
         if (!status) return ''
+        const label = status.phase === 'reading-source' || status.phase === 'writing-export' || status.phase === 'uploading-database'
+            ? language.risuNest.backup.progressTransferring
+            : status.phase === 'activating-database' || status.phase === 'publishing-destination' || status.phase === 'finalizing-publication' || status.phase === 'finalizing-export' || status.phase === 'complete'
+                ? language.risuNest.backup.progressFinalizing
+                : language.risuNest.backup.progressPreparing
         const total = status.progress.totalBytes
-        if (total && total > 0) return `${status.phase}: ${Math.min(100, Math.round(status.progress.completedBytes * 100 / total))}%`
+        if (total && total > 0) return `${label}: ${Math.min(100, Math.round(status.progress.completedBytes * 100 / total))}%`
         const bytes = status.progress.completedBytes
-        return bytes > 0 ? `${status.phase}: ${(bytes / (1024 * 1024)).toFixed(1)} MiB` : status.phase
+        return bytes > 0 ? `${label}: ${(bytes / (1024 * 1024)).toFixed(1)} MiB` : label
     }
 
     function showRisuSaveError(error: unknown): void {
+        console.error('RisuSave operation failed', error)
         const partialDestinationMayRemain = hasPartialDestinationWarning(error)
         if (error instanceof DOMException && error.name === 'AbortError') {
             alertPartialDestinationWarning(error, language.screenshotPartialDestinationMayRemain, alertError)
@@ -41,8 +47,9 @@
             alertError(language.risuSaveRevisionConflict)
             return
         }
-        const detail = error instanceof Error ? error.message : String(error)
-        alertError(partialDestinationMayRemain ? `${detail} ${language.screenshotPartialDestinationMayRemain}` : detail)
+        alertError(partialDestinationMayRemain
+            ? `${language.risuNest.backup.actionFailed} ${language.screenshotPartialDestinationMayRemain}`
+            : language.risuNest.backup.actionFailed)
     }
 
     async function runRisuSaveOperation(kind: 'import' | 'export'): Promise<void> {
@@ -78,7 +85,7 @@
     <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('export')} className="mt-2">{language.exportRisuSave}</Button>
 {/if}
 {#if risuSaveOperation}
-    <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2">
+    <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
         <span>{risuSaveProgressText(risuSaveStatus)}</span>
         <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
     </div>
@@ -97,25 +104,25 @@
                 restart: restartNativeApp,
                 onEmpty: () => alertNormal(language.noLocalSnapshots),
             })
-        } catch (error) { alertError(error instanceof Error ? error : String(error)) }
+        } catch (error) { console.error('Native snapshot restore failed', error); alertError(language.risuNest.backup.actionFailed) }
     }} className="mt-2">{language.restoreLocalSnapshot}</Button>
 {/if}
 <Button onclick={() => openSyncConflictBackups()} className="mt-2">{language.syncConflictBackups}</Button>
 {#if isTauri && DBState.db.account}
     <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {
-        if (!await alertConfirm('Replace local data with the official account backup?')) return
-        if (!await alertConfirm('Official snapshots do not include separate inlay payloads. Referenced image, audio, video, and signature inlays may not be restored. The app will restart after restoring the official account backup. Continue?')) return
+        if (!await alertConfirm(language.risuNest.backup.officialRestoreConfirm)) return
+        if (!await alertConfirm(language.risuNest.backup.officialRestoreInlayWarning)) return
         try {
             const result = await getNativeOfficialAccountFlow().restore()
-            if (result.kind === 'missing') alertNormal('No official account backup was found. Local data was not changed.')
-        } catch (error) { alertError(error instanceof Error ? error : String(error)) }
+            if (result.kind === 'missing') alertNormal(language.risuNest.backup.officialMissing)
+        } catch (error) { console.error('Official account restore failed', error); alertError(language.risuNest.backup.actionFailed) }
     })} className="mt-2">{language.risuNest.backup.officialRestore}</Button>
     <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {
-        if (!await alertConfirm('Overwrite the official account backup with current local data?')) return
+        if (!await alertConfirm(language.risuNest.backup.officialPublishConfirm)) return
         const controller = new AbortController()
         nativePublishController = controller
-        try { await getNativeOfficialAccountFlow().publish(controller.signal); alertNormal('Official account backup published.') }
-        catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) alertError(error instanceof Error ? error : String(error)) }
+        try { await getNativeOfficialAccountFlow().publish(controller.signal); alertNormal(language.risuNest.backup.officialPublished) }
+        catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) { console.error('Official account publish failed', error); alertError(language.risuNest.backup.actionFailed) } }
         finally { if (nativePublishController === controller) nativePublishController = null }
     })} className="mt-2">{language.risuNest.backup.officialPublish}</Button>
     {#if nativePublishController}

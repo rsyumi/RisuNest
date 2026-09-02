@@ -103,9 +103,9 @@
 
 <h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.storage.title}</h2>
 {#if state.loading && !rollup}
-    <span class="text-textcolor2">Loading...</span>
+    <span class="text-textcolor2" role="status" aria-live="polite">{language.loading}</span>
 {:else if state.loadFailed && !rollup}
-    <div class="text-textcolor2">
+    <div class="text-textcolor2" role="alert" aria-live="assertive">
         <span>{language.risuNest.storage.loadFailed}</span>
         <Button size="sm" disabled={state.loading || state.busy !== null} onclick={() => dashboard.load()}>{language.risuNest.storage.retry}</Button>
     </div>
@@ -130,19 +130,24 @@
 
     <div class="mt-3 flex flex-wrap gap-2">
         <Button disabled={state.loading || state.busy !== null} onclick={createSnapshot}>{language.risuNest.storage.createSnapshot}</Button>
-        <Button disabled={state.loading || state.busy !== null} onclick={() => dashboard.calculateTempSize()}>{language.risuNest.storage.calculateSize}</Button>
-        <Button disabled={state.loading || state.busy !== null} onclick={cleanTemp}>{language.risuNest.storage.cleanSyncTemp}</Button>
+        {#if state.tempUsage}
+            <Button disabled={state.loading || state.busy !== null} onclick={cleanTemp}>{language.risuNest.storage.cleanSyncTemp}</Button>
+        {:else}
+            <Button disabled={state.loading || state.busy !== null} onclick={() => dashboard.calculateTempSize()}>{language.risuNest.storage.calculateSize}</Button>
+        {/if}
         <Button disabled={state.loading || state.busy !== null} onclick={runGc}>{language.risuNest.storage.gcRun}</Button>
     </div>
-    <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.cleanSyncTempNote}{#if state.tempUsage} {formatRisuNestStorageBytes(state.tempUsage.bytes)}{/if}</p>
-    {#if state.gcPreview}
-        <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.gcResult.replace('{0}', String(state.gcPreview.candidateCount)).replace('{1}', formatRisuNestStorageBytes(state.gcPreview.candidateBytes))}</p>
-    {/if}
+    <div role="status" aria-live="polite">
+        <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.cleanSyncTempNote}{#if state.tempUsage} {formatRisuNestStorageBytes(state.tempUsage.bytes)}{/if}</p>
+        {#if state.gcPreview}
+            <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.gcResult.replace('{0}', String(state.gcPreview.candidateCount)).replace('{1}', formatRisuNestStorageBytes(state.gcPreview.candidateBytes))}</p>
+        {/if}
+    </div>
 
     <details class="mt-3">
         <summary>{language.risuNest.storage.snapshots}</summary>
         {#each state.snapshots as snapshot}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{snapshot.path} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button disabled={state.loading || state.busy !== null} onclick={() => deleteSnapshot(snapshot.path)}>{language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button disabled={state.loading || state.busy !== null} onclick={() => deleteSnapshot(snapshot.path)}>{language.remove}</button></div>
         {/each}
     </details>
     <details class="mt-2">
@@ -154,7 +159,7 @@
     <details class="mt-2">
         <summary>{language.risuNest.storage.syncBackups}</summary>
         {#each state.peerBackups as backup}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{backup.path} ({formatRisuNestStorageBytes(backup.bytes)})</span><button data-path={backup.path} disabled={state.loading || state.busy !== null} onclick={() => deletePeerBackup(backup.path)}>{language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.bytes)})</span><button data-path={backup.path} disabled={state.loading || state.busy !== null} onclick={() => deletePeerBackup(backup.path)}>{language.remove}</button></div>
         {/each}
     </details>
 {/if}

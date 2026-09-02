@@ -42,4 +42,21 @@ describe('UserSettings local backup route', () => {
         expect(accountGate).toBeGreaterThan(snapshot)
         expect(officialRestore).toBeGreaterThan(accountGate)
     })
+
+    it('uses localized safe copy for official backup actions and native failures', async () => {
+        const backupSource = (await import('./RisuNestBackupRestore.svelte?raw')).default
+
+        for (const key of [
+            'officialRestoreConfirm',
+            'officialRestoreInlayWarning',
+            'officialMissing',
+            'officialPublishConfirm',
+            'officialPublished',
+            'actionFailed',
+        ]) expect(backupSource).toContain(`language.risuNest.backup.${key}`)
+
+        expect(backupSource).not.toContain('status.phase}')
+        expect(backupSource).not.toContain('${status.phase}')
+        expect(backupSource).not.toContain("alertError(error instanceof Error ? error : String(error))")
+    })
 })

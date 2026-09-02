@@ -106,7 +106,7 @@
 
     <label class="flex items-center gap-2 cursor-pointer">
         <input
-            class="hidden"
+            class="sr-only"
             type="checkbox"
             checked={fileLogEnabled}
             disabled={fileLogUpdatePending}
@@ -119,13 +119,13 @@
     </label>
     <span class="text-textcolor2 text-sm">{language.risuNest.diag.fileLogHelp}</span>
     {#if fileLogEnabled && fileLogPath}
-        <code class="text-textcolor2 text-sm break-all">{fileLogPath}</code>
+        <code class="text-textcolor2 text-sm break-all" role="status" aria-live="polite">{fileLogPath}</code>
     {/if}
 
     {#if errorMessage}
-        <span class="text-red-500">{errorMessage}</span>
+        <span class="text-draculared" role="alert" aria-live="assertive">{errorMessage}</span>
     {:else if entries.length === 0}
-        <span class="text-textcolor2">{language.risuNest.diag.logEmpty}</span>
+        <span class="text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</span>
     {:else}
         <pre class="bg-bgcolor border border-darkborderc rounded-md p-3 whitespace-pre-wrap break-all max-h-80 overflow-auto">{formattedLog}</pre>
     {/if}

@@ -78,6 +78,7 @@ describe('RisuNest Android platform settings', () => {
         expect(target.textContent).toContain('Android 16')
         expect(target.textContent).toContain('140.0.1')
         expect(target.textContent).toContain('foreground')
+        expect(target.querySelector('[role="status"][aria-live="polite"]')).not.toBeNull()
         target.querySelector('button')?.click()
         expect(mocks.openNotificationSettings).toHaveBeenCalledOnce()
         mocks.updateDeviceSettings.mockClear()

@@ -153,7 +153,7 @@ describe('DeviceSyncSettings', () => {
         await vi.advanceTimersByTimeAsync(0); await tick()
         expect(target.querySelector('img[alt="Register a new device"]')).not.toBeNull()
         expect(target.textContent).toContain('2 minutes 5 seconds left')
-        target.querySelectorAll<HTMLInputElement>('[data-permissions] input')[1].click(); button('Create a new link')!.click()
+        target.querySelectorAll<HTMLInputElement>('[data-permissions] input')[1].click(); button('Create new link')!.click()
         await vi.waitFor(() => expect(controllerState.controller.rotateLink).toHaveBeenCalledWith({ read: true, bidirectional: true }))
     })
 

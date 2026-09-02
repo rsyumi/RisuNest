@@ -133,6 +133,8 @@ describe('RisuNestLogViewer', () => {
 
         expect(target.textContent).toContain('/data/logs/risunest.log')
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+        expect(checkbox.classList.contains('sr-only')).toBe(true)
+        expect(checkbox.classList.contains('hidden')).toBe(false)
         checkbox.checked = false
         checkbox.dispatchEvent(new Event('change', { bubbles: true }))
         await Promise.resolve()
@@ -155,6 +157,7 @@ describe('RisuNestLogViewer', () => {
         expect(target.textContent).toContain('Localized error')
         expect(target.textContent).not.toContain('native command detail')
         expect(error).toHaveBeenCalledWith('Native log viewer command failed', expect.any(Error))
+        expect(target.querySelector('[role="alert"][aria-live="assertive"]')).not.toBeNull()
     })
 
     it('disables the file logging checkbox while its native update is pending', async () => {
