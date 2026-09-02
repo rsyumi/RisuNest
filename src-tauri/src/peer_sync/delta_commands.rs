@@ -8,7 +8,7 @@ use super::android_foreground::{
 use super::lan::discover_lan_ipv4;
 #[cfg(desktop)]
 use super::lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
-use super::logical_delta_transfer::execute_logical_delta_pull_with_pre_activation;
+use super::logical_delta_transfer::execute_logical_delta_pull_with_commit_intent;
 #[cfg(test)]
 use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase as AndroidTargetForegroundPhase;
 #[cfg(any(target_os = "android", test))]
@@ -16,8 +16,15 @@ use super::target_foreground_transition::{
     AndroidTargetForegroundTransition, AndroidTargetForegroundTransitionError,
 };
 use super::{
-    lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
-    logical_delta::decode_logical_manifest,
+    delta_completion::{
+        recover_delta_completion, DeltaCompletionContext, DeltaCompletionMode,
+        LanDeltaCompletionTransport, RecoveredDeltaCompletion,
+    },
+    lan::{
+        LanCloneHostControl, LanLogicalDeltaClient, PeerCompletionCapability,
+        PreparedLogicalLanSession,
+    },
+    logical_delta::{decode_logical_manifest, hash_logical_manifest},
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     PeerSyncError, ReadyLogicalDeltaPlan,
 };
@@ -30,8 +37,9 @@ use crate::{
     },
     local_backup::{CancellationProbe, NeverCancelled},
     persistent_store::{
-        self, establish_logical_common_base, logical_delta_source::LogicalDeltaSourceSession,
-        PersistentLogicalDeltaTarget, PersistentStore, StoreError, PRODUCT_LOGICAL_LIBRARY_ID,
+        self, establish_logical_common_base_with_commit_intent,
+        logical_delta_source::LogicalDeltaSourceSession, PersistentLogicalDeltaTarget,
+        PersistentStore, StoreError, SyncGenerationIdentity, PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
 use serde::Serialize;
@@ -1096,6 +1104,57 @@ pub enum PeerDeltaPullResult {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeltaCompletionAttempt {
+    operation_id: String,
+    mode: DeltaCompletionMode,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delta_completion_context(
+    attempt: &DeltaCompletionAttempt,
+    source_device_id: &str,
+    durable_job_id: &str,
+    manifest_id: &str,
+    pre_revision: i64,
+    pre_common_base: Option<SyncGenerationIdentity>,
+    post_revision: i64,
+    post_common_base: SyncGenerationIdentity,
+    transferred_objects: u64,
+    transferred_bytes: u64,
+) -> DeltaCompletionContext {
+    DeltaCompletionContext {
+        operation_id: attempt.operation_id.clone(),
+        source_device_id: source_device_id.to_owned(),
+        manifest_id: manifest_id.to_owned(),
+        mode: attempt.mode,
+        durable_job_id: durable_job_id.to_owned(),
+        pre_revision,
+        pre_common_base,
+        post_revision,
+        post_common_base,
+        transferred_objects,
+        transferred_bytes,
+    }
+}
+
+fn selection_totals(
+    selection: &super::LogicalDeltaTransferSelection,
+) -> Result<(u64, u64), PeerSyncError> {
+    let objects = u64::try_from(selection.missing_objects().len()).map_err(|_| {
+        PeerSyncError::Validation("logical transfer object count overflow".to_owned())
+    })?;
+    let bytes = selection
+        .missing_objects()
+        .iter()
+        .try_fold(0_u64, |total, object| {
+            total.checked_add(object.size).ok_or_else(|| {
+                PeerSyncError::Validation("logical transfer byte count overflow".to_owned())
+            })
+        })?;
+    Ok((objects, bytes))
+}
+
 #[derive(Default)]
 struct MeasuredTransferTotals {
     objects: Cell<u64>,
@@ -1195,6 +1254,31 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
     remote_source: &mut S,
     cancellation: &dyn CancellationProbe,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
+    pull_logical_delta_with_completion(
+        store,
+        cas,
+        app_root,
+        source_device_id,
+        expected_revision,
+        remote_manifest_bytes,
+        remote_source,
+        cancellation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    source_device_id: &str,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+    cancellation: &dyn CancellationProbe,
+    completion: Option<&DeltaCompletionAttempt>,
+) -> Result<PeerDeltaPullResult, PeerSyncError> {
     if cancellation.is_cancelled() {
         return Err(PeerSyncError::Cancelled);
     }
@@ -1219,8 +1303,25 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
             reason: "noExactCommonBase",
         });
     }
+    let manifest_id = hash_logical_manifest(&remote_manifest)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    let pre_common_base = if completion.is_some() {
+        store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, source_device_id)
+            .map_err(store_error)?
+    } else {
+        None
+    };
+    let post_common_base = SyncGenerationIdentity {
+        generation_id: remote_manifest.generation.clone(),
+        manifest_hash: manifest_id.clone(),
+        generation_sequence: remote_manifest.generation_sequence.clone(),
+    };
 
-    let job_id = format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", uuid::Uuid::new_v4());
+    let operation_id = completion
+        .map(|attempt| attempt.operation_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let job_id = format!("{P4_DELTA_TARGET_JOB_PREFIX}{operation_id}");
     let job = RefCell::new(DurableCasJob::begin(
         app_root,
         &job_id,
@@ -1243,7 +1344,26 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
     if !target.has_common_base()? {
         drop(target);
         job.borrow_mut().seal(store, now_millis()?)?;
-        let bootstrap = establish_logical_common_base(
+        if cancellation.is_cancelled() {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(PeerSyncError::Cancelled);
+        }
+        let intent_written = Cell::new(false);
+        let bootstrap_context = completion.map(|attempt| {
+            delta_completion_context(
+                attempt,
+                source_device_id,
+                &job_id,
+                &manifest_id,
+                expected_revision,
+                pre_common_base.clone(),
+                expected_revision,
+                post_common_base.clone(),
+                0,
+                0,
+            )
+        });
+        let bootstrap = establish_logical_common_base_with_commit_intent(
             store,
             cas,
             source_device_id,
@@ -1251,8 +1371,20 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
             &local.manifest.generation,
             expected_revision,
             remote_manifest_bytes,
+            || {
+                if cancellation.is_cancelled() {
+                    return Err(PeerSyncError::Cancelled);
+                }
+                if let Some(context) = bootstrap_context.as_ref() {
+                    super::device_registry::store_delta_completion_activation_intent(
+                        app_root, context,
+                    )?;
+                    intent_written.set(true);
+                }
+                Ok(())
+            },
         );
-        return finish_bootstrap(&job, expected_revision, bootstrap);
+        return finish_bootstrap(&job, expected_revision, bootstrap, intent_written.get());
     }
 
     let plan = match target.build_ready_plan(expected_revision) {
@@ -1274,7 +1406,15 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
         .map(|object| (object.hash.clone(), object.size))
         .collect::<BTreeMap<_, _>>();
     let mut measured_source = MeasuredLogicalDeltaSource::new(remote_source);
-    let activation = execute_logical_delta_pull_with_pre_activation(
+    let post_revision = if plan.apply.is_empty() {
+        expected_revision
+    } else {
+        expected_revision
+            .checked_add(1)
+            .ok_or_else(|| PeerSyncError::Validation("logical revision overflow".to_owned()))?
+    };
+    let intent_written = Cell::new(false);
+    let activation = execute_logical_delta_pull_with_commit_intent(
         &plan,
         &local_hashes,
         cas,
@@ -1282,6 +1422,28 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
         &mut measured_source,
         &mut target,
         |_| Ok(()),
+        |selection| {
+            if let Some(attempt) = completion {
+                let (transferred_objects, transferred_bytes) = selection_totals(selection)?;
+                let context = delta_completion_context(
+                    attempt,
+                    source_device_id,
+                    &job_id,
+                    &manifest_id,
+                    expected_revision,
+                    pre_common_base.clone(),
+                    post_revision,
+                    post_common_base.clone(),
+                    transferred_objects,
+                    transferred_bytes,
+                );
+                super::device_registry::store_delta_completion_activation_intent(
+                    app_root, &context,
+                )?;
+                intent_written.set(true);
+            }
+            Ok(())
+        },
         cancellation,
     );
     let (transferred_objects, transferred_bytes) = measured_source.totals();
@@ -1294,6 +1456,7 @@ fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
         transferred_objects,
         transferred_bytes,
         durable_abort_succeeded,
+        intent_written.get(),
     )
 }
 
@@ -1304,10 +1467,13 @@ fn finish_pull(
     transferred_objects: u64,
     transferred_bytes: u64,
     durable_abort_succeeded: bool,
+    intent_written: bool,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match activation {
         Ok(LogicalDeltaActivation::Activated { revision }) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            }
             Ok(if plan.apply.is_empty() {
                 PeerDeltaPullResult::NoChanges {
                     revision,
@@ -1323,7 +1489,9 @@ fn finish_pull(
             })
         }
         Ok(LogicalDeltaActivation::AlreadyActive { revision }) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            }
             Ok(PeerDeltaPullResult::NoChanges {
                 revision,
                 transferred_objects: 0,
@@ -1334,7 +1502,9 @@ fn finish_pull(
             actual_revision,
             actual_base_manifest_hash,
         }) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             Ok(classify_activation_conflict(
                 &plan,
                 actual_revision,
@@ -1342,7 +1512,7 @@ fn finish_pull(
             ))
         }
         Err(error) => {
-            if !job.borrow().is_sealed() || durable_abort_succeeded {
+            if !intent_written && (!job.borrow().is_sealed() || durable_abort_succeeded) {
                 let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
             }
             classify_plan_error(error)
@@ -1354,10 +1524,13 @@ fn finish_bootstrap(
     job: &RefCell<DurableCasJob>,
     expected_revision: i64,
     bootstrap: Result<(), PeerSyncError>,
+    intent_written: bool,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match bootstrap {
         Ok(()) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Committed);
+            }
             Ok(PeerDeltaPullResult::NoChanges {
                 revision: expected_revision,
                 transferred_objects: 0,
@@ -1365,17 +1538,23 @@ fn finish_bootstrap(
             })
         }
         Err(PeerSyncError::Validation(message)) if message.contains("remote content differs") => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             Ok(PeerDeltaPullResult::FullCloneRequired {
                 reason: "noExactCommonBase",
             })
         }
         Err(error @ PeerSyncError::ActivationConflict { .. }) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             classify_plan_error(error)
         }
         Err(error) => {
-            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            if !intent_written {
+                let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            }
             Err(error)
         }
     }
@@ -1811,6 +1990,62 @@ fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T
     })
 }
 
+fn fetch_delta_manifest_and_completion(
+    client: &LanLogicalDeltaClient,
+) -> Result<(Vec<u8>, Option<DeltaCompletionAttempt>), PeerSyncError> {
+    if !client.is_v2_registered() {
+        return client.fetch_manifest().map(|manifest| (manifest, None));
+    }
+    let observed = client.hello_with_capabilities()?;
+    if observed.hello.device_id != client.source_device_id()
+        || !observed.hello.permissions.allows_read()
+    {
+        return Err(PeerSyncError::Protocol(
+            "registered delta source identity or permission changed".to_owned(),
+        ));
+    }
+    let manifest = client.fetch_manifest_with_completion_lease(None)?;
+    let attempt = match (observed.completion, manifest.completion_lease_id) {
+        (PeerCompletionCapability::V1, Some(lease)) => DeltaCompletionAttempt {
+            operation_id: lease.as_str().to_owned(),
+            mode: DeltaCompletionMode::CompletionV1,
+        },
+        (PeerCompletionCapability::Unsupported, None) => DeltaCompletionAttempt {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+        },
+        _ => {
+            return Err(PeerSyncError::Protocol(
+                "registered delta completion capability changed during manifest fetch".to_owned(),
+            ))
+        }
+    };
+    Ok((manifest.bytes, Some(attempt)))
+}
+
+fn recovered_delta_result(completed: RecoveredDeltaCompletion) -> PeerDeltaPullResult {
+    if completed.context.post_revision > completed.context.pre_revision {
+        PeerDeltaPullResult::Updated {
+            revision: completed.context.post_revision,
+            transferred_objects: completed.context.transferred_objects,
+            transferred_bytes: completed.useful_bytes,
+        }
+    } else {
+        PeerDeltaPullResult::NoChanges {
+            revision: completed.context.post_revision,
+            transferred_objects: completed.context.transferred_objects,
+            transferred_bytes: completed.useful_bytes,
+        }
+    }
+}
+
+fn is_successful_delta_result(result: &PeerDeltaPullResult) -> bool {
+    matches!(
+        result,
+        PeerDeltaPullResult::NoChanges { .. } | PeerDeltaPullResult::Updated { .. }
+    )
+}
+
 async fn peer_delta_pull_with_client_factory<
     C: CancellationProbe + Send + 'static,
     F: FnOnce(&Path) -> Result<LanLogicalDeltaClient, PeerSyncError> + Send + 'static,
@@ -1828,6 +2063,18 @@ async fn peer_delta_pull_with_client_factory<
         let _guard = state.begin_pull().map_err(|error| {
             local_operation_failure("peer delta target state", error, registered)
         })?;
+        let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {
+            open_peer_delta_store(store)
+        })
+        .map_err(|error| local_operation_failure("peer delta store", error, registered))?;
+        let mut completion_transport = LanDeltaCompletionTransport;
+        if let Some(completed) =
+            recover_delta_completion(&mut store, &app_root, &mut completion_transport).map_err(
+                |error| peer_operation_failure("peer delta completion recovery", error, registered),
+            )?
+        {
+            return Ok(recovered_delta_result(completed));
+        }
         reclaim_abandoned_durable_cas_jobs(
             &app_root,
             P4_DELTA_TARGET_JOB_PREFIX,
@@ -1836,17 +2083,12 @@ async fn peer_delta_pull_with_client_factory<
         .map_err(|error| local_operation_failure("peer delta recovery", error, registered))?;
         let mut client = client_factory(&app_root)
             .map_err(|error| peer_operation_failure("peer delta client", error, registered))?;
-        let manifest = client
-            .fetch_manifest()
+        let (manifest, completion) = fetch_delta_manifest_and_completion(&client)
             .map_err(|error| peer_operation_failure("peer delta manifest", error, registered))?;
         let source_device_id = client.source_device_id().to_owned();
-        let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {
-            open_peer_delta_store(store)
-        })
-        .map_err(|error| local_operation_failure("peer delta store", error, registered))?;
         let cas = PayloadCas::new(&app_root)
             .map_err(|error| local_operation_failure("peer delta CAS", error, registered))?;
-        let result = pull_logical_delta_with_cancellation(
+        let pulled = pull_logical_delta_with_completion(
             &mut store,
             &cas,
             &app_root,
@@ -1855,15 +2097,23 @@ async fn peer_delta_pull_with_client_factory<
             &manifest,
             &mut client,
             &cancellation,
-        )
-        .map_err(|error| peer_operation_failure("peer delta pull", error, registered))?;
-        record_delta_completion(
-            &app_root,
-            &source_device_id,
-            client.is_v2_registered(),
-            &result,
+            completion.as_ref(),
         );
-        Ok(result)
+        let recovered = recover_delta_completion(&mut store, &app_root, &mut completion_transport)
+            .map_err(|error| peer_operation_failure("peer delta completion", error, registered))?;
+        if let Some(completed) = recovered {
+            return Ok(recovered_delta_result(completed));
+        }
+        match pulled {
+            Ok(result) if completion.is_some() && is_successful_delta_result(&result) => {
+                Err(registered_local_operation_failure(
+                    "registered delta completion",
+                    "durable completion journal is missing",
+                ))
+            }
+            Ok(result) => Ok(result),
+            Err(error) => Err(peer_operation_failure("peer delta pull", error, registered)),
+        }
     })
     .await
     .map_err(|error| delta_worker_failure(error, registered))?
@@ -1929,33 +2179,6 @@ pub async fn peer_delta_pull(
     outcome
 }
 
-fn record_delta_completion(
-    app_root: &Path,
-    source_device_id: &str,
-    registered_v2: bool,
-    result: &PeerDeltaPullResult,
-) {
-    if !registered_v2 {
-        return;
-    }
-    let transferred_bytes = match result {
-        PeerDeltaPullResult::NoChanges {
-            transferred_bytes, ..
-        }
-        | PeerDeltaPullResult::Updated {
-            transferred_bytes, ..
-        } => *transferred_bytes,
-        PeerDeltaPullResult::Conflict { .. } | PeerDeltaPullResult::FullCloneRequired { .. } => {
-            return
-        }
-    };
-    super::device_registry::record_incoming_completed_operation_best_effort(
-        app_root,
-        source_device_id,
-        transferred_bytes,
-    );
-}
-
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -2013,6 +2236,10 @@ mod tests {
         asset_repository::job_pins::{collect_durable_cas_job_roots, CasObjectRole},
         local_backup::AtomicCancellation,
         peer_sync::{
+            delta_completion::{
+                recover_delta_completion, DeltaCompletionContext, DeltaCompletionTransport,
+                PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
+            },
             device_registry::{DevicePermissions, IncomingSource, IncomingSourceRegistry},
             logical_delta::{
                 build_logical_manifest, BuiltLogicalManifest, LogicalManifest,
@@ -2039,6 +2266,61 @@ mod tests {
         objects: BTreeMap<String, Vec<u8>>,
         cancelled: Arc<AtomicBool>,
         reads: usize,
+    }
+
+    struct NoCompletionTransport;
+
+    impl DeltaCompletionTransport for NoCompletionTransport {
+        fn prepare(
+            &mut self,
+            _source: &IncomingSource,
+            _context: &DeltaCompletionContext,
+        ) -> Result<u64, PeerSyncError> {
+            panic!("unsupported completion must not prepare the source")
+        }
+
+        fn deliver(
+            &mut self,
+            _source: &IncomingSource,
+            _delivery: &super::super::device_registry::PendingCompletionDelivery,
+        ) -> Result<(), PeerSyncError> {
+            panic!("unsupported completion must not deliver to the source")
+        }
+    }
+
+    struct CancellingLanSource<'a> {
+        client: &'a mut LanLogicalDeltaClient,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl LogicalDeltaObjectSource for CancellingLanSource<'_> {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            Ok(Box::new(CancelWhenCompleteReader {
+                inner: self.client.open_object(object)?,
+                remaining: object.size,
+                cancelled: Arc::clone(&self.cancelled),
+            }))
+        }
+    }
+
+    struct CancelWhenCompleteReader {
+        inner: Box<dyn Read>,
+        remaining: u64,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl Read for CancelWhenCompleteReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(output)?;
+            self.remaining = self.remaining.saturating_sub(read as u64);
+            if self.remaining == 0 {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
     }
 
     impl LogicalDeltaObjectSource for CancelAfterFirstReadSource {
@@ -3043,6 +3325,7 @@ mod tests {
                     expected: Some("7".to_owned()),
                     actual: Some("8".to_owned()),
                 }),
+                false,
             )
             .unwrap(),
             PeerDeltaPullResult::Conflict {
@@ -3082,6 +3365,7 @@ mod tests {
             0,
             0,
             true,
+            false,
         )
         .unwrap_err();
 
@@ -3121,6 +3405,7 @@ mod tests {
             0,
             0,
             false,
+            false,
         )
         .is_err());
 
@@ -3152,6 +3437,7 @@ mod tests {
             &job,
             0,
             Err(PeerSyncError::Storage("bootstrap failed".to_owned())),
+            false,
         )
         .is_err());
 
@@ -3321,6 +3607,77 @@ mod tests {
     }
 
     #[test]
+    fn registered_conflict_and_full_clone_do_not_create_completion_or_count_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        register_accounting_source(directory.path(), 40, 7);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let mut source = empty_source();
+        let conflict = DeltaCompletionAttempt {
+            operation_id: "00000000-0000-4000-8000-000000000023".to_owned(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+        };
+
+        assert_eq!(
+            pull_logical_delta_with_completion(
+                &mut store,
+                &cas,
+                directory.path(),
+                ACCOUNTING_SOURCE_ID,
+                1,
+                &local.manifest_bytes,
+                &mut source,
+                &NeverCancelled,
+                Some(&conflict),
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
+            }
+        );
+
+        let divergent =
+            remote_root_manifest(&local.manifest, "remote-other", json!({"side":"remote"}));
+        let full_clone = DeltaCompletionAttempt {
+            operation_id: "00000000-0000-4000-8000-000000000024".to_owned(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+        };
+        assert_eq!(
+            pull_logical_delta_with_completion(
+                &mut store,
+                &cas,
+                directory.path(),
+                ACCOUNTING_SOURCE_ID,
+                0,
+                &divergent.manifest_bytes,
+                &mut source,
+                &NeverCancelled,
+                Some(&full_clone),
+            )
+            .unwrap(),
+            PeerDeltaPullResult::FullCloneRequired {
+                reason: "noExactCommonBase",
+            }
+        );
+
+        assert_eq!(accounting_source(directory.path()).total_bytes, 40);
+        assert!(PeerDeltaCompletionJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        for attempt in [conflict, full_clone] {
+            assert!(DurableCasJob::open(
+                directory.path(),
+                &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn coordinator_fetches_only_changed_objects_and_activates_the_exact_revision() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -3374,81 +3731,367 @@ mod tests {
     }
 
     #[test]
-    fn delta_completion_accounting_counts_only_updated_and_no_changes_once() {
+    fn registered_unsupported_activation_defers_accounting_until_durable_recovery() {
         let directory = tempfile::tempdir().unwrap();
         register_accounting_source(directory.path(), 40, 7);
-
-        record_delta_completion(
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        pull_logical_delta(
+            &mut store,
+            &cas,
             directory.path(),
             ACCOUNTING_SOURCE_ID,
-            true,
-            &PeerDeltaPullResult::Updated {
-                revision: 1,
-                transferred_objects: 1,
-                transferred_bytes: 12,
-            },
+            0,
+            &local.manifest_bytes,
+            &mut empty_source(),
+        )
+        .unwrap();
+        let remote = remote_root_manifest(
+            &local.manifest,
+            "registered-remote",
+            json!({"side":"remote"}),
         );
-        let after_updated = accounting_source(directory.path());
-        assert_eq!(after_updated.total_bytes, 52);
-        assert!(after_updated.last_seen_ms > 7);
+        let mut source = FixtureSource {
+            objects: remote
+                .record_objects
+                .iter()
+                .map(|record| (record.object.hash.clone(), record.object.bytes.clone()))
+                .collect(),
+            reads: 0,
+        };
+        let attempt = DeltaCompletionAttempt {
+            operation_id: "00000000-0000-4000-8000-000000000025".to_owned(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+        };
 
-        record_delta_completion(
+        let result = pull_logical_delta_with_completion(
+            &mut store,
+            &cas,
             directory.path(),
             ACCOUNTING_SOURCE_ID,
-            true,
-            &PeerDeltaPullResult::NoChanges {
-                revision: 1,
-                transferred_objects: 0,
-                transferred_bytes: 0,
-            },
-        );
-        let after_no_changes = accounting_source(directory.path());
-        assert_eq!(after_no_changes.total_bytes, 52);
-        assert!(after_no_changes.last_seen_ms >= after_updated.last_seen_ms);
+            0,
+            &remote.manifest_bytes,
+            &mut source,
+            &NeverCancelled,
+            Some(&attempt),
+        )
+        .unwrap();
 
-        for non_success in [
-            PeerDeltaPullResult::Conflict {
-                reason: "stale revision",
-            },
-            PeerDeltaPullResult::FullCloneRequired {
-                reason: "missing common base",
-            },
-        ] {
-            record_delta_completion(directory.path(), ACCOUNTING_SOURCE_ID, true, &non_success);
-        }
-        assert_eq!(accounting_source(directory.path()), after_no_changes);
-
-        record_delta_completion(
+        assert!(matches!(
+            result,
+            PeerDeltaPullResult::Updated { revision: 1, .. }
+        ));
+        assert_eq!(accounting_source(directory.path()).total_bytes, 40);
+        let retained = PeerDeltaCompletionJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            retained,
+            PeerDeltaDurableCompletion::ActivationIntent { .. }
+        ));
+        assert!(DurableCasJob::open(
             directory.path(),
-            ACCOUNTING_SOURCE_ID,
-            false,
-            &PeerDeltaPullResult::Updated {
-                revision: 2,
-                transferred_objects: 1,
-                transferred_bytes: 99,
-            },
+            &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
+        )
+        .unwrap()
+        .is_sealed());
+
+        let completed =
+            recover_delta_completion(&mut store, directory.path(), &mut NoCompletionTransport)
+                .unwrap()
+                .unwrap();
+        assert_eq!(completed.useful_bytes, remote.record_objects[0].object.size);
+        assert_eq!(
+            accounting_source(directory.path()).total_bytes,
+            40 + remote.record_objects[0].object.size
         );
-        assert_eq!(accounting_source(directory.path()), after_no_changes);
+        assert!(PeerDeltaCompletionJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn delta_completion_accounting_overflow_preserves_the_successful_pull_result() {
-        let directory = tempfile::tempdir().unwrap();
-        register_accounting_source(directory.path(), u64::MAX, 7);
-        let completed = PeerDeltaPullResult::Updated {
-            revision: 1,
-            transferred_objects: 1,
-            transferred_bytes: 1,
-        };
-        let before = fs::read(directory.path().join("peer-sync/sources.json")).unwrap();
+    fn registered_v1_zero_byte_completion_is_durable_on_both_peers_before_success() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id = canonical_source_device_id(source_root.path()).unwrap();
+        let (session, manifest_bytes) = prepared_delta_source(source_root.path());
+        let state = PeerDeltaCommandState::default();
+        let prepared = state
+            .install_source(session, &source_device_id, manifest_bytes)
+            .unwrap();
+        state
+            .configure_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let running = state
+            .start_source(prepared.session_id.as_deref().unwrap(), Ipv4Addr::LOCALHOST)
+            .unwrap();
+        let pairing = url::Url::parse(running.pairing_uri.as_deref().unwrap()).unwrap();
+        let endpoint = pairing
+            .query_pairs()
+            .find(|(key, _)| key == "endpoint")
+            .unwrap()
+            .1
+            .into_owned();
+        let claim = pairing.fragment().unwrap().strip_prefix("claim=").unwrap();
+        let mut client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            prepared.session_id.as_deref().unwrap(),
+            prepared.manifest_id.as_deref().unwrap(),
+            claim,
+        )
+        .unwrap();
+        let (remote_manifest, completion) = fetch_delta_manifest_and_completion(&client).unwrap();
+        let attempt = completion.unwrap();
+        assert_eq!(attempt.mode, DeltaCompletionMode::CompletionV1);
 
-        record_delta_completion(directory.path(), ACCOUNTING_SOURCE_ID, true, &completed);
-
-        assert!(matches!(completed, PeerDeltaPullResult::Updated { .. }));
+        let mut target_store = PersistentStore::open(target_root.path()).unwrap();
+        let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        let staged = pull_logical_delta_with_completion(
+            &mut target_store,
+            &target_cas,
+            target_root.path(),
+            &source_device_id,
+            0,
+            &remote_manifest,
+            &mut client,
+            &NeverCancelled,
+            Some(&attempt),
+        )
+        .unwrap();
         assert_eq!(
-            fs::read(directory.path().join("peer-sync/sources.json")).unwrap(),
-            before
+            staged,
+            PeerDeltaPullResult::NoChanges {
+                revision: 0,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+            }
         );
+        assert_eq!(accounting_source(target_root.path()).total_bytes, 0);
+
+        let completed = recover_delta_completion(
+            &mut target_store,
+            target_root.path(),
+            &mut LanDeltaCompletionTransport,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(completed.useful_bytes, 0);
+        assert!(PeerDeltaCompletionJournal::new(target_root.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(accounting_source(target_root.path()).total_bytes, 0);
+        let outgoing =
+            super::super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap();
+        assert_eq!(outgoing.devices()[0].total_bytes, 0);
+
+        state
+            .stop_source(prepared.session_id.as_deref().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn registered_v1_retry_reuses_lease_and_counts_source_proof_once() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id = canonical_source_device_id(source_root.path()).unwrap();
+
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        source_store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"side":"base"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let source_base = source_store
+            .seal_or_initialize_active_logical_generation(&source_cas)
+            .unwrap();
+
+        let mut target_store = PersistentStore::open(target_root.path()).unwrap();
+        target_store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"side":"base"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        let target_base = target_store
+            .seal_or_initialize_active_logical_generation(&target_cas)
+            .unwrap();
+        crate::persistent_store::establish_logical_common_base(
+            &mut target_store,
+            &target_cas,
+            &source_device_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &target_base.manifest.generation,
+            1,
+            &source_base.manifest_bytes,
+        )
+        .unwrap();
+
+        source_store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(json!({"side":"remote"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        drop(source_store);
+        let (session, manifest_bytes) = prepared_delta_source(source_root.path());
+        let state = PeerDeltaCommandState::default();
+        let prepared = state
+            .install_source(session, &source_device_id, manifest_bytes)
+            .unwrap();
+        state
+            .configure_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let running = state
+            .start_source(prepared.session_id.as_deref().unwrap(), Ipv4Addr::LOCALHOST)
+            .unwrap();
+        let pairing = url::Url::parse(running.pairing_uri.as_deref().unwrap()).unwrap();
+        let endpoint = pairing
+            .query_pairs()
+            .find(|(key, _)| key == "endpoint")
+            .unwrap()
+            .1
+            .into_owned();
+        let claim = pairing.fragment().unwrap().strip_prefix("claim=").unwrap();
+        let mut client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            prepared.session_id.as_deref().unwrap(),
+            prepared.manifest_id.as_deref().unwrap(),
+            claim,
+        )
+        .unwrap();
+        let (remote_manifest, first_completion) =
+            fetch_delta_manifest_and_completion(&client).unwrap();
+        let first_attempt = first_completion.unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let mut cancelling_source = CancellingLanSource {
+            client: &mut client,
+            cancelled,
+        };
+
+        assert_eq!(
+            pull_logical_delta_with_completion(
+                &mut target_store,
+                &target_cas,
+                target_root.path(),
+                &source_device_id,
+                1,
+                &remote_manifest,
+                &mut cancelling_source,
+                &cancellation,
+                Some(&first_attempt),
+            )
+            .unwrap_err(),
+            PeerSyncError::Cancelled
+        );
+        assert!(PeerDeltaCompletionJournal::new(target_root.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(accounting_source(target_root.path()).total_bytes, 0);
+
+        let (retry_manifest, retry_completion) =
+            fetch_delta_manifest_and_completion(&client).unwrap();
+        let retry_attempt = retry_completion.unwrap();
+        assert_eq!(retry_attempt.operation_id, first_attempt.operation_id);
+        assert!(matches!(
+            pull_logical_delta_with_completion(
+                &mut target_store,
+                &target_cas,
+                target_root.path(),
+                &source_device_id,
+                1,
+                &retry_manifest,
+                &mut client,
+                &NeverCancelled,
+                Some(&retry_attempt),
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Updated { .. }
+        ));
+
+        let completed = recover_delta_completion(
+            &mut target_store,
+            target_root.path(),
+            &mut LanDeltaCompletionTransport,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(completed.useful_bytes > 0);
+        assert_eq!(
+            accounting_source(target_root.path()).total_bytes,
+            completed.useful_bytes
+        );
+        let outgoing =
+            super::super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+                .unwrap();
+        assert_eq!(outgoing.devices()[0].total_bytes, completed.useful_bytes);
+        assert!(outgoing
+            .has_exact_completion_receipt(
+                &outgoing.devices()[0].device_id,
+                super::super::device_registry::CompletionLane::Delta,
+                &first_attempt.operation_id,
+                prepared.manifest_id.as_deref().unwrap(),
+                completed.useful_bytes,
+            )
+            .unwrap());
+        assert!(recover_delta_completion(
+            &mut target_store,
+            target_root.path(),
+            &mut LanDeltaCompletionTransport,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            accounting_source(target_root.path()).total_bytes,
+            completed.useful_bytes
+        );
+
+        state
+            .stop_source(prepared.session_id.as_deref().unwrap())
+            .unwrap();
     }
 
     #[test]

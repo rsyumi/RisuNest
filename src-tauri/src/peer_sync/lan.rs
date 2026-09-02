@@ -7222,6 +7222,7 @@ mod timeout_tests {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let accounting_root = tempfile::tempdir().unwrap();
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
             generation: "generation-1".to_owned(),
@@ -7274,6 +7275,19 @@ mod timeout_tests {
             &pairing.claim,
         )
         .unwrap();
+        register_outgoing_claim(
+            accounting_root.path(),
+            OutgoingDevice {
+                device_id: client.device_id.clone(),
+                name: "legacy logical target".to_owned(),
+                bearer_digest: hex::encode(digest(client.bearer.as_bytes())),
+                permissions: DevicePermissions::read(),
+                created_at_ms: 1,
+                last_seen_ms: 1,
+                total_bytes: 11,
+            },
+        )
+        .unwrap();
 
         assert_eq!(client.source_device_id(), source_device_id);
         assert_eq!(client.fetch_manifest().unwrap(), built.manifest_bytes);
@@ -7293,6 +7307,13 @@ mod timeout_tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].verified_bytes, received.len() as u64);
         assert_eq!(devices[0].current_object, None);
+        assert_eq!(
+            OutgoingDeviceRegistry::load(accounting_root.path())
+                .unwrap()
+                .devices()[0]
+                .total_bytes,
+            11
+        );
 
         assert!(host.revoke(&client.device_id));
         assert!(matches!(
