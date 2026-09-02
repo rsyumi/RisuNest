@@ -1553,16 +1553,15 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
     assert!(report.verified_objects >= 1);
     assert!(report.transferred_bytes >= 64);
     let outgoing_path = source_root.path().join("peer-sync/devices.json");
-    let mut outgoing: Value = serde_json::from_slice(&fs::read(&outgoing_path).unwrap()).unwrap();
+    let outgoing: Value = serde_json::from_slice(&fs::read(&outgoing_path).unwrap()).unwrap();
     let offer = outgoing["completionOffers"]
-        .as_array_mut()
+        .as_array()
         .unwrap()
-        .iter_mut()
+        .iter()
         .find(|offer| offer["leaseId"] == completion_lease_id)
         .unwrap();
     assert_eq!(offer["ready"], true);
-    offer["ready"] = Value::Bool(false);
-    fs::write(&outgoing_path, serde_json::to_vec(&outgoing).unwrap()).unwrap();
+    host.stop().unwrap();
     drop(reopened);
     let resumed_registry =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
@@ -1587,7 +1586,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
         .unwrap(),
         super::device_registry::CompletionAcceptance::Recorded
     );
-    host.stop().unwrap();
 }
 
 #[test]

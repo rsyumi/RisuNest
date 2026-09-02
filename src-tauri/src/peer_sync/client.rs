@@ -173,6 +173,7 @@ struct LedgerState {
     manifest_id: Option<String>,
     objects: BTreeMap<String, ObjectProgress>,
     activated: bool,
+    terminal_progress_lease_id: Option<CompletionLeaseId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +189,10 @@ enum LedgerEvent {
     },
     Activated {
         manifest_id: String,
+    },
+    TerminalProgress {
+        manifest_id: String,
+        completion_lease_id: String,
     },
 }
 
@@ -851,7 +856,7 @@ impl LoopbackCloneClient {
     }
 
     fn report_verified_progress(
-        &self,
+        &mut self,
         manifest: &CloneManifest,
         current_object: Option<&str>,
     ) -> Result<(), PeerSyncError> {
@@ -859,6 +864,21 @@ impl LoopbackCloneClient {
             return Ok(());
         }
         let verified_bytes = self.verified_bytes(manifest)?;
+        let total_bytes = manifest
+            .objects
+            .values()
+            .try_fold(0_u64, |total, object| total.checked_add(object.size))
+            .ok_or_else(|| PeerSyncError::Protocol("clone byte count overflow".to_owned()))?;
+        let terminal_lease_id = if current_object.is_none() && verified_bytes == total_bytes {
+            self.completion_lease_id.clone()
+        } else {
+            None
+        };
+        if terminal_lease_id.as_ref() == self.ledger.terminal_progress_lease_id.as_ref()
+            && terminal_lease_id.is_some()
+        {
+            return Ok(());
+        }
         let mut progress = serde_json::json!({
             "verifiedBytes": verified_bytes,
             "currentObject": current_object,
@@ -881,6 +901,16 @@ impl LoopbackCloneClient {
                 "progress request returned {}",
                 response.status()
             )));
+        }
+        if let Some(lease_id) = terminal_lease_id {
+            let manifest_id = self.ledger.manifest_id.clone().ok_or_else(|| {
+                PeerSyncError::Storage("clone terminal progress ledger has no manifest".to_owned())
+            })?;
+            self.append_event(&LedgerEvent::TerminalProgress {
+                manifest_id,
+                completion_lease_id: lease_id.as_str().to_owned(),
+            })?;
+            self.ledger.terminal_progress_lease_id = Some(lease_id);
         }
         Ok(())
     }
@@ -976,13 +1006,62 @@ impl LoopbackCloneClient {
         bytes.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .read(true)
+            .write(true)
             .open(self.root.join("ledger.jsonl"))?;
-        file.write_all(&bytes)?;
-        file.flush()?;
-        file.sync_all()?;
+        let original_len = repair_ledger_tail_for_append(&mut file)?;
+        if let Err(error) = (|| {
+            file.write_all(&bytes)?;
+            file.flush()?;
+            file.sync_all()
+        })() {
+            let rollback = file.set_len(original_len).and_then(|()| file.sync_all());
+            return match rollback {
+                Ok(()) => Err(error.into()),
+                Err(rollback) => Err(PeerSyncError::Storage(format!(
+                    "clone ledger append failed: {error}; rollback failed: {rollback}"
+                ))),
+            };
+        }
         Ok(())
     }
+}
+
+fn repair_ledger_tail_for_append(file: &mut File) -> Result<u64, PeerSyncError> {
+    const SCAN_BYTES: usize = 4 * 1024;
+
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(length);
+    }
+
+    let mut end = length;
+    let mut buffer = [0_u8; SCAN_BYTES];
+    while end > 0 {
+        let read = end.min(SCAN_BYTES as u64) as usize;
+        let start = end - read as u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..read])?;
+        if let Some(index) = buffer[..read].iter().rposition(|byte| *byte == b'\n') {
+            let valid_len = start + index as u64 + 1;
+            file.set_len(valid_len)?;
+            file.sync_all()?;
+            file.seek(SeekFrom::End(0))?;
+            return Ok(valid_len);
+        }
+        end = start;
+    }
+    file.set_len(0)?;
+    file.sync_all()?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1344,6 +1423,22 @@ fn load_ledger(path: &Path) -> Result<LedgerState, PeerSyncError> {
                 }
                 ledger.activated = true;
             }
+            LedgerEvent::TerminalProgress {
+                manifest_id,
+                completion_lease_id,
+            } => {
+                if ledger.manifest_id.as_deref() != Some(&manifest_id) {
+                    return Err(PeerSyncError::Storage(
+                        "clone terminal progress ledger references another manifest".to_owned(),
+                    ));
+                }
+                ledger.terminal_progress_lease_id =
+                    Some(CompletionLeaseId::parse(&completion_lease_id).map_err(|_| {
+                        PeerSyncError::Storage(
+                            "clone terminal progress ledger has an invalid lease".to_owned(),
+                        )
+                    })?);
+            }
         }
     }
     drop(reader);
@@ -1447,6 +1542,124 @@ fn transport_error(error: impl std::fmt::Display) -> PeerSyncError {
 mod timeout_tests {
     use super::*;
 
+    fn terminal_progress_manifest() -> (CloneManifest, String) {
+        let object_hash = sha256_hex(&[]);
+        let manifest = CloneManifest {
+            schema: super::super::protocol::CLONE_MANIFEST_SCHEMA.to_owned(),
+            session_id: "terminal-progress".to_owned(),
+            source_revision: 1,
+            created_at: "2026-09-02T00:00:00Z".to_owned(),
+            chunk_size: super::super::protocol::CLONE_CHUNK_SIZE,
+            database: super::super::protocol::CloneDatabase {
+                format: super::super::protocol::CLONE_DATABASE_FORMAT.to_owned(),
+                object: object_hash.clone(),
+            },
+            payloads: Vec::new(),
+            objects: BTreeMap::from([(
+                object_hash.clone(),
+                super::super::protocol::ObjectDescriptor {
+                    size: 0,
+                    sha256: object_hash,
+                    chunks: Vec::new(),
+                },
+            )]),
+        };
+        let manifest_id = sha256_hex(&manifest.canonical_bytes().expect("manifest bytes"));
+        (manifest, manifest_id)
+    }
+
+    fn terminal_progress_client(
+        staging_root: &Path,
+        address: std::net::SocketAddr,
+        lease_id: &str,
+    ) -> LoopbackCloneClient {
+        fs::create_dir_all(staging_root).expect("create staging root");
+        let root = fs::canonicalize(staging_root).expect("canonical staging root");
+        let (manifest, manifest_id) = terminal_progress_manifest();
+        let ledger = load_ledger(&root.join("ledger.jsonl")).expect("load ledger");
+        let mut client = LoopbackCloneClient {
+            root,
+            transport: HttpCloneTransport {
+                session_url: Url::parse(&format!("http://{address}/v1/sessions/terminal-progress"))
+                    .expect("session URL"),
+                http: Client::builder().no_proxy().build().expect("HTTP client"),
+                ranges: HttpRangeStream::new(Duration::from_secs(1)).expect("range client"),
+                bearer: Some("registered-bearer".to_owned()),
+            },
+            required_manifest_id: Some(manifest_id.clone()),
+            source_device_id: Some("00000000-0000-4000-8000-000000000403".to_owned()),
+            manifest: Some(manifest),
+            manifest_id: Some(manifest_id.clone()),
+            ledger,
+            completion_v1: true,
+            completion_lease_id: Some(CompletionLeaseId::parse(lease_id).expect("lease ID")),
+            fail_after_cas_promotion: false,
+            pause_after_cas_promotion: None,
+            pause_after_verified_chunk: None,
+            fail_record_activation: false,
+        };
+        if client.ledger.manifest_id.is_none() {
+            client
+                .append_event(&LedgerEvent::Manifest {
+                    manifest_id: manifest_id.clone(),
+                })
+                .expect("record manifest");
+            client.ledger.manifest_id = Some(manifest_id);
+        }
+        client
+    }
+
+    fn terminal_progress_server(
+        response_count: usize,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        use std::net::{Shutdown, TcpListener};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind progress fixture");
+        let address = listener.local_addr().expect("progress fixture address");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..response_count {
+                let (mut stream, _) = listener.accept().expect("accept progress request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone progress stream"));
+                let mut request = String::new();
+                let mut content_length = 0_usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read progress request");
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().expect("content length");
+                    }
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0_u8; content_length];
+                reader.read_exact(&mut body).expect("read progress body");
+                request.push_str(std::str::from_utf8(&body).expect("progress body UTF-8"));
+                requests.push(request);
+                drop(reader);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("write progress response");
+                stream.flush().expect("flush progress response");
+                stream
+                    .shutdown(Shutdown::Write)
+                    .expect("finish progress response");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("set progress drain timeout");
+                let mut drain = [0_u8; 64];
+                while stream.read(&mut drain).is_ok_and(|read| read != 0) {}
+            }
+            requests
+        });
+        (address, server)
+    }
+
     #[test]
     fn clone_http_control_requests_keep_a_short_total_timeout() {
         let transport = HttpCloneTransport {
@@ -1461,6 +1674,108 @@ mod timeout_tests {
             .build()
             .unwrap();
         assert_eq!(control.timeout(), Some(&CONTROL_REQUEST_TIMEOUT));
+    }
+
+    #[test]
+    fn successful_terminal_progress_is_not_reposted_for_the_same_lease_after_restart() {
+        let staging = tempfile::tempdir().expect("staging parent");
+        let transfer_root = staging.path().join("transfer");
+        let lease_id = "00000000-0000-4000-8000-000000000411";
+        let (address, server) = terminal_progress_server(1);
+        let mut first = terminal_progress_client(&transfer_root, address, lease_id);
+
+        first
+            .report_terminal_progress()
+            .expect("initial terminal progress");
+        assert_eq!(server.join().expect("join progress fixture").len(), 1);
+        drop(first);
+
+        let mut restarted = terminal_progress_client(&transfer_root, address, lease_id);
+        restarted
+            .report_terminal_progress()
+            .expect("durably acknowledged terminal progress must work offline");
+    }
+
+    #[test]
+    fn terminal_progress_acknowledgement_is_exact_to_the_completion_lease() {
+        let staging = tempfile::tempdir().expect("staging parent");
+        let transfer_root = staging.path().join("transfer");
+        let first_lease = "00000000-0000-4000-8000-000000000412";
+        let second_lease = "00000000-0000-4000-8000-000000000413";
+        let (first_address, first_server) = terminal_progress_server(1);
+        let mut first = terminal_progress_client(&transfer_root, first_address, first_lease);
+        first
+            .report_terminal_progress()
+            .expect("first terminal progress");
+        assert_eq!(first_server.join().expect("join first fixture").len(), 1);
+        drop(first);
+
+        let (second_address, second_server) = terminal_progress_server(1);
+        let mut second = terminal_progress_client(&transfer_root, second_address, second_lease);
+        second
+            .report_terminal_progress()
+            .expect("different lease must be reported");
+        let requests = second_server.join().expect("join second fixture");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(second_lease));
+        assert!(!requests[0].contains(first_lease));
+        drop(second);
+
+        let mut old_lease = terminal_progress_client(&transfer_root, second_address, first_lease);
+        assert!(old_lease.report_terminal_progress().is_err());
+    }
+
+    #[test]
+    fn terminal_progress_ack_write_failure_retries_after_remote_success() {
+        let staging = tempfile::tempdir().expect("staging parent");
+        let transfer_root = staging.path().join("transfer");
+        let displaced_root = staging.path().join("displaced-transfer");
+        let lease_id = "00000000-0000-4000-8000-000000000414";
+        let (address, server) = terminal_progress_server(2);
+        let mut client = terminal_progress_client(&transfer_root, address, lease_id);
+        fs::rename(&transfer_root, &displaced_root).expect("displace transfer root");
+
+        assert!(matches!(
+            client.report_terminal_progress(),
+            Err(PeerSyncError::Storage(_))
+        ));
+        fs::rename(&displaced_root, &transfer_root).expect("restore transfer root");
+        client
+            .report_terminal_progress()
+            .expect("retry terminal progress after restoring ledger");
+        assert_eq!(server.join().expect("join progress fixture").len(), 2);
+        drop(client);
+
+        let mut restarted = terminal_progress_client(&transfer_root, address, lease_id);
+        restarted
+            .report_terminal_progress()
+            .expect("retried acknowledgement must survive restart");
+    }
+
+    #[test]
+    fn terminal_progress_retry_repairs_a_partial_acknowledgement_append() {
+        let staging = tempfile::tempdir().expect("staging parent");
+        let transfer_root = staging.path().join("transfer");
+        let lease_id = "00000000-0000-4000-8000-000000000415";
+        let (address, server) = terminal_progress_server(1);
+        let mut client = terminal_progress_client(&transfer_root, address, lease_id);
+        OpenOptions::new()
+            .append(true)
+            .open(transfer_root.join("ledger.jsonl"))
+            .expect("open ledger")
+            .write_all(b"{\"kind\":\"terminal-progress\"")
+            .expect("write failed append prefix");
+
+        client
+            .report_terminal_progress()
+            .expect("retry terminal progress after partial append");
+        assert_eq!(server.join().expect("join progress fixture").len(), 1);
+        drop(client);
+
+        let mut restarted = terminal_progress_client(&transfer_root, address, lease_id);
+        restarted
+            .report_terminal_progress()
+            .expect("repaired acknowledgement must survive restart");
     }
 
     fn assert_resume_manifest_rejects_response_lease(

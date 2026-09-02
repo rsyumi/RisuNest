@@ -4813,12 +4813,36 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Target"
         );
+        {
+            let mut runtime = source.lock_runtime().unwrap();
+            runtime
+                .source
+                .as_mut()
+                .unwrap()
+                .host
+                .as_mut()
+                .unwrap()
+                .stop()
+                .unwrap();
+        }
         drop(target);
         let target = PeerCloneCommandState::default();
         target
             .resume_target_download(&target_root.path().join("peer-sync"), request.clone())
             .unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        {
+            let mut runtime = source.lock_runtime().unwrap();
+            runtime
+                .source
+                .as_mut()
+                .unwrap()
+                .host
+                .as_mut()
+                .unwrap()
+                .start_fixed_on(Ipv4Addr::UNSPECIFIED, bound.port())
+                .unwrap();
+        }
         let operation_id = target
             .lock_runtime()
             .unwrap()
