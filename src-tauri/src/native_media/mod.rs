@@ -61,10 +61,18 @@ pub(crate) struct EncodedInlayImage {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InlayEncodeOptions {
     format: InlayEncodeFormat,
+    #[serde(deserialize_with = "deserialize_inlay_quality")]
     quality: u8,
     #[serde(deserialize_with = "deserialize_inlay_max_dimension")]
     max_dimension: u32,
     skip_reencode: bool,
+}
+
+fn deserialize_inlay_quality<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(u8::deserialize(deserializer)?.clamp(1, 100))
 }
 
 fn deserialize_inlay_max_dimension<'de, D>(deserializer: D) -> Result<u32, D::Error>

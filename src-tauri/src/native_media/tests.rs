@@ -723,6 +723,21 @@ fn native_options_clamp_max_dimension_before_original_mode_ignores_it() {
 }
 
 #[test]
+fn native_options_clamp_webp_quality_to_the_encoder_range() {
+    for (input, expected) in [(0, 1), (1, 1), (70, 70), (100, 100), (101, 100), (255, 100)] {
+        let options: InlayEncodeOptions = serde_json::from_value(json!({
+            "format": "webp",
+            "quality": input,
+            "maxDimension": 0,
+            "skipReencode": false,
+        }))
+        .unwrap();
+
+        assert_eq!(options.quality, expected);
+    }
+}
+
+#[test]
 fn configured_png_converts_jpeg_and_webp_sources() {
     for (name, source) in [
         ("jpeg", encoded_fixture(ImageFormat::Jpeg, 9, 4)),
