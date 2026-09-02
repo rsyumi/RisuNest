@@ -4056,24 +4056,14 @@ fn deferred_source_completion_allows_cleanup(
     }
     let lane = super::device_registry::CompletionLane::Bidirectional;
     let manifest_id = &evidence.expected_source_generation.manifest_hash;
-    let Some(useful_bytes) = super::device_registry::outgoing_completion_lease_ready_bytes(
+    Ok(super::device_registry::outgoing_completion_receipt_bytes(
         app_root,
         &evidence.target_device_id,
         lane,
         &evidence.operation_id,
         manifest_id,
     )?
-    else {
-        return Ok(false);
-    };
-    super::device_registry::outgoing_completion_receipt_matches(
-        app_root,
-        &evidence.target_device_id,
-        lane,
-        &evidence.operation_id,
-        manifest_id,
-        useful_bytes,
-    )
+    .is_some())
 }
 
 fn require_deferred_source_completion_cleanup(
@@ -5790,6 +5780,12 @@ impl PeerBidirectionalCommandState {
                 }
             }
             PeerBidirectionalDurableOperation::TargetPrepared { context, .. } => {
+                abandon_target_completion_delivery(app_root, &context)?;
+                journal.abandon(operation_id)
+            }
+            PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
+                if context.completion_mode == PeerBidirectionalCompletionMode::V1 =>
+            {
                 abandon_target_completion_delivery(app_root, &context)?;
                 journal.abandon(operation_id)
             }

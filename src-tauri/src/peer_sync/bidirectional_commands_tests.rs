@@ -4452,7 +4452,17 @@ fn explicit_v1_target_abandon_cleans_only_its_delivery_and_allows_source_removal
             shared_generation: generation("shared-v1", "1", 'e'),
             changed: false,
             remote_backup_required: false,
-            remote_apply_receipt: None,
+            remote_apply_receipt: Some(LanBidirectionalRemoteApplyReceipt {
+                committed_revision: 7,
+                committed_generation: LanBidirectionalGeneration {
+                    generation_id: "shared-v1".to_owned(),
+                    manifest_hash: "e".repeat(64),
+                    generation_sequence: "1".to_owned(),
+                },
+                transferred_objects: 1,
+                transferred_bytes: 13,
+                backup: None,
+            }),
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -10075,6 +10085,25 @@ fn deferred_v1_source_completed_ack_requires_exact_receipt_or_explicit_revoke() 
                 combined_bytes,
             )
             .unwrap();
+            super::super::device_registry::issue_outgoing_unmeasured_completion_offer(
+                directory.path(),
+                target_device_id,
+                super::super::device_registry::CompletionLane::Bidirectional,
+                &"f".repeat(64),
+                None,
+            )
+            .unwrap();
+            assert!(
+                super::super::device_registry::outgoing_completion_lease_ready_bytes(
+                    directory.path(),
+                    target_device_id,
+                    super::super::device_registry::CompletionLane::Bidirectional,
+                    &operation_id,
+                    &evidence.expected_source_generation.manifest_hash,
+                )
+                .unwrap()
+                .is_none()
+            );
         } else {
             super::super::device_registry::revoke_outgoing_device(
                 directory.path(),

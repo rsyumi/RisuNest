@@ -630,6 +630,26 @@ impl OutgoingDeviceRegistry {
         }))
     }
 
+    pub(crate) fn completion_receipt_bytes(
+        &self,
+        device_id: &str,
+        lane: CompletionLane,
+        lease_id: &str,
+        manifest_id: &str,
+    ) -> Result<Option<u64>, PeerSyncError> {
+        validate_completion_tuple(device_id, lane, lease_id, manifest_id)?;
+        let receipt_id = completion_receipt_id(lane.as_str(), lease_id, manifest_id);
+        Ok(self
+            .completed_receipts
+            .iter()
+            .find(|receipt| {
+                receipt.device_id == device_id
+                    && receipt.lane == lane.as_str()
+                    && receipt.receipt_id == receipt_id
+            })
+            .and_then(|receipt| receipt.transferred_bytes))
+    }
+
     pub(crate) fn completion_lease_allows_remote_apply(
         &self,
         device_id: &str,
@@ -1557,6 +1577,24 @@ pub(crate) fn outgoing_completion_receipt_matches(
         lease_id,
         manifest_id,
         transferred_bytes,
+    )
+}
+
+pub(crate) fn outgoing_completion_receipt_bytes(
+    app_root: &Path,
+    device_id: &str,
+    lane: CompletionLane,
+    lease_id: &str,
+    manifest_id: &str,
+) -> Result<Option<u64>, PeerSyncError> {
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    OutgoingDeviceRegistry::load(app_root)?.completion_receipt_bytes(
+        device_id,
+        lane,
+        lease_id,
+        manifest_id,
     )
 }
 
