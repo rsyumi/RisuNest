@@ -60,6 +60,10 @@ describe('RisuNestLogViewer', () => {
 
     beforeEach(() => {
         deviceSettings.reset()
+        nativeLog.getNativeLogTail.mockReset()
+        nativeLog.getNativeLogFilePath.mockReset()
+        nativeLog.setNativeLogFileEnabled.mockReset()
+        alerts.alertMd.mockReset()
         target = document.createElement('div')
         document.body.append(target)
         nativeLog.getNativeLogTail.mockResolvedValue([])
@@ -85,18 +89,28 @@ describe('RisuNestLogViewer', () => {
         await tick()
     }
 
-    it('keeps native entries out of the page until the explicit view action', async () => {
-        nativeLog.getNativeLogTail.mockResolvedValue([
+    async function settleAction() {
+        await Promise.resolve()
+        await Promise.resolve()
+        await tick()
+    }
+
+    it('fetches a fresh tail for view while keeping native entries off the page', async () => {
+        nativeLog.getNativeLogTail.mockResolvedValueOnce([
             { tsMs: 0, level: 'warn', target: 'native', message: 'older' },
             { tsMs: 1_000, level: 'error', target: 'native', message: 'newer' },
         ])
 
         await render()
 
+        expect(nativeLog.getNativeLogTail).not.toHaveBeenCalled()
         expect(target.textContent).not.toContain('newer')
         expect(target.textContent).not.toContain('older')
 
         target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
+        await settleAction()
+
+        expect(nativeLog.getNativeLogTail).toHaveBeenCalledOnce()
         expect(alerts.alertMd).toHaveBeenCalledWith(
             '[1970-01-01T00:00:01.000Z] [error] newer\n[1970-01-01T00:00:00.000Z] [warn] older',
         )
@@ -105,31 +119,78 @@ describe('RisuNestLogViewer', () => {
     it('shows the localized empty state', async () => {
         await render()
 
-        expect(target.textContent).toContain('No errors recorded.')
+        expect(target.textContent).not.toContain('No errors recorded.')
+        target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
+        await settleAction()
+        expect(alerts.alertMd).toHaveBeenCalledWith('No errors recorded.')
     })
 
-    it('views logs with alertMd and copies with the project clipboard fallback', async () => {
-        nativeLog.getNativeLogTail.mockResolvedValue([
-            { tsMs: 0, level: 'error', target: 'native', message: 'failure' },
+    it('fetches a fresh tail for copy and uses the project clipboard fallback', async () => {
+        nativeLog.getNativeLogTail.mockResolvedValueOnce([
+            { tsMs: 1_000, level: 'error', target: 'native', message: 'post-mount failure' },
         ])
         Object.defineProperty(document, 'execCommand', {
             configurable: true,
             value: vi.fn(() => true),
         })
         const execCommand = vi.spyOn(document, 'execCommand')
+        const writeText = vi.fn(async () => { throw new Error('denied') })
         Object.defineProperty(navigator, 'clipboard', {
             configurable: true,
-            value: { writeText: vi.fn(async () => { throw new Error('denied') }) },
+            value: { writeText },
         })
         await render()
 
-        target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
         target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
-        await Promise.resolve()
-        await Promise.resolve()
+        await settleAction()
 
-        expect(alerts.alertMd).toHaveBeenCalledWith('[1970-01-01T00:00:00.000Z] [error] failure')
+        expect(nativeLog.getNativeLogTail).toHaveBeenCalledOnce()
+        expect(writeText).toHaveBeenCalledWith(
+            '[1970-01-01T00:00:01.000Z] [error] post-mount failure',
+        )
+        expect(document.querySelector('textarea')).toBeNull()
         expect(execCommand).toHaveBeenCalledWith('copy')
+    })
+
+    it('ignores a stale view result when a newer view finishes first', async () => {
+        await render()
+        const resolvers: Array<(entries: Array<{ tsMs: number, level: string, target: string, message: string }>) => void> = []
+        nativeLog.getNativeLogTail.mockImplementation(() => new Promise((resolve) => {
+            resolvers.push(resolve)
+        }))
+
+        const viewButton = target.querySelector<HTMLButtonElement>('[data-view-log]')!
+        viewButton.click()
+        viewButton.click()
+        expect(resolvers).toHaveLength(2)
+        resolvers[1]([{ tsMs: 2_000, level: 'error', target: 'native', message: 'newest' }])
+        await settleAction()
+        resolvers[0]([{ tsMs: 1_000, level: 'error', target: 'native', message: 'stale' }])
+        await settleAction()
+
+        expect(alerts.alertMd).toHaveBeenCalledOnce()
+        expect(alerts.alertMd).toHaveBeenCalledWith('[1970-01-01T00:00:02.000Z] [error] newest')
+    })
+
+    it('ignores a stale copy result when a newer copy finishes first', async () => {
+        await render()
+        const resolvers: Array<(entries: Array<{ tsMs: number, level: string, target: string, message: string }>) => void> = []
+        nativeLog.getNativeLogTail.mockImplementation(() => new Promise((resolve) => {
+            resolvers.push(resolve)
+        }))
+        const writeText = vi.spyOn(navigator.clipboard, 'writeText')
+
+        const copyButton = target.querySelector<HTMLButtonElement>('[data-copy-log]')!
+        copyButton.click()
+        copyButton.click()
+        expect(resolvers).toHaveLength(2)
+        resolvers[1]([{ tsMs: 2_000, level: 'error', target: 'native', message: 'newest' }])
+        await settleAction()
+        resolvers[0]([{ tsMs: 1_000, level: 'error', target: 'native', message: 'stale' }])
+        await settleAction()
+
+        expect(writeText).toHaveBeenCalledOnce()
+        expect(writeText).toHaveBeenCalledWith('[1970-01-01T00:00:02.000Z] [error] newest')
     })
 
     it('synchronizes file logging with native state and device settings', async () => {
@@ -154,14 +215,31 @@ describe('RisuNestLogViewer', () => {
     })
 
     it('shows localized failure copy without rendering raw command details', async () => {
-        nativeLog.getNativeLogTail.mockRejectedValue(new Error('native command detail'))
+        nativeLog.getNativeLogTail.mockRejectedValueOnce(new Error('native command detail'))
         const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         await render()
+
+        target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
+        await settleAction()
 
         expect(target.textContent).toContain('Localized error')
         expect(target.textContent).not.toContain('native command detail')
         expect(error).not.toHaveBeenCalled()
+        expect(alerts.alertMd).not.toHaveBeenCalled()
         expect(target.querySelector('[role="alert"][aria-live="assertive"]')).not.toBeNull()
+    })
+
+    it('maps a copy tail failure to localized safe copy', async () => {
+        nativeLog.getNativeLogTail.mockRejectedValueOnce(new Error('copy command detail'))
+        const writeText = vi.spyOn(navigator.clipboard, 'writeText')
+        await render()
+
+        target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
+        await settleAction()
+
+        expect(target.textContent).toContain('Localized error')
+        expect(target.textContent).not.toContain('copy command detail')
+        expect(writeText).not.toHaveBeenCalled()
     })
 
     it('disables the file logging checkbox while its native update is pending', async () => {

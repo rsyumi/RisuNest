@@ -21,7 +21,7 @@ fn keeps_a_fifo_ring_and_returns_the_newest_tail() {
 #[test]
 fn serializes_timestamp_and_masks_sensitive_values_before_every_sink() {
     let state = NativeLogState::for_tests();
-    state.record("error", "test", "Authorization: Bearer secret-token x-api-key: key-value sk-abcdefghijklmnopqrstuvwxyz 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    state.record("error", "test", "Authorization: Bearer secret-token\nx-api-key: key-value\nsk-abcdefghijklmnopqrstuvwxyz\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     let entry = state.tail(None).pop().unwrap();
     assert!(entry.ts_ms > 0);
     assert_eq!(entry.level, "error");
@@ -30,6 +30,10 @@ fn serializes_timestamp_and_masks_sensitive_values_before_every_sink() {
     assert!(!entry.message.contains("key-value"));
     assert!(!entry.message.contains("sk-abcdefghijklmnopqrstuvwxyz"));
     assert!(!entry.message.contains("0123456789abcdef"));
+    assert_eq!(
+        entry.message,
+        "Authorization: ***\nx-api-key: ***\n***\n***"
+    );
     assert!(serde_json::to_value(entry).unwrap()["tsMs"].is_number());
 }
 
@@ -39,7 +43,7 @@ fn masks_sk_secrets_only_at_token_boundaries() {
     let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
     state.record("info", "test", format!("token {secret}"));
     let entry = state.tail(None).pop().unwrap();
-    assert!(!entry.message.contains(secret));
+    assert_eq!(entry.message, "token ***");
 
     let ordinary = "ask-me-later desk-chair prefixsk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
     state.record("info", "test", ordinary);
@@ -50,17 +54,40 @@ fn masks_sk_secrets_only_at_token_boundaries() {
 fn masks_complete_authorization_values_for_every_scheme_case_insensitively() {
     let state = NativeLogState::for_tests();
     let cases = [
-        "Authorization: Bearer fixture-bearer-material\r\nmethod=GET",
-        "authorization: Basic fixture-basic-material\r\nmethod=GET",
-        "AUTHORIZATION: Custom fixture-custom-material\r\nmethod=GET",
+        (
+            "Authorization: Bearer fixture-bearer-material\r\nmethod=GET",
+            "Authorization: ***\r\nmethod=GET",
+        ),
+        (
+            "authorization: Basic fixture-basic-material\r\nmethod=GET",
+            "authorization: ***\r\nmethod=GET",
+        ),
+        (
+            "AUTHORIZATION: Custom fixture-custom-material\r\nmethod=GET",
+            "AUTHORIZATION: ***\r\nmethod=GET",
+        ),
     ];
 
-    for message in cases {
+    for (message, expected) in cases {
         state.record("info", "test", message);
         let masked = state.tail(Some(1)).pop().unwrap().message;
-        assert!(!masked.contains("fixture-"), "unmasked message: {masked}");
-        assert!(masked.contains("method=GET"));
+        assert_eq!(masked, expected);
     }
+}
+
+#[test]
+fn uses_the_exact_spec_replacement_for_bearer_x_api_key_and_long_tokens() {
+    let state = NativeLogState::for_tests();
+    state.record(
+        "info",
+        "test",
+        "Bearer short-secret, x-api-key: second-secret\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+
+    assert_eq!(
+        state.tail(Some(1)).pop().unwrap().message,
+        "Bearer ***, x-api-key: ***\n***"
+    );
 }
 
 #[test]
@@ -73,29 +100,21 @@ fn masks_json_and_query_secret_values_without_hiding_safe_fields() {
     );
 
     let masked = state.tail(Some(1)).pop().unwrap().message;
-    assert!(
-        !masked.contains("fixture-json"),
-        "unmasked message: {masked}"
+    assert_eq!(
+        masked,
+        r#"payload={"authorization":"***","api_key":"***","access_token":"***","safe":"visible"} url=/path?token=***&x-api-key=***&safe=visible"#
     );
-    assert!(
-        !masked.contains("fixture-query"),
-        "unmasked message: {masked}"
-    );
-    assert!(masked.contains(r#""safe":"visible""#));
-    assert!(masked.contains("safe=visible"));
 }
 
 #[test]
-fn formats_debug_console_output_only_after_masking() {
+fn formats_console_output_only_after_masking() {
     let line = format_console_line(
         "error",
         "native_log",
         "Authorization: Basic fixture-console-secret\r\nmethod=GET",
     );
 
-    assert!(!line.contains("fixture-console-secret"));
-    assert!(line.contains("[REDACTED]"));
-    assert!(line.contains("method=GET"));
+    assert_eq!(line, "[error] native_log: Authorization: ***\r\nmethod=GET");
 }
 
 #[test]
@@ -242,7 +261,7 @@ fn panic_capture_includes_payload_and_location() {
 #[test]
 fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
     let state = NativeLogState::for_tests();
-    let previous = std::panic::take_hook();
+    let original = std::panic::take_hook();
     let previous_called = Arc::new(AtomicBool::new(false));
     let previous_called_by_hook = previous_called.clone();
     std::panic::set_hook(Box::new(move |_| {
@@ -251,7 +270,8 @@ fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
     install_panic_hook_for(state.clone());
     let _ = std::panic::catch_unwind(|| panic!("captured panic"));
     let installed = std::panic::take_hook();
-    std::panic::set_hook(previous);
+    std::panic::set_hook(original);
+    drop(installed);
 
     assert!(!previous_called.load(Ordering::SeqCst));
     assert!(state.tail(None).iter().any(|entry| {
@@ -259,7 +279,6 @@ fn panic_hook_captures_the_payload_without_forwarding_the_raw_previous_hook() {
             && entry.message.contains("captured panic")
             && entry.message.contains("tests.rs")
     }));
-    drop(installed);
 }
 
 #[test]
@@ -275,9 +294,10 @@ fn panic_hook_does_not_forward_sensitive_payloads_to_the_previous_hook() {
     let _ = std::panic::catch_unwind(|| panic!("Authorization: Bearer fixture-panic-secret"));
     let installed = std::panic::take_hook();
     std::panic::set_hook(original);
+    drop(installed);
 
     assert!(!previous_called.load(Ordering::SeqCst));
     let entry = state.tail(Some(1)).pop().unwrap();
     assert!(!entry.message.contains("fixture-panic-secret"));
-    drop(installed);
+    assert!(entry.message.contains("Authorization: ***"));
 }

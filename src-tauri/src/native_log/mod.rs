@@ -223,12 +223,12 @@ fn redact_json_value(input: &str, key: &str) -> String {
 
         if input.as_bytes().get(value_start) == Some(&b'\"') {
             result.push('\"');
-            result.push_str("[REDACTED]");
+            result.push_str("***");
             let value = &input[value_start + 1..];
             let end = find_json_string_end(value).unwrap_or(value.len());
             cursor = value_start + 1 + end;
         } else {
-            result.push_str("[REDACTED]");
+            result.push_str("***");
             let value = &input[value_start..];
             let end = value
                 .find(|character: char| {
@@ -291,8 +291,8 @@ fn redact_sk_tokens(input: &str) -> String {
             continue;
         }
 
-        output.push_str(&input[cursor..value_start]);
-        output.push_str("[REDACTED]");
+        output.push_str(&input[cursor..start]);
+        output.push_str("***");
         let end = value_start
             + input[value_start..]
                 .find(|character: char| !is_secret_token_character(character))
@@ -319,7 +319,7 @@ fn redact_after_until(input: &str, label: &str, is_terminator: impl Fn(char) -> 
         let suffix = &input[value_start..];
         let trimmed = suffix.len() - suffix.trim_start().len();
         result.push_str(&suffix[..trimmed]);
-        result.push_str("[REDACTED]");
+        result.push_str("***");
         let end = value_start
             + trimmed
             + suffix[trimmed..]
@@ -409,7 +409,7 @@ fn redact_long_runs(input: &str) -> String {
 
 fn append_run(output: &mut String, run: &mut String) {
     if run.len() >= 64 {
-        output.push_str("[REDACTED]");
+        output.push_str("***");
     } else {
         output.push_str(run);
     }
@@ -435,6 +435,10 @@ pub(crate) fn install_panic_hook() {
 }
 
 fn install_panic_hook_for(state: NativeLogState) {
+    // PanicHookInfo exposes the original payload by reference and cannot be
+    // forwarded with a redacted replacement. Recreate the useful default
+    // diagnostic from masked payload and location instead of invoking a
+    // previous hook with raw data.
     std::panic::set_hook(Box::new(move |info| {
         let payload = info
             .payload()
@@ -448,7 +452,6 @@ fn install_panic_hook_for(state: NativeLogState) {
             state.record("panic", "panic", payload);
             payload.to_owned()
         };
-        #[cfg(debug_assertions)]
         eprintln!("{}", format_console_line("panic", "panic", &message));
     }));
 }

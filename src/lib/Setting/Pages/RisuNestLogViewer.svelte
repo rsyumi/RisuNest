@@ -15,36 +15,36 @@
     } from 'src/ts/storage/deviceSettings'
 
     let entries = $state<NativeLogEntry[]>([])
+    let logLoaded = $state(false)
     let errorMessage = $state('')
     let fileLogEnabled = $state(getDeviceSettings().nativeFileLogEnabled)
     let fileLogPath = $state('')
     let fileLogUpdatePending = $state(false)
-    let formattedLog = $derived(entries
+    let viewRequest = 0
+    let copyRequest = 0
+
+    function formatLog(logEntries: NativeLogEntry[]) {
+        return logEntries
         .slice()
         .reverse()
         .map((entry) => `[${new Date(entry.tsMs).toISOString()}] [${entry.level}] ${entry.message}`)
-        .join('\n'))
+        .join('\n')
+    }
 
     const unsubscribe = subscribeDeviceSettings((settings) => {
         fileLogEnabled = settings.nativeFileLogEnabled
         if (fileLogEnabled && !fileLogUpdatePending) void loadFilePath()
     })
 
-    onDestroy(unsubscribe)
-
-    onMount(() => {
-        void refresh()
+    onDestroy(() => {
+        unsubscribe()
+        viewRequest++
+        copyRequest++
     })
 
-    async function refresh() {
-        try {
-            entries = await getNativeLogTail()
-            errorMessage = ''
-        } catch {
-            errorMessage = language.error
-        }
-        if (fileLogEnabled) await loadFilePath()
-    }
+    onMount(() => {
+        if (fileLogEnabled) void loadFilePath()
+    })
 
     async function loadFilePath() {
         try {
@@ -54,21 +54,44 @@
         }
     }
 
-    function viewLog() {
-        alertMd(formattedLog || language.risuNest.diag.logEmpty)
+    async function viewLog() {
+        const request = ++viewRequest
+        try {
+            const freshEntries = await getNativeLogTail()
+            if (request !== viewRequest) return
+            entries = freshEntries
+            logLoaded = true
+            errorMessage = ''
+            alertMd(formatLog(freshEntries) || language.risuNest.diag.logEmpty)
+        } catch {
+            if (request === viewRequest) errorMessage = language.error
+        }
     }
 
     async function copyLog() {
-        const text = formattedLog || language.risuNest.diag.logEmpty
+        const request = ++copyRequest
         try {
-            await navigator.clipboard.writeText(text)
+            const freshEntries = await getNativeLogTail()
+            if (request !== copyRequest) return
+            entries = freshEntries
+            logLoaded = true
+            errorMessage = ''
+            const text = formatLog(freshEntries) || language.risuNest.diag.logEmpty
+            try {
+                await navigator.clipboard.writeText(text)
+            } catch {
+                const textarea = document.createElement('textarea')
+                textarea.value = text
+                document.body.appendChild(textarea)
+                textarea.select()
+                try {
+                    if (!document.execCommand('copy')) throw new Error('copy failed')
+                } finally {
+                    document.body.removeChild(textarea)
+                }
+            }
         } catch {
-            const textarea = document.createElement('textarea')
-            textarea.value = text
-            document.body.appendChild(textarea)
-            textarea.select()
-            document.execCommand('copy')
-            document.body.removeChild(textarea)
+            if (request === copyRequest) errorMessage = language.error
         }
     }
 
@@ -121,7 +144,7 @@
 
     {#if errorMessage}
         <span class="text-draculared" role="alert" aria-live="assertive">{errorMessage}</span>
-    {:else if entries.length === 0}
+    {:else if logLoaded && entries.length === 0}
         <span class="text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</span>
     {/if}
 </section>
