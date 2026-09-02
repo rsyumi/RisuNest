@@ -32,10 +32,11 @@
     let activeWork = $state<WorkLane | null>(null)
     let suppressWorkInference = false
     let workActionPending = $state(false)
-    let actionError = $state<string | null>(null)
+    let shareActionError = $state<string | null>(null)
+    let workActionError = $state<string | null>(null)
 
     const sourceBusy = $derived(['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(snapshot.source.phase))
-    const sourceError = $derived(snapshot.source.latestError ?? snapshot.error)
+    const sourceError = $derived(snapshot.source.latestError ?? (activeWork ? null : snapshot.error))
     const pairUri = $derived(snapshot.source.pairingUri ?? '')
     const expired = $derived(!snapshot.source.expiresAtMs || snapshot.source.expiresAtMs <= now)
     const remaining = $derived(snapshot.source.expiresAtMs ? Math.max(0, snapshot.source.expiresAtMs - now) : 0)
@@ -135,13 +136,15 @@
             publicBaseUrl: settings.syncPublicBaseUrl,
         }
     }
-    async function runAction(action: () => Promise<unknown>): Promise<boolean> {
-        actionError = null
+    async function runAction(action: () => Promise<unknown>, scope: 'share' | 'work' = 'share'): Promise<boolean> {
+        if (scope === 'work') workActionError = null
+        else shareActionError = null
         try {
             await action()
             return true
         } catch (error) {
-            actionError = safeError(error)
+            if (scope === 'work') workActionError = safeError(error)
+            else shareActionError = safeError(error)
             return false
         }
     }
@@ -194,7 +197,7 @@
     async function runWorkAction(action: () => Promise<unknown>): Promise<boolean> {
         if (workActionPending) return false
         workActionPending = true
-        const completed = await runAction(action)
+        const completed = await runAction(action, 'work')
         workActionPending = false
         return completed
     }
@@ -251,7 +254,7 @@
         workActionPending = true
         try {
             const confirmed = await alertConfirm(sync.work.abandonConfirm)
-            if (confirmed && await runAction(() => controller.abandonBidirectional())) dismissWork()
+            if (confirmed && await runAction(() => controller.abandonBidirectional(), 'work')) dismissWork()
         } finally {
             workActionPending = false
         }
@@ -299,7 +302,7 @@
             targetId = 'new-link'
             stagedUri = uri
         })
-        void controller.initialize().catch(() => { actionError = sync.share.stateError })
+        void controller.initialize().catch(() => { shareActionError = sync.share.stateError })
         notificationsEnabled = androidPeerSyncNotificationsEnabled()
         const timer = setInterval(() => { now = Date.now() }, 1000)
         void createQr()
@@ -360,7 +363,7 @@
                 </div>
             </div>
         {/if}
-        {#if actionError && !activeWork}<p data-share-error role="alert" class="mt-3 text-sm text-draculared">{actionError}</p>
+        {#if shareActionError}<p data-share-error role="alert" class="mt-3 text-sm text-draculared">{shareActionError}</p>
         {:else if sourceError}<p role="alert" class="mt-3 text-sm text-draculared">{safeError(sourceError)}</p>{/if}
     </div>
 
@@ -443,7 +446,7 @@
                         <Button className="mt-2" size="sm" onclick={acknowledgeBidi}>{sync.work.dismiss}</Button>
                     {/if}
                 {/if}
-                {#if actionError}<p data-work-error role="alert" class="mt-2 text-sm text-draculared">{actionError}</p>{/if}
+                {#if workActionError}<p data-work-error role="alert" class="mt-2 text-sm text-draculared">{workActionError}</p>{/if}
             </div>
         {/if}
     </div>

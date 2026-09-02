@@ -155,15 +155,36 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('keeps a receive action error inside the work card', async () => {
-        controllerState.controller.pullStagedDelta.mockRejectedValueOnce(new Error('private target detail'))
+        controllerState.controller.pullStagedDelta.mockImplementationOnce(async () => {
+            controllerState.emit(snapshot({ error: 'operation-failed' }))
+            throw new Error('private target detail')
+        })
         await render()
 
         button('Get changes only')!.click()
 
         await vi.waitFor(() => expect(target.querySelector('[data-work-error]')?.textContent).toBe('Error'))
         expect(target.querySelector('[data-sync-card="work"]')?.contains(target.querySelector('[data-work-error]'))).toBe(true)
-        expect(target.querySelector('[data-share-error]')).toBeNull()
+        expect(target.querySelector('[data-sync-card="sharing"]')?.querySelector('[role="alert"]')).toBeNull()
         expect(target.textContent).not.toContain('private target detail')
+    })
+
+    it('keeps a source action error in sharing while terminal work remains visible', async () => {
+        controllerState.controller.stop.mockRejectedValueOnce('port-unavailable')
+        await render(snapshot({
+            source: { phase: 'running' },
+            targets: {
+                clone: cloneBase,
+                delta: { ...deltaBase, pullPhase: 'completed', pullResult: { kind: 'noChanges', revision: 1, transferredObjects: 0, transferredBytes: 0 } },
+                bidirectional: bidiBase,
+            },
+        }))
+
+        button('Stop sharing')!.click()
+
+        await vi.waitFor(() => expect(target.querySelector('[data-share-error]')?.textContent)
+            .toBe('That port is already in use. Choose another port.'))
+        expect(target.querySelector('[data-work-error]')).toBeNull()
     })
 
     it('selects only incoming targets without contacting them and revokes each direction separately', async () => {

@@ -288,6 +288,7 @@ export function createDeviceSyncController(options: {
             ),
         })
         await refreshRegistries()
+        if (claimEpoch !== stagedLinkEpoch) throw new DeviceSyncError('unavailable')
         return claimed.sourceDeviceId
     }
     const joinRegisteredClone = async (deviceId: string): Promise<void> => {

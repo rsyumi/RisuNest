@@ -345,6 +345,42 @@ describe('device sync controller', () => {
         },
     )
 
+    it('fences a staged claim replaced while its registry refresh is pending', async () => {
+        let resolveRefresh!: (value: Array<{
+            deviceId: string, name: string, permissions: readonly ['read'],
+        }>) => void
+        const incomingSources = vi.fn()
+            .mockResolvedValueOnce([{ deviceId: 'old-source', name: 'Old', permissions: ['read'] as const }])
+            .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve }))
+        const pullRegistered = vi.fn(async () => ({ kind: 'noChanges' }))
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(), incomingSources,
+                claimStagedClone: async () => ({
+                    sourceDeviceId: 'old-source', endpoint: 'http://old/',
+                    sessionId: 'old-session', manifestId: 'a'.repeat(64),
+                }),
+            },
+            targets: {
+                delta: {
+                    snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
+                    initialize: async () => undefined, pullRegistered,
+                },
+            },
+        })
+        await controller.initialize()
+        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        const pending = controller.pullStagedDelta()
+        await vi.waitFor(() => expect(incomingSources).toHaveBeenCalledTimes(2))
+
+        controller.stageLink('invalid replacement')
+        resolveRefresh([{ deviceId: 'old-source', name: 'Old', permissions: ['read'] }])
+
+        await expect(pending).rejects.toMatchObject({ code: 'unavailable' })
+        expect(controller.snapshot()).toMatchObject({ stagedLink: null, stagedSourceDeviceId: null })
+        expect(pullRegistered).not.toHaveBeenCalled()
+    })
+
     it('initializes every target before completing unified initialization', async () => {
         const events: string[] = []
         const target = <T>(name: string, snapshot: T) => ({
