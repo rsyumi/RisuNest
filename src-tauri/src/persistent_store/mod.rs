@@ -8,8 +8,9 @@ pub(crate) mod logical_delta_source;
 mod logical_delta_target;
 #[allow(unused_imports)]
 pub(crate) use logical_delta_target::{
-    establish_logical_common_base, LogicalDeltaConflict, LogicalDeltaConflictKind,
-    LogicalDeltaConflictPolicy, LogicalDeltaPlanResolution, PersistentLogicalDeltaTarget,
+    establish_logical_common_base, establish_logical_common_base_with_commit_intent,
+    LogicalDeltaConflict, LogicalDeltaConflictKind, LogicalDeltaConflictPolicy,
+    LogicalDeltaPlanResolution, PersistentLogicalDeltaTarget,
 };
 mod logical_index;
 pub(crate) use logical_index::PRODUCT_LOGICAL_LIBRARY_ID;

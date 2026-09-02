@@ -903,6 +903,63 @@ fn first_common_base_is_established_only_from_an_exact_active_logical_state() {
 }
 
 #[test]
+fn common_base_commit_intent_failure_rolls_back_the_new_common_base() {
+    let (_directory, mut store, cas) = open_fixture();
+    let local = store
+        .rebuild_logical_index(
+            &cas,
+            LogicalIndexBuildRequest {
+                library_id: "library".to_owned(),
+                generation_id: "local-0".to_owned(),
+                generation_sequence: "7".to_owned(),
+                parent_generation_id: None,
+                lease: None,
+            },
+        )
+        .unwrap();
+    let mut remote = local.manifest.clone();
+    remote.generation = "remote-0".to_owned();
+    remote.generation_sequence = "11".to_owned();
+    remote.parent_generation = None;
+    remote.source_revision = 99;
+    let remote_bytes = encode_logical_manifest(&remote).unwrap();
+    let callback_called = std::cell::Cell::new(false);
+
+    let result = establish_logical_common_base_with_commit_intent(
+        &mut store,
+        &cas,
+        "peer",
+        "library",
+        "local-0",
+        0,
+        &remote_bytes,
+        || {
+            callback_called.set(true);
+            Err(PeerSyncError::Storage(
+                "commit intent write failed".to_owned(),
+            ))
+        },
+    );
+
+    assert!(
+        matches!(result, Err(PeerSyncError::Storage(message)) if message == "commit intent write failed")
+    );
+    assert!(callback_called.get());
+    assert_eq!(
+        store
+            .connection
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM logical_peer_common_bases
+                 WHERE peer_id = 'peer' AND library_id = 'library'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn first_common_base_rejects_local_content_or_revision_mismatch_without_a_row() {
     let (_directory, mut store, cas) = open_fixture();
     let local = store

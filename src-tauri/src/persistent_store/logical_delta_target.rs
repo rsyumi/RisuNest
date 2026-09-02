@@ -192,6 +192,31 @@ pub(crate) fn establish_logical_common_base(
     expected_revision: i64,
     remote_manifest_bytes: &[u8],
 ) -> Result<(), PeerSyncError> {
+    establish_logical_common_base_with_commit_intent(
+        store,
+        cas,
+        peer_id,
+        library_id,
+        local_generation_id,
+        expected_revision,
+        remote_manifest_bytes,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn establish_logical_common_base_with_commit_intent<F>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    peer_id: &str,
+    library_id: &str,
+    local_generation_id: &str,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    commit_intent: F,
+) -> Result<(), PeerSyncError>
+where
+    F: FnOnce() -> Result<(), PeerSyncError>,
+{
     if peer_id.is_empty() || library_id.is_empty() || local_generation_id.is_empty() {
         return validation("logical common-base identities must be nonempty");
     }
@@ -310,6 +335,7 @@ pub(crate) fn establish_logical_common_base(
                 .map_err(sql_error)?;
         }
     }
+    commit_intent()?;
     transaction.commit().map_err(sql_error)
 }
 

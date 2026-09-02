@@ -21,6 +21,8 @@ mod client;
 pub(crate) mod commands;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod delta_commands;
+#[cfg(any(desktop, target_os = "android", test))]
+mod delta_completion;
 pub(crate) mod device_registry;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod registered_target_commands;
@@ -43,6 +45,8 @@ mod session;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod shared_session;
 
+#[cfg(test)]
+mod delta_completion_tests;
 #[cfg(test)]
 mod device_registry_tests;
 #[cfg(all(test, any(desktop, target_os = "android")))]

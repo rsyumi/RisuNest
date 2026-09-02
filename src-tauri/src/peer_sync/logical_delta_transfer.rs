@@ -204,19 +204,51 @@ where
     T: LogicalDeltaStagedTarget,
     F: FnOnce(&LogicalDeltaTransferSelection) -> Result<(), PeerSyncError>,
 {
+    execute_logical_delta_pull_with_commit_intent(
+        plan,
+        local_manifest_object_hashes,
+        target_cas,
+        remote_object_sizes,
+        source,
+        target,
+        before_activation,
+        |_| Ok(()),
+        cancellation,
+    )
+}
+
+pub(crate) fn execute_logical_delta_pull_with_commit_intent<S, T, F, G>(
+    plan: &ReadyLogicalDeltaPlan,
+    local_manifest_object_hashes: &BTreeSet<String>,
+    target_cas: &PayloadCas,
+    remote_object_sizes: &BTreeMap<String, u64>,
+    source: &mut S,
+    target: &mut T,
+    before_activation: F,
+    commit_intent: G,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LogicalDeltaActivation, PeerSyncError>
+where
+    S: LogicalDeltaObjectSource,
+    T: LogicalDeltaStagedTarget,
+    F: FnOnce(&LogicalDeltaTransferSelection) -> Result<(), PeerSyncError>,
+    G: FnOnce(&LogicalDeltaTransferSelection) -> Result<(), PeerSyncError>,
+{
     check_cancelled(cancellation)?;
     let mut stage = target.begin(plan)?;
     let result = (|| {
         if target.can_activate_without_transfer(&stage) {
-            check_cancelled(cancellation)?;
-            before_activation(&LogicalDeltaTransferSelection {
+            let selection = LogicalDeltaTransferSelection {
                 reused_from_local_manifest: Vec::new(),
                 reused_from_cas: Vec::new(),
                 missing_objects: Vec::new(),
-            })?;
+            };
+            check_cancelled(cancellation)?;
+            before_activation(&selection)?;
             check_cancelled(cancellation)?;
             target.prepare_activation(&mut stage)?;
             check_cancelled(cancellation)?;
+            commit_intent(&selection)?;
             return target.activate_database_and_base_if_current(
                 &mut stage,
                 plan.expected_local_revision,
@@ -252,6 +284,7 @@ where
         target.stage_database_changes(&mut stage, plan)?;
         target.prepare_activation(&mut stage)?;
         check_cancelled(cancellation)?;
+        commit_intent(&selection)?;
         target.activate_database_and_base_if_current(
             &mut stage,
             plan.expected_local_revision,
@@ -474,10 +507,10 @@ impl Read for VerifiedObjectReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_logical_delta_pull, execute_logical_delta_pull_with_pre_activation,
-        select_missing_logical_delta_objects, LogicalDeltaActivation, LogicalDeltaApplyOperation,
-        LogicalDeltaObject, LogicalDeltaObjectSource, LogicalDeltaStagedTarget,
-        ReadyLogicalDeltaPlan,
+        execute_logical_delta_pull, execute_logical_delta_pull_with_commit_intent,
+        execute_logical_delta_pull_with_pre_activation, select_missing_logical_delta_objects,
+        LogicalDeltaActivation, LogicalDeltaApplyOperation, LogicalDeltaObject,
+        LogicalDeltaObjectSource, LogicalDeltaStagedTarget, ReadyLogicalDeltaPlan,
     };
     use crate::{
         asset_repository::PayloadCas,
@@ -641,6 +674,8 @@ mod tests {
         fail_database_stage: bool,
         cancel_on_prepare: Option<Arc<AtomicBool>>,
         activate_without_transfer: bool,
+        prepared: Option<Arc<AtomicBool>>,
+        require_commit_intent: Option<Arc<AtomicBool>>,
     }
 
     impl FixtureTarget {
@@ -655,6 +690,8 @@ mod tests {
                 fail_database_stage: false,
                 cancel_on_prepare: None,
                 activate_without_transfer: false,
+                prepared: None,
+                require_commit_intent: None,
             }
         }
     }
@@ -706,6 +743,9 @@ mod tests {
 
         fn prepare_activation(&mut self, _stage: &mut Self::Stage) -> Result<(), PeerSyncError> {
             self.events.push("prepare".to_owned());
+            if let Some(prepared) = &self.prepared {
+                prepared.store(true, Ordering::SeqCst);
+            }
             if let Some(cancelled) = &self.cancel_on_prepare {
                 cancelled.store(true, Ordering::SeqCst);
             }
@@ -721,6 +761,14 @@ mod tests {
             next_base_generation_sequence: &str,
         ) -> Result<LogicalDeltaActivation, PeerSyncError> {
             self.events.push("activate".to_owned());
+            if let Some(commit_intent) = &self.require_commit_intent {
+                assert!(commit_intent.load(Ordering::SeqCst));
+            }
+            if self.activate_without_transfer {
+                return Ok(LogicalDeltaActivation::AlreadyActive {
+                    revision: self.active_revision,
+                });
+            }
             if self.active_revision != expected_local_revision
                 || self.active_base != expected_base_manifest_hash
             {
@@ -1000,6 +1048,160 @@ mod tests {
         assert!(!target.events.iter().any(|event| event == "prepare"));
         assert_eq!(target.events.last().map(String::as_str), Some("abort"));
         assert!(!target.events.iter().any(|event| event == "activate"));
+    }
+
+    #[test]
+    fn commit_intent_runs_after_prepare_and_immediately_before_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), payload)]),
+            content_gets: 0,
+        };
+        let prepared = Arc::new(AtomicBool::new(false));
+        let commit_intent = Arc::new(AtomicBool::new(false));
+        let mut target = FixtureTarget::new();
+        target.prepared = Some(Arc::clone(&prepared));
+        target.require_commit_intent = Some(Arc::clone(&commit_intent));
+
+        let activation = execute_logical_delta_pull_with_commit_intent(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash, b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            |_| {
+                assert!(prepared.load(Ordering::SeqCst));
+                commit_intent.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(
+            activation,
+            LogicalDeltaActivation::Activated { revision: 8 }
+        );
+        assert!(commit_intent.load(Ordering::SeqCst));
+        assert_eq!(target.events.last().map(String::as_str), Some("activate"));
+        assert_eq!(target.aborts, 0);
+    }
+
+    #[test]
+    fn commit_intent_runs_for_the_already_active_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let prepared = Arc::new(AtomicBool::new(false));
+        let commit_intent = Arc::new(AtomicBool::new(false));
+        let mut target = FixtureTarget::new();
+        target.activate_without_transfer = true;
+        target.prepared = Some(Arc::clone(&prepared));
+        target.require_commit_intent = Some(Arc::clone(&commit_intent));
+
+        let activation = execute_logical_delta_pull_with_commit_intent(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            |_| {
+                assert!(prepared.load(Ordering::SeqCst));
+                commit_intent.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(
+            activation,
+            LogicalDeltaActivation::AlreadyActive { revision: 7 }
+        );
+        assert!(commit_intent.load(Ordering::SeqCst));
+        assert_eq!(target.events, ["begin", "prepare", "activate", "abort"]);
+    }
+
+    #[test]
+    fn final_cancellation_prevents_commit_intent_and_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
+        let commit_intent = Arc::new(AtomicBool::new(false));
+        let mut target = FixtureTarget::new();
+        target.cancel_on_prepare = Some(cancelled);
+
+        let error = execute_logical_delta_pull_with_commit_intent(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            |_| {
+                commit_intent.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PeerSyncError::Cancelled);
+        assert!(!commit_intent.load(Ordering::SeqCst));
+        assert_eq!(target.events, ["begin", "database", "prepare", "abort"]);
+    }
+
+    #[test]
+    fn commit_intent_failure_aborts_without_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        let error = execute_logical_delta_pull_with_commit_intent(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+            &mut source,
+            &mut target,
+            |_| Ok(()),
+            |_| Err(PeerSyncError::Storage("commit intent failed".to_owned())),
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, PeerSyncError::Storage(message) if message == "commit intent failed")
+        );
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.events, ["begin", "database", "prepare", "abort"]);
     }
 
     struct CancellingSource {
