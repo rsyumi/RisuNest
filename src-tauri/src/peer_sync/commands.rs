@@ -6402,6 +6402,164 @@ mod tests {
     }
 
     #[test]
+    fn registered_target_publication_wins_before_bearer_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let state = PeerCloneCommandState::default();
+        let source_device_id = "00000000-0000-4000-8000-000000000233";
+        let bearer = "7".repeat(64);
+        let request = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000234".to_owned(),
+            manifest_id: "8".repeat(64),
+        };
+        super::super::device_registry::register_incoming_source(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: source_device_id.to_owned(),
+                name: "Desktop source".to_owned(),
+                endpoint: request.endpoint.clone(),
+                bearer: bearer.clone(),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 0,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
+        let reached_publish = Arc::new(Barrier::new(2));
+        let resume_publish = Arc::new(Barrier::new(2));
+        state
+            .pause_registered_target_publish_once_for_test(
+                Arc::clone(&reached_publish),
+                Arc::clone(&resume_publish),
+            )
+            .unwrap();
+        let worker_state = state.clone();
+        let worker_root = peer_root.clone();
+        let worker_request = request.clone();
+        let worker_bearer = bearer.clone();
+        let worker = thread::spawn(move || {
+            worker_state.connect_registered_target(
+                &worker_root,
+                &worker_request.endpoint,
+                &worker_request.session_id,
+                &worker_request.manifest_id,
+                source_device_id,
+                &worker_bearer,
+                PeerCompletionCapability::Unsupported,
+            )
+        });
+
+        reached_publish.wait();
+        let sources_path = root.path().join("peer-sync/sources.json");
+        let before = fs::read(&sources_path).unwrap();
+        let (rotation_tx, rotation_rx) = mpsc::channel();
+        let rotation_root = root.path().to_owned();
+        let rotation = thread::spawn(move || {
+            rotation_tx
+                .send(
+                    super::super::registry_commands::register_incoming_source_if_compatible(
+                        &rotation_root,
+                        super::super::device_registry::IncomingSource {
+                            device_id: source_device_id.to_owned(),
+                            name: "Rotated source".to_owned(),
+                            endpoint: "http://127.0.0.1:32146".to_owned(),
+                            bearer: "9".repeat(64),
+                            permissions: super::super::device_registry::DevicePermissions::read(),
+                            last_seen_ms: 1,
+                            total_bytes: 0,
+                        },
+                    ),
+                )
+                .unwrap();
+        });
+        assert!(rotation_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        resume_publish.wait();
+
+        worker.join().unwrap().unwrap();
+        assert!(matches!(
+            rotation_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(PeerSyncError::Validation(message))
+                if message == "registered clone source is used by an active target"
+        ));
+        rotation.join().unwrap();
+        assert_eq!(fs::read(&sources_path).unwrap(), before);
+        assert!(registered_clone_source_is_active(root.path(), source_device_id).unwrap());
+    }
+
+    #[test]
+    fn bearer_rotation_wins_before_registered_target_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let state = PeerCloneCommandState::default();
+        let source_device_id = "00000000-0000-4000-8000-000000000235";
+        let bearer = "a".repeat(64);
+        let request = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000236".to_owned(),
+            manifest_id: "b".repeat(64),
+        };
+        super::super::device_registry::register_incoming_source(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: source_device_id.to_owned(),
+                name: "Desktop source".to_owned(),
+                endpoint: request.endpoint.clone(),
+                bearer: bearer.clone(),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 0,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
+        let pause = Arc::new(Barrier::new(2));
+        state
+            .pause_target_claim_before_network_for_test(Arc::clone(&pause))
+            .unwrap();
+        let worker_state = state.clone();
+        let worker_root = peer_root.clone();
+        let worker_request = request.clone();
+        let worker_bearer = bearer.clone();
+        let worker = thread::spawn(move || {
+            worker_state.connect_registered_target(
+                &worker_root,
+                &worker_request.endpoint,
+                &worker_request.session_id,
+                &worker_request.manifest_id,
+                source_device_id,
+                &worker_bearer,
+                PeerCompletionCapability::Unsupported,
+            )
+        });
+
+        pause.wait();
+        super::super::registry_commands::register_incoming_source_if_compatible(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: source_device_id.to_owned(),
+                name: "Rotated source".to_owned(),
+                endpoint: request.endpoint.clone(),
+                bearer: "c".repeat(64),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 1,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
+        pause.wait();
+
+        assert_eq!(
+            worker.join().unwrap().unwrap_err(),
+            PeerSyncError::Validation("registered peer clone source is unavailable".to_owned())
+        );
+        let marker_path = target_paths(&peer_root, &request)
+            .unwrap()
+            .job_root
+            .join(TARGET_OPERATION_MARKER_FILE);
+        assert!(!marker_path.try_exists().unwrap());
+    }
+
+    #[test]
     fn initialize_discards_an_unpublished_registered_target_orphan() {
         let root = tempfile::tempdir().unwrap();
         let peer_root = root.path().join("peer-clone");

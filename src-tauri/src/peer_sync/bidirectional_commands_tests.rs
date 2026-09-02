@@ -2280,6 +2280,104 @@ fn legacy_target_journal_does_not_claim_registered_source_activity() {
 }
 
 #[test]
+fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
+    let directory = tempfile::tempdir().unwrap();
+    register_bidirectional_accounting_source(directory.path(), 40, 7);
+    let operation_id = "123e4567-e89b-42d3-a456-426614174096";
+    let journal = PeerBidirectionalOperationJournal::new(directory.path());
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::Unsupported;
+    journal
+        .store(&PeerBidirectionalDurableOperation::TargetPrepared {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: retained_context,
+            local_generation: generation("local", "1", 'e'),
+            conflict_policy: TargetPreparedConflictPolicy::Reject,
+            changed: false,
+            remote_backup_required: false,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        })
+        .unwrap();
+    let sources_path = directory.path().join("peer-sync/sources.json");
+    let before = fs::read(&sources_path).unwrap();
+
+    assert!(super::super::registry_commands::register_incoming_source_if_compatible(
+        directory.path(),
+        super::super::device_registry::IncomingSource {
+            device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
+            name: "rotated source".to_owned(),
+            endpoint: "http://192.168.0.99:32146".to_owned(),
+            bearer: "d".repeat(64),
+            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 9,
+            total_bytes: 0,
+        },
+    )
+    .is_err());
+    assert_eq!(fs::read(&sources_path).unwrap(), before);
+
+    let legacy_context = context(operation_id);
+    journal
+        .store(&PeerBidirectionalDurableOperation::TargetPrepared {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context: legacy_context,
+            local_generation: generation("local", "1", 'e'),
+            conflict_policy: TargetPreparedConflictPolicy::Reject,
+            changed: false,
+            remote_backup_required: false,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backups: vec![],
+        })
+        .unwrap();
+    super::super::registry_commands::register_incoming_source_if_compatible(
+        directory.path(),
+        super::super::device_registry::IncomingSource {
+            device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
+            name: "legacy rotation".to_owned(),
+            endpoint: "http://192.168.0.99:32146".to_owned(),
+            bearer: "d".repeat(64),
+            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 9,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+
+    journal
+        .store(&PeerBidirectionalDurableOperation::Completed {
+            schema: OPERATION_SCHEMA.to_owned(),
+            remote_apply_receipt: None,
+            source_binding: None,
+            result: PeerBidirectionalCompletedResult {
+                kind: "noChanges".to_owned(),
+                operation_id: operation_id.to_owned(),
+                revision: 0,
+                remote_revision: 0,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups: vec![],
+            },
+        })
+        .unwrap();
+    super::super::registry_commands::register_incoming_source_if_compatible(
+        directory.path(),
+        super::super::device_registry::IncomingSource {
+            device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
+            name: "completed rotation".to_owned(),
+            endpoint: "http://192.168.0.100:32146".to_owned(),
+            bearer: "e".repeat(64),
+            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 10,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn v1_local_commit_persists_the_exact_pending_completion_delivery() {
     let directory = tempfile::tempdir().unwrap();
     let operation_id = "123e4567-e89b-42d3-a456-426614174097";

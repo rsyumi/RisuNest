@@ -4,7 +4,7 @@ use super::delta_completion::{
     DeltaCompletionTransport, PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
 };
 use super::device_registry::{
-    completion_receipt_id, prepare_incoming_completion_delivery,
+    completion_receipt_id, incoming_source_by_id, prepare_incoming_completion_delivery,
     record_incoming_completed_operation_once_for_lane, snapshot_incoming_completion_delivery,
     CompletionLane, DevicePermissions, IncomingSource, IncomingSourceRegistry,
     PendingCompletionDelivery,
@@ -197,6 +197,105 @@ fn registered_delta_source_activity_is_scoped_to_the_retained_journal_source() {
         "00000000-0000-4000-8000-000000000094",
     )
     .unwrap());
+}
+
+#[test]
+fn compatible_registration_allows_rotation_without_a_journal_and_same_bearer_refresh_with_one() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 40);
+
+    super::registry_commands::register_incoming_source_if_compatible(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.to_owned(),
+            name: "rotated source".to_owned(),
+            endpoint: "http://192.168.0.10:32145".to_owned(),
+            bearer: "d".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 99,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let receipt_id = "e".repeat(64);
+    record_incoming_completed_operation_once_for_lane(
+        root.path(),
+        SOURCE_ID,
+        CompletionLane::Delta,
+        &receipt_id,
+        12,
+    )
+    .unwrap();
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&context(OPERATION_ID))
+        .unwrap();
+
+    super::registry_commands::register_incoming_source_if_compatible(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.to_owned(),
+            name: "moved source".to_owned(),
+            endpoint: "http://192.168.0.11:32145".to_owned(),
+            bearer: "d".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 100,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    record_incoming_completed_operation_once_for_lane(
+        root.path(),
+        SOURCE_ID,
+        CompletionLane::Delta,
+        &receipt_id,
+        12,
+    )
+    .unwrap();
+
+    let source = incoming_source_by_id(root.path(), SOURCE_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.name, "moved source");
+    assert_eq!(source.endpoint, "http://192.168.0.11:32145");
+    assert_eq!(source.bearer, "d".repeat(64));
+    assert!(source.permissions.allows_bidirectional());
+    assert_eq!(source.total_bytes, 52);
+}
+
+#[test]
+fn active_delta_journal_blocks_rotation_and_removal_until_exact_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 40);
+    let operation = context(OPERATION_ID);
+    let journal = PeerDeltaCompletionJournal::new(root.path());
+    journal.store_activation_intent(&operation).unwrap();
+    let sources_path = root.path().join("peer-sync/sources.json");
+    let before = std::fs::read(&sources_path).unwrap();
+    let rotated = IncomingSource {
+        device_id: SOURCE_ID.to_owned(),
+        name: "rotated source".to_owned(),
+        endpoint: "http://192.168.0.10:32145".to_owned(),
+        bearer: "d".repeat(64),
+        permissions: DevicePermissions::read(),
+        last_seen_ms: 99,
+        total_bytes: 0,
+    };
+
+    assert!(super::registry_commands::register_incoming_source_if_compatible(
+        root.path(),
+        rotated,
+    )
+    .is_err());
+    assert_eq!(std::fs::read(&sources_path).unwrap(), before);
+    assert!(super::registry_commands::remove_incoming_source_if_inactive(root.path(), SOURCE_ID)
+        .is_err());
+    assert_eq!(std::fs::read(&sources_path).unwrap(), before);
+
+    journal.remove_exact(&operation).unwrap();
+    super::registry_commands::remove_incoming_source_if_inactive(root.path(), SOURCE_ID).unwrap();
+    assert!(incoming_source_by_id(root.path(), SOURCE_ID)
+        .unwrap()
+        .is_none());
 }
 
 #[test]

@@ -6,8 +6,9 @@ use super::{
     bidirectional_commands::PeerBidirectionalCommandState,
     delta_commands::PeerDeltaCommandState,
     device_registry::{
-        incoming_source_summaries, outgoing_device_summaries, remove_incoming_source,
-        revoke_outgoing_device, IncomingSourceSummary, OutgoingDeviceSummary,
+        incoming_source_by_id, incoming_source_summaries, outgoing_device_summaries,
+        register_incoming_source, remove_incoming_source, revoke_outgoing_device, IncomingSource,
+        IncomingSourceSummary, OutgoingDeviceSummary,
     },
     logical_completion::invalidate_outgoing_logical_completion_proofs,
     PeerSyncError,
@@ -91,6 +92,45 @@ pub fn peer_sync_remove_incoming_source(app: AppHandle, device_id: String) -> Re
     )
 }
 
+pub(crate) fn register_incoming_source_if_compatible(
+    app_root: &Path,
+    source: IncomingSource,
+) -> Result<(), PeerSyncError> {
+    let _lifecycle = lock_registered_source_lifecycle()?;
+    let bearer_changed = incoming_source_by_id(app_root, &source.device_id)?
+        .is_some_and(|current| current.bearer != source.bearer);
+    if !bearer_changed {
+        return register_incoming_source(app_root, source);
+    }
+
+    #[cfg(desktop)]
+    if super::commands::registered_clone_source_is_active(app_root, &source.device_id)? {
+        return Err(PeerSyncError::Validation(
+            "registered clone source is used by an active target".to_owned(),
+        ));
+    }
+    #[cfg(any(target_os = "android", test))]
+    if super::android_client::registered_clone_source_is_active(app_root, &source.device_id)? {
+        return Err(PeerSyncError::Validation(
+            "registered Android clone source is used by an active job".to_owned(),
+        ));
+    }
+    if super::delta_completion::registered_delta_source_is_active(app_root, &source.device_id)? {
+        return Err(PeerSyncError::Validation(
+            "registered delta source is used by an active target".to_owned(),
+        ));
+    }
+    if super::bidirectional_commands::registered_bidirectional_source_is_active(
+        app_root,
+        &source.device_id,
+    )? {
+        return Err(PeerSyncError::Validation(
+            "registered bidirectional source is used by an active target".to_owned(),
+        ));
+    }
+    register_incoming_source(app_root, source)
+}
+
 pub(crate) fn remove_incoming_source_if_inactive(
     app_root: &std::path::Path,
     device_id: &str,
@@ -100,6 +140,11 @@ pub(crate) fn remove_incoming_source_if_inactive(
     if super::commands::registered_clone_source_is_active(app_root, device_id)? {
         return Err(super::PeerSyncError::Validation(
             "registered clone source is used by an active target".to_owned(),
+        ));
+    }
+    if super::delta_completion::registered_delta_source_is_active(app_root, device_id)? {
+        return Err(super::PeerSyncError::Validation(
+            "registered delta source is used by an active target".to_owned(),
         ));
     }
     if super::bidirectional_commands::registered_bidirectional_source_is_active(

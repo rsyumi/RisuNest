@@ -3,8 +3,8 @@ use super::{
         accept_outgoing_completion_offer, issue_outgoing_measured_completion_offer,
         load_or_create_device_id, outgoing_bidirectional_completion_lease_allows_remote_apply,
         outgoing_completion_lease_ready_bytes, outgoing_completion_offer_active,
-        outgoing_device_is_registered, record_outgoing_seen, register_incoming_source,
-        register_outgoing_claim, revoke_outgoing_device, seal_outgoing_completion_lease,
+        outgoing_device_is_registered, record_outgoing_seen, register_outgoing_claim,
+        revoke_outgoing_device, seal_outgoing_completion_lease,
         CompletionAcceptance, CompletionLane, CompletionLeaseId, CompletionSealStatus,
         DevicePermissions, IncomingSource, OutgoingDevice, OutgoingDeviceRegistry,
     },
@@ -17,6 +17,7 @@ use super::{
         OutgoingLogicalIssuedObjects,
     },
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
+    registry_commands::register_incoming_source_if_compatible,
     PeerSyncError,
 };
 #[cfg(any(desktop, target_os = "android"))]
@@ -376,7 +377,7 @@ impl LanCloneClient {
         };
         client.persist(credential_path)?;
         if let Some(source) = registration {
-            if let Err(error) = register_incoming_source(app_root, source) {
+            if let Err(error) = register_incoming_source_if_compatible(app_root, source) {
                 restore_credential(credential_path, previous_credential.as_deref()).map_err(
                     |rollback| {
                         PeerSyncError::Storage(format!(
@@ -589,7 +590,7 @@ impl LanCloneClient {
     }
 
     fn register_incoming_source(&self, app_root: &Path) -> Result<(), PeerSyncError> {
-        register_incoming_source(app_root, self.incoming_source()?)
+        register_incoming_source_if_compatible(app_root, self.incoming_source()?)
     }
 
     fn incoming_source(&self) -> Result<IncomingSource, PeerSyncError> {
@@ -8519,7 +8520,7 @@ impl LanLogicalDeltaClient {
                 "v2 claim source device identity differs from authenticated hello".to_owned(),
             ));
         }
-        register_incoming_source(
+        register_incoming_source_if_compatible(
             app_root,
             IncomingSource {
                 device_id: source_device_id.clone(),
