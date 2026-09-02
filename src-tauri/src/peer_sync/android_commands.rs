@@ -187,14 +187,19 @@ pub(crate) async fn peer_clone_android_finalize(
 
 #[tauri::command]
 pub(crate) async fn peer_clone_android_release(
+    app: AppHandle,
     state: State<'_, AndroidPeerCloneCommandState>,
     job_id: String,
 ) -> Result<(), String> {
     let registry = state.registry()?;
-    tauri::async_runtime::spawn_blocking(move || registry.release(&job_id))
-        .await
-        .map_err(|error| format!("Android peer clone release worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        persistent_store::commands::with_store_mut(app.state(), |store| {
+            registry.release(&job_id, store).map_err(as_store_error)
+        })
         .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Android peer clone release worker failed: {error}"))?
 }
 
 fn app_data_root_string(root: &std::path::Path) -> Result<String, String> {

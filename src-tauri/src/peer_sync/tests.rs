@@ -1486,6 +1486,78 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
 }
 
 #[test]
+fn android_registered_clone_publish_revalidates_a_concurrently_removed_source() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    host.enable_v2_registry(
+        source_root.path(),
+        "Android source",
+        super::device_registry::DevicePermissions::read(),
+    )
+    .unwrap();
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let credential = target_root.path().join("registration-credential.json");
+    let _client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Android target",
+        &credential,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let source_device_id =
+        super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+    let registered =
+        super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+            .unwrap()
+            .unwrap();
+    let target_device_id =
+        super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+    let registry = Arc::new(
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap(),
+    );
+    let reached_publish = Arc::new(Barrier::new(2));
+    let resume_publish = Arc::new(Barrier::new(2));
+    registry.pause_registered_publish_once_for_test(
+        Arc::clone(&reached_publish),
+        Arc::clone(&resume_publish),
+    );
+    let removal_source_device_id = source_device_id.clone();
+    let worker_registry = Arc::clone(&registry);
+    let worker = thread::spawn(move || {
+        worker_registry.connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+        )
+    });
+
+    reached_publish.wait();
+    let removal = super::device_registry::remove_incoming_source(
+        target_root.path(),
+        &removal_source_device_id,
+    );
+    resume_publish.wait();
+    removal.unwrap();
+
+    assert_eq!(
+        worker.join().unwrap().unwrap_err(),
+        PeerSyncError::Validation("registered Android clone source is unavailable".to_owned())
+    );
+    assert!(registry.current().unwrap().is_none());
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_registration_claim_is_strict_v2_and_does_not_consume_a_legacy_claim() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
@@ -1848,6 +1920,84 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
     );
     let status_path = verified_job_root.join("status.json");
     let verified_bytes = registry.current().unwrap().unwrap().total_bytes.unwrap();
+    let mut forged_commit: Value =
+        serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    forged_commit["committedRevision"] = Value::from(2);
+    target_store
+        .set_app_kv(
+            "peerCloneActiveManifest",
+            &json!({ "manifestId": pairing.manifest_id, "revision": 2 }),
+        )
+        .unwrap();
+    fs::write(&status_path, serde_json::to_vec(&forged_commit).unwrap()).unwrap();
+    assert!(matches!(
+        registry.finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &target_root.path().join("peer-clone-activation"),
+            1,
+            &crate::local_backup::NeverCancelled,
+        ),
+        Err(PeerSyncError::Validation(message))
+            if message == "Android clone committed activation evidence is invalid"
+    ));
+    assert_eq!(
+        target_store.read_root(None).unwrap().value["username"],
+        "Target"
+    );
+    assert_eq!(
+        super::device_registry::IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()[0]
+            .total_bytes,
+        0
+    );
+    forged_commit["committedRevision"] = Value::from(1);
+    target_store
+        .set_app_kv(
+            "peerCloneActiveManifest",
+            &json!({ "manifestId": "0".repeat(64), "revision": 1 }),
+        )
+        .unwrap();
+    fs::write(&status_path, serde_json::to_vec(&forged_commit).unwrap()).unwrap();
+    assert!(matches!(
+        registry.finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &target_root.path().join("peer-clone-activation"),
+            1,
+            &crate::local_backup::NeverCancelled,
+        ),
+        Err(PeerSyncError::Validation(message))
+            if message == "Android clone committed activation evidence is invalid"
+    ));
+    forged_commit["committedRevision"] = Value::from(0);
+    target_store
+        .set_app_kv(
+            "peerCloneActiveManifest",
+            &json!({ "manifestId": pairing.manifest_id, "revision": 1 }),
+        )
+        .unwrap();
+    fs::write(&status_path, serde_json::to_vec(&forged_commit).unwrap()).unwrap();
+    assert!(matches!(
+        registry.finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &target_root.path().join("peer-clone-activation"),
+            1,
+            &crate::local_backup::NeverCancelled,
+        ),
+        Err(PeerSyncError::Validation(message))
+            if message == "Android clone committed activation evidence is invalid"
+    ));
+    forged_commit["committedRevision"] = Value::Null;
+    target_store
+        .remove_app_kv("peerCloneActiveManifest")
+        .unwrap();
+    fs::write(&status_path, serde_json::to_vec(&forged_commit).unwrap()).unwrap();
     let mut tampered_status: Value =
         serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
     tampered_status["completedBytes"] = Value::from(1);
@@ -1917,6 +2067,19 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
     let completion_status: Value =
         serde_json::from_slice(&fs::read(verified_job_root.join("status.json")).unwrap()).unwrap();
     assert_eq!(completion_status["completionAcknowledged"], true);
+    let mut unrelated_source = registered.clone();
+    let unrelated_source_id = uuid::Uuid::new_v4().to_string();
+    unrelated_source.device_id = unrelated_source_id.clone();
+    super::device_registry::register_incoming_source(target_root.path(), unrelated_source).unwrap();
+    super::device_registry::remove_incoming_source(target_root.path(), &unrelated_source_id)
+        .unwrap();
+    assert_eq!(
+        super::device_registry::remove_incoming_source(target_root.path(), &source_device_id)
+            .unwrap_err(),
+        PeerSyncError::Validation(
+            "incoming source is used by the active Android clone job".to_owned()
+        )
+    );
     let committed_job = AndroidResumableCloneJob::open(&verified_job_root).unwrap();
     assert_eq!(
         committed_job
@@ -2009,7 +2172,7 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
         0,
     )
     .unwrap();
-    assert!(registry.release(&claimed.job_id).is_err());
+    assert!(registry.release(&claimed.job_id, &target_store).is_err());
     assert!(verified_job_root.exists());
     super::device_registry::record_incoming_completed_operation_once(
         target_root.path(),
@@ -2018,7 +2181,7 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
         0,
     )
     .unwrap();
-    registry.release(&claimed.job_id).unwrap();
+    registry.release(&claimed.job_id, &target_store).unwrap();
 
     assert!(registry.current().unwrap().is_none());
     assert!(!target_root
@@ -2026,6 +2189,7 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
         .join("peer-clone-jobs")
         .join(&claimed.job_id)
         .exists());
+    super::device_registry::remove_incoming_source(target_root.path(), &source_device_id).unwrap();
 }
 
 #[test]
@@ -2129,9 +2293,29 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
         .join("status.json");
     let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
     assert_ne!(persisted["completionAcknowledged"], true);
-    assert!(registry.release(&claimed.job_id).is_err());
+    assert!(registry.release(&claimed.job_id, &target_store).is_err());
     assert!(status_path.is_file());
+    target_store
+        .remove_app_kv("peerCloneAndroidActiveOperation")
+        .unwrap();
+    let mut post_activation_root = target_store.read_root(None).unwrap().value;
+    post_activation_root["username"] = Value::from("Post activation edit");
+    let ordinary_commit: crate::persistent_store::WorkingSetCommit =
+        serde_json::from_value(json!({
+            "expectedRevision": 2,
+            "root": post_activation_root,
+        }))
+        .unwrap();
+    target_store.commit(&ordinary_commit).unwrap();
+    assert_eq!(target_store.revision().unwrap(), 3);
     drop(registry);
+    let mut legacy_status: Value =
+        serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    legacy_status
+        .as_object_mut()
+        .unwrap()
+        .remove("completionAcknowledged");
+    fs::write(&status_path, serde_json::to_vec(&legacy_status).unwrap()).unwrap();
 
     let restarted =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
@@ -2147,16 +2331,7 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
     incoming.upsert(reset).unwrap();
     incoming.save().unwrap();
 
-    restarted
-        .finalize(
-            &claimed.job_id,
-            &mut target_store,
-            &target_cas,
-            &activation_root,
-            2,
-            &crate::local_backup::NeverCancelled,
-        )
-        .unwrap();
+    restarted.release(&claimed.job_id, &target_store).unwrap();
 
     assert_eq!(
         super::device_registry::IncomingSourceRegistry::load(target_root.path())
@@ -2165,10 +2340,78 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
             .total_bytes,
         verified_bytes
     );
-    let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
-    assert_eq!(persisted["completionAcknowledged"], true);
-    restarted.release(&claimed.job_id).unwrap();
     assert!(!status_path.exists());
+    assert_eq!(target_store.revision().unwrap(), 3);
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_registry_rebuilds_verified_missing_status_from_transfer_ledger() {
+    let source_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source_cas = crate::asset_repository::PayloadCas::new(source_root.path()).unwrap();
+    let target_cas = crate::asset_repository::PayloadCas::new(target_root.path()).unwrap();
+    let mut source_store =
+        crate::persistent_store::PersistentStore::open(source_root.path()).unwrap();
+    let mut target_store =
+        crate::persistent_store::PersistentStore::open(target_root.path()).unwrap();
+    seed_android_product_store(&mut source_store, "Source");
+    seed_android_product_store(&mut target_store, "Target");
+    let prepared = prepare_lossless_clone_session(
+        &mut source_store,
+        &source_cas,
+        1,
+        &source_root.path().join("preparation"),
+        &source_root.path().join("session"),
+        &crate::local_backup::NeverCancelled,
+    )
+    .unwrap();
+    let mut host = LanCloneHost::prepare(prepared);
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+    registry
+        .download(&claimed.job_id, &TransferCancellation::new())
+        .unwrap();
+    let verified = registry.current().unwrap().unwrap();
+    let status_path = target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id)
+        .join("status.json");
+    fs::remove_file(&status_path).unwrap();
+    drop(registry);
+
+    let restarted =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let rebuilt = restarted.current().unwrap().unwrap();
+    assert_eq!(
+        rebuilt.phase,
+        AndroidCloneJobPhase::VerifiedAwaitingActivation
+    );
+    assert_eq!(rebuilt.completed_bytes, verified.completed_bytes);
+    assert_eq!(rebuilt.total_bytes, verified.total_bytes);
+    restarted
+        .finalize(
+            &claimed.job_id,
+            &mut target_store,
+            &target_cas,
+            &target_root.path().join("peer-clone-activation"),
+            1,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+    restarted.release(&claimed.job_id, &target_store).unwrap();
+    assert!(restarted.current().unwrap().is_none());
     host.stop().unwrap();
 }
 
@@ -2258,7 +2501,73 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .total_bytes,
         first_total
     );
-    registry.release(&first.job_id).unwrap();
+    registry.release(&first.job_id, &target_store).unwrap();
+    let legacy_pairing = host.rotate_pairing_link().unwrap();
+    let legacy_no_backup = registry
+        .connect_registered(
+            &registered.endpoint,
+            &legacy_pairing.session_id,
+            &legacy_pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+        )
+        .unwrap();
+    registry
+        .download(&legacy_no_backup.job_id, &TransferCancellation::new())
+        .unwrap();
+    let legacy_total = registry.current().unwrap().unwrap().total_bytes.unwrap();
+    let legacy_receipt = registry
+        .finalize(
+            &legacy_no_backup.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            2,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+    assert_eq!(legacy_receipt.revision, 2);
+    assert_eq!(legacy_receipt.backup_path, None);
+    target_store
+        .remove_app_kv("peerCloneAndroidActiveOperation")
+        .unwrap();
+    let legacy_status_path = target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&legacy_no_backup.job_id)
+        .join("status.json");
+    let mut legacy_status: Value =
+        serde_json::from_slice(&fs::read(&legacy_status_path).unwrap()).unwrap();
+    legacy_status["completionAcknowledged"] = Value::Bool(false);
+    fs::write(
+        &legacy_status_path,
+        serde_json::to_vec(&legacy_status).unwrap(),
+    )
+    .unwrap();
+    drop(registry);
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    registry
+        .release(&legacy_no_backup.job_id, &target_store)
+        .unwrap();
+    let migrated_witness = target_store
+        .get_app_kv("peerCloneAndroidActiveOperation")
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated_witness["jobId"], legacy_no_backup.job_id);
+    assert_eq!(migrated_witness["manifestId"], pairing.manifest_id);
+    assert_eq!(migrated_witness["revision"], 2);
+    let mut post_clone_root = target_store.read_root(None).unwrap().value;
+    post_clone_root["username"] = Value::from("Edited after first clone");
+    let ordinary_commit: crate::persistent_store::WorkingSetCommit =
+        serde_json::from_value(json!({
+            "expectedRevision": 2,
+            "root": post_clone_root,
+        }))
+        .unwrap();
+    target_store.commit(&ordinary_commit).unwrap();
+    assert_eq!(target_store.revision().unwrap(), 3);
     let second_pairing = host.rotate_pairing_link().unwrap();
     assert_eq!(second_pairing.manifest_id, pairing.manifest_id);
     let second = registry
@@ -2276,6 +2585,49 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
         .download(&second.job_id, &TransferCancellation::new())
         .unwrap();
     let second_total = registry.current().unwrap().unwrap().total_bytes.unwrap();
+    let second_status_path = target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&second.job_id)
+        .join("status.json");
+    let mut replayed_status: Value =
+        serde_json::from_slice(&fs::read(&second_status_path).unwrap()).unwrap();
+    replayed_status["committedRevision"] = Value::from(2);
+    replayed_status["backupPath"] = Value::from(first_backup.to_string_lossy().to_string());
+    fs::write(
+        &second_status_path,
+        serde_json::to_vec(&replayed_status).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        registry
+            .finalize(
+                &second.job_id,
+                &mut target_store,
+                &target_cas,
+                &activation_root,
+                3,
+                &crate::local_backup::NeverCancelled,
+            )
+            .unwrap_err(),
+        PeerSyncError::Validation(
+            "Android clone committed activation evidence is invalid".to_owned()
+        )
+    );
+    assert_eq!(
+        super::device_registry::IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()[0]
+            .total_bytes,
+        first_total + legacy_total
+    );
+    replayed_status["committedRevision"] = Value::Null;
+    replayed_status["backupPath"] = Value::Null;
+    fs::write(
+        &second_status_path,
+        serde_json::to_vec(&replayed_status).unwrap(),
+    )
+    .unwrap();
 
     let second_receipt = registry
         .finalize(
@@ -2283,27 +2635,31 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &mut target_store,
             &target_cas,
             &activation_root,
-            2,
+            3,
             &crate::local_backup::NeverCancelled,
         )
         .unwrap();
 
-    assert_eq!(second_receipt.revision, 2);
-    assert_eq!(second_receipt.backup_path, None);
-    assert_eq!(registry.current().unwrap().unwrap().backup_path, None);
+    assert_eq!(second_receipt.revision, 4);
+    let second_backup = second_receipt.backup_path.unwrap();
+    assert!(second_backup.is_file());
+    assert_eq!(
+        registry.current().unwrap().unwrap().backup_path,
+        Some(second_backup)
+    );
     assert_eq!(
         super::device_registry::IncomingSourceRegistry::load(target_root.path())
             .unwrap()
             .sources()[0]
             .total_bytes,
-        first_total + second_total
+        first_total + legacy_total + second_total
     );
     assert!(first_backup.is_file());
     assert_eq!(
         fs::read_dir(activation_root.join("backups"))
             .unwrap()
             .count(),
-        1
+        2
     );
     host.stop().unwrap();
 }
@@ -2386,6 +2742,55 @@ fn android_clone_registry_retries_after_backup_receipt_persistence_fails() {
             .count(),
         1
     );
+    registry.release(&claimed.job_id, &target_store).unwrap();
+    let legacy_pairing = host.rotate_pairing_link().unwrap();
+    let legacy = registry
+        .claim(
+            &endpoint,
+            &legacy_pairing.session_id,
+            &legacy_pairing.manifest_id,
+            &legacy_pairing.claim,
+        )
+        .unwrap();
+    registry
+        .download(&legacy.job_id, &TransferCancellation::new())
+        .unwrap();
+    let legacy_receipt = registry
+        .finalize(
+            &legacy.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            2,
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+    assert_eq!(legacy_receipt.revision, 2);
+    assert_eq!(legacy_receipt.backup_path, None);
+    target_store
+        .remove_app_kv("peerCloneAndroidActiveOperation")
+        .unwrap();
+    let legacy_status_path = target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&legacy.job_id)
+        .join("status.json");
+    let mut legacy_status: Value =
+        serde_json::from_slice(&fs::read(&legacy_status_path).unwrap()).unwrap();
+    legacy_status
+        .as_object_mut()
+        .unwrap()
+        .remove("completionAcknowledged");
+    fs::write(
+        &legacy_status_path,
+        serde_json::to_vec(&legacy_status).unwrap(),
+    )
+    .unwrap();
+    drop(registry);
+    let restarted =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    restarted.release(&legacy.job_id, &target_store).unwrap();
+    assert!(restarted.current().unwrap().is_none());
     host.stop().unwrap();
 }
 
