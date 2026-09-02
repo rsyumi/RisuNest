@@ -1246,7 +1246,7 @@ impl IncomingSourceRegistry {
     pub(crate) fn abandon_completion_delivery(
         &mut self,
         delivery: &PendingCompletionDelivery,
-    ) -> Result<(), PeerSyncError> {
+    ) -> Result<bool, PeerSyncError> {
         validate_pending_completion_delivery(delivery)?;
         let Some(pending_index) = self
             .pending_completion_deliveries
@@ -1256,7 +1256,7 @@ impl IncomingSourceRegistry {
                     && pending.lane == delivery.lane
             })
         else {
-            return Ok(());
+            return Ok(false);
         };
         if &self.pending_completion_deliveries[pending_index] != delivery {
             return invalid("pending incoming completion delivery does not match abandonment");
@@ -1265,7 +1265,7 @@ impl IncomingSourceRegistry {
         pending.remove(pending_index);
         self.write_state(&self.sources, &self.completed_receipts, &pending)?;
         self.pending_completion_deliveries = pending;
-        Ok(())
+        Ok(true)
     }
 
     fn completion_is_durable(
@@ -1803,7 +1803,7 @@ pub(crate) fn finalize_incoming_completion_delivery(
 pub(crate) fn abandon_incoming_completion_delivery(
     app_root: &Path,
     delivery: &PendingCompletionDelivery,
-) -> Result<(), PeerSyncError> {
+) -> Result<bool, PeerSyncError> {
     let _guard = incoming_registry_lock()
         .lock()
         .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;

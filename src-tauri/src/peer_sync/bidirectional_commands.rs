@@ -4082,11 +4082,11 @@ fn require_deferred_source_completion_cleanup(
 fn abandon_target_completion_delivery(
     app_root: &Path,
     context: &PeerBidirectionalOperationContext,
-) -> Result<(), PeerSyncError> {
+) -> Result<bool, PeerSyncError> {
     if let Some(delivery) = &context.completion_delivery {
-        super::device_registry::abandon_incoming_completion_delivery(app_root, delivery)?;
+        return super::device_registry::abandon_incoming_completion_delivery(app_root, delivery);
     }
-    Ok(())
+    Ok(false)
 }
 
 enum SourcePreparedState {
@@ -5785,18 +5785,14 @@ impl PeerBidirectionalCommandState {
             }
             PeerBidirectionalDurableOperation::LocalCommitted {
                 context,
-                remote_apply_receipt: Some(_),
-                ..
-            } if context.completion_mode == PeerBidirectionalCompletionMode::V1
-                && context.completion_delivery.is_some() =>
-            {
-                abandon_target_completion_delivery(app_root, &context)?;
-                journal.abandon(operation_id)
-            }
-            PeerBidirectionalDurableOperation::LocalCommitted {
                 remote_apply_receipt: Some(receipt),
                 ..
             } => {
+                if context.completion_mode == PeerBidirectionalCompletionMode::V1
+                    && abandon_target_completion_delivery(app_root, &context)?
+                {
+                    return journal.abandon(operation_id);
+                }
                 complete_bidirectional_local_after_remote_apply(
                     store,
                     &PayloadCas::new(app_root)?,
