@@ -658,7 +658,7 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
             ));
         }
         let outcome = if job.is_sealed() && self.marker_committed(manifest_id)? {
-            let backup_path = self.expected_backup_path(manifest_id, durable_job_id);
+            let backup_path = self.expected_backup_path(durable_job_id);
             if self
                 .backup_observer_stage
                 .as_ref()
@@ -675,10 +675,29 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
         Ok(true)
     }
 
-    fn expected_backup_path(&self, manifest_id: &str, durable_job_id: &str) -> PathBuf {
+    fn expected_backup_path(&self, durable_job_id: &str) -> PathBuf {
         self.root
             .join("backups")
-            .join(format!("pre-clone-{manifest_id}-{durable_job_id}.lossless"))
+            .join(format!("pre-clone-{durable_job_id}.lossless"))
+    }
+
+    pub(crate) fn recover_owned_committed_backup(
+        &mut self,
+        manifest_id: &str,
+        durable_job_id: &str,
+        path: &Path,
+    ) -> Result<(), PeerSyncError> {
+        if self.backup_observer_stage.as_ref()
+            != Some(&(manifest_id.to_owned(), durable_job_id.to_owned()))
+            || !self.marker_committed(manifest_id)?
+            || fs::canonicalize(self.expected_backup_path(durable_job_id))?
+                != fs::canonicalize(path)?
+        {
+            return Err(PeerSyncError::Validation(
+                "peer clone backup receipt does not own the committed activation".to_owned(),
+            ));
+        }
+        self.observe_committed_backup(path)
     }
 
     fn observe_committed_backup(&mut self, path: &Path) -> Result<(), PeerSyncError> {
@@ -736,7 +755,7 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
             pre_replacement_backup: self
                 .root
                 .join("backups")
-                .join(format!("pre-clone-{manifest_id}-{stage_id}.lossless")),
+                .join(format!("pre-clone-{stage_id}.lossless")),
             manifest_id: manifest_id.to_owned(),
             durable_job_id: stage_id,
         })

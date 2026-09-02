@@ -44,6 +44,7 @@ export interface AndroidRegisteredCloneStatus {
     completedBytes: number
     totalBytes?: number
     committedRevision?: number
+    backupPath?: string
     error?: 'transferFailed'
 }
 
@@ -86,7 +87,7 @@ function invalidStatus(): never {
 
 function safeStatusFields(source: Record<string, unknown>): Pick<
     AndroidPeerCloneTargetStatus,
-    'jobId' | 'phase' | 'completedBytes' | 'totalBytes' | 'committedRevision' | 'error'
+    'jobId' | 'phase' | 'completedBytes' | 'totalBytes' | 'committedRevision' | 'backupPath' | 'error'
 > {
     if (
         typeof source.jobId !== 'string'
@@ -106,6 +107,7 @@ function safeStatusFields(source: Record<string, unknown>): Pick<
             || !Number.isSafeInteger(source.committedRevision)
             || source.committedRevision < 0
         ))
+        || (source.backupPath !== undefined && typeof source.backupPath !== 'string')
         || (source.error !== undefined && typeof source.error !== 'string')
     ) invalidStatus()
     return {
@@ -114,6 +116,7 @@ function safeStatusFields(source: Record<string, unknown>): Pick<
         completedBytes: source.completedBytes,
         ...(typeof source.totalBytes === 'number' ? { totalBytes: source.totalBytes } : {}),
         ...(typeof source.committedRevision === 'number' ? { committedRevision: source.committedRevision } : {}),
+        ...(typeof source.backupPath === 'string' ? { backupPath: source.backupPath } : {}),
         ...(typeof source.error === 'string' ? { error: source.error } : {}),
     }
 }
@@ -122,7 +125,7 @@ function safeRegisteredStatus(value: unknown): AndroidRegisteredCloneStatus {
     if (!value || typeof value !== 'object' || Array.isArray(value)) invalidStatus()
     const source = value as Record<string, unknown>
     const allowed = new Set([
-        'sourceDeviceId', 'jobId', 'phase', 'completedBytes', 'totalBytes', 'committedRevision', 'error',
+        'sourceDeviceId', 'jobId', 'phase', 'completedBytes', 'totalBytes', 'committedRevision', 'backupPath', 'error',
     ])
     if (
         Object.keys(source).some((key) => !allowed.has(key))
@@ -131,6 +134,10 @@ function safeRegisteredStatus(value: unknown): AndroidRegisteredCloneStatus {
         || (source.error !== undefined && source.error !== 'transferFailed')
     ) invalidStatus()
     const { error, ...safeFields } = safeStatusFields(source)
+    if (
+        safeFields.backupPath !== undefined
+        && safeFields.backupPath !== `pre-clone-${safeFields.jobId}.lossless`
+    ) invalidStatus()
     return {
         sourceDeviceId: source.sourceDeviceId,
         ...safeFields,
@@ -143,7 +150,7 @@ function safeDirectStatus(value: unknown): AndroidPeerCloneTargetStatus {
     const source = value as Record<string, unknown>
     const allowed = new Set([
         'jobId', 'endpoint', 'sessionId', 'manifestId', 'phase', 'completedBytes',
-        'totalBytes', 'committedRevision', 'error',
+        'totalBytes', 'committedRevision', 'backupPath', 'error',
     ])
     if (
         Object.keys(source).some((key) => !allowed.has(key))

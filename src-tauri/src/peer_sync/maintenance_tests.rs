@@ -186,8 +186,7 @@ fn desktop_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
     let root = directory.path();
     let id = "00000000-0000-4000-8000-000000000002";
     let backup = root.join(format!(
-        "peer-clone/activation/backups/pre-clone-{}-{id}.lossless",
-        "a".repeat(64)
+        "peer-clone/activation/backups/pre-clone-{id}.lossless"
     ));
     fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
     fs::write(&backup, b"backup").expect("write backup");
@@ -215,8 +214,7 @@ fn android_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
     let root = directory.path();
     let id = "00000000-0000-4000-8000-000000000003";
     let backup = root.join(format!(
-        "peer-clone-activation/backups/pre-clone-{}-{id}.lossless",
-        "b".repeat(64)
+        "peer-clone-activation/backups/pre-clone-{id}.lossless"
     ));
     fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
     fs::write(&backup, b"backup").expect("write backup");

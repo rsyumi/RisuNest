@@ -174,14 +174,20 @@ pub(crate) fn desktop_clone_backup_job_is_active(app_root: &Path, backup: &Path)
     else {
         return false;
     };
-    if stem.len() != 101
-        || !stem.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit)
-        || stem.as_bytes()[64] != b'-'
+    let job_id = if stem.len() == 36 {
+        stem
+    } else if stem.len() == 101
+        && stem.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit)
+        && stem.as_bytes()[64] == b'-'
     {
+        &stem[65..]
+    } else {
         return false;
-    }
-    let job_id = &stem[65..];
-    if uuid::Uuid::parse_str(job_id).is_err() {
+    };
+    let Ok(parsed) = uuid::Uuid::parse_str(job_id) else {
+        return false;
+    };
+    if parsed.to_string() != job_id {
         return false;
     }
     let Ok(job) = crate::asset_repository::job_pins::DurableCasJob::open(app_root, job_id) else {

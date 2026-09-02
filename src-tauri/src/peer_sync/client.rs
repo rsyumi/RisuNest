@@ -1183,6 +1183,15 @@ fn load_ledger(path: &Path) -> Result<LedgerState, PeerSyncError> {
     Ok(ledger)
 }
 
+pub(crate) fn persisted_activation_matches(
+    transfer_root: &Path,
+    manifest_id: &str,
+) -> Result<bool, PeerSyncError> {
+    super::protocol::validate_hash(manifest_id)?;
+    let ledger = load_ledger(&transfer_root.join("ledger.jsonl"))?;
+    Ok(ledger.activated && ledger.manifest_id.as_deref() == Some(manifest_id))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn validate_loopback_url(value: &str) -> Result<Url, PeerSyncError> {
     let url = Url::parse(value).map_err(|error| PeerSyncError::Protocol(error.to_string()))?;

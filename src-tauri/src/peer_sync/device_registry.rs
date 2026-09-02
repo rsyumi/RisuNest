@@ -142,6 +142,8 @@ struct OutgoingFile {
 struct IncomingFile {
     schema: String,
     sources: Vec<IncomingSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    completed_receipts: Vec<CompletionReceipt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -340,24 +342,33 @@ impl OutgoingDeviceRegistry {
 pub(crate) struct IncomingSourceRegistry {
     root: PathBuf,
     sources: Vec<IncomingSource>,
+    completed_receipts: Vec<CompletionReceipt>,
 }
 
 impl IncomingSourceRegistry {
     pub(crate) fn load(app_root: &Path) -> Result<Self, PeerSyncError> {
         let root = ensure_peer_root(app_root)?;
         let path = root.join("sources.json");
-        let sources = match read_registry(&path)? {
-            None => Vec::new(),
+        let (sources, completed_receipts) = match read_registry(&path)? {
+            None => (Vec::new(), Vec::new()),
             Some(bytes) => {
                 let file: IncomingFile = parse_registry(&bytes)?;
                 if file.schema != INCOMING_SCHEMA {
                     return invalid("unsupported incoming peer source registry schema");
                 }
-                file.sources
+                (file.sources, file.completed_receipts)
             }
         };
         validate_incoming(&sources)?;
-        Ok(Self { root, sources })
+        validate_incoming_receipts(
+            &completed_receipts,
+            sources.iter().map(|source| source.device_id.as_str()),
+        )?;
+        Ok(Self {
+            root,
+            sources,
+            completed_receipts,
+        })
     }
 
     pub(crate) fn sources(&self) -> &[IncomingSource] {
@@ -383,6 +394,8 @@ impl IncomingSourceRegistry {
     pub(crate) fn remove(&mut self, device_id: &str) -> Result<(), PeerSyncError> {
         validate_id(device_id)?;
         self.sources.retain(|item| item.device_id != device_id);
+        self.completed_receipts
+            .retain(|receipt| receipt.device_id != device_id);
         Ok(())
     }
 
@@ -410,10 +423,77 @@ impl IncomingSourceRegistry {
             &IncomingFile {
                 schema: INCOMING_SCHEMA.to_owned(),
                 sources: updated.clone(),
+                completed_receipts: self.completed_receipts.clone(),
             },
         )?;
         self.sources = updated;
         Ok(())
+    }
+
+    pub(crate) fn record_completed_operation_once(
+        &mut self,
+        source_id: &str,
+        receipt_id: &str,
+        bytes: u64,
+        seen_at_ms: u64,
+    ) -> Result<(), PeerSyncError> {
+        validate_id(source_id)?;
+        validate_receipt_id(receipt_id)?;
+        let mut sources = self.sources.clone();
+        let mut receipts = self.completed_receipts.clone();
+        let source = sources
+            .iter_mut()
+            .find(|item| item.device_id == source_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered incoming source is missing".to_owned())
+            })?;
+        source.last_seen_ms = source.last_seen_ms.max(seen_at_ms);
+        let retained = receipts
+            .iter_mut()
+            .find(|receipt| receipt.device_id == source_id && receipt.lane == "clone");
+        if !retained
+            .as_ref()
+            .is_some_and(|receipt| receipt.receipt_id == receipt_id)
+        {
+            source.total_bytes = source
+                .total_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| PeerSyncError::Validation("peer total bytes overflow".to_owned()))?;
+            if let Some(retained) = retained {
+                retained.receipt_id = receipt_id.to_owned();
+            } else {
+                receipts.push(CompletionReceipt {
+                    device_id: source_id.to_owned(),
+                    lane: "clone".to_owned(),
+                    receipt_id: receipt_id.to_owned(),
+                });
+            }
+        }
+        write_registry(
+            &self.root.join("sources.json"),
+            &IncomingFile {
+                schema: INCOMING_SCHEMA.to_owned(),
+                sources: sources.clone(),
+                completed_receipts: receipts.clone(),
+            },
+        )?;
+        self.sources = sources;
+        self.completed_receipts = receipts;
+        Ok(())
+    }
+
+    pub(crate) fn has_completed_operation(
+        &self,
+        source_id: &str,
+        receipt_id: &str,
+    ) -> Result<bool, PeerSyncError> {
+        validate_id(source_id)?;
+        validate_receipt_id(receipt_id)?;
+        Ok(self.completed_receipts.iter().any(|receipt| {
+            receipt.device_id == source_id
+                && receipt.lane == "clone"
+                && receipt.receipt_id == receipt_id
+        }))
     }
 
     pub(crate) fn save(&self) -> Result<(), PeerSyncError> {
@@ -422,6 +502,7 @@ impl IncomingSourceRegistry {
             &IncomingFile {
                 schema: INCOMING_SCHEMA.to_owned(),
                 sources: self.sources.clone(),
+                completed_receipts: self.completed_receipts.clone(),
             },
         )
     }
@@ -610,6 +691,29 @@ pub(crate) fn record_incoming_completed_operation_best_effort(
     if let Err(error) = record_incoming_completed_operation(app_root, source_id, bytes) {
         crate::nlog!("warn", "peer sync completion accounting failed: {error}");
     }
+}
+
+pub(crate) fn record_incoming_completed_operation_once(
+    app_root: &Path,
+    source_id: &str,
+    receipt_id: &str,
+    bytes: u64,
+) -> Result<(), PeerSyncError> {
+    let seen_at_ms = completion_timestamp_ms()?;
+    with_incoming_registry(app_root, |registry| {
+        registry.record_completed_operation_once(source_id, receipt_id, bytes, seen_at_ms)
+    })
+}
+
+pub(crate) fn incoming_completed_operation_recorded(
+    app_root: &Path,
+    source_id: &str,
+    receipt_id: &str,
+) -> Result<bool, PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    IncomingSourceRegistry::load(app_root)?.has_completed_operation(source_id, receipt_id)
 }
 
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
@@ -809,6 +913,17 @@ fn validate_receipts<'a>(
         {
             return invalid("invalid peer completion receipt");
         }
+    }
+    Ok(())
+}
+
+fn validate_incoming_receipts<'a>(
+    receipts: &[CompletionReceipt],
+    registered_ids: impl Iterator<Item = &'a str>,
+) -> Result<(), PeerSyncError> {
+    validate_receipts(receipts, registered_ids)?;
+    if receipts.iter().any(|receipt| receipt.lane != "clone") {
+        return invalid("invalid incoming peer completion receipt lane");
     }
     Ok(())
 }

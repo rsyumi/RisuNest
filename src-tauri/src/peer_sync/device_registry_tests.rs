@@ -264,6 +264,97 @@ fn incoming_completion_accounting_persists_positive_and_zero_byte_successes() {
 }
 
 #[test]
+fn incoming_clone_receipt_survives_reregistration_and_counts_a_new_operation() {
+    let root = tempfile::tempdir().unwrap();
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let first_receipt = "d".repeat(64);
+    let second_receipt = "e".repeat(64);
+    IncomingSourceRegistry::load(root.path())
+        .unwrap()
+        .record_completed_operation_once(SOURCE_ID, &first_receipt, 12, 30)
+        .unwrap();
+
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Renamed Android".into(),
+            endpoint: "http://192.168.0.6:32145".into(),
+            bearer: "f".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 99,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let mut restarted = IncomingSourceRegistry::load(root.path()).unwrap();
+    restarted
+        .record_completed_operation_once(SOURCE_ID, &first_receipt, 12, 31)
+        .unwrap();
+    assert_eq!(restarted.sources()[0].total_bytes, 12);
+    restarted
+        .record_completed_operation_once(SOURCE_ID, &second_receipt, 12, 32)
+        .unwrap();
+    assert_eq!(restarted.sources()[0].total_bytes, 24);
+    assert_eq!(restarted.sources()[0].last_seen_ms, 32);
+}
+
+#[test]
+fn incoming_clone_receipt_write_failure_rolls_back_memory_and_file() {
+    let root = tempfile::tempdir().unwrap();
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let first_receipt = "d".repeat(64);
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry
+        .record_completed_operation_once(SOURCE_ID, &first_receipt, 12, 30)
+        .unwrap();
+    let registry_path = root.path().join("peer-sync/sources.json");
+    let preserved_path = root.path().join("peer-sync/sources.preserved.json");
+    let before = fs::read(&registry_path).unwrap();
+    fs::rename(&registry_path, &preserved_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+
+    assert!(registry
+        .record_completed_operation_once(SOURCE_ID, &"e".repeat(64), 12, 31)
+        .is_err());
+    assert_eq!(registry.sources()[0].total_bytes, 12);
+    assert_eq!(registry.sources()[0].last_seen_ms, 30);
+
+    fs::remove_dir(&registry_path).unwrap();
+    fs::rename(&preserved_path, &registry_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+    let mut restarted = IncomingSourceRegistry::load(root.path()).unwrap();
+    restarted
+        .record_completed_operation_once(SOURCE_ID, &first_receipt, 12, 32)
+        .unwrap();
+    assert_eq!(restarted.sources()[0].total_bytes, 12);
+}
+
+#[test]
 fn incoming_completion_accounting_rejects_overflow_without_mutating_memory_or_file() {
     let root = tempfile::tempdir().unwrap();
     let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();

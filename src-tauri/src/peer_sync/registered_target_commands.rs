@@ -92,6 +92,8 @@ pub struct AndroidRegisteredCloneStatus {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     committed_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_path: Option<PathBuf>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -99,6 +101,10 @@ pub(crate) fn safe_android_clone_status(
     source_device_id: &str,
     status: &AndroidCloneJobStatus,
 ) -> AndroidRegisteredCloneStatus {
+    let backup_path = status
+        .backup_path
+        .as_ref()
+        .map(|_| PathBuf::from(format!("pre-clone-{}.lossless", status.job_id)));
     AndroidRegisteredCloneStatus {
         source_device_id: source_device_id.to_owned(),
         job_id: status.job_id.clone(),
@@ -107,6 +113,7 @@ pub(crate) fn safe_android_clone_status(
         total_bytes: status.total_bytes,
         error: status.error.as_ref().map(|_| "transferFailed".to_owned()),
         committed_revision: status.committed_revision,
+        backup_path,
     }
 }
 
@@ -905,8 +912,9 @@ mod tests {
 
     #[test]
     fn android_registered_clone_status_omits_native_connection_secrets() {
+        let job_id = "00000000-0000-4000-8000-000000000199";
         let status = crate::peer_sync::android_client::AndroidCloneJobStatus {
-            job_id: "00000000-0000-4000-8000-000000000199".to_owned(),
+            job_id: job_id.to_owned(),
             endpoint: "http://192.168.4.8:32145".to_owned(),
             session_id: SESSION_ID.to_owned(),
             manifest_id: MANIFEST_ID.to_owned(),
@@ -918,6 +926,9 @@ mod tests {
                 "http://192.168.4.8:32145"
             )),
             committed_revision: None,
+            backup_path: Some(std::path::PathBuf::from(format!(
+                "/data/user/0/app/peer-clone-activation/backups/pre-clone-{MANIFEST_ID}-{job_id}.lossless"
+            ))),
         };
         let json = serde_json::to_string(&safe_android_clone_status(SOURCE_ID, &status)).unwrap();
         assert!(json.contains(SOURCE_ID));
@@ -927,6 +938,8 @@ mod tests {
         assert!(!json.contains(MANIFEST_ID));
         assert!(!json.contains(BEARER));
         assert!(json.contains("transferFailed"));
+        assert!(json.contains("backupPath"));
+        assert!(json.contains(&format!("pre-clone-{job_id}.lossless")));
     }
 
     #[test]

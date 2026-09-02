@@ -161,6 +161,46 @@ describe('Android peer clone facade', () => {
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_claim')).toBe(false)
     })
 
+    it('recovers a registered committed backup receipt without exposing source connection fields', async () => {
+        const registeredStatus = {
+            sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+            jobId: '11111111-1111-4111-8111-111111111111',
+            phase: 'awaitingActivation' as const,
+            completedBytes: 42,
+            totalBytes: 42,
+            committedRevision: 8,
+            backupPath: 'pre-clone-11111111-1111-4111-8111-111111111111.lossless',
+        }
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => registeredStatus as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).resolves.toEqual(registeredStatus)
+        expect(facade.getState().backupPaths).toEqual([registeredStatus.backupPath])
+        expect(JSON.stringify(await facade.recover())).not.toMatch(/endpoint|sessionId|manifestId/i)
+    })
+
+    it('rejects a registered backup receipt containing a native manifest path', async () => {
+        const jobId = '11111111-1111-4111-8111-111111111111'
+        const manifestId = 'a'.repeat(64)
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => ({
+                sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+                jobId,
+                phase: 'awaitingActivation',
+                completedBytes: 42,
+                totalBytes: 42,
+                backupPath: `/data/user/0/app/backups/pre-clone-${manifestId}-${jobId}.lossless`,
+            }) as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).rejects.toThrow('invalid Android peer clone status')
+    })
+
     it('accepts the safe registered transfer failure category', async () => {
         const registeredStatus = {
             sourceDeviceId: '22222222-2222-4222-8222-222222222222',
