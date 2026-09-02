@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { createDeviceSyncFacade } from './deviceSync'
+import { createDeviceSyncFacade, parseDeviceSyncUri } from './deviceSync'
 
 describe('device sync facade', () => {
     it('forwards saved sharing settings and rejects a fixed port of zero', async () => {
@@ -50,9 +50,32 @@ describe('device sync facade', () => {
         })
         await facade.reconnectRegisteredClone('223e4567-e89b-42d3-a456-426614174000')
         expect(invoke.mock.calls).toEqual([
-            ['peer_clone_claim_client', { endpoint: 'http://192.168.1.2:32145/', sessionId: 'session', manifestId: 'manifest', claim: 'claim' }],
+            ['peer_clone_claim_v2_client', { endpoint: 'http://192.168.1.2:32145/', sessionId: 'session', manifestId: 'manifest', claim: 'claim' }],
             ['peer_clone_claim_registered_client', { deviceId: '223e4567-e89b-42d3-a456-426614174000' }],
         ])
+    })
+
+    it.each([
+        'http://127.0.0.1:32145',
+        'http://127.1:32145',
+        'http://127.255.255.254:32145',
+        'http://[::1]:32145',
+    ])('rejects canonical v2 loopback endpoint %s', (endpoint) => {
+        const pairingUri = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+
+        expect(() => parseDeviceSyncUri(pairingUri)).toThrow('Invalid device sync link')
+    })
+
+    it.each([
+        ['http://10.1.2.3:32145', 'http://10.1.2.3:32145/'],
+        ['http://169.254.1.2:32145', 'http://169.254.1.2:32145/'],
+        ['http://[fd12:3456::1]:32145', 'http://[fd12:3456::1]:32145/'],
+        ['http://[fe80::1234]:32145', 'http://[fe80::1234]:32145/'],
+        ['https://sync.example.com', 'https://sync.example.com/'],
+    ])('accepts canonical v2 endpoint %s under the LAN/public HTTPS policy', (endpoint, canonical) => {
+        const pairingUri = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+
+        expect(parseDeviceSyncUri(pairingUri).endpoint).toBe(canonical)
     })
 
     it('rejects malformed or secret-bearing native claim descriptors', async () => {

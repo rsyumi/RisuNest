@@ -2940,7 +2940,9 @@ pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError
         .map_err(|_| PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))?;
     let valid_lan_ip = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_loopback()
+        }
         _ => false,
     };
     let valid_public_domain = matches!(
@@ -2979,6 +2981,24 @@ pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError
         return Ok(format!("https://{}", url.host_str().unwrap()));
     }
     Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))
+}
+
+pub(crate) fn validate_device_sync_endpoint(value: &str) -> Result<String, PeerSyncError> {
+    let endpoint = validate_lan_endpoint(value)?;
+    let url = reqwest::Url::parse(&endpoint)
+        .map_err(|_| PeerSyncError::Protocol("invalid device sync endpoint".to_owned()))?;
+    if matches!(
+        url.host(),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback()
+    ) || matches!(
+        url.host(),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback()
+    ) {
+        return Err(PeerSyncError::Protocol(
+            "invalid device sync endpoint".to_owned(),
+        ));
+    }
+    Ok(endpoint)
 }
 
 pub(crate) fn validate_private_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
@@ -3052,6 +3072,33 @@ mod endpoint_tests {
             validate_lan_endpoint("https://quick-id.trycloudflare.com").unwrap(),
             "https://quick-id.trycloudflare.com"
         );
+    }
+
+    #[test]
+    fn canonical_device_sync_endpoint_rejects_loopback_and_accepts_private_ipv6() {
+        for endpoint in [
+            "http://127.0.0.1:32145",
+            "http://127.1:32145",
+            "http://127.255.255.254:32145",
+            "http://[::1]:32145",
+        ] {
+            assert!(
+                validate_device_sync_endpoint(endpoint).is_err(),
+                "{endpoint}"
+            );
+        }
+        for endpoint in [
+            "http://10.1.2.3:32145",
+            "http://169.254.1.2:32145",
+            "http://[fd12:3456::1]:32145",
+            "http://[fe80::1234]:32145",
+            "https://sync.example.com",
+        ] {
+            assert!(
+                validate_device_sync_endpoint(endpoint).is_ok(),
+                "{endpoint}"
+            );
+        }
     }
 
     #[test]
@@ -3710,6 +3757,41 @@ mod timeout_tests {
         (endpoint, calls_rx, server)
     }
 
+    fn rejecting_v2_claim_server() -> (String, mpsc::Receiver<usize>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (calls_tx, calls_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut rejected, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut rejected).starts_with("POST "));
+            calls_tx.send(1).unwrap();
+            rejected
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            rejected.flush().unwrap();
+            finish_response(&mut rejected);
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut unexpected, _)) => {
+                        assert!(read_request_head(&mut unexpected).starts_with("POST "));
+                        calls_tx.send(2).unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("claim server accept failed: {error}"),
+                }
+            }
+        });
+        (endpoint, calls_rx, server)
+    }
+
     fn mismatched_clone_hello_server(
         target_device_id: String,
         claimed_source_device_id: String,
@@ -3998,6 +4080,36 @@ mod timeout_tests {
         assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
         assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn strict_v2_clone_stops_after_one_bad_request_without_persisting() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target_root = tempfile::tempdir().unwrap();
+        let credential = target_root.path().join("strict-v2-credential.json");
+        let (endpoint, calls, server) = rejecting_v2_claim_server();
+
+        let result = LanCloneClient::claim_strict_v2_and_persist_and_register(
+            target_root.path(),
+            "Windows target",
+            &credential,
+            &endpoint,
+            "00000000-0000-4000-8000-000000000097",
+            &"a".repeat(64),
+            &"b".repeat(64),
+        );
+
+        assert!(matches!(result, Err(PeerSyncError::Protocol(_))));
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        server.join().unwrap();
+        assert!(calls.try_recv().is_err());
+        assert!(!credential.exists());
+        assert!(IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()
+            .is_empty());
     }
 
     fn finish_response(stream: &mut TcpStream) {

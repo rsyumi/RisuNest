@@ -136,6 +136,13 @@ describe('RisuNest native command integration', () => {
             peer_sync::registered_target_commands::peer_clone_claim_client,`)
     })
 
+    it('uses target-exclusive canonical v2 clone claim handlers', () => {
+        expectExactRustBlock(handlerSource, `#[cfg(desktop)]
+            peer_sync::commands::peer_clone_claim_v2_client,`)
+        expectExactRustBlock(handlerSource, `#[cfg(target_os = "android")]
+            peer_sync::registered_target_commands::peer_clone_claim_v2_client,`)
+    })
+
     it('exposes registered reconnect commands on both supported native targets', () => {
         for (const command of [
             'peer_sync_registered_hello',

@@ -566,8 +566,12 @@ pub fn run() {
             peer_sync::commands::peer_clone_revoke,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_claim_client,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_claim_v2_client,
             #[cfg(target_os = "android")]
             peer_sync::registered_target_commands::peer_clone_claim_client,
+            #[cfg(target_os = "android")]
+            peer_sync::registered_target_commands::peer_clone_claim_v2_client,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_download,
             #[cfg(desktop)]

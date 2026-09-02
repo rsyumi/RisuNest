@@ -208,11 +208,17 @@ function hasBareAuthorityPath(value: string): boolean {
 
 function isAllowedLanHost(hostname: string): boolean {
     const ipv4 = parseIpv4(hostname)
-    if (!ipv4) return false
-    return ipv4[0] === 10
-        || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
-        || (ipv4[0] === 192 && ipv4[1] === 168)
-        || (ipv4[0] === 169 && ipv4[1] === 254)
+    if (ipv4) {
+        return ipv4[0] === 10
+            || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+            || (ipv4[0] === 192 && ipv4[1] === 168)
+            || (ipv4[0] === 169 && ipv4[1] === 254)
+    }
+    if (!hostname.startsWith('[') || !hostname.endsWith(']')) return false
+    const firstHextet = hostname.slice(1, -1).split(':', 1)[0]
+    if (!/^[0-9a-f]{1,4}$/i.test(firstHextet)) return false
+    const first = Number.parseInt(firstHextet, 16)
+    return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80
 }
 
 function isLoopbackHost(hostname: string): boolean {

@@ -152,7 +152,7 @@ export function parseDeviceSyncUri(uri: string): StagedDeviceSyncLink {
         hostname: 'peer-clone',
         invalid: () => { throw new Error('Invalid device sync link') },
         claimRule: 'hex64Fragment',
-        allowLanEndpoint: true,
+        allowLanEndpoint: false,
         trimTrailingSlash: false,
     })
 }
@@ -295,7 +295,7 @@ export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = 
             await safeInvoke(nativeInvoke, 'peer_sync_remove_incoming_source', { deviceId })
         },
         claimStagedClone: async (link: StagedDeviceSyncLink): Promise<RegisteredCloneSession> =>
-            safeRegisteredCloneSession(await safeInvoke(nativeInvoke, 'peer_clone_claim_client', { ...link })),
+            safeRegisteredCloneSession(await safeInvoke(nativeInvoke, 'peer_clone_claim_v2_client', { ...link })),
         reconnectRegisteredClone: async (deviceId: string): Promise<RegisteredCloneSession> =>
             safeRegisteredCloneSession(await safeInvoke(nativeInvoke, 'peer_clone_claim_registered_client', { deviceId })),
     }
