@@ -173,7 +173,7 @@ pub(crate) struct LanCompletionManifestResponse {
     pub(crate) completion_lease_id: Option<CompletionLeaseId>,
 }
 
-fn parse_completion_lease_headers(
+pub(super) fn parse_completion_lease_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<Option<CompletionLeaseId>, PeerSyncError> {
     let completion_versions = headers

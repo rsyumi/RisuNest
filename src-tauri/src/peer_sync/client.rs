@@ -1,4 +1,9 @@
-use super::lan::LanCloneClient;
+use super::device_registry::CompletionLeaseId;
+use super::lan::{
+    parse_completion_lease_headers, LanCloneClient, PeerCompletionCapability,
+    PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1,
+    PEER_COMPLETION_RESUME_HEADER,
+};
 use super::{
     http_stream::HttpRangeStream,
     protocol::{sha256_hex, CloneManifest, CloneObjectKind, MAX_MANIFEST_BYTES},
@@ -124,6 +129,8 @@ pub struct LoopbackCloneClient {
     manifest: Option<CloneManifest>,
     manifest_id: Option<String>,
     ledger: LedgerState,
+    completion_v1: bool,
+    completion_lease_id: Option<CompletionLeaseId>,
     #[cfg(test)]
     fail_after_cas_promotion: bool,
     #[cfg(test)]
@@ -228,6 +235,8 @@ impl LoopbackCloneClient {
             manifest: None,
             manifest_id: None,
             ledger,
+            completion_v1: false,
+            completion_lease_id: None,
             #[cfg(test)]
             fail_after_cas_promotion: false,
             #[cfg(test)]
@@ -244,7 +253,34 @@ impl LoopbackCloneClient {
         lan: LanCloneClient,
         expected_manifest_id: &str,
     ) -> Result<Self, PeerSyncError> {
+        Self::from_lan_with_completion(
+            staging_root,
+            lan,
+            expected_manifest_id,
+            PeerCompletionCapability::Unsupported,
+            None,
+        )
+    }
+
+    pub(crate) fn from_lan_with_completion(
+        staging_root: impl AsRef<Path>,
+        lan: LanCloneClient,
+        expected_manifest_id: &str,
+        capability: PeerCompletionCapability,
+        resume_lease_id: Option<&str>,
+    ) -> Result<Self, PeerSyncError> {
         super::protocol::validate_hash(expected_manifest_id)?;
+        let completion_lease_id = match (capability, resume_lease_id) {
+            (PeerCompletionCapability::Unsupported, None) => None,
+            (PeerCompletionCapability::V1, lease_id) => {
+                lease_id.map(CompletionLeaseId::parse).transpose()?
+            }
+            (PeerCompletionCapability::Unsupported, Some(_)) => {
+                return Err(PeerSyncError::Protocol(
+                    "unsupported peer completion cannot resume a lease".to_owned(),
+                ))
+            }
+        };
         let (http, ranges, session_url, bearer, persisted_manifest_id, source_device_id) =
             lan.into_resumable_parts()?;
         if persisted_manifest_id
@@ -272,6 +308,8 @@ impl LoopbackCloneClient {
             manifest: None,
             manifest_id: None,
             ledger,
+            completion_v1: capability == PeerCompletionCapability::V1,
+            completion_lease_id,
             #[cfg(test)]
             fail_after_cas_promotion: false,
             #[cfg(test)]
@@ -285,6 +323,17 @@ impl LoopbackCloneClient {
 
     pub(crate) fn source_device_id(&self) -> Option<&str> {
         self.source_device_id.as_deref()
+    }
+
+    pub(crate) fn prepare_completion_manifest(&mut self) -> Result<Option<String>, PeerSyncError> {
+        if !self.completion_v1 {
+            return Ok(None);
+        }
+        self.fetch_manifest()?;
+        Ok(self
+            .completion_lease_id
+            .as_ref()
+            .map(|lease_id| lease_id.as_str().to_owned()))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -358,6 +407,12 @@ impl LoopbackCloneClient {
         Ok(all_verified)
     }
 
+    pub(crate) fn report_terminal_progress(&mut self) -> Result<(), PeerSyncError> {
+        self.fetch_manifest()?;
+        let manifest = self.manifest.as_ref().unwrap().clone();
+        self.report_verified_progress(&manifest, None)
+    }
+
     #[cfg(test)]
     pub fn verified_chunk_count(&self, object: &str) -> usize {
         self.ledger
@@ -411,23 +466,34 @@ impl LoopbackCloneClient {
             self.ledger.manifest_id.as_deref(),
             requested_session_id,
         )? {
-            if self.ledger.manifest_id.is_none() {
-                self.append_event(&LedgerEvent::Manifest {
-                    manifest_id: manifest_id.clone(),
-                })?;
-                self.ledger.manifest_id = Some(manifest_id.clone());
+            if !self.completion_v1 || self.completion_lease_id.is_some() {
+                if self.ledger.manifest_id.is_none() {
+                    self.append_event(&LedgerEvent::Manifest {
+                        manifest_id: manifest_id.clone(),
+                    })?;
+                    self.ledger.manifest_id = Some(manifest_id.clone());
+                }
+                self.manifest = Some(manifest);
+                self.manifest_id = Some(manifest_id);
+                return Ok(());
             }
-            self.manifest = Some(manifest);
-            self.manifest_id = Some(manifest_id);
-            return Ok(());
+        }
+        let mut request = self
+            .transport
+            .http
+            .get(self.transport.endpoint("manifest")?);
+        if self.completion_v1 {
+            request = request.header(
+                PEER_COMPLETION_CAPABILITY_HEADER,
+                PEER_COMPLETION_CAPABILITY_V1,
+            );
+            if let Some(lease_id) = self.completion_lease_id.as_ref() {
+                request = request.header(PEER_COMPLETION_RESUME_HEADER, lease_id.as_str());
+            }
         }
         let response = self
             .transport
-            .control_request(
-                self.transport
-                    .http
-                    .get(self.transport.endpoint("manifest")?),
-            )
+            .control_request(request)
             .send()
             .map_err(transport_error)?;
         if response.status() != StatusCode::OK {
@@ -442,6 +508,18 @@ impl LoopbackCloneClient {
             ));
         }
         let etag = required_header(&response, ETAG)?.to_owned();
+        let completion_lease_id = if self.completion_v1 {
+            parse_completion_lease_headers(response.headers())?
+        } else {
+            None
+        };
+        if let Some(persisted) = self.completion_lease_id.as_ref() {
+            if completion_lease_id.as_ref() != Some(persisted) {
+                return Err(PeerSyncError::Protocol(
+                    "clone completion resume lease changed".to_owned(),
+                ));
+            }
+        }
         let mut bytes = Vec::new();
         response
             .take(MAX_MANIFEST_BYTES as u64 + 1)
@@ -488,6 +566,7 @@ impl LoopbackCloneClient {
             self.ledger.manifest_id = Some(manifest_id.clone());
         }
         persist_manifest(&self.root.join(PERSISTED_MANIFEST_FILE), &bytes)?;
+        self.completion_lease_id = completion_lease_id;
         self.manifest = Some(manifest);
         self.manifest_id = Some(manifest_id);
         Ok(())
@@ -710,16 +789,20 @@ impl LoopbackCloneClient {
             return Ok(());
         }
         let verified_bytes = self.verified_bytes(manifest)?;
+        let mut progress = serde_json::json!({
+            "verifiedBytes": verified_bytes,
+            "currentObject": current_object,
+        });
+        if let Some(lease_id) = self.completion_lease_id.as_ref() {
+            progress["operationId"] = serde_json::Value::String(lease_id.as_str().to_owned());
+        }
         let response = self
             .transport
             .control_request(
                 self.transport
                     .http
                     .post(self.transport.endpoint("progress")?)
-                    .json(&serde_json::json!({
-                        "verifiedBytes": verified_bytes,
-                        "currentObject": current_object,
-                    })),
+                    .json(&progress),
             )
             .send()
             .map_err(transport_error)?;
@@ -1289,5 +1372,148 @@ mod timeout_tests {
             .build()
             .unwrap();
         assert_eq!(control.timeout(), Some(&CONTROL_REQUEST_TIMEOUT));
+    }
+
+    fn assert_resume_manifest_rejects_response_lease(
+        include_capability: bool,
+        response_lease: Option<&str>,
+        expected_error: &str,
+    ) {
+        use std::net::{Shutdown, TcpListener};
+        use std::thread;
+
+        let persisted = CompletionLeaseId::parse("00000000-0000-4000-8000-000000000401")
+            .expect("persisted lease");
+        let object_hash = sha256_hex(&[]);
+        let manifest = CloneManifest {
+            schema: super::super::protocol::CLONE_MANIFEST_SCHEMA.to_owned(),
+            session_id: "resume".to_owned(),
+            source_revision: 1,
+            created_at: "2026-09-02T00:00:00Z".to_owned(),
+            chunk_size: super::super::protocol::CLONE_CHUNK_SIZE,
+            database: super::super::protocol::CloneDatabase {
+                format: super::super::protocol::CLONE_DATABASE_FORMAT.to_owned(),
+                object: object_hash.clone(),
+            },
+            payloads: Vec::new(),
+            objects: BTreeMap::from([(
+                object_hash.clone(),
+                super::super::protocol::ObjectDescriptor {
+                    size: 0,
+                    sha256: object_hash,
+                    chunks: Vec::new(),
+                },
+            )]),
+        };
+        let manifest_bytes = manifest.canonical_bytes().expect("manifest bytes");
+        let manifest_id = sha256_hex(&manifest_bytes);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let expected_error = expected_error.to_owned();
+        let include_capability = include_capability;
+        let response_lease = response_lease.map(str::to_owned);
+        let response_manifest_id = manifest_id.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept manifest request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone manifest stream"));
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read manifest request");
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut completion_headers = String::new();
+            if include_capability {
+                completion_headers.push_str(&format!(
+                    "{}: {}\r\n",
+                    PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1
+                ));
+            }
+            if let Some(lease) = response_lease {
+                completion_headers.push_str(&format!(
+                    "{}: {lease}\r\n",
+                    super::super::lan::PEER_COMPLETION_LEASE_HEADER
+                ));
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"{response_manifest_id}\"\r\n{completion_headers}Connection: close\r\n\r\n",
+                manifest_bytes.len(),
+            );
+            let mut response_bytes = response.into_bytes();
+            response_bytes.extend_from_slice(&manifest_bytes);
+            stream
+                .write_all(&response_bytes)
+                .expect("write manifest response");
+            stream.flush().expect("flush manifest response");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("finish manifest response");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set fixture drain timeout");
+            let mut drain = [0_u8; 64];
+            while stream.read(&mut drain).is_ok_and(|read| read != 0) {}
+            request
+        });
+
+        let staging = tempfile::tempdir().expect("staging root");
+        let root = fs::canonicalize(staging.path()).expect("canonical staging root");
+        let mut client = LoopbackCloneClient {
+            root,
+            transport: HttpCloneTransport {
+                session_url: Url::parse(&format!("http://{address}/v1/sessions/resume"))
+                    .expect("session URL"),
+                http: Client::builder().no_proxy().build().expect("HTTP client"),
+                ranges: HttpRangeStream::new(Duration::from_secs(1)).expect("range client"),
+                bearer: Some("registered-bearer".to_owned()),
+            },
+            required_manifest_id: Some(manifest_id),
+            source_device_id: Some("00000000-0000-4000-8000-000000000403".to_owned()),
+            manifest: None,
+            manifest_id: None,
+            ledger: LedgerState::default(),
+            completion_v1: true,
+            completion_lease_id: Some(persisted.clone()),
+            fail_after_cas_promotion: false,
+            pause_after_cas_promotion: None,
+            pause_after_verified_chunk: None,
+            fail_record_activation: false,
+        };
+
+        let error = client
+            .prepare_completion_manifest()
+            .expect_err("resume response must fail closed");
+        assert_eq!(error, PeerSyncError::Protocol(expected_error));
+        assert_eq!(client.completion_lease_id.as_ref(), Some(&persisted));
+        assert!(client.manifest.is_none());
+        let request = server.join().expect("join fixture");
+        assert!(request.contains("/manifest"));
+        assert!(request.to_ascii_lowercase().contains(
+            &format!("{}: {}", PEER_COMPLETION_RESUME_HEADER, persisted.as_str())
+                .to_ascii_lowercase()
+        ));
+        assert!(!request.contains("/progress"));
+    }
+
+    #[test]
+    fn resumed_completion_manifest_requires_the_exact_response_lease() {
+        assert_resume_manifest_rejects_response_lease(
+            false,
+            None,
+            "clone completion resume lease changed",
+        );
+        assert_resume_manifest_rejects_response_lease(
+            true,
+            None,
+            "invalid peer completion lease headers",
+        );
+        assert_resume_manifest_rejects_response_lease(
+            true,
+            Some("00000000-0000-4000-8000-000000000402"),
+            "clone completion resume lease changed",
+        );
     }
 }

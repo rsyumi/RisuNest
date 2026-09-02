@@ -1,6 +1,6 @@
 use super::lan::{
     validate_device_sync_endpoint, validate_lan_endpoint, LanCloneHostControl,
-    NAMED_TUNNEL_ORIGIN_UNAVAILABLE,
+    PeerCompletionCapability, NAMED_TUNNEL_ORIGIN_UNAVAILABLE,
 };
 use super::production::prepare_unified_clone_source;
 use super::{
@@ -288,6 +288,10 @@ struct TargetOperationMarker {
     backup_path: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     completion_acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_lease_id: Option<String>,
 }
 
 impl TargetOperationMarker {
@@ -299,6 +303,8 @@ impl TargetOperationMarker {
             operation_id: uuid::Uuid::new_v4().to_string(),
             backup_path: None,
             completion_acknowledged: false,
+            completion_capability: None,
+            completion_lease_id: None,
         }
     }
 
@@ -315,6 +321,16 @@ impl TargetOperationMarker {
                 .as_deref()
                 .is_some_and(|path| path != target_backup_relative_path(&self.operation_id))
             || (self.completion_acknowledged && self.backup_path.is_none())
+            || match (
+                self.completion_capability.as_deref(),
+                self.completion_lease_id.as_deref(),
+            ) {
+                (None, None) => false,
+                (Some(super::lan::PEER_COMPLETION_CAPABILITY_V1), Some(lease_id)) => {
+                    !is_canonical_v4_uuid(lease_id) || lease_id == self.operation_id
+                }
+                _ => true,
+            }
         {
             return Err(PeerSyncError::Validation(
                 "invalid peer clone target operation marker".to_owned(),
@@ -554,6 +570,12 @@ impl PeerCloneCommandState {
 
     pub(crate) fn initialize(peer_root: &Path) -> Self {
         let state = Self::default();
+        if let Err(error) = sweep_unpublished_registered_target_orphans(peer_root) {
+            crate::nlog!(
+                "warn",
+                "failed to sweep unpublished registered peer clone targets: {error}"
+            );
+        }
         if let Err(error) = sweep_activated_target_residues(peer_root) {
             crate::nlog!(
                 "warn",
@@ -1129,6 +1151,7 @@ impl PeerCloneCommandState {
             PeerSyncError::Storage("peer clone target root has no app root".to_owned())
         })?;
         let paths = target_paths(peer_root, &request)?;
+        let new_job = !paths.job_root.try_exists()?;
         let rotate_credential = {
             let mut runtime = self.lock_runtime()?;
             if let Some(target) = &runtime.target {
@@ -1208,6 +1231,7 @@ impl PeerCloneCommandState {
             pause.wait();
             pause.wait();
         }
+        let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
 
         let claimed = (|| {
             let claim_client = || {
@@ -1262,12 +1286,56 @@ impl PeerCloneCommandState {
                     "persisted peer clone target identity does not match the request".to_owned(),
                 ));
             }
-            LoopbackCloneClient::from_lan(&paths.transfer, lan, manifest_id)
+            let operation_id = load_or_create_target_operation_id(&paths.job_root, &request)?;
+            let marker = read_target_operation_marker(
+                &paths.job_root.join(TARGET_OPERATION_MARKER_FILE),
+                &request,
+            )?
+            .ok_or_else(|| {
+                PeerSyncError::Storage("peer clone target operation marker is missing".to_owned())
+            })?;
+            let completion_capability = if new_job {
+                registered_clone_completion_capability(&lan)?
+            } else {
+                marker_completion_capability(&marker)?
+            };
+            let mut client = LoopbackCloneClient::from_lan_with_completion(
+                &paths.transfer,
+                lan,
+                manifest_id,
+                completion_capability,
+                marker.completion_lease_id.as_deref(),
+            )?;
+            let completion_lease_id = if completion_capability == PeerCompletionCapability::V1 {
+                client.prepare_completion_manifest()?
+            } else {
+                None
+            };
+            persist_target_completion_lease(
+                &paths.job_root,
+                &request,
+                &operation_id,
+                completion_capability,
+                completion_lease_id.as_deref(),
+            )?;
+            Ok((client, operation_id))
         })();
 
         let mut runtime = self.lock_runtime()?;
         runtime.target_claiming = false;
-        let client = claimed?;
+        let (client, operation_id) = match claimed {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                if new_job {
+                    remove_directory_if_exists(&paths.job_root).map_err(|cleanup| {
+                        PeerSyncError::Storage(format!(
+                            "{error}; failed to discard unavailable peer clone: {cleanup}"
+                        ))
+                    })?;
+                }
+                return Err(error);
+            }
+        };
         if rotate_credential {
             let target = runtime.target.as_mut().ok_or_else(|| {
                 PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
@@ -1292,7 +1360,6 @@ impl PeerCloneCommandState {
             return Ok(result);
         }
         let result = clone_claim_result(&request, &client);
-        let operation_id = load_or_create_target_operation_id(&paths.job_root, &request)?;
         runtime.target = Some(TargetRuntime {
             request,
             job_root: paths.job_root,
@@ -1321,6 +1388,7 @@ impl PeerCloneCommandState {
         manifest_id: &str,
         source_device_id: &str,
         bearer: &str,
+        completion_capability: PeerCompletionCapability,
     ) -> Result<PeerCloneClaimResult, PeerSyncError> {
         self.reap_finished_target_worker()?;
         let request = PeerCloneTargetRequest {
@@ -1332,6 +1400,7 @@ impl PeerCloneCommandState {
             PeerSyncError::Storage("peer clone target root has no app root".to_owned())
         })?;
         let paths = target_paths(peer_root, &request)?;
+        let new_job = !paths.job_root.try_exists()?;
         {
             let mut runtime = self.lock_runtime()?;
             if runtime.target_claiming {
@@ -1361,6 +1430,27 @@ impl PeerCloneCommandState {
             }
             runtime.target_claiming = true;
         }
+        #[cfg(test)]
+        let target_claim_pause = { self.lock_runtime()?.target_claim_pause.take() };
+        #[cfg(test)]
+        if let Some(pause) = target_claim_pause {
+            pause.wait();
+            pause.wait();
+        }
+        let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
+        let operation_id = load_or_create_target_operation_id(&paths.job_root, &request)?;
+        let persisted_marker = read_target_operation_marker(
+            &paths.job_root.join(TARGET_OPERATION_MARKER_FILE),
+            &request,
+        )?
+        .ok_or_else(|| {
+            PeerSyncError::Storage("peer clone target operation marker is missing".to_owned())
+        })?;
+        let completion_capability = if new_job {
+            completion_capability
+        } else {
+            marker_completion_capability(&persisted_marker)?
+        };
         let connected = (|| {
             let local_device_id = super::device_registry::load_or_create_device_id(app_root)?;
             let lan = LanCloneClient::from_registered_and_persist(
@@ -1372,13 +1462,62 @@ impl PeerCloneCommandState {
                 source_device_id,
                 bearer,
             )?;
-            LoopbackCloneClient::from_lan(&paths.transfer, lan, manifest_id)
+            if !lan.matches_registered_credential(
+                endpoint,
+                session_id,
+                manifest_id,
+                &local_device_id,
+                source_device_id,
+                bearer,
+            )? {
+                return Err(PeerSyncError::Validation(
+                    "registered peer clone credential changed while connecting".to_owned(),
+                ));
+            }
+            let mut client = LoopbackCloneClient::from_lan_with_completion(
+                &paths.transfer,
+                lan,
+                manifest_id,
+                completion_capability,
+                persisted_marker.completion_lease_id.as_deref(),
+            )?;
+            let completion_lease_id = client.prepare_completion_manifest()?;
+            persist_target_completion_lease(
+                &paths.job_root,
+                &request,
+                &operation_id,
+                completion_capability,
+                completion_lease_id.as_deref(),
+            )?;
+            let registered =
+                super::device_registry::incoming_source_by_id(app_root, source_device_id)?;
+            if !registered.as_ref().is_some_and(|registered| {
+                registered.endpoint == endpoint
+                    && registered.bearer == bearer
+                    && registered.permissions.allows_read()
+            }) {
+                return Err(PeerSyncError::Validation(
+                    "registered peer clone source is unavailable".to_owned(),
+                ));
+            }
+            Ok(client)
         })();
         let mut runtime = self.lock_runtime()?;
         runtime.target_claiming = false;
-        let client = connected?;
+        let client = match connected {
+            Ok(client) => client,
+            Err(error) => {
+                if new_job {
+                    remove_directory_if_exists(&paths.job_root).map_err(|cleanup| {
+                        PeerSyncError::Storage(format!(
+                            "{error}; failed to discard unavailable registered peer clone: {cleanup}"
+                        ))
+                    })?;
+                }
+                return Err(error);
+            }
+        };
         let result = clone_claim_result(&request, &client);
-        let operation_id = load_or_create_target_operation_id(&paths.job_root, &request)?;
         runtime.target = Some(TargetRuntime {
             request,
             job_root: paths.job_root,
@@ -1537,7 +1676,22 @@ impl PeerCloneCommandState {
                             .to_owned(),
                     ));
                 }
-                LoopbackCloneClient::from_lan(&paths.transfer, lan, &request.manifest_id)
+                let marker = read_target_operation_marker(
+                    &paths.job_root.join(TARGET_OPERATION_MARKER_FILE),
+                    &request,
+                )?
+                .ok_or_else(|| {
+                    PeerSyncError::Storage(
+                        "peer clone target operation marker is missing".to_owned(),
+                    )
+                })?;
+                LoopbackCloneClient::from_lan_with_completion(
+                    &paths.transfer,
+                    lan,
+                    &request.manifest_id,
+                    marker_completion_capability(&marker)?,
+                    marker.completion_lease_id.as_deref(),
+                )
             })();
             let mut runtime = self.lock_runtime()?;
             runtime.target_claiming = false;
@@ -1629,6 +1783,10 @@ impl PeerCloneCommandState {
             };
             update_target_progress(&runtime, &worker_request, verified_bytes, total_bytes);
             if all_objects_verified {
+                if let Err(error) = client.report_terminal_progress() {
+                    finish_target_worker(&runtime, &worker_request, client, Err(error), None);
+                    return;
+                }
                 finish_target_worker(
                     &runtime,
                     &worker_request,
@@ -2047,6 +2205,89 @@ fn load_or_create_target_operation_id(
     })
 }
 
+fn persist_target_completion_lease(
+    job_root: &Path,
+    request: &PeerCloneTargetRequest,
+    operation_id: &str,
+    capability: PeerCompletionCapability,
+    completion_lease_id: Option<&str>,
+) -> Result<(), PeerSyncError> {
+    let marker_path = job_root.join(TARGET_OPERATION_MARKER_FILE);
+    let mut marker = read_target_operation_marker(&marker_path, request)?.ok_or_else(|| {
+        PeerSyncError::Storage("peer clone target operation marker is missing".to_owned())
+    })?;
+    if marker.operation_id != operation_id {
+        return Err(PeerSyncError::Validation(
+            "peer clone completion lease belongs to another local operation".to_owned(),
+        ));
+    }
+    let proposed = match (capability, completion_lease_id) {
+        (PeerCompletionCapability::Unsupported, None) => (None, None),
+        (PeerCompletionCapability::V1, Some(lease_id)) if is_canonical_v4_uuid(lease_id) => (
+            Some(super::lan::PEER_COMPLETION_CAPABILITY_V1.to_owned()),
+            Some(lease_id.to_owned()),
+        ),
+        _ => {
+            return Err(PeerSyncError::Protocol(
+                "peer clone completion capability did not provide an exact lease".to_owned(),
+            ))
+        }
+    };
+    if marker.completion_capability.is_some() || marker.completion_lease_id.is_some() {
+        if (
+            marker.completion_capability.as_ref(),
+            marker.completion_lease_id.as_ref(),
+        ) != (proposed.0.as_ref(), proposed.1.as_ref())
+        {
+            return Err(PeerSyncError::Validation(
+                "peer clone completion lease changed while resuming".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    marker.completion_capability = proposed.0;
+    marker.completion_lease_id = proposed.1;
+    write_target_operation_marker(&marker_path, &marker, request)
+}
+
+fn marker_completion_capability(
+    marker: &TargetOperationMarker,
+) -> Result<PeerCompletionCapability, PeerSyncError> {
+    match marker.completion_capability.as_deref() {
+        None if marker.completion_lease_id.is_none() => Ok(PeerCompletionCapability::Unsupported),
+        Some(super::lan::PEER_COMPLETION_CAPABILITY_V1) if marker.completion_lease_id.is_some() => {
+            Ok(PeerCompletionCapability::V1)
+        }
+        _ => Err(PeerSyncError::Validation(
+            "peer clone target completion state is inconsistent".to_owned(),
+        )),
+    }
+}
+
+fn registered_clone_completion_capability(
+    lan: &LanCloneClient,
+) -> Result<PeerCompletionCapability, PeerSyncError> {
+    let Some(source_device_id) = lan.registered_source_device_id() else {
+        return Ok(PeerCompletionCapability::Unsupported);
+    };
+    let (_, session_id, manifest_id) = lan.target_identity()?;
+    let observed = lan.hello_with_capabilities()?;
+    if observed.hello.device_id != source_device_id
+        || !observed.hello.permissions.allows_read()
+        || !observed
+            .hello
+            .lanes
+            .clone
+            .as_ref()
+            .is_some_and(|lane| lane.session_id == session_id && lane.manifest_id == manifest_id)
+    {
+        return Err(PeerSyncError::Protocol(
+            "registered peer clone capability hello changed its target identity".to_owned(),
+        ));
+    }
+    Ok(observed.completion)
+}
+
 fn read_target_operation_marker(
     path: &Path,
     request: &PeerCloneTargetRequest,
@@ -2148,6 +2389,133 @@ pub(crate) fn retryable_target_operation_references_backup(
         }
     }
     Ok(false)
+}
+
+pub(crate) fn registered_clone_source_is_active(
+    app_root: &Path,
+    source_device_id: &str,
+) -> Result<bool, PeerSyncError> {
+    let targets_root = app_root.join("peer-clone").join("targets");
+    let metadata = match fs::symlink_metadata(&targets_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata_is_symlink_or_reparse(&metadata) {
+        return Err(PeerSyncError::Validation(
+            "peer clone target root is not a plain directory".to_owned(),
+        ));
+    }
+    for entry in fs::read_dir(&targets_root)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata_is_symlink_or_reparse(&metadata) {
+            return Err(PeerSyncError::Validation(
+                "peer clone target job root is not a plain directory".to_owned(),
+            ));
+        }
+        let Some(session_id) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(PeerSyncError::Validation(
+                "peer clone target session identity is invalid".to_owned(),
+            ));
+        };
+        let marker_path = entry.path().join(TARGET_OPERATION_MARKER_FILE);
+        let Some(bytes) = read_target_operation_marker_bytes(&marker_path)? else {
+            continue;
+        };
+        let marker: TargetOperationMarker = serde_json::from_slice(&bytes)
+            .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+        let request = PeerCloneTargetRequest {
+            endpoint: String::new(),
+            session_id: session_id.clone(),
+            manifest_id: marker.manifest_id.clone(),
+        };
+        marker.validate_for(&request)?;
+        let credential = LanCloneClient::open_persisted(&entry.path().join("credential.json"))?;
+        let (_, credential_session_id, credential_manifest_id) = credential.target_identity()?;
+        if credential_session_id != session_id || credential_manifest_id != marker.manifest_id {
+            return Err(PeerSyncError::Validation(
+                "peer clone target identity is inconsistent".to_owned(),
+            ));
+        }
+        if credential.registered_source_device_id() == Some(source_device_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sweep_unpublished_registered_target_orphans(peer_root: &Path) -> Result<(), PeerSyncError> {
+    let Some(app_root) = peer_root.parent() else {
+        return Ok(());
+    };
+    let targets_root = peer_root.join("targets");
+    if !ordinary_directory(peer_root)? || !ordinary_directory(&targets_root)? {
+        return Ok(());
+    }
+    let local_device_id = super::device_registry::load_or_create_device_id(app_root)?;
+    let active_manifest_id = active_target_manifest_evidence(peer_root)?;
+    for entry in fs::read_dir(&targets_root)? {
+        let entry = entry?;
+        let Some(session_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_canonical_uuid(&session_id) || !ordinary_directory(&entry.path())? {
+            continue;
+        }
+        let Some(bytes) =
+            read_target_operation_marker_bytes(&entry.path().join(TARGET_OPERATION_MARKER_FILE))?
+        else {
+            continue;
+        };
+        let marker: TargetOperationMarker = match serde_json::from_slice(&bytes) {
+            Ok(marker) => marker,
+            Err(_) => continue,
+        };
+        let request = PeerCloneTargetRequest {
+            endpoint: String::new(),
+            session_id: session_id.clone(),
+            manifest_id: marker.manifest_id.clone(),
+        };
+        if marker.validate_for(&request).is_err() || marker.backup_path.is_some() {
+            continue;
+        }
+        if active_manifest_id.as_deref() == Some(marker.manifest_id.as_str())
+            && super::client::persisted_activation_matches(
+                &entry.path().join("transfer"),
+                &marker.manifest_id,
+            )?
+        {
+            continue;
+        }
+        let credential = match LanCloneClient::open_persisted(&entry.path().join("credential.json"))
+        {
+            Ok(credential) => credential,
+            Err(_) => continue,
+        };
+        let Some(source_device_id) = credential.registered_source_device_id() else {
+            continue;
+        };
+        let Some(source) =
+            super::device_registry::incoming_source_by_id(app_root, source_device_id)?
+        else {
+            remove_directory_if_exists(&entry.path())?;
+            continue;
+        };
+        if !source.permissions.allows_read()
+            || !credential.matches_registered_credential(
+                &source.endpoint,
+                &session_id,
+                &marker.manifest_id,
+                &local_device_id,
+                source_device_id,
+                &source.bearer,
+            )?
+        {
+            remove_directory_if_exists(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn persist_target_backup_receipt(
@@ -3327,6 +3695,29 @@ mod tests {
     }
 
     #[test]
+    fn target_operation_marker_migrates_legacy_completion_state_by_omitting_it() {
+        let request = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000300".to_owned(),
+            manifest_id: "a".repeat(64),
+        };
+        let legacy = serde_json::json!({
+            "schema": TARGET_OPERATION_MARKER_SCHEMA,
+            "sessionId": request.session_id,
+            "manifestId": request.manifest_id,
+            "operationId": "00000000-0000-4000-8000-000000000301"
+        });
+
+        let marker: TargetOperationMarker = serde_json::from_value(legacy).unwrap();
+        marker.validate_for(&request).unwrap();
+        assert_eq!(marker.completion_capability.as_deref(), None);
+        assert_eq!(marker.completion_lease_id.as_deref(), None);
+        let serialized = serde_json::to_value(marker).unwrap();
+        assert!(serialized.get("completionCapability").is_none());
+        assert!(serialized.get("completionLeaseId").is_none());
+    }
+
+    #[test]
     fn target_operation_marker_replaces_inherited_or_non_v4_operation_ids() {
         let root = tempfile::tempdir().unwrap();
         let request = PeerCloneTargetRequest {
@@ -3350,6 +3741,8 @@ mod tests {
                     operation_id: invalid_operation_id.to_owned(),
                     backup_path: None,
                     completion_acknowledged: false,
+                    completion_capability: None,
+                    completion_lease_id: None,
                 })
                 .unwrap(),
             )
@@ -3415,6 +3808,8 @@ mod tests {
                 operation_id: operation_id.to_owned(),
                 backup_path: Some(target_backup_relative_path(operation_id)),
                 completion_acknowledged: false,
+                completion_capability: None,
+                completion_lease_id: None,
             },
             &request,
         )
@@ -4274,6 +4669,19 @@ mod tests {
             .unwrap()
             .operation_id
             .clone();
+        let marker_path = peer_root
+            .join("targets")
+            .join(&request.session_id)
+            .join(TARGET_OPERATION_MARKER_FILE);
+        let completion_marker: Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(completion_marker["completionCapability"], "v1");
+        let completion_lease_id = completion_marker["completionLeaseId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(is_canonical_v4_uuid(&completion_lease_id));
+        assert_ne!(completion_lease_id, operation_id);
         target
             .start_target_download(&peer_root, request.clone())
             .unwrap();
@@ -4380,6 +4788,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(marker_after_retry["completionLeaseId"], completion_lease_id);
         assert_eq!(marker_after_retry["completionAcknowledged"], true);
         assert!(!retryable_target_operation_references_backup(&peer_root, &backup_path).unwrap());
         drop(recovered);
@@ -4572,6 +4981,29 @@ mod tests {
         let first = target
             .finalize_target(&mut target_store, &target_cas, &peer_root, &request)
             .unwrap();
+        let source_registry: Value = serde_json::from_slice(
+            &fs::read(source_root.path().join("peer-sync/devices.json")).unwrap(),
+        )
+        .unwrap();
+        let offer = source_registry["completionOffers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|offer| offer["lane"] == "clone")
+            .unwrap();
+        assert_eq!(offer["ready"], true);
+        assert_eq!(
+            super::super::device_registry::accept_outgoing_completion_offer(
+                source_root.path(),
+                offer["deviceId"].as_str().unwrap(),
+                super::super::device_registry::CompletionLane::Clone,
+                offer["leaseId"].as_str().unwrap(),
+                offer["manifestId"].as_str().unwrap(),
+                offer["transferredBytes"].as_u64().unwrap(),
+            )
+            .unwrap(),
+            super::super::device_registry::CompletionAcceptance::Recorded
+        );
         target.release_target(&request).unwrap();
 
         let mut local_root = target_store.read_root(None).unwrap().value;
@@ -4601,6 +5033,7 @@ mod tests {
                 &request.manifest_id,
                 &source_device_id,
                 &registered_source.bearer,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
         let second_operation_id = target
@@ -5061,6 +5494,22 @@ mod tests {
         };
         let source_device_id = "00000000-0000-4000-8000-000000000203";
         let bearer = "b".repeat(64);
+        let register_source = |endpoint: &str| {
+            super::super::device_registry::register_incoming_source(
+                root.path(),
+                super::super::device_registry::IncomingSource {
+                    device_id: source_device_id.to_owned(),
+                    name: "Desktop source".to_owned(),
+                    endpoint: endpoint.to_owned(),
+                    bearer: bearer.clone(),
+                    permissions: super::super::device_registry::DevicePermissions::read(),
+                    last_seen_ms: 0,
+                    total_bytes: 0,
+                },
+            )
+            .unwrap();
+        };
+        register_source(&first.endpoint);
 
         state
             .connect_registered_target(
@@ -5070,8 +5519,17 @@ mod tests {
                 &first.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             )
             .unwrap();
+        assert!(registered_clone_source_is_active(root.path(), source_device_id).unwrap());
+        assert!(
+            super::super::registry_commands::remove_incoming_source_if_inactive(
+                root.path(),
+                source_device_id,
+            )
+            .is_err()
+        );
         assert!(state
             .connect_registered_target(
                 &peer_root,
@@ -5080,6 +5538,7 @@ mod tests {
                 &restarted.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             )
             .is_err());
         let first_root = target_paths(&peer_root, &first).unwrap().job_root;
@@ -5100,6 +5559,7 @@ mod tests {
                 &restarted.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             )
             .is_err());
         state
@@ -5110,6 +5570,7 @@ mod tests {
             .unwrap()
             .status
             .phase = PeerCloneTargetPhase::Failed;
+        register_source(&restarted.endpoint);
 
         let result = state
             .connect_registered_target(
@@ -5119,6 +5580,7 @@ mod tests {
                 &restarted.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             )
             .unwrap();
 
@@ -5148,6 +5610,22 @@ mod tests {
         };
         let source_device_id = "00000000-0000-4000-8000-000000000213";
         let bearer = "f".repeat(64);
+        let register_source = |endpoint: &str| {
+            super::super::device_registry::register_incoming_source(
+                root.path(),
+                super::super::device_registry::IncomingSource {
+                    device_id: source_device_id.to_owned(),
+                    name: "Desktop source".to_owned(),
+                    endpoint: endpoint.to_owned(),
+                    bearer: bearer.clone(),
+                    permissions: super::super::device_registry::DevicePermissions::read(),
+                    last_seen_ms: 0,
+                    total_bytes: 0,
+                },
+            )
+            .unwrap();
+        };
+        register_source(&first.endpoint);
         state
             .connect_registered_target(
                 &peer_root,
@@ -5156,6 +5634,7 @@ mod tests {
                 &first.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             )
             .unwrap();
         state
@@ -5178,6 +5657,7 @@ mod tests {
                 &restarted.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             ),
             Err(PeerSyncError::Storage(message))
                 if message == "injected peer clone target release cleanup failure"
@@ -5192,6 +5672,7 @@ mod tests {
             assert!(!runtime.target_claiming);
         }
 
+        register_source(&restarted.endpoint);
         state
             .connect_registered_target(
                 &peer_root,
@@ -5200,10 +5681,190 @@ mod tests {
                 &restarted.manifest_id,
                 source_device_id,
                 &bearer,
+                PeerCompletionCapability::Unsupported,
             )
             .unwrap();
         assert!(!first_root.try_exists().unwrap());
         assert!(restarted_root.try_exists().unwrap());
+    }
+
+    #[test]
+    fn registered_target_publish_revalidates_a_concurrently_removed_source() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let state = PeerCloneCommandState::default();
+        let source_device_id = "00000000-0000-4000-8000-000000000223";
+        let bearer = "a".repeat(64);
+        let request = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000224".to_owned(),
+            manifest_id: "b".repeat(64),
+        };
+        super::super::device_registry::register_incoming_source(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: source_device_id.to_owned(),
+                name: "Desktop source".to_owned(),
+                endpoint: request.endpoint.clone(),
+                bearer: bearer.clone(),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 0,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
+        let pause = Arc::new(Barrier::new(2));
+        state
+            .pause_target_claim_before_network_for_test(Arc::clone(&pause))
+            .unwrap();
+        let worker_state = state.clone();
+        let worker_root = peer_root.clone();
+        let worker_request = request.clone();
+        let worker_bearer = bearer.clone();
+        let worker = thread::spawn(move || {
+            worker_state.connect_registered_target(
+                &worker_root,
+                &worker_request.endpoint,
+                &worker_request.session_id,
+                &worker_request.manifest_id,
+                source_device_id,
+                &worker_bearer,
+                PeerCompletionCapability::Unsupported,
+            )
+        });
+
+        pause.wait();
+        super::super::registry_commands::remove_incoming_source_if_inactive(
+            root.path(),
+            source_device_id,
+        )
+        .unwrap();
+        pause.wait();
+
+        assert_eq!(
+            worker.join().unwrap().unwrap_err(),
+            PeerSyncError::Validation("registered peer clone source is unavailable".to_owned())
+        );
+        assert!(state.lock_runtime().unwrap().target.is_none());
+        assert!(!target_paths(&peer_root, &request)
+            .unwrap()
+            .job_root
+            .try_exists()
+            .unwrap());
+    }
+
+    #[test]
+    fn initialize_discards_an_unpublished_registered_target_orphan() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let source_device_id = "00000000-0000-4000-8000-000000000225";
+        let bearer = "c".repeat(64);
+        let request = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000226".to_owned(),
+            manifest_id: "d".repeat(64),
+        };
+        super::super::device_registry::register_incoming_source(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: source_device_id.to_owned(),
+                name: "Desktop source".to_owned(),
+                endpoint: request.endpoint.clone(),
+                bearer: bearer.clone(),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 0,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
+        let state = PeerCloneCommandState::default();
+        state
+            .connect_registered_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                source_device_id,
+                &bearer,
+                PeerCompletionCapability::Unsupported,
+            )
+            .unwrap();
+        let job_root = target_paths(&peer_root, &request).unwrap().job_root;
+        assert!(job_root.exists());
+        drop(state);
+
+        let sources_path = root.path().join("peer-sync/sources.json");
+        let mut sources: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sources_path).unwrap()).unwrap();
+        sources["sources"] = serde_json::json!([]);
+        fs::write(&sources_path, serde_json::to_vec(&sources).unwrap()).unwrap();
+
+        let _recovered = PeerCloneCommandState::initialize(&peer_root);
+        assert!(!job_root.exists());
+    }
+
+    #[test]
+    fn legacy_registered_target_resume_does_not_opt_into_completion_v1() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let source_device_id = "00000000-0000-4000-8000-000000000227";
+        let bearer = "e".repeat(64);
+        let request = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000228".to_owned(),
+            manifest_id: "f".repeat(64),
+        };
+        super::super::device_registry::register_incoming_source(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: source_device_id.to_owned(),
+                name: "Desktop source".to_owned(),
+                endpoint: request.endpoint.clone(),
+                bearer: bearer.clone(),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 0,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
+        let state = PeerCloneCommandState::default();
+        state
+            .connect_registered_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                source_device_id,
+                &bearer,
+                PeerCompletionCapability::Unsupported,
+            )
+            .unwrap();
+        drop(state);
+
+        let recovered = PeerCloneCommandState::initialize(&peer_root);
+        recovered
+            .connect_registered_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                source_device_id,
+                &bearer,
+                PeerCompletionCapability::V1,
+            )
+            .unwrap();
+        let marker: Value = serde_json::from_slice(
+            &fs::read(
+                target_paths(&peer_root, &request)
+                    .unwrap()
+                    .job_root
+                    .join(TARGET_OPERATION_MARKER_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(marker.get("completionCapability").is_none());
+        assert!(marker.get("completionLeaseId").is_none());
     }
 
     #[test]

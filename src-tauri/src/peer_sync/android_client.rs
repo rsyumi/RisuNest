@@ -1,7 +1,8 @@
 use super::{
-    activate_downloaded_clone, lan::validate_lan_endpoint, CloneTargetAdapter, CloneValidator,
-    DownloadReport, LanCloneClient, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
-    TransferCancellation,
+    activate_downloaded_clone,
+    lan::{validate_lan_endpoint, PeerCompletionCapability},
+    CloneTargetAdapter, CloneValidator, DownloadReport, LanCloneClient, LoopbackCloneClient,
+    LosslessCloneTargetAdapter, PeerSyncError, TransferCancellation,
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -120,6 +121,8 @@ struct AndroidCloneJobDescriptor {
     schema: String,
     job_id: String,
     manifest_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_capability: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,10 +160,12 @@ struct AndroidClonePersistedStatus {
     backup_path: Option<PathBuf>,
     #[serde(default)]
     completion_acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_lease_id: Option<String>,
 }
 
 impl AndroidClonePersistedStatus {
-    fn ready() -> Self {
+    fn ready(completion_lease_id: Option<String>) -> Self {
         Self {
             schema: JOB_STATUS_SCHEMA.to_owned(),
             phase: AndroidCloneJobPhase::Ready,
@@ -170,6 +175,7 @@ impl AndroidClonePersistedStatus {
             committed_revision: None,
             backup_path: None,
             completion_acknowledged: false,
+            completion_lease_id,
         }
     }
 
@@ -190,6 +196,10 @@ impl AndroidClonePersistedStatus {
             || invalid_error
             || invalid_commit
             || invalid_acknowledgement
+            || self
+                .completion_lease_id
+                .as_deref()
+                .is_some_and(|lease_id| !is_canonical_v4_uuid(lease_id))
         {
             return Err(PeerSyncError::Storage(
                 "Android clone job status is invalid".to_owned(),
@@ -313,6 +323,7 @@ impl AndroidResumableCloneJob {
                 schema: JOB_SCHEMA.to_owned(),
                 job_id: job_id.clone(),
                 manifest_id: manifest_id.to_owned(),
+                completion_capability: None,
             };
             write_new_json(&root.join("job.json"), &descriptor)?;
             let lan = LanCloneClient::claim_and_persist(
@@ -333,7 +344,7 @@ impl AndroidResumableCloneJob {
             let client = LoopbackCloneClient::from_lan(&root, lan, manifest_id)?;
             write_new_json(
                 &root.join("status.json"),
-                &AndroidClonePersistedStatus::ready(),
+                &AndroidClonePersistedStatus::ready(None),
             )?;
             Ok(Self {
                 root: root.clone(),
@@ -357,6 +368,7 @@ impl AndroidResumableCloneJob {
         target_device_id: &str,
         source_device_id: &str,
         bearer: &str,
+        completion_capability: PeerCompletionCapability,
     ) -> Result<Self, PeerSyncError> {
         let job_root = job_root.as_ref();
         let job_id = validate_job_id_from_path(job_root)?;
@@ -374,6 +386,8 @@ impl AndroidResumableCloneJob {
                 schema: JOB_SCHEMA.to_owned(),
                 job_id: job_id.clone(),
                 manifest_id: manifest_id.to_owned(),
+                completion_capability: (completion_capability == PeerCompletionCapability::V1)
+                    .then(|| super::lan::PEER_COMPLETION_CAPABILITY_V1.to_owned()),
             };
             write_new_json(&root.join("job.json"), &descriptor)?;
             let lan = LanCloneClient::from_registered_and_persist(
@@ -385,10 +399,21 @@ impl AndroidResumableCloneJob {
                 source_device_id,
                 bearer,
             )?;
-            let client = LoopbackCloneClient::from_lan(&root, lan, manifest_id)?;
+            let mut client = LoopbackCloneClient::from_lan_with_completion(
+                &root,
+                lan,
+                manifest_id,
+                completion_capability,
+                None,
+            )?;
             write_new_json(
                 &root.join("status.json"),
-                &AndroidClonePersistedStatus::ready(),
+                &AndroidClonePersistedStatus::ready(None),
+            )?;
+            let completion_lease_id = client.prepare_completion_manifest()?;
+            write_json_atomic(
+                &root.join("status.json"),
+                &AndroidClonePersistedStatus::ready(completion_lease_id),
             )?;
             Ok(Self {
                 root: root.clone(),
@@ -425,7 +450,26 @@ impl AndroidResumableCloneJob {
         }
         let endpoint = endpoint.to_owned();
         let session_id = session_id.to_owned();
-        let client = LoopbackCloneClient::from_lan(&root, lan, &descriptor.manifest_id)?;
+        let status_path = root.join("status.json");
+        let persisted_status = if status_path.exists() {
+            Some(read_bounded_json::<AndroidClonePersistedStatus>(
+                &status_path,
+                MAX_JOB_RECORD_BYTES,
+            )?)
+        } else {
+            None
+        };
+        let completion_capability = descriptor_completion_capability(&descriptor)?;
+        let resume_lease_id = persisted_status
+            .as_ref()
+            .and_then(|status| status.completion_lease_id.as_deref());
+        let client = LoopbackCloneClient::from_lan_with_completion(
+            &root,
+            lan,
+            &descriptor.manifest_id,
+            completion_capability,
+            resume_lease_id,
+        )?;
         let mut job = Self {
             root,
             descriptor,
@@ -433,8 +477,9 @@ impl AndroidResumableCloneJob {
             session_id,
             client,
         };
-        if !job.root.join("status.json").exists() {
-            let mut status = AndroidClonePersistedStatus::ready();
+        if persisted_status.is_none() {
+            let completion_lease_id = job.client.prepare_completion_manifest()?;
+            let mut status = AndroidClonePersistedStatus::ready(completion_lease_id);
             if job.root.join("verified.json").is_file() {
                 let (completed_bytes, total_bytes) = job.client.transfer_progress()?;
                 if completed_bytes != total_bytes {
@@ -448,7 +493,8 @@ impl AndroidResumableCloneJob {
             }
             write_new_json(&job.root.join("status.json"), &status)?;
         } else {
-            job.read_status()?;
+            let status = job.read_status()?;
+            validate_android_completion_state(&job.descriptor, &status)?;
         }
         Ok(job)
     }
@@ -491,9 +537,11 @@ impl AndroidResumableCloneJob {
         if self.cancel_requested()? || cancellation.is_cancelled() {
             return Err(PeerSyncError::Cancelled);
         }
-        if self.read_status()?.committed_revision.is_some() {
+        let initial_status = self.read_status()?;
+        if initial_status.committed_revision.is_some() {
             return Err(PeerSyncError::AlreadyActivated);
         }
+        let completion_lease_id = initial_status.completion_lease_id;
 
         let all_objects_verified = match self.client.all_objects_verified(cancellation) {
             Ok(verified) => verified,
@@ -504,6 +552,9 @@ impl AndroidResumableCloneJob {
             Err(error) => return self.finish_download_error(error),
         };
         if all_objects_verified {
+            if let Err(error) = self.client.report_terminal_progress() {
+                return self.finish_download_error(error);
+            }
             self.ensure_verified_marker()?;
             self.write_status(&AndroidClonePersistedStatus {
                 schema: JOB_STATUS_SCHEMA.to_owned(),
@@ -514,6 +565,7 @@ impl AndroidResumableCloneJob {
                 committed_revision: None,
                 backup_path: None,
                 completion_acknowledged: false,
+                completion_lease_id: completion_lease_id.clone(),
             })?;
             return Ok(DownloadReport::default());
         }
@@ -527,6 +579,7 @@ impl AndroidResumableCloneJob {
             committed_revision: None,
             backup_path: None,
             completion_acknowledged: false,
+            completion_lease_id: completion_lease_id.clone(),
         })?;
         let status_error = RefCell::new(None);
         let last_persisted = Cell::new(completed_before);
@@ -555,6 +608,7 @@ impl AndroidResumableCloneJob {
                         committed_revision: None,
                         backup_path: None,
                         completion_acknowledged: false,
+                        completion_lease_id: completion_lease_id.clone(),
                     };
                     if let Err(error) = write_json_atomic(&status_path, &status) {
                         *status_error.borrow_mut() = Some(error);
@@ -585,6 +639,7 @@ impl AndroidResumableCloneJob {
                     committed_revision: None,
                     backup_path: None,
                     completion_acknowledged: false,
+                    completion_lease_id,
                 })?;
                 Ok(report)
             }
@@ -772,12 +827,12 @@ impl AndroidResumableCloneJob {
     fn read_status(&self) -> Result<AndroidClonePersistedStatus, PeerSyncError> {
         let status: AndroidClonePersistedStatus =
             read_bounded_json(&self.root.join("status.json"), MAX_JOB_RECORD_BYTES)?;
-        status.validate()?;
+        validate_android_completion_state(&self.descriptor, &status)?;
         Ok(status)
     }
 
     fn write_status(&self, status: &AndroidClonePersistedStatus) -> Result<(), PeerSyncError> {
-        status.validate()?;
+        validate_android_completion_state(&self.descriptor, status)?;
         write_json_atomic(&self.root.join("status.json"), status)
     }
 
@@ -893,6 +948,7 @@ impl AndroidCloneJobRegistry {
         target_device_id: &str,
         source_device_id: &str,
         bearer: &str,
+        completion_capability: PeerCompletionCapability,
     ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
         let endpoint = validate_lan_endpoint(endpoint)?;
         validate_session_id(session_id)?;
@@ -931,9 +987,11 @@ impl AndroidCloneJobRegistry {
             target_device_id,
             source_device_id,
             bearer,
+            completion_capability,
         )?;
         #[cfg(test)]
         self.wait_before_registered_publish_for_test()?;
+        let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
         if let Err(error) = self.write_current_id(&job_id) {
             let _ = job.discard();
             return Err(error);
@@ -945,9 +1003,12 @@ impl AndroidCloneJobRegistry {
             source_device_id,
         );
         let source_is_current = source.as_ref().is_ok_and(|source| {
-            source
-                .as_ref()
-                .is_some_and(|source| source.endpoint == endpoint && source.bearer == bearer)
+            source.as_ref().is_some_and(|source| {
+                source.device_id == source_device_id
+                    && source.endpoint == endpoint
+                    && source.bearer == bearer
+                    && source.permissions.allows_read()
+            })
         });
         if !source_is_current {
             let source_error = source.err().unwrap_or_else(|| {
@@ -1355,6 +1416,7 @@ impl AndroidCloneJobRegistry {
         pause_interrupted_downloads: bool,
     ) -> Result<(), PeerSyncError> {
         cleanup_deleting_jobs(&self.jobs_root)?;
+        let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
         let pointer = self.read_current_id()?;
         let mut jobs = Vec::new();
         for entry in fs::read_dir(&self.jobs_root)? {
@@ -1379,6 +1441,14 @@ impl AndroidCloneJobRegistry {
                 }
                 Err(error) => return Err(error),
             };
+            let status = job.read_status()?;
+            if status.committed_revision.is_none()
+                && job.client.source_device_id().is_some()
+                && !registered_android_job_source_is_current(&self.jobs_root, &job)?
+            {
+                job.discard()?;
+                continue;
+            }
             if pause_interrupted_downloads && job.cancel_requested()? {
                 job.discard()?;
                 continue;
@@ -1445,6 +1515,35 @@ impl AndroidCloneJobRegistry {
             .lock()
             .map_err(|_| PeerSyncError::Storage("Android clone registry lock failed".to_owned()))
     }
+}
+
+fn registered_android_job_source_is_current(
+    jobs_root: &Path,
+    job: &AndroidResumableCloneJob,
+) -> Result<bool, PeerSyncError> {
+    let app_root = jobs_root.parent().ok_or_else(|| {
+        PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
+    })?;
+    let credential = LanCloneClient::open_persisted(&job.root.join("credential.json"))?;
+    let Some(source_device_id) = credential.registered_source_device_id() else {
+        return Ok(true);
+    };
+    let Some(source) = super::device_registry::incoming_source_by_id(app_root, source_device_id)?
+    else {
+        return Ok(false);
+    };
+    let (endpoint, session_id, manifest_id) = credential.target_identity()?;
+    let local_device_id = super::device_registry::load_or_create_device_id(app_root)?;
+    Ok(source.permissions.allows_read()
+        && credential.matches_registered_credential(
+            endpoint,
+            session_id,
+            manifest_id,
+            &local_device_id,
+            source_device_id,
+            &source.bearer,
+        )?
+        && source.endpoint == endpoint)
 }
 
 fn record_activation_witness(
@@ -1629,12 +1728,51 @@ fn validate_job(job_root: &Path) -> Result<(PathBuf, AndroidCloneJobDescriptor),
     if descriptor.schema != JOB_SCHEMA
         || descriptor.job_id != job_id
         || !is_sha256(&descriptor.manifest_id)
+        || !matches!(
+            descriptor.completion_capability.as_deref(),
+            None | Some(super::lan::PEER_COMPLETION_CAPABILITY_V1)
+        )
     {
         return Err(PeerSyncError::Storage(
             "Android clone job descriptor is invalid".to_owned(),
         ));
     }
     Ok((root, descriptor))
+}
+
+fn descriptor_completion_capability(
+    descriptor: &AndroidCloneJobDescriptor,
+) -> Result<PeerCompletionCapability, PeerSyncError> {
+    match descriptor.completion_capability.as_deref() {
+        None => Ok(PeerCompletionCapability::Unsupported),
+        Some(super::lan::PEER_COMPLETION_CAPABILITY_V1) => Ok(PeerCompletionCapability::V1),
+        Some(_) => Err(PeerSyncError::Storage(
+            "Android clone completion capability is invalid".to_owned(),
+        )),
+    }
+}
+
+fn validate_android_completion_state(
+    descriptor: &AndroidCloneJobDescriptor,
+    status: &AndroidClonePersistedStatus,
+) -> Result<(), PeerSyncError> {
+    status.validate()?;
+    let valid = match (
+        descriptor.completion_capability.as_deref(),
+        status.completion_lease_id.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(super::lan::PEER_COMPLETION_CAPABILITY_V1), Some(lease_id)) => {
+            is_canonical_v4_uuid(lease_id) && lease_id != descriptor.job_id
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(PeerSyncError::Storage(
+            "Android clone completion lease is inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_job_id_from_path(path: &Path) -> Result<String, PeerSyncError> {
@@ -1657,6 +1795,12 @@ fn validate_job_id(value: &str) -> Result<(), PeerSyncError> {
         ));
     }
     Ok(())
+}
+
+fn is_canonical_v4_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|parsed| parsed.get_version_num() == 4 && parsed.to_string() == value)
+        .unwrap_or(false)
 }
 
 fn validate_session_id(value: &str) -> Result<(), PeerSyncError> {

@@ -17,6 +17,18 @@ use super::{commands::PeerCloneCommandState, shared_session::DeviceSyncSourceSta
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 
+fn registered_source_lifecycle_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub(crate) fn lock_registered_source_lifecycle(
+) -> Result<std::sync::MutexGuard<'static, ()>, super::PeerSyncError> {
+    registered_source_lifecycle_lock().lock().map_err(|_| {
+        super::PeerSyncError::Storage("registered source lifecycle lock failed".to_owned())
+    })
+}
+
 trait RegistryAppRootResolver {
     fn resolve_registry_app_root(&self) -> Result<PathBuf, String>;
 }
@@ -75,8 +87,28 @@ pub fn peer_sync_incoming_sources(app: AppHandle) -> Result<Vec<IncomingSourceSu
 pub fn peer_sync_remove_incoming_source(app: AppHandle, device_id: String) -> Result<(), String> {
     finish_registry_command(
         "incoming source removal",
-        remove_incoming_source(&app_root(&app)?, &device_id),
+        remove_incoming_source_if_inactive(&app_root(&app)?, &device_id),
     )
+}
+
+pub(crate) fn remove_incoming_source_if_inactive(
+    app_root: &std::path::Path,
+    device_id: &str,
+) -> Result<(), super::PeerSyncError> {
+    let _lifecycle = lock_registered_source_lifecycle()?;
+    #[cfg(desktop)]
+    if super::commands::registered_clone_source_is_active(app_root, device_id)? {
+        return Err(super::PeerSyncError::Validation(
+            "registered clone source is used by an active target".to_owned(),
+        ));
+    }
+    #[cfg(target_os = "android")]
+    if super::android_client::registered_clone_source_is_active(app_root, device_id)? {
+        return Err(super::PeerSyncError::Validation(
+            "registered Android clone source is used by an active job".to_owned(),
+        ));
+    }
+    remove_incoming_source(app_root, device_id)
 }
 
 #[cfg(desktop)]

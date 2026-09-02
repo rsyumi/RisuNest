@@ -3,7 +3,8 @@ use super::android_client::{AndroidCloneJobPhase, AndroidCloneJobStatus};
 use super::{
     device_registry::{incoming_source_by_id, DevicePermissions, IncomingSource},
     lan::{
-        authenticated_peer_hello_status, AuthenticatedPeerHelloOutcome, PeerHello, PeerHelloLane,
+        authenticated_peer_hello_status, authenticated_peer_hello_with_capabilities,
+        AuthenticatedPeerHelloOutcome, PeerCompletionCapability, PeerHello, PeerHelloLane,
     },
     PeerSyncError,
 };
@@ -43,6 +44,7 @@ struct RegisteredSourceConnection {
     source: IncomingSource,
     lane: PeerHelloLane,
     hello: PeerHello,
+    completion: PeerCompletionCapability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -220,7 +222,24 @@ fn resolve_registered_source(
     device_id: &str,
     lane: RegisteredLane,
 ) -> Result<RegisteredSourceConnection, RegisteredTargetError> {
-    resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello_status)
+    let mut connection =
+        resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello_status)?;
+    if lane == RegisteredLane::Clone {
+        let observed = authenticated_peer_hello_with_capabilities(
+            &connection.source.endpoint,
+            &connection.source.bearer,
+        )
+        .map_err(|error| safe_failure("registered clone capabilities", error))?;
+        if observed.hello != connection.hello {
+            crate::nlog!(
+                "warn",
+                "registered clone capability hello changed its authenticated identity"
+            );
+            return Err(RegisteredTargetError::IdentityMismatch);
+        }
+        connection.completion = observed.completion;
+    }
+    Ok(connection)
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -328,6 +347,7 @@ pub async fn peer_clone_claim_registered_client(
                 &connection.lane.manifest_id,
                 &connection.source.device_id,
                 &connection.source.bearer,
+                connection.completion,
             )
             .map_err(|error| {
                 registered_target_operation_failure("registered clone target", error)
@@ -420,6 +440,7 @@ pub async fn peer_clone_claim_registered_client(
                 &local_device_id,
                 &connection.source.device_id,
                 &connection.source.bearer,
+                connection.completion,
             )
             .map_err(|error| {
                 registered_target_operation_failure("registered Android clone target", error)
@@ -613,6 +634,7 @@ fn resolve_registered_source_with(
         source,
         lane: descriptor,
         hello: current,
+        completion: PeerCompletionCapability::Unsupported,
     })
 }
 
@@ -1003,6 +1025,7 @@ mod tests {
     #[cfg(desktop)]
     fn registered_clone_primes_the_existing_target_runtime() {
         let root = tempfile::tempdir().unwrap();
+        register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
         let state = crate::peer_sync::commands::PeerCloneCommandState::default();
         let target = state
             .connect_registered_target(
@@ -1012,6 +1035,7 @@ mod tests {
                 MANIFEST_ID,
                 SOURCE_ID,
                 BEARER,
+                PeerCompletionCapability::Unsupported,
             )
             .unwrap();
         assert_eq!(target.source_device_id.as_deref(), Some(SOURCE_ID));
