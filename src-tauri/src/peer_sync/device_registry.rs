@@ -1223,6 +1223,31 @@ impl IncomingSourceRegistry {
         Ok(CompletionDeliveryFinalizeStatus::Finalized)
     }
 
+    pub(crate) fn abandon_completion_delivery(
+        &mut self,
+        delivery: &PendingCompletionDelivery,
+    ) -> Result<(), PeerSyncError> {
+        validate_pending_completion_delivery(delivery)?;
+        let Some(pending_index) = self
+            .pending_completion_deliveries
+            .iter()
+            .position(|pending| {
+                pending.source_device_id == delivery.source_device_id
+                    && pending.lane == delivery.lane
+            })
+        else {
+            return Ok(());
+        };
+        if &self.pending_completion_deliveries[pending_index] != delivery {
+            return invalid("pending incoming completion delivery does not match abandonment");
+        }
+        let mut pending = self.pending_completion_deliveries.clone();
+        pending.remove(pending_index);
+        self.write_state(&self.sources, &self.completed_receipts, &pending)?;
+        self.pending_completion_deliveries = pending;
+        Ok(())
+    }
+
     fn completion_is_durable(
         &self,
         delivery: &PendingCompletionDelivery,
@@ -1735,6 +1760,17 @@ pub(crate) fn finalize_incoming_completion_delivery(
         .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
     let mut registry = IncomingSourceRegistry::load(app_root)?;
     registry.finalize_completion_delivery(delivery, seen_at_ms)
+}
+
+pub(crate) fn abandon_incoming_completion_delivery(
+    app_root: &Path,
+    delivery: &PendingCompletionDelivery,
+) -> Result<(), PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    registry.abandon_completion_delivery(delivery)
 }
 
 pub(crate) fn incoming_completion_is_durable(
