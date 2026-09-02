@@ -50,5 +50,6 @@
     multiple={item.options?.multiple}
     disableable={item.options?.disableable}
     {customText}
+    ariaLabel={getLabel(item)}
     bind:value={localValue}
 />

@@ -12,6 +12,7 @@
     class:py-3={size === 'lg'}
     bind:value
     onchange={onchange}
+    aria-label={ariaLabel}
 >
     {@render children?.()}
 </select>
@@ -24,6 +25,7 @@
         onchange?: (event: Event & {
             currentTarget: EventTarget & HTMLSelectElement;
         }) => any;
+        ariaLabel?: string;
     }
 
     let {
@@ -31,7 +33,8 @@
         className = "",
         size = 'md',
         children,
-        onchange
+        onchange,
+        ariaLabel
     }: Props = $props();
 
 </script>

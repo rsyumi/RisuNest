@@ -57,14 +57,33 @@ describe('device settings', () => {
         expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
     })
 
-    it('keeps the configured build profile when no valid stored profile exists', async () => {
+    it.each([
+        ['absent', null],
+        ['invalid', '{not json'],
+    ])('applies the normalized default profile when storage is %s', async (_case, stored) => {
         vi.stubEnv('VITE_RUNTIME_PERFORMANCE_PROFILE', 'low-spec')
-        localStorage.setItem('risuNestDeviceSettings', '{not json')
+        if (stored !== null) localStorage.setItem('risuNestDeviceSettings', stored)
 
         await loadDeviceSettings()
         const { getRuntimePerformanceProfile } = await import('../runtimePerformanceProfile')
 
-        expect(getRuntimePerformanceProfile()).toBe('low-spec')
+        expect(getRuntimePerformanceProfile()).toBe('normal')
+    })
+
+    it('applies the initial profile once and skips runtime updates when the profile is unchanged', async () => {
+        vi.resetModules()
+        const runtimeProfile = await import('../runtimePerformanceProfile')
+        runtimeProfile.setRuntimePerformanceProfile('low-spec')
+        const setProfile = vi.spyOn(runtimeProfile, 'setRuntimePerformanceProfile')
+        const deviceSettings = await import('./deviceSettings')
+
+        expect(setProfile).toHaveBeenCalledOnce()
+        expect(setProfile).toHaveBeenCalledWith('normal')
+
+        setProfile.mockClear()
+        deviceSettings.updateDeviceSettings({ syncAutoListen: true })
+
+        expect(setProfile).not.toHaveBeenCalled()
     })
 
     it('guards storage read and write failures', async () => {

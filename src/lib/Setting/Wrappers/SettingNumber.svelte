@@ -40,5 +40,6 @@
     size="sm"
     min={item.options?.min}
     max={item.options?.max}
+    ariaLabel={getLabel(item)}
     bind:value={localValue}
 />

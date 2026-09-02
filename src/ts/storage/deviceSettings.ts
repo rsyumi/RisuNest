@@ -48,27 +48,21 @@ function isValidSettings(value: unknown): value is RisuNestDeviceSettings {
         && typeof settings.syncPublicBaseUrl === 'string'
 }
 
-function readSettings(): {
-    settings: RisuNestDeviceSettings
-    hasStoredProfile: boolean
-} {
+function readSettings(): RisuNestDeviceSettings {
     try {
         const stored = localStorage.getItem(storageKey)
-        if (!stored) return { settings: snapshot(defaults), hasStoredProfile: false }
+        if (!stored) return snapshot(defaults)
         const parsed: unknown = JSON.parse(stored)
         return isValidSettings(parsed)
-            ? { settings: snapshot(parsed), hasStoredProfile: true }
-            : { settings: snapshot(defaults), hasStoredProfile: false }
+            ? snapshot(parsed)
+            : snapshot(defaults)
     } catch {
-        return { settings: snapshot(defaults), hasStoredProfile: false }
+        return snapshot(defaults)
     }
 }
 
-const initialSettings = readSettings()
-let settings = initialSettings.settings
-if (initialSettings.hasStoredProfile) {
-    setRuntimePerformanceProfile(settings.performanceProfile)
-}
+let settings = readSettings()
+setRuntimePerformanceProfile(settings.performanceProfile)
 const listeners = new Set<(settings: RisuNestDeviceSettings) => void>()
 
 export function getDeviceSettings(): RisuNestDeviceSettings {
@@ -80,8 +74,11 @@ export function updateDeviceSettings(
 ): RisuNestDeviceSettings {
     const { schema: _schema, ...updates } = partial as Partial<RisuNestDeviceSettings>
     const next = { ...settings, ...updates }
+    const previousPerformanceProfile = settings.performanceProfile
     settings = isValidSettings(next) ? next : snapshot(defaults)
-    setRuntimePerformanceProfile(settings.performanceProfile)
+    if (settings.performanceProfile !== previousPerformanceProfile) {
+        setRuntimePerformanceProfile(settings.performanceProfile)
+    }
     try {
         localStorage.setItem(storageKey, JSON.stringify(settings))
     } catch {

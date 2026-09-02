@@ -48,12 +48,14 @@ describe('RisuNestPerformanceSettings', () => {
         expect(group).not.toBeNull()
         expect(standard?.getAttribute('aria-pressed')).toBe('true')
         expect(lowSpec?.getAttribute('aria-pressed')).toBe('false')
+        expect(deviceSettings.updateDeviceSettings).not.toHaveBeenCalled()
 
         lowSpec?.click()
         await tick()
 
         expect(standard?.getAttribute('aria-pressed')).toBe('false')
         expect(lowSpec?.getAttribute('aria-pressed')).toBe('true')
-        expect(deviceSettings.updateDeviceSettings).toHaveBeenLastCalledWith({ performanceProfile: 'low-spec' })
+        expect(deviceSettings.updateDeviceSettings).toHaveBeenCalledOnce()
+        expect(deviceSettings.updateDeviceSettings).toHaveBeenCalledWith({ performanceProfile: 'low-spec' })
     })
 })

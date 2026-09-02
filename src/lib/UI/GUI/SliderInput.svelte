@@ -30,6 +30,7 @@
     aria-valuemax={max}
     aria-valuenow={sliderValue}
     aria-valuetext={displayText}
+    aria-label={ariaLabel}
     class="relative w-full h-8 border-darkborderc border rounded-full cursor-pointer"
     class:rounded-l-none={disableable}
     style:background={
@@ -88,6 +89,7 @@
     disableable?: boolean;
     customText?: string|undefined;
     onchange?: Function;
+    ariaLabel?: string;
   }
 
   let {
@@ -100,7 +102,8 @@
     multiple = 1,
     disableable = false,
     customText = undefined,
-    onchange
+    onchange,
+    ariaLabel
   }: Props = $props();
 
   let isDisabledValue = $derived(value === -1000 || value === undefined);

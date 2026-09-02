@@ -47,7 +47,7 @@
     {getLabel(item)}
     {#if item.helpKey}<Help key={item.helpKey as any}/>{/if}
 </span>
-<SelectInput bind:value={localValue}>
+<SelectInput bind:value={localValue} ariaLabel={getLabel(item)}>
     {#each processedOptions as opt}
         <OptionInput value={opt.value}>
             {opt.labelKey ? (resolveLanguagePath(opt.labelKey) ?? opt.label) : opt.label}

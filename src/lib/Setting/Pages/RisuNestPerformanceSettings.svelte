@@ -10,11 +10,13 @@
 
     onDestroy(unsubscribe)
 
-    $effect(() => {
+    function selectProfile(nextProfile: typeof profile) {
+        if (nextProfile === profile) return
+        profile = nextProfile
         updateDeviceSettings({
-            performanceProfile: profile === 'low-spec' ? 'low-spec' : 'normal',
+            performanceProfile: nextProfile,
         })
-    })
+    }
 </script>
 
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.perf.title}</h2>
@@ -28,7 +30,7 @@
             type="button"
             aria-pressed={profile === option.value}
             class="rounded-md px-4 py-2 text-sm {profile === option.value ? 'bg-darkborderc text-textcolor' : 'text-textcolor2'}"
-            onclick={() => { profile = option.value as typeof profile }}
+            onclick={() => selectProfile(option.value as typeof profile)}
         >{option.label}</button>
     {/each}
 </div>

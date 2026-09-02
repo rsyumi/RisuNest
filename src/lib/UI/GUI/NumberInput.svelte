@@ -22,6 +22,7 @@
     bind:value
     onchange={onChange}
     placeholder={placeholder}
+    aria-label={ariaLabel}
 />
 
 <script lang="ts">
@@ -41,6 +42,7 @@
         className?: string;
         disabled?: boolean;
         placeholder?: string;
+        ariaLabel?: string;
     }
 
     let {
@@ -56,7 +58,8 @@
         onChange = () => {},
         className = '',
         disabled = false,
-        placeholder
+        placeholder,
+        ariaLabel
     }: Props = $props();
 </script>
 
