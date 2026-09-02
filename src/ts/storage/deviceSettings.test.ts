@@ -64,26 +64,83 @@ describe('device settings', () => {
         vi.stubEnv('VITE_RUNTIME_PERFORMANCE_PROFILE', 'low-spec')
         if (stored !== null) localStorage.setItem('risuNestDeviceSettings', stored)
 
-        await loadDeviceSettings()
+        const deviceSettings = await loadDeviceSettings()
+        deviceSettings.getDeviceSettings()
         const { getRuntimePerformanceProfile } = await import('../runtimePerformanceProfile')
 
         expect(getRuntimePerformanceProfile()).toBe('normal')
     })
 
-    it('applies the initial profile once and skips runtime updates when the profile is unchanged', async () => {
+    it('defers storage and runtime initialization until the first API use, then initializes once', async () => {
         vi.resetModules()
         const runtimeProfile = await import('../runtimePerformanceProfile')
         runtimeProfile.setRuntimePerformanceProfile('low-spec')
+        const getItem = vi.spyOn(localStorage, 'getItem')
         const setProfile = vi.spyOn(runtimeProfile, 'setRuntimePerformanceProfile')
         const deviceSettings = await import('./deviceSettings')
 
+        expect(getItem).not.toHaveBeenCalled()
+        expect(setProfile).not.toHaveBeenCalled()
+
+        expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
         expect(setProfile).toHaveBeenCalledOnce()
         expect(setProfile).toHaveBeenCalledWith('normal')
 
-        setProfile.mockClear()
+        deviceSettings.getDeviceSettings()
         deviceSettings.updateDeviceSettings({ syncAutoListen: true })
+        const unsubscribe = deviceSettings.subscribeDeviceSettings(vi.fn())
+        unsubscribe()
 
+        expect(getItem).toHaveBeenCalledOnce()
+        expect(setProfile).toHaveBeenCalledOnce()
+    })
+
+    it('loads persisted settings once when update is the first API use', async () => {
+        localStorage.setItem('risuNestDeviceSettings', JSON.stringify({
+            ...defaults,
+            performanceProfile: 'low-spec',
+        }))
+        vi.resetModules()
+        const runtimeProfile = await import('../runtimePerformanceProfile')
+        const getItem = vi.spyOn(localStorage, 'getItem')
+        const setProfile = vi.spyOn(runtimeProfile, 'setRuntimePerformanceProfile')
+        const deviceSettings = await import('./deviceSettings')
+
+        expect(getItem).not.toHaveBeenCalled()
         expect(setProfile).not.toHaveBeenCalled()
+
+        const updated = deviceSettings.updateDeviceSettings({ syncAutoListen: true })
+
+        expect(updated).toEqual({
+            ...defaults,
+            performanceProfile: 'low-spec',
+            syncAutoListen: true,
+        })
+        expect(getItem).toHaveBeenCalledOnce()
+        expect(setProfile).toHaveBeenCalledOnce()
+        expect(setProfile).toHaveBeenCalledWith('low-spec')
+    })
+
+    it('loads settings once when subscribe is the first API use', async () => {
+        vi.resetModules()
+        const runtimeProfile = await import('../runtimePerformanceProfile')
+        runtimeProfile.setRuntimePerformanceProfile('low-spec')
+        const getItem = vi.spyOn(localStorage, 'getItem')
+        const setProfile = vi.spyOn(runtimeProfile, 'setRuntimePerformanceProfile')
+        const deviceSettings = await import('./deviceSettings')
+
+        expect(getItem).not.toHaveBeenCalled()
+        expect(setProfile).not.toHaveBeenCalled()
+
+        const unsubscribeFirst = deviceSettings.subscribeDeviceSettings(vi.fn())
+        const unsubscribeSecond = deviceSettings.subscribeDeviceSettings(vi.fn())
+
+        expect(getItem).toHaveBeenCalledOnce()
+        expect(setProfile).toHaveBeenCalledOnce()
+        expect(setProfile).toHaveBeenCalledWith('normal')
+
+        unsubscribeFirst()
+        unsubscribeSecond()
     })
 
     it('guards storage read and write failures', async () => {
