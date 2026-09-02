@@ -524,19 +524,32 @@ impl OutgoingDeviceRegistry {
             .any(|offer| offer.device_id == device_id && offer.lane == lane.as_str()))
     }
 
-    pub(crate) fn completion_lease_is_current(
+    pub(crate) fn completion_lease_allows_remote_apply(
         &self,
         device_id: &str,
-        lane: CompletionLane,
         lease_id: &str,
+        manifest_id: &str,
     ) -> Result<bool, PeerSyncError> {
-        validate_id(device_id)?;
-        CompletionLeaseId::parse(lease_id)?;
-        Ok(self.completion_offers.iter().any(|offer| {
+        let lane = CompletionLane::Bidirectional;
+        validate_completion_tuple(device_id, lane, lease_id, manifest_id)?;
+        let Some(offer) = self.completion_offers.iter().find(|offer| {
             offer.device_id == device_id
                 && offer.lane == lane.as_str()
                 && offer.lease_id == lease_id
-        }))
+                && offer.manifest_id == manifest_id
+        }) else {
+            return Ok(false);
+        };
+        let completed = offer.transferred_bytes.is_some_and(|transferred_bytes| {
+            let receipt_id = completion_receipt_id(lane.as_str(), lease_id, &offer.manifest_id);
+            self.completed_receipts.iter().any(|receipt| {
+                receipt.device_id == device_id
+                    && receipt.lane == lane.as_str()
+                    && receipt.receipt_id == receipt_id
+                    && receipt.transferred_bytes == Some(transferred_bytes)
+            })
+        });
+        Ok(!completed)
     }
 
     pub(crate) fn seal_completion_lease(
@@ -1126,16 +1139,20 @@ pub(crate) fn outgoing_completion_offer_active(
     OutgoingDeviceRegistry::load(app_root)?.has_completion_lease(device_id, lane)
 }
 
-pub(crate) fn outgoing_completion_offer_is_current(
+pub(crate) fn outgoing_bidirectional_completion_lease_allows_remote_apply(
     app_root: &Path,
     device_id: &str,
-    lane: CompletionLane,
     lease_id: &str,
+    manifest_id: &str,
 ) -> Result<bool, PeerSyncError> {
     let _guard = outgoing_registry_lock()
         .lock()
         .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
-    OutgoingDeviceRegistry::load(app_root)?.completion_lease_is_current(device_id, lane, lease_id)
+    OutgoingDeviceRegistry::load(app_root)?.completion_lease_allows_remote_apply(
+        device_id,
+        lease_id,
+        manifest_id,
+    )
 }
 
 pub(crate) fn seal_outgoing_completion_lease(

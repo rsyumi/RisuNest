@@ -2,8 +2,8 @@ use super::{
     device_registry::{
         accept_outgoing_completion_offer, completion_receipt_id,
         issue_outgoing_measured_completion_offer, issue_outgoing_unmeasured_completion_offer,
-        load_or_create_device_id, outgoing_completion_offer_active,
-        outgoing_completion_offer_is_current, outgoing_device_is_registered,
+        load_or_create_device_id, outgoing_bidirectional_completion_lease_allows_remote_apply,
+        outgoing_completion_offer_active, outgoing_device_is_registered,
         record_outgoing_completed_operation, record_outgoing_seen, register_incoming_source,
         register_outgoing_claim, revoke_outgoing_device, seal_outgoing_completion_lease,
         CompletionAcceptance, CompletionLane, CompletionLeaseId, CompletionSealStatus,
@@ -2608,11 +2608,11 @@ fn bidirectional_remote_apply(
     let completion_deferred = request.completion_deferred_v1 == Some(true);
     if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
         let valid_completion_mode = if completion_deferred {
-            outgoing_completion_offer_is_current(
+            outgoing_bidirectional_completion_lease_allows_remote_apply(
                 &registration.app_root,
                 &device.device_id,
-                CompletionLane::Bidirectional,
                 &operation_id,
+                session.manifest_id(),
             )
         } else {
             outgoing_completion_offer_active(
@@ -5109,9 +5109,23 @@ mod timeout_tests {
         source_device_id: &str,
         control: Arc<BidirectionalControlFixture>,
     ) -> PreparedBidirectionalLogicalLanSession {
+        prepared_bidirectional_logical_session_with_generation(
+            session_id,
+            source_device_id,
+            "generation-1",
+            control,
+        )
+    }
+
+    fn prepared_bidirectional_logical_session_with_generation(
+        session_id: &str,
+        source_device_id: &str,
+        generation: &str,
+        control: Arc<BidirectionalControlFixture>,
+    ) -> PreparedBidirectionalLogicalLanSession {
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
-            generation: "generation-1".to_owned(),
+            generation: generation.to_owned(),
             generation_sequence: "1".to_owned(),
             parent_generation: Some("generation-0".to_owned()),
             source_revision: 1,
@@ -5702,17 +5716,21 @@ mod timeout_tests {
             .unwrap(),
             CompletionSealStatus::Sealed
         );
+        client.request_remote_apply(request.clone()).unwrap();
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
         assert_eq!(
             client
                 .deliver_completion(capability, completion_lease.as_str(), 17)
                 .unwrap(),
             PeerCompletionDelivery::Delivered
         );
+        assert!(client.request_remote_apply(request.clone()).is_err());
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
         let mut legacy = request;
         legacy.operation_id = "00000000-0000-4000-8000-000000000111".to_owned();
         legacy.completion_deferred_v1 = None;
         assert!(client.request_remote_apply(legacy).is_err());
-        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 2);
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
@@ -5721,6 +5739,101 @@ mod timeout_tests {
             17
         );
         host.stop().unwrap();
+    }
+
+    #[test]
+    fn bidirectional_deferred_lease_rejects_a_stale_manifest_before_remote_apply() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let first_control = Arc::new(BidirectionalControlFixture::default());
+        let mut first_host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000114",
+                &source_device_id,
+                first_control,
+            ));
+        first_host
+            .enable_v2_registry(
+                source_root.path(),
+                "Windows",
+                DevicePermissions::read_and_bidirectional(),
+            )
+            .unwrap();
+        let first_pairing = first_host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let first_endpoint = format!("http://{}", first_host.address().unwrap());
+        let first_client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &first_endpoint,
+            &first_pairing.session_id,
+            &first_pairing.manifest_id,
+            &first_pairing.claim,
+        )
+        .unwrap();
+        let stale_lease = first_client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        let target_device_id = first_client.inner.device_id.clone();
+        let bearer = first_client.inner.bearer.clone();
+        let stale_manifest_id = first_pairing.manifest_id;
+        first_host.stop().unwrap();
+
+        let restarted_control = Arc::new(BidirectionalControlFixture::default());
+        let mut restarted_host = LanCloneHost::prepare_bidirectional_logical(
+            prepared_bidirectional_logical_session_with_generation(
+                "00000000-0000-4000-8000-000000000115",
+                &source_device_id,
+                "generation-2",
+                Arc::clone(&restarted_control),
+            ),
+        );
+        restarted_host
+            .enable_v2_registry(
+                source_root.path(),
+                "Windows",
+                DevicePermissions::read_and_bidirectional(),
+            )
+            .unwrap();
+        let restarted_pairing = restarted_host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        assert_ne!(restarted_pairing.manifest_id, stale_manifest_id);
+        let restarted_endpoint = format!("http://{}", restarted_host.address().unwrap());
+        let restarted_client = LanBidirectionalLogicalClient::from_registered(
+            &restarted_endpoint,
+            &restarted_pairing.session_id,
+            &restarted_pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &bearer,
+        )
+        .unwrap();
+        let generation = LanBidirectionalGeneration {
+            generation_id: "generation-2".to_owned(),
+            manifest_hash: restarted_pairing.manifest_id.clone(),
+            generation_sequence: "1".to_owned(),
+        };
+        let request = LanBidirectionalRemoteApplyRequest {
+            operation_id: stale_lease.as_str().to_owned(),
+            source_endpoint: restarted_endpoint,
+            source_session_id: restarted_pairing.session_id,
+            source_manifest_id: restarted_pairing.manifest_id,
+            source_claim: restarted_pairing.claim,
+            expected_source_revision: 0,
+            expected_source_generation: generation.clone(),
+            expected_common_base_manifest_hash: generation.manifest_hash,
+            backup_losing_side: false,
+            completion_deferred_v1: Some(true),
+        };
+
+        assert!(restarted_client.request_remote_apply(request).is_err());
+        assert_eq!(*restarted_control.remote_apply_calls.lock().unwrap(), 0);
+        restarted_host.stop().unwrap();
     }
 
     #[test]
