@@ -43,7 +43,7 @@ export interface AndroidRegisteredCloneStatus {
     completedBytes: number
     totalBytes?: number
     committedRevision?: number
-    error?: string
+    error?: 'transferFailed'
 }
 
 export type AndroidPeerCloneStatus = AndroidPeerCloneTargetStatus | AndroidRegisteredCloneStatus
@@ -128,7 +128,12 @@ function safeRegisteredStatus(value: unknown): AndroidRegisteredCloneStatus {
         || !canonicalSourceDeviceUuid.test(source.sourceDeviceId)
         || (source.error !== undefined && source.error !== 'transferFailed')
     ) invalidStatus()
-    return { sourceDeviceId: source.sourceDeviceId, ...safeStatusFields(source) }
+    const { error, ...safeFields } = safeStatusFields(source)
+    return {
+        sourceDeviceId: source.sourceDeviceId,
+        ...safeFields,
+        ...(error === 'transferFailed' ? { error } : {}),
+    }
 }
 
 function safeDirectStatus(value: unknown): AndroidPeerCloneTargetStatus {

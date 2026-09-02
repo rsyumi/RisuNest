@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 
 import {
     createAndroidPeerCloneFacade,
@@ -6,6 +6,7 @@ import {
     type AndroidPeerCloneBridge,
     type AndroidPeerCloneInvoke,
     type AndroidPeerCloneReplacementRuntime,
+    type AndroidRegisteredCloneStatus,
 } from './peerCloneAndroid'
 import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
 
@@ -32,6 +33,11 @@ function bridge(mode: 'foreground' | 'uidt' = 'uidt') {
 }
 
 describe('Android peer clone facade', () => {
+    it('exposes only the safe registered failure category', () => {
+        expectTypeOf<AndroidRegisteredCloneStatus['error']>()
+            .toEqualTypeOf<'transferFailed' | undefined>()
+    })
+
     it('caches one module-level facade so retained recovery fences survive settings remounts', () => {
         const first = getAndroidPeerCloneFacade(runtime().replacement)
         const second = getAndroidPeerCloneFacade(runtime().replacement)
@@ -172,22 +178,26 @@ describe('Android peer clone facade', () => {
         await expect(facade.recover()).resolves.toEqual(registeredStatus)
     })
 
-    it('rejects a raw registered error before secret details cross IPC', async () => {
-        const secret = 'Bearer raw-secret-token'
+    it.each([
+        ['raw bearer', 'Bearer raw-secret-token'],
+        ['safe-category near miss', 'transferFailed '],
+        ['diagnostic detail', 'connection refused at 192.168.1.4'],
+        ['endpoint detail', 'http://192.168.1.4:43123/'],
+    ])('rejects registered %s before details cross IPC', async (_label, errorDetail) => {
         const facade = createAndroidPeerCloneFacade({
             invoke: vi.fn(async <T>() => ({
                 sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                 jobId: '11111111-1111-4111-8111-111111111111',
                 phase: 'failed',
                 completedBytes: 12,
-                error: secret,
+                error: errorDetail,
             }) as T) as unknown as AndroidPeerCloneInvoke,
             bridge: bridge(),
             runtime: runtime().replacement,
         })
 
         await expect(facade.recover()).rejects.toThrow('invalid Android peer clone status')
-        expect(JSON.stringify(facade.getState())).not.toContain(secret)
+        expect(JSON.stringify(facade.getState())).not.toContain(errorDetail)
     })
 
     it('accepts a canonical non-v4 registered source identity', async () => {
@@ -211,6 +221,21 @@ describe('Android peer clone facade', () => {
             invoke: vi.fn(async <T>() => ({
                 sourceDeviceId: '01890f3e-9b4a-7cc2-98c8-4d3f9b6a2e1',
                 jobId: '11111111-1111-4111-8111-111111111111',
+                phase: 'ready',
+                completedBytes: 0,
+            }) as T) as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        await expect(facade.recover()).rejects.toThrow('invalid Android peer clone status')
+    })
+
+    it('rejects a non-v4 registered job identity', async () => {
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn(async <T>() => ({
+                sourceDeviceId: '01890f3e-9b4a-7cc2-98c8-4d3f9b6a2e11',
+                jobId: '01890f3e-9b4a-7cc2-98c8-4d3f9b6a2e11',
                 phase: 'ready',
                 completedBytes: 0,
             }) as T) as unknown as AndroidPeerCloneInvoke,
