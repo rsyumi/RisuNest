@@ -1,15 +1,16 @@
 use super::delta_completion::{
-    complete_delta_accounting, recover_delta_completion, unlink_canonical_with_sync,
-    DeltaCommitWitness, DeltaCompletionContext, DeltaCompletionMode, DeltaCompletionTransport,
-    PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
+    complete_delta_accounting, recover_delta_completion, registered_delta_source_is_active,
+    unlink_canonical_with_sync, DeltaCommitWitness, DeltaCompletionContext, DeltaCompletionMode,
+    DeltaCompletionTransport, PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
 };
 use super::device_registry::{
-    completion_receipt_id, record_incoming_completed_operation_once_for_lane, CompletionLane,
-    DevicePermissions, IncomingSource, IncomingSourceRegistry, PendingCompletionDelivery,
+    completion_receipt_id, record_incoming_completed_operation_once_for_lane,
+    snapshot_incoming_completion_delivery, CompletionLane, DevicePermissions, IncomingSource,
+    IncomingSourceRegistry, PendingCompletionDelivery,
 };
 use crate::{
     asset_repository::{
-        job_pins::{CasJobKind, DurableCasJob},
+        job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
         PayloadCas,
     },
     persistent_store::{
@@ -125,6 +126,23 @@ fn delta_completion_journal_is_single_flight_and_source_prepare_is_retryable() {
     journal.remove_exact(&first).unwrap();
     journal.remove_exact(&first).unwrap();
     assert_eq!(journal.load().unwrap(), None);
+}
+
+#[test]
+fn registered_delta_source_activity_is_scoped_to_the_retained_journal_source() {
+    let root = tempfile::tempdir().unwrap();
+    let operation = context(OPERATION_ID);
+
+    assert!(!registered_delta_source_is_active(root.path(), SOURCE_ID).unwrap());
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    assert!(registered_delta_source_is_active(root.path(), SOURCE_ID).unwrap());
+    assert!(!registered_delta_source_is_active(
+        root.path(),
+        "00000000-0000-4000-8000-000000000094",
+    )
+    .unwrap());
 }
 
 #[test]
@@ -262,6 +280,11 @@ fn v1_completion_overflow_retains_source_proof_and_pending_outbox() {
     ));
     let registry = IncomingSourceRegistry::load(root.path()).unwrap();
     assert_eq!(registry.sources()[0].total_bytes, u64::MAX);
+    let pending =
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta)
+            .unwrap()
+            .unwrap();
+    assert_eq!(pending.delivery.useful_bytes, 1);
 }
 
 #[test]
@@ -329,6 +352,7 @@ fn unsupported_completion_rejects_a_same_receipt_with_different_bytes() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
+    let before = std::fs::read(root.path().join("peer-sync/sources.json")).unwrap();
     let mut transport = FixtureTransport {
         root: root.path().to_owned(),
         prepared_bytes: 99,
@@ -338,6 +362,10 @@ fn unsupported_completion_rejects_a_same_receipt_with_different_bytes() {
     };
 
     assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        before
+    );
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
         15
@@ -392,6 +420,51 @@ fn recovery_clears_uncommitted_intent_without_counting() {
         .unwrap()
         .is_none());
     assert!(DurableCasJob::open(root.path(), &operation.durable_job_id).is_err());
+}
+
+#[test]
+fn uncommitted_recovery_rejects_a_released_unsealed_job_without_counting() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    let mut operation = context(OPERATION_ID);
+    operation.pre_revision = 0;
+    operation.pre_common_base = None;
+    operation.post_revision = 1;
+    let mut job = DurableCasJob::begin(
+        root.path(),
+        &operation.durable_job_id,
+        CasJobKind::LogicalDeltaTarget,
+        1,
+    )
+    .unwrap();
+    job.leave_release_record_for_cleanup_retry(CasReleaseOutcome::Aborted)
+        .unwrap();
+    drop(job);
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let mut transport = FixtureTransport {
+        root: root.path().to_owned(),
+        prepared_bytes: 17,
+        expected_before_delivery: 5,
+        prepares: 0,
+        deliveries: 0,
+    };
+
+    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        5
+    );
+    assert!(PeerDeltaCompletionJournal::new(root.path())
+        .load()
+        .unwrap()
+        .is_some());
+    let retained = DurableCasJob::open(root.path(), &operation.durable_job_id).unwrap();
+    assert!(!retained.is_sealed());
+    assert!(retained.is_released());
 }
 
 fn committed_context(root: &Path) -> (PersistentStore, PayloadCas, DeltaCompletionContext) {
@@ -471,10 +544,77 @@ fn committed_recovery_counts_then_releases_job_and_journal_once() {
 }
 
 #[test]
+fn committed_recovery_rejects_a_released_job_until_exact_accounting_is_durable() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let (mut store, _cas, operation) = committed_context(root.path());
+    let mut job = DurableCasJob::begin(
+        root.path(),
+        &operation.durable_job_id,
+        CasJobKind::LogicalDeltaTarget,
+        1,
+    )
+    .unwrap();
+    job.seal(&mut store, 1).unwrap();
+    job.leave_release_record_for_cleanup_retry(CasReleaseOutcome::Committed)
+        .unwrap();
+    drop(job);
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let mut transport = FixtureTransport {
+        root: root.path().to_owned(),
+        prepared_bytes: 99,
+        expected_before_delivery: 5,
+        prepares: 0,
+        deliveries: 0,
+    };
+
+    assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
+    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        5
+    );
+    assert!(PeerDeltaCompletionJournal::new(root.path())
+        .load()
+        .unwrap()
+        .is_some());
+    let retained = DurableCasJob::open(root.path(), &operation.durable_job_id).unwrap();
+    assert!(retained.is_sealed());
+    assert!(retained.is_released());
+
+    let receipt_id = completion_receipt_id(
+        CompletionLane::Delta.as_str(),
+        &operation.operation_id,
+        &operation.manifest_id,
+    );
+    record_incoming_completed_operation_once_for_lane(
+        root.path(),
+        SOURCE_ID,
+        CompletionLane::Delta,
+        &receipt_id,
+        operation.transferred_bytes,
+    )
+    .unwrap();
+    assert!(
+        recover_delta_completion(&mut store, root.path(), &mut transport)
+            .unwrap()
+            .is_some()
+    );
+    assert!(PeerDeltaCompletionJournal::new(root.path())
+        .load()
+        .unwrap()
+        .is_none());
+    assert!(DurableCasJob::open(root.path(), &operation.durable_job_id).is_err());
+}
+
+#[test]
 fn committed_recovery_overflow_retains_job_and_journal_without_success() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), u64::MAX);
-    let (mut store, _cas, operation) = committed_context(root.path());
+    let (mut store, _cas, mut operation) = committed_context(root.path());
+    operation.mode = DeltaCompletionMode::CompletionV1;
     let mut job = DurableCasJob::begin(
         root.path(),
         &operation.durable_job_id,
@@ -487,6 +627,9 @@ fn committed_recovery_overflow_retains_job_and_journal_without_success() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_source_prepared(&operation, 1)
+        .unwrap();
     let mut transport = FixtureTransport {
         root: root.path().to_owned(),
         prepared_bytes: 99,
@@ -496,15 +639,23 @@ fn committed_recovery_overflow_retains_job_and_journal_without_success() {
     };
 
     assert!(recover_delta_completion(&mut store, root.path(), &mut transport).is_err());
-    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
+    assert_eq!((transport.prepares, transport.deliveries), (0, 1));
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
         u64::MAX
     );
-    assert!(PeerDeltaCompletionJournal::new(root.path())
-        .load()
-        .unwrap()
-        .is_some());
+    assert!(matches!(
+        PeerDeltaCompletionJournal::new(root.path()).load().unwrap(),
+        Some(PeerDeltaDurableCompletion::SourcePrepared {
+            useful_bytes: 1,
+            ..
+        })
+    ));
+    let pending =
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta)
+            .unwrap()
+            .unwrap();
+    assert_eq!(pending.delivery.useful_bytes, 1);
     let retained = DurableCasJob::open(root.path(), &operation.durable_job_id).unwrap();
     assert!(retained.is_sealed());
     assert!(!retained.is_released());

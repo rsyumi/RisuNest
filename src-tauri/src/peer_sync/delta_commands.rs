@@ -18,7 +18,7 @@ use super::target_foreground_transition::{
 use super::{
     delta_completion::{
         recover_delta_completion, DeltaCompletionContext, DeltaCompletionMode,
-        LanDeltaCompletionTransport, RecoveredDeltaCompletion,
+        LanDeltaCompletionTransport, PeerDeltaCompletionJournal, RecoveredDeltaCompletion,
     },
     lan::{
         LanCloneHostControl, LanLogicalDeltaClient, PeerCompletionCapability,
@@ -1108,6 +1108,7 @@ pub enum PeerDeltaPullResult {
 struct DeltaCompletionAttempt {
     operation_id: String,
     mode: DeltaCompletionMode,
+    source_bearer: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1136,6 +1137,27 @@ fn delta_completion_context(
         transferred_objects,
         transferred_bytes,
     }
+}
+
+fn publish_delta_activation_intent(
+    app_root: &Path,
+    context: &DeltaCompletionContext,
+    expected_source_bearer: &str,
+    intent_written: &Cell<bool>,
+) -> Result<(), PeerSyncError> {
+    intent_written.set(true);
+    let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
+    let source =
+        super::device_registry::incoming_source_by_id(app_root, &context.source_device_id)?
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered incoming source is missing".to_owned())
+            })?;
+    if source.bearer != expected_source_bearer || !source.permissions.allows_read() {
+        return Err(PeerSyncError::Validation(
+            "registered delta source credential or permission changed".to_owned(),
+        ));
+    }
+    PeerDeltaCompletionJournal::new(app_root).store_activation_intent(context)
 }
 
 fn selection_totals(
@@ -1375,11 +1397,13 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
                 if cancellation.is_cancelled() {
                     return Err(PeerSyncError::Cancelled);
                 }
-                if let Some(context) = bootstrap_context.as_ref() {
-                    super::device_registry::store_delta_completion_activation_intent(
-                        app_root, context,
+                if let (Some(context), Some(attempt)) = (bootstrap_context.as_ref(), completion) {
+                    publish_delta_activation_intent(
+                        app_root,
+                        context,
+                        &attempt.source_bearer,
+                        &intent_written,
                     )?;
-                    intent_written.set(true);
                 }
                 Ok(())
             },
@@ -1437,10 +1461,12 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
                     transferred_objects,
                     transferred_bytes,
                 );
-                super::device_registry::store_delta_completion_activation_intent(
-                    app_root, &context,
+                publish_delta_activation_intent(
+                    app_root,
+                    &context,
+                    &attempt.source_bearer,
+                    &intent_written,
                 )?;
-                intent_written.set(true);
             }
             Ok(())
         },
@@ -2004,15 +2030,20 @@ fn fetch_delta_manifest_and_completion(
             "registered delta source identity or permission changed".to_owned(),
         ));
     }
+    let source_bearer = client.registered_source_bearer().ok_or_else(|| {
+        PeerSyncError::Protocol("registered delta source credential is missing".to_owned())
+    })?;
     let manifest = client.fetch_manifest_with_completion_lease(None)?;
     let attempt = match (observed.completion, manifest.completion_lease_id) {
         (PeerCompletionCapability::V1, Some(lease)) => DeltaCompletionAttempt {
             operation_id: lease.as_str().to_owned(),
             mode: DeltaCompletionMode::CompletionV1,
+            source_bearer: source_bearer.to_owned(),
         },
         (PeerCompletionCapability::Unsupported, None) => DeltaCompletionAttempt {
             operation_id: uuid::Uuid::new_v4().to_string(),
             mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: source_bearer.to_owned(),
         },
         _ => {
             return Err(PeerSyncError::Protocol(
@@ -2237,8 +2268,9 @@ mod tests {
         local_backup::AtomicCancellation,
         peer_sync::{
             delta_completion::{
-                recover_delta_completion, DeltaCompletionContext, DeltaCompletionTransport,
-                PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
+                fail_next_delta_completion_store_after_replace, recover_delta_completion,
+                DeltaCompletionContext, DeltaCompletionTransport, PeerDeltaCompletionJournal,
+                PeerDeltaDurableCompletion,
             },
             device_registry::{DevicePermissions, IncomingSource, IncomingSourceRegistry},
             logical_delta::{
@@ -3415,6 +3447,56 @@ mod tests {
     }
 
     #[test]
+    fn activation_intent_revalidates_the_registered_source_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        register_accounting_source(directory.path(), 40, 7);
+        let attempt = DeltaCompletionAttempt {
+            operation_id: "00000000-0000-4000-8000-000000000027".to_owned(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: "b".repeat(64),
+        };
+        let context = delta_completion_context(
+            &attempt,
+            ACCOUNTING_SOURCE_ID,
+            &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
+            &"b".repeat(64),
+            0,
+            None,
+            1,
+            SyncGenerationIdentity {
+                generation_id: "remote".to_owned(),
+                manifest_hash: "b".repeat(64),
+                generation_sequence: "1".to_owned(),
+            },
+            1,
+            17,
+        );
+        let intent_written = Cell::new(false);
+        let before = fs::read(directory.path().join("peer-sync/sources.json")).unwrap();
+
+        let error = publish_delta_activation_intent(
+            directory.path(),
+            &context,
+            &attempt.source_bearer,
+            &intent_written,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("credential or permission changed"));
+        assert!(intent_written.get());
+        assert_eq!(
+            fs::read(directory.path().join("peer-sync/sources.json")).unwrap(),
+            before
+        );
+        assert!(PeerDeltaCompletionJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn generic_bootstrap_error_releases_its_sealed_durable_roots() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -3619,6 +3701,7 @@ mod tests {
         let conflict = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000023".to_owned(),
             mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: "a".repeat(64),
         };
 
         assert_eq!(
@@ -3644,6 +3727,7 @@ mod tests {
         let full_clone = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000024".to_owned(),
             mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: "a".repeat(64),
         };
         assert_eq!(
             pull_logical_delta_with_completion(
@@ -3765,6 +3849,7 @@ mod tests {
         let attempt = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000025".to_owned(),
             mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: "a".repeat(64),
         };
 
         let result = pull_logical_delta_with_completion(
@@ -3813,6 +3898,93 @@ mod tests {
             .load()
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn visible_journal_publication_error_retains_the_sealed_target_job() {
+        let directory = tempfile::tempdir().unwrap();
+        register_accounting_source(directory.path(), 40, 7);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        pull_logical_delta(
+            &mut store,
+            &cas,
+            directory.path(),
+            ACCOUNTING_SOURCE_ID,
+            0,
+            &local.manifest_bytes,
+            &mut empty_source(),
+        )
+        .unwrap();
+        let remote = remote_root_manifest(
+            &local.manifest,
+            "registered-publication-failure",
+            json!({"side":"remote"}),
+        );
+        let mut source = FixtureSource {
+            objects: remote
+                .record_objects
+                .iter()
+                .map(|record| (record.object.hash.clone(), record.object.bytes.clone()))
+                .collect(),
+            reads: 0,
+        };
+        let attempt = DeltaCompletionAttempt {
+            operation_id: "00000000-0000-4000-8000-000000000026".to_owned(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: "a".repeat(64),
+        };
+        fail_next_delta_completion_store_after_replace(directory.path());
+
+        let error = pull_logical_delta_with_completion(
+            &mut store,
+            &cas,
+            directory.path(),
+            ACCOUNTING_SOURCE_ID,
+            0,
+            &remote.manifest_bytes,
+            &mut source,
+            &NeverCancelled,
+            Some(&attempt),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected journal publication failure"));
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(accounting_source(directory.path()).total_bytes, 40);
+        assert!(matches!(
+            PeerDeltaCompletionJournal::new(directory.path())
+                .load()
+                .unwrap(),
+            Some(PeerDeltaDurableCompletion::ActivationIntent { .. })
+        ));
+        let retained = DurableCasJob::open(
+            directory.path(),
+            &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
+        )
+        .unwrap();
+        assert!(retained.is_sealed());
+        assert!(!retained.is_released());
+
+        assert!(
+            recover_delta_completion(&mut store, directory.path(), &mut NoCompletionTransport,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(PeerDeltaCompletionJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert!(DurableCasJob::open(
+            directory.path(),
+            &format!("{P4_DELTA_TARGET_JOB_PREFIX}{}", attempt.operation_id),
+        )
+        .is_err());
     }
 
     #[test]

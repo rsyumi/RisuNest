@@ -1007,6 +1007,13 @@ impl IncomingSourceRegistry {
         let retained = receipts
             .iter_mut()
             .find(|receipt| receipt.device_id == source_id && receipt.lane == lane);
+        if lane == CompletionLane::Delta.as_str()
+            && retained.as_ref().is_some_and(|receipt| {
+                receipt.receipt_id == receipt_id && receipt.transferred_bytes != Some(bytes)
+            })
+        {
+            return invalid("delta completion receipt byte count conflicts");
+        }
         if !retained
             .as_ref()
             .is_some_and(|receipt| receipt.receipt_id == receipt_id)
@@ -1313,44 +1320,7 @@ pub(crate) fn register_incoming_source(
     app_root: &Path,
     source: IncomingSource,
 ) -> Result<(), PeerSyncError> {
-    let _guard = incoming_registry_lock()
-        .lock()
-        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
-    let mut registry = IncomingSourceRegistry::load(app_root)?;
-    let bearer_changes = registry
-        .sources()
-        .iter()
-        .any(|existing| existing.device_id == source.device_id && existing.bearer != source.bearer);
-    if bearer_changes
-        && super::delta_completion::PeerDeltaCompletionJournal::new(app_root)
-            .references_source(&source.device_id)?
-    {
-        return invalid(
-            "incoming source credential cannot rotate while delta completion is retained",
-        );
-    }
-    registry.upsert(source)?;
-    registry.save()
-}
-
-pub(crate) fn store_delta_completion_activation_intent(
-    app_root: &Path,
-    context: &super::delta_completion::DeltaCompletionContext,
-) -> Result<(), PeerSyncError> {
-    validate_id(&context.source_device_id)?;
-    let _guard = incoming_registry_lock()
-        .lock()
-        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
-    let registry = IncomingSourceRegistry::load(app_root)?;
-    if !registry
-        .sources()
-        .iter()
-        .any(|source| source.device_id == context.source_device_id)
-    {
-        return invalid("registered incoming source is missing");
-    }
-    super::delta_completion::PeerDeltaCompletionJournal::new(app_root)
-        .store_activation_intent(context)
+    with_incoming_registry(app_root, |registry| registry.upsert(source))
 }
 
 pub(crate) fn outgoing_device_is_registered(
@@ -1424,11 +1394,6 @@ pub(crate) fn remove_incoming_source(
                 "incoming source is used by the active Android clone job".to_owned(),
             ));
         }
-    }
-    if super::delta_completion::PeerDeltaCompletionJournal::new(app_root)
-        .references_source(device_id)?
-    {
-        return invalid("incoming source is used by a retained delta completion");
     }
     let mut registry = IncomingSourceRegistry::load(app_root)?;
     registry.remove(device_id)?;

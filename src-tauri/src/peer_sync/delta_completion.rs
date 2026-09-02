@@ -17,6 +17,8 @@ use crate::{
     trust_boundary::{is_link_like, is_lower_hex_256, sync_directory},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -33,6 +35,36 @@ const P4_DELTA_TARGET_JOB_PREFIX: &str = "p4-delta-target-";
 fn journal_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+fn journal_store_failures() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_delta_completion_store_after_replace(app_root: &Path) {
+    journal_store_failures()
+        .lock()
+        .expect("delta completion test failure lock")
+        .insert(PeerDeltaCompletionJournal::new(app_root).path());
+}
+
+#[cfg(test)]
+fn fail_store_after_replace_if_requested(path: &Path) -> Result<(), PeerSyncError> {
+    if journal_store_failures()
+        .lock()
+        .map_err(|_| {
+            PeerSyncError::Storage("delta completion test failure lock failed".to_owned())
+        })?
+        .remove(path)
+    {
+        return Err(PeerSyncError::Storage(
+            "injected journal publication failure".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -369,7 +401,10 @@ impl PeerDeltaCompletionJournal {
             file.flush()?;
             file.sync_all()?;
             drop(file);
-            replace_file_atomic(&temporary, &path)
+            replace_file_atomic(&temporary, &path)?;
+            #[cfg(test)]
+            fail_store_after_replace_if_requested(&path)?;
+            Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(temporary);
@@ -590,7 +625,7 @@ pub(crate) fn recover_delta_completion(
         DeltaCommitWitness::Committed => {
             let already_durable = delta_accounting_is_durable(app_root, &operation)?;
             let job = match DurableCasJob::open(app_root, &context.durable_job_id) {
-                Ok(job) => Some(validate_job(job)?),
+                Ok(job) => Some(validate_committed_job(job, already_durable)?),
                 Err(error) if error.kind() == io::ErrorKind::NotFound && already_durable => None,
                 Err(error) => return Err(error.into()),
             };
@@ -615,14 +650,38 @@ fn open_required_job(
     app_root: &Path,
     context: &DeltaCompletionContext,
 ) -> Result<DurableCasJob, PeerSyncError> {
-    validate_job(DurableCasJob::open(app_root, &context.durable_job_id)?)
+    validate_active_job(DurableCasJob::open(app_root, &context.durable_job_id)?)
 }
 
-fn validate_job(job: DurableCasJob) -> Result<DurableCasJob, PeerSyncError> {
-    if job.kind() != CasJobKind::LogicalDeltaTarget || (!job.is_sealed() && !job.is_released()) {
+fn validate_active_job(job: DurableCasJob) -> Result<DurableCasJob, PeerSyncError> {
+    validate_job_state(&job, false)?;
+    Ok(job)
+}
+
+fn validate_committed_job(
+    job: DurableCasJob,
+    accounting_is_durable: bool,
+) -> Result<DurableCasJob, PeerSyncError> {
+    validate_job_state(&job, accounting_is_durable)?;
+    Ok(job)
+}
+
+fn validate_job_state(job: &DurableCasJob, allow_released: bool) -> Result<(), PeerSyncError> {
+    if job.kind() != CasJobKind::LogicalDeltaTarget
+        || !job.is_sealed()
+        || (job.is_released() && !allow_released)
+    {
         return invalid("delta completion CAS job is not an exact sealed target job");
     }
-    Ok(job)
+    Ok(())
+}
+
+pub(crate) fn registered_delta_source_is_active(
+    app_root: &Path,
+    source_device_id: &str,
+) -> Result<bool, PeerSyncError> {
+    validate_uuid(source_device_id, "delta completion source")?;
+    PeerDeltaCompletionJournal::new(app_root).references_source(source_device_id)
 }
 
 fn operation_useful_bytes(operation: &PeerDeltaDurableCompletion) -> u64 {

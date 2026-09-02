@@ -8591,6 +8591,10 @@ impl LanLogicalDeltaClient {
         &self.source_device_id
     }
 
+    pub(crate) fn registered_source_bearer(&self) -> Option<&str> {
+        self.registered_v2.then_some(self.bearer.as_str())
+    }
+
     pub(crate) fn is_v2_registered(&self) -> bool {
         self.registered_v2
     }

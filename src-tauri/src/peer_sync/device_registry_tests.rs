@@ -1,4 +1,3 @@
-use super::delta_completion::{DeltaCompletionContext, DeltaCompletionMode};
 use super::device_registry::{
     accept_outgoing_completion_offer, finalize_incoming_completion_delivery,
     incoming_completed_operation_recorded_for_lane,
@@ -8,13 +7,11 @@ use super::device_registry::{
     record_incoming_completed_operation, record_incoming_completed_operation_best_effort,
     record_incoming_completed_operation_once_for_lane, register_incoming_source,
     register_outgoing_claim, remove_incoming_source, revoke_outgoing_device,
-    seal_outgoing_completion_lease, snapshot_incoming_completion_delivery,
-    store_delta_completion_activation_intent, CompletionAcceptance,
+    seal_outgoing_completion_lease, snapshot_incoming_completion_delivery, CompletionAcceptance,
     CompletionDeliveryFinalizeStatus, CompletionDeliveryPrepareStatus, CompletionLane,
     CompletionSealStatus, DevicePermissions, IncomingSource, IncomingSourceRegistry,
     OutgoingDevice, OutgoingDeviceRegistry, PendingCompletionDelivery,
 };
-use crate::persistent_store::SyncGenerationIdentity;
 use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -59,85 +56,6 @@ fn register_test_source(root: &std::path::Path, bearer: char, total_bytes: u64) 
         },
     )
     .unwrap();
-}
-
-fn delta_completion_context() -> DeltaCompletionContext {
-    let operation_id = "00000000-0000-4000-8000-000000000091";
-    DeltaCompletionContext {
-        operation_id: operation_id.to_owned(),
-        source_device_id: SOURCE_ID.to_owned(),
-        manifest_id: "b".repeat(64),
-        mode: DeltaCompletionMode::CompletionV1,
-        durable_job_id: format!("p4-delta-target-{operation_id}"),
-        pre_revision: 4,
-        pre_common_base: Some(SyncGenerationIdentity {
-            generation_id: "base".to_owned(),
-            manifest_hash: "a".repeat(64),
-            generation_sequence: "1".to_owned(),
-        }),
-        post_revision: 5,
-        post_common_base: SyncGenerationIdentity {
-            generation_id: "remote".to_owned(),
-            manifest_hash: "b".repeat(64),
-            generation_sequence: "2".to_owned(),
-        },
-        transferred_objects: 1,
-        transferred_bytes: 17,
-    }
-}
-
-#[test]
-fn delta_completion_intent_retains_registered_source_and_credential() {
-    let root = tempfile::tempdir().unwrap();
-    register_test_source(root.path(), 'c', 0);
-    store_delta_completion_activation_intent(root.path(), &delta_completion_context()).unwrap();
-    let before = fs::read(root.path().join("peer-sync/sources.json")).unwrap();
-
-    assert!(remove_incoming_source(root.path(), SOURCE_ID).is_err());
-    assert!(register_incoming_source(
-        root.path(),
-        IncomingSource {
-            device_id: SOURCE_ID.into(),
-            name: "Rotated".into(),
-            endpoint: "http://192.168.0.9:32145".into(),
-            bearer: "d".repeat(64),
-            permissions: DevicePermissions::read(),
-            last_seen_ms: 99,
-            total_bytes: 0,
-        },
-    )
-    .is_err());
-    assert_eq!(
-        fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
-        before
-    );
-
-    register_incoming_source(
-        root.path(),
-        IncomingSource {
-            device_id: SOURCE_ID.into(),
-            name: "Same credential".into(),
-            endpoint: "http://192.168.0.9:32145".into(),
-            bearer: "c".repeat(64),
-            permissions: DevicePermissions::read(),
-            last_seen_ms: 99,
-            total_bytes: 0,
-        },
-    )
-    .unwrap();
-}
-
-#[test]
-fn delta_completion_intent_requires_the_registered_source() {
-    let root = tempfile::tempdir().unwrap();
-
-    assert!(
-        store_delta_completion_activation_intent(root.path(), &delta_completion_context()).is_err()
-    );
-    assert!(!root
-        .path()
-        .join("peer-delta/completion-operation.json")
-        .exists());
 }
 
 #[test]
