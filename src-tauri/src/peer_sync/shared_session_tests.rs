@@ -5,10 +5,10 @@ use super::{
     },
     device_registry::{DevicePermissions, OutgoingDeviceRegistry},
     shared_session::{
-        AndroidDeviceSyncHost, AndroidDeviceSyncSourceState, DeviceSyncLinkPermissions,
-        DeviceSyncListenMethod, DeviceSyncPrepareRequest, DeviceSyncSourcePhase, SharedPairingData,
-        SharedSessionLifecycle, SharedSessionPhase, SharedSourceLane, SharedSourceOwnership,
-        SharedSourcePreparation,
+        reserve_device_sync_source, AndroidDeviceSyncHost, AndroidDeviceSyncSourceState,
+        DeviceSyncLinkPermissions, DeviceSyncListenMethod, DeviceSyncPrepareRequest,
+        DeviceSyncSourcePhase, SharedPairingData, SharedSessionLifecycle, SharedSessionPhase,
+        SharedSourceLane, SharedSourceOwnership, SharedSourcePreparation,
     },
     PeerSyncError,
 };
@@ -69,6 +69,31 @@ struct AndroidHostEvents {
 
 struct AndroidHostFixture {
     events: Arc<Mutex<AndroidHostEvents>>,
+}
+
+#[test]
+fn android_source_reserve_logs_the_underlying_failure_and_preserves_its_string_contract() {
+    let _guard = test_registry_guard();
+    let occupied = android_foreground_registry()
+        .reserve(AndroidForegroundLane::P1Source)
+        .unwrap();
+
+    let error = reserve_device_sync_source().unwrap_err();
+
+    assert_eq!(error, "Android foreground service is already reserved");
+    let entry = crate::native_log::global_state()
+        .tail(None)
+        .into_iter()
+        .rev()
+        .find(|entry| {
+            entry.target.ends_with("peer_sync::shared_session")
+                && entry.message.contains("device sync source reserve failed")
+        })
+        .expect("Android source reservation failure log");
+    assert!(entry
+        .message
+        .contains("Android foreground service is already reserved"));
+    assert!(android_foreground_registry().detach_if_generation(&occupied));
 }
 
 impl AndroidDeviceSyncHost for AndroidHostFixture {

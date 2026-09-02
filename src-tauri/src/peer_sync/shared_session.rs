@@ -1833,8 +1833,21 @@ fn android_device_sync_failure(
 #[tauri::command]
 pub(crate) fn device_sync_source_reserve(
 ) -> Result<super::android_foreground::AndroidForegroundKey, String> {
+    reserve_device_sync_source()
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn reserve_device_sync_source(
+) -> Result<super::android_foreground::AndroidForegroundKey, String> {
     super::android_foreground::registry()
         .reserve(super::android_foreground::AndroidForegroundLane::DeviceSyncSource)
+        .map_err(|error| {
+            crate::nlog!(
+                "error",
+                "Android device sync source reserve failed: {error}"
+            );
+            error
+        })
 }
 
 #[cfg(target_os = "android")]
