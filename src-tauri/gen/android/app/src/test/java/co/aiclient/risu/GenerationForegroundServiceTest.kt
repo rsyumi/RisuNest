@@ -1,6 +1,7 @@
 package co.aiclient.risu
 
 import android.app.Service
+import java.io.File
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -10,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.w3c.dom.Element
 
 class GenerationForegroundServiceTest {
   @Test
@@ -194,6 +196,63 @@ class GenerationForegroundServiceTest {
     assertEquals(0, currentStops)
     assertEquals(1, staleStops)
     assertEquals(1, finalStops)
+  }
+
+  @Test
+  fun `stale service destruction cannot clear a fresh generation`() {
+    val lifecycle = GenerationForegroundLifecycle()
+    var oldToken = -1L
+    var freshToken = -1L
+    var finalStops = 0
+
+    assertTrue(lifecycle.begin { token -> oldToken = token; true })
+    assertTrue(lifecycle.activate(oldToken, 80, {}, {}))
+    assertTrue(lifecycle.end { true })
+    assertTrue(lifecycle.begin { token -> freshToken = token; true })
+    assertTrue(lifecycle.activate(freshToken, 80, {}, {}))
+
+    assertFalse(lifecycle.serviceDestroyed(oldToken, 80))
+    assertTrue(lifecycle.end { finalStops += 1; true })
+
+    assertEquals(1, finalStops)
+  }
+
+  @Test
+  fun `current service destruction clears the generation gate`() {
+    val lifecycle = GenerationForegroundLifecycle()
+    var token = -1L
+    var starts = 0
+    var lateStops = 0
+
+    assertTrue(lifecycle.begin { activeToken -> token = activeToken; starts += 1; true })
+    assertTrue(lifecycle.activate(token, 90, {}, {}))
+
+    assertTrue(lifecycle.serviceDestroyed(token, 90))
+    assertFalse(lifecycle.end { lateStops += 1; true })
+    assertTrue(lifecycle.begin { starts += 1; true })
+
+    assertEquals(2, starts)
+    assertEquals(0, lateStops)
+  }
+
+  @Test
+  fun `removing the app task stops the generation service`() {
+    val manifest = File("src/main/AndroidManifest.xml")
+    val document = javax.xml.parsers.DocumentBuilderFactory.newInstance().apply {
+      isNamespaceAware = true
+    }.newDocumentBuilder().parse(manifest)
+    val services = document.getElementsByTagName("service")
+    val generationService = (0 until services.length)
+      .map { services.item(it) as Element }
+      .single {
+        it.getAttributeNS("http://schemas.android.com/apk/res/android", "name") ==
+          ".GenerationForegroundService"
+      }
+
+    assertEquals(
+      "true",
+      generationService.getAttributeNS("http://schemas.android.com/apk/res/android", "stopWithTask"),
+    )
   }
 
   @Test

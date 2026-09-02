@@ -67,6 +67,15 @@ internal class GenerationForegroundLifecycle {
   }
 
   @Synchronized
+  fun serviceDestroyed(token: Long, startId: Int): Boolean {
+    if (token != activeToken || startId != activeStartId) return false
+    count = 0
+    activeToken = INVALID_GENERATION_FOREGROUND_TOKEN
+    activeStartId = null
+    return true
+  }
+
+  @Synchronized
   fun activate(
     token: Long,
     startId: Int,
@@ -85,6 +94,7 @@ internal class GenerationForegroundLifecycle {
 
 class GenerationForegroundService : Service() {
   private var activatedToken = INVALID_GENERATION_FOREGROUND_TOKEN
+  private var activatedStartId: Int? = null
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -99,6 +109,7 @@ class GenerationForegroundService : Service() {
       startId = startId,
       startForeground = {
         activatedToken = token
+        activatedStartId = startId
         startInForeground()
       },
       stopStaleStart = {
@@ -106,6 +117,13 @@ class GenerationForegroundService : Service() {
       },
     )
     return GENERATION_FOREGROUND_START_MODE
+  }
+
+  override fun onDestroy() {
+    activatedStartId?.let { startId ->
+      lifecycle.serviceDestroyed(activatedToken, startId)
+    }
+    super.onDestroy()
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {

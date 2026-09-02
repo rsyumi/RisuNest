@@ -52,7 +52,18 @@
 {#if notificationStatus !== null}
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.platform.title}</h2>
     <div class="flex flex-col gap-2 text-textcolor">
-        <span role="status" aria-live="polite">{language.risuNest.platform.notifications}: {notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}</span>
+        <div class="flex items-center gap-2">
+            <span>{language.risuNest.platform.notifications}:</span>
+            <span
+                role="status"
+                aria-live="polite"
+                class={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${notificationStatus
+                    ? 'border-success-500 bg-success-500/10 text-textcolor'
+                    : 'border-draculared bg-draculared/10 text-textcolor'}`}
+            >
+                {notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}
+            </span>
+        </div>
         <Button onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
         <Check bind:check={keepAlive} name={language.risuNest.platform.keepAlive} />
         <span class="text-textcolor2 text-sm">{language.risuNest.platform.keepAliveHelp}</span>
