@@ -4379,6 +4379,48 @@ fn explicit_v1_target_abandon_removes_a_source_unavailable_local_commit() {
 }
 
 #[test]
+fn v1_remote_receipt_without_a_delivery_retries_completion_instead_of_abandoning() {
+    let directory = tempfile::tempdir().unwrap();
+    let operation_id = "123e4567-e89b-42d3-a456-426614174096";
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::V1;
+    let retained = PeerBidirectionalDurableOperation::LocalCommitted {
+        schema: OPERATION_SCHEMA.to_owned(),
+        context: retained_context,
+        committed_revision: 0,
+        shared_generation: generation("shared-v1", "1", 'e'),
+        changed: false,
+        remote_backup_required: false,
+        remote_apply_receipt: Some(LanBidirectionalRemoteApplyReceipt {
+            committed_revision: 7,
+            committed_generation: LanBidirectionalGeneration {
+                generation_id: "shared-v1".to_owned(),
+                manifest_hash: "e".repeat(64),
+                generation_sequence: "1".to_owned(),
+            },
+            transferred_objects: 1,
+            transferred_bytes: 13,
+            backup: None,
+        }),
+        transferred_objects: 0,
+        transferred_bytes: 0,
+        backups: vec![],
+    };
+    let journal = PeerBidirectionalOperationJournal::new(directory.path());
+    journal.store(&retained).unwrap();
+
+    assert!(matches!(
+        PeerBidirectionalCommandState::default().acknowledge(
+            directory.path(),
+            &mut PersistentStore::open(directory.path()).unwrap(),
+            operation_id,
+        ),
+        Err(PeerSyncError::ActivationConflict { .. })
+    ));
+    assert_eq!(journal.load().unwrap(), Some(retained));
+}
+
+#[test]
 fn explicit_v1_target_abandon_cleans_only_its_delivery_and_allows_source_removal() {
     let directory = tempfile::tempdir().unwrap();
     register_bidirectional_accounting_source(directory.path(), 11, 7);

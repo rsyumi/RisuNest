@@ -5783,8 +5783,12 @@ impl PeerBidirectionalCommandState {
                 abandon_target_completion_delivery(app_root, &context)?;
                 journal.abandon(operation_id)
             }
-            PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
-                if context.completion_mode == PeerBidirectionalCompletionMode::V1 =>
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                context,
+                remote_apply_receipt: Some(_),
+                ..
+            } if context.completion_mode == PeerBidirectionalCompletionMode::V1
+                && context.completion_delivery.is_some() =>
             {
                 abandon_target_completion_delivery(app_root, &context)?;
                 journal.abandon(operation_id)
