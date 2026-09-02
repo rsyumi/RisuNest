@@ -1,4 +1,5 @@
 import { getDeviceSettings } from './storage/deviceSettings'
+import { isTauriAndroid } from './platform'
 
 export interface AndroidGenerationKeepAliveBridge {
     begin(): boolean
@@ -20,7 +21,7 @@ function bridge(): AndroidGenerationKeepAliveBridge | undefined {
 }
 
 export function beginAndroidGenerationKeepAlive(enabled = getDeviceSettings().androidKeepAliveDuringGeneration): boolean {
-    if (!enabled) return false
+    if (!isTauriAndroid || !enabled) return false
     try {
         return bridge()?.begin() === true
     } catch {
@@ -29,7 +30,7 @@ export function beginAndroidGenerationKeepAlive(enabled = getDeviceSettings().an
 }
 
 export function endAndroidGenerationKeepAlive(acquired: boolean): void {
-    if (!acquired) return
+    if (!isTauriAndroid || !acquired) return
     try {
         bridge()?.end()
     } catch {
@@ -38,6 +39,7 @@ export function endAndroidGenerationKeepAlive(acquired: boolean): void {
 }
 
 export function androidGenerationNotificationsEnabled(): boolean | null {
+    if (!isTauriAndroid) return null
     try {
         const value = bridge()?.notificationsEnabled()
         return typeof value === 'boolean' ? value : null

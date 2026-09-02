@@ -672,4 +672,18 @@ class MainActivityBehaviorTest {
     posted.forEach { it() }
     assertEquals(1, launches)
   }
+
+  @Test
+  fun `generation keep alive requests notification permission before checking availability`() {
+    val events = mutableListOf<String>()
+
+    val started = beginGenerationKeepAlive(
+      requestNotifications = { events.add("request") },
+      notificationsEnabled = { events.add("enabled"); false },
+      startService = { events.add("start"); true },
+    )
+
+    assertEquals(false, started)
+    assertEquals(listOf("request", "enabled"), events)
+  }
 }

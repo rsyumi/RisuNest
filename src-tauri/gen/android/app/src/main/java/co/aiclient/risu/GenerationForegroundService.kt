@@ -17,6 +17,32 @@ private const val GENERATION_FOREGROUND_END = "co.aiclient.risu.GENERATION_FOREG
 
 internal enum class GenerationForegroundCommand { START, STOP, NONE }
 
+internal class GenerationForegroundDispatchGate {
+  private var count = 0
+
+  @Synchronized
+  fun begin(dispatch: () -> Boolean): Boolean {
+    count += 1
+    if (dispatch()) return true
+    count -= 1
+    return false
+  }
+
+  @Synchronized
+  fun end(dispatch: () -> Boolean): Boolean {
+    if (count == 0) return false
+    count -= 1
+    if (dispatch()) return true
+    count += 1
+    return false
+  }
+
+  @Synchronized
+  fun timeout() {
+    count = 0
+  }
+}
+
 internal class GenerationForegroundController {
   private var count = 0
 
@@ -56,6 +82,7 @@ class GenerationForegroundService : Service() {
 
   override fun onTimeout(startId: Int, fgsType: Int) {
     controller.timeout()
+    dispatchGate.timeout()
     stopForeground(STOP_FOREGROUND_REMOVE)
     stopSelf()
   }
@@ -94,19 +121,25 @@ class GenerationForegroundService : Service() {
   }
 
   companion object {
-    internal fun start(context: Context): Boolean = runCatching {
-      ContextCompat.startForegroundService(
-        context,
-        Intent(context, GenerationForegroundService::class.java).setAction(GENERATION_FOREGROUND_BEGIN),
-      )
-      true
-    }.getOrDefault(false)
+    private val dispatchGate = GenerationForegroundDispatchGate()
 
-    internal fun stop(context: Context): Boolean = runCatching {
-      context.startService(
-        Intent(context, GenerationForegroundService::class.java).setAction(GENERATION_FOREGROUND_END),
-      ) != null
-    }.getOrDefault(false)
+    internal fun start(context: Context): Boolean = dispatchGate.begin {
+      runCatching {
+        ContextCompat.startForegroundService(
+          context,
+          Intent(context, GenerationForegroundService::class.java).setAction(GENERATION_FOREGROUND_BEGIN),
+        )
+        true
+      }.getOrDefault(false)
+    }
+
+    internal fun stop(context: Context): Boolean = dispatchGate.end {
+      runCatching {
+        context.startService(
+          Intent(context, GenerationForegroundService::class.java).setAction(GENERATION_FOREGROUND_END),
+        ) != null
+      }.getOrDefault(false)
+    }
 
     internal fun notificationsEnabled(context: Context): Boolean {
       val manager = NotificationManagerCompat.from(context)

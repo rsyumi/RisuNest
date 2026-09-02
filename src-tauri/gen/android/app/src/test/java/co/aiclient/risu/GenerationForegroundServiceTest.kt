@@ -6,6 +6,48 @@ import org.junit.Test
 
 class GenerationForegroundServiceTest {
   @Test
+  fun `late end does not dispatch after the final generation ended`() {
+    val gate = GenerationForegroundDispatchGate()
+    var starts = 0
+    var ends = 0
+
+    assertEquals(true, gate.begin { starts += 1; true })
+    assertEquals(true, gate.end { ends += 1; true })
+    assertEquals(false, gate.end { ends += 1; true })
+
+    assertEquals(1, starts)
+    assertEquals(1, ends)
+  }
+
+  @Test
+  fun `dispatch gate preserves nested generations and resets after timeout`() {
+    val gate = GenerationForegroundDispatchGate()
+    var ends = 0
+
+    assertEquals(true, gate.begin { true })
+    assertEquals(true, gate.begin { true })
+    assertEquals(true, gate.end { ends += 1; true })
+    gate.timeout()
+    assertEquals(false, gate.end { ends += 1; true })
+
+    assertEquals(1, ends)
+  }
+
+  @Test
+  fun `failed dispatch rolls back the matching generation transition`() {
+    val gate = GenerationForegroundDispatchGate()
+    var ends = 0
+
+    assertEquals(false, gate.begin { false })
+    assertEquals(false, gate.end { ends += 1; true })
+    assertEquals(true, gate.begin { true })
+    assertEquals(false, gate.end { ends += 1; false })
+    assertEquals(true, gate.end { ends += 1; true })
+
+    assertEquals(2, ends)
+  }
+
+  @Test
   fun `first begin starts and nested begin does not start twice`() {
     val controller = GenerationForegroundController()
 

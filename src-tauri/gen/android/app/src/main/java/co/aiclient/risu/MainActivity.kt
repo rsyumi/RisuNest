@@ -379,6 +379,16 @@ internal fun requestPostNotificationsIfNeeded(
   postToMain(launchRequest)
 }
 
+internal fun beginGenerationKeepAlive(
+  requestNotifications: () -> Unit,
+  notificationsEnabled: () -> Boolean,
+  startService: () -> Boolean,
+): Boolean {
+  requestNotifications()
+  if (!notificationsEnabled()) return false
+  return startService()
+}
+
 private val postNotificationsRequestedInProcess = AtomicBoolean(false)
 
 class MainActivity : TauriActivity(), RendererRecoveryHost {
@@ -707,7 +717,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     @JavascriptInterface
     fun startSource(lane: String, operationId: String, generation: Long): Boolean {
       val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
-      requestPostNotificationsForPeerSync()
+      requestPostNotificationsForForegroundService()
       return PeerSyncForegroundService.start(this@MainActivity, identity)
     }
 
@@ -732,10 +742,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   private inner class GenerationKeepAliveBridge {
     @JavascriptInterface
-    fun begin(): Boolean {
-      if (!GenerationForegroundService.notificationsEnabled(this@MainActivity)) return false
-      return GenerationForegroundService.start(this@MainActivity)
-    }
+    fun begin(): Boolean = beginGenerationKeepAlive(
+      requestNotifications = ::requestPostNotificationsForForegroundService,
+      notificationsEnabled = { GenerationForegroundService.notificationsEnabled(this@MainActivity) },
+      startService = { GenerationForegroundService.start(this@MainActivity) },
+    )
 
     @JavascriptInterface
     fun end(): Boolean = GenerationForegroundService.stop(this@MainActivity)
@@ -767,7 +778,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   // affordance) unless POST_NOTIFICATIONS was requested at runtime. Request it at
   // most once per process before the first foreground lane starts; the service
   // itself never depends on the outcome.
-  private fun requestPostNotificationsForPeerSync() {
+  private fun requestPostNotificationsForForegroundService() {
     requestPostNotificationsIfNeeded(
       gate = postNotificationsGate,
       isGranted = {
