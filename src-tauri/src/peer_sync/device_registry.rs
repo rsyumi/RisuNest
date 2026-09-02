@@ -975,15 +975,7 @@ fn write_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), PeerSyncEr
     result
 }
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), PeerSyncError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+    let mut file = create_owner_only_file(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -994,4 +986,31 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), PeerSyncError> {
     file.flush()?;
     file.sync_all()?;
     Ok(())
+}
+
+fn create_owner_only_file(path: &Path) -> Result<File, PeerSyncError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+#[cfg(all(test, unix))]
+mod unix_permission_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn owner_only_file_is_restricted_before_post_open_hardening() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("registry.tmp");
+
+        let file = super::create_owner_only_file(&path).unwrap();
+
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
 }

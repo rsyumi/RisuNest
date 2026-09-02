@@ -733,10 +733,14 @@ fn peer_registry_storage_is_owner_only_on_unix() {
 
     let root = tempfile::tempdir().unwrap();
     let peer_root = root.path().join("peer-sync");
-    fs::create_dir(&peer_root).unwrap();
-    fs::set_permissions(&peer_root, fs::Permissions::from_mode(0o755)).unwrap();
 
     super::device_registry::load_or_create_device_id(root.path()).unwrap();
+    assert_eq!(
+        fs::metadata(&peer_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    fs::set_permissions(&peer_root, fs::Permissions::from_mode(0o755)).unwrap();
     let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
     registry
         .upsert(IncomingSource {
