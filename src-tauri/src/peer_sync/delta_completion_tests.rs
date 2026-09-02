@@ -4,8 +4,8 @@ use super::delta_completion::{
     PeerDeltaCompletionJournal, PeerDeltaDurableCompletion,
 };
 use super::device_registry::{
-    CompletionLane, DevicePermissions, IncomingSource, IncomingSourceRegistry,
-    PendingCompletionDelivery,
+    completion_receipt_id, record_incoming_completed_operation_once_for_lane, CompletionLane,
+    DevicePermissions, IncomingSource, IncomingSourceRegistry, PendingCompletionDelivery,
 };
 use crate::{
     asset_repository::{
@@ -304,6 +304,48 @@ fn unsupported_completion_records_target_only_once_including_zero_bytes() {
             ),
         )
         .unwrap());
+}
+
+#[test]
+fn unsupported_completion_rejects_a_same_receipt_with_different_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let mut operation = context(OPERATION_ID);
+    operation.mode = DeltaCompletionMode::UnsupportedV2;
+    operation.transferred_bytes = 9;
+    let receipt_id = completion_receipt_id(
+        CompletionLane::Delta.as_str(),
+        &operation.operation_id,
+        &operation.manifest_id,
+    );
+    record_incoming_completed_operation_once_for_lane(
+        root.path(),
+        SOURCE_ID,
+        CompletionLane::Delta,
+        &receipt_id,
+        10,
+    )
+    .unwrap();
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let mut transport = FixtureTransport {
+        root: root.path().to_owned(),
+        prepared_bytes: 99,
+        expected_before_delivery: 15,
+        prepares: 0,
+        deliveries: 0,
+    };
+
+    assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        15
+    );
+    assert!(PeerDeltaCompletionJournal::new(root.path())
+        .load()
+        .unwrap()
+        .is_some());
 }
 
 #[test]

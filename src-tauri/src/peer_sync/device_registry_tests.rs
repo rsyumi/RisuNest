@@ -325,14 +325,14 @@ fn unsupported_completion_records_once_without_creating_an_outbox() {
             .unwrap();
     assert!(json.get("pendingCompletionDeliveries").is_none());
 
-    assert!(record_incoming_completed_operation_once_for_lane(
+    record_incoming_completed_operation_once_for_lane(
         root.path(),
         SOURCE_ID,
         CompletionLane::Bidirectional,
         &receipt_id,
         10,
     )
-    .is_err());
+    .unwrap();
     assert!(incoming_completed_operation_recorded_for_lane_with_bytes(
         root.path(),
         SOURCE_ID,

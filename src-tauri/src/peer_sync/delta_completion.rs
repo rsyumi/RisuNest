@@ -1,6 +1,5 @@
 use super::device_registry::{
     completion_receipt_id, finalize_incoming_completion_delivery,
-    incoming_completed_operation_recorded_for_lane,
     incoming_completed_operation_recorded_for_lane_with_bytes, incoming_completion_is_durable,
     incoming_source_by_id, prepare_incoming_completion_delivery,
     record_incoming_completed_operation_once_for_lane, snapshot_incoming_completion_delivery,
@@ -546,11 +545,12 @@ pub(crate) fn complete_delta_accounting(
                 &receipt_id,
                 useful_bytes,
             )?;
-            if !incoming_completed_operation_recorded_for_lane(
+            if !incoming_completed_operation_recorded_for_lane_with_bytes(
                 app_root,
                 &context.source_device_id,
                 CompletionLane::Delta,
                 &receipt_id,
+                useful_bytes,
             )? {
                 return invalid("delta completion receipt is not durable");
             }

@@ -1007,11 +1007,6 @@ impl IncomingSourceRegistry {
         let retained = receipts
             .iter_mut()
             .find(|receipt| receipt.device_id == source_id && receipt.lane == lane);
-        if retained.as_ref().is_some_and(|receipt| {
-            receipt.receipt_id == receipt_id && receipt.transferred_bytes != Some(bytes)
-        }) {
-            return invalid("incoming completion receipt byte count conflicts");
-        }
         if !retained
             .as_ref()
             .is_some_and(|receipt| receipt.receipt_id == receipt_id)
