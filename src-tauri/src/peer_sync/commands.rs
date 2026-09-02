@@ -3115,7 +3115,7 @@ mod tests {
         source
             .revoke_source_device(&request.session_id, &device_id)
             .unwrap();
-        assert!(source.source_status().unwrap().devices[0].revoked);
+        assert!(source.source_status().unwrap().devices.is_empty());
         assert_eq!(target_store.revision().unwrap(), 1);
         assert_eq!(
             target_store.read_root(None).unwrap().value["username"],
@@ -3129,13 +3129,16 @@ mod tests {
             .unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
         target.fail_target_finalize_cleanup_once_for_test().unwrap();
-        let mut accounting =
+        let accounting =
             super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
                 .unwrap();
-        let mut source_accounting = accounting.sources()[0].clone();
-        source_accounting.total_bytes = u64::MAX;
-        accounting.upsert(source_accounting).unwrap();
-        accounting.save().unwrap();
+        let remaining = u64::MAX - accounting.sources()[0].total_bytes;
+        super::super::device_registry::record_incoming_completed_operation(
+            target_root.path(),
+            &source_device_id,
+            remaining,
+        )
+        .unwrap();
         let accounting_before =
             fs::read(target_root.path().join("peer-sync/sources.json")).unwrap();
 

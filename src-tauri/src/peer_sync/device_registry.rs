@@ -1,6 +1,7 @@
 use super::PeerSyncError;
 use crate::trust_boundary::{is_link_like, is_lower_hex_256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -132,6 +133,8 @@ pub struct IncomingSourceSummary {
 struct OutgoingFile {
     schema: String,
     devices: Vec<OutgoingDevice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    completed_receipts: Vec<CompletionReceipt>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,27 +144,46 @@ struct IncomingFile {
     sources: Vec<IncomingSource>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompletionReceipt {
+    device_id: String,
+    // Clone exposes one live session, and bidirectional control retains one operation.
+    // A new receipt for the same lane therefore makes the previous proof unreplayable.
+    lane: String,
+    receipt_id: String,
+}
+
 pub(crate) struct OutgoingDeviceRegistry {
     root: PathBuf,
     devices: Vec<OutgoingDevice>,
+    completed_receipts: Vec<CompletionReceipt>,
 }
 
 impl OutgoingDeviceRegistry {
     pub(crate) fn load(app_root: &Path) -> Result<Self, PeerSyncError> {
         let root = ensure_peer_root(app_root)?;
         let path = root.join("devices.json");
-        let devices = match read_registry(&path)? {
-            None => Vec::new(),
+        let (devices, completed_receipts) = match read_registry(&path)? {
+            None => (Vec::new(), Vec::new()),
             Some(bytes) => {
                 let file: OutgoingFile = parse_registry(&bytes)?;
                 if file.schema != OUTGOING_SCHEMA {
                     return invalid("unsupported outgoing peer device registry schema");
                 }
-                file.devices
+                (file.devices, file.completed_receipts)
             }
         };
         validate_outgoing(&devices)?;
-        Ok(Self { root, devices })
+        validate_receipts(
+            &completed_receipts,
+            devices.iter().map(|device| device.device_id.as_str()),
+        )?;
+        Ok(Self {
+            root,
+            devices,
+            completed_receipts,
+        })
     }
 
     pub(crate) fn devices(&self) -> &[OutgoingDevice] {
@@ -205,6 +227,8 @@ impl OutgoingDeviceRegistry {
     pub(crate) fn remove(&mut self, device_id: &str) -> Result<(), PeerSyncError> {
         validate_id(device_id)?;
         self.devices.retain(|item| item.device_id != device_id);
+        self.completed_receipts
+            .retain(|receipt| receipt.device_id != device_id);
         Ok(())
     }
 
@@ -227,12 +251,87 @@ impl OutgoingDeviceRegistry {
         Ok(())
     }
 
+    pub(crate) fn record_completed_operation(
+        &mut self,
+        device_id: &str,
+        lane: &str,
+        receipt_id: &str,
+        bytes: u64,
+        seen_at_ms: u64,
+    ) -> Result<(), PeerSyncError> {
+        validate_id(device_id)?;
+        validate_receipt_lane(lane)?;
+        validate_receipt_id(receipt_id)?;
+        let mut devices = self.devices.clone();
+        let mut receipts = self.completed_receipts.clone();
+        let device = devices
+            .iter_mut()
+            .find(|item| item.device_id == device_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered outgoing device is missing".to_owned())
+            })?;
+        device.last_seen_ms = device.last_seen_ms.max(seen_at_ms);
+        let retained = receipts
+            .iter_mut()
+            .find(|receipt| receipt.device_id == device_id && receipt.lane == lane);
+        if !retained
+            .as_ref()
+            .is_some_and(|receipt| receipt.receipt_id == receipt_id)
+        {
+            device.total_bytes = device
+                .total_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| PeerSyncError::Validation("peer total bytes overflow".to_owned()))?;
+            if let Some(retained) = retained {
+                retained.receipt_id = receipt_id.to_owned();
+            } else {
+                receipts.push(CompletionReceipt {
+                    device_id: device_id.to_owned(),
+                    lane: lane.to_owned(),
+                    receipt_id: receipt_id.to_owned(),
+                });
+            }
+        }
+        self.write_state(&devices, &receipts)?;
+        self.devices = devices;
+        self.completed_receipts = receipts;
+        Ok(())
+    }
+
+    pub(crate) fn record_seen(
+        &mut self,
+        device_id: &str,
+        seen_at_ms: u64,
+    ) -> Result<(), PeerSyncError> {
+        validate_id(device_id)?;
+        let mut devices = self.devices.clone();
+        let device = devices
+            .iter_mut()
+            .find(|item| item.device_id == device_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered outgoing device is missing".to_owned())
+            })?;
+        device.last_seen_ms = device.last_seen_ms.max(seen_at_ms);
+        self.write_state(&devices, &self.completed_receipts)?;
+        self.devices = devices;
+        Ok(())
+    }
+
     pub(crate) fn save(&self) -> Result<(), PeerSyncError> {
+        self.write_state(&self.devices, &self.completed_receipts)
+    }
+
+    fn write_state(
+        &self,
+        devices: &[OutgoingDevice],
+        completed_receipts: &[CompletionReceipt],
+    ) -> Result<(), PeerSyncError> {
         write_registry(
             &self.root.join("devices.json"),
             &OutgoingFile {
                 schema: OUTGOING_SCHEMA.to_owned(),
-                devices: self.devices.clone(),
+                devices: devices.to_vec(),
+                completed_receipts: completed_receipts.to_vec(),
             },
         )
     }
@@ -265,13 +364,15 @@ impl IncomingSourceRegistry {
         &self.sources
     }
 
-    pub(crate) fn upsert(&mut self, source: IncomingSource) -> Result<(), PeerSyncError> {
+    pub(crate) fn upsert(&mut self, mut source: IncomingSource) -> Result<(), PeerSyncError> {
         validate_incoming(std::slice::from_ref(&source))?;
         if let Some(existing) = self
             .sources
             .iter_mut()
             .find(|item| item.device_id == source.device_id)
         {
+            source.last_seen_ms = existing.last_seen_ms;
+            source.total_bytes = existing.total_bytes;
             *existing = source;
         } else {
             self.sources.push(source);
@@ -450,17 +551,45 @@ pub(crate) fn remove_incoming_source(
     with_incoming_registry(app_root, |registry| registry.remove(device_id))
 }
 
+pub(crate) fn completion_receipt_id(lane: &str, operation_id: &str, manifest_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [lane, operation_id, manifest_id] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+pub(crate) fn record_outgoing_completed_operation(
+    app_root: &Path,
+    device_id: &str,
+    lane: &str,
+    receipt_id: &str,
+    bytes: u64,
+) -> Result<(), PeerSyncError> {
+    let seen_at_ms = completion_timestamp_ms()?;
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    let mut registry = OutgoingDeviceRegistry::load(app_root)?;
+    registry.record_completed_operation(device_id, lane, receipt_id, bytes, seen_at_ms)
+}
+
+pub(crate) fn record_outgoing_seen(app_root: &Path, device_id: &str) -> Result<(), PeerSyncError> {
+    let seen_at_ms = completion_timestamp_ms()?;
+    let _guard = outgoing_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
+    let mut registry = OutgoingDeviceRegistry::load(app_root)?;
+    registry.record_seen(device_id, seen_at_ms)
+}
+
 pub(crate) fn record_incoming_completed_operation(
     app_root: &Path,
     source_id: &str,
     bytes: u64,
 ) -> Result<(), PeerSyncError> {
-    let seen_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| PeerSyncError::Storage(error.to_string()))?
-        .as_millis()
-        .try_into()
-        .map_err(|_| PeerSyncError::Storage("peer completion timestamp overflow".to_owned()))?;
+    let seen_at_ms = completion_timestamp_ms()?;
     with_incoming_registry(app_root, |registry| {
         if !registry
             .sources()
@@ -633,6 +762,53 @@ fn validate_incoming(sources: &[IncomingSource]) -> Result<(), PeerSyncError> {
             return invalid("invalid registered peer source");
         }
         item.permissions.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_receipt_id(value: &str) -> Result<(), PeerSyncError> {
+    if is_lower_hex_256(value) {
+        Ok(())
+    } else {
+        invalid("invalid peer completion receipt")
+    }
+}
+
+fn validate_receipt_lane(value: &str) -> Result<(), PeerSyncError> {
+    if matches!(value, "clone" | "bidirectional") {
+        Ok(())
+    } else {
+        invalid("invalid peer completion receipt lane")
+    }
+}
+
+fn completion_timestamp_ms() -> Result<u64, PeerSyncError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| PeerSyncError::Storage("peer completion timestamp overflow".to_owned()))
+}
+
+fn validate_receipts<'a>(
+    receipts: &[CompletionReceipt],
+    registered_ids: impl Iterator<Item = &'a str>,
+) -> Result<(), PeerSyncError> {
+    let registered_ids = registered_ids.collect::<std::collections::BTreeSet<_>>();
+    if receipts.len() > registered_ids.len().saturating_mul(2) {
+        return invalid("too many peer completion receipts");
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for receipt in receipts {
+        validate_id(&receipt.device_id)?;
+        validate_receipt_lane(&receipt.lane)?;
+        validate_receipt_id(&receipt.receipt_id)?;
+        if !registered_ids.contains(receipt.device_id.as_str())
+            || !unique.insert((&receipt.device_id, &receipt.lane))
+        {
+            return invalid("invalid peer completion receipt");
+        }
     }
     Ok(())
 }

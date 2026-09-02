@@ -127,6 +127,114 @@ fn incoming_registry_stores_bearer_and_revoke_replaces_file_atomically() {
 }
 
 #[test]
+fn outgoing_completion_receipt_survives_restart_and_prevents_retry_double_counting() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    registry
+        .upsert(OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Target".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 20,
+            total_bytes: 30,
+        })
+        .unwrap();
+    registry.save().unwrap();
+
+    registry
+        .record_completed_operation(TARGET_ID, "clone", &"b".repeat(64), 12, 40)
+        .unwrap();
+    let mut restarted = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    restarted
+        .record_completed_operation(TARGET_ID, "clone", &"b".repeat(64), 12, 41)
+        .unwrap();
+
+    let restored = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    assert_eq!(restored.devices()[0].total_bytes, 42);
+    assert_eq!(restored.devices()[0].last_seen_ms, 41);
+}
+
+#[test]
+fn outgoing_receipts_are_not_evicted_while_their_devices_remain_registered() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    let device_ids = (1_u128..=257)
+        .map(|value| uuid::Uuid::from_u128(value).to_string())
+        .collect::<Vec<_>>();
+    for device_id in &device_ids {
+        registry
+            .upsert(OutgoingDevice {
+                device_id: device_id.clone(),
+                name: "Target".into(),
+                bearer_digest: "a".repeat(64),
+                permissions: DevicePermissions::read(),
+                created_at_ms: 10,
+                last_seen_ms: 20,
+                total_bytes: 0,
+            })
+            .unwrap();
+    }
+    registry.save().unwrap();
+
+    for (index, device_id) in device_ids.iter().enumerate() {
+        registry
+            .record_completed_operation(device_id, "clone", &format!("{index:064x}"), 1, 40)
+            .unwrap();
+    }
+    let mut restarted = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    restarted
+        .record_completed_operation(&device_ids[0], "clone", &"0".repeat(64), 1, 41)
+        .unwrap();
+
+    let restored = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    assert_eq!(restored.devices()[0].total_bytes, 1);
+    assert_eq!(restored.devices()[0].last_seen_ms, 41);
+}
+
+#[test]
+fn reregistering_an_incoming_source_rotates_credentials_without_erasing_history() {
+    let root = tempfile::tempdir().unwrap();
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Old source".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 25,
+            total_bytes: 40,
+        },
+    )
+    .unwrap();
+
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Renamed source".into(),
+            endpoint: "http://192.168.0.6:32145".into(),
+            bearer: "b".repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 99,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+
+    let restored = IncomingSourceRegistry::load(root.path()).unwrap();
+    let source = &restored.sources()[0];
+    assert_eq!(source.name, "Renamed source");
+    assert_eq!(source.endpoint, "http://192.168.0.6:32145");
+    assert_eq!(source.bearer, "b".repeat(64));
+    assert!(source.permissions.allows_bidirectional());
+    assert_eq!(source.last_seen_ms, 25);
+    assert_eq!(source.total_bytes, 40);
+}
+
+#[test]
 fn incoming_completion_accounting_persists_positive_and_zero_byte_successes() {
     let root = tempfile::tempdir().unwrap();
     let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();

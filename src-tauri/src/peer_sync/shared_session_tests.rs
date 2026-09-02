@@ -4,7 +4,7 @@ use super::shared_session::{
     run_device_sync_rotate_link, SharedSourceEngines, SharedSourcePreparationContext,
 };
 use super::{
-    device_registry::DevicePermissions,
+    device_registry::{DevicePermissions, OutgoingDeviceRegistry},
     lan::{
         LanBidirectionalControl, LanBidirectionalRegistrationRequest,
         LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
@@ -15,6 +15,7 @@ use super::{
         LogicalRecordEnvelope, LogicalRecordLocator, ProjectedLogicalRecord,
     },
     prepare_clone_session,
+    protocol::CloneManifest,
     shared_session::{
         DeviceSyncLinkPermissions, DeviceSyncListenMethod, DeviceSyncPrepareRequest,
         DeviceSyncSourcePhase, DeviceSyncSourceState, SharedPairingData, SharedPeerTunnel,
@@ -33,6 +34,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    fs,
     io::{Cursor, Read},
     net::{Ipv4Addr, TcpListener},
     path::PathBuf,
@@ -1688,6 +1690,9 @@ fn unified_source_revoke_hook_invalidates_an_established_live_bearer() {
         reqwest::StatusCode::OK
     );
 
+    let registry = root.path().join("peer-sync/devices.json");
+    fs::remove_file(&registry).unwrap();
+    fs::create_dir(&registry).unwrap();
     state.revoke_registered_device(device_id);
 
     assert_eq!(
@@ -1697,8 +1702,85 @@ fn unified_source_revoke_hook_invalidates_an_established_live_bearer() {
             .send()
             .unwrap()
             .status(),
-        reqwest::StatusCode::FORBIDDEN
+        reqwest::StatusCode::UNAUTHORIZED
     );
+    fs::remove_dir(registry).unwrap();
+    state.stop().unwrap();
+}
+
+#[test]
+fn clone_terminal_progress_persists_last_seen_and_counts_a_retry_once() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+    let pairing = state.pairing_for_test().unwrap();
+    let device_id = "00000000-0000-4000-8000-000000000032";
+    let response = claim(&pairing, device_id);
+    let bearer = response.json::<serde_json::Value>().unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let client = reqwest::blocking::Client::new();
+    let manifest = client
+        .get(format!(
+            "{}/v1/sessions/{}/manifest",
+            pairing.endpoint, pairing.session_id
+        ))
+        .bearer_auth(&bearer)
+        .send()
+        .unwrap()
+        .json::<CloneManifest>()
+        .unwrap();
+    let total_bytes = manifest
+        .objects
+        .values()
+        .map(|object| object.size)
+        .sum::<u64>();
+
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .post(format!(
+                    "{}/v1/sessions/{}/progress",
+                    pairing.endpoint, pairing.session_id
+                ))
+                .bearer_auth(&bearer)
+                .json(&serde_json::json!({
+                    "verifiedBytes": total_bytes,
+                    "currentObject": null
+                }))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+    }
+
+    let registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
+    assert_eq!(registry.devices()[0].total_bytes, total_bytes);
+    assert!(registry.devices()[0].last_seen_ms > 0);
     state.stop().unwrap();
 }
 
