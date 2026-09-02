@@ -43,7 +43,8 @@ function isValidSettings(value: unknown): value is RisuNestDeviceSettings {
         && (settings.syncListenMethod === 'lan' || settings.syncListenMethod === 'quick' || settings.syncListenMethod === 'fixed-url')
         && typeof syncFixedPort === 'number'
         && Number.isInteger(syncFixedPort)
-        && syncFixedPort >= 0
+        && syncFixedPort >= 1
+        && syncFixedPort <= 65535
         && typeof settings.syncPublicBaseUrl === 'string'
 }
 
@@ -74,8 +75,11 @@ export function getDeviceSettings(): RisuNestDeviceSettings {
     return snapshot(settings)
 }
 
-export function updateDeviceSettings(partial: Partial<RisuNestDeviceSettings>): void {
-    const next = { ...settings, ...partial }
+export function updateDeviceSettings(
+    partial: Partial<Omit<RisuNestDeviceSettings, 'schema'>>,
+): RisuNestDeviceSettings {
+    const { schema: _schema, ...updates } = partial as Partial<RisuNestDeviceSettings>
+    const next = { ...settings, ...updates }
     settings = isValidSettings(next) ? next : snapshot(defaults)
     setRuntimePerformanceProfile(settings.performanceProfile)
     try {
@@ -86,6 +90,7 @@ export function updateDeviceSettings(partial: Partial<RisuNestDeviceSettings>): 
     for (const listener of listeners) {
         listener(snapshot(settings))
     }
+    return snapshot(settings)
 }
 
 export function subscribeDeviceSettings(

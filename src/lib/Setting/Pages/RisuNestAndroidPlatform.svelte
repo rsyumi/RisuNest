@@ -44,7 +44,9 @@
     })
     onDestroy(unsubscribe)
 
-    $effect(() => updateDeviceSettings({ androidKeepAliveDuringGeneration: keepAlive }))
+    $effect(() => {
+        updateDeviceSettings({ androidKeepAliveDuringGeneration: keepAlive })
+    })
 </script>
 
 {#if notificationStatus !== null}

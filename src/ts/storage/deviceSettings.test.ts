@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 
+type DeviceSettingsUpdate = Parameters<typeof import('./deviceSettings').updateDeviceSettings>[0]
+
+// @ts-expect-error The persisted settings schema is not caller-configurable.
+const schemaUpdate: DeviceSettingsUpdate = { schema: 'risunest.device-settings/v1' }
+void schemaUpdate
+
 async function loadDeviceSettings() {
     vi.resetModules()
     return await import('./deviceSettings')
@@ -37,13 +43,17 @@ describe('device settings', () => {
         expect(getDeviceSettings()).toEqual(defaults)
     })
 
-    it('recovers defaults from malformed or invalid stored JSON', async () => {
-        localStorage.setItem('risuNestDeviceSettings', '{not json')
-        let deviceSettings = await loadDeviceSettings()
-        expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
+    it.each([0, 65536, -1, 1.5])('recovers exact defaults from an invalid stored port %s', async (syncFixedPort) => {
+        localStorage.setItem('risuNestDeviceSettings', JSON.stringify({ ...defaults, syncFixedPort }))
 
-        localStorage.setItem('risuNestDeviceSettings', JSON.stringify({ ...defaults, syncFixedPort: -1 }))
-        deviceSettings = await loadDeviceSettings()
+        const deviceSettings = await loadDeviceSettings()
+
+        expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
+    })
+
+    it('recovers defaults from malformed stored JSON', async () => {
+        localStorage.setItem('risuNestDeviceSettings', '{not json')
+        const deviceSettings = await loadDeviceSettings()
         expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
     })
 
@@ -97,6 +107,45 @@ describe('device settings', () => {
             syncPublicBaseUrl: 'https://sync.example.test',
         })
         expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(getDeviceSettings())
+    })
+
+    it.each([0, 65536])('recovers exact defaults from an invalid updated port %s', async (syncFixedPort) => {
+        const { getDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
+        updateDeviceSettings({ syncAutoListen: true })
+
+        updateDeviceSettings({ syncFixedPort })
+
+        expect(getDeviceSettings()).toEqual(defaults)
+        expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(defaults)
+    })
+
+    it('ignores a runtime schema override while applying valid settings', async () => {
+        const { getDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
+
+        updateDeviceSettings({
+            schema: 'not-a-device-settings-schema',
+            syncAutoListen: true,
+        } as never)
+
+        expect(getDeviceSettings()).toEqual({ ...defaults, syncAutoListen: true })
+    })
+
+    it('returns an isolated normalized snapshot after persistence and notification', async () => {
+        const { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
+        const listener = vi.fn(() => {
+            expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual({
+                ...defaults,
+                syncFixedPort: 43000,
+            })
+        })
+        subscribeDeviceSettings(listener)
+
+        const updated = updateDeviceSettings({ syncFixedPort: 43000 })
+
+        expect(listener).toHaveBeenCalledOnce()
+        expect(updated).toEqual({ ...defaults, syncFixedPort: 43000 })
+        updated.syncFixedPort = 1
+        expect(getDeviceSettings().syncFixedPort).toBe(43000)
     })
 
     it('returns immutable snapshots and notifies only active subscribers', async () => {

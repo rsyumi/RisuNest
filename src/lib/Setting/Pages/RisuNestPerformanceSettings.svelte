@@ -11,9 +11,11 @@
 
     onDestroy(unsubscribe)
 
-    $effect(() => updateDeviceSettings({
-        performanceProfile: profile === 'low-spec' ? 'low-spec' : 'normal',
-    }))
+    $effect(() => {
+        updateDeviceSettings({
+            performanceProfile: profile === 'low-spec' ? 'low-spec' : 'normal',
+        })
+    })
 </script>
 
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.perf.title}</h2>

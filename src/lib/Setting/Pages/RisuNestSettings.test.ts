@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-import settingsSource from '../Settings.svelte?raw'
-import pageSource from './RisuNestSettings.svelte?raw'
-import tauriLibSource from '../../../../src-tauri/src/lib.rs?raw'
-import peerCloneAndroidSource from './PeerCloneAndroidSettings.svelte?raw'
+import settingsRawSource from '../Settings.svelte?raw'
+import pageRawSource from './RisuNestSettings.svelte?raw'
+import tauriLibRawSource from '../../../../src-tauri/src/lib.rs?raw'
+import peerCloneAndroidRawSource from './PeerCloneAndroidSettings.svelte?raw'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
+
+const normalizeNewlines = (source: string) => source.replace(/\r\n?/g, '\n')
+const settingsSource = normalizeNewlines(settingsRawSource)
+const pageSource = normalizeNewlines(pageRawSource)
+const tauriLibSource = normalizeNewlines(tauriLibRawSource)
+const peerCloneAndroidSource = normalizeNewlines(peerCloneAndroidRawSource)
 
 describe('RisuNest settings navigation', () => {
     it('places RisuNest and Tauri-only Device Sync before Support', () => {
