@@ -90,6 +90,13 @@ pub(crate) enum CompletionDeliveryFinalizeStatus {
     AlreadyFinalized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionDeliveryAbandonStatus {
+    Removed,
+    Missing,
+    AlreadyDurable,
+}
+
 fn outgoing_registry_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -1246,7 +1253,7 @@ impl IncomingSourceRegistry {
     pub(crate) fn abandon_completion_delivery(
         &mut self,
         delivery: &PendingCompletionDelivery,
-    ) -> Result<bool, PeerSyncError> {
+    ) -> Result<CompletionDeliveryAbandonStatus, PeerSyncError> {
         validate_pending_completion_delivery(delivery)?;
         let Some(pending_index) = self
             .pending_completion_deliveries
@@ -1256,7 +1263,16 @@ impl IncomingSourceRegistry {
                     && pending.lane == delivery.lane
             })
         else {
-            return Ok(false);
+            return if self.completed_receipts.iter().any(|receipt| {
+                receipt.device_id == delivery.source_device_id
+                    && receipt.lane == delivery.lane
+                    && receipt.receipt_id == delivery.receipt_id
+                    && receipt.transferred_bytes == Some(delivery.useful_bytes)
+            }) {
+                Ok(CompletionDeliveryAbandonStatus::AlreadyDurable)
+            } else {
+                Ok(CompletionDeliveryAbandonStatus::Missing)
+            };
         };
         if &self.pending_completion_deliveries[pending_index] != delivery {
             return invalid("pending incoming completion delivery does not match abandonment");
@@ -1265,7 +1281,7 @@ impl IncomingSourceRegistry {
         pending.remove(pending_index);
         self.write_state(&self.sources, &self.completed_receipts, &pending)?;
         self.pending_completion_deliveries = pending;
-        Ok(true)
+        Ok(CompletionDeliveryAbandonStatus::Removed)
     }
 
     fn completion_is_durable(
@@ -1803,7 +1819,7 @@ pub(crate) fn finalize_incoming_completion_delivery(
 pub(crate) fn abandon_incoming_completion_delivery(
     app_root: &Path,
     delivery: &PendingCompletionDelivery,
-) -> Result<bool, PeerSyncError> {
+) -> Result<CompletionDeliveryAbandonStatus, PeerSyncError> {
     let _guard = incoming_registry_lock()
         .lock()
         .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
