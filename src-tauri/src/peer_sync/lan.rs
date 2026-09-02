@@ -2132,6 +2132,11 @@ fn handle_request(
         Ok(device) => device,
         Err(status) => return respond_empty(stream, status),
     };
+    if matches!(session, LanSession::BidirectionalLogical(_))
+        && !device.permissions.allows_bidirectional()
+    {
+        return respond_empty(stream, 403);
+    }
     if !device.permissions.allows_read() {
         return respond_empty(stream, 403);
     }
@@ -2144,11 +2149,6 @@ fn handle_request(
                 return respond_empty(stream, 400);
             }
             if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
-                if matches!(session, LanSession::BidirectionalLogical(_))
-                    && !device.permissions.allows_bidirectional()
-                {
-                    return respond_empty(stream, 403);
-                }
                 let issued = match session {
                     LanSession::Clone(clone) => {
                         let transferred_bytes = clone
@@ -5495,6 +5495,51 @@ mod timeout_tests {
         .unwrap()
     }
 
+    fn prepared_bidirectional_logical_session_with_object(
+        session_id: &str,
+        source_device_id: &str,
+        control: Arc<BidirectionalControlFixture>,
+    ) -> (PreparedBidirectionalLogicalLanSession, String) {
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "permission-check".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let object = built.manifest.objects[0].clone();
+        let object_bytes = built.record_objects[0].object.bytes.clone();
+        let object_hash = object.hash.clone();
+        let session = PreparedBidirectionalLogicalLanSession::new(
+            session_id,
+            source_device_id,
+            built.manifest_hash,
+            built.manifest_bytes,
+            vec![LogicalDeltaObject {
+                hash: object.hash.clone(),
+                size: object.size,
+            }],
+            Box::new(LogicalFixtureSource(BTreeMap::from([(
+                object.hash,
+                object_bytes,
+            )]))),
+            control,
+        )
+        .unwrap();
+        (session, object_hash)
+    }
+
     fn prepared_logical_session(
         session_id: &str,
         source_device_id: &str,
@@ -6914,6 +6959,7 @@ mod timeout_tests {
         .unwrap();
 
         assert_eq!(client.source_device_id(), source_id);
+        assert!(!client.fetch_manifest().unwrap().is_empty());
         let hello = client.hello().unwrap();
         assert_eq!(hello.device_id, source_id);
         assert!(hello.permissions.allows_bidirectional());
@@ -7184,7 +7230,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn v2_read_only_claim_cannot_invoke_bidirectional_handlers() {
+    fn v2_read_only_claim_cannot_access_bidirectional_session_routes() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7193,12 +7239,12 @@ mod timeout_tests {
             super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
         let target_id = "00000000-0000-4000-8000-000000000093";
         let control = Arc::new(BidirectionalControlFixture::default());
-        let mut host =
-            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
-                "00000000-0000-4000-8000-000000000094",
-                &source_id,
-                Arc::clone(&control),
-            ));
+        let (session, object_hash) = prepared_bidirectional_logical_session_with_object(
+            "00000000-0000-4000-8000-000000000094",
+            &source_id,
+            Arc::clone(&control),
+        );
+        let mut host = LanCloneHost::prepare_bidirectional_logical(session);
         host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
             .unwrap();
         let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
@@ -7212,10 +7258,36 @@ mod timeout_tests {
             .json()
             .unwrap();
         assert_eq!(claim["permissions"], serde_json::json!(["read"]));
+        let bearer = claim["bearer"].as_str().unwrap();
+        let raw = reqwest::blocking::Client::new();
+        let statuses = [
+            raw.get(format!("{session_url}/manifest"))
+                .bearer_auth(bearer)
+                .send()
+                .unwrap()
+                .status(),
+            raw.post(format!("{session_url}/progress"))
+                .bearer_auth(bearer)
+                .json(&serde_json::json!({"verifiedBytes": 0, "currentObject": null}))
+                .send()
+                .unwrap()
+                .status(),
+            raw.head(format!("{session_url}/objects/{object_hash}"))
+                .bearer_auth(bearer)
+                .send()
+                .unwrap()
+                .status(),
+            raw.get(format!("{session_url}/objects/{object_hash}"))
+                .bearer_auth(bearer)
+                .send()
+                .unwrap()
+                .status(),
+        ];
+        assert_eq!(statuses, [reqwest::StatusCode::FORBIDDEN; 4]);
         assert_eq!(
-            reqwest::blocking::Client::new()
+            raw
                 .post(format!("{session_url}/registration"))
-                .bearer_auth(claim["bearer"].as_str().unwrap())
+                .bearer_auth(bearer)
                 .json(&serde_json::json!({
                     "libraryId": "library",
                     "generation": {"generationId": "generation-1", "manifestHash": pairing.manifest_id, "generationSequence": "1"},
