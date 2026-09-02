@@ -146,6 +146,8 @@ struct AndroidClonePersistedStatus {
     committed_revision: Option<u64>,
     #[serde(default)]
     backup_path: Option<PathBuf>,
+    #[serde(default)]
+    completion_acknowledged: bool,
 }
 
 impl AndroidClonePersistedStatus {
@@ -158,6 +160,7 @@ impl AndroidClonePersistedStatus {
             error: None,
             committed_revision: None,
             backup_path: None,
+            completion_acknowledged: false,
         }
     }
 
@@ -171,7 +174,14 @@ impl AndroidClonePersistedStatus {
             .is_some_and(|error| error.len() > MAX_ERROR_BYTES);
         let invalid_commit = self.committed_revision.is_some()
             && self.phase != AndroidCloneJobPhase::VerifiedAwaitingActivation;
-        if self.schema != JOB_STATUS_SCHEMA || invalid_progress || invalid_error || invalid_commit {
+        let invalid_acknowledgement =
+            self.completion_acknowledged && self.committed_revision.is_none();
+        if self.schema != JOB_STATUS_SCHEMA
+            || invalid_progress
+            || invalid_error
+            || invalid_commit
+            || invalid_acknowledgement
+        {
             return Err(PeerSyncError::Storage(
                 "Android clone job status is invalid".to_owned(),
             ));
@@ -411,6 +421,7 @@ impl AndroidResumableCloneJob {
                 error: None,
                 committed_revision: None,
                 backup_path: None,
+                completion_acknowledged: false,
             })?;
             return Ok(DownloadReport::default());
         }
@@ -423,6 +434,7 @@ impl AndroidResumableCloneJob {
             error: None,
             committed_revision: None,
             backup_path: None,
+            completion_acknowledged: false,
         })?;
         let status_error = RefCell::new(None);
         let last_persisted = Cell::new(completed_before);
@@ -450,6 +462,7 @@ impl AndroidResumableCloneJob {
                         error: None,
                         committed_revision: None,
                         backup_path: None,
+                        completion_acknowledged: false,
                     };
                     if let Err(error) = write_json_atomic(&status_path, &status) {
                         *status_error.borrow_mut() = Some(error);
@@ -479,6 +492,7 @@ impl AndroidResumableCloneJob {
                     error: None,
                     committed_revision: None,
                     backup_path: None,
+                    completion_acknowledged: false,
                 })?;
                 Ok(report)
             }
@@ -573,6 +587,20 @@ impl AndroidResumableCloneJob {
             self.write_status(&status)?;
         }
         self.status()
+    }
+
+    fn acknowledge_completion(&self) -> Result<(), PeerSyncError> {
+        let mut status = self.reconciled_status()?;
+        if status.committed_revision.is_none() {
+            return Err(PeerSyncError::Validation(
+                "Android clone completion cannot be acknowledged before commit".to_owned(),
+            ));
+        }
+        if !status.completion_acknowledged {
+            status.completion_acknowledged = true;
+            self.write_status(&status)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn record_backup_path(
@@ -880,6 +908,8 @@ impl AndroidCloneJobRegistry {
         let job = AndroidResumableCloneJob::open(&root)?;
         let status = job.status()?;
         if let Some(committed_revision) = status.committed_revision {
+            self.finish_durable_completion(&root, job_id)?;
+            let status = AndroidResumableCloneJob::open(&root)?.status()?;
             return Ok(AndroidCloneFinalizeReceipt {
                 revision: committed_revision,
                 backup_path: status.backup_path,
@@ -949,11 +979,61 @@ impl AndroidCloneJobRegistry {
                 PeerSyncError::Storage("Android clone committed revision is negative".to_owned())
             })?;
         AndroidResumableCloneJob::open(&root)?.mark_committed(committed_revision)?;
+        self.finish_durable_completion(&root, job_id)?;
         let status = AndroidResumableCloneJob::open(&root)?.status()?;
         Ok(AndroidCloneFinalizeReceipt {
             revision: committed_revision,
             backup_path: status.backup_path,
         })
+    }
+
+    fn finish_durable_completion(&self, root: &Path, job_id: &str) -> Result<(), PeerSyncError> {
+        let mut job = AndroidResumableCloneJob::open(root)?;
+        let persisted = job.read_status()?;
+        if persisted.committed_revision.is_none() {
+            return Err(PeerSyncError::Validation(
+                "Android clone completion is not committed".to_owned(),
+            ));
+        }
+        let (ledger_completed, ledger_total) = job.client.transfer_progress()?;
+        if ledger_completed != ledger_total
+            || persisted.completed_bytes != ledger_completed
+            || persisted.total_bytes != Some(ledger_total)
+        {
+            return Err(PeerSyncError::Storage(
+                "Android clone completion bytes differ from its verified transfer ledger"
+                    .to_owned(),
+            ));
+        }
+        if let Some(source_device_id) = job.client.source_device_id() {
+            let app_root = self.jobs_root.parent().ok_or_else(|| {
+                PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
+            })?;
+            let receipt_id = super::device_registry::completion_receipt_id(
+                "clone",
+                job_id,
+                &job.descriptor.manifest_id,
+            );
+            if persisted.completion_acknowledged {
+                if !super::device_registry::incoming_completed_operation_recorded(
+                    app_root,
+                    source_device_id,
+                    &receipt_id,
+                )? {
+                    return Err(PeerSyncError::Validation(
+                        "Android clone completion receipt is missing".to_owned(),
+                    ));
+                }
+            } else {
+                super::device_registry::record_incoming_completed_operation_once(
+                    app_root,
+                    source_device_id,
+                    &receipt_id,
+                    ledger_total,
+                )?;
+            }
+        }
+        job.acknowledge_completion()
     }
 
     #[cfg(test)]
@@ -971,11 +1051,13 @@ impl AndroidCloneJobRegistry {
         let state = self.lock()?;
         let root = self.owned_job_root_locked(job_id, &state)?;
         let job = AndroidResumableCloneJob::open(root)?;
-        if job.status()?.committed_revision.is_none() {
+        let status = job.read_status()?;
+        if status.committed_revision.is_none() || !status.completion_acknowledged {
             return Err(PeerSyncError::Validation(
-                "Android clone job cannot be released before commit".to_owned(),
+                "Android clone job cannot be released before durable completion".to_owned(),
             ));
         }
+        self.finish_durable_completion(&job.root, job_id)?;
         job.discard()?;
         self.remove_current_id()
     }
