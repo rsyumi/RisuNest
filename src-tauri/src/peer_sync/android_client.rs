@@ -989,44 +989,38 @@ impl AndroidCloneJobRegistry {
             bearer,
             completion_capability,
         )?;
-        #[cfg(test)]
-        self.wait_before_registered_publish_for_test()?;
-        let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
-        if let Err(error) = self.write_current_id(&job_id) {
-            let _ = job.discard();
-            return Err(error);
-        }
-        let source = super::device_registry::incoming_source_by_id(
-            self.jobs_root.parent().ok_or_else(|| {
+        let published = (|| {
+            let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
+            if !registered_android_job_source_is_current(&self.jobs_root, &job)? {
+                return Err(PeerSyncError::Validation(
+                    "registered Android clone source is unavailable".to_owned(),
+                ));
+            }
+            let app_root = self.jobs_root.parent().ok_or_else(|| {
                 PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
-            })?,
-            source_device_id,
-        );
-        let source_is_current = source.as_ref().is_ok_and(|source| {
-            source.as_ref().is_some_and(|source| {
+            })?;
+            let source = super::device_registry::incoming_source_by_id(app_root, source_device_id)?;
+            if !source.as_ref().is_some_and(|source| {
                 source.device_id == source_device_id
                     && source.endpoint == endpoint
                     && source.bearer == bearer
                     && source.permissions.allows_read()
-            })
-        });
-        if !source_is_current {
-            let source_error = source.err().unwrap_or_else(|| {
-                PeerSyncError::Validation(
+            }) {
+                return Err(PeerSyncError::Validation(
                     "registered Android clone source is unavailable".to_owned(),
-                )
-            });
+                ));
+            }
+            #[cfg(test)]
+            self.wait_before_registered_publish_for_test()?;
+            self.write_current_id(&job_id)
+        })();
+        if let Err(error) = published {
             job.discard().map_err(|cleanup| {
                 PeerSyncError::Storage(format!(
-                    "{source_error}; failed to discard unavailable registered Android clone: {cleanup}"
+                    "{error}; failed to discard unavailable registered Android clone: {cleanup}"
                 ))
             })?;
-            self.remove_current_id().map_err(|cleanup| {
-                PeerSyncError::Storage(format!(
-                    "{source_error}; failed to release unavailable registered Android clone ownership: {cleanup}"
-                ))
-            })?;
-            return Err(source_error);
+            return Err(error);
         }
         job.status()
     }
@@ -1121,7 +1115,7 @@ impl AndroidCloneJobRegistry {
                 legacy_receipt,
                 false,
             )?;
-            self.finish_durable_completion(&root, job_id)?;
+            self.finish_durable_completion(&root, job_id, activation_root)?;
             let status = AndroidResumableCloneJob::open(&root)?.status()?;
             return Ok(AndroidCloneFinalizeReceipt {
                 revision: committed_revision,
@@ -1204,7 +1198,7 @@ impl AndroidCloneJobRegistry {
             false,
             false,
         )?;
-        self.finish_durable_completion(&root, job_id)?;
+        self.finish_durable_completion(&root, job_id, activation_root)?;
         let status = AndroidResumableCloneJob::open(&root)?.status()?;
         Ok(AndroidCloneFinalizeReceipt {
             revision: committed_revision,
@@ -1212,12 +1206,29 @@ impl AndroidCloneJobRegistry {
         })
     }
 
-    fn finish_durable_completion(&self, root: &Path, job_id: &str) -> Result<(), PeerSyncError> {
+    fn finish_durable_completion(
+        &self,
+        root: &Path,
+        job_id: &str,
+        activation_root: &Path,
+    ) -> Result<(), PeerSyncError> {
         let mut job = AndroidResumableCloneJob::open(root)?;
         let persisted = job.read_status()?;
         if persisted.committed_revision.is_none() {
             return Err(PeerSyncError::Validation(
                 "Android clone completion is not committed".to_owned(),
+            ));
+        }
+        let completion_capability = descriptor_completion_capability(&job.descriptor)?;
+        if job.client.source_device_id().is_some()
+            && !legacy_backup_owns_activation(
+                persisted.backup_path.as_deref(),
+                activation_root,
+                job_id,
+            )?
+        {
+            return Err(PeerSyncError::Validation(
+                "registered Android clone completion backup receipt is missing".to_owned(),
             ));
         }
         let (ledger_completed, ledger_total) = job.client.transfer_progress()?;
@@ -1234,28 +1245,82 @@ impl AndroidCloneJobRegistry {
             let app_root = self.jobs_root.parent().ok_or_else(|| {
                 PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
             })?;
-            let receipt_id = super::device_registry::completion_receipt_id(
-                "clone",
-                job_id,
-                &job.descriptor.manifest_id,
-            );
-            if persisted.completion_acknowledged {
-                if !super::device_registry::incoming_completed_operation_recorded(
-                    app_root,
-                    source_device_id,
-                    &receipt_id,
-                )? {
-                    return Err(PeerSyncError::Validation(
-                        "Android clone completion receipt is missing".to_owned(),
-                    ));
+            match completion_capability {
+                PeerCompletionCapability::Unsupported => {
+                    let receipt_id = super::device_registry::completion_receipt_id(
+                        "clone",
+                        job_id,
+                        &job.descriptor.manifest_id,
+                    );
+                    if persisted.completion_acknowledged {
+                        if !super::device_registry::incoming_completed_operation_recorded(
+                            app_root,
+                            source_device_id,
+                            &receipt_id,
+                        )? {
+                            return Err(PeerSyncError::Validation(
+                                "Android clone completion receipt is missing".to_owned(),
+                            ));
+                        }
+                    } else {
+                        super::device_registry::record_incoming_completed_operation_once(
+                            app_root,
+                            source_device_id,
+                            &receipt_id,
+                            ledger_total,
+                        )?;
+                    }
                 }
-            } else {
-                super::device_registry::record_incoming_completed_operation_once(
-                    app_root,
-                    source_device_id,
-                    &receipt_id,
-                    ledger_total,
-                )?;
+                PeerCompletionCapability::V1 => {
+                    let completion_lease_id =
+                        persisted.completion_lease_id.as_deref().ok_or_else(|| {
+                            PeerSyncError::Validation(
+                                "Android clone completion lease is missing".to_owned(),
+                            )
+                        })?;
+                    let delivery = super::device_registry::PendingCompletionDelivery {
+                        source_device_id: source_device_id.to_owned(),
+                        lane: super::device_registry::CompletionLane::Clone
+                            .as_str()
+                            .to_owned(),
+                        completion_lease_id: completion_lease_id.to_owned(),
+                        manifest_id: job.descriptor.manifest_id.clone(),
+                        useful_bytes: ledger_total,
+                        receipt_id: super::device_registry::completion_receipt_id(
+                            "clone",
+                            completion_lease_id,
+                            &job.descriptor.manifest_id,
+                        ),
+                    };
+                    if persisted.completion_acknowledged {
+                        if !super::device_registry::incoming_completion_is_durable(
+                            app_root, &delivery,
+                        )? {
+                            return Err(PeerSyncError::Validation(
+                                "Android clone completion receipt is missing".to_owned(),
+                            ));
+                        }
+                    } else {
+                        let delivered =
+                            super::client::prepare_and_deliver_registered_clone_completion(
+                                app_root,
+                                &root.join("credential.json"),
+                                &delivery,
+                            )?;
+                        if delivered {
+                            super::device_registry::finalize_incoming_completion_delivery(
+                                app_root, &delivery,
+                            )?;
+                        }
+                        if !super::device_registry::incoming_completion_is_durable(
+                            app_root, &delivery,
+                        )? {
+                            return Err(PeerSyncError::Validation(
+                                "Android clone completion is not durable".to_owned(),
+                            ));
+                        }
+                    }
+                }
             }
         }
         job.acknowledge_completion()
@@ -1373,7 +1438,7 @@ impl AndroidCloneJobRegistry {
             legacy_receipt,
             legacy_source_less,
         )?;
-        self.finish_durable_completion(&job.root, job_id)?;
+        self.finish_durable_completion(&job.root, job_id, &activation_root)?;
         let completed = AndroidResumableCloneJob::open(&job.root)?;
         if !completed.read_status()?.completion_acknowledged {
             return Err(PeerSyncError::Validation(
@@ -1442,6 +1507,13 @@ impl AndroidCloneJobRegistry {
                 Err(error) => return Err(error),
             };
             let status = job.read_status()?;
+            if status.committed_revision.is_none()
+                && job.client.source_device_id().is_some()
+                && pointer.as_deref() != Some(job_id.as_str())
+            {
+                job.discard()?;
+                continue;
+            }
             if status.committed_revision.is_none()
                 && job.client.source_device_id().is_some()
                 && !registered_android_job_source_is_current(&self.jobs_root, &job)?

@@ -2341,7 +2341,7 @@ fn unified_source_revoke_hook_invalidates_an_established_live_bearer() {
 }
 
 #[test]
-fn clone_terminal_progress_persists_last_seen_and_counts_a_retry_once() {
+fn clone_terminal_progress_persists_last_seen_without_legacy_source_accounting() {
     let (root, host) = host();
     let state = DeviceSyncSourceState::new_for_test(
         TransportPreparation {
@@ -2411,7 +2411,7 @@ fn clone_terminal_progress_persists_last_seen_and_counts_a_retry_once() {
     }
 
     let registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
-    assert_eq!(registry.devices()[0].total_bytes, total_bytes);
+    assert_eq!(registry.devices()[0].total_bytes, 0);
     assert!(registry.devices()[0].last_seen_ms > 0);
     state.stop().unwrap();
 }

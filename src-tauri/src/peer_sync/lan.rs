@@ -2650,19 +2650,6 @@ fn progress(
                 Ok(false) => {}
                 Err(_) => return respond_empty(stream, 500),
             }
-            let receipt_id =
-                completion_receipt_id("clone", session.session_id(), session.manifest_id());
-            if record_outgoing_completed_operation(
-                &registration.app_root,
-                device_id,
-                "clone",
-                &receipt_id,
-                progress.verified_bytes,
-            )
-            .is_err()
-            {
-                return respond_empty(stream, 500);
-            }
         }
     }
     respond_empty(stream, 204)

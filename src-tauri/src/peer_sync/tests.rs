@@ -1591,7 +1591,7 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
 }
 
 #[test]
-fn android_registered_clone_publish_revalidates_a_concurrently_removed_source() {
+fn android_registered_clone_publication_serializes_source_removal_after_revalidation() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
@@ -1648,18 +1648,40 @@ fn android_registered_clone_publish_revalidates_a_concurrently_removed_source() 
     });
 
     reached_publish.wait();
-    let removal = super::registry_commands::remove_incoming_source_if_inactive(
-        target_root.path(),
-        &removal_source_device_id,
-    );
+    assert!(!target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join("current.json")
+        .try_exists()
+        .unwrap());
+    let (removal_tx, removal_rx) = mpsc::channel();
+    let removal_root = target_root.path().to_owned();
+    let removal = thread::spawn(move || {
+        let result = (|| {
+            let _lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
+            if super::android_client::registered_clone_source_is_active(
+                &removal_root,
+                &removal_source_device_id,
+            )? {
+                return Err(PeerSyncError::Validation(
+                    "registered Android clone source is used by an active job".to_owned(),
+                ));
+            }
+            super::device_registry::remove_incoming_source(&removal_root, &removal_source_device_id)
+        })();
+        removal_tx.send(result).unwrap();
+    });
+    assert!(removal_rx.recv_timeout(Duration::from_millis(100)).is_err());
     resume_publish.wait();
-    removal.unwrap();
 
-    assert_eq!(
-        worker.join().unwrap().unwrap_err(),
-        PeerSyncError::Validation("registered Android clone source is unavailable".to_owned())
-    );
-    assert!(registry.current().unwrap().is_none());
+    worker.join().unwrap().unwrap();
+    assert!(matches!(
+        removal_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Err(PeerSyncError::Validation(message))
+            if message == "registered Android clone source is used by an active job"
+    ));
+    removal.join().unwrap();
+    assert!(registry.current().unwrap().is_some());
     host.stop().unwrap();
 }
 
@@ -1829,6 +1851,71 @@ fn android_clone_registry_removes_a_pre_ownership_partial_claim_after_restart() 
 
     assert!(registry.current().unwrap().is_none());
     assert!(!job_root.exists());
+}
+
+#[test]
+fn android_clone_recovery_discards_a_valid_registered_job_without_published_ownership() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    host.enable_v2_registry(
+        source_root.path(),
+        "Android source",
+        super::device_registry::DevicePermissions::read(),
+    )
+    .unwrap();
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registration_credential = target_root.path().join("registration-credential.json");
+    let _registration = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Android target",
+        &registration_credential,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let source_device_id =
+        super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+    let registered =
+        super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+            .unwrap()
+            .unwrap();
+    let target_device_id =
+        super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let started = registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
+        )
+        .unwrap();
+    let jobs_root = target_root.path().join("peer-clone-jobs");
+    let job_root = jobs_root.join(&started.job_id);
+    fs::remove_file(jobs_root.join("current.json")).unwrap();
+    drop(registry);
+
+    let recovered =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+
+    assert!(recovered.current().unwrap().is_none());
+    assert!(!job_root.exists());
+    assert!(
+        super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+            .unwrap()
+            .is_some()
+    );
+    host.stop().unwrap();
 }
 
 #[test]
@@ -2121,7 +2208,6 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
     assert!(!verified_job_root.join("cancel.requested").exists());
 
     drop(registry);
-    host.stop().unwrap();
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
 
@@ -2232,6 +2318,10 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
             if message == "Android clone completion bytes differ from its verified transfer ledger"
     ));
     let mut retry_status: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    let completion_lease_id = retry_status["completionLeaseId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     retry_status["completedBytes"] = Value::from(verified_bytes);
     retry_status["totalBytes"] = Value::from(verified_bytes);
     fs::write(&status_path, serde_json::to_vec(&retry_status).unwrap()).unwrap();
@@ -2269,7 +2359,7 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
     assert_eq!(accounted.sources()[0].total_bytes, verified_bytes);
     let expected_receipt = super::device_registry::completion_receipt_id(
         "clone",
-        &claimed.job_id,
+        &completion_lease_id,
         &pairing.manifest_id,
     );
     assert!(
@@ -2279,6 +2369,13 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
             &expected_receipt,
         )
         .unwrap()
+    );
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        verified_bytes
     );
     let completion_status: Value =
         serde_json::from_slice(&fs::read(verified_job_root.join("status.json")).unwrap()).unwrap();
@@ -2401,7 +2498,7 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
         target_root.path(),
         &source_device_id,
         &expected_receipt,
-        0,
+        verified_bytes,
     )
     .unwrap();
     registry.release(&claimed.job_id, &target_store).unwrap();
@@ -2419,6 +2516,7 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
         .join("peer-clone-jobs")
         .join(&claimed.job_id)
         .exists());
+    host.stop().unwrap();
     super::device_registry::remove_incoming_source(target_root.path(), &source_device_id).unwrap();
 }
 
@@ -2524,6 +2622,35 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
         .join("status.json");
     let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
     assert_ne!(persisted["completionAcknowledged"], true);
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        verified_bytes
+    );
+    let interrupted_sources: Value = serde_json::from_slice(
+        &fs::read(target_root.path().join("peer-sync/sources.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        interrupted_sources["sources"][0]["totalBytes"],
+        Value::from(u64::MAX)
+    );
+    assert_eq!(
+        interrupted_sources["pendingCompletionDeliveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        super::registry_commands::remove_incoming_source_if_inactive(
+            target_root.path(),
+            &source_device_id,
+        )
+        .is_err()
+    );
     assert!(registry.release(&claimed.job_id, &target_store).is_err());
     assert!(status_path.is_file());
     target_store
@@ -2554,13 +2681,10 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
         restarted.current().unwrap().unwrap().committed_revision,
         Some(2)
     );
-    let mut incoming =
-        super::device_registry::IncomingSourceRegistry::load(target_root.path()).unwrap();
-    incoming.remove(&source_device_id).unwrap();
-    let mut reset = registered;
-    reset.total_bytes = 0;
-    incoming.upsert(reset).unwrap();
-    incoming.save().unwrap();
+    let sources_path = target_root.path().join("peer-sync/sources.json");
+    let mut reset: Value = serde_json::from_slice(&fs::read(&sources_path).unwrap()).unwrap();
+    reset["sources"][0]["totalBytes"] = Value::from(0);
+    fs::write(&sources_path, serde_json::to_vec(&reset).unwrap()).unwrap();
 
     restarted.release(&claimed.job_id, &target_store).unwrap();
 
@@ -2568,6 +2692,13 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
         super::device_registry::IncomingSourceRegistry::load(target_root.path())
             .unwrap()
             .sources()[0]
+            .total_bytes,
+        verified_bytes
+    );
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
             .total_bytes,
         verified_bytes
     );
@@ -2699,31 +2830,6 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .unwrap();
     let target_device_id =
         super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
-    let accept_ready_clone_offer = |expected_bytes| {
-        let outgoing: Value = serde_json::from_slice(
-            &fs::read(source_root.path().join("peer-sync/devices.json")).unwrap(),
-        )
-        .unwrap();
-        let offer = outgoing["completionOffers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|offer| offer["lane"] == "clone" && offer["ready"] == true)
-            .unwrap();
-        assert_eq!(offer["transferredBytes"].as_u64(), Some(expected_bytes));
-        assert_eq!(
-            super::device_registry::accept_outgoing_completion_offer(
-                source_root.path(),
-                &target_device_id,
-                super::device_registry::CompletionLane::Clone,
-                offer["leaseId"].as_str().unwrap(),
-                offer["manifestId"].as_str().unwrap(),
-                expected_bytes,
-            )
-            .unwrap(),
-            super::device_registry::CompletionAcceptance::Recorded
-        );
-    };
     let first = registry
         .connect_registered(
             &registered.endpoint,
@@ -2758,9 +2864,42 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .total_bytes,
         first_total
     );
-    accept_ready_clone_offer(first_total);
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        first_total
+    );
     registry.release(&first.job_id, &target_store).unwrap();
+    let mut before_unsupported = target_store.read_root(None).unwrap().value;
+    before_unsupported["username"] = Value::from("Edited before unsupported clone");
+    let before_unsupported_commit: crate::persistent_store::WorkingSetCommit =
+        serde_json::from_value(json!({
+            "expectedRevision": 2,
+            "root": before_unsupported,
+        }))
+        .unwrap();
+    target_store.commit(&before_unsupported_commit).unwrap();
+    assert_eq!(target_store.revision().unwrap(), 3);
+    assert!(host.revoke(&target_device_id));
     let legacy_pairing = host.rotate_pairing_link().unwrap();
+    let _registration = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Android target",
+        &target_root
+            .path()
+            .join("registration-credential-after-revoke.json"),
+        &endpoint,
+        &legacy_pairing.session_id,
+        &legacy_pairing.manifest_id,
+        &legacy_pairing.claim,
+    )
+    .unwrap();
+    let registered =
+        super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+            .unwrap()
+            .unwrap();
     let legacy_no_backup = registry
         .connect_registered(
             &registered.endpoint,
@@ -2769,26 +2908,51 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry
         .download(&legacy_no_backup.job_id, &TransferCancellation::new())
         .unwrap();
     let legacy_total = registry.current().unwrap().unwrap().total_bytes.unwrap();
+    assert_eq!(host.devices()[0].verified_bytes, legacy_total);
     let legacy_receipt = registry
         .finalize(
             &legacy_no_backup.job_id,
             &mut target_store,
             &target_cas,
             &activation_root,
-            2,
+            3,
             &crate::local_backup::NeverCancelled,
         )
         .unwrap();
-    assert_eq!(legacy_receipt.revision, 2);
-    assert_eq!(legacy_receipt.backup_path, None);
-    accept_ready_clone_offer(legacy_total);
+    assert_eq!(legacy_receipt.revision, 4);
+    assert!(legacy_receipt.backup_path.as_ref().unwrap().is_file());
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        0
+    );
+    assert_eq!(
+        super::device_registry::IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()[0]
+            .total_bytes,
+        first_total + legacy_total
+    );
+    let unsupported_registry: Value = serde_json::from_slice(
+        &fs::read(target_root.path().join("peer-sync/sources.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        unsupported_registry["pendingCompletionDeliveries"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0
+    );
     target_store
         .remove_app_kv("peerCloneAndroidActiveOperation")
         .unwrap();
@@ -2817,17 +2981,17 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
         .unwrap();
     assert_eq!(migrated_witness["jobId"], legacy_no_backup.job_id);
     assert_eq!(migrated_witness["manifestId"], pairing.manifest_id);
-    assert_eq!(migrated_witness["revision"], 2);
+    assert_eq!(migrated_witness["revision"], 4);
     let mut post_clone_root = target_store.read_root(None).unwrap().value;
     post_clone_root["username"] = Value::from("Edited after first clone");
     let ordinary_commit: crate::persistent_store::WorkingSetCommit =
         serde_json::from_value(json!({
-            "expectedRevision": 2,
+            "expectedRevision": 4,
             "root": post_clone_root,
         }))
         .unwrap();
     target_store.commit(&ordinary_commit).unwrap();
-    assert_eq!(target_store.revision().unwrap(), 3);
+    assert_eq!(target_store.revision().unwrap(), 5);
     let second_pairing = host.rotate_pairing_link().unwrap();
     assert_eq!(second_pairing.manifest_id, pairing.manifest_id);
     let second = registry
@@ -2867,7 +3031,7 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
                 &mut target_store,
                 &target_cas,
                 &activation_root,
-                3,
+                5,
                 &crate::local_backup::NeverCancelled,
             )
             .unwrap_err(),
@@ -2896,12 +3060,12 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &mut target_store,
             &target_cas,
             &activation_root,
-            3,
+            5,
             &crate::local_backup::NeverCancelled,
         )
         .unwrap();
 
-    assert_eq!(second_receipt.revision, 4);
+    assert_eq!(second_receipt.revision, 6);
     let second_backup = second_receipt.backup_path.unwrap();
     assert!(second_backup.is_file());
     assert_eq!(
@@ -2915,13 +3079,74 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .total_bytes,
         first_total + legacy_total + second_total
     );
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        second_total
+    );
     assert!(first_backup.is_file());
     assert_eq!(
         fs::read_dir(activation_root.join("backups"))
             .unwrap()
             .count(),
-        2
+        3
     );
+
+    registry.release(&second.job_id, &target_store).unwrap();
+    let already_active = registry
+        .connect_registered(
+            &registered.endpoint,
+            &second_pairing.session_id,
+            &second_pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::V1,
+        )
+        .unwrap();
+    registry
+        .download(&already_active.job_id, &TransferCancellation::new())
+        .unwrap();
+    assert!(registry
+        .finalize(
+            &already_active.job_id,
+            &mut target_store,
+            &target_cas,
+            &activation_root,
+            6,
+            &crate::local_backup::NeverCancelled,
+        )
+        .is_err());
+    assert_eq!(
+        super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        second_total
+    );
+    assert_eq!(
+        super::device_registry::IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()[0]
+            .total_bytes,
+        first_total + legacy_total + second_total
+    );
+    let already_active_status = registry.current().unwrap().unwrap();
+    assert_eq!(already_active_status.backup_path, None);
+    let persisted_already_active: Value = serde_json::from_slice(
+        &fs::read(
+            target_root
+                .path()
+                .join("peer-clone-jobs")
+                .join(&already_active.job_id)
+                .join("status.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(persisted_already_active["completionAcknowledged"], true);
     host.stop().unwrap();
 }
 

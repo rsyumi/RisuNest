@@ -2,9 +2,10 @@ use super::device_registry::{
     accept_outgoing_completion_offer, finalize_incoming_completion_delivery,
     incoming_completed_operation_bytes_for_lane, incoming_completed_operation_recorded_for_lane,
     incoming_completion_is_durable, incoming_source_summaries,
-    issue_outgoing_unmeasured_completion_offer, outgoing_device_summaries,
-    prepare_incoming_completion_delivery, record_incoming_completed_operation,
-    record_incoming_completed_operation_best_effort,
+    issue_outgoing_measured_completion_offer, issue_outgoing_unmeasured_completion_offer,
+    outgoing_completion_receipt_matches,
+    outgoing_device_summaries, prepare_incoming_completion_delivery,
+    record_incoming_completed_operation, record_incoming_completed_operation_best_effort,
     record_incoming_completed_operation_once_for_lane, register_incoming_source,
     register_outgoing_claim, remove_incoming_source, revoke_outgoing_device,
     seal_outgoing_completion_lease, snapshot_incoming_completion_delivery, CompletionAcceptance,
@@ -117,6 +118,121 @@ fn incoming_completion_delivery_is_remote_first_durable_and_retry_safe() {
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
         16
+    );
+}
+
+#[test]
+fn zero_byte_clone_completion_persists_exact_receipts_on_both_sides() {
+    let source_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    register_outgoing_claim(
+        source_root.path(),
+        OutgoingDevice {
+            device_id: TARGET_ID.into(),
+            name: "Android target".into(),
+            bearer_digest: "a".repeat(64),
+            permissions: DevicePermissions::read(),
+            created_at_ms: 10,
+            last_seen_ms: 0,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    register_test_source(target_root.path(), 'c', 0);
+    let manifest_id = "d".repeat(64);
+    let lease = issue_outgoing_measured_completion_offer(
+        source_root.path(),
+        TARGET_ID,
+        CompletionLane::Clone,
+        &manifest_id,
+        0,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        seal_outgoing_completion_lease(
+            source_root.path(),
+            TARGET_ID,
+            CompletionLane::Clone,
+            lease.as_str(),
+            &manifest_id,
+            0,
+        )
+        .unwrap(),
+        CompletionSealStatus::Sealed
+    );
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            source_root.path(),
+            TARGET_ID,
+            CompletionLane::Clone,
+            lease.as_str(),
+            &manifest_id,
+            0,
+        )
+        .unwrap(),
+        CompletionAcceptance::Recorded
+    );
+    assert_eq!(
+        OutgoingDeviceRegistry::load(source_root.path())
+            .unwrap()
+            .devices()[0]
+            .total_bytes,
+        0
+    );
+    assert!(outgoing_completion_receipt_matches(
+        source_root.path(),
+        TARGET_ID,
+        CompletionLane::Clone,
+        lease.as_str(),
+        &manifest_id,
+        0,
+    )
+    .unwrap());
+
+    let delivery = PendingCompletionDelivery {
+        source_device_id: SOURCE_ID.to_owned(),
+        lane: CompletionLane::Clone.as_str().to_owned(),
+        completion_lease_id: lease.as_str().to_owned(),
+        manifest_id: manifest_id.clone(),
+        useful_bytes: 0,
+        receipt_id: super::device_registry::completion_receipt_id(
+            CompletionLane::Clone.as_str(),
+            lease.as_str(),
+            &manifest_id,
+        ),
+    };
+    assert_eq!(
+        prepare_incoming_completion_delivery(target_root.path(), delivery.clone()).unwrap(),
+        CompletionDeliveryPrepareStatus::Pending
+    );
+    assert_eq!(
+        finalize_incoming_completion_delivery(target_root.path(), &delivery).unwrap(),
+        CompletionDeliveryFinalizeStatus::Finalized
+    );
+    assert_eq!(
+        IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()[0]
+            .total_bytes,
+        0
+    );
+    assert!(incoming_completion_is_durable(target_root.path(), &delivery).unwrap());
+    assert_eq!(
+        prepare_incoming_completion_delivery(target_root.path(), delivery.clone()).unwrap(),
+        CompletionDeliveryPrepareStatus::AlreadyDurable
+    );
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            source_root.path(),
+            TARGET_ID,
+            CompletionLane::Clone,
+            lease.as_str(),
+            &manifest_id,
+            0,
+        )
+        .unwrap(),
+        CompletionAcceptance::AlreadyRecorded
     );
 }
 

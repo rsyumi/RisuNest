@@ -1,7 +1,11 @@
-use super::device_registry::CompletionLeaseId;
+use super::device_registry::{
+    load_or_create_device_id, prepare_incoming_completion_delivery,
+    snapshot_incoming_completion_delivery, CompletionDeliveryPrepareStatus, CompletionLane,
+    CompletionLeaseId, PendingCompletionDelivery,
+};
 use super::lan::{
     parse_completion_lease_headers, LanCloneClient, PeerCompletionCapability,
-    PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1,
+    PeerCompletionDelivery, PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1,
     PEER_COMPLETION_RESUME_HEADER,
 };
 use super::{
@@ -34,6 +38,72 @@ use std::{
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PERSISTED_MANIFEST_FILE: &str = "manifest.json";
+
+pub(crate) fn prepare_and_deliver_registered_clone_completion(
+    app_root: &Path,
+    credential_path: &Path,
+    delivery: &PendingCompletionDelivery,
+) -> Result<bool, PeerSyncError> {
+    match prepare_incoming_completion_delivery(app_root, delivery.clone())? {
+        CompletionDeliveryPrepareStatus::AlreadyDurable => return Ok(false),
+        CompletionDeliveryPrepareStatus::Pending => {}
+    }
+    let snapshot = snapshot_incoming_completion_delivery(
+        app_root,
+        &delivery.source_device_id,
+        CompletionLane::Clone,
+    )?
+    .ok_or_else(|| {
+        PeerSyncError::Validation("pending clone completion delivery is missing".to_owned())
+    })?;
+    if snapshot.delivery != *delivery {
+        return Err(PeerSyncError::Validation(
+            "pending clone completion delivery changed".to_owned(),
+        ));
+    }
+    let lan = LanCloneClient::open_persisted(credential_path)?;
+    let (endpoint, session_id, manifest_id) = lan.target_identity()?;
+    let target_device_id = load_or_create_device_id(app_root)?;
+    if delivery.lane != CompletionLane::Clone.as_str()
+        || delivery.manifest_id != manifest_id
+        || lan.registered_source_device_id() != Some(delivery.source_device_id.as_str())
+        || snapshot.source.device_id != delivery.source_device_id
+        || snapshot.source.endpoint != endpoint
+        || !snapshot.source.permissions.allows_read()
+        || !lan.matches_registered_credential(
+            endpoint,
+            session_id,
+            manifest_id,
+            &target_device_id,
+            &delivery.source_device_id,
+            &snapshot.source.bearer,
+        )?
+    {
+        return Err(PeerSyncError::Validation(
+            "registered clone completion credential changed".to_owned(),
+        ));
+    }
+    let hello = lan.hello_with_capabilities()?;
+    if hello.hello.device_id != delivery.source_device_id
+        || !hello.hello.permissions.allows_read()
+        || hello.completion != PeerCompletionCapability::V1
+    {
+        return Err(PeerSyncError::Protocol(
+            "registered clone completion capability changed".to_owned(),
+        ));
+    }
+    if lan.deliver_completion(
+        PeerCompletionCapability::V1,
+        &delivery.completion_lease_id,
+        delivery.useful_bytes,
+    )? != PeerCompletionDelivery::Delivered
+    {
+        return Err(PeerSyncError::Protocol(
+            "registered clone completion is unsupported".to_owned(),
+        ));
+    }
+    Ok(true)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DownloadReport {
@@ -1071,6 +1141,25 @@ fn transfer_order(manifest: &CloneManifest) -> Vec<String> {
         ordered.push(manifest.database.object.clone());
     }
     ordered
+}
+
+pub(crate) fn persisted_clone_manifest_total(
+    transfer_root: &Path,
+    expected_session_id: &str,
+    expected_manifest_id: &str,
+) -> Result<u64, PeerSyncError> {
+    let (manifest, _) = load_persisted_manifest(
+        &transfer_root.join(PERSISTED_MANIFEST_FILE),
+        Some(expected_manifest_id),
+        None,
+        Some(expected_session_id),
+    )?
+    .ok_or_else(|| PeerSyncError::Storage("persisted clone manifest is missing".to_owned()))?;
+    manifest
+        .objects
+        .values()
+        .try_fold(0_u64, |total, object| total.checked_add(object.size))
+        .ok_or_else(|| PeerSyncError::Storage("persisted clone byte count overflow".to_owned()))
 }
 
 fn load_persisted_manifest(
