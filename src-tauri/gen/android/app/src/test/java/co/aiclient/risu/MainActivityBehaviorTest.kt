@@ -2,8 +2,12 @@ package co.aiclient.risu
 
 import android.content.ComponentCallbacks2
 import androidx.core.view.WindowInsetsCompat
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class MainActivityBehaviorTest {
@@ -685,5 +689,117 @@ class MainActivityBehaviorTest {
 
     assertEquals(false, started)
     assertEquals(listOf("request", "enabled"), events)
+  }
+
+  @Test
+  fun `activity teardown removes the generation bridge before stopping generation only`() {
+    val events = mutableListOf<String>()
+    val owner = GenerationKeepAliveOwner()
+
+    owner.teardown(
+      removeJavascriptBridge = { events.add("remove-generation-bridge") },
+      stopGeneration = { events.add("stop-generation") },
+    )
+
+    assertEquals(listOf("remove-generation-bridge", "stop-generation"), events)
+  }
+
+  @Test
+  fun `activity teardown still stops generation when bridge removal fails`() {
+    var stopped = false
+    val owner = GenerationKeepAliveOwner()
+
+    assertThrows(IllegalStateException::class.java) {
+      owner.teardown(
+        removeJavascriptBridge = { error("bridge failure") },
+        stopGeneration = { stopped = true },
+      )
+    }
+
+    assertEquals(true, stopped)
+  }
+
+  @Test
+  fun `activity teardown rejects a late bridge begin after ownership closes`() {
+    var starts = 0
+    var stops = 0
+    val owner = GenerationKeepAliveOwner()
+
+    owner.teardown(
+      removeJavascriptBridge = {},
+      stopGeneration = { stops += 1 },
+    )
+
+    assertEquals(false, owner.begin { starts += 1; true })
+    owner.teardown(
+      removeJavascriptBridge = {},
+      stopGeneration = { stops += 1 },
+    )
+    assertEquals(0, starts)
+    assertEquals(1, stops)
+  }
+
+  @Test
+  fun `activity teardown waits for an admitted bridge begin before stopping`() {
+    val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+    val startEntered = CountDownLatch(1)
+    val teardownAttempted = CountDownLatch(1)
+    val releaseStart = CountDownLatch(1)
+    val owner = GenerationKeepAliveOwner()
+
+    val beginThread = thread(isDaemon = true) {
+      owner.begin {
+        events.add("start-enter")
+        startEntered.countDown()
+        assertEquals(true, releaseStart.await(5, TimeUnit.SECONDS))
+        events.add("start-exit")
+        true
+      }
+    }
+    assertEquals(true, startEntered.await(5, TimeUnit.SECONDS))
+    val teardownThread = thread(isDaemon = true) {
+      teardownAttempted.countDown()
+      owner.teardown(
+        removeJavascriptBridge = { events.add("remove-bridge") },
+        stopGeneration = { events.add("stop") },
+      )
+    }
+    assertEquals(true, teardownAttempted.await(5, TimeUnit.SECONDS))
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+    while (
+      teardownThread.state != Thread.State.BLOCKED &&
+      !events.contains("remove-bridge") &&
+      System.nanoTime() < deadline
+    ) {
+      Thread.yield()
+    }
+    assertEquals(Thread.State.BLOCKED, teardownThread.state)
+
+    releaseStart.countDown()
+    beginThread.join(5_000)
+    teardownThread.join(5_000)
+
+    assertEquals(false, beginThread.isAlive)
+    assertEquals(false, teardownThread.isAlive)
+    assertEquals(listOf("start-enter", "start-exit", "remove-bridge", "stop"), events)
+  }
+
+  @Test
+  fun `late end from a destroyed owner cannot stop a recreated owner generation`() {
+    val lifecycle = GenerationForegroundLifecycle()
+    val oldOwner = GenerationKeepAliveOwner()
+    val freshOwner = GenerationKeepAliveOwner()
+    var freshToken = -1L
+    var stops = 0
+
+    oldOwner.teardown({}, {})
+    assertEquals(true, freshOwner.begin {
+      lifecycle.begin { token -> freshToken = token; true }
+    })
+    assertEquals(true, lifecycle.activate(freshToken, 200, {}, {}))
+
+    assertEquals(false, oldOwner.end { lifecycle.end { stops += 1; true } })
+    assertEquals(true, freshOwner.end { lifecycle.end { stops += 1; true } })
+    assertEquals(1, stops)
   }
 }

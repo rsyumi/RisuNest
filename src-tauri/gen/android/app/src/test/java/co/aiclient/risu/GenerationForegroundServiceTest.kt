@@ -31,6 +31,54 @@ class GenerationForegroundServiceTest {
   }
 
   @Test
+  fun `teardown clears every nested generation and stops once`() {
+    val lifecycle = GenerationForegroundLifecycle()
+    var stops = 0
+
+    assertTrue(lifecycle.begin { true })
+    assertTrue(lifecycle.begin { true })
+    assertTrue(lifecycle.stopAll { stops += 1; true })
+    assertFalse(lifecycle.end { stops += 1; true })
+
+    assertEquals(1, stops)
+  }
+
+  @Test
+  fun `repeated teardown is idempotent and recreation begins from zero`() {
+    val lifecycle = GenerationForegroundLifecycle()
+    var starts = 0
+    var stops = 0
+
+    assertTrue(lifecycle.begin { starts += 1; true })
+    assertTrue(lifecycle.stopAll { stops += 1; true })
+    assertFalse(lifecycle.stopAll { stops += 1; true })
+    assertTrue(lifecycle.begin { starts += 1; true })
+    assertTrue(lifecycle.end { stops += 1; true })
+
+    assertEquals(2, starts)
+    assertEquals(2, stops)
+  }
+
+  @Test
+  fun `queued start invalidated by teardown cannot reactivate after recreation`() {
+    val lifecycle = GenerationForegroundLifecycle()
+    var staleToken = -1L
+    var freshToken = -1L
+    var foregroundStarts = 0
+    var staleStops = 0
+
+    assertTrue(lifecycle.begin { token -> staleToken = token; true })
+    assertTrue(lifecycle.stopAll { true })
+    assertTrue(lifecycle.begin { token -> freshToken = token; true })
+
+    assertFalse(lifecycle.activate(staleToken, 100, { foregroundStarts += 1 }, { staleStops += 1 }))
+    assertTrue(lifecycle.activate(freshToken, 101, { foregroundStarts += 1 }, { staleStops += 1 }))
+
+    assertEquals(1, foregroundStarts)
+    assertEquals(1, staleStops)
+  }
+
+  @Test
   fun `failed first start leaves no acquired generation`() {
     val lifecycle = GenerationForegroundLifecycle()
     var stops = 0

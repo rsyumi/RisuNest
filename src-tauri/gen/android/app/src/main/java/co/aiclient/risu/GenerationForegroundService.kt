@@ -49,6 +49,15 @@ internal class GenerationForegroundLifecycle {
   }
 
   @Synchronized
+  fun stopAll(stopService: () -> Boolean): Boolean {
+    if (count == 0) return false
+    count = 0
+    activeToken = INVALID_GENERATION_FOREGROUND_TOKEN
+    activeStartId = null
+    return stopService()
+  }
+
+  @Synchronized
   fun timeout(
     token: Long,
     startId: Int,
@@ -178,6 +187,12 @@ class GenerationForegroundService : Service() {
     }
 
     internal fun stop(context: Context): Boolean = lifecycle.end {
+      runCatching {
+        context.stopService(Intent(context, GenerationForegroundService::class.java))
+      }.getOrDefault(false)
+    }
+
+    internal fun stopAll(context: Context): Boolean = lifecycle.stopAll {
       runCatching {
         context.stopService(Intent(context, GenerationForegroundService::class.java))
       }.getOrDefault(false)

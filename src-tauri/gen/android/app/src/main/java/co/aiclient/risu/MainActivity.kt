@@ -389,6 +389,36 @@ internal fun beginGenerationKeepAlive(
   return startService()
 }
 
+internal class GenerationKeepAliveOwner {
+  private var closed = false
+
+  @Synchronized
+  fun begin(startGeneration: () -> Boolean): Boolean {
+    if (closed) return false
+    return startGeneration()
+  }
+
+  @Synchronized
+  fun end(stopGeneration: () -> Boolean): Boolean {
+    if (closed) return false
+    return stopGeneration()
+  }
+
+  @Synchronized
+  fun teardown(
+    removeJavascriptBridge: () -> Unit,
+    stopGeneration: () -> Unit,
+  ) {
+    if (closed) return
+    closed = true
+    try {
+      removeJavascriptBridge()
+    } finally {
+      stopGeneration()
+    }
+  }
+}
+
 private val postNotificationsRequestedInProcess = AtomicBoolean(false)
 
 class MainActivity : TauriActivity(), RendererRecoveryHost {
@@ -397,6 +427,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
   private val exitFlushGate = ExitFlushGate()
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
+  private val generationKeepAliveOwner = GenerationKeepAliveOwner()
   private val mainHandler = Handler(Looper.getMainLooper())
   private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private val safSourcePickFlow = SafSourcePickFlow { block -> safScope.launch { block() } }
@@ -638,7 +669,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safProgressDispatchMillis.clear()
     lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
     lifecycleWebView?.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
-    lifecycleWebView?.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
+    generationKeepAliveOwner.teardown(
+      removeJavascriptBridge = {
+        lifecycleWebView?.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
+      },
+      stopGeneration = { GenerationForegroundService.stopAll(this) },
+    )
     lifecycleWebView = null
     super.onDestroy()
   }
@@ -742,14 +778,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   private inner class GenerationKeepAliveBridge {
     @JavascriptInterface
-    fun begin(): Boolean = beginGenerationKeepAlive(
-      requestNotifications = ::requestPostNotificationsForForegroundService,
-      notificationsEnabled = { GenerationForegroundService.notificationsEnabled(this@MainActivity) },
-      startService = { GenerationForegroundService.start(this@MainActivity) },
-    )
+    fun begin(): Boolean = generationKeepAliveOwner.begin {
+      beginGenerationKeepAlive(
+        requestNotifications = ::requestPostNotificationsForForegroundService,
+        notificationsEnabled = { GenerationForegroundService.notificationsEnabled(this@MainActivity) },
+        startService = { GenerationForegroundService.start(this@MainActivity) },
+      )
+    }
 
     @JavascriptInterface
-    fun end(): Boolean = GenerationForegroundService.stop(this@MainActivity)
+    fun end(): Boolean = generationKeepAliveOwner.end {
+      GenerationForegroundService.stop(this@MainActivity)
+    }
 
     @JavascriptInterface
     fun notificationsEnabled(): Boolean = GenerationForegroundService.notificationsEnabled(this@MainActivity)
