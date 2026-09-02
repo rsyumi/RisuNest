@@ -2771,10 +2771,16 @@ fn one_listener_routes_all_lanes_and_hello_returns_exact_descriptors() {
         hello["lanes"]["bidirectional"]["sessionId"],
         "00000000-0000-4000-8000-000000000012"
     );
-    for lane in [
-        pairing.session_id.as_str(),
-        "00000000-0000-4000-8000-000000000011",
-        "00000000-0000-4000-8000-000000000012",
+    for (lane, expected_status) in [
+        (pairing.session_id.as_str(), reqwest::StatusCode::OK),
+        (
+            "00000000-0000-4000-8000-000000000011",
+            reqwest::StatusCode::OK,
+        ),
+        (
+            "00000000-0000-4000-8000-000000000012",
+            reqwest::StatusCode::FORBIDDEN,
+        ),
     ] {
         assert_eq!(
             reqwest::blocking::Client::new()
@@ -2783,7 +2789,7 @@ fn one_listener_routes_all_lanes_and_hello_returns_exact_descriptors() {
                 .send()
                 .unwrap()
                 .status(),
-            reqwest::StatusCode::OK
+            expected_status
         );
     }
     let manifest: serde_json::Value = reqwest::blocking::Client::new()
