@@ -465,6 +465,12 @@ struct DeviceSyncRuntime {
 }
 
 #[cfg(desktop)]
+struct DeviceSyncRotationFailure {
+    category: DeviceSyncErrorCategory,
+    error: PeerSyncError,
+}
+
+#[cfg(desktop)]
 pub(crate) trait SharedPublicOriginVerifier: Send + Sync {
     fn verify(&self, host: &SharedSessionHost, public_url: &url::Url) -> Result<(), PeerSyncError>;
 }
@@ -846,28 +852,62 @@ where
         Ok(Self::status_from_runtime(&runtime))
     }
 
-    pub(crate) fn rotate_link(
+    fn rotate_link(
         &self,
         permissions: DeviceSyncLinkPermissions,
-    ) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
-        let _operation = self.lock_operation()?;
+    ) -> Result<DeviceSyncSourceStatus, DeviceSyncRotationFailure> {
+        let _operation = self.lock_operation().map_err(|error| {
+            self.record_error_category(DeviceSyncErrorCategory::StateUnavailable);
+            DeviceSyncRotationFailure {
+                category: DeviceSyncErrorCategory::StateUnavailable,
+                error,
+            }
+        })?;
+        {
+            let mut runtime = self
+                .lock_runtime()
+                .map_err(|error| DeviceSyncRotationFailure {
+                    category: DeviceSyncErrorCategory::StateUnavailable,
+                    error,
+                })?;
+            runtime.latest_error = None;
+        }
         if !permissions.read {
             let error = PeerSyncError::Validation(
                 "device sync sharing requires read permission".to_owned(),
             );
-            let mut runtime = self.lock_runtime()?;
+            let mut runtime = self
+                .lock_runtime()
+                .map_err(|error| DeviceSyncRotationFailure {
+                    category: DeviceSyncErrorCategory::StateUnavailable,
+                    error,
+                })?;
             if runtime.phase == DeviceSyncSourcePhase::Running {
                 runtime.latest_error = Some(DeviceSyncErrorCategory::InvalidConfiguration);
-                return Err(error);
+            } else {
+                runtime.phase = DeviceSyncSourcePhase::Error;
+                runtime.latest_error = Some(DeviceSyncErrorCategory::InvalidConfiguration);
             }
-            drop(runtime);
-            return self.fail(DeviceSyncErrorCategory::InvalidConfiguration, error);
+            return Err(DeviceSyncRotationFailure {
+                category: DeviceSyncErrorCategory::InvalidConfiguration,
+                error,
+            });
         }
-        if self.lock_runtime()?.phase != DeviceSyncSourcePhase::Running {
-            return self.fail(
-                DeviceSyncErrorCategory::StateUnavailable,
-                PeerSyncError::Protocol("device sync source is not running".to_owned()),
-            );
+        {
+            let mut runtime = self
+                .lock_runtime()
+                .map_err(|error| DeviceSyncRotationFailure {
+                    category: DeviceSyncErrorCategory::StateUnavailable,
+                    error,
+                })?;
+            if runtime.phase != DeviceSyncSourcePhase::Running {
+                runtime.phase = DeviceSyncSourcePhase::Error;
+                runtime.latest_error = Some(DeviceSyncErrorCategory::StateUnavailable);
+                return Err(DeviceSyncRotationFailure {
+                    category: DeviceSyncErrorCategory::StateUnavailable,
+                    error: PeerSyncError::Protocol("device sync source is not running".to_owned()),
+                });
+            }
         }
         let host_permissions = if permissions.bidirectional {
             DevicePermissions::read_and_bidirectional()
@@ -877,8 +917,23 @@ where
         let rotated = self.lifecycle.with_host_mut(|host| {
             host.set_pairing_permissions(host_permissions)?;
             host.rotate_link()
-        })??;
-        let mut runtime = self.lock_runtime()?;
+        });
+        let rotated = match rotated {
+            Ok(Ok(pairing)) => pairing,
+            Ok(Err(error)) | Err(error) => {
+                self.record_error_category(DeviceSyncErrorCategory::StateUnavailable);
+                return Err(DeviceSyncRotationFailure {
+                    category: DeviceSyncErrorCategory::StateUnavailable,
+                    error,
+                });
+            }
+        };
+        let mut runtime = self
+            .lock_runtime()
+            .map_err(|error| DeviceSyncRotationFailure {
+                category: DeviceSyncErrorCategory::StateUnavailable,
+                error,
+            })?;
         runtime.pairing = Some(rotated);
         runtime.latest_error = None;
         runtime.phase = DeviceSyncSourcePhase::Running;
@@ -950,6 +1005,11 @@ where
             .lock()
             .ok()
             .and_then(|runtime| runtime.pairing.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_host_for_test(&self) -> Result<(), PeerSyncError> {
+        self.lifecycle.stop()
     }
 
     fn fail<T>(
@@ -1050,31 +1110,6 @@ where
 }
 
 #[cfg(desktop)]
-fn device_sync_rotate_link_failure<P>(
-    state: &DeviceSyncSourceState<P>,
-    error: PeerSyncError,
-) -> DeviceSyncErrorCategory
-where
-    P: SharedSourceOwnership<Host = SharedSessionHost>,
-{
-    crate::nlog!("error", "device sync link rotation failed: {error}");
-    let status = state.status().ok();
-    let category = status
-        .as_ref()
-        .and_then(|status| status.latest_error)
-        .unwrap_or(DeviceSyncErrorCategory::StateUnavailable);
-    let is_recoverable_configuration_error = category
-        == DeviceSyncErrorCategory::InvalidConfiguration
-        && status.as_ref().is_some_and(|status| {
-            status.phase == DeviceSyncSourcePhase::Running && status.pairing_uri.is_some()
-        });
-    if !is_recoverable_configuration_error {
-        state.record_error_category(category);
-    }
-    category
-}
-
-#[cfg(desktop)]
 pub(crate) async fn run_device_sync_rotate_link<P>(
     state: DeviceSyncSourceState<P>,
     permissions: DeviceSyncLinkPermissions,
@@ -1082,12 +1117,18 @@ pub(crate) async fn run_device_sync_rotate_link<P>(
 where
     P: SharedSourceOwnership<Host = SharedSessionHost> + Send + 'static,
 {
-    state.clear_error_category();
     let worker_state = state.clone();
     match tauri::async_runtime::spawn_blocking(move || worker_state.rotate_link(permissions)).await
     {
         Ok(Ok(status)) => Ok(status),
-        Ok(Err(error)) => Err(device_sync_rotate_link_failure(&state, error)),
+        Ok(Err(failure)) => {
+            crate::nlog!(
+                "error",
+                "device sync link rotation failed: {}",
+                failure.error
+            );
+            Err(failure.category)
+        }
         Err(error) => Err(device_sync_command_failure(
             &state,
             "link rotation worker",

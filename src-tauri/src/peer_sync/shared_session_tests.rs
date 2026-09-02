@@ -1147,8 +1147,8 @@ fn command_invalid_rotation_preserves_status_and_allows_corrected_rotation() {
 }
 
 #[test]
-fn command_fatal_rotation_failure_still_enters_error_state() {
-    let (_root, host) = host();
+fn overlapping_command_rotations_keep_results_bound_to_each_operation() {
+    let (root, host) = host();
     let state = DeviceSyncSourceState::new_for_test(
         TransportPreparation {
             host: Some(host),
@@ -1156,6 +1156,109 @@ fn command_fatal_rotation_failure_still_enters_error_state() {
         },
         Ipv4Addr::LOCALHOST,
     );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    let initial = state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+    let initial_pairing = state.pairing_for_test().unwrap();
+    let bearer = claim(&initial_pairing, "00000000-0000-4000-8000-000000000033")
+        .json::<serde_json::Value>()
+        .unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let invalid_state = state.clone();
+    let invalid_barrier = Arc::clone(&barrier);
+    let invalid = std::thread::spawn(move || {
+        invalid_barrier.wait();
+        tauri::async_runtime::block_on(run_device_sync_rotate_link(
+            invalid_state,
+            DeviceSyncLinkPermissions {
+                read: false,
+                bidirectional: false,
+            },
+        ))
+    });
+    let valid_state = state.clone();
+    let valid_barrier = Arc::clone(&barrier);
+    let valid = std::thread::spawn(move || {
+        valid_barrier.wait();
+        tauri::async_runtime::block_on(run_device_sync_rotate_link(
+            valid_state,
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: true,
+            },
+        ))
+    });
+    barrier.wait();
+
+    assert_eq!(
+        invalid.join().unwrap(),
+        Err(super::shared_session::DeviceSyncErrorCategory::InvalidConfiguration)
+    );
+    let rotated = valid.join().unwrap().unwrap();
+    assert_eq!(rotated.phase, DeviceSyncSourcePhase::Running);
+    assert_ne!(rotated.pairing_uri, initial.pairing_uri);
+    let final_status = state.status().unwrap();
+    assert_eq!(final_status.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(final_status.endpoint, initial.endpoint);
+    assert_eq!(final_status.pairing_uri, rotated.pairing_uri);
+    assert_eq!(
+        reqwest::blocking::Client::new()
+            .get(format!("{}/v1/peer/hello", initial_pairing.endpoint))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    state.stop().unwrap();
+}
+
+#[test]
+fn command_active_host_rotation_failure_enters_error_state() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    let initial = state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .unwrap();
+    state.remove_host_for_test().unwrap();
 
     let result = tauri::async_runtime::block_on(run_device_sync_rotate_link(
         state.clone(),
@@ -1175,7 +1278,7 @@ fn command_fatal_rotation_failure_still_enters_error_state() {
         status.latest_error,
         Some(super::shared_session::DeviceSyncErrorCategory::StateUnavailable)
     );
-    assert_eq!(status.pairing_uri, None);
+    assert_eq!(status.pairing_uri, initial.pairing_uri);
 }
 
 struct FailingSharedTunnelLauncher;
