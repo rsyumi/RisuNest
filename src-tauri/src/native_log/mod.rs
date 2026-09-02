@@ -101,8 +101,9 @@ impl NativeLogState {
         }
     }
 
-    pub(crate) fn record_panic(&self, file: &str, line: u32, column: u32) {
-        let message = format!("panic captured at {file}:{line}:{column}");
+    pub(crate) fn record_panic(&self, payload: Option<&str>, file: &str, line: u32, column: u32) {
+        let payload = payload.unwrap_or("non-string panic payload");
+        let message = format!("panic captured at {file}:{line}:{column}: {payload}");
         self.record("panic", "panic", &message);
     }
 
@@ -457,10 +458,22 @@ fn install_panic_hook_once_for(installed: &Once, state: NativeLogState) {
 fn install_panic_hook_for(state: NativeLogState) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
         if let Some(location) = info.location() {
-            state.record_panic(location.file(), location.line(), location.column());
+            state.record_panic(payload, location.file(), location.line(), location.column());
         } else {
-            state.record("panic", "panic", "panic captured");
+            state.record(
+                "panic",
+                "panic",
+                format!(
+                    "panic captured: {}",
+                    payload.unwrap_or("non-string panic payload")
+                ),
+            );
         }
         previous(info);
     }));

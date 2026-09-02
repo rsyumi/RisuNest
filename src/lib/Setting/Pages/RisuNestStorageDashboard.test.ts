@@ -22,6 +22,7 @@ vi.mock('src/ts/platform', () => ({ isTauri: true }))
 vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
+import { languageKorean } from 'src/lang/ko'
 
 const stats = {
     databaseBytes: 1024 * 1024,
@@ -109,6 +110,22 @@ describe('RisuNestStorageDashboard', () => {
         const peerDelete = [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.dataset.path === 'peer.risudat')
         peerDelete?.click()
         await vi.waitFor(() => expect(alerts.alertError).toHaveBeenCalledWith("This backup is used by a sync in progress and can't be deleted."))
+    })
+
+    it('uses a dedicated localized confirmation before deleting a conflict backup', async () => {
+        const target = setup()
+        alerts.alertConfirm.mockResolvedValue(false)
+        await vi.waitFor(() => expect(target.textContent).toContain('Conflict backups'))
+
+        const conflictRow = target.querySelectorAll<HTMLElement>('[data-storage-backup-list]')[1]
+        conflictRow?.querySelector<HTMLButtonElement>('button')?.click()
+
+        await vi.waitFor(() => expect(alerts.alertConfirm).toHaveBeenCalledWith(
+            'Delete this conflict backup? This conflict backup cannot be recovered after deletion.',
+        ))
+        expect(backups.remove).not.toHaveBeenCalled()
+        expect(languageKorean.risuNest.storage.deleteConflictBackupConfirm)
+            .toBe('이 충돌 백업을 삭제할까요? 삭제한 충돌 백업은 복구할 수 없습니다.')
     })
 
     it('surfaces a temporary-size failure with safe localized copy', async () => {

@@ -91,7 +91,7 @@
     }
 
     async function deleteConflictBackup(id: string): Promise<void> {
-        if (!await alertConfirm(language.risuNest.storage.deleteSnapshotConfirm)) return
+        if (!await alertConfirm(language.risuNest.storage.deleteConflictBackupConfirm)) return
         try { await dashboard.deleteConflictBackup(id) } catch (error) { showActionError(error) }
     }
 

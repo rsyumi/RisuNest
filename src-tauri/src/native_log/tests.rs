@@ -251,12 +251,21 @@ fn file_write_failure_is_nonfatal_when_log_root_is_a_file() {
 }
 
 #[test]
-fn panic_capture_excludes_raw_payload_and_includes_location() {
+fn panic_capture_masks_payload_and_includes_location() {
     let state = NativeLogState::for_tests();
-    state.record_panic("file.rs", 42, 7);
+    state.record_panic(
+        Some("request failed with Authorization: Bearer fixture-panic-secret"),
+        "file.rs",
+        42,
+        7,
+    );
     let entry = state.tail(None).pop().unwrap();
     assert_eq!(entry.level, "panic");
-    assert_eq!(entry.message, "panic captured at file.rs:42:7");
+    assert_eq!(
+        entry.message,
+        "panic captured at file.rs:42:7: request failed with Authorization: ***"
+    );
+    assert!(!entry.message.contains("fixture-panic-secret"));
 }
 
 #[test]
@@ -414,7 +423,9 @@ fn panic_hook_masks_sensitive_payload_in_native_log_while_preserving_previous_ho
         previous_calls_by_hook.fetch_add(1, Ordering::SeqCst);
     }));
     install_panic_hook_for(state.clone());
-    let _ = std::panic::catch_unwind(|| panic!("database password is fixture-panic-secret"));
+    let _ = std::panic::catch_unwind(|| {
+        panic!("request failed with Authorization: Bearer fixture-panic-secret")
+    });
     let installed = std::panic::take_hook();
     std::panic::set_hook(original);
     drop(installed);
@@ -422,5 +433,51 @@ fn panic_hook_masks_sensitive_payload_in_native_log_while_preserving_previous_ho
     assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
     let entry = state.tail(Some(1)).pop().unwrap();
     assert!(!entry.message.contains("fixture-panic-secret"));
+    assert!(entry
+        .message
+        .contains("request failed with Authorization: ***"));
     assert!(entry.message.contains("panic captured at"));
+}
+
+#[test]
+fn panic_hook_records_str_and_string_payloads_with_location() {
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
+    let state = NativeLogState::for_tests();
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    install_panic_hook_for(state.clone());
+
+    let _ = std::panic::catch_unwind(|| panic!("literal panic context"));
+    let _ = std::panic::catch_unwind(|| std::panic::panic_any(String::from("owned panic context")));
+
+    let installed = std::panic::take_hook();
+    std::panic::set_hook(original);
+    drop(installed);
+
+    let entries = state.tail(None);
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].message.contains("literal panic context"));
+    assert!(entries[0].message.contains("tests.rs"));
+    assert!(entries[1].message.contains("owned panic context"));
+    assert!(entries[1].message.contains("tests.rs"));
+}
+
+#[test]
+fn panic_hook_uses_a_safe_label_for_non_string_payloads() {
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
+    let state = NativeLogState::for_tests();
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    install_panic_hook_for(state.clone());
+
+    let _ = std::panic::catch_unwind(|| std::panic::panic_any(42_u8));
+
+    let installed = std::panic::take_hook();
+    std::panic::set_hook(original);
+    drop(installed);
+
+    let entry = state.tail(Some(1)).pop().unwrap();
+    assert!(entry.message.contains("non-string panic payload"));
+    assert!(entry.message.contains("tests.rs"));
+    assert!(!entry.message.contains("42"));
 }
