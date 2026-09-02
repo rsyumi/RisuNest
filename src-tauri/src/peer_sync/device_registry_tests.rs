@@ -1231,9 +1231,9 @@ fn incoming_registry_stores_bearer_and_revoke_replaces_file_atomically() {
 #[test]
 fn outgoing_completion_receipt_survives_restart_and_prevents_retry_double_counting() {
     let root = tempfile::tempdir().unwrap();
-    let mut registry = OutgoingDeviceRegistry::load(root.path()).unwrap();
-    registry
-        .upsert(OutgoingDevice {
+    register_outgoing_claim(
+        root.path(),
+        OutgoingDevice {
             device_id: TARGET_ID.into(),
             name: "Target".into(),
             bearer_digest: "a".repeat(64),
@@ -1241,21 +1241,66 @@ fn outgoing_completion_receipt_survives_restart_and_prevents_retry_double_counti
             created_at_ms: 10,
             last_seen_ms: 20,
             total_bytes: 30,
-        })
-        .unwrap();
-    registry.save().unwrap();
+        },
+    )
+    .unwrap();
+    let manifest_id = "b".repeat(64);
+    let lease = issue_outgoing_measured_completion_offer(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Clone,
+        &manifest_id,
+        12,
+        None,
+    )
+    .unwrap();
+    seal_outgoing_completion_lease(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Clone,
+        lease.as_str(),
+        &manifest_id,
+        12,
+    )
+    .unwrap();
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Clone,
+            lease.as_str(),
+            &manifest_id,
+            12,
+        )
+        .unwrap(),
+        CompletionAcceptance::Recorded
+    );
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            TARGET_ID,
+            CompletionLane::Clone,
+            lease.as_str(),
+            &manifest_id,
+            12,
+        )
+        .unwrap(),
+        CompletionAcceptance::AlreadyRecorded
+    );
 
-    registry
-        .record_completed_operation(TARGET_ID, "clone", &"b".repeat(64), 12, 40)
-        .unwrap();
-    let mut restarted = OutgoingDeviceRegistry::load(root.path()).unwrap();
-    restarted
-        .record_completed_operation(TARGET_ID, "clone", &"b".repeat(64), 12, 41)
-        .unwrap();
-
-    let restored = OutgoingDeviceRegistry::load(root.path()).unwrap();
-    assert_eq!(restored.devices()[0].total_bytes, 42);
-    assert_eq!(restored.devices()[0].last_seen_ms, 41);
+    assert_eq!(
+        OutgoingDeviceRegistry::load(root.path()).unwrap().devices()[0].total_bytes,
+        42
+    );
+    assert!(outgoing_completion_receipt_matches(
+        root.path(),
+        TARGET_ID,
+        CompletionLane::Clone,
+        lease.as_str(),
+        &manifest_id,
+        12,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -1280,19 +1325,66 @@ fn outgoing_receipts_are_not_evicted_while_their_devices_remain_registered() {
     }
     registry.save().unwrap();
 
+    let mut completions = Vec::with_capacity(device_ids.len());
     for (index, device_id) in device_ids.iter().enumerate() {
-        registry
-            .record_completed_operation(device_id, "clone", &format!("{index:064x}"), 1, 40)
-            .unwrap();
-    }
-    let mut restarted = OutgoingDeviceRegistry::load(root.path()).unwrap();
-    restarted
-        .record_completed_operation(&device_ids[0], "clone", &"0".repeat(64), 1, 41)
+        let manifest_id = format!("{index:064x}");
+        let lease = issue_outgoing_measured_completion_offer(
+            root.path(),
+            device_id,
+            CompletionLane::Clone,
+            &manifest_id,
+            1,
+            None,
+        )
         .unwrap();
+        seal_outgoing_completion_lease(
+            root.path(),
+            device_id,
+            CompletionLane::Clone,
+            lease.as_str(),
+            &manifest_id,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            accept_outgoing_completion_offer(
+                root.path(),
+                device_id,
+                CompletionLane::Clone,
+                lease.as_str(),
+                &manifest_id,
+                1,
+            )
+            .unwrap(),
+            CompletionAcceptance::Recorded
+        );
+        completions.push((lease, manifest_id));
+    }
+    let (first_lease, first_manifest) = &completions[0];
+    assert_eq!(
+        accept_outgoing_completion_offer(
+            root.path(),
+            &device_ids[0],
+            CompletionLane::Clone,
+            first_lease.as_str(),
+            first_manifest,
+            1,
+        )
+        .unwrap(),
+        CompletionAcceptance::AlreadyRecorded
+    );
 
     let restored = OutgoingDeviceRegistry::load(root.path()).unwrap();
     assert_eq!(restored.devices()[0].total_bytes, 1);
-    assert_eq!(restored.devices()[0].last_seen_ms, 41);
+    assert!(outgoing_completion_receipt_matches(
+        root.path(),
+        &device_ids[0],
+        CompletionLane::Clone,
+        first_lease.as_str(),
+        first_manifest,
+        1,
+    )
+    .unwrap());
 }
 
 #[test]

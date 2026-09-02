@@ -408,62 +408,6 @@ impl OutgoingDeviceRegistry {
         Ok(())
     }
 
-    pub(crate) fn record_completed_operation(
-        &mut self,
-        device_id: &str,
-        lane: &str,
-        receipt_id: &str,
-        bytes: u64,
-        seen_at_ms: u64,
-    ) -> Result<(), PeerSyncError> {
-        validate_id(device_id)?;
-        validate_receipt_lane(lane)?;
-        validate_receipt_id(receipt_id)?;
-        if self
-            .completion_offers
-            .iter()
-            .any(|offer| offer.device_id == device_id && offer.lane == lane)
-        {
-            return invalid("deferred peer completion lease is active");
-        }
-        let mut devices = self.devices.clone();
-        let mut receipts = self.completed_receipts.clone();
-        let device = devices
-            .iter_mut()
-            .find(|item| item.device_id == device_id)
-            .ok_or_else(|| {
-                PeerSyncError::Validation("registered outgoing device is missing".to_owned())
-            })?;
-        device.last_seen_ms = device.last_seen_ms.max(seen_at_ms);
-        let retained = receipts
-            .iter_mut()
-            .find(|receipt| receipt.device_id == device_id && receipt.lane == lane);
-        if !retained
-            .as_ref()
-            .is_some_and(|receipt| receipt.receipt_id == receipt_id)
-        {
-            device.total_bytes = device
-                .total_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| PeerSyncError::Validation("peer total bytes overflow".to_owned()))?;
-            if let Some(retained) = retained {
-                retained.receipt_id = receipt_id.to_owned();
-                retained.transferred_bytes = Some(bytes);
-            } else {
-                receipts.push(CompletionReceipt {
-                    device_id: device_id.to_owned(),
-                    lane: lane.to_owned(),
-                    receipt_id: receipt_id.to_owned(),
-                    transferred_bytes: Some(bytes),
-                });
-            }
-        }
-        self.write_state(&devices, &receipts, &self.completion_offers)?;
-        self.devices = devices;
-        self.completed_receipts = receipts;
-        Ok(())
-    }
-
     pub(crate) fn issue_completion_lease(
         &mut self,
         device_id: &str,
@@ -1471,21 +1415,6 @@ pub(crate) fn completion_receipt_id(lane: &str, operation_id: &str, manifest_id:
         hasher.update(value.as_bytes());
     }
     hex::encode(hasher.finalize())
-}
-
-pub(crate) fn record_outgoing_completed_operation(
-    app_root: &Path,
-    device_id: &str,
-    lane: &str,
-    receipt_id: &str,
-    bytes: u64,
-) -> Result<(), PeerSyncError> {
-    let seen_at_ms = completion_timestamp_ms()?;
-    let _guard = outgoing_registry_lock()
-        .lock()
-        .map_err(|_| PeerSyncError::Storage("outgoing peer registry lock failed".to_owned()))?;
-    let mut registry = OutgoingDeviceRegistry::load(app_root)?;
-    registry.record_completed_operation(device_id, lane, receipt_id, bytes, seen_at_ms)
 }
 
 pub(crate) fn issue_outgoing_measured_completion_offer(
