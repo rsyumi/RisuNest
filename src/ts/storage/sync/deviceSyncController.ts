@@ -307,6 +307,7 @@ export function createDeviceSyncController(options: {
         try {
             update({ stagedLink: parseDeviceSyncUri(uri), stagedSourceDeviceId: null, error: null })
         } catch (error) {
+            update({ stagedLink: null, stagedSourceDeviceId: null })
             fail(error)
         }
     }

@@ -14,6 +14,13 @@ const database = vi.hoisted(() => ({
     characters: [{ chaId: 'char-a', name: 'Aster', chats: [{ id: 'chat-a', name: 'First meeting' }] }],
 }))
 const qrCode = vi.hoisted(() => ({ toDataURL: vi.fn<(uri: string) => Promise<string>>() }))
+const deepLinks = vi.hoisted(() => {
+    let listener: ((uri: string) => void) | undefined
+    return {
+        subscribe: vi.fn((next: (uri: string) => void) => { listener = next; return () => { listener = undefined } }),
+        emit: (uri: string) => listener?.(uri),
+    }
+})
 const controllerState = vi.hoisted(() => {
     let listener: ((snapshot: unknown) => void) | undefined
     const controller = {
@@ -34,9 +41,13 @@ vi.mock('src/ts/storage/deviceSettings', () => ({
     updateDeviceSettings: (partial: Record<string, unknown>) => Object.assign(settingsState.value, partial),
 }))
 vi.mock('src/ts/storage/sync/deviceSyncProduction', () => ({ getProductionDeviceSyncController: () => controllerState.controller }))
+vi.mock('src/ts/storage/sync/peerCloneDeepLink', () => ({ subscribeDeviceSyncUri: deepLinks.subscribe }))
 vi.mock('src/ts/storage/sync/peerSyncShared', () => ({ androidPeerSyncNotificationsEnabled: () => environment.notifications }))
 vi.mock('src/ts/storage/database.svelte', () => ({ getDatabase: () => database }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
+vi.mock('src/lang', async () => {
+    const language = (await import('src/lang/en')).languageEnglish
+    return { language: { ...language, risuNest: { ...language.risuNest, sync: { ...language.risuNest.sync, menuTitle: '기기 동기화' } } } }
+})
 vi.mock('qrcode', () => ({ default: { toDataURL: qrCode.toDataURL } }))
 
 import DeviceSyncSettings from './DeviceSyncSettings.svelte'
@@ -130,6 +141,16 @@ describe('DeviceSyncSettings', () => {
         expect(target.textContent).not.toContain('raw native secret')
     })
 
+    it('preserves a concrete safe category from a rejected sharing action', async () => {
+        controllerState.controller.prepare.mockRejectedValueOnce('port-unavailable')
+        await render()
+
+        button('Start sharing')!.click()
+
+        await vi.waitFor(() => expect(target.querySelector('[data-page-error]')?.textContent)
+            .toBe('That port is already in use. Choose another port.'))
+    })
+
     it('selects only incoming targets without contacting them and revokes each direction separately', async () => {
         await render(snapshot({
             devices: [{ deviceId: 'out-a', name: 'Outgoing', permissions: ['read', 'bidirectional'], totalBytes: 2048 }],
@@ -144,6 +165,46 @@ describe('DeviceSyncSettings', () => {
         removeButtons[1].click(); await vi.waitFor(() => expect(controllerState.controller.revokeIncoming).toHaveBeenCalledWith('in-a'))
         expect(target.textContent).toContain('2.0 KiB total')
         expect(target.querySelectorAll('[data-device-icon]')).toHaveLength(2)
+    })
+
+    it('switches to a newly received registration link and fills the mounted input', async () => {
+        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+        await render(snapshot({ sources: [{ deviceId: 'source-a', name: 'Source A', permissions: ['read'] }] }))
+        const select = target.querySelector<HTMLSelectElement>('#device-sync-target')!
+        select.value = 'source-a'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+
+        deepLinks.emit(uri)
+        await tick()
+
+        expect(select.value).toBe('new-link')
+        expect(target.querySelector<HTMLInputElement>('#device-sync-link')?.value).toBe(uri)
+    })
+
+    it('enforces the selected incoming permissions and blocks an expired registration', async () => {
+        const sources = [
+            { deviceId: 'read-only', name: 'Read only', permissions: ['read'] as const },
+            { deviceId: 'expired', name: 'Expired', permissions: ['read', 'bidirectional'] as const },
+        ]
+        await render(snapshot({ sources, expiredSourceIds: ['expired'] }))
+        const select = target.querySelector<HTMLSelectElement>('#device-sync-target')!
+        select.value = 'read-only'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+        expect(['Copy everything', 'Get changes only', 'Two-way sync'].map((name) => button(name)?.disabled))
+            .toEqual([false, false, true])
+
+        select.value = 'expired'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+        expect(['Copy everything', 'Get changes only', 'Two-way sync'].map((name) => button(name)?.disabled))
+            .toEqual([true, true, true])
+        expect(target.textContent).toContain('Registration expired. Register again with a new link.')
+    })
+
+    it.each([
+        ['port-unavailable', 'That port is already in use. Choose another port.'],
+        ['invalid-configuration', 'Check the sharing method, port, and public address.'],
+        ['cleanup-failed', 'Sharing stopped, but cleanup did not finish. Try stopping again.'],
+    ] as const)('maps the safe sharing error %s to concrete localized copy', async (code, message) => {
+        await render(snapshot({ source: { phase: 'error', latestError: code } }))
+        expect(target.querySelector('[data-sync-card="sharing"]')?.textContent).toContain(message)
+        expect(target.querySelector('[data-sync-card="sharing"]')?.textContent).not.toContain(code)
     })
 
     it('shows QR, localized countdown, and rotates using permissions selected before the link', async () => {

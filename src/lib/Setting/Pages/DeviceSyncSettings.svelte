@@ -10,6 +10,8 @@
     import { decodeLogicalRecordKey } from 'src/ts/storage/sync/logicalRecordKey'
     import { getProductionDeviceSyncController } from 'src/ts/storage/sync/deviceSyncProduction'
     import type { DeviceSyncControllerSnapshot } from 'src/ts/storage/sync/deviceSyncController'
+    import { classifyDeviceSyncFailure } from 'src/ts/storage/sync/deviceSync'
+    import { subscribeDeviceSyncUri } from 'src/ts/storage/sync/peerCloneDeepLink'
     import { androidPeerSyncNotificationsEnabled } from 'src/ts/storage/sync/peerSyncShared'
     import Button from 'src/lib/UI/GUI/Button.svelte'
 
@@ -43,6 +45,7 @@
     const cloneTarget = $derived(clone?.state.target)
     const bidiPhase = $derived(bidi?.operationPhase ?? 'idle')
     const selectedIncoming = $derived(snapshot.sources.find((source) => source.deviceId === targetId))
+    const selectedExpired = $derived(targetId !== 'new-link' && snapshot.expiredSourceIds.includes(targetId))
     const cloneBusy = $derived(
         workActionPending && activeWork === 'clone'
         || cloneTarget?.phase === 'downloading'
@@ -104,14 +107,17 @@
         const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000))
         const minutes = Math.floor(totalSeconds / 60)
         const seconds = totalSeconds % 60
-        const korean = sync.menuTitle === '기기 동기화'
-        if (korean) return minutes > 0 ? `${minutes}분 ${seconds}초` : `${seconds}초`
-        const minuteText = `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`
-        const secondText = `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`
+        const minuteText = format(minutes === 1 ? sync.share.durationMinute : sync.share.durationMinutes, minutes)
+        const secondText = format(seconds === 1 ? sync.share.durationSecond : sync.share.durationSeconds, seconds)
         return minutes > 0 ? `${minuteText} ${secondText}` : secondText
     }
     function safeError(code: unknown): string {
-        return code === 'registration-expired' ? sync.registrationExpired : sync.share.stateError
+        const safeCode = classifyDeviceSyncFailure(code).code
+        if (safeCode === 'registration-expired') return sync.registrationExpired
+        if (safeCode === 'port-unavailable') return sync.share.errorPortUnavailable
+        if (safeCode === 'invalid-configuration') return sync.share.errorInvalidConfiguration
+        if (safeCode === 'cleanup-failed') return sync.share.errorCleanupFailed
+        return sync.share.stateError
     }
     function cloneBackupPaths(): string[] {
         const paths = (cloneTarget as unknown as { backupPaths?: unknown } | undefined)?.backupPaths
@@ -129,8 +135,8 @@
         try {
             await action()
             return true
-        } catch {
-            actionError = sync.share.stateError
+        } catch (error) {
+            actionError = safeError(error)
             return false
         }
     }
@@ -168,10 +174,17 @@
         await runAction(() => direction === 'incoming' ? controller.revokeIncoming(deviceId) : controller.revokeOutgoing(deviceId))
     }
     async function beginWork(lane: WorkLane, action: () => Promise<unknown>): Promise<void> {
-        if (receiveBusy) return
+        if (receiveBusy || !workAllowed(lane)) return
         suppressWorkInference = false
         activeWork = lane
         await runWorkAction(action)
+    }
+    function workAllowed(lane: WorkLane): boolean {
+        if (selectedExpired) return false
+        if (targetId === 'new-link') return true
+        return lane === 'bidirectional'
+            ? Boolean(selectedIncoming?.permissions.includes('bidirectional'))
+            : Boolean(selectedIncoming?.permissions.includes('read'))
     }
     async function runWorkAction(action: () => Promise<unknown>): Promise<boolean> {
         if (workActionPending) return false
@@ -277,11 +290,15 @@
             if (!activeWork && !suppressWorkInference) activeWork = inferWork(next)
             void createQr()
         })
+        const unsubscribeDeepLink = subscribeDeviceSyncUri((uri) => {
+            targetId = 'new-link'
+            stagedUri = uri
+        })
         void controller.initialize().catch(() => { actionError = sync.share.stateError })
         notificationsEnabled = androidPeerSyncNotificationsEnabled()
         const timer = setInterval(() => { now = Date.now() }, 1000)
         void createQr()
-        return () => { clearInterval(timer); unsubscribe() }
+        return () => { clearInterval(timer); unsubscribe(); unsubscribeDeepLink() }
     })
 </script>
 
@@ -374,8 +391,9 @@
             {#each snapshot.sources as source (source.deviceId)}<option value={source.deviceId}>{source.name || source.deviceId.slice(0, 8)}</option>{/each}<option value="new-link">{sync.work.useNewLink}</option>
         </select>
         {#if targetId === 'new-link'}<label class="sr-only" for="device-sync-link">{sync.work.linkPlaceholder}</label><input id="device-sync-link" class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" placeholder={sync.work.linkPlaceholder} bind:value={stagedUri} />{/if}
-        <div class="mt-3 flex flex-col gap-2 sm:flex-row"><Button disabled={receiveBusy} onclick={startClone}>{sync.work.clone}</Button><Button disabled={receiveBusy} onclick={startDelta}>{sync.work.delta}</Button><Button disabled={receiveBusy} onclick={startBidi}>{sync.work.bidirectional}</Button></div>
+        <div class="mt-3 flex flex-col gap-2 sm:flex-row"><Button disabled={receiveBusy || !workAllowed('clone')} onclick={startClone}>{sync.work.clone}</Button><Button disabled={receiveBusy || !workAllowed('delta')} onclick={startDelta}>{sync.work.delta}</Button><Button disabled={receiveBusy || !workAllowed('bidirectional')} onclick={startBidi}>{sync.work.bidirectional}</Button></div>
         {#if sourceBusy}<p class="mt-2 text-sm text-textcolor2">{sync.work.blockedWhileSharing}</p>{/if}
+        {#if selectedExpired}<p role="alert" class="mt-2 text-sm text-draculared">{sync.registrationExpired}</p>{/if}
 
         {#if activeWork}
             <div data-work-status aria-live="polite" class="mt-4 border-t border-darkborderc pt-4">

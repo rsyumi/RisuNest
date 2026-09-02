@@ -226,6 +226,63 @@ describe('device sync controller', () => {
         expect(controller.snapshot().stagedLink).toBeNull()
     })
 
+    it.each(['clone', 'delta', 'bidirectional'] as const)(
+        'clears a previously staged %s source when its replacement link is invalid',
+        async (lane) => {
+            const claimStagedClone = vi.fn(async () => ({
+                sourceDeviceId: 'source', endpoint: 'http://source/', sessionId: 'session', manifestId: 'a'.repeat(64),
+            }))
+            const joinRegistered = vi.fn(async () => undefined)
+            const pullRegistered = vi.fn(async () => ({ kind: 'noChanges' }))
+            const syncRegistered = vi.fn(async () => ({ kind: 'noChanges' }))
+            const controller = createDeviceSyncController({
+                facade: {
+                    ...sourceFacade(),
+                    incomingSources: async () => [{
+                        deviceId: 'source', name: 'Source', permissions: ['read', 'bidirectional'] as const,
+                    }],
+                    claimStagedClone,
+                },
+                targets: {
+                    clone: {
+                        snapshot: () => cloneSnapshot(), subscribe: () => () => undefined,
+                        initialize: async () => undefined, joinClaimed: vi.fn(), joinRegistered,
+                        confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn(),
+                    },
+                    delta: {
+                        snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
+                        initialize: async () => undefined, pullRegistered,
+                    },
+                    bidirectional: {
+                        snapshot: () => bidirectionalSnapshot(), subscribe: () => () => undefined,
+                        initialize: async () => undefined, syncRegistered, resolveRegistered: vi.fn(),
+                        resume: vi.fn(), acknowledge: vi.fn(), abandon: vi.fn(),
+                    },
+                },
+            })
+            await controller.initialize()
+            const valid = `risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+            const run = lane === 'clone'
+                ? () => controller.claimStagedClone()
+                : lane === 'delta'
+                    ? () => controller.pullStagedDelta()
+                    : () => controller.syncStagedBidirectional()
+            controller.stageLink(valid)
+            await run()
+
+            controller.stageLink('not a registration link')
+
+            expect(controller.snapshot()).toMatchObject({
+                stagedLink: null, stagedSourceDeviceId: null, error: 'operation-failed',
+            })
+            await expect(run()).rejects.toMatchObject({ code: 'unavailable' })
+            expect(claimStagedClone).toHaveBeenCalledOnce()
+            expect(joinRegistered).toHaveBeenCalledTimes(lane === 'clone' ? 1 : 0)
+            expect(pullRegistered).toHaveBeenCalledTimes(lane === 'delta' ? 1 : 0)
+            expect(syncRegistered).toHaveBeenCalledTimes(lane === 'bidirectional' ? 1 : 0)
+        },
+    )
+
     it('initializes every target before completing unified initialization', async () => {
         const events: string[] = []
         const target = <T>(name: string, snapshot: T) => ({
