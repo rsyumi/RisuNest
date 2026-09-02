@@ -40,6 +40,36 @@ fn android_p5_target_foreground_retains_running_until_durable_terminal_projectio
 }
 
 #[test]
+fn registered_bidirectional_terminal_projection_bounds_transport_and_local_errors() {
+    let _registry_guard = super::super::android_foreground::test_registry_guard();
+    let state = PeerBidirectionalCommandState::default();
+    let foreground = state.reserve_target_foreground().unwrap();
+    assert!(registry().attach_exact(&foreground));
+    state.mark_target_running_exact(&foreground).unwrap();
+
+    let local = bound_registered_bidirectional_outcome::<PeerBidirectionalSyncResult>(
+        Err("C:\\private\\store and bearer secret".to_owned()),
+        true,
+    );
+    assert_eq!(local.as_ref().unwrap_err(), "operationFailed");
+    state
+        .publish_target_terminal_exact(&foreground, local)
+        .unwrap();
+    let terminal = state.target_foreground_status().unwrap().unwrap();
+    assert_eq!(terminal.error.as_deref(), Some("operationFailed"));
+    assert!(state.release_target_foreground_exact(&foreground).unwrap());
+
+    assert_eq!(
+        bidirectional_peer_operation_failure(
+            "registered bidirectional transport",
+            PeerSyncError::Transport("http://192.168.1.7/session/secret".to_owned()),
+            true,
+        ),
+        "transportUnavailable"
+    );
+}
+
+#[test]
 fn android_p5_source_release_consumes_exact_full_stop_after_notification_callback() {
     let _registry_guard = super::super::android_foreground::test_registry_guard();
     let directory = tempfile::tempdir().unwrap();

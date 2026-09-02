@@ -185,6 +185,7 @@ enum RegisteredTargetError {
     LaneUnavailable,
     IdentityMismatch,
     TransportUnavailable,
+    OperationFailed,
 }
 
 impl RegisteredTargetError {
@@ -196,6 +197,7 @@ impl RegisteredTargetError {
             Self::LaneUnavailable => "laneUnavailable",
             Self::IdentityMismatch => "identityMismatch",
             Self::TransportUnavailable => "transportUnavailable",
+            Self::OperationFailed => "operationFailed",
         }
     }
 }
@@ -223,6 +225,27 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
 fn safe_command_failure(context: &str, error: impl fmt::Display) -> String {
     crate::nlog!("warn", "{context} failed: {error}");
     "transportUnavailable".to_owned()
+}
+
+fn registered_operation_failure(context: &str, error: impl fmt::Display) -> String {
+    crate::nlog!("warn", "{context} failed: {error}");
+    "operationFailed".to_owned()
+}
+
+fn registered_target_operation_failure(
+    context: &str,
+    error: PeerSyncError,
+) -> RegisteredTargetError {
+    crate::nlog!("warn", "{context} failed: {error}");
+    RegisteredTargetError::OperationFailed
+}
+
+fn registered_claim_failure(context: &str, error: PeerSyncError) -> RegisteredTargetError {
+    crate::nlog!("warn", "{context} failed: {error}");
+    match error {
+        PeerSyncError::Transport(_) => RegisteredTargetError::TransportUnavailable,
+        _ => RegisteredTargetError::OperationFailed,
+    }
 }
 
 fn registered_hello(
@@ -299,11 +322,13 @@ pub async fn peer_clone_claim_registered_client(
                 &connection.source.device_id,
                 &connection.source.bearer,
             )
-            .map_err(|error| safe_failure("registered clone target", error))?;
+            .map_err(|error| {
+                registered_target_operation_failure("registered clone target", error)
+            })?;
         Ok(connection.clone_target())
     })
     .await
-    .map_err(|error| safe_command_failure("registered clone target worker", error))?
+    .map_err(|error| registered_operation_failure("registered clone target worker", error))?
     .map_err(|error: RegisteredTargetError| error.to_string())
 }
 
@@ -322,12 +347,12 @@ pub async fn peer_clone_claim_client(
             .map_err(|error| safe_failure("Android clone registration endpoint", error))?;
         let credential_root = root.join("peer-clone").join("android-registration");
         std::fs::create_dir_all(&credential_root).map_err(|error| {
-            safe_failure(
+            registered_target_operation_failure(
                 "Android clone registration storage",
                 PeerSyncError::from(error),
             )
         })?;
-        let client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        let client = super::lan::LanCloneClient::claim_strict_v2_and_persist_and_register(
             &root,
             super::device_registry::platform_device_name(),
             &credential_root.join("credential.json"),
@@ -336,10 +361,10 @@ pub async fn peer_clone_claim_client(
             &manifest_id,
             &claim,
         )
-        .map_err(|error| safe_failure("Android clone registration", error))?;
+        .map_err(|error| registered_claim_failure("Android clone registration", error))?;
         let source_device_id = client
             .registered_source_device_id()
-            .ok_or(RegisteredTargetError::TransportUnavailable)?
+            .ok_or(RegisteredTargetError::OperationFailed)?
             .to_owned();
         Ok(AndroidPeerCloneClaimResult {
             source_device_id,
@@ -349,7 +374,7 @@ pub async fn peer_clone_claim_client(
         })
     })
     .await
-    .map_err(|error| safe_command_failure("Android clone registration worker", error))?
+    .map_err(|error| registered_operation_failure("Android clone registration worker", error))?
     .map_err(|error: RegisteredTargetError| error.to_string())
 }
 
@@ -364,8 +389,10 @@ pub async fn peer_clone_claim_registered_client(
     let registry = state.registry()?;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = resolve_registered_source(&root, &device_id, RegisteredLane::Clone)?;
-        let local_device_id = super::device_registry::load_or_create_device_id(&root)
-            .map_err(|error| safe_failure("registered Android local identity", error))?;
+        let local_device_id =
+            super::device_registry::load_or_create_device_id(&root).map_err(|error| {
+                registered_target_operation_failure("registered Android local identity", error)
+            })?;
         let status = registry
             .connect_registered(
                 &connection.source.endpoint,
@@ -375,14 +402,16 @@ pub async fn peer_clone_claim_registered_client(
                 &connection.source.device_id,
                 &connection.source.bearer,
             )
-            .map_err(|error| safe_failure("registered Android clone target", error))?;
+            .map_err(|error| {
+                registered_target_operation_failure("registered Android clone target", error)
+            })?;
         Ok(safe_android_clone_status(
             &connection.source.device_id,
             &status,
         ))
     })
     .await
-    .map_err(|error| safe_command_failure("registered Android clone worker", error))?
+    .map_err(|error| registered_operation_failure("registered Android clone worker", error))?
     .map_err(|error: RegisteredTargetError| error.to_string())
 }
 
@@ -402,7 +431,10 @@ pub async fn peer_delta_pull_registered(
     .map_err(|error| safe_command_failure("registered delta hello worker", error))?
     .map_err(|error| error.to_string())?;
     let local_device_id = super::device_registry::load_or_create_device_id(&app_root(&app)?)
-        .map_err(|error| safe_failure("registered delta local identity", error).to_string())?;
+        .map_err(|error| {
+            registered_target_operation_failure("registered delta local identity", error)
+                .to_string()
+        })?;
     let client = LanLogicalDeltaClient::from_registered(
         &connection.source.endpoint,
         &connection.lane.session_id,
@@ -411,13 +443,10 @@ pub async fn peer_delta_pull_registered(
         &connection.source.device_id,
         &connection.source.bearer,
     )
-    .map_err(|error| safe_failure("registered delta client", error).to_string())?;
-    peer_delta_pull_registered_client(app, state.inner().clone(), client, expected_revision)
-        .await
-        .map_err(|error| {
-            crate::nlog!("warn", "registered delta pull failed: {error}");
-            "transportUnavailable".to_owned()
-        })
+    .map_err(|error| {
+        registered_target_operation_failure("registered delta client", error).to_string()
+    })?;
+    peer_delta_pull_registered_client(app, state.inner().clone(), client, expected_revision).await
 }
 
 #[tauri::command]
@@ -437,7 +466,10 @@ pub async fn peer_delta_pull_registered(
     .map_err(|error| safe_command_failure("registered delta hello worker", error))?
     .map_err(|error| error.to_string())?;
     let local_device_id = super::device_registry::load_or_create_device_id(&app_root(&app)?)
-        .map_err(|error| safe_failure("registered delta local identity", error).to_string())?;
+        .map_err(|error| {
+            registered_target_operation_failure("registered delta local identity", error)
+                .to_string()
+        })?;
     let client = LanLogicalDeltaClient::from_registered(
         &connection.source.endpoint,
         &connection.lane.session_id,
@@ -446,7 +478,9 @@ pub async fn peer_delta_pull_registered(
         &connection.source.device_id,
         &connection.source.bearer,
     )
-    .map_err(|error| safe_failure("registered delta client", error).to_string())?;
+    .map_err(|error| {
+        registered_target_operation_failure("registered delta client", error).to_string()
+    })?;
     peer_delta_pull_registered_client(
         app,
         state.inner().clone(),
@@ -455,10 +489,6 @@ pub async fn peer_delta_pull_registered(
         foreground,
     )
     .await
-    .map_err(|error| {
-        crate::nlog!("warn", "registered delta pull failed: {error}");
-        "transportUnavailable".to_owned()
-    })
 }
 
 #[tauri::command]
@@ -488,10 +518,6 @@ pub async fn peer_bidirectional_sync_registered(
         foreground,
     )
     .await
-    .map_err(|error| {
-        crate::nlog!("warn", "registered bidirectional sync failed: {error}");
-        "transportUnavailable".to_owned()
-    })
 }
 
 #[tauri::command]
@@ -526,13 +552,6 @@ pub async fn peer_bidirectional_resolve_registered(
         foreground,
     )
     .await
-    .map_err(|error| {
-        crate::nlog!(
-            "warn",
-            "registered bidirectional resolution failed: {error}"
-        );
-        "transportUnavailable".to_owned()
-    })
 }
 
 fn resolve_registered_source_with(
@@ -797,6 +816,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(false_unauthorized.code(), "transportUnavailable");
+    }
+
+    #[test]
+    fn registered_post_hello_failures_are_not_reported_as_connection_failures() {
+        let target = registered_target_operation_failure(
+            "registered clone target",
+            PeerSyncError::Storage("local target state is unavailable".to_owned()),
+        );
+        assert_eq!(target.code(), "operationFailed");
+        assert_ne!(target.code(), "transportUnavailable");
+
+        let claim_storage = registered_claim_failure(
+            "registered clone credential",
+            PeerSyncError::Storage("local credential write failed".to_owned()),
+        );
+        assert_eq!(claim_storage.code(), "operationFailed");
+        let claim_validation = registered_claim_failure(
+            "registered incoming registry",
+            PeerSyncError::Validation("local registry is invalid".to_owned()),
+        );
+        assert_eq!(claim_validation.code(), "operationFailed");
+        let claim_transport = registered_claim_failure(
+            "registered clone claim",
+            PeerSyncError::Transport("source disconnected".to_owned()),
+        );
+        assert_eq!(claim_transport.code(), "transportUnavailable");
+
+        let code = registered_operation_failure(
+            "registered delta pull",
+            "local expected revision is stale",
+        );
+        assert_eq!(code, "operationFailed");
+        assert_ne!(code, "transportUnavailable");
+        assert!(!code.contains("revision"));
     }
 
     #[test]

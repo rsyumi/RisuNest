@@ -1,7 +1,9 @@
 #[cfg(test)]
 use super::android_foreground::test_registry_guard;
 #[cfg(any(target_os = "android", test))]
-use super::android_foreground::{registry, AndroidForegroundKey, AndroidForegroundLane};
+use super::android_foreground::{
+    registry, AndroidCancellationProbe, AndroidForegroundKey, AndroidForegroundLane,
+};
 #[cfg(desktop)]
 use super::lan::discover_lan_ipv4;
 #[cfg(desktop)]
@@ -35,6 +37,8 @@ use crate::{
 use serde::Serialize;
 #[cfg(test)]
 use std::fs;
+#[cfg(any(target_os = "android", test))]
+use std::future::Future;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -1672,6 +1676,7 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
         state,
         expected_revision,
         cancellation,
+        false,
         move |app_root| match LanLogicalDeltaClient::claim_v2_and_register(
             app_root,
             super::device_registry::platform_device_name(),
@@ -1683,9 +1688,8 @@ async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static
             Ok(client) => Ok(client),
             Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
                 LanLogicalDeltaClient::claim_p4(&endpoint, &session_id, &manifest_id, &claim)
-                    .map_err(|error| error.to_string())
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error),
         },
     )
     .await
@@ -1698,9 +1702,14 @@ pub(crate) async fn peer_delta_pull_registered_client(
     client: LanLogicalDeltaClient,
     expected_revision: i64,
 ) -> Result<PeerDeltaPullResult, String> {
-    peer_delta_pull_with_client_factory(app, state, expected_revision, NeverCancelled, move |_| {
-        Ok(client)
-    })
+    peer_delta_pull_with_client_factory(
+        app,
+        state,
+        expected_revision,
+        NeverCancelled,
+        true,
+        move |_| Ok(client),
+    )
     .await
 }
 
@@ -1712,51 +1721,131 @@ pub(crate) async fn peer_delta_pull_registered_client(
     expected_revision: i64,
     foreground: AndroidForegroundKey,
 ) -> Result<PeerDeltaPullResult, String> {
-    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target).await?;
+    let operation_state = state.clone();
+    run_registered_delta_target_operation(state, foreground, move |cancellation| async move {
+        peer_delta_pull_with_client_factory(
+            app,
+            operation_state,
+            expected_revision,
+            cancellation,
+            true,
+            move |_| Ok(client),
+        )
+        .await
+    })
+    .await
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn run_registered_delta_target_operation<F, Fut>(
+    state: PeerDeltaCommandState,
+    foreground: AndroidForegroundKey,
+    operation: F,
+) -> Result<PeerDeltaPullResult, String>
+where
+    F: FnOnce(AndroidCancellationProbe) -> Fut,
+    Fut: Future<Output = Result<PeerDeltaPullResult, String>>,
+{
+    let cancellation = super::android_foreground::acquire_foreground_lane(
+        &foreground,
+        AndroidForegroundLane::P4Target,
+    )
+    .await
+    .map_err(|error| registered_local_operation_failure("registered delta foreground", error))?;
     state
         .mark_target_running_exact(&foreground)
-        .map_err(|error| error.to_string())?;
-    let outcome = peer_delta_pull_with_client_factory(
-        app,
-        state.clone(),
-        expected_revision,
-        cancellation,
-        move |_| Ok(client),
-    )
-    .await;
+        .map_err(|error| {
+            registered_local_operation_failure("registered delta foreground state", error)
+        })?;
+    let outcome = bound_registered_operation_outcome(operation(cancellation).await);
     state
         .publish_target_terminal_exact(&foreground, outcome.clone())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            registered_local_operation_failure("registered delta terminal state", error)
+        })?;
     outcome
+}
+
+fn registered_local_operation_failure(context: &str, error: impl std::fmt::Display) -> String {
+    crate::nlog!("warn", "{context} failed: {error}");
+    "operationFailed".to_owned()
+}
+
+fn peer_operation_failure(context: &str, error: PeerSyncError, registered: bool) -> String {
+    if !registered {
+        return error.to_string();
+    }
+    crate::nlog!("warn", "{context} failed: {error}");
+    match error {
+        PeerSyncError::Transport(_) => "transportUnavailable".to_owned(),
+        _ => "operationFailed".to_owned(),
+    }
+}
+
+fn local_operation_failure(
+    context: &str,
+    error: impl std::fmt::Display,
+    registered: bool,
+) -> String {
+    if !registered {
+        return error.to_string();
+    }
+    registered_local_operation_failure(context, error)
+}
+
+fn delta_worker_failure(error: impl std::fmt::Display, registered: bool) -> String {
+    if registered {
+        local_operation_failure("peer delta pull worker", error, true)
+    } else {
+        format!("peer delta pull worker failed: {error}")
+    }
+}
+
+fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T, String> {
+    outcome.map_err(|error| {
+        if error == "transportUnavailable" {
+            error
+        } else {
+            registered_local_operation_failure("registered delta operation", error)
+        }
+    })
 }
 
 async fn peer_delta_pull_with_client_factory<
     C: CancellationProbe + Send + 'static,
-    F: FnOnce(&Path) -> Result<LanLogicalDeltaClient, String> + Send + 'static,
+    F: FnOnce(&Path) -> Result<LanLogicalDeltaClient, PeerSyncError> + Send + 'static,
 >(
     app: AppHandle,
     state: PeerDeltaCommandState,
     expected_revision: i64,
     cancellation: C,
+    registered: bool,
     client_factory: F,
 ) -> Result<PeerDeltaPullResult, String> {
-    let app_root = app_root(&app)?;
+    let app_root = app_root(&app)
+        .map_err(|error| local_operation_failure("peer delta app root", error, registered))?;
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state.begin_pull().map_err(|error| error.to_string())?;
+        let _guard = state.begin_pull().map_err(|error| {
+            local_operation_failure("peer delta target state", error, registered)
+        })?;
         reclaim_abandoned_durable_cas_jobs(
             &app_root,
             P4_DELTA_TARGET_JOB_PREFIX,
             CasJobKind::LogicalDeltaTarget,
         )
-        .map_err(|error| error.to_string())?;
-        let mut client = client_factory(&app_root)?;
-        let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
+        .map_err(|error| local_operation_failure("peer delta recovery", error, registered))?;
+        let mut client = client_factory(&app_root)
+            .map_err(|error| peer_operation_failure("peer delta client", error, registered))?;
+        let manifest = client
+            .fetch_manifest()
+            .map_err(|error| peer_operation_failure("peer delta manifest", error, registered))?;
         let source_device_id = client.source_device_id().to_owned();
         let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {
             open_peer_delta_store(store)
         })
-        .map_err(|error| error.to_string())?;
-        let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
+        .map_err(|error| local_operation_failure("peer delta store", error, registered))?;
+        let cas = PayloadCas::new(&app_root)
+            .map_err(|error| local_operation_failure("peer delta CAS", error, registered))?;
         let result = pull_logical_delta_with_cancellation(
             &mut store,
             &cas,
@@ -1767,7 +1856,7 @@ async fn peer_delta_pull_with_client_factory<
             &mut client,
             &cancellation,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| peer_operation_failure("peer delta pull", error, registered))?;
         record_delta_completion(
             &app_root,
             &source_device_id,
@@ -1777,7 +1866,7 @@ async fn peer_delta_pull_with_client_factory<
         Ok(result)
     })
     .await
-    .map_err(|error| format!("peer delta pull worker failed: {error}"))?
+    .map_err(|error| delta_worker_failure(error, registered))?
 }
 
 #[cfg(desktop)]
@@ -2254,6 +2343,67 @@ mod tests {
         assert!(fresh.generation > foreground.generation);
         assert!(!registry().detach_if_generation(&foreground));
         assert!(state.release_target_foreground_exact(&fresh).unwrap());
+    }
+
+    #[test]
+    fn registered_delta_composes_exact_foreground_cancellation_and_terminal_publication() {
+        let _registry_guard = test_registry_guard();
+        let state = PeerDeltaCommandState::default();
+        let foreground = state.reserve_target_foreground().unwrap();
+        assert!(registry().attach_exact(&foreground));
+        let mut stale = foreground.clone();
+        stale.generation += 1;
+        let operation_foreground = foreground.clone();
+
+        let outcome = tauri::async_runtime::block_on(run_registered_delta_target_operation(
+            state.clone(),
+            foreground.clone(),
+            move |cancellation| async move {
+                assert!(!registry().cancel_exact(&stale));
+                assert!(!cancellation.is_cancelled());
+                assert!(registry().cancel_exact(&operation_foreground));
+                assert!(cancellation.is_cancelled());
+                Err("registered delta cancelled".to_owned())
+            },
+        ));
+
+        assert_eq!(outcome.unwrap_err(), "operationFailed");
+        let terminal = state.target_foreground_status().unwrap().unwrap();
+        assert_eq!(terminal.foreground, foreground);
+        assert_eq!(terminal.phase, AndroidTargetForegroundPhase::Terminal);
+        assert_eq!(terminal.result, None);
+        assert_eq!(terminal.error.as_deref(), Some("operationFailed"));
+        assert!(state
+            .release_target_foreground_exact(&terminal.foreground)
+            .unwrap());
+    }
+
+    #[test]
+    fn registered_delta_bounds_transport_and_local_operation_errors() {
+        assert_eq!(
+            peer_operation_failure(
+                "registered delta transport",
+                PeerSyncError::Transport("http://192.168.1.7/session/secret".to_owned()),
+                true,
+            ),
+            "transportUnavailable"
+        );
+        assert_eq!(
+            peer_operation_failure(
+                "registered delta local",
+                PeerSyncError::Storage("C:\\private\\store".to_owned()),
+                true,
+            ),
+            "operationFailed"
+        );
+        assert_eq!(
+            delta_worker_failure("cancelled worker", false),
+            "peer delta pull worker failed: cancelled worker"
+        );
+        assert_eq!(
+            delta_worker_failure("cancelled worker", true),
+            "operationFailed"
+        );
     }
 
     #[test]

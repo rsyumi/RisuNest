@@ -6343,6 +6343,7 @@ pub async fn peer_bidirectional_sync(
         state,
         expected_revision,
         foreground,
+        false,
         move |root, local_device_id| {
             claim_bidirectional_client(
                 root,
@@ -6373,6 +6374,7 @@ pub(crate) async fn peer_bidirectional_sync_registered_client(
         state,
         expected_revision,
         foreground,
+        true,
         move |_, local_device_id| {
             LanBidirectionalLogicalClient::from_registered(
                 &endpoint,
@@ -6387,6 +6389,38 @@ pub(crate) async fn peer_bidirectional_sync_registered_client(
     .await
 }
 
+fn bidirectional_peer_operation_failure(
+    context: &str,
+    error: PeerSyncError,
+    registered: bool,
+) -> String {
+    if !registered {
+        return error.to_string();
+    }
+    crate::nlog!("warn", "{context} failed: {error}");
+    match error {
+        PeerSyncError::Transport(_) => "transportUnavailable".to_owned(),
+        _ => "operationFailed".to_owned(),
+    }
+}
+
+fn bound_registered_bidirectional_outcome<T>(
+    outcome: Result<T, String>,
+    registered: bool,
+) -> Result<T, String> {
+    if !registered {
+        return outcome;
+    }
+    outcome.map_err(|error| {
+        if error == "transportUnavailable" {
+            error
+        } else {
+            crate::nlog!("warn", "registered bidirectional operation failed: {error}");
+            "operationFailed".to_owned()
+        }
+    })
+}
+
 async fn peer_bidirectional_sync_with_factory<
     F: Fn(&Path, &str) -> Result<LanBidirectionalLogicalClient, PeerSyncError> + Send + Sync + 'static,
 >(
@@ -6394,37 +6428,69 @@ async fn peer_bidirectional_sync_with_factory<
     state: State<'_, PeerBidirectionalCommandState>,
     expected_revision: i64,
     foreground: Option<AndroidForegroundKey>,
+    registered: bool,
     client_factory: F,
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
     #[cfg(target_os = "android")]
-    let foreground = foreground
-        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    let foreground = foreground.ok_or_else(|| {
+        if registered {
+            crate::nlog!("warn", "registered bidirectional foreground is missing");
+            "operationFailed".to_owned()
+        } else {
+            "Android bidirectional target foreground is required".to_owned()
+        }
+    })?;
     #[cfg(target_os = "android")]
     let cancellation = state
         .mark_target_running_exact(&foreground)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            bidirectional_peer_operation_failure(
+                "bidirectional target foreground",
+                error,
+                registered,
+            )
+        })?;
     #[cfg(desktop)]
     let cancellation = {
         let _ = foreground;
         NeverCancelled
     };
     let worker_state = state.clone();
-    let root = app_root(&app)?;
+    let root = app_root(&app).map_err(|error| {
+        if registered {
+            crate::nlog!("warn", "registered bidirectional app root failed: {error}");
+            "operationFailed".to_owned()
+        } else {
+            error
+        }
+    })?;
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = worker_state
-            .begin_target()
-            .map_err(|error| error.to_string())?;
+        let _guard = worker_state.begin_target().map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional target state", error, registered)
+        })?;
         #[cfg(target_os = "android")]
         if cancellation.is_cancelled() {
             return Err("Android foreground service was cancelled".to_owned());
         }
         if let Some(retained) = PeerBidirectionalOperationJournal::new(&root)
             .load()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                bidirectional_peer_operation_failure(
+                    "bidirectional operation journal",
+                    error,
+                    registered,
+                )
+            })?
         {
             let local_device_id = super::delta_commands::canonical_source_device_id(&root)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    bidirectional_peer_operation_failure(
+                        "bidirectional local identity",
+                        error,
+                        registered,
+                    )
+                })?;
             match &retained {
                 PeerBidirectionalDurableOperation::TargetPrepared { context, .. } => {
                     if context.credential.device_id != local_device_id {
@@ -6433,8 +6499,13 @@ async fn peer_bidirectional_sync_with_factory<
                                 .to_owned(),
                         );
                     }
-                    let mut client = client_factory(&root, &local_device_id)
-                        .map_err(|error| error.to_string())?;
+                    let mut client = client_factory(&root, &local_device_id).map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional client",
+                            error,
+                            registered,
+                        )
+                    })?;
                     if client.source_device_id() != context.credential.source_device_id {
                         return Err(
                             "fresh bidirectional source belongs to another device".to_owned()
@@ -6450,7 +6521,13 @@ async fn peer_bidirectional_sync_with_factory<
                         &mut client,
                         &cancellation,
                     )
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional target recovery",
+                            error,
+                            registered,
+                        )
+                    });
                 }
                 PeerBidirectionalDurableOperation::LocalCommitted {
                     context,
@@ -6467,7 +6544,13 @@ async fn peer_bidirectional_sync_with_factory<
                             expected_revision,
                             None,
                         )
-                        .map_err(|error| error.to_string());
+                        .map_err(|error| {
+                            bidirectional_peer_operation_failure(
+                                "bidirectional remote completion",
+                                error,
+                                registered,
+                            )
+                        });
                     }
                     if context.credential.device_id != local_device_id {
                         return Err(
@@ -6475,14 +6558,25 @@ async fn peer_bidirectional_sync_with_factory<
                                 .to_owned(),
                         );
                     }
-                    let client = client_factory(&root, &local_device_id)
-                        .map_err(|error| error.to_string())?;
+                    let client = client_factory(&root, &local_device_id).map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional client",
+                            error,
+                            registered,
+                        )
+                    })?;
                     if client.source_device_id() != context.credential.source_device_id {
                         return Err(
                             "fresh bidirectional source belongs to another device".to_owned()
                         );
                     }
-                    let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
+                    let manifest = client.fetch_manifest().map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional manifest",
+                            error,
+                            registered,
+                        )
+                    })?;
                     let decoded =
                         decode_logical_manifest(&manifest).map_err(|error| error.to_string())?;
                     if decoded.library_id != context.library_id {
@@ -6498,7 +6592,13 @@ async fn peer_bidirectional_sync_with_factory<
                         expected_revision,
                         Some(&client),
                     )
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional remote completion",
+                            error,
+                            registered,
+                        )
+                    });
                 }
                 PeerBidirectionalDurableOperation::AwaitingConflict { context, .. } => {
                     if context.credential.device_id != local_device_id {
@@ -6507,10 +6607,20 @@ async fn peer_bidirectional_sync_with_factory<
                                 .to_owned(),
                         );
                     }
-                    let client = client_factory(&root, &local_device_id)
-                        .map_err(|error| error.to_string())?;
-                    let manifest_bytes =
-                        client.fetch_manifest().map_err(|error| error.to_string())?;
+                    let client = client_factory(&root, &local_device_id).map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional client",
+                            error,
+                            registered,
+                        )
+                    })?;
+                    let manifest_bytes = client.fetch_manifest().map_err(|error| {
+                        bidirectional_peer_operation_failure(
+                            "bidirectional manifest",
+                            error,
+                            registered,
+                        )
+                    })?;
                     let manifest = decode_logical_manifest(&manifest_bytes)
                         .map_err(|error| error.to_string())?;
                     let remote_revision =
@@ -6536,11 +6646,20 @@ async fn peer_bidirectional_sync_with_factory<
                 _ => return retained_result(&retained).map_err(|error| error.to_string()),
             }
         }
-        let local_device_id = super::delta_commands::canonical_source_device_id(&root)
-            .map_err(|error| error.to_string())?;
-        let mut client =
-            client_factory(&root, &local_device_id).map_err(|error| error.to_string())?;
-        let remote_manifest_bytes = client.fetch_manifest().map_err(|error| error.to_string())?;
+        let local_device_id =
+            super::delta_commands::canonical_source_device_id(&root).map_err(|error| {
+                bidirectional_peer_operation_failure(
+                    "bidirectional local identity",
+                    error,
+                    registered,
+                )
+            })?;
+        let mut client = client_factory(&root, &local_device_id).map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional client", error, registered)
+        })?;
+        let remote_manifest_bytes = client.fetch_manifest().map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional manifest", error, registered)
+        })?;
         let remote_manifest =
             decode_logical_manifest(&remote_manifest_bytes).map_err(|error| error.to_string())?;
         let remote_revision = i64::try_from(remote_manifest.source_revision)
@@ -6562,7 +6681,13 @@ async fn peer_bidirectional_sync_with_factory<
                 },
                 expected_revision: remote_revision,
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                bidirectional_peer_operation_failure(
+                    "bidirectional registration",
+                    error,
+                    registered,
+                )
+            })?;
         let outcome = begin_bidirectional_local_merge_with_cancellation(
             &mut store,
             &PayloadCas::new(&root).map_err(|error| error.to_string())?,
@@ -6573,7 +6698,9 @@ async fn peer_bidirectional_sync_with_factory<
             &mut client,
             &cancellation,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional local merge", error, registered)
+        })?;
         match outcome {
             LocalMergeOutcome::Conflict(result) => Ok(conflict_result(result)),
             LocalMergeOutcome::LocalCommitted => {
@@ -6599,16 +6726,32 @@ async fn peer_bidirectional_sync_with_factory<
                     committed_revision,
                     Some(&client),
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    bidirectional_peer_operation_failure(
+                        "bidirectional remote completion",
+                        error,
+                        registered,
+                    )
+                })
             }
         }
     })
     .await
-    .map_err(|error| format!("peer bidirectional sync worker failed: {error}"))?;
+    .map_err(|error| {
+        if registered {
+            crate::nlog!("warn", "registered bidirectional worker failed: {error}");
+            "operationFailed".to_owned()
+        } else {
+            format!("peer bidirectional sync worker failed: {error}")
+        }
+    })?;
+    let outcome = bound_registered_bidirectional_outcome(outcome, registered);
     #[cfg(target_os = "android")]
     state
         .publish_target_terminal_exact(&foreground, outcome.clone())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional terminal state", error, registered)
+        })?;
     outcome
 }
 
@@ -6727,6 +6870,7 @@ pub async fn peer_bidirectional_resolve_with_link(
         winner,
         expected_revision,
         foreground,
+        false,
         move |root, local_device_id| {
             claim_bidirectional_client(
                 root,
@@ -6762,6 +6906,7 @@ pub(crate) async fn peer_bidirectional_resolve_registered_client(
         winner,
         expected_revision,
         foreground,
+        true,
         move |_, local_device_id| {
             LanBidirectionalLogicalClient::from_registered(
                 &endpoint,
@@ -6785,40 +6930,72 @@ async fn peer_bidirectional_resolve_with_factory<
     winner: PeerBidirectionalConflictWinner,
     expected_revision: i64,
     foreground: Option<AndroidForegroundKey>,
+    registered: bool,
     client_factory: F,
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
     #[cfg(target_os = "android")]
-    let foreground = foreground
-        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    let foreground = foreground.ok_or_else(|| {
+        if registered {
+            crate::nlog!("warn", "registered bidirectional foreground is missing");
+            "operationFailed".to_owned()
+        } else {
+            "Android bidirectional target foreground is required".to_owned()
+        }
+    })?;
     #[cfg(target_os = "android")]
     let cancellation = state
         .mark_target_running_exact(&foreground)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            bidirectional_peer_operation_failure(
+                "bidirectional target foreground",
+                error,
+                registered,
+            )
+        })?;
     #[cfg(desktop)]
     let cancellation = {
         let _ = foreground;
         NeverCancelled
     };
     let worker_state = state.clone();
-    let root = app_root(&app)?;
+    let root = app_root(&app).map_err(|error| {
+        if registered {
+            crate::nlog!("warn", "registered bidirectional app root failed: {error}");
+            "operationFailed".to_owned()
+        } else {
+            error
+        }
+    })?;
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = worker_state
-            .begin_target()
-            .map_err(|error| error.to_string())?;
+        let _guard = worker_state.begin_target().map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional target state", error, registered)
+        })?;
         #[cfg(target_os = "android")]
         if cancellation.is_cancelled() {
             return Err("Android foreground service was cancelled".to_owned());
         }
         let retained = PeerBidirectionalOperationJournal::new(&root)
             .load()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                bidirectional_peer_operation_failure(
+                    "bidirectional operation journal",
+                    error,
+                    registered,
+                )
+            })?
             .ok_or_else(|| "bidirectional operation is not retained".to_owned())?;
         if retained.operation_id() != operation_id {
             return Err("another bidirectional operation is retained".to_owned());
         }
-        let local_device_id = super::delta_commands::canonical_source_device_id(&root)
-            .map_err(|error| error.to_string())?;
+        let local_device_id =
+            super::delta_commands::canonical_source_device_id(&root).map_err(|error| {
+                bidirectional_peer_operation_failure(
+                    "bidirectional local identity",
+                    error,
+                    registered,
+                )
+            })?;
         let PeerBidirectionalDurableOperation::AwaitingConflict { context, .. } = &retained else {
             return retained_result(&retained).map_err(|error| error.to_string());
         };
@@ -6827,9 +7004,12 @@ async fn peer_bidirectional_resolve_with_factory<
                 "retained bidirectional operation belongs to another target device".to_owned(),
             );
         }
-        let mut client =
-            client_factory(&root, &local_device_id).map_err(|error| error.to_string())?;
-        let remote_manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
+        let mut client = client_factory(&root, &local_device_id).map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional client", error, registered)
+        })?;
+        let remote_manifest = client.fetch_manifest().map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional manifest", error, registered)
+        })?;
         let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
         let outcome = resolve_awaiting_conflict_with_fresh_source_and_cancellation(
             &mut store,
@@ -6844,7 +7024,13 @@ async fn peer_bidirectional_resolve_with_factory<
             &mut client,
             &cancellation,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            bidirectional_peer_operation_failure(
+                "bidirectional conflict resolution",
+                error,
+                registered,
+            )
+        })?;
         match outcome {
             LocalMergeOutcome::Conflict(result) => Ok(conflict_result(result)),
             LocalMergeOutcome::LocalCommitted => {
@@ -6865,16 +7051,35 @@ async fn peer_bidirectional_resolve_with_factory<
                     committed_revision,
                     Some(&client),
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    bidirectional_peer_operation_failure(
+                        "bidirectional remote completion",
+                        error,
+                        registered,
+                    )
+                })
             }
         }
     })
     .await
-    .map_err(|error| format!("peer bidirectional linked resolution worker failed: {error}"))?;
+    .map_err(|error| {
+        if registered {
+            crate::nlog!(
+                "warn",
+                "registered bidirectional resolution worker failed: {error}"
+            );
+            "operationFailed".to_owned()
+        } else {
+            format!("peer bidirectional linked resolution worker failed: {error}")
+        }
+    })?;
+    let outcome = bound_registered_bidirectional_outcome(outcome, registered);
     #[cfg(target_os = "android")]
     state
         .publish_target_terminal_exact(&foreground, outcome.clone())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            bidirectional_peer_operation_failure("bidirectional terminal state", error, registered)
+        })?;
     outcome
 }
 

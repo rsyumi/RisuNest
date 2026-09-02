@@ -1486,6 +1486,42 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
 }
 
 #[test]
+fn android_registration_claim_is_strict_v2_and_does_not_consume_a_legacy_claim() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let credential = target_root.path().join("strict-v2-credential.json");
+
+    assert!(
+        super::lan::LanCloneClient::claim_strict_v2_and_persist_and_register(
+            target_root.path(),
+            "Android target",
+            &credential,
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .is_err()
+    );
+    assert!(!credential.exists());
+    assert!(
+        super::device_registry::incoming_source_summaries(target_root.path())
+            .unwrap()
+            .is_empty()
+    );
+
+    let legacy =
+        super::lan::LanCloneClient::claim(&endpoint, &pairing.session_id, &pairing.claim).unwrap();
+    assert!(legacy.registered_source_device_id().is_none());
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
