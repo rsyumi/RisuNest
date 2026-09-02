@@ -75,6 +75,18 @@ pub(crate) enum CompletionAcceptance {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionDeliveryPrepareStatus {
+    Pending,
+    AlreadyDurable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionDeliveryFinalizeStatus {
+    Finalized,
+    AlreadyFinalized,
+}
+
 fn outgoing_registry_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -164,6 +176,23 @@ pub(crate) struct IncomingSource {
     pub(crate) total_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PendingCompletionDelivery {
+    pub(crate) source_device_id: String,
+    pub(crate) lane: String,
+    pub(crate) completion_lease_id: String,
+    pub(crate) manifest_id: String,
+    pub(crate) useful_bytes: u64,
+    pub(crate) receipt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncomingCompletionDeliverySnapshot {
+    pub(crate) source: IncomingSource,
+    pub(crate) delivery: PendingCompletionDelivery,
+}
+
 // These are the only registry records that cross the native command boundary.
 // Credentials and endpoints remain native-only so a future controller can use
 // them without exposing them to the WebView.
@@ -206,6 +235,8 @@ struct IncomingFile {
     sources: Vec<IncomingSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     completed_receipts: Vec<CompletionReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_completion_deliveries: Vec<PendingCompletionDelivery>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -731,24 +762,35 @@ pub(crate) struct IncomingSourceRegistry {
     root: PathBuf,
     sources: Vec<IncomingSource>,
     completed_receipts: Vec<CompletionReceipt>,
+    pending_completion_deliveries: Vec<PendingCompletionDelivery>,
 }
 
 impl IncomingSourceRegistry {
     pub(crate) fn load(app_root: &Path) -> Result<Self, PeerSyncError> {
         let root = ensure_peer_root(app_root)?;
         let path = root.join("sources.json");
-        let (sources, completed_receipts) = match read_registry(&path)? {
-            None => (Vec::new(), Vec::new()),
-            Some(bytes) => {
-                let file: IncomingFile = parse_registry(&bytes)?;
-                if file.schema != INCOMING_SCHEMA {
-                    return invalid("unsupported incoming peer source registry schema");
+        let (sources, completed_receipts, pending_completion_deliveries) =
+            match read_registry(&path)? {
+                None => (Vec::new(), Vec::new(), Vec::new()),
+                Some(bytes) => {
+                    let file: IncomingFile = parse_registry(&bytes)?;
+                    if file.schema != INCOMING_SCHEMA {
+                        return invalid("unsupported incoming peer source registry schema");
+                    }
+                    (
+                        file.sources,
+                        file.completed_receipts,
+                        file.pending_completion_deliveries,
+                    )
                 }
-                (file.sources, file.completed_receipts)
-            }
-        };
+            };
         validate_incoming(&sources)?;
         validate_incoming_receipts(
+            &completed_receipts,
+            sources.iter().map(|source| source.device_id.as_str()),
+        )?;
+        validate_pending_completion_deliveries(
+            &pending_completion_deliveries,
             &completed_receipts,
             sources.iter().map(|source| source.device_id.as_str()),
         )?;
@@ -756,6 +798,7 @@ impl IncomingSourceRegistry {
             root,
             sources,
             completed_receipts,
+            pending_completion_deliveries,
         })
     }
 
@@ -770,6 +813,16 @@ impl IncomingSourceRegistry {
             .iter_mut()
             .find(|item| item.device_id == source.device_id)
         {
+            if existing.bearer != source.bearer
+                && self
+                    .pending_completion_deliveries
+                    .iter()
+                    .any(|delivery| delivery.source_device_id == source.device_id)
+            {
+                return invalid(
+                    "incoming source credential cannot rotate while completion delivery is pending",
+                );
+            }
             source.last_seen_ms = existing.last_seen_ms;
             source.total_bytes = existing.total_bytes;
             *existing = source;
@@ -781,6 +834,13 @@ impl IncomingSourceRegistry {
 
     pub(crate) fn remove(&mut self, device_id: &str) -> Result<(), PeerSyncError> {
         validate_id(device_id)?;
+        if self
+            .pending_completion_deliveries
+            .iter()
+            .any(|delivery| delivery.source_device_id == device_id)
+        {
+            return invalid("incoming source has a pending completion delivery");
+        }
         self.sources.retain(|item| item.device_id != device_id);
         self.completed_receipts
             .retain(|receipt| receipt.device_id != device_id);
@@ -794,6 +854,13 @@ impl IncomingSourceRegistry {
         seen_at_ms: u64,
     ) -> Result<(), PeerSyncError> {
         validate_id(source_id)?;
+        if self
+            .pending_completion_deliveries
+            .iter()
+            .any(|delivery| delivery.source_device_id == source_id)
+        {
+            return invalid("incoming source has a pending completion delivery");
+        }
         let mut updated = self.sources.clone();
         let source = updated
             .iter_mut()
@@ -812,6 +879,7 @@ impl IncomingSourceRegistry {
                 schema: INCOMING_SCHEMA.to_owned(),
                 sources: updated.clone(),
                 completed_receipts: self.completed_receipts.clone(),
+                pending_completion_deliveries: self.pending_completion_deliveries.clone(),
             },
         )?;
         self.sources = updated;
@@ -845,6 +913,13 @@ impl IncomingSourceRegistry {
         validate_id(source_id)?;
         validate_receipt_id(receipt_id)?;
         let lane = lane.as_str();
+        if self
+            .pending_completion_deliveries
+            .iter()
+            .any(|delivery| delivery.source_device_id == source_id && delivery.lane == lane)
+        {
+            return invalid("incoming source lane has a pending completion delivery");
+        }
         let mut sources = self.sources.clone();
         let mut receipts = self.completed_receipts.clone();
         let source = sources
@@ -883,6 +958,7 @@ impl IncomingSourceRegistry {
                 schema: INCOMING_SCHEMA.to_owned(),
                 sources: sources.clone(),
                 completed_receipts: receipts.clone(),
+                pending_completion_deliveries: self.pending_completion_deliveries.clone(),
             },
         )?;
         self.sources = sources;
@@ -914,14 +990,175 @@ impl IncomingSourceRegistry {
         }))
     }
 
-    pub(crate) fn save(&self) -> Result<(), PeerSyncError> {
+    pub(crate) fn prepare_completion_delivery(
+        &mut self,
+        delivery: PendingCompletionDelivery,
+    ) -> Result<CompletionDeliveryPrepareStatus, PeerSyncError> {
+        validate_pending_completion_delivery(&delivery)?;
+        if !self
+            .sources
+            .iter()
+            .any(|source| source.device_id == delivery.source_device_id)
+        {
+            return invalid("registered incoming source is missing");
+        }
+        if let Some(pending) = self.pending_completion_deliveries.iter().find(|pending| {
+            pending.source_device_id == delivery.source_device_id && pending.lane == delivery.lane
+        }) {
+            return if pending == &delivery {
+                Ok(CompletionDeliveryPrepareStatus::Pending)
+            } else {
+                invalid("incoming source lane has a different pending completion delivery")
+            };
+        }
+        if let Some(receipt) = self.completed_receipts.iter().find(|receipt| {
+            receipt.device_id == delivery.source_device_id && receipt.lane == delivery.lane
+        }) {
+            if receipt.receipt_id == delivery.receipt_id {
+                return if receipt.transferred_bytes == Some(delivery.useful_bytes) {
+                    Ok(CompletionDeliveryPrepareStatus::AlreadyDurable)
+                } else {
+                    invalid("incoming completion receipt byte count conflicts")
+                };
+            }
+        }
+        let mut pending = self.pending_completion_deliveries.clone();
+        pending.push(delivery);
+        self.write_state(&self.sources, &self.completed_receipts, &pending)?;
+        self.pending_completion_deliveries = pending;
+        Ok(CompletionDeliveryPrepareStatus::Pending)
+    }
+
+    fn completion_delivery_snapshot(
+        &self,
+        source_id: &str,
+        lane: CompletionLane,
+    ) -> Result<Option<IncomingCompletionDeliverySnapshot>, PeerSyncError> {
+        validate_id(source_id)?;
+        let lane = lane.as_str();
+        let Some(delivery) = self
+            .pending_completion_deliveries
+            .iter()
+            .find(|delivery| delivery.source_device_id == source_id && delivery.lane == lane)
+        else {
+            return Ok(None);
+        };
+        let source = self
+            .sources
+            .iter()
+            .find(|source| source.device_id == source_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered incoming source is missing".to_owned())
+            })?;
+        Ok(Some(IncomingCompletionDeliverySnapshot {
+            source: source.clone(),
+            delivery: delivery.clone(),
+        }))
+    }
+
+    pub(crate) fn finalize_completion_delivery(
+        &mut self,
+        delivery: &PendingCompletionDelivery,
+        seen_at_ms: u64,
+    ) -> Result<CompletionDeliveryFinalizeStatus, PeerSyncError> {
+        validate_pending_completion_delivery(delivery)?;
+        let pending_index = self
+            .pending_completion_deliveries
+            .iter()
+            .position(|pending| {
+                pending.source_device_id == delivery.source_device_id
+                    && pending.lane == delivery.lane
+            });
+        let Some(pending_index) = pending_index else {
+            return if self.completed_receipts.iter().any(|receipt| {
+                receipt.device_id == delivery.source_device_id
+                    && receipt.lane == delivery.lane
+                    && receipt.receipt_id == delivery.receipt_id
+                    && receipt.transferred_bytes == Some(delivery.useful_bytes)
+            }) {
+                Ok(CompletionDeliveryFinalizeStatus::AlreadyFinalized)
+            } else {
+                invalid("pending incoming completion delivery is missing")
+            };
+        };
+        if &self.pending_completion_deliveries[pending_index] != delivery {
+            return invalid("pending incoming completion delivery does not match acknowledgement");
+        }
+
+        let mut sources = self.sources.clone();
+        let mut receipts = self.completed_receipts.clone();
+        let mut pending = self.pending_completion_deliveries.clone();
+        let source = sources
+            .iter_mut()
+            .find(|source| source.device_id == delivery.source_device_id)
+            .ok_or_else(|| {
+                PeerSyncError::Validation("registered incoming source is missing".to_owned())
+            })?;
+        source.total_bytes = source
+            .total_bytes
+            .checked_add(delivery.useful_bytes)
+            .ok_or_else(|| PeerSyncError::Validation("peer total bytes overflow".to_owned()))?;
+        source.last_seen_ms = source.last_seen_ms.max(seen_at_ms);
+        if let Some(receipt) = receipts.iter_mut().find(|receipt| {
+            receipt.device_id == delivery.source_device_id && receipt.lane == delivery.lane
+        }) {
+            receipt.receipt_id = delivery.receipt_id.clone();
+            receipt.transferred_bytes = Some(delivery.useful_bytes);
+        } else {
+            receipts.push(CompletionReceipt {
+                device_id: delivery.source_device_id.clone(),
+                lane: delivery.lane.clone(),
+                receipt_id: delivery.receipt_id.clone(),
+                transferred_bytes: Some(delivery.useful_bytes),
+            });
+        }
+        pending.remove(pending_index);
+        self.write_state(&sources, &receipts, &pending)?;
+        self.sources = sources;
+        self.completed_receipts = receipts;
+        self.pending_completion_deliveries = pending;
+        Ok(CompletionDeliveryFinalizeStatus::Finalized)
+    }
+
+    fn completion_is_durable(
+        &self,
+        delivery: &PendingCompletionDelivery,
+    ) -> Result<bool, PeerSyncError> {
+        validate_pending_completion_delivery(delivery)?;
+        let lane_pending = self.pending_completion_deliveries.iter().any(|pending| {
+            pending.source_device_id == delivery.source_device_id && pending.lane == delivery.lane
+        });
+        Ok(!lane_pending
+            && self.completed_receipts.iter().any(|receipt| {
+                receipt.device_id == delivery.source_device_id
+                    && receipt.lane == delivery.lane
+                    && receipt.receipt_id == delivery.receipt_id
+                    && receipt.transferred_bytes == Some(delivery.useful_bytes)
+            }))
+    }
+
+    fn write_state(
+        &self,
+        sources: &[IncomingSource],
+        completed_receipts: &[CompletionReceipt],
+        pending_completion_deliveries: &[PendingCompletionDelivery],
+    ) -> Result<(), PeerSyncError> {
         write_registry(
             &self.root.join("sources.json"),
             &IncomingFile {
                 schema: INCOMING_SCHEMA.to_owned(),
-                sources: self.sources.clone(),
-                completed_receipts: self.completed_receipts.clone(),
+                sources: sources.to_vec(),
+                completed_receipts: completed_receipts.to_vec(),
+                pending_completion_deliveries: pending_completion_deliveries.to_vec(),
             },
+        )
+    }
+
+    pub(crate) fn save(&self) -> Result<(), PeerSyncError> {
+        self.write_state(
+            &self.sources,
+            &self.completed_receipts,
+            &self.pending_completion_deliveries,
         )
     }
 }
@@ -1291,6 +1528,53 @@ pub(crate) fn incoming_completed_operation_recorded_for_lane(
         .has_completed_operation_for_lane(source_id, lane, receipt_id)
 }
 
+pub(crate) fn prepare_incoming_completion_delivery(
+    app_root: &Path,
+    delivery: PendingCompletionDelivery,
+) -> Result<CompletionDeliveryPrepareStatus, PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    registry.prepare_completion_delivery(delivery)
+}
+
+// The returned value owns both the native-only credential and the exact
+// delivery record. The registry lock is released before the caller performs
+// any HTTP request.
+pub(crate) fn snapshot_incoming_completion_delivery(
+    app_root: &Path,
+    source_id: &str,
+    lane: CompletionLane,
+) -> Result<Option<IncomingCompletionDeliverySnapshot>, PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    IncomingSourceRegistry::load(app_root)?.completion_delivery_snapshot(source_id, lane)
+}
+
+pub(crate) fn finalize_incoming_completion_delivery(
+    app_root: &Path,
+    delivery: &PendingCompletionDelivery,
+) -> Result<CompletionDeliveryFinalizeStatus, PeerSyncError> {
+    let seen_at_ms = completion_timestamp_ms()?;
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    let mut registry = IncomingSourceRegistry::load(app_root)?;
+    registry.finalize_completion_delivery(delivery, seen_at_ms)
+}
+
+pub(crate) fn incoming_completion_is_durable(
+    app_root: &Path,
+    delivery: &PendingCompletionDelivery,
+) -> Result<bool, PeerSyncError> {
+    let _guard = incoming_registry_lock()
+        .lock()
+        .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
+    IncomingSourceRegistry::load(app_root)?.completion_is_durable(delivery)
+}
+
 pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
     let root = ensure_peer_root(app_root)?;
     let current = root.join("device-id");
@@ -1543,6 +1827,54 @@ fn validate_incoming_receipts<'a>(
     registered_ids: impl Iterator<Item = &'a str>,
 ) -> Result<(), PeerSyncError> {
     validate_receipts(receipts, registered_ids)
+}
+
+fn validate_pending_completion_delivery(
+    delivery: &PendingCompletionDelivery,
+) -> Result<(), PeerSyncError> {
+    let lane = CompletionLane::parse(&delivery.lane)?;
+    validate_completion_tuple(
+        &delivery.source_device_id,
+        lane,
+        &delivery.completion_lease_id,
+        &delivery.manifest_id,
+    )?;
+    validate_receipt_id(&delivery.receipt_id)?;
+    if completion_receipt_id(
+        &delivery.lane,
+        &delivery.completion_lease_id,
+        &delivery.manifest_id,
+    ) != delivery.receipt_id
+    {
+        return invalid("incoming completion delivery receipt does not match its evidence");
+    }
+    Ok(())
+}
+
+fn validate_pending_completion_deliveries<'a>(
+    deliveries: &[PendingCompletionDelivery],
+    completed_receipts: &[CompletionReceipt],
+    registered_ids: impl Iterator<Item = &'a str>,
+) -> Result<(), PeerSyncError> {
+    let registered_ids = registered_ids.collect::<std::collections::BTreeSet<_>>();
+    if deliveries.len() > registered_ids.len().saturating_mul(3) {
+        return invalid("too many pending incoming completion deliveries");
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for delivery in deliveries {
+        validate_pending_completion_delivery(delivery)?;
+        if !registered_ids.contains(delivery.source_device_id.as_str())
+            || !unique.insert((&delivery.source_device_id, &delivery.lane))
+            || completed_receipts.iter().any(|receipt| {
+                receipt.device_id == delivery.source_device_id
+                    && receipt.lane == delivery.lane
+                    && receipt.receipt_id == delivery.receipt_id
+            })
+        {
+            return invalid("invalid pending incoming completion delivery");
+        }
+    }
+    Ok(())
 }
 
 fn validate_completion_offers<'a>(

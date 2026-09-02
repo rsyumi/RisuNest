@@ -1,13 +1,15 @@
 use super::device_registry::{
-    accept_outgoing_completion_offer, incoming_completed_operation_recorded_for_lane,
+    accept_outgoing_completion_offer, finalize_incoming_completion_delivery,
+    incoming_completed_operation_recorded_for_lane, incoming_completion_is_durable,
     incoming_source_summaries, issue_outgoing_unmeasured_completion_offer,
-    outgoing_device_summaries, record_incoming_completed_operation,
-    record_incoming_completed_operation_best_effort,
+    outgoing_device_summaries, prepare_incoming_completion_delivery,
+    record_incoming_completed_operation, record_incoming_completed_operation_best_effort,
     record_incoming_completed_operation_once_for_lane, record_outgoing_completed_operation,
     register_incoming_source, register_outgoing_claim, remove_incoming_source,
-    revoke_outgoing_device, seal_outgoing_completion_lease, CompletionAcceptance, CompletionLane,
-    CompletionSealStatus, DevicePermissions, IncomingSource, IncomingSourceRegistry,
-    OutgoingDevice, OutgoingDeviceRegistry,
+    revoke_outgoing_device, seal_outgoing_completion_lease, snapshot_incoming_completion_delivery,
+    CompletionAcceptance, CompletionDeliveryFinalizeStatus, CompletionDeliveryPrepareStatus,
+    CompletionLane, CompletionSealStatus, DevicePermissions, IncomingSource,
+    IncomingSourceRegistry, OutgoingDevice, OutgoingDeviceRegistry, PendingCompletionDelivery,
 };
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -15,6 +17,436 @@ use std::thread;
 
 const SOURCE_ID: &str = "b8e9d6d7-6d4c-43d8-b00a-80c8f34478b6";
 const TARGET_ID: &str = "5c39d09f-4b6d-4e21-9ad3-a674c4c1c9b0";
+
+fn pending_delivery(
+    lane: CompletionLane,
+    lease_suffix: u8,
+    manifest_byte: char,
+    useful_bytes: u64,
+) -> PendingCompletionDelivery {
+    let completion_lease_id = format!("00000000-0000-4000-8000-{lease_suffix:012}");
+    let manifest_id = manifest_byte.to_string().repeat(64);
+    let receipt_id = super::device_registry::completion_receipt_id(
+        lane.as_str(),
+        &completion_lease_id,
+        &manifest_id,
+    );
+    PendingCompletionDelivery {
+        source_device_id: SOURCE_ID.to_owned(),
+        lane: lane.as_str().to_owned(),
+        completion_lease_id,
+        manifest_id,
+        useful_bytes,
+        receipt_id,
+    }
+}
+
+fn register_test_source(root: &std::path::Path, bearer: char, total_bytes: u64) {
+    register_incoming_source(
+        root,
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Android".into(),
+            endpoint: "http://192.168.0.5:32145".into(),
+            bearer: bearer.to_string().repeat(64),
+            permissions: DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 25,
+            total_bytes,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn incoming_completion_delivery_is_remote_first_durable_and_retry_safe() {
+    let root = tempfile::tempdir().unwrap();
+    register_test_source(root.path(), 'c', 5);
+    let delivery = pending_delivery(CompletionLane::Delta, 1, 'a', 11);
+
+    assert_eq!(
+        prepare_incoming_completion_delivery(root.path(), delivery.clone()).unwrap(),
+        CompletionDeliveryPrepareStatus::Pending
+    );
+    let prepared_bytes = fs::read(root.path().join("peer-sync/sources.json")).unwrap();
+    let restarted = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(restarted.sources()[0].total_bytes, 5);
+    assert!(!restarted
+        .has_completed_operation_for_lane(SOURCE_ID, CompletionLane::Delta, &delivery.receipt_id,)
+        .unwrap());
+    assert!(!incoming_completion_is_durable(root.path(), &delivery).unwrap());
+
+    let snapshot =
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta)
+            .unwrap()
+            .unwrap();
+    assert_eq!(snapshot.source.device_id, SOURCE_ID);
+    assert_eq!(snapshot.source.bearer, "c".repeat(64));
+    assert_eq!(snapshot.delivery, delivery);
+
+    assert_eq!(
+        prepare_incoming_completion_delivery(root.path(), delivery.clone()).unwrap(),
+        CompletionDeliveryPrepareStatus::Pending
+    );
+    assert_eq!(
+        fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        prepared_bytes
+    );
+
+    assert_eq!(
+        finalize_incoming_completion_delivery(root.path(), &delivery).unwrap(),
+        CompletionDeliveryFinalizeStatus::Finalized
+    );
+    let finalized = IncomingSourceRegistry::load(root.path()).unwrap();
+    assert_eq!(finalized.sources()[0].total_bytes, 16);
+    assert!(incoming_completion_is_durable(root.path(), &delivery).unwrap());
+    assert!(
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta,)
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(
+        prepare_incoming_completion_delivery(root.path(), delivery.clone()).unwrap(),
+        CompletionDeliveryPrepareStatus::AlreadyDurable
+    );
+    assert_eq!(
+        finalize_incoming_completion_delivery(root.path(), &delivery).unwrap(),
+        CompletionDeliveryFinalizeStatus::AlreadyFinalized
+    );
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        16
+    );
+}
+
+#[test]
+fn pending_delivery_blocks_later_work_and_a_b_a_replay_does_not_recount_locally() {
+    let root = tempfile::tempdir().unwrap();
+    register_test_source(root.path(), 'c', 0);
+    let operation_a = pending_delivery(CompletionLane::Delta, 1, 'a', 11);
+    let operation_b = pending_delivery(CompletionLane::Delta, 2, 'b', 7);
+    let operation_c = pending_delivery(CompletionLane::Delta, 3, 'c', 5);
+
+    prepare_incoming_completion_delivery(root.path(), operation_a.clone()).unwrap();
+    finalize_incoming_completion_delivery(root.path(), &operation_a).unwrap();
+    prepare_incoming_completion_delivery(root.path(), operation_b.clone()).unwrap();
+    finalize_incoming_completion_delivery(root.path(), &operation_b).unwrap();
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        18
+    );
+
+    assert_eq!(
+        prepare_incoming_completion_delivery(root.path(), operation_a.clone()).unwrap(),
+        CompletionDeliveryPrepareStatus::Pending
+    );
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        18
+    );
+    assert!(!incoming_completion_is_durable(root.path(), &operation_a).unwrap());
+    assert!(!incoming_completion_is_durable(root.path(), &operation_b).unwrap());
+    assert!(prepare_incoming_completion_delivery(root.path(), operation_c).is_err());
+    assert_eq!(
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta,)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        operation_a
+    );
+}
+
+#[test]
+fn pending_delivery_fails_closed_for_removal_and_credential_rotation() {
+    let root = tempfile::tempdir().unwrap();
+    register_test_source(root.path(), 'c', 0);
+    let delivery = pending_delivery(CompletionLane::Clone, 1, 'a', 9);
+    prepare_incoming_completion_delivery(root.path(), delivery.clone()).unwrap();
+    let before = fs::read(root.path().join("peer-sync/sources.json")).unwrap();
+
+    assert!(remove_incoming_source(root.path(), SOURCE_ID).is_err());
+    assert_eq!(
+        fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        before
+    );
+
+    assert!(register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Rotated".into(),
+            endpoint: "http://192.168.0.9:32145".into(),
+            bearer: "d".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 99,
+            total_bytes: 0,
+        },
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
+        before
+    );
+
+    register_incoming_source(
+        root.path(),
+        IncomingSource {
+            device_id: SOURCE_ID.into(),
+            name: "Same credential".into(),
+            endpoint: "http://192.168.0.9:32145".into(),
+            bearer: "c".repeat(64),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 99,
+            total_bytes: 0,
+        },
+    )
+    .unwrap();
+    let snapshot =
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Clone)
+            .unwrap()
+            .unwrap();
+    assert_eq!(snapshot.source.endpoint, "http://192.168.0.9:32145");
+    assert_eq!(snapshot.source.bearer, "c".repeat(64));
+    assert_eq!(snapshot.delivery, delivery);
+}
+
+#[test]
+fn unsupported_completion_records_once_without_creating_an_outbox() {
+    let root = tempfile::tempdir().unwrap();
+    register_test_source(root.path(), 'c', 4);
+    let receipt_id = "a".repeat(64);
+
+    record_incoming_completed_operation_once_for_lane(
+        root.path(),
+        SOURCE_ID,
+        CompletionLane::Bidirectional,
+        &receipt_id,
+        9,
+    )
+    .unwrap();
+    record_incoming_completed_operation_once_for_lane(
+        root.path(),
+        SOURCE_ID,
+        CompletionLane::Bidirectional,
+        &receipt_id,
+        9,
+    )
+    .unwrap();
+
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        13
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("peer-sync/sources.json")).unwrap())
+            .unwrap();
+    assert!(json.get("pendingCompletionDeliveries").is_none());
+}
+
+#[test]
+fn pending_completion_json_is_exact_bounded_and_backward_compatible() {
+    let root = tempfile::tempdir().unwrap();
+    register_test_source(root.path(), 'c', 0);
+    let clone = pending_delivery(CompletionLane::Clone, 1, 'a', 9);
+    let delta = pending_delivery(CompletionLane::Delta, 2, 'b', 10);
+    let bidirectional = pending_delivery(CompletionLane::Bidirectional, 3, 'c', 11);
+    for delivery in [&clone, &delta, &bidirectional] {
+        prepare_incoming_completion_delivery(root.path(), delivery.clone()).unwrap();
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("peer-sync/sources.json")).unwrap())
+            .unwrap();
+    let pending = json["pendingCompletionDeliveries"].as_array().unwrap();
+    assert_eq!(pending.len(), 3);
+    assert_eq!(
+        pending[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "completionLeaseId",
+            "lane",
+            "manifestId",
+            "receiptId",
+            "sourceDeviceId",
+            "usefulBytes",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(pending[0]["sourceDeviceId"], SOURCE_ID);
+    assert_eq!(pending[0]["lane"], "clone");
+    assert_eq!(pending[0]["completionLeaseId"], clone.completion_lease_id);
+    assert_eq!(pending[0]["manifestId"], clone.manifest_id);
+    assert_eq!(pending[0]["usefulBytes"], 9);
+    assert_eq!(pending[0]["receiptId"], clone.receipt_id);
+
+    assert!(prepare_incoming_completion_delivery(
+        root.path(),
+        pending_delivery(CompletionLane::Clone, 4, 'd', 12),
+    )
+    .is_err());
+
+    let legacy_root = tempfile::tempdir().unwrap();
+    let peer_root = legacy_root.path().join("peer-sync");
+    fs::create_dir_all(&peer_root).unwrap();
+    fs::write(
+        peer_root.join("sources.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "risunest.peer-source-registry/v1",
+            "sources": [{
+                "deviceId": SOURCE_ID,
+                "name": "Legacy",
+                "endpoint": "http://192.168.0.5:32145",
+                "bearer": "c".repeat(64),
+                "permissions": ["read"],
+                "lastSeenMs": 1,
+                "totalBytes": 2
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        IncomingSourceRegistry::load(legacy_root.path())
+            .unwrap()
+            .sources()[0]
+            .total_bytes,
+        2
+    );
+}
+
+#[test]
+fn malformed_pending_completion_deliveries_are_rejected() {
+    let source = serde_json::json!({
+        "deviceId": SOURCE_ID,
+        "name": "Android",
+        "endpoint": "http://192.168.0.5:32145",
+        "bearer": "c".repeat(64),
+        "permissions": ["read", "bidirectional"],
+        "lastSeenMs": 1,
+        "totalBytes": 2
+    });
+    let valid = pending_delivery(CompletionLane::Delta, 1, 'a', 9);
+    let valid_json = serde_json::to_value(&valid).unwrap();
+    let mut cases = Vec::new();
+    for (field, value) in [
+        ("sourceDeviceId", serde_json::json!(TARGET_ID)),
+        ("lane", serde_json::json!("other")),
+        (
+            "completionLeaseId",
+            serde_json::json!("00000000-0000-1000-8000-000000000001"),
+        ),
+        ("manifestId", serde_json::json!("A".repeat(64))),
+        ("receiptId", serde_json::json!("b".repeat(64))),
+    ] {
+        let mut invalid = valid_json.clone();
+        invalid[field] = value;
+        cases.push(vec![invalid]);
+    }
+    cases.push(vec![valid_json.clone(), valid_json.clone()]);
+    let mut unknown = valid_json;
+    unknown["unexpected"] = serde_json::json!(true);
+    cases.push(vec![unknown]);
+
+    for pending in cases {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-sync");
+        fs::create_dir_all(&peer_root).unwrap();
+        fs::write(
+            peer_root.join("sources.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "risunest.peer-source-registry/v1",
+                "sources": [source.clone()],
+                "pendingCompletionDeliveries": pending
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(IncomingSourceRegistry::load(root.path()).is_err());
+    }
+}
+
+#[test]
+fn completion_delivery_prepare_and_finalize_failures_are_atomic() {
+    let prepare_root = tempfile::tempdir().unwrap();
+    register_test_source(prepare_root.path(), 'c', 0);
+    let delivery = pending_delivery(CompletionLane::Clone, 1, 'a', 9);
+    let mut registry = IncomingSourceRegistry::load(prepare_root.path()).unwrap();
+    let registry_path = prepare_root.path().join("peer-sync/sources.json");
+    let preserved_path = prepare_root.path().join("peer-sync/sources.preserved.json");
+    let before_prepare = fs::read(&registry_path).unwrap();
+    fs::rename(&registry_path, &preserved_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+    assert!(registry
+        .prepare_completion_delivery(delivery.clone())
+        .is_err());
+    assert_eq!(registry.sources()[0].total_bytes, 0);
+    fs::remove_dir(&registry_path).unwrap();
+    fs::rename(&preserved_path, &registry_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), before_prepare);
+    assert!(snapshot_incoming_completion_delivery(
+        prepare_root.path(),
+        SOURCE_ID,
+        CompletionLane::Clone,
+    )
+    .unwrap()
+    .is_none());
+
+    let overflow_root = tempfile::tempdir().unwrap();
+    register_test_source(overflow_root.path(), 'c', u64::MAX);
+    prepare_incoming_completion_delivery(overflow_root.path(), delivery.clone()).unwrap();
+    let before_overflow = fs::read(overflow_root.path().join("peer-sync/sources.json")).unwrap();
+    let different_ack = pending_delivery(CompletionLane::Clone, 2, 'b', 9);
+    assert!(finalize_incoming_completion_delivery(overflow_root.path(), &different_ack).is_err());
+    assert_eq!(
+        fs::read(overflow_root.path().join("peer-sync/sources.json")).unwrap(),
+        before_overflow
+    );
+    assert!(finalize_incoming_completion_delivery(overflow_root.path(), &delivery).is_err());
+    assert_eq!(
+        fs::read(overflow_root.path().join("peer-sync/sources.json")).unwrap(),
+        before_overflow
+    );
+    assert_eq!(
+        snapshot_incoming_completion_delivery(
+            overflow_root.path(),
+            SOURCE_ID,
+            CompletionLane::Clone,
+        )
+        .unwrap()
+        .unwrap()
+        .delivery,
+        delivery
+    );
+
+    let write_root = tempfile::tempdir().unwrap();
+    register_test_source(write_root.path(), 'c', 0);
+    prepare_incoming_completion_delivery(write_root.path(), delivery.clone()).unwrap();
+    let mut registry = IncomingSourceRegistry::load(write_root.path()).unwrap();
+    let registry_path = write_root.path().join("peer-sync/sources.json");
+    let preserved_path = write_root.path().join("peer-sync/sources.preserved.json");
+    let before_finalize = fs::read(&registry_path).unwrap();
+    fs::rename(&registry_path, &preserved_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+    assert!(registry
+        .finalize_completion_delivery(&delivery, 99)
+        .is_err());
+    assert_eq!(registry.sources()[0].total_bytes, 0);
+    fs::remove_dir(&registry_path).unwrap();
+    fs::rename(&preserved_path, &registry_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), before_finalize);
+    assert_eq!(
+        snapshot_incoming_completion_delivery(write_root.path(), SOURCE_ID, CompletionLane::Clone,)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        delivery
+    );
+}
 
 #[test]
 fn source_issued_completion_lease_blocks_a_b_a_replay_after_reload() {
@@ -1131,6 +1563,9 @@ fn registries_reject_malformed_oversized_and_linked_files() {
     fs::write(peer_root.join("devices.json"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
     assert!(OutgoingDeviceRegistry::load(root.path()).is_err());
 
+    fs::write(peer_root.join("sources.json"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    assert!(IncomingSourceRegistry::load(root.path()).is_err());
+
     let outside = root.path().join("outside.json");
     fs::write(&outside, b"{}").unwrap();
     fs::remove_file(peer_root.join("devices.json")).unwrap();
@@ -1138,6 +1573,13 @@ fn registries_reject_malformed_oversized_and_linked_files() {
     std::os::unix::fs::symlink(&outside, peer_root.join("devices.json")).unwrap();
     #[cfg(unix)]
     assert!(OutgoingDeviceRegistry::load(root.path()).is_err());
+
+    #[cfg(unix)]
+    {
+        fs::remove_file(peer_root.join("sources.json")).unwrap();
+        std::os::unix::fs::symlink(&outside, peer_root.join("sources.json")).unwrap();
+        assert!(IncomingSourceRegistry::load(root.path()).is_err());
+    }
 }
 
 #[test]
