@@ -1,5 +1,5 @@
 import type { SettingItem } from './types'
-import { MAX_INLAY_DIMENSION } from '../storage/blobStore'
+import { MAX_INLAY_DIMENSION, normalizeInlayEncodeOptions } from '../storage/blobStore'
 
 export const risuNestSettingsItems: SettingItem[] = [
     { id: 'risunest.inlay.header', type: 'header', labelKey: 'risuNest.inlay.title', options: { level: 'h2' } },
@@ -32,6 +32,9 @@ export const risuNestSettingsItems: SettingItem[] = [
         labelKey: 'risuNest.inlay.maxDimension',
         helpKey: 'risuNest.inlay.maxDimensionHelp',
         bindKey: 'risunestInlayMaxDimension',
+        setValue: (db, value: number) => {
+            db.risunestInlayMaxDimension = normalizeInlayEncodeOptions({ maxDimension: value }).maxDimension
+        },
         condition: (ctx) => ctx.db.risunestInlayFormat !== 'original',
         options: { min: 0, max: MAX_INLAY_DIMENSION, step: 1 },
     },

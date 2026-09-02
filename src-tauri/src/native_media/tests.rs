@@ -3,7 +3,7 @@ use super::{
     write_inlay_image, write_inlay_image_with_suffix, InlayEncodeFormat, InlayEncodeOptions,
     InlayImageMetadata,
 };
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::json;
 use std::{fs, io::Cursor, path::Path};
 use tauri::http::{header, Method, Request, StatusCode};
@@ -615,6 +615,9 @@ fn configurable_inlay_encoding_resizes_before_webp_encoding() {
 #[test]
 fn configured_webp_quality_is_forwarded_instead_of_using_the_default() {
     let source = encoded_fixture(ImageFormat::Png, 32, 24);
+    let rgba = image::load_from_memory_with_format(&source, ImageFormat::Png)
+        .unwrap()
+        .to_rgba8();
     let configured = encode_inlay_image(
         "quality-70",
         &source,
@@ -629,8 +632,11 @@ fn configured_webp_quality_is_forwarded_instead_of_using_the_default() {
     .unwrap();
     let defaulted = encode_inlay_image("quality-85", &source, "source.png", None).unwrap();
 
-    assert_ne!(configured.data, defaulted.data);
-    for encoded in [&configured.data, &defaulted.data] {
+    for (encoded, quality) in [(&configured.data, 70.0), (&defaulted.data, 85.0)] {
+        let expected = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+            .encode(quality)
+            .to_vec();
+        assert_eq!(encoded.as_slice(), expected.as_slice());
         let decoded = image::load_from_memory_with_format(encoded, ImageFormat::WebP).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (32, 24));
     }
@@ -654,8 +660,15 @@ fn configured_png_resizes_losslessly_with_truthful_dimensions() {
 
     assert_eq!(&result.data[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
-    let decoded = image::load_from_memory_with_format(&result.data, ImageFormat::Png).unwrap();
+    let decoded = image::load_from_memory_with_format(&result.data, ImageFormat::Png)
+        .unwrap()
+        .to_rgba8();
     assert_eq!((decoded.width(), decoded.height()), (5, 3));
+    let expected = image::load_from_memory_with_format(&source, ImageFormat::Jpeg)
+        .unwrap()
+        .resize(5, 3, FilterType::Lanczos3)
+        .to_rgba8();
+    assert_eq!(decoded, expected);
 }
 
 #[test]
