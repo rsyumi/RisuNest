@@ -62,10 +62,20 @@ describe('RisuNest Android platform settings', () => {
         return target
     }
 
-    it('hides when Android notification status is unavailable', async () => {
+    it('keeps platform controls and diagnostics visible when notification status is unavailable', async () => {
         const target = mountPlatform(null)
         await tick()
-        expect(target.textContent).toBe('')
+        await Promise.resolve()
+        await tick()
+
+        expect(target.textContent).toContain('Platform')
+        expect(target.textContent).toContain('Open system settings')
+        expect(target.textContent).toContain('Keep app alive while generating')
+        expect(target.textContent).toContain('Android 16')
+        expect(target.textContent).toContain('140.0.1')
+        expect(target.textContent).toContain('foreground')
+        expect(target.querySelector('[role="status"]')).toBeNull()
+        expect(target.querySelector('[role="alert"]')).toBeNull()
     })
 
     it('renders notification state, diagnostics, settings action, and persisted keep-alive toggle', async () => {
