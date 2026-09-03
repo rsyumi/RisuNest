@@ -1893,6 +1893,45 @@ fn new_registration_is_refused_while_an_android_clone_job_uses_a_registered_sour
 }
 
 #[test]
+fn source_removal_is_refused_while_an_android_clone_job_uses_the_source() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture_source(root.path(), &[64]);
+    let mut peers = RegistrationPeers::prepare(&source);
+    let target_device_id =
+        super::device_registry::load_or_create_device_id(peers.target_root.path()).unwrap();
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(peers.target_root.path())
+            .unwrap();
+    registry
+        .connect_registered(
+            &peers.registered.endpoint,
+            &peers.session_id,
+            &peers.manifest_id,
+            &target_device_id,
+            &peers.source_device_id,
+            &peers.registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
+        )
+        .unwrap();
+    let incoming_before = peers.incoming_bytes();
+
+    let refused = super::registry_commands::remove_incoming_source_if_inactive(
+        peers.target_root.path(),
+        &peers.source_device_id,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        refused,
+        PeerSyncError::Validation(
+            "registered Android clone source is used by an active job".to_owned()
+        )
+    );
+    assert_eq!(peers.incoming_bytes(), incoming_before);
+    peers.host.stop().unwrap();
+}
+
+#[test]
 fn android_clone_recovery_discards_an_unpublished_registered_source_orphan() {
     let root = tempfile::tempdir().unwrap();
     let source_device_id = "00000000-0000-4000-8000-000000000291";

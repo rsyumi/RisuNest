@@ -96,7 +96,9 @@ pub fn peer_sync_incoming_sources(app: AppHandle) -> Result<Vec<IncomingSourceSu
         incoming_source_summaries(&app_root(&app)?),
     )
 }
-#[tauri::command]
+// The lifecycle hold this waits on can span a registration round trip, so it
+// must not run on the main thread.
+#[tauri::command(async)]
 pub fn peer_sync_remove_incoming_source(app: AppHandle, device_id: String) -> Result<(), String> {
     finish_registry_command(
         "incoming source removal",
@@ -145,7 +147,8 @@ pub(crate) fn ensure_no_active_registered_source_work(
     _lifecycle: &std::sync::MutexGuard<'_, ()>,
     app_root: &Path,
 ) -> Result<(), PeerSyncError> {
-    if active_registered_source_lane(app_root, None)?.is_some() {
+    if let Some(lane) = active_registered_source_lane(app_root, None)? {
+        crate::nlog!("warn", "new registration refused: {lane}");
         return Err(PeerSyncError::Validation(
             REGISTRATION_BLOCKED_BY_ACTIVE_WORK.to_owned(),
         ));
@@ -184,30 +187,8 @@ pub(crate) fn remove_incoming_source_if_inactive(
     device_id: &str,
 ) -> Result<(), super::PeerSyncError> {
     let _lifecycle = lock_registered_source_lifecycle()?;
-    #[cfg(desktop)]
-    if super::commands::registered_clone_source_is_active(app_root, Some(device_id))? {
-        return Err(super::PeerSyncError::Validation(
-            "registered clone source is used by an active target".to_owned(),
-        ));
-    }
-    if super::delta_completion::registered_delta_source_is_active(app_root, Some(device_id))? {
-        return Err(super::PeerSyncError::Validation(
-            "registered delta source is used by an active target".to_owned(),
-        ));
-    }
-    if super::bidirectional_commands::registered_bidirectional_source_is_active(
-        app_root,
-        Some(device_id),
-    )? {
-        return Err(super::PeerSyncError::Validation(
-            "registered bidirectional source is used by an active target".to_owned(),
-        ));
-    }
-    #[cfg(target_os = "android")]
-    if super::android_client::registered_clone_source_is_active(app_root, Some(device_id))? {
-        return Err(super::PeerSyncError::Validation(
-            "registered Android clone source is used by an active job".to_owned(),
-        ));
+    if let Some(lane) = active_registered_source_lane(app_root, Some(device_id))? {
+        return Err(super::PeerSyncError::Validation(lane.to_owned()));
     }
     remove_incoming_source(app_root, device_id)
 }
