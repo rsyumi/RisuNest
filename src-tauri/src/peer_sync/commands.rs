@@ -6473,7 +6473,9 @@ mod tests {
                 )
                 .unwrap();
         });
-        assert!(rotation_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(rotation_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
         resume_publish.wait();
 
         worker.join().unwrap().unwrap();

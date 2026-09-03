@@ -2287,6 +2287,9 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
     let journal = PeerBidirectionalOperationJournal::new(directory.path());
     let mut retained_context = context(operation_id);
     retained_context.completion_mode = PeerBidirectionalCompletionMode::Unsupported;
+    retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+    retained_context.expected_remote_generation.manifest_hash =
+        retained_context.credential.manifest_id.clone();
     journal
         .store(&PeerBidirectionalDurableOperation::TargetPrepared {
             schema: OPERATION_SCHEMA.to_owned(),
@@ -2303,22 +2306,28 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
     let sources_path = directory.path().join("peer-sync/sources.json");
     let before = fs::read(&sources_path).unwrap();
 
-    assert!(super::super::registry_commands::register_incoming_source_if_compatible(
-        directory.path(),
-        super::super::device_registry::IncomingSource {
-            device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
-            name: "rotated source".to_owned(),
-            endpoint: "http://192.168.0.99:32146".to_owned(),
-            bearer: "d".repeat(64),
-            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
-            last_seen_ms: 9,
-            total_bytes: 0,
-        },
-    )
-    .is_err());
+    assert!(
+        super::super::registry_commands::register_incoming_source_if_compatible(
+            directory.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
+                name: "rotated source".to_owned(),
+                endpoint: "http://192.168.0.99:32146".to_owned(),
+                bearer: "d".repeat(64),
+                permissions:
+                    super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+                last_seen_ms: 9,
+                total_bytes: 0,
+            },
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(&sources_path).unwrap(), before);
 
-    let legacy_context = context(operation_id);
+    let mut legacy_context = context(operation_id);
+    legacy_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+    legacy_context.expected_remote_generation.manifest_hash =
+        legacy_context.credential.manifest_id.clone();
     journal
         .store(&PeerBidirectionalDurableOperation::TargetPrepared {
             schema: OPERATION_SCHEMA.to_owned(),

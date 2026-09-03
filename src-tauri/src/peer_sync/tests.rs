@@ -1513,11 +1513,13 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
     let before_rotation = fs::read(&sources_path).unwrap();
     let mut rotated_source = registered.clone();
     rotated_source.bearer = "0".repeat(64);
-    assert!(super::registry_commands::register_incoming_source_if_compatible(
-        target_root.path(),
-        rotated_source,
-    )
-    .is_err());
+    assert!(
+        super::registry_commands::register_incoming_source_if_compatible(
+            target_root.path(),
+            rotated_source,
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(&sources_path).unwrap(), before_rotation);
     let rotated_bearer = if registered.bearer == "f".repeat(64) {
         "e".repeat(64)

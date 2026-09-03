@@ -281,14 +281,15 @@ fn active_delta_journal_blocks_rotation_and_removal_until_exact_cleanup() {
         total_bytes: 0,
     };
 
-    assert!(super::registry_commands::register_incoming_source_if_compatible(
-        root.path(),
-        rotated,
-    )
-    .is_err());
+    assert!(
+        super::registry_commands::register_incoming_source_if_compatible(root.path(), rotated,)
+            .is_err()
+    );
     assert_eq!(std::fs::read(&sources_path).unwrap(), before);
-    assert!(super::registry_commands::remove_incoming_source_if_inactive(root.path(), SOURCE_ID)
-        .is_err());
+    assert!(
+        super::registry_commands::remove_incoming_source_if_inactive(root.path(), SOURCE_ID)
+            .is_err()
+    );
     assert_eq!(std::fs::read(&sources_path).unwrap(), before);
 
     journal.remove_exact(&operation).unwrap();

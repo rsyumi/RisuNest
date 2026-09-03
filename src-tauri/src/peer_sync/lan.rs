@@ -4,9 +4,9 @@ use super::{
         load_or_create_device_id, outgoing_bidirectional_completion_lease_allows_remote_apply,
         outgoing_completion_lease_ready_bytes, outgoing_completion_offer_active,
         outgoing_device_is_registered, record_outgoing_seen, register_outgoing_claim,
-        revoke_outgoing_device, seal_outgoing_completion_lease,
-        CompletionAcceptance, CompletionLane, CompletionLeaseId, CompletionSealStatus,
-        DevicePermissions, IncomingSource, OutgoingDevice, OutgoingDeviceRegistry,
+        revoke_outgoing_device, seal_outgoing_completion_lease, CompletionAcceptance,
+        CompletionLane, CompletionLeaseId, CompletionSealStatus, DevicePermissions, IncomingSource,
+        OutgoingDevice, OutgoingDeviceRegistry,
     },
     http_stream::HttpRangeStream,
     logical_completion::{
