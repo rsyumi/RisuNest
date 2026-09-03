@@ -26,13 +26,18 @@ export class DeviceSyncError extends Error {
 }
 
 // The native side reports this refusal by a stable code, which its own error
-// wrapping may surround with detail that must never reach the user.
+// wrapping may surround with detail that must never reach the user. Registered
+// target commands report the same refusal by their own bounded code.
 const NATIVE_REGISTRATION_BLOCKED = 'peer-registration-blocked-by-active-work'
+const REGISTERED_TARGET_REGISTRATION_BLOCKED = 'registrationBlockedByActiveWork'
 
 export function classifyDeviceSyncFailure(error: unknown): DeviceSyncError {
     if (error instanceof DeviceSyncError) return error
     const message = error instanceof Error ? error.message : String(error)
-    if (message.includes(NATIVE_REGISTRATION_BLOCKED)) {
+    if (
+        message === REGISTERED_TARGET_REGISTRATION_BLOCKED
+        || message.includes(NATIVE_REGISTRATION_BLOCKED)
+    ) {
         return new DeviceSyncError('registration-blocked-by-active-work')
     }
     if (message === 'authorizationExpired' || message === 'sourceMissing') {

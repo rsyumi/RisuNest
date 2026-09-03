@@ -199,6 +199,7 @@ describe('device sync facade', () => {
     it.each([
         'peer-registration-blocked-by-active-work',
         'Validation("peer-registration-blocked-by-active-work")',
+        'registrationBlockedByActiveWork',
     ])('maps the native registration refusal %s to its own category', async (nativeError) => {
         const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }) })
 

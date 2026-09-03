@@ -194,6 +194,7 @@ enum RegisteredTargetError {
     LaneUnavailable,
     IdentityMismatch,
     TransportUnavailable,
+    RegistrationBlockedByActiveWork,
     OperationFailed,
 }
 
@@ -206,6 +207,7 @@ impl RegisteredTargetError {
             Self::LaneUnavailable => "laneUnavailable",
             Self::IdentityMismatch => "identityMismatch",
             Self::TransportUnavailable => "transportUnavailable",
+            Self::RegistrationBlockedByActiveWork => "registrationBlockedByActiveWork",
             Self::OperationFailed => "operationFailed",
         }
     }
@@ -270,6 +272,14 @@ fn registered_claim_failure(context: &str, error: PeerSyncError) -> RegisteredTa
     crate::nlog!("warn", "{context} failed: {error}");
     match error {
         PeerSyncError::Transport(_) => RegisteredTargetError::TransportUnavailable,
+        // The user has to finish or stop their operation first, so this refusal
+        // needs its own code instead of the generic failure.
+        PeerSyncError::Validation(message)
+            if message
+                == crate::peer_sync::registry_commands::REGISTRATION_BLOCKED_BY_ACTIVE_WORK =>
+        {
+            RegisteredTargetError::RegistrationBlockedByActiveWork
+        }
         _ => RegisteredTargetError::OperationFailed,
     }
 }
@@ -891,6 +901,18 @@ mod tests {
         assert_eq!(code, "operationFailed");
         assert_ne!(code, "transportUnavailable");
         assert!(!code.contains("revision"));
+    }
+
+    #[test]
+    fn a_refused_new_registration_keeps_its_own_code_for_the_interface() {
+        let blocked = registered_claim_failure(
+            "registered clone registration",
+            PeerSyncError::Validation(
+                crate::peer_sync::registry_commands::REGISTRATION_BLOCKED_BY_ACTIVE_WORK.to_owned(),
+            ),
+        );
+
+        assert_eq!(blocked.code(), "registrationBlockedByActiveWork");
     }
 
     #[test]
