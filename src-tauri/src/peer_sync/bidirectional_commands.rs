@@ -7678,9 +7678,10 @@ pub(crate) struct PeerBidirectionalOperationJournal {
     root: PathBuf,
 }
 
+/// `source_device_id` of `None` asks the same question about any registered source.
 pub(crate) fn registered_bidirectional_source_is_active(
     app_root: &Path,
-    source_device_id: &str,
+    source_device_id: Option<&str>,
 ) -> Result<bool, PeerSyncError> {
     Ok(matches!(
         PeerBidirectionalOperationJournal::new(app_root).load()?,
@@ -7689,7 +7690,8 @@ pub(crate) fn registered_bidirectional_source_is_active(
             | PeerBidirectionalDurableOperation::AwaitingConflict { context, .. }
             | PeerBidirectionalDurableOperation::LocalCommitted { context, .. }
         ) if context.completion_mode != PeerBidirectionalCompletionMode::Legacy
-            && context.credential.source_device_id == source_device_id
+            && source_device_id
+                .is_none_or(|wanted| context.credential.source_device_id == wanted)
     ))
 }
 

@@ -2269,9 +2269,10 @@ fn legacy_target_journal_does_not_claim_registered_source_activity() {
 
     assert!(!registered_bidirectional_source_is_active(
         directory.path(),
-        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
+        Some(BIDIRECTIONAL_ACCOUNTING_SOURCE_ID),
     )
     .unwrap());
+    assert!(!registered_bidirectional_source_is_active(directory.path(), None).unwrap());
     super::super::registry_commands::remove_incoming_source_if_inactive(
         directory.path(),
         BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
@@ -2305,6 +2306,14 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
         .unwrap();
     let sources_path = directory.path().join("peer-sync/sources.json");
     let before = fs::read(&sources_path).unwrap();
+    let preflight = || {
+        let lifecycle =
+            super::super::registry_commands::lock_registered_source_lifecycle().unwrap();
+        super::super::registry_commands::ensure_no_active_registered_source_work(
+            &lifecycle,
+            directory.path(),
+        )
+    };
 
     assert!(
         super::super::registry_commands::register_incoming_source_if_compatible(
@@ -2323,6 +2332,7 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
         .is_err()
     );
     assert_eq!(fs::read(&sources_path).unwrap(), before);
+    assert!(preflight().is_err());
 
     let mut legacy_context = context(operation_id);
     legacy_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
@@ -2354,6 +2364,7 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
         },
     )
     .unwrap();
+    preflight().unwrap();
 
     journal
         .store(&PeerBidirectionalDurableOperation::Completed {
@@ -2384,6 +2395,7 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
         },
     )
     .unwrap();
+    preflight().unwrap();
 }
 
 #[test]

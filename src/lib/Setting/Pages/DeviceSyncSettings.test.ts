@@ -604,6 +604,22 @@ describe('DeviceSyncSettings', () => {
         expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('Error')
     })
 
+    it('tells the user to finish the current operation when a registration is refused', async () => {
+        await render(snapshot({
+            workError: 'registration-blocked-by-active-work',
+            targets: {
+                clone: cloneBase,
+                delta: deltaBase,
+                bidirectional: { ...bidiBase, operationPhase: 'targetPrepared', operationRetained: true },
+            },
+        }))
+
+        expect(target.querySelector('[data-sync-card="work"] [data-work-error]')?.textContent)
+            .toBe('Finish or stop the current operation before registering a new device.')
+        expect(target.querySelector('[data-sync-card="work"]')?.textContent)
+            .not.toContain('registration-blocked-by-active-work')
+    })
+
     it('renders one work alert when the selected source and operation are both expired', async () => {
         await render(snapshot({
             sources: [{ deviceId: 'source-a', name: 'Source A', permissions: ['read'] }],

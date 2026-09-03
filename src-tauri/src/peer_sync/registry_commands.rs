@@ -30,6 +30,18 @@ pub(crate) fn lock_registered_source_lifecycle(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn registered_source_lifecycle_is_locked() -> bool {
+    matches!(
+        registered_source_lifecycle_lock().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
+/// Stable code the interface maps to its own wording; never shown as native text.
+pub(crate) const REGISTRATION_BLOCKED_BY_ACTIVE_WORK: &str =
+    "peer-registration-blocked-by-active-work";
+
 trait RegistryAppRootResolver {
     fn resolve_registry_app_root(&self) -> Result<PathBuf, String>;
 }
@@ -92,41 +104,77 @@ pub fn peer_sync_remove_incoming_source(app: AppHandle, device_id: String) -> Re
     )
 }
 
+/// Names the lane still depending on a registered source, or `None` when no lane
+/// does. `source_device_id` of `None` looks at every registered source at once.
+fn active_registered_source_lane(
+    app_root: &Path,
+    source_device_id: Option<&str>,
+) -> Result<Option<&'static str>, PeerSyncError> {
+    #[cfg(desktop)]
+    if super::commands::registered_clone_source_is_active(app_root, source_device_id)? {
+        return Ok(Some("registered clone source is used by an active target"));
+    }
+    #[cfg(any(target_os = "android", test))]
+    if super::android_client::registered_clone_source_is_active(app_root, source_device_id)? {
+        return Ok(Some(
+            "registered Android clone source is used by an active job",
+        ));
+    }
+    if super::delta_completion::registered_delta_source_is_active(app_root, source_device_id)? {
+        return Ok(Some("registered delta source is used by an active target"));
+    }
+    if super::bidirectional_commands::registered_bidirectional_source_is_active(
+        app_root,
+        source_device_id,
+    )? {
+        return Ok(Some(
+            "registered bidirectional source is used by an active target",
+        ));
+    }
+    Ok(None)
+}
+
+/// Refuses a new registration while any lane still depends on a registered source.
+/// The remote peer replaces its authorization as soon as it answers a new
+/// registration link, and it has no way to take that back once this device
+/// refuses, so the refusal has to happen before the request leaves.
+///
+/// The caller must already hold the registered-source lifecycle guard, so that no
+/// lane can start between this check and the registration that follows it.
+pub(crate) fn ensure_no_active_registered_source_work(
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    app_root: &Path,
+) -> Result<(), PeerSyncError> {
+    if active_registered_source_lane(app_root, None)?.is_some() {
+        return Err(PeerSyncError::Validation(
+            REGISTRATION_BLOCKED_BY_ACTIVE_WORK.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn register_incoming_source_if_compatible(
     app_root: &Path,
     source: IncomingSource,
 ) -> Result<(), PeerSyncError> {
-    let _lifecycle = lock_registered_source_lifecycle()?;
+    let lifecycle = lock_registered_source_lifecycle()?;
+    register_incoming_source_if_compatible_locked(&lifecycle, app_root, source)
+}
+
+/// The lock-held half of the guard, for callers that already hold the lifecycle
+/// guard across a wider span than a single registration.
+pub(crate) fn register_incoming_source_if_compatible_locked(
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    app_root: &Path,
+    source: IncomingSource,
+) -> Result<(), PeerSyncError> {
     let bearer_changed = incoming_source_by_id(app_root, &source.device_id)?
         .is_some_and(|current| current.bearer != source.bearer);
     if !bearer_changed {
         return register_incoming_source(app_root, source);
     }
-
-    #[cfg(desktop)]
-    if super::commands::registered_clone_source_is_active(app_root, &source.device_id)? {
-        return Err(PeerSyncError::Validation(
-            "registered clone source is used by an active target".to_owned(),
-        ));
-    }
-    #[cfg(any(target_os = "android", test))]
-    if super::android_client::registered_clone_source_is_active(app_root, &source.device_id)? {
-        return Err(PeerSyncError::Validation(
-            "registered Android clone source is used by an active job".to_owned(),
-        ));
-    }
-    if super::delta_completion::registered_delta_source_is_active(app_root, &source.device_id)? {
-        return Err(PeerSyncError::Validation(
-            "registered delta source is used by an active target".to_owned(),
-        ));
-    }
-    if super::bidirectional_commands::registered_bidirectional_source_is_active(
-        app_root,
-        &source.device_id,
-    )? {
-        return Err(PeerSyncError::Validation(
-            "registered bidirectional source is used by an active target".to_owned(),
-        ));
+    if let Some(lane) = active_registered_source_lane(app_root, Some(&source.device_id))? {
+        return Err(PeerSyncError::Validation(lane.to_owned()));
     }
     register_incoming_source(app_root, source)
 }
@@ -137,25 +185,26 @@ pub(crate) fn remove_incoming_source_if_inactive(
 ) -> Result<(), super::PeerSyncError> {
     let _lifecycle = lock_registered_source_lifecycle()?;
     #[cfg(desktop)]
-    if super::commands::registered_clone_source_is_active(app_root, device_id)? {
+    if super::commands::registered_clone_source_is_active(app_root, Some(device_id))? {
         return Err(super::PeerSyncError::Validation(
             "registered clone source is used by an active target".to_owned(),
         ));
     }
-    if super::delta_completion::registered_delta_source_is_active(app_root, device_id)? {
+    if super::delta_completion::registered_delta_source_is_active(app_root, Some(device_id))? {
         return Err(super::PeerSyncError::Validation(
             "registered delta source is used by an active target".to_owned(),
         ));
     }
     if super::bidirectional_commands::registered_bidirectional_source_is_active(
-        app_root, device_id,
+        app_root,
+        Some(device_id),
     )? {
         return Err(super::PeerSyncError::Validation(
             "registered bidirectional source is used by an active target".to_owned(),
         ));
     }
     #[cfg(target_os = "android")]
-    if super::android_client::registered_clone_source_is_active(app_root, device_id)? {
+    if super::android_client::registered_clone_source_is_active(app_root, Some(device_id))? {
         return Err(super::PeerSyncError::Validation(
             "registered Android clone source is used by an active job".to_owned(),
         ));
@@ -204,6 +253,7 @@ mod tests {
 
     const DEVICE_ID: &str = "00000000-0000-4000-8000-000000000205";
     const MANIFEST_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_SOURCE_ID: &str = "00000000-0000-4000-8000-000000000206";
 
     fn root_with_logical_proof() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -329,6 +379,40 @@ mod tests {
             .devices()
             .is_empty());
         assert!(!proof.exists());
+    }
+
+    #[test]
+    fn a_new_registration_is_refused_by_work_that_belongs_to_a_different_source() {
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = lock_registered_source_lifecycle().unwrap();
+
+        ensure_no_active_registered_source_work(&lifecycle, root.path()).unwrap();
+
+        crate::peer_sync::delta_completion::PeerDeltaCompletionJournal::new(root.path())
+            .store_activation_intent(
+                &crate::peer_sync::delta_completion::DeltaCompletionContext {
+                    operation_id: "00000000-0000-4000-8000-000000000207".to_owned(),
+                    source_device_id: OTHER_SOURCE_ID.to_owned(),
+                    manifest_id: MANIFEST_ID.to_owned(),
+                    mode: crate::peer_sync::delta_completion::DeltaCompletionMode::CompletionV1,
+                    pre_revision: 1,
+                    pre_common_base: None,
+                    post_revision: 2,
+                    post_common_base: crate::persistent_store::SyncGenerationIdentity {
+                        generation_id: "generation-2".to_owned(),
+                        manifest_hash: MANIFEST_ID.to_owned(),
+                        generation_sequence: "2".to_owned(),
+                    },
+                    transferred_objects: 1,
+                    transferred_bytes: 3,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            ensure_no_active_registered_source_work(&lifecycle, root.path()).unwrap_err(),
+            PeerSyncError::Validation(REGISTRATION_BLOCKED_BY_ACTIVE_WORK.to_owned())
+        );
     }
 
     #[test]

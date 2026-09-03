@@ -1671,7 +1671,7 @@ fn android_registered_clone_publication_serializes_source_removal_after_revalida
             let _lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
             if super::android_client::registered_clone_source_is_active(
                 &removal_root,
-                &removal_source_device_id,
+                Some(&removal_source_device_id),
             )? {
                 return Err(PeerSyncError::Validation(
                     "registered Android clone source is used by an active job".to_owned(),
@@ -1693,6 +1693,203 @@ fn android_registered_clone_publication_serializes_source_removal_after_revalida
     removal.join().unwrap();
     assert!(registry.current().unwrap().is_some());
     host.stop().unwrap();
+}
+
+const REGISTRATION_BLOCKED: &str = "peer-registration-blocked-by-active-work";
+
+// A source host that already registered the target once, so any further
+// registration link replaces the authorization the target is already using.
+struct RegistrationPeers {
+    host: LanCloneHost,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    source_root: tempfile::TempDir,
+    target_root: tempfile::TempDir,
+    _session_root: tempfile::TempDir,
+    source_device_id: String,
+    registered: super::device_registry::IncomingSource,
+}
+
+impl RegistrationPeers {
+    fn prepare(source: &FixtureSource) -> Self {
+        let source_root = tempfile::tempdir().unwrap();
+        let session_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let mut host = LanCloneHost::prepare(prepare(source, session_root.path()));
+        host.enable_v2_registry(
+            source_root.path(),
+            "Desktop source",
+            super::device_registry::DevicePermissions::read(),
+        )
+        .unwrap();
+        let pairing = host.start().unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+        super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+            target_root.path(),
+            "Desktop target",
+            &target_root.path().join("registration-credential.json"),
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let source_device_id =
+            super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let registered =
+            super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+                .unwrap()
+                .unwrap();
+        Self {
+            host,
+            endpoint,
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+            source_root,
+            target_root,
+            _session_root: session_root,
+            source_device_id,
+            registered,
+        }
+    }
+
+    fn outgoing_bytes(&self) -> Vec<u8> {
+        fs::read(self.source_root.path().join("peer-sync/devices.json")).unwrap()
+    }
+
+    fn incoming_bytes(&self) -> Vec<u8> {
+        fs::read(self.target_root.path().join("peer-sync/sources.json")).unwrap()
+    }
+
+    fn claim(&self, credential: &Path, pairing: &LanPairing) -> Result<(), PeerSyncError> {
+        super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+            self.target_root.path(),
+            "Desktop target",
+            credential,
+            &self.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .map(|_| ())
+    }
+
+    fn registered_hello_succeeds(&self) -> bool {
+        super::lan::authenticated_peer_hello(&self.endpoint, &self.registered.bearer)
+            .is_ok_and(|hello| hello.device_id == self.source_device_id)
+    }
+}
+
+#[test]
+fn new_registration_is_refused_while_a_clone_target_uses_a_registered_source() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture_source(root.path(), &[64]);
+    let mut peers = RegistrationPeers::prepare(&source);
+    let state = super::commands::PeerCloneCommandState::default();
+    state
+        .connect_registered_target(
+            &peers.target_root.path().join("peer-clone"),
+            &peers.registered.endpoint,
+            &peers.session_id,
+            &peers.manifest_id,
+            &peers.source_device_id,
+            &peers.registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
+        )
+        .unwrap();
+    let outgoing_before = peers.outgoing_bytes();
+    let incoming_before = peers.incoming_bytes();
+    let rotated = peers.host.rotate_pairing_link().unwrap();
+    let credential = peers.target_root.path().join("second-credential.json");
+
+    let blocked = peers.claim(&credential, &rotated).unwrap_err();
+
+    assert_eq!(
+        blocked,
+        PeerSyncError::Validation(REGISTRATION_BLOCKED.to_owned())
+    );
+    assert_eq!(peers.outgoing_bytes(), outgoing_before);
+    assert_eq!(peers.incoming_bytes(), incoming_before);
+    assert!(!credential.try_exists().unwrap());
+    assert!(peers.registered_hello_succeeds());
+
+    // Finishing the target releases the refusal, and the same link still works,
+    // which is only possible because the refused attempt never consumed it.
+    fs::remove_dir_all(peers.target_root.path().join("peer-clone").join("targets")).unwrap();
+    peers.claim(&credential, &rotated).unwrap();
+
+    assert!(credential.try_exists().unwrap());
+    assert_ne!(peers.outgoing_bytes(), outgoing_before);
+    assert_ne!(peers.incoming_bytes(), incoming_before);
+    peers.host.stop().unwrap();
+}
+
+#[test]
+fn a_new_registration_holds_the_source_lifecycle_across_the_claim_round_trip() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture_source(root.path(), &[64]);
+    let mut peers = RegistrationPeers::prepare(&source);
+    let locked_during_claim = Arc::new(AtomicBool::new(false));
+    peers.host.set_after_v2_registry_claim_hook_for_test({
+        let locked_during_claim = Arc::clone(&locked_during_claim);
+        Arc::new(move || {
+            locked_during_claim.store(
+                super::registry_commands::registered_source_lifecycle_is_locked(),
+                Ordering::SeqCst,
+            );
+        })
+    });
+    let rotated = peers.host.rotate_pairing_link().unwrap();
+
+    peers
+        .claim(&peers.target_root.path().join("relinked.json"), &rotated)
+        .unwrap();
+
+    assert!(locked_during_claim.load(Ordering::SeqCst));
+    peers.host.stop().unwrap();
+}
+
+#[test]
+fn new_registration_is_refused_while_an_android_clone_job_uses_a_registered_source() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture_source(root.path(), &[64]);
+    let mut peers = RegistrationPeers::prepare(&source);
+    let target_device_id =
+        super::device_registry::load_or_create_device_id(peers.target_root.path()).unwrap();
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(peers.target_root.path())
+            .unwrap();
+    registry
+        .connect_registered(
+            &peers.registered.endpoint,
+            &peers.session_id,
+            &peers.manifest_id,
+            &target_device_id,
+            &peers.source_device_id,
+            &peers.registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
+        )
+        .unwrap();
+    let outgoing_before = peers.outgoing_bytes();
+    let incoming_before = peers.incoming_bytes();
+    let rotated = peers.host.rotate_pairing_link().unwrap();
+    let credential = peers
+        .target_root
+        .path()
+        .join("android-second-credential.json");
+
+    let blocked = peers.claim(&credential, &rotated).unwrap_err();
+
+    assert_eq!(
+        blocked,
+        PeerSyncError::Validation(REGISTRATION_BLOCKED.to_owned())
+    );
+    assert_eq!(peers.outgoing_bytes(), outgoing_before);
+    assert_eq!(peers.incoming_bytes(), incoming_before);
+    assert!(!credential.try_exists().unwrap());
+    assert!(peers.registered_hello_succeeds());
+    peers.host.stop().unwrap();
 }
 
 #[test]

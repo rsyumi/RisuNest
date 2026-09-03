@@ -187,16 +187,17 @@ fn registered_delta_source_activity_is_scoped_to_the_retained_journal_source() {
     let root = tempfile::tempdir().unwrap();
     let operation = context(OPERATION_ID);
 
-    assert!(!registered_delta_source_is_active(root.path(), SOURCE_ID).unwrap());
+    assert!(!registered_delta_source_is_active(root.path(), Some(SOURCE_ID)).unwrap());
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    assert!(registered_delta_source_is_active(root.path(), SOURCE_ID).unwrap());
+    assert!(registered_delta_source_is_active(root.path(), Some(SOURCE_ID)).unwrap());
     assert!(!registered_delta_source_is_active(
         root.path(),
-        "00000000-0000-4000-8000-000000000094",
+        Some("00000000-0000-4000-8000-000000000094"),
     )
     .unwrap());
+    assert!(registered_delta_source_is_active(root.path(), None).unwrap());
 }
 
 #[test]

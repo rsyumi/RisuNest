@@ -1397,7 +1397,7 @@ pub(crate) fn remove_incoming_source(
         .map_err(|_| PeerSyncError::Storage("incoming peer registry lock failed".to_owned()))?;
     #[cfg(any(target_os = "android", test))]
     {
-        if super::android_client::registered_clone_source_is_active(app_root, device_id)? {
+        if super::android_client::registered_clone_source_is_active(app_root, Some(device_id))? {
             return Err(PeerSyncError::Validation(
                 "incoming source is used by the active Android clone job".to_owned(),
             ));

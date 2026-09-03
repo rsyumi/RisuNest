@@ -17,7 +17,10 @@ use super::{
         OutgoingLogicalIssuedObjects,
     },
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
-    registry_commands::register_incoming_source_if_compatible,
+    registry_commands::{
+        ensure_no_active_registered_source_work, lock_registered_source_lifecycle,
+        register_incoming_source_if_compatible, register_incoming_source_if_compatible_locked,
+    },
     PeerSyncError,
 };
 #[cfg(any(desktop, target_os = "android"))]
@@ -356,6 +359,11 @@ impl LanCloneClient {
         validate_object_hash(manifest_id)?;
         validate_device_name(target_name)?;
         let target_device_id = load_or_create_device_id(app_root)?;
+        // One lifecycle hold covers the refusal, the claim round trip that makes the
+        // source replace its authorization, and this device's own registration, so a
+        // lane cannot start in the middle and lose the authorization it is using.
+        let lifecycle = lock_registered_source_lifecycle()?;
+        ensure_no_active_registered_source_work(&lifecycle, app_root)?;
         let (mut client, registered_v2) = Self::claim_v2_with_device(
             endpoint,
             session_id,
@@ -377,7 +385,9 @@ impl LanCloneClient {
         };
         client.persist(credential_path)?;
         if let Some(source) = registration {
-            if let Err(error) = register_incoming_source_if_compatible(app_root, source) {
+            if let Err(error) =
+                register_incoming_source_if_compatible_locked(&lifecycle, app_root, source)
+            {
                 restore_credential(credential_path, previous_credential.as_deref()).map_err(
                     |rollback| {
                         PeerSyncError::Storage(format!(
@@ -1701,7 +1711,10 @@ impl LanCloneHost {
     }
 
     #[cfg(test)]
-    fn set_after_v2_registry_claim_hook_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn set_after_v2_registry_claim_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
         *recovered_lock(&self.shared.after_v2_registry_claim) = Some(hook);
     }
 
@@ -6924,6 +6937,87 @@ mod timeout_tests {
         host.stop().unwrap();
     }
 
+    fn retained_delta_completion(
+        source_device_id: &str,
+        manifest_id: &str,
+    ) -> super::super::delta_completion::DeltaCompletionContext {
+        let base = |sequence: &str| crate::persistent_store::SyncGenerationIdentity {
+            generation_id: format!("generation-{sequence}"),
+            manifest_hash: manifest_id.to_owned(),
+            generation_sequence: sequence.to_owned(),
+        };
+        super::super::delta_completion::DeltaCompletionContext {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            source_device_id: source_device_id.to_owned(),
+            manifest_id: manifest_id.to_owned(),
+            mode: super::super::delta_completion::DeltaCompletionMode::CompletionV1,
+            pre_revision: 4,
+            pre_common_base: Some(base("1")),
+            post_revision: 5,
+            post_common_base: base("2"),
+            transferred_objects: 1,
+            transferred_bytes: 17,
+        }
+    }
+
+    #[test]
+    fn a_new_logical_registration_is_refused_while_a_delta_completion_is_retained() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000097",
+            &source_id,
+        ));
+        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
+            .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        super::super::delta_completion::PeerDeltaCompletionJournal::new(target_root.path())
+            .store_activation_intent(&retained_delta_completion(&source_id, &pairing.manifest_id))
+            .unwrap();
+        let outgoing_path = source_root.path().join("peer-sync/devices.json");
+        let incoming_path = target_root.path().join("peer-sync/sources.json");
+        let outgoing_before = fs::read(&outgoing_path).unwrap();
+        let incoming_before = fs::read(&incoming_path).unwrap();
+        let rotated = host.rotate_pairing_link().unwrap();
+
+        let blocked = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &rotated.session_id,
+            &rotated.manifest_id,
+            &rotated.claim,
+        )
+        .err();
+
+        assert_eq!(
+            blocked,
+            Some(PeerSyncError::Validation(
+                "peer-registration-blocked-by-active-work".to_owned()
+            ))
+        );
+        assert_eq!(fs::read(&outgoing_path).unwrap(), outgoing_before);
+        assert_eq!(fs::read(&incoming_path).unwrap(), incoming_before);
+        // The retained operation keeps authenticating with the authorization it has.
+        assert_eq!(client.hello().unwrap().device_id, source_id);
+        host.stop().unwrap();
+    }
+
     #[test]
     fn v2_bidirectional_claim_registers_the_stable_source_and_granted_permissions() {
         let _guard = LOGICAL_LAN_TEST_LOCK
@@ -8419,6 +8513,11 @@ impl LanLogicalDeltaClient {
         };
         let control_client = build_logical_http_client(LogicalRequestKind::Control, timeouts)?;
         let object_client = build_logical_http_client(LogicalRequestKind::Object, timeouts)?;
+        // One lifecycle hold covers the refusal, the claim round trip that makes the
+        // source replace its authorization, and this device's own registration, so a
+        // lane cannot start in the middle and lose the authorization it is using.
+        let lifecycle = lock_registered_source_lifecycle()?;
+        ensure_no_active_registered_source_work(&lifecycle, app_root)?;
         let response = control_client
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {
@@ -8520,7 +8619,8 @@ impl LanLogicalDeltaClient {
                 "v2 claim source device identity differs from authenticated hello".to_owned(),
             ));
         }
-        register_incoming_source_if_compatible(
+        register_incoming_source_if_compatible_locked(
+            &lifecycle,
             app_root,
             IncomingSource {
                 device_id: source_device_id.clone(),

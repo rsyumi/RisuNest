@@ -196,6 +196,20 @@ describe('device sync facade', () => {
         await expect(facade.reconnectRegisteredClone('source')).rejects.toMatchObject({ code: category })
     })
 
+    it.each([
+        'peer-registration-blocked-by-active-work',
+        'Validation("peer-registration-blocked-by-active-work")',
+    ])('maps the native registration refusal %s to its own category', async (nativeError) => {
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }) })
+
+        await expect(facade.claimStagedClone({
+            endpoint: 'http://10.1.2.3:32145',
+            sessionId: '00000000-0000-4000-8000-000000000001',
+            manifestId: 'a'.repeat(64),
+            claim: 'b'.repeat(64),
+        })).rejects.toMatchObject({ code: 'registration-blocked-by-active-work' })
+    })
+
     it('keeps directional registry revoke commands separate', async () => {
         const invoke = vi.fn(async () => undefined)
         const facade = createDeviceSyncFacade({ invoke })

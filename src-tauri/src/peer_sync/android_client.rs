@@ -1723,9 +1723,10 @@ fn legacy_backup_owns_activation(
     Ok(fs::canonicalize(backup_path)? == expected)
 }
 
+/// `source_device_id` of `None` asks the same question about any registered source.
 pub(crate) fn registered_clone_source_is_active(
     app_root: &Path,
-    source_device_id: &str,
+    source_device_id: Option<&str>,
 ) -> Result<bool, PeerSyncError> {
     let app_root = fs::canonicalize(app_root)?;
     let requested_jobs_root = app_root.join("peer-clone-jobs");
@@ -1758,7 +1759,9 @@ pub(crate) fn registered_clone_source_is_active(
             "Android clone job target identity is inconsistent".to_owned(),
         ));
     }
-    Ok(credential.registered_source_device_id() == Some(source_device_id))
+    Ok(credential
+        .registered_source_device_id()
+        .is_some_and(|registered| source_device_id.is_none_or(|wanted| registered == wanted)))
 }
 
 struct AndroidVerifiedCloneValidator;

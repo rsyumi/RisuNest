@@ -246,10 +246,14 @@ impl PeerDeltaCompletionJournal {
         self.load_locked()
     }
 
-    pub(crate) fn references_source(&self, source_device_id: &str) -> Result<bool, PeerSyncError> {
-        Ok(self
-            .load()?
-            .is_some_and(|operation| operation.context().source_device_id == source_device_id))
+    /// `source_device_id` of `None` matches any retained operation.
+    pub(crate) fn references_source(
+        &self,
+        source_device_id: Option<&str>,
+    ) -> Result<bool, PeerSyncError> {
+        Ok(self.load()?.is_some_and(|operation| {
+            source_device_id.is_none_or(|wanted| operation.context().source_device_id == wanted)
+        }))
     }
 
     pub(crate) fn store_activation_intent(
@@ -627,11 +631,14 @@ fn open_uncommitted_job(
     Ok(Some(job))
 }
 
+/// `source_device_id` of `None` asks the same question about any registered source.
 pub(crate) fn registered_delta_source_is_active(
     app_root: &Path,
-    source_device_id: &str,
+    source_device_id: Option<&str>,
 ) -> Result<bool, PeerSyncError> {
-    validate_uuid(source_device_id, "delta completion source")?;
+    if let Some(source_device_id) = source_device_id {
+        validate_uuid(source_device_id, "delta completion source")?;
+    }
     PeerDeltaCompletionJournal::new(app_root).references_source(source_device_id)
 }
 

@@ -130,6 +130,10 @@
             || safeCode === 'registration-expired'
             || safeCode === 'transport-changed'
         ) return sync.registrationExpired
+        if (
+            code === 'registration-blocked-by-active-work'
+            || safeCode === 'registration-blocked-by-active-work'
+        ) return sync.work.registerBlockedByActiveWork
         if (safeCode === 'port-unavailable') return sync.share.errorPortUnavailable
         if (safeCode === 'invalid-configuration') return sync.share.errorInvalidConfiguration
         if (safeCode === 'cleanup-failed') return sync.share.errorCleanupFailed

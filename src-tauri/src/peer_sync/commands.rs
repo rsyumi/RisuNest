@@ -2720,9 +2720,10 @@ pub(crate) fn retryable_target_operation_references_backup(
     Ok(false)
 }
 
+/// `source_device_id` of `None` asks the same question about any registered source.
 pub(crate) fn registered_clone_source_is_active(
     app_root: &Path,
-    source_device_id: &str,
+    source_device_id: Option<&str>,
 ) -> Result<bool, PeerSyncError> {
     let targets_root = app_root.join("peer-clone").join("targets");
     let metadata = match fs::symlink_metadata(&targets_root) {
@@ -2767,7 +2768,10 @@ pub(crate) fn registered_clone_source_is_active(
                 "peer clone target identity is inconsistent".to_owned(),
             ));
         }
-        if credential.registered_source_device_id() == Some(source_device_id) {
+        if credential
+            .registered_source_device_id()
+            .is_some_and(|registered| source_device_id.is_none_or(|wanted| registered == wanted))
+        {
             return Ok(true);
         }
     }
@@ -6089,7 +6093,7 @@ mod tests {
                 PeerCompletionCapability::Unsupported,
             )
             .unwrap();
-        assert!(registered_clone_source_is_active(root.path(), source_device_id).unwrap());
+        assert!(registered_clone_source_is_active(root.path(), Some(source_device_id)).unwrap());
         assert!(
             super::super::registry_commands::remove_incoming_source_if_inactive(
                 root.path(),
@@ -6398,7 +6402,7 @@ mod tests {
         ));
         removal.join().unwrap();
         assert!(marker_path.try_exists().unwrap());
-        assert!(registered_clone_source_is_active(root.path(), source_device_id).unwrap());
+        assert!(registered_clone_source_is_active(root.path(), Some(source_device_id)).unwrap());
     }
 
     #[test]
@@ -6486,7 +6490,7 @@ mod tests {
         ));
         rotation.join().unwrap();
         assert_eq!(fs::read(&sources_path).unwrap(), before);
-        assert!(registered_clone_source_is_active(root.path(), source_device_id).unwrap());
+        assert!(registered_clone_source_is_active(root.path(), Some(source_device_id)).unwrap());
     }
 
     #[test]

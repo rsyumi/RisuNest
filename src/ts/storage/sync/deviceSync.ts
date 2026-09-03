@@ -14,6 +14,7 @@ export type DeviceSyncErrorCode =
     | 'cleanup-failed'
     | 'state-unavailable'
     | 'registration-expired'
+    | 'registration-blocked-by-active-work'
     | 'transport-changed'
     | 'operation-failed'
     | 'unavailable'
@@ -24,9 +25,16 @@ export class DeviceSyncError extends Error {
     }
 }
 
+// The native side reports this refusal by a stable code, which its own error
+// wrapping may surround with detail that must never reach the user.
+const NATIVE_REGISTRATION_BLOCKED = 'peer-registration-blocked-by-active-work'
+
 export function classifyDeviceSyncFailure(error: unknown): DeviceSyncError {
     if (error instanceof DeviceSyncError) return error
     const message = error instanceof Error ? error.message : String(error)
+    if (message.includes(NATIVE_REGISTRATION_BLOCKED)) {
+        return new DeviceSyncError('registration-blocked-by-active-work')
+    }
     if (message === 'authorizationExpired' || message === 'sourceMissing') {
         return new DeviceSyncError('registration-expired')
     }
