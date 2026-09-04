@@ -166,9 +166,9 @@ export function parseDeviceSyncUri(uri: string): StagedDeviceSyncLink {
     ) {
         throw new Error('Invalid device sync link')
     }
-    value.pathname = '/v1'
-    return parsePeerPairingUri(value.toString(), {
+    return parsePeerPairingUri(uri, {
         hostname: 'peer-clone',
+        pathname: '/v2',
         invalid: () => { throw new Error('Invalid device sync link') },
         claimRule: 'hex64Fragment',
         allowLanEndpoint: false,

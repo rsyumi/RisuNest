@@ -45,7 +45,7 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
         abandonRetained: vi.fn(async () => undefined),
         stop: vi.fn(async () => undefined),
         revoke: vi.fn(async () => undefined),
-        pull: vi.fn(async () => ({
+        pullRegistered: vi.fn(async () => ({
             kind: 'noChanges',
             revision: 1,
             transferredObjects: 0,
@@ -171,22 +171,22 @@ describe('peer delta controller', () => {
         vi.useRealTimers()
     })
     test('keeps source ownership and one in-flight pull outside component subscriptions', async () => {
-        let resolvePull!: (value: Awaited<ReturnType<Facade['pull']>>) => void
-        const pull = vi.fn(() => new Promise<Awaited<ReturnType<Facade['pull']>>>((resolve) => {
+        let resolvePull!: (value: Awaited<ReturnType<Facade['pullRegistered']>>) => void
+        const pullRegistered = vi.fn(() => new Promise<Awaited<ReturnType<Facade['pullRegistered']>>>((resolve) => {
             resolvePull = resolve
         }))
-        const facade = facadeFixture({ pull })
+        const facade = facadeFixture({ pullRegistered })
         const controller = createPeerDeltaController({ facade, sourcePollMilliseconds: 60_000 })
         const unsubscribe = controller.subscribe(() => undefined)
         await controller.initialize()
         await controller.prepare()
         await controller.start('session')
 
-        const first = controller.pull('pairing')
-        const second = controller.pull('pairing')
+        const first = controller.pullRegistered('source-device')
+        await expect(controller.pullRegistered('source-device'))
+            .rejects.toThrow('A peer delta pull is already running')
         unsubscribe()
-        expect(second).toBe(first)
-        expect(pull).toHaveBeenCalledOnce()
+        expect(pullRegistered).toHaveBeenCalledOnce()
         expect(controller.snapshot().pullPhase).toBe('running')
 
         resolvePull({
@@ -196,7 +196,6 @@ describe('peer delta controller', () => {
             transferredBytes: 20,
         })
         await expect(first).resolves.toMatchObject({ kind: 'updated' })
-        await expect(second).resolves.toMatchObject({ kind: 'updated' })
         expect(controller.snapshot()).toMatchObject({
             pullPhase: 'completed',
             pullResult: { kind: 'updated', revision: 2 },
@@ -207,7 +206,7 @@ describe('peer delta controller', () => {
     test('projects full-clone-required without converting it to a generic failure', async () => {
         const controller = createPeerDeltaController({
             facade: facadeFixture({
-                pull: vi.fn(async () => ({
+                pullRegistered: vi.fn(async () => ({
                     kind: 'fullCloneRequired',
                     reason: 'noExactCommonBase',
                 } as const)),
@@ -215,7 +214,7 @@ describe('peer delta controller', () => {
         })
         await controller.initialize()
 
-        await expect(controller.pull('pairing')).resolves.toEqual({
+        await expect(controller.pullRegistered('source-device')).resolves.toEqual({
             kind: 'fullCloneRequired',
             reason: 'noExactCommonBase',
         })
@@ -223,21 +222,22 @@ describe('peer delta controller', () => {
         expect(controller.snapshot().error).toBe('')
     })
 
-    test('rejects a different pairing while a pull remains active across resubscription', async () => {
-        let resolvePull!: (value: Awaited<ReturnType<Facade['pull']>>) => void
+    test('rejects a second registered pull while one remains active across resubscription', async () => {
+        let resolvePull!: (value: Awaited<ReturnType<Facade['pullRegistered']>>) => void
         const controller = createPeerDeltaController({
             facade: facadeFixture({
-                pull: vi.fn(() => new Promise<Awaited<ReturnType<Facade['pull']>>>((resolve) => {
+                pullRegistered: vi.fn(() => new Promise<Awaited<ReturnType<Facade['pullRegistered']>>>((resolve) => {
                     resolvePull = resolve
                 })),
             }),
         })
         const unsubscribe = controller.subscribe(() => undefined)
-        const active = controller.pull('first-pairing')
+        const active = controller.pullRegistered('first-device')
         unsubscribe()
         const resubscribe = controller.subscribe(() => undefined)
 
-        await expect(controller.pull('second-pairing')).rejects.toThrow('different pairing')
+        await expect(controller.pullRegistered('second-device'))
+            .rejects.toThrow('A peer delta pull is already running')
         expect(controller.snapshot().pullPhase).toBe('running')
 
         resolvePull({ kind: 'noChanges', revision: 1, transferredObjects: 0, transferredBytes: 0 })
@@ -258,13 +258,13 @@ describe('peer delta controller', () => {
             facade: facadeFixture({
                 start: vi.fn(async () => sourceStatus),
                 status: vi.fn(async () => sourceStatus),
-                pull: vi.fn(async () => { throw new Error('renderer refresh failed') }),
+                pullRegistered: vi.fn(async () => { throw new Error('renderer refresh failed') }),
             }),
             sourcePollMilliseconds: 10,
         })
         await controller.start('session')
 
-        await expect(controller.pull('pairing')).rejects.toThrow('renderer refresh failed')
+        await expect(controller.pullRegistered('source-device')).rejects.toThrow('renderer refresh failed')
         await vi.advanceTimersByTimeAsync(10)
 
         expect(controller.snapshot()).toMatchObject({

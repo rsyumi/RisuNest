@@ -276,8 +276,10 @@ export function parsePeerLanEndpoint(value: string): string {
 }
 
 export interface PeerPairingUriRules {
-    /** Lane hostname in `risuailocal://<hostname>/v1`. */
+    /** Lane hostname in `risuailocal://<hostname><pathname>`. */
     hostname: string
+    /** Required path, `/v1` for the per-lane pairing URIs and `/v2` for device sync links. */
+    pathname: string
     /** Lane-specific rejection, e.g. `throw new Error('Invalid peer delta pairing URI')`. */
     invalid(): never
     /**
@@ -299,7 +301,7 @@ export function parsePeerPairingUri(value: string, rules: PeerPairingUriRules): 
     } catch {
         return rules.invalid()
     }
-    if (uri.protocol !== 'risuailocal:' || uri.hostname !== rules.hostname || uri.pathname !== '/v1') {
+    if (uri.protocol !== 'risuailocal:' || uri.hostname !== rules.hostname || uri.pathname !== rules.pathname) {
         return rules.invalid()
     }
     const expectedKeys = ['endpoint', 'session', 'manifest']
@@ -345,6 +347,7 @@ export function parsePeerPairingUri(value: string, rules: PeerPairingUriRules): 
 export function parsePeerCloneUri(value: string): PeerClonePairing {
     return parsePeerPairingUri(value, {
         hostname: 'peer-clone',
+        pathname: '/v1',
         invalid: invalidPairingUri,
         claimRule: 'encodedHex64',
         allowLanEndpoint: false,
@@ -636,27 +639,18 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             if (!state.target.destructiveConfirmed || !pairing) {
                 throw new Error('Peer clone target requires destructive replacement confirmation')
             }
+            if (!claimOwned) throw new Error('Peer clone target requires a registered source claim')
             const args = ownTarget({
                 endpoint: pairing.endpoint,
                 sessionId: pairing.sessionId,
                 manifestId: pairing.manifestId,
             })
-            const pairingClaim = pairing.claim
             try {
                 await requireTargetReady()
-                if (!claimOwned) {
-                    await nativeInvoke('peer_clone_claim_client', {
-                        ...args,
-                        claim: pairingClaim,
-                    })
-                    claimOwned = true
-                }
                 await nativeInvoke('peer_clone_download', args)
                 state = reducePeerCloneState(state, { type: 'target-resumed' })
             } catch (error) {
-                state = claimOwned
-                    ? reducePeerCloneState(state, { type: 'target-failed' })
-                    : reducePeerCloneState(state, { type: 'target-joined', pairing })
+                state = reducePeerCloneState(state, { type: 'target-failed' })
                 throw error
             }
         },

@@ -174,7 +174,7 @@ describe('production device sync composition', () => {
             resume: vi.fn(async () => undefined),
             cancel: vi.fn(async () => { state = { ...state, phase: 'cancelled' } }),
             targetStatus: vi.fn(async () => ({
-                jobId: 'job', endpoint: 'http://source/', sessionId: 'session', manifestId: 'manifest',
+                sourceDeviceId: 'source', jobId: 'job',
                 phase: 'downloading' as const, completedBytes: 1,
             })),
         }

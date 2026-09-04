@@ -9,6 +9,11 @@ import { createPeerCloneController } from './peerCloneController'
 
 const claim = 'b'.repeat(64)
 const pairingUri = `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${claim}`
+const claimedTarget = {
+    endpoint: 'http://192.168.1.4:43123/',
+    sessionId: '123e4567-e89b-12d3-a456-426614174000',
+    manifestId: 'a'.repeat(64),
+}
 
 afterEach(() => {
     vi.useRealTimers()
@@ -65,7 +70,7 @@ describe('peer clone controller lifecycle', () => {
         })
         const controller = createPeerCloneController({ facade, targetPollMilliseconds: 10 })
         const unsubscribe = controller.subscribe(vi.fn())
-        controller.join(pairingUri)
+        controller.joinClaimed(claimedTarget)
         controller.confirmDestructiveReplace()
         await controller.download()
         unsubscribe()
@@ -178,7 +183,7 @@ describe('peer clone controller lifecycle', () => {
             }),
             targetPollMilliseconds: 10,
         })
-        controller.join(pairingUri)
+        controller.joinClaimed(claimedTarget)
         controller.confirmDestructiveReplace()
         await controller.download()
         await vi.advanceTimersByTimeAsync(10)

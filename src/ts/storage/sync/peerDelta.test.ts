@@ -280,7 +280,7 @@ describe('peer logical delta product facade', () => {
         const platform = 'web' as const
         const facade = createPeerDeltaFacade({ platform })
         await expect(facade.capabilities()).rejects.toThrow(`unsupported on ${platform}`)
-        await expect(facade.pull(pairing)).rejects.toThrow(`unsupported on ${platform}`)
+        await expect(facade.pullRegistered('source-device')).rejects.toThrow(`unsupported on ${platform}`)
     })
 
     test('runs Android P4 target through a foreground identity with renderer ordering intact', async () => {
@@ -309,11 +309,11 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-        await facade.pull(pairing)
+        await facade.pullRegistered('source-device')
 
         expect(events).toEqual([
             'peer_delta_target_foreground_status', 'flush', 'capture', 'fence',
-            'peer_delta_target_reserve', 'service-start', 'peer_delta_pull',
+            'peer_delta_target_reserve', 'service-start', 'peer_delta_pull_registered',
             'refresh:5', 'release', 'service-stop', 'peer_delta_target_foreground_release',
         ])
         await expect(facade.startQuickTunnel('session')).rejects.toThrow('Peer delta is unsupported on android')
@@ -406,7 +406,7 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-        await expect(facade.pull(pairing)).rejects.toBe(primary)
+        await expect(facade.pullRegistered('source-device')).rejects.toBe(primary)
 
         expect(owner).toBeUndefined()
         expect(events).toEqual([
@@ -440,7 +440,7 @@ describe('peer logical delta product facade', () => {
                 return { foreground, phase: 'terminal', error: 'cancelled before activation' } as T
             }
             if (command === 'peer_delta_target_reserve') return foreground as T
-            if (command === 'peer_delta_pull') {
+            if (command === 'peer_delta_pull_registered') {
                 phase = 'terminal'
                 throw primary
             }
@@ -453,7 +453,7 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-        await expect(facade.pull(pairing)).rejects.toBe(primary)
+        await expect(facade.pullRegistered('source-device')).rejects.toBe(primary)
 
         expect(events).toEqual(['release', 'service-stop', 'native-release'])
         expect(phase).toBe('absent')
@@ -490,7 +490,7 @@ describe('peer logical delta product facade', () => {
                 } as T
             }
             if (command === 'peer_delta_target_reserve') return foreground as T
-            if (command === 'peer_delta_pull') {
+            if (command === 'peer_delta_pull_registered') {
                 phase = 'terminal'
                 throw primary
             }
@@ -502,11 +502,11 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-        await expect(facade.pull(pairing)).rejects.toBe(primary)
+        await expect(facade.pullRegistered('source-device')).rejects.toBe(primary)
 
         expect(events).toEqual([
             'peer_delta_target_foreground_status', 'flush', 'capture', 'fence',
-            'peer_delta_target_reserve', 'peer_delta_pull',
+            'peer_delta_target_reserve', 'peer_delta_pull_registered',
             'peer_delta_target_foreground_status', 'refresh:5', 'release',
             'service-stop', 'peer_delta_target_foreground_release',
         ])
@@ -536,7 +536,7 @@ describe('peer logical delta product facade', () => {
                 return { foreground, phase, ...(phase === 'terminal' ? { error: 'cancelled' } : {}) } as T
             }
             if (command === 'peer_delta_target_reserve') return foreground as T
-            if (command === 'peer_delta_pull') {
+            if (command === 'peer_delta_pull_registered') {
                 phase = 'running'
                 throw primary
             }
@@ -554,7 +554,7 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-        await expect(facade.pull(pairing)).rejects.toBe(primary)
+        await expect(facade.pullRegistered('source-device')).rejects.toBe(primary)
 
         expect(events).toEqual([
             'status:absent', 'status:running', 'cancel', 'status:terminal',
@@ -573,7 +573,7 @@ describe('peer logical delta product facade', () => {
                     : null) as T
             }
             if (command === 'peer_delta_target_reserve') return foreground as T
-            if (command === 'peer_delta_pull') {
+            if (command === 'peer_delta_pull_registered') {
                 phase = 'terminal'
                 throw primary
             }
@@ -594,7 +594,7 @@ describe('peer logical delta product facade', () => {
             bridge: { startSource: vi.fn(() => true), stopSource: vi.fn(() => false) },
         })
 
-        const failure = await facade.pull(pairing).catch((error: unknown) => error)
+        const failure = await facade.pullRegistered('source-device').catch((error: unknown) => error)
 
         expect(failure).toBeInstanceOf(AggregateError)
         expect((failure as AggregateError).errors[0]).toBe(primary)
@@ -617,7 +617,7 @@ describe('peer logical delta product facade', () => {
                     return (phase === 'running' ? { foreground, phase } : null) as T
                 }
                 if (command === 'peer_delta_target_reserve') return foreground as T
-                if (command === 'peer_delta_pull') {
+                if (command === 'peer_delta_pull_registered') {
                     phase = 'running'
                     throw primary
                 }
@@ -634,7 +634,7 @@ describe('peer logical delta product facade', () => {
             }
             const facade = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-            const failurePromise = facade.pull(pairing).catch((error: unknown) => error)
+            const failurePromise = facade.pullRegistered('source-device').catch((error: unknown) => error)
             await vi.runAllTimersAsync()
             const failure = await failurePromise
 
@@ -687,7 +687,7 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const first = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
 
-        await expect(first.pull(pairing)).rejects.toThrow(
+        await expect(first.pullRegistered('source-device')).rejects.toThrow(
             'Android peer delta pull and foreground cleanup both failed',
         )
         expect(nativeOwner).toEqual(foreground)
@@ -735,7 +735,7 @@ describe('peer logical delta product facade', () => {
 
         const reconstructed = createPeerDeltaFacade({ platform: 'android', invoke, runtime, bridge })
         await reconstructed.recoverTargetForeground()
-        await expect(reconstructed.pull(pairing)).resolves.toMatchObject({ kind: 'noChanges' })
+        await expect(reconstructed.pullRegistered('source-device')).resolves.toMatchObject({ kind: 'noChanges' })
         expect(nativeOwner).toBeUndefined()
     })
 
@@ -853,7 +853,7 @@ describe('peer logical delta product facade', () => {
         }) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'desktop', invoke, runtime })
 
-        await expect(facade.pull(pairing)).resolves.toEqual({
+        await expect(facade.pullRegistered('source-device')).resolves.toEqual({
             kind: 'updated',
             revision: 15,
             transferredObjects: 2,
@@ -863,15 +863,12 @@ describe('peer logical delta product facade', () => {
             'flush',
             'capture',
             'fence:14:3',
-            'invoke:peer_delta_pull:14',
+            'invoke:peer_delta_pull_registered:14',
             'refresh:15',
             'release',
         ])
-        expect(invoke).toHaveBeenCalledWith('peer_delta_pull', {
-            endpoint: 'http://192.168.1.20:32145/',
-            sessionId: '00000000-0000-4000-8000-000000000001',
-            manifestId: 'a'.repeat(64),
-            claim: 'b'.repeat(64),
+        expect(invoke).toHaveBeenCalledWith('peer_delta_pull_registered', {
+            deviceId: 'source-device',
             expectedRevision: 14,
         })
     })
@@ -893,7 +890,7 @@ describe('peer logical delta product facade', () => {
         }) as T) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'desktop', invoke, runtime })
 
-        await expect(facade.pull(pairing)).resolves.toEqual({
+        await expect(facade.pullRegistered('source-device')).resolves.toEqual({
             kind: 'fullCloneRequired',
             reason: 'noExactCommonBase',
         })
@@ -917,7 +914,7 @@ describe('peer logical delta product facade', () => {
             runtime,
         })
 
-        await expect(facade.pull(pairing)).rejects.toThrow('stale revision')
+        await expect(facade.pullRegistered('source-device')).rejects.toThrow('stale revision')
         expect(release).toHaveBeenCalledOnce()
     })
 
@@ -943,10 +940,10 @@ describe('peer logical delta product facade', () => {
         const invoke = vi.fn(async <T>(): Promise<T> => result as T) as PeerDeltaInvoke
         const facade = createPeerDeltaFacade({ platform: 'desktop', invoke, runtime })
 
-        await expect(facade.pull(pairing)).rejects.toThrow('renderer refresh failed')
+        await expect(facade.pullRegistered('source-device')).rejects.toThrow('renderer refresh failed')
         expect(release).not.toHaveBeenCalled()
 
-        await expect(facade.pull(pairing)).resolves.toEqual(result)
+        await expect(facade.pullRegistered('source-device')).resolves.toEqual(result)
         expect(invoke).toHaveBeenCalledOnce()
         expect(runtime.flushPendingData).toHaveBeenCalledOnce()
         expect(runtime.capturePersistentMutationToken).toHaveBeenCalledOnce()
@@ -987,7 +984,7 @@ describe('peer logical delta product facade', () => {
                 return (phase === 'terminal' ? { foreground, phase, result } : null) as T
             }
             if (command === 'peer_delta_target_reserve') return foreground as T
-            if (command === 'peer_delta_pull') {
+            if (command === 'peer_delta_pull_registered') {
                 phase = 'terminal'
                 return result as T
             }
@@ -1005,13 +1002,13 @@ describe('peer logical delta product facade', () => {
             bridge: { startSource: vi.fn(() => true), stopSource },
         })
 
-        await expect(facade.pull(pairing)).rejects.toThrow('renderer refresh failed')
+        await expect(facade.pullRegistered('source-device')).rejects.toThrow('renderer refresh failed')
         expect(refresh).toHaveBeenCalledOnce()
         expect(release).not.toHaveBeenCalled()
         expect(stopSource).not.toHaveBeenCalled()
         expect(invoke).not.toHaveBeenCalledWith('peer_delta_target_foreground_release', expect.anything())
 
-        await expect(facade.pull(pairing)).resolves.toEqual(result)
+        await expect(facade.pullRegistered('source-device')).resolves.toEqual(result)
         expect(refresh).toHaveBeenCalledTimes(2)
         expect(release).toHaveBeenCalledOnce()
         expect(stopSource).toHaveBeenCalledOnce()

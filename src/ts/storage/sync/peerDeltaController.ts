@@ -41,7 +41,7 @@ export function createPeerDeltaController(options: {
     let targetInitialization: Promise<void> | undefined
     let sourceError = ''
     let pullError = ''
-    let activePull: { pairingUri: string, promise: Promise<PeerDeltaPullResult> } | undefined
+    let activePull: Promise<PeerDeltaPullResult> | undefined
 
     const publish = (): void => {
         snapshot = { ...snapshot, error: pullError || sourceError }
@@ -210,36 +210,6 @@ export function createPeerDeltaController(options: {
             await options.facade.revoke(sessionId, deviceId)
             update({ sourceStatus: await options.facade.status() })
         }),
-        pull(pairingUri: string): Promise<PeerDeltaPullResult> {
-            if (activePull) {
-                if (activePull.pairingUri !== pairingUri) {
-                    return Promise.reject(new Error('A peer delta pull for a different pairing is already running'))
-                }
-                return activePull.promise
-            }
-            pullError = ''
-            update({ pullPhase: 'running', pullResult: undefined })
-            const promise = options.facade.pull(pairingUri).then((pullResult) => {
-                pullError = ''
-                update({
-                    pullResult,
-                    pullPhase: pullResult.kind === 'fullCloneRequired'
-                        ? 'fullCloneRequired'
-                        : pullResult.kind === 'conflict' ? 'conflict' : 'completed',
-                })
-                return pullResult
-            }).catch((cause) => {
-                pullError = cause instanceof Error ? cause.message : String(cause)
-                update({
-                    pullPhase: 'failed',
-                })
-                throw cause
-            }).finally(() => {
-                activePull = undefined
-            })
-            activePull = { pairingUri, promise }
-            return promise
-        },
         pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
             if (activePull) return Promise.reject(new Error('A peer delta pull is already running'))
             pullError = ''
@@ -263,7 +233,7 @@ export function createPeerDeltaController(options: {
                 await refreshRetainedAfterPull()
                 activePull = undefined
             })
-            activePull = { pairingUri: `registered:${deviceId}`, promise }
+            activePull = promise
             return promise
         },
         async abandonRetained(): Promise<void> {

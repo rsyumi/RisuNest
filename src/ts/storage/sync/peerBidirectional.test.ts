@@ -11,10 +11,6 @@ import {
 const pairingUri = 'risuailocal://peer-sync/v1?endpoint=http%3A%2F%2F192.168.1.20%3A32146'
     + '&session=123e4567-e89b-42d3-a456-426614174000'
     + `&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
-const publicPairingUri = pairingUri.replace(
-    'http%3A%2F%2F192.168.1.20%3A32146',
-    'https%3A%2F%2Ffresh-public.example',
-)
 
 function runtime(log: string[]): PeerBidirectionalMutationRuntime {
     return {
@@ -104,7 +100,9 @@ describe('peer bidirectional facade', () => {
         const platform = 'web' as const
         const facade = createPeerBidirectionalFacade({ platform })
         await expect(facade.capabilities()).rejects.toThrow(`Peer sync is unsupported on ${platform}`)
-        await expect(facade.sync(pairingUri)).rejects.toThrow(`Peer sync is unsupported on ${platform}`)
+        await expect(facade.syncRegistered('device-web')).rejects.toThrow(
+            `Peer sync is unsupported on ${platform}`,
+        )
     })
 
     it('flushes and fences the source revision from prepare until stop completes', async () => {
@@ -397,7 +395,8 @@ describe('peer bidirectional facade', () => {
                 nativeOwner = true
                 return foreground as T
             }
-            if (command === 'peer_bidirectional_sync') {
+            if (command === 'peer_bidirectional_sync_registered') {
+                expect(args?.deviceId).toBe('device-android-p5')
                 expect(args?.foreground).toEqual(foreground)
                 return result as T
             }
@@ -418,7 +417,7 @@ describe('peer bidirectional facade', () => {
             bridge,
         })
 
-        await expect(facade.sync(pairingUri)).resolves.toEqual(result)
+        await expect(facade.syncRegistered('device-android-p5')).resolves.toEqual(result)
         expect(nativeOwner).toBe(false)
         expect(events).toEqual([
             'peer_bidirectional_target_foreground_status',
@@ -427,7 +426,7 @@ describe('peer bidirectional facade', () => {
             'acquire:7:11',
             'peer_bidirectional_target_reserve',
             'service-start',
-            'peer_bidirectional_sync',
+            'peer_bidirectional_sync_registered',
             'refresh:8',
             'service-stop',
             'peer_bidirectional_target_foreground_release',
@@ -458,7 +457,9 @@ describe('peer bidirectional facade', () => {
                     : { foreground, phase: 'terminal', result: retained }) as T
             }
             if (command === 'peer_bidirectional_target_reserve') return foreground as T
-            if (command === 'peer_bidirectional_sync') throw new Error('android sync response lost')
+            if (command === 'peer_bidirectional_sync_registered') {
+                throw new Error('android sync response lost')
+            }
             if (command === 'peer_bidirectional_status') {
                 return {
                     source: { phase: 'idle', devices: [] },
@@ -483,7 +484,7 @@ describe('peer bidirectional facade', () => {
             bridge,
         })
 
-        await expect(facade.sync(pairingUri)).rejects.toThrow('android sync response lost')
+        await expect(facade.syncRegistered('device-android-lost')).rejects.toThrow('android sync response lost')
         expect(events.filter((event) => event === 'refresh:8')).toHaveLength(1)
         expect(events.slice(-4)).toEqual([
             'peer_bidirectional_target_foreground_status',
@@ -491,7 +492,7 @@ describe('peer bidirectional facade', () => {
             'peer_bidirectional_target_foreground_release',
             'release',
         ])
-        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_sync'))
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_sync_registered'))
             .toHaveLength(1)
     })
 
@@ -756,51 +757,6 @@ describe('peer bidirectional facade', () => {
         expect(events).not.toContain('peer_sync_foreground_source_abandon')
     })
 
-    it.each(['local', 'remote'] as const)(
-        'resolves the %s winner with a fresh public link in one native mutation',
-        async (winner) => {
-            const events: string[] = []
-            const result = {
-                kind: 'conflict' as const,
-                operationId: 'operation-public-conflict',
-                conflicts: [{ key: 'r1:root', type: 'sameRecord' as const }],
-                localManifestHash: 'c'.repeat(64),
-                remoteManifestHash: 'd'.repeat(64),
-            }
-            const invoke = vi.fn(async () => result)
-            const facade = createPeerBidirectionalFacade({
-                platform: 'desktop',
-                runtime: runtime(events),
-                invoke: invoke as unknown as PeerBidirectionalInvoke,
-            })
-
-            await expect(facade.resolve('operation-public-conflict', winner, publicPairingUri))
-                .resolves.toEqual(result)
-            expect(invoke).toHaveBeenCalledWith('peer_bidirectional_resolve_with_link', {
-                operationId: 'operation-public-conflict',
-                winner,
-                endpoint: 'https://fresh-public.example',
-                sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                manifestId: 'a'.repeat(64),
-                claim: 'b'.repeat(64),
-                expectedRevision: 7,
-            })
-        },
-    )
-
-    it('rejects a malformed linked conflict source before invoking native authority', async () => {
-        const invoke = vi.fn()
-        const facade = createPeerBidirectionalFacade({
-            platform: 'desktop',
-            runtime: runtime([]),
-            invoke: invoke as unknown as PeerBidirectionalInvoke,
-        })
-
-        expect(() => facade.resolve('operation-public-conflict', 'local', 'not-a-pairing-link'))
-            .toThrow('Invalid peer sync pairing URI')
-        expect(invoke).not.toHaveBeenCalled()
-    })
-
     it('starts Quick and Named P5 tunnels through transient one-shot commands', async () => {
         const invoke = vi.fn(async (command: string) => {
             if (command === 'peer_bidirectional_tunnel_start') {
@@ -886,7 +842,7 @@ describe('peer bidirectional facade', () => {
             'peer_bidirectional_prepare',
             { expectedRevision: 7 },
         ))
-        await expect(facade.sync(pairingUri)).rejects.toThrow('peer sync source is active')
+        await expect(facade.syncRegistered('device-source-active')).rejects.toThrow('peer sync source is active')
         finishPrepare({ phase: 'prepared', sessionId: 'session-source', devices: [] })
         await preparing
     })
@@ -895,7 +851,7 @@ describe('peer bidirectional facade', () => {
         const events: string[] = []
         let finishSync!: (value: unknown) => void
         const invoke = vi.fn((command: string) => {
-            if (command === 'peer_bidirectional_sync') {
+            if (command === 'peer_bidirectional_sync_registered') {
                 return new Promise((resolve) => {
                     finishSync = resolve
                 })
@@ -908,10 +864,10 @@ describe('peer bidirectional facade', () => {
             runtime: runtime(events),
         })
 
-        const syncing = facade.sync(pairingUri)
+        const syncing = facade.syncRegistered('device-target-active')
         await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(
-            'peer_bidirectional_sync',
-            expect.objectContaining({ expectedRevision: 7 }),
+            'peer_bidirectional_sync_registered',
+            expect.objectContaining({ deviceId: 'device-target-active', expectedRevision: 7 }),
         ))
         await expect(facade.prepare()).rejects.toThrow('source or target is already active')
         finishSync({
@@ -1496,12 +1452,15 @@ describe('peer bidirectional facade', () => {
             runtime: runtime(events),
         })
 
-        await expect(facade.sync(pairingUri)).resolves.toMatchObject({ kind: 'updated', revision: 8 })
+        await expect(facade.syncRegistered('device-fence')).resolves.toMatchObject({
+            kind: 'updated',
+            revision: 8,
+        })
         expect(events).toEqual([
             'flush:peer-bidirectional-sync',
             'capture:peer-bidirectional-sync',
             'acquire:7:11',
-            'invoke:peer_bidirectional_sync:7',
+            'invoke:peer_bidirectional_sync_registered:7',
             'refresh:8',
             'release',
         ])
@@ -1598,12 +1557,12 @@ describe('peer bidirectional facade', () => {
             phase: 'localCommitted' as const,
             operation: {
                 phase: 'localCommitted' as const,
-                operationId: 'operation-linked-response-loss',
+                operationId: 'operation-registered-response-loss',
                 committedRevision: 8,
             },
             expected: {
                 kind: 'resumeRequired' as const,
-                operationId: 'operation-linked-response-loss',
+                operationId: 'operation-registered-response-loss',
                 phase: 'localCommitted' as const,
                 committedRevision: 8,
             },
@@ -1614,7 +1573,7 @@ describe('peer bidirectional facade', () => {
                 phase: 'completed' as const,
                 result: {
                     kind: 'updated' as const,
-                    operationId: 'operation-linked-response-loss',
+                    operationId: 'operation-registered-response-loss',
                     revision: 8,
                     remoteRevision: 9,
                     transferredObjects: 1,
@@ -1624,7 +1583,7 @@ describe('peer bidirectional facade', () => {
             },
             expected: {
                 kind: 'updated' as const,
-                operationId: 'operation-linked-response-loss',
+                operationId: 'operation-registered-response-loss',
                 revision: 8,
                 remoteRevision: 9,
                 transferredObjects: 1,
@@ -1632,11 +1591,13 @@ describe('peer bidirectional facade', () => {
                 backups: [],
             },
         },
-    ])('returns exact linked resolve progress after a lost $phase response', async ({ operation, expected }) => {
+    ])('returns exact registered resolve progress after a lost $phase response', async ({ operation, expected }) => {
         const events: string[] = []
         const invoke = vi.fn(async (command: string) => {
             events.push(`invoke:${command}`)
-            if (command === 'peer_bidirectional_resolve_with_link') throw new Error('linked response lost')
+            if (command === 'peer_bidirectional_resolve_registered') {
+                throw new Error('registered response lost')
+            }
             if (command === 'peer_bidirectional_status') {
                 return { source: { phase: 'idle', devices: [] }, operation }
             }
@@ -1647,13 +1608,13 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
         })
 
-        await expect(facade.resolve(
-            'operation-linked-response-loss',
+        await expect(facade.resolveRegistered(
+            'device-registered-response-loss',
+            'operation-registered-response-loss',
             'local',
-            publicPairingUri,
         )).resolves.toEqual(expected)
         expect(events).toContain('refresh:8')
-        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_resolve_with_link'))
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_resolve_registered'))
             .toHaveLength(1)
     })
 
@@ -1672,16 +1633,18 @@ describe('peer bidirectional facade', () => {
                 phase: 'awaitingConflict' as const,
                 result: {
                     kind: 'conflict' as const,
-                    operationId: 'operation-linked-rejected',
+                    operationId: 'operation-registered-rejected',
                     conflicts: [{ key: 'r1:root', type: 'sameRecord' as const }],
                     localManifestHash: 'c'.repeat(64),
                     remoteManifestHash: 'd'.repeat(64),
                 },
             },
         },
-    ])('preserves linked resolve rejection for $name', async ({ operation }) => {
+    ])('preserves registered resolve rejection for $name', async ({ operation }) => {
         const invoke = vi.fn(async (command: string) => {
-            if (command === 'peer_bidirectional_resolve_with_link') throw new Error('linked resolve rejected')
+            if (command === 'peer_bidirectional_resolve_registered') {
+                throw new Error('registered resolve rejected')
+            }
             if (command === 'peer_bidirectional_status') {
                 return { source: { phase: 'idle', devices: [] }, operation }
             }
@@ -1692,12 +1655,12 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
         })
 
-        await expect(facade.resolve(
-            'operation-linked-rejected',
+        await expect(facade.resolveRegistered(
+            'device-registered-rejected',
+            'operation-registered-rejected',
             'remote',
-            publicPairingUri,
-        )).rejects.toThrow('linked resolve rejected')
-        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_resolve_with_link'))
+        )).rejects.toThrow('registered resolve rejected')
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_resolve_registered'))
             .toHaveLength(1)
     })
 
@@ -1725,7 +1688,9 @@ describe('peer bidirectional facade', () => {
             const events: string[] = []
             const invoke = vi.fn(async (command: string) => {
                 events.push(`invoke:${command}`)
-                if (command === 'peer_bidirectional_sync') throw new Error('sync response lost')
+                if (command === 'peer_bidirectional_sync_registered') {
+                    throw new Error('sync response lost')
+                }
                 if (command === 'peer_bidirectional_status') {
                     return {
                         source: { phase: 'idle', devices: [] },
@@ -1739,7 +1704,7 @@ describe('peer bidirectional facade', () => {
                 invoke: invoke as unknown as PeerBidirectionalInvoke,
             })
 
-            await expect(facade.sync(pairingUri)).rejects.toThrow('sync response lost')
+            await expect(facade.syncRegistered('device-normalized')).rejects.toThrow('sync response lost')
             expect(events.slice(-3)).toEqual([
                 'invoke:peer_bidirectional_status',
                 'refresh:8',
@@ -1754,7 +1719,9 @@ describe('peer bidirectional facade', () => {
             const events: string[] = []
             const invoke = vi.fn(async (command: string) => {
                 events.push(`invoke:${command}`)
-                if (command === 'peer_bidirectional_sync') throw new Error('sync failed before commit')
+                if (command === 'peer_bidirectional_sync_registered') {
+                    throw new Error('sync failed before commit')
+                }
                 if (command === 'peer_bidirectional_status') {
                     return {
                         source: { phase: 'idle', devices: [] },
@@ -1768,7 +1735,7 @@ describe('peer bidirectional facade', () => {
                 invoke: invoke as unknown as PeerBidirectionalInvoke,
             })
 
-            await expect(facade.sync(pairingUri)).rejects.toThrow('sync failed before commit')
+            await expect(facade.syncRegistered('device-precommit')).rejects.toThrow('sync failed before commit')
 
             expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
             expect(events.at(-1)).toBe('release')
@@ -1820,7 +1787,7 @@ describe('peer bidirectional facade', () => {
             })) as unknown as PeerBidirectionalInvoke,
         })
 
-        await expect(facade.sync(pairingUri)).resolves.toMatchObject({
+        await expect(facade.syncRegistered('device-conflict')).resolves.toMatchObject({
             kind: 'conflict',
             operationId: 'operation-2',
         })
@@ -1841,7 +1808,7 @@ describe('peer bidirectional facade', () => {
             })) as unknown as PeerBidirectionalInvoke,
         })
 
-        await expect(facade.sync(pairingUri)).resolves.toMatchObject({ kind: 'stale' })
+        await expect(facade.syncRegistered('device-stale')).resolves.toMatchObject({ kind: 'stale' })
         expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
         expect(events.at(-1)).toBe('release')
     })
@@ -1880,8 +1847,8 @@ describe('peer bidirectional facade', () => {
             invoke: invoke as unknown as PeerBidirectionalInvoke,
         })
 
-        await expect(facade.sync(pairingUri)).rejects.toThrow('renderer refresh failed')
-        await expect(facade.sync(pairingUri)).resolves.toMatchObject({ kind: 'noChanges' })
+        await expect(facade.syncRegistered('device-retry')).rejects.toThrow('renderer refresh failed')
+        await expect(facade.syncRegistered('device-retry')).resolves.toMatchObject({ kind: 'noChanges' })
         expect(invoke).toHaveBeenCalledTimes(1)
         expect(events.filter((event) => event === 'release')).toHaveLength(1)
     })

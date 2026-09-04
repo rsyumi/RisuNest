@@ -1,7 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
-import { parsePeerCloneEndpoint, parsePeerCloneUri, type PeerClonePairing } from './peerClone'
 import type { PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 
 export type AndroidPeerCloneInvoke = PeerSyncInvoke
@@ -24,23 +23,13 @@ export interface AndroidPeerCloneCapabilities {
     productionEnabled: boolean
 }
 
-export interface AndroidPeerCloneTargetStatus {
-    jobId: string
-    endpoint: string
-    sessionId: string
-    manifestId: string
-    phase: 'ready' | 'paused' | 'downloading' | 'awaitingActivation' | 'cancelled' | 'completed' | 'failed'
-    completedBytes: number
-    totalBytes?: number
-    committedRevision?: number
-    backupPath?: string
-    error?: string
-}
+export type AndroidPeerClonePhase =
+    'ready' | 'paused' | 'downloading' | 'awaitingActivation' | 'cancelled' | 'completed' | 'failed'
 
 export interface AndroidRegisteredCloneStatus {
     sourceDeviceId: string
     jobId: string
-    phase: AndroidPeerCloneTargetStatus['phase']
+    phase: AndroidPeerClonePhase
     completedBytes: number
     totalBytes?: number
     committedRevision?: number
@@ -48,7 +37,7 @@ export interface AndroidRegisteredCloneStatus {
     error?: 'transferFailed'
 }
 
-export type AndroidPeerCloneStatus = AndroidPeerCloneTargetStatus | AndroidRegisteredCloneStatus
+export type AndroidPeerCloneStatus = AndroidRegisteredCloneStatus
 
 export interface AndroidPeerCloneState {
     phase: 'idle' | 'joined' | 'confirmed' | 'paused' | 'downloading' | 'cancelled' | 'completed' | 'failed'
@@ -73,11 +62,9 @@ const initialState: AndroidPeerCloneState = {
     completedBytes: 0,
 }
 
-const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const canonicalSourceDeviceUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const canonicalUuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const sha256 = /^[0-9a-f]{64}$/
-const statusPhases = new Set<AndroidPeerCloneTargetStatus['phase']>([
+const statusPhases = new Set<AndroidPeerClonePhase>([
     'ready', 'paused', 'downloading', 'awaitingActivation', 'cancelled', 'completed', 'failed',
 ])
 
@@ -85,15 +72,22 @@ function invalidStatus(): never {
     throw new Error('invalid Android peer clone status')
 }
 
-function safeStatusFields(source: Record<string, unknown>): Pick<
-    AndroidPeerCloneTargetStatus,
-    'jobId' | 'phase' | 'completedBytes' | 'totalBytes' | 'committedRevision' | 'backupPath' | 'error'
-> {
+interface AndroidCloneStatusFields {
+    jobId: string
+    phase: AndroidPeerClonePhase
+    completedBytes: number
+    totalBytes?: number
+    committedRevision?: number
+    backupPath?: string
+    error?: string
+}
+
+function safeStatusFields(source: Record<string, unknown>): AndroidCloneStatusFields {
     if (
         typeof source.jobId !== 'string'
         || !canonicalUuidV4.test(source.jobId)
         || typeof source.phase !== 'string'
-        || !statusPhases.has(source.phase as AndroidPeerCloneTargetStatus['phase'])
+        || !statusPhases.has(source.phase as AndroidPeerClonePhase)
         || typeof source.completedBytes !== 'number'
         || !Number.isSafeInteger(source.completedBytes)
         || source.completedBytes < 0
@@ -112,7 +106,7 @@ function safeStatusFields(source: Record<string, unknown>): Pick<
     ) invalidStatus()
     return {
         jobId: source.jobId,
-        phase: source.phase as AndroidPeerCloneTargetStatus['phase'],
+        phase: source.phase as AndroidPeerClonePhase,
         completedBytes: source.completedBytes,
         ...(typeof source.totalBytes === 'number' ? { totalBytes: source.totalBytes } : {}),
         ...(typeof source.committedRevision === 'number' ? { committedRevision: source.committedRevision } : {}),
@@ -145,41 +139,9 @@ function safeRegisteredStatus(value: unknown): AndroidRegisteredCloneStatus {
     }
 }
 
-function safeDirectStatus(value: unknown): AndroidPeerCloneTargetStatus {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) invalidStatus()
-    const source = value as Record<string, unknown>
-    const allowed = new Set([
-        'jobId', 'endpoint', 'sessionId', 'manifestId', 'phase', 'completedBytes',
-        'totalBytes', 'committedRevision', 'backupPath', 'error',
-    ])
-    if (
-        Object.keys(source).some((key) => !allowed.has(key))
-        || typeof source.endpoint !== 'string'
-        || typeof source.sessionId !== 'string'
-        || !canonicalUuid.test(source.sessionId)
-        || typeof source.manifestId !== 'string'
-        || !sha256.test(source.manifestId)
-    ) invalidStatus()
-    let endpoint: string
-    try {
-        endpoint = parsePeerCloneEndpoint(source.endpoint)
-    } catch {
-        invalidStatus()
-    }
-    return {
-        endpoint,
-        sessionId: source.sessionId,
-        manifestId: source.manifestId,
-        ...safeStatusFields(source),
-    }
-}
-
 function safeCurrentStatus(value: unknown): AndroidPeerCloneStatus | null {
     if (value === null) return null
-    if (!value || typeof value !== 'object' || Array.isArray(value)) invalidStatus()
-    return Object.prototype.hasOwnProperty.call(value, 'sourceDeviceId')
-        ? safeRegisteredStatus(value)
-        : safeDirectStatus(value)
+    return safeRegisteredStatus(value)
 }
 
 function browserBridge(): AndroidPeerCloneBridge {
@@ -195,7 +157,6 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
     const nativeInvoke = options.invoke ?? invoke
     const platformBridge = options.bridge ?? browserBridge()
     let state = initialState
-    let pairing: PeerClonePairing | undefined
     let jobId: string | undefined
     let finalization: Promise<AndroidPeerCloneStatus> | undefined
     let committedRecovery: {
@@ -251,14 +212,6 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             return null
         }
         jobId = status.jobId
-        pairing = 'sourceDeviceId' in status
-            ? undefined
-            : {
-                endpoint: status.endpoint,
-                sessionId: status.sessionId,
-                manifestId: status.manifestId,
-                claim: '',
-            }
         const phase = status.phase === 'ready' || status.phase === 'paused'
             ? 'paused'
             : status.phase === 'awaitingActivation'
@@ -381,15 +334,6 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
     return {
         getState: () => state,
         capabilities,
-        join(uri: string): AndroidPeerCloneState {
-            if (jobId && state.phase !== 'cancelled' && state.phase !== 'completed') {
-                throw new Error('Android peer clone already owns a clone job')
-            }
-            pairing = parsePeerCloneUri(uri)
-            jobId = undefined
-            state = { ...initialState, phase: 'joined' }
-            return state
-        },
         async joinRegistered(deviceId: string): Promise<AndroidPeerCloneState> {
             if (jobId && state.phase !== 'cancelled' && state.phase !== 'completed') {
                 throw new Error('Android peer clone already owns a clone job')
@@ -405,7 +349,7 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             return state
         },
         confirmDestructiveReplace(): AndroidPeerCloneState {
-            if (!pairing && !jobId) throw new Error('Android peer clone target has not joined a pairing')
+            if (!jobId) throw new Error('Android peer clone target has not joined a pairing')
             state = {
                 ...state,
                 phase: state.phase === 'paused' ? 'paused' : 'confirmed',
@@ -414,23 +358,12 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             return state
         },
         async download(): Promise<void> {
-            if (!state.destructiveConfirmed || (!pairing && !jobId)) {
+            if (!state.destructiveConfirmed || !jobId) {
                 throw new Error('Android peer clone target requires destructive replacement confirmation')
             }
-            const request = pairing
             const mode = await requireReady()
             if (mode === 'disabled') throw new Error('Android peer clone is not enabled by native production gates')
-            if (jobId) {
-                await beginTransfer(jobId, mode)
-                return
-            }
-            if (!request) throw new Error('Android peer clone target has not joined a pairing')
-            const claimed = await nativeInvoke<AndroidPeerCloneTargetStatus>('peer_clone_android_claim', {
-                endpoint: request.endpoint, sessionId: request.sessionId,
-                manifestId: request.manifestId, claim: request.claim,
-            })
-            adoptStatus(claimed)
-            await beginTransfer(claimed.jobId, mode)
+            await beginTransfer(jobId, mode)
         },
         async recover(): Promise<AndroidPeerCloneStatus | null> {
             const current = safeCurrentStatus(await nativeInvoke<unknown>('peer_clone_android_current'))

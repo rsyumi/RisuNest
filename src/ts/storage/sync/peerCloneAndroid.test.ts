@@ -10,8 +10,6 @@ import {
 } from './peerCloneAndroid'
 import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
 
-const pairingUri = 'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-42d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-
 function runtime() {
     const release = vi.fn()
     const refreshCommittedWorkingSet = vi.fn(async (_revision: number) => {})
@@ -38,53 +36,21 @@ describe('Android peer clone facade', () => {
             .toEqualTypeOf<'transferFailed' | undefined>()
     })
 
+    it('exposes no pairing-link join, so a target can only be claimed through a registered source', () => {
+        const facade = createAndroidPeerCloneFacade({
+            invoke: vi.fn() as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+
+        expect('join' in facade).toBe(false)
+    })
+
     it('caches one module-level facade so retained recovery fences survive settings remounts', () => {
         const first = getAndroidPeerCloneFacade(runtime().replacement)
         const second = getAndroidPeerCloneFacade(runtime().replacement)
 
         expect(second).toBe(first)
-    })
-
-    it('claims once and schedules API 34 UIDT with only the opaque native job id', async () => {
-        const calls: [string, Record<string, unknown> | undefined][] = []
-        const invoke: AndroidPeerCloneInvoke = async <T>(command: string, args?: Record<string, unknown>) => {
-            calls.push([command, args])
-            if (command === 'peer_clone_android_capabilities') {
-                return {
-                    androidClient: true,
-                    atomicActivationReady: true,
-                    losslessBackupReady: true,
-                    httpTransportReady: true,
-                    productionEnabled: true,
-                } as T
-            }
-            if (command === 'peer_clone_android_claim') {
-                return { jobId: '11111111-1111-4111-8111-111111111111', phase: 'ready' } as T
-            }
-            throw new Error(`unexpected command ${command}`)
-        }
-        const nativeBridge = bridge('uidt')
-        const facade = createAndroidPeerCloneFacade({
-            invoke: invoke as unknown as AndroidPeerCloneInvoke,
-            bridge: nativeBridge,
-            runtime: runtime().replacement,
-        })
-
-        facade.join(pairingUri)
-        facade.confirmDestructiveReplace()
-        await facade.download()
-
-        expect(calls).toEqual([
-            ['peer_clone_android_capabilities', undefined],
-            ['peer_clone_android_claim', {
-                endpoint: 'http://192.168.1.4:43123/',
-                sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                manifestId: 'a'.repeat(64),
-                claim: 'b'.repeat(64),
-            }],
-        ])
-        expect(nativeBridge.schedule).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111')
-        expect(JSON.stringify(nativeBridge)).not.toContain('bbbbbbbb')
     })
 
     it('creates and polls a secret-free registered job by opaque job id', async () => {
@@ -325,7 +291,7 @@ describe('Android peer clone facade', () => {
         expect(facade.getState().phase).toBe('idle')
     })
 
-    it('fails closed for a malformed legacy current status', async () => {
+    it('fails closed for a current status without a registered source identity', async () => {
         const facade = createAndroidPeerCloneFacade({
             invoke: vi.fn(async <T>() => ({
                 jobId: '11111111-1111-4111-8111-111111111111',
@@ -340,62 +306,6 @@ describe('Android peer clone facade', () => {
         expect(facade.getState().phase).toBe('idle')
     })
 
-    it('captures the confirmed pairing before the capability await', async () => {
-        type Capabilities = {
-            androidClient: boolean
-            atomicActivationReady: boolean
-            losslessBackupReady: boolean
-            httpTransportReady: boolean
-            productionEnabled: boolean
-        }
-        let resolveCapabilities: ((value: Capabilities) => void) | undefined
-        const capabilityPromise = new Promise<Capabilities>((resolve) => { resolveCapabilities = resolve })
-        const invoke = vi.fn(<T>(command: string, args?: Record<string, unknown>): Promise<T> => {
-            if (command === 'peer_clone_android_capabilities') {
-                return capabilityPromise as Promise<T>
-            }
-            if (command === 'peer_clone_android_claim') {
-                return Promise.resolve({
-                    jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: args?.endpoint,
-                    sessionId: args?.sessionId,
-                    manifestId: args?.manifestId,
-                    phase: 'ready',
-                    completedBytes: 0,
-                } as T)
-            }
-            return Promise.reject(new Error(`unexpected command ${command}`))
-        })
-        const facade = createAndroidPeerCloneFacade({
-            invoke: invoke as unknown as AndroidPeerCloneInvoke,
-            bridge: bridge('uidt'),
-            runtime: runtime().replacement,
-        })
-        facade.join(pairingUri)
-        facade.confirmDestructiveReplace()
-
-        const download = facade.download()
-        await vi.waitFor(() => expect(resolveCapabilities).toBeTypeOf('function'))
-        facade.join(
-            'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.5%3A43123&session=223e4567-e89b-42d3-a456-426614174000&manifest=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc#claim=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-        )
-        resolveCapabilities?.({
-            androidClient: true,
-            atomicActivationReady: true,
-            losslessBackupReady: true,
-            httpTransportReady: true,
-            productionEnabled: true,
-        })
-        await download
-
-        expect(invoke).toHaveBeenCalledWith('peer_clone_android_claim', {
-            endpoint: 'http://192.168.1.4:43123/',
-            sessionId: '123e4567-e89b-42d3-a456-426614174000',
-            manifestId: 'a'.repeat(64),
-            claim: 'b'.repeat(64),
-        })
-    })
-
     it('runs the same native job in foreground below API 34 without scheduling background work', async () => {
         let finishForeground: (() => void) | undefined
         const invoke = vi.fn(async <T>(command: string): Promise<T> => {
@@ -408,8 +318,13 @@ describe('Android peer clone facade', () => {
                     productionEnabled: true,
                 } as T
             }
-            if (command === 'peer_clone_android_claim') {
-                return { jobId: '11111111-1111-4111-8111-111111111111', phase: 'ready' } as T
+            if (command === 'peer_clone_claim_registered_client') {
+                return {
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
+                    jobId: '11111111-1111-4111-8111-111111111111',
+                    phase: 'ready',
+                    completedBytes: 0,
+                } as T
             }
             if (command === 'peer_clone_android_download') {
                 return new Promise<void>((resolve) => { finishForeground = resolve }) as Promise<T>
@@ -423,7 +338,7 @@ describe('Android peer clone facade', () => {
             runtime: runtime().replacement,
         })
 
-        facade.join(pairingUri)
+        await facade.joinRegistered('22222222-2222-4222-8222-222222222222')
         facade.confirmDestructiveReplace()
         await facade.download()
 
@@ -461,9 +376,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -506,9 +419,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'downloading',
                     completedBytes: 1,
                 } as T
@@ -541,9 +452,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'ready',
                     completedBytes: 1,
                     totalBytes: 42,
@@ -577,9 +486,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -613,9 +520,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -658,9 +563,7 @@ describe('Android peer clone facade', () => {
                 if (currentCalls > 2) throw new Error('transient status IPC failure')
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -702,9 +605,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -747,14 +648,12 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
                     committedRevision: 8,
-                    backupPath: '/data/user/0/app/recovered.lossless',
+                    backupPath: 'pre-clone-11111111-1111-4111-8111-111111111111.lossless',
                 } as T
             }
             if (command === 'peer_clone_android_release') return undefined as T
@@ -769,9 +668,9 @@ describe('Android peer clone facade', () => {
         await facade.recover()
         await expect(facade.targetStatus()).resolves.toMatchObject({
             phase: 'completed',
-            backupPath: '/data/user/0/app/recovered.lossless',
+            backupPath: 'pre-clone-11111111-1111-4111-8111-111111111111.lossless',
         })
-        expect(facade.getState().backupPaths).toEqual(['/data/user/0/app/recovered.lossless'])
+        expect(facade.getState().backupPaths).toEqual(['pre-clone-11111111-1111-4111-8111-111111111111.lossless'])
 
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_finalize')).toBe(false)
         expect(invoke).toHaveBeenCalledWith('peer_clone_android_release', {
@@ -787,9 +686,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -821,9 +718,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -851,9 +746,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'awaitingActivation',
                     completedBytes: 42,
                     totalBytes: 42,
@@ -890,13 +783,11 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'failed',
                     completedBytes: 1,
                     totalBytes: 42,
-                    error: 'invalid downloaded package',
+                    error: 'transferFailed',
                 } as T
             }
             if (command === 'peer_clone_android_request_cancel') return undefined as T
@@ -911,7 +802,8 @@ describe('Android peer clone facade', () => {
 
         await facade.recover()
 
-        expect(() => facade.join(pairingUri)).toThrow('already owns a clone job')
+        await expect(facade.joinRegistered('22222222-2222-4222-8222-222222222222'))
+            .rejects.toThrow('already owns a clone job')
         await facade.cancel()
         expect(nativeBridge.cancel).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111')
     })
@@ -921,9 +813,7 @@ describe('Android peer clone facade', () => {
             if (command === 'peer_clone_android_current') {
                 return {
                     jobId: '11111111-1111-4111-8111-111111111111',
-                    endpoint: 'http://192.168.1.4:43123/',
-                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
+                    sourceDeviceId: '22222222-2222-4222-8222-222222222222',
                     phase: 'ready',
                     completedBytes: 1,
                 } as T
@@ -938,7 +828,8 @@ describe('Android peer clone facade', () => {
         })
         await facade.recover()
 
-        expect(() => facade.join(pairingUri)).toThrow('already owns a clone job')
+        await expect(facade.joinRegistered('22222222-2222-4222-8222-222222222222'))
+            .rejects.toThrow('already owns a clone job')
         await facade.cancel()
         await expect(facade.resume()).rejects.toThrow('not paused')
     })
@@ -957,10 +848,8 @@ describe('Android peer clone facade', () => {
             runtime: runtime().replacement,
         })
 
-        facade.join(pairingUri)
-        facade.confirmDestructiveReplace()
-
-        await expect(facade.download()).rejects.toThrow('Android peer clone is not enabled by native production gates')
+        await expect(facade.joinRegistered('22222222-2222-4222-8222-222222222222'))
+            .rejects.toThrow('Android peer clone is not enabled by native production gates')
     })
 
     it('reports a disabled platform bridge and does not spend the one-time claim', async () => {
@@ -985,9 +874,8 @@ describe('Android peer clone facade', () => {
         })
 
         expect(await facade.capabilities()).toMatchObject({ productionEnabled: false })
-        facade.join(pairingUri)
-        facade.confirmDestructiveReplace()
-        await expect(facade.download()).rejects.toThrow('Android peer clone is not enabled by native production gates')
-        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_claim')).toBe(false)
+        await expect(facade.joinRegistered('22222222-2222-4222-8222-222222222222'))
+            .rejects.toThrow('Android peer clone is not enabled by native production gates')
+        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_claim_registered_client')).toBe(false)
     })
 })

@@ -34,15 +34,6 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
         status: async () => idleStatus(),
         stop: async () => undefined,
         revoke: async () => undefined,
-        sync: async () => ({
-            kind: 'noChanges',
-            operationId: 'operation-1',
-            revision: 1,
-            remoteRevision: 1,
-            transferredObjects: 0,
-            transferredBytes: 0,
-            backups: [],
-        }),
         syncRegistered: async () => ({
             kind: 'noChanges', operationId: 'operation-1', revision: 1, remoteRevision: 1,
             transferredObjects: 0, transferredBytes: 0, backups: [],
@@ -208,7 +199,7 @@ describe('peer bidirectional controller', () => {
     })
 
     it.each(['targetPrepared', 'awaitingConflict'] as const)(
-        'keeps retained %s state when fresh-link recovery fails',
+        'keeps retained %s state when registered recovery fails',
         async (retainedPhase) => {
             const conflict: PeerBidirectionalSyncResult = {
                 kind: 'conflict',
@@ -223,10 +214,10 @@ describe('peer bidirectional controller', () => {
                       operationId: 'operation-reconnect',
                   }
                 : { phase: 'awaitingConflict' as const, result: conflict }
-            const sync = vi.fn(async () => { throw new Error('fresh peer unavailable') })
+            const syncRegistered = vi.fn(async () => { throw new Error('fresh peer unavailable') })
             const controller = createPeerBidirectionalController({
                 facade: facade({
-                    sync,
+                    syncRegistered,
                     status: async () => ({
                         source: { phase: 'idle', devices: [] },
                         operation,
@@ -235,9 +226,9 @@ describe('peer bidirectional controller', () => {
             })
             await controller.initialize()
 
-            await expect(controller.sync('pairing-fresh')).rejects.toThrow('fresh peer unavailable')
+            await expect(controller.syncRegistered('device-fresh')).rejects.toThrow('fresh peer unavailable')
 
-            expect(sync).toHaveBeenCalledWith('pairing-fresh')
+            expect(syncRegistered).toHaveBeenCalledWith('device-fresh')
             expect(controller.snapshot()).toMatchObject({
                 operationPhase: retainedPhase,
                 operationId: 'operation-reconnect',
@@ -413,26 +404,6 @@ describe('peer bidirectional controller', () => {
             operationResult: undefined,
             operationRetained: true,
         })
-    })
-
-    it('keeps target sync blocked while a source-prepared operation is retained', async () => {
-        const sync = vi.fn(facade().sync)
-        const controller = createPeerBidirectionalController({
-            facade: facade({
-                sync,
-                status: async () => ({
-                    source: { phase: 'stopped', devices: [] },
-                    operation: {
-                        phase: 'sourcePrepared',
-                        operationId: 'operation-source-prepared',
-                    },
-                } as unknown as PeerBidirectionalStatus),
-            }),
-        })
-        await controller.initialize()
-
-        await expect(controller.sync('pairing-fresh')).rejects.toThrow('retained peer sync operation')
-        expect(sync).not.toHaveBeenCalled()
     })
 
     it('abandons a stopped source-prepared operation and preserves a completed receipt', async () => {
@@ -699,15 +670,15 @@ describe('peer bidirectional controller', () => {
         })
     })
 
-    it('shares one promise for the same pairing and rejects a different concurrent pairing', async () => {
+    it('shares one promise for the same device and rejects a different concurrent device', async () => {
         let finish!: (value: PeerBidirectionalSyncResult) => void
-        const sync = vi.fn(() => new Promise<PeerBidirectionalSyncResult>((resolve) => {
+        const syncRegistered = vi.fn(() => new Promise<PeerBidirectionalSyncResult>((resolve) => {
             finish = resolve
         }))
-        const controller = createPeerBidirectionalController({ facade: facade({ sync }) })
-        const first = controller.sync('pairing-a')
-        const same = controller.sync('pairing-a')
-        await expect(controller.sync('pairing-b')).rejects.toThrow('different pairing')
+        const controller = createPeerBidirectionalController({ facade: facade({ syncRegistered }) })
+        const first = controller.syncRegistered('device-a')
+        const same = controller.syncRegistered('device-a')
+        await expect(controller.syncRegistered('device-b')).rejects.toThrow('different peer sync operation')
         expect(first).toBe(same)
         finish({
             kind: 'noChanges',
@@ -719,7 +690,7 @@ describe('peer bidirectional controller', () => {
             backups: [],
         })
         await first
-        expect(sync).toHaveBeenCalledTimes(1)
+        expect(syncRegistered).toHaveBeenCalledTimes(1)
     })
 
     it('retains explicit conflicts until the user chooses one side', async () => {
@@ -734,7 +705,7 @@ describe('peer bidirectional controller', () => {
         }))
         const controller = createPeerBidirectionalController({
             facade: facade({
-                sync: async () => ({
+                syncRegistered: async () => ({
                     kind: 'conflict',
                     operationId: 'operation-conflict',
                     conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
@@ -745,50 +716,11 @@ describe('peer bidirectional controller', () => {
             }),
         })
 
-        await controller.sync('pairing')
+        await controller.syncRegistered('device-conflict')
         expect(controller.snapshot().operationPhase).toBe('awaitingConflict')
         await controller.resolve('local')
         expect(resolve).toHaveBeenCalledWith('operation-conflict', 'local')
         expect(controller.snapshot()).toMatchObject({ operationPhase: 'completed' })
-    })
-
-    it('passes a fresh conflict link atomically with the selected winner', async () => {
-        const resolve = vi.fn(async () => ({
-            kind: 'noChanges' as const,
-            operationId: 'operation-public-conflict',
-            revision: 4,
-            remoteRevision: 4,
-            transferredObjects: 0,
-            transferredBytes: 0,
-            backups: [],
-        }))
-        const controller = createPeerBidirectionalController({
-            facade: facade({
-                status: async () => ({
-                    source: { phase: 'idle', devices: [] },
-                    operation: {
-                        phase: 'awaitingConflict',
-                        result: {
-                            kind: 'conflict',
-                            operationId: 'operation-public-conflict',
-                            conflicts: [{ key: 'r1:root', type: 'sameRecord' }],
-                            localManifestHash: 'a'.repeat(64),
-                            remoteManifestHash: 'b'.repeat(64),
-                        },
-                    },
-                }),
-                resolve,
-            }),
-        })
-        await controller.initialize()
-
-        await controller.resolve('remote', 'fresh-public-link')
-
-        expect(resolve).toHaveBeenCalledWith(
-            'operation-public-conflict',
-            'remote',
-            'fresh-public-link',
-        )
     })
 
     it('resumes a native committed operation recovered after restart', async () => {
@@ -895,11 +827,11 @@ describe('peer bidirectional controller', () => {
         const controller = createPeerBidirectionalController({
             facade: facade({
                 prepare: async () => { throw new Error('source failed') },
-                sync: async () => { throw new Error('target failed') },
+                syncRegistered: async () => { throw new Error('target failed') },
             }),
         })
 
-        await expect(controller.sync('pairing')).rejects.toThrow('target failed')
+        await expect(controller.syncRegistered('device-target')).rejects.toThrow('target failed')
         await expect(controller.prepare()).rejects.toThrow('source failed')
         expect(controller.snapshot()).toMatchObject({
             operationError: 'target failed',
@@ -999,11 +931,11 @@ describe('peer bidirectional controller', () => {
                     source: { phase: 'idle', devices: [] },
                     operation: { phase: 'awaitingConflict', result: conflict },
                 }),
-                sync: async () => { throw new Error('sync response lost') },
+                syncRegistered: async () => { throw new Error('sync response lost') },
             }),
         })
         await synced.initialize()
-        await expect(synced.sync('pairing')).rejects.toThrow('sync response lost')
+        await expect(synced.syncRegistered('device-response-loss')).rejects.toThrow('sync response lost')
         expect(synced.snapshot()).toMatchObject({
             operationPhase: 'awaitingConflict',
             operationResult: conflict,
@@ -1082,12 +1014,12 @@ describe('peer bidirectional controller', () => {
                               source: { phase: 'idle', devices: [] },
                               operation: { phase, operationId: `operation-${phase}` },
                           } as PeerBidirectionalStatus),
-                    sync: async () => { throw new Error('sync failed before commit') },
+                    syncRegistered: async () => { throw new Error('sync failed before commit') },
                 }),
             })
             await controller.initialize()
 
-            await expect(controller.sync('pairing')).rejects.toThrow('sync failed before commit')
+            await expect(controller.syncRegistered('device-precommit')).rejects.toThrow('sync failed before commit')
 
             expect(controller.snapshot()).toMatchObject({
                 operationPhase: phase,
@@ -1100,18 +1032,19 @@ describe('peer bidirectional controller', () => {
     )
 
     it('rejects target start while source is active and source start while target is retained', async () => {
-        const sync = vi.fn(facade().sync)
+        const syncRegistered = vi.fn(facade().syncRegistered)
         const sourceActive = createPeerBidirectionalController({
             facade: facade({
                 status: async () => ({
                     source: { phase: 'running', sessionId: 'session-source', devices: [] },
                 }),
-                sync,
+                syncRegistered,
             }),
         })
         await sourceActive.initialize()
-        await expect(sourceActive.sync('pairing')).rejects.toThrow('peer sync source is active')
-        expect(sync).not.toHaveBeenCalled()
+        await expect(sourceActive.syncRegistered('device-source-active'))
+            .rejects.toThrow('peer sync source is active')
+        expect(syncRegistered).not.toHaveBeenCalled()
 
         const start = vi.fn(facade().start)
         const targetRetained = createPeerBidirectionalController({
@@ -1264,9 +1197,9 @@ describe('peer bidirectional controller', () => {
         })
     })
 
-    it('rejects source prepare but permits fresh-link recovery for an awaiting conflict', async () => {
+    it('rejects source prepare but permits registered recovery for an awaiting conflict', async () => {
         const prepare = vi.fn(async () => ({ phase: 'prepared' as const, sessionId: 'session', devices: [] }))
-        const sync = vi.fn(async () => ({
+        const syncRegistered = vi.fn(async () => ({
             kind: 'noChanges' as const,
             operationId: 'operation-new',
             revision: 4,
@@ -1291,15 +1224,15 @@ describe('peer bidirectional controller', () => {
                     },
                 }),
                 prepare,
-                sync,
+                syncRegistered,
             }),
         })
         await controller.initialize()
 
         await expect(controller.prepare()).rejects.toThrow('retained peer sync operation')
-        await expect(controller.sync('pairing-new')).resolves.toMatchObject({ kind: 'noChanges' })
+        await expect(controller.syncRegistered('device-new')).resolves.toMatchObject({ kind: 'noChanges' })
         expect(prepare).not.toHaveBeenCalled()
-        expect(sync).toHaveBeenCalledWith('pairing-new')
+        expect(syncRegistered).toHaveBeenCalledWith('device-new')
     })
 
     it('keeps a committed renderer-refresh failure recoverable through resume', async () => {
@@ -1356,7 +1289,7 @@ describe('peer bidirectional controller', () => {
     it('acknowledges and clears a retained terminal result', async () => {
         const acknowledge = vi.fn(async () => undefined)
         const controller = createPeerBidirectionalController({ facade: facade({ acknowledge }) })
-        await controller.sync('pairing')
+        await controller.syncRegistered('device-terminal')
         expect(controller.snapshot().operationPhase).toBe('completed')
 
         await controller.acknowledge()
@@ -1406,7 +1339,7 @@ describe('peer bidirectional controller', () => {
         'abandons a retained %s operation and permits a new sync',
         async (retainedPhase) => {
             const acknowledge = vi.fn(async () => undefined)
-            const sync = vi.fn(async () => ({
+            const syncRegistered = vi.fn(async () => ({
                 kind: 'noChanges' as const,
                 operationId: 'operation-next',
                 revision: 8,
@@ -1418,7 +1351,7 @@ describe('peer bidirectional controller', () => {
             const controller = createPeerBidirectionalController({
                 facade: facade({
                     acknowledge,
-                    sync,
+                    syncRegistered,
                     status: async () => ({
                         source: { phase: 'idle', devices: [] },
                         operation: {
@@ -1445,18 +1378,18 @@ describe('peer bidirectional controller', () => {
                 operationId: undefined,
                 operationRetained: false,
             })
-            await controller.sync('pairing-next')
-            expect(sync).toHaveBeenCalledWith('pairing-next')
+            await controller.syncRegistered('device-next')
+            expect(syncRegistered).toHaveBeenCalledWith('device-next')
         },
     )
 
     it.each(['localCommitted', 'sourceUnavailable'] as const)(
-        'uses a fresh pairing to recover a retained %s operation',
+        'uses a registered device to recover a retained %s operation',
         async (retainedPhase) => {
-            const sync = vi.fn(facade().sync)
+            const syncRegistered = vi.fn(facade().syncRegistered)
             const controller = createPeerBidirectionalController({
                 facade: facade({
-                    sync,
+                    syncRegistered,
                     status: async () => ({
                         source: { phase: 'idle', devices: [] },
                         operation: {
@@ -1475,9 +1408,9 @@ describe('peer bidirectional controller', () => {
             await controller.initialize()
             if (retainedPhase === 'sourceUnavailable') await controller.resume()
 
-            await expect(controller.sync('pairing-fresh')).resolves.toMatchObject({ kind: 'noChanges' })
+            await expect(controller.syncRegistered('device-fresh')).resolves.toMatchObject({ kind: 'noChanges' })
 
-            expect(sync).toHaveBeenCalledWith('pairing-fresh')
+            expect(syncRegistered).toHaveBeenCalledWith('device-fresh')
             expect(controller.snapshot().operationPhase).toBe('completed')
         },
     )
@@ -1607,7 +1540,7 @@ describe('peer bidirectional controller', () => {
                         operationId: 'operation-source-blocked',
                         committedRevision: 7,
                     }),
-                    sync: async () => {
+                    syncRegistered: async () => {
                         throw new PeerBidirectionalRefreshError(completed, new Error('refresh failed'))
                     },
                 }),
@@ -1615,51 +1548,13 @@ describe('peer bidirectional controller', () => {
             await controller.initialize()
             if (retainedPhase === 'sourceUnavailable') await controller.resume()
             if (retainedPhase === 'refreshPending') {
-                await expect(controller.sync('pairing-refresh')).rejects.toThrow('refresh failed')
+                await expect(controller.syncRegistered('device-refresh')).rejects.toThrow('refresh failed')
             }
 
             await expect(controller.prepare()).rejects.toThrow('retained peer sync operation')
             await expect(controller.start('session-blocked')).rejects.toThrow('retained peer sync operation')
             expect(prepare).not.toHaveBeenCalled()
             expect(start).not.toHaveBeenCalled()
-        },
-    )
-
-    it.each(['completed', 'refreshPending'] as const)(
-        'continues to reject fresh pairing sync while %s is retained',
-        async (retainedPhase) => {
-            const completed: PeerBidirectionalSyncResult = {
-                kind: 'noChanges',
-                operationId: 'operation-blocked',
-                revision: 7,
-                remoteRevision: 7,
-                transferredObjects: 0,
-                transferredBytes: 0,
-                backups: [],
-            }
-            const sync = vi.fn(async () => {
-                if (retainedPhase === 'refreshPending') {
-                    throw new PeerBidirectionalRefreshError(completed, new Error('refresh failed'))
-                }
-                return completed
-            })
-            const controller = createPeerBidirectionalController({
-                facade: facade({
-                    sync,
-                    status: async () => ({
-                        source: { phase: 'idle', devices: [] },
-                        operation: retainedPhase === 'completed'
-                            ? { phase: 'completed', result: completed }
-                            : undefined,
-                    }),
-                }),
-            })
-            await controller.initialize()
-            if (retainedPhase === 'refreshPending') {
-                await expect(controller.sync('pairing-original')).rejects.toThrow('refresh failed')
-            }
-
-            await expect(controller.sync('pairing-fresh')).rejects.toThrow('retained peer sync operation')
         },
     )
 })

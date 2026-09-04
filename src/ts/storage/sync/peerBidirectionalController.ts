@@ -395,39 +395,16 @@ export function createPeerBidirectionalController(options: {
                 update({ sourceStatus: status.source })
             },
         ),
-        sync(pairingUri: string) {
-            const key = `pairing:${pairingUri}`
-            if (activeOperation) {
-                return runOperation(key, () => options.facade.sync(pairingUri))
-            }
-            if (
-                snapshot.operationRetained
-                && ![
-                    'awaitingConflict',
-                    'targetPrepared',
-                    'localCommitted',
-                    'sourceUnavailable',
-                ].includes(snapshot.operationPhase)
-            ) {
-                return Promise.reject(new Error('A retained peer sync operation must be resolved first'))
-            }
-            if (['prepared', 'running'].includes(snapshot.sourceStatus.phase)) {
-                return Promise.reject(new Error('A peer sync source is active'))
-            }
-            return runOperation(key, () => options.facade.sync(pairingUri))
-        },
         syncRegistered(deviceId: string) {
             if (['prepared', 'running'].includes(snapshot.sourceStatus.phase)) {
                 return Promise.reject(new Error('A peer sync source is active'))
             }
             return runOperation(`registered:${deviceId}`, () => options.facade.syncRegistered(deviceId))
         },
-        resolve(winner: 'local' | 'remote', pairingUri?: string) {
+        resolve(winner: 'local' | 'remote') {
             const operationId = snapshot.operationId
-            const key = `operation:${operationId ?? ''}:resolve:${winner}:${pairingUri ?? 'retained'}`
-            const resolve = (id: string) => pairingUri
-                ? options.facade.resolve(id, winner, pairingUri)
-                : options.facade.resolve(id, winner)
+            const key = `operation:${operationId ?? ''}:resolve:${winner}:retained`
+            const resolve = (id: string) => options.facade.resolve(id, winner)
             if (activeOperation) {
                 return runOperation(key, () => resolve(operationId ?? ''))
             }

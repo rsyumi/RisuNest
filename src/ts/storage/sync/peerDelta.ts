@@ -138,6 +138,7 @@ function invalidPairingUri(): never {
 export function parsePeerDeltaUri(value: string): PeerDeltaPairing {
     return parsePeerPairingUri(value, {
         hostname: 'peer-delta',
+        pathname: '/v1',
         invalid: invalidPairingUri,
         claimRule: 'hex64Fragment',
         allowLanEndpoint: true,
@@ -247,7 +248,7 @@ export function createPeerDeltaFacade(options: {
     }
     const runPull = async (
         key: string,
-        command: 'peer_delta_pull' | 'peer_delta_pull_registered',
+        command: 'peer_delta_pull_registered',
         args: Record<string, unknown>,
     ): Promise<PeerDeltaPullResult> => {
         requireNative()
@@ -388,10 +389,6 @@ export function createPeerDeltaFacade(options: {
         async revoke(sessionId: string, deviceId: string): Promise<void> {
             requireNative()
             return nativeInvoke('peer_delta_revoke', { sessionId, deviceId })
-        },
-        async pull(pairingUri: string): Promise<PeerDeltaPullResult> {
-            const pairing = parsePeerDeltaUri(pairingUri)
-            return runPull(`pairing:${pairingUri}`, 'peer_delta_pull', { ...pairing })
         },
         async pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
             return runPull(`registered:${deviceId}`, 'peer_delta_pull_registered', { deviceId })

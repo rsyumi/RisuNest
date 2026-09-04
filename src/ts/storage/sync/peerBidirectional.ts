@@ -144,12 +144,10 @@ export interface PeerBidirectionalFacade {
     status(): Promise<PeerBidirectionalStatus>
     stop(sessionId: string): Promise<void>
     revoke(sessionId: string, deviceId: string): Promise<void>
-    sync(pairingUri: string): Promise<PeerBidirectionalSyncResult>
     syncRegistered(deviceId: string): Promise<PeerBidirectionalSyncResult>
     resolve(
         operationId: string,
         winner: 'local' | 'remote',
-        pairingUri?: string,
     ): Promise<PeerBidirectionalSyncResult>
     resolveRegistered(
         deviceId: string,
@@ -167,6 +165,7 @@ function invalidPairingUri(): never {
 export function parsePeerBidirectionalUri(value: string): PeerBidirectionalPairing {
     return parsePeerPairingUri(value, {
         hostname: 'peer-sync',
+        pathname: '/v1',
         invalid: invalidPairingUri,
         claimRule: 'hex64Fragment',
         allowLanEndpoint: true,
@@ -280,7 +279,6 @@ export function createPeerBidirectionalFacade(options: {
         if (recoveredOperationId !== operationId) return false
         if (
             command === 'peer_bidirectional_resolve'
-            || command === 'peer_bidirectional_resolve_with_link'
             || command === 'peer_bidirectional_resolve_registered'
         ) {
             return operation.phase === 'localCommitted' || operation.phase === 'completed'
@@ -751,15 +749,6 @@ export function createPeerBidirectionalFacade(options: {
             requireNative()
             await nativeInvoke('peer_bidirectional_revoke', { sessionId, deviceId })
         },
-        sync(pairingUri) {
-            const pairing = parsePeerBidirectionalUri(pairingUri)
-            return runMutation(
-                'peer-bidirectional-sync',
-                `pairing:${pairingUri}`,
-                'peer_bidirectional_sync',
-                { ...pairing },
-            )
-        },
         syncRegistered(deviceId) {
             return runMutation(
                 'peer-bidirectional-sync',
@@ -768,16 +757,7 @@ export function createPeerBidirectionalFacade(options: {
                 { deviceId },
             )
         },
-        resolve(operationId, winner, pairingUri) {
-            if (pairingUri) {
-                const pairing = parsePeerBidirectionalUri(pairingUri)
-                return runMutation(
-                    'peer-bidirectional-resolve',
-                    `operation:${operationId}:resolve:${winner}:pairing:${pairingUri}`,
-                    'peer_bidirectional_resolve_with_link',
-                    { operationId, winner, ...pairing },
-                )
-            }
+        resolve(operationId, winner) {
             return runMutation(
                 'peer-bidirectional-resolve',
                 `operation:${operationId}:resolve:${winner}`,

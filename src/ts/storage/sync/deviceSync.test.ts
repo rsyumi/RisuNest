@@ -56,6 +56,17 @@ describe('device sync facade', () => {
     })
 
     it.each([
+        ['peer-clone', '/v1'],
+        ['peer-delta', '/v1'],
+        ['peer-sync', '/v1'],
+        ['peer-clone', '/v3'],
+    ])('rejects the %s lane link at %s instead of a device sync v2 link', (host, path) => {
+        const uri = `risuailocal://${host}${path}?endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+
+        expect(() => parseDeviceSyncUri(uri)).toThrow('Invalid device sync link')
+    })
+
+    it.each([
         'http://127.0.0.1:32145',
         'http://127.1:32145',
         'http://127.255.255.254:32145',
