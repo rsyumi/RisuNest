@@ -1863,15 +1863,15 @@ impl From<RetainedDeltaCompletion> for RetainedDeltaCompletionStatus {
 }
 
 /// The pull owns the same journal, so its guard is what keeps a status read and
-/// a running pull apart. The store is opened under the guard, never before it.
+/// a running pull apart. The store is opened under the guard and only once a
+/// journal is actually there, so the usual empty answer opens nothing.
 fn retained_completion_under_pull_guard(
     state: &PeerDeltaCommandState,
     app_root: &Path,
     open_store: impl FnOnce() -> Result<PersistentStore, PeerSyncError>,
 ) -> Result<Option<RetainedDeltaCompletionStatus>, PeerSyncError> {
     let _guard = state.begin_pull()?;
-    let mut store = open_store()?;
-    retained_delta_completion(&mut store, app_root)
+    retained_delta_completion(app_root, open_store)
         .map(|retained| retained.map(RetainedDeltaCompletionStatus::from))
 }
 

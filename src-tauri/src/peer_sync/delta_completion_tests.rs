@@ -2,8 +2,8 @@ use super::delta_completion::{
     abandon_retained_delta_completion, complete_delta_accounting, recover_delta_completion,
     registered_delta_source_is_active, retained_delta_completion, unlink_canonical_with_sync,
     DeltaCommitWitness, DeltaCompletionContext, DeltaCompletionMode, DeltaCompletionTransport,
-    PeerDeltaCompletionJournal, PeerDeltaDurableCompletion, RetainedDeltaWitness,
-    DELTA_COMPLETION_AMBIGUOUS,
+    PeerDeltaCompletionJournal, PeerDeltaDurableCompletion, RetainedDeltaCompletion,
+    RetainedDeltaWitness, DELTA_COMPLETION_AMBIGUOUS,
 };
 use super::device_registry::{
     completion_receipt_id, incoming_source_by_id, prepare_incoming_completion_delivery,
@@ -56,6 +56,16 @@ fn context(operation_id: &str) -> DeltaCompletionContext {
 
 fn job_id(operation: &DeltaCompletionContext) -> String {
     format!("p4-delta-target-{}", operation.operation_id)
+}
+
+/// The status read owns the store it opens, so the caller holds none of its own
+/// while it runs.
+fn retained_status(root: &Path) -> Option<RetainedDeltaCompletion> {
+    retained_delta_completion(root, || {
+        PersistentStore::open(root)
+            .map_err(|error| super::PeerSyncError::Storage(error.to_string()))
+    })
+    .unwrap()
 }
 
 fn register_source(root: &Path, total_bytes: u64) {
@@ -903,10 +913,14 @@ fn ambiguous_recovery_returns_the_stable_retained_code_and_keeps_the_journal() {
 #[test]
 fn retained_delta_completion_reports_nothing_without_a_journal() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = PersistentStore::open(root.path()).unwrap();
 
+    // Every target initialization asks this question, so the usual empty answer
+    // must cost nothing beyond the journal read.
     assert_eq!(
-        retained_delta_completion(&mut store, root.path()).unwrap(),
+        retained_delta_completion(root.path(), || panic!(
+            "the store must not be opened without a retained journal"
+        ))
+        .unwrap(),
         None
     );
 }
@@ -914,15 +928,12 @@ fn retained_delta_completion_reports_nothing_without_a_journal() {
 #[test]
 fn retained_delta_completion_names_the_source_and_classifies_every_witness() {
     let ambiguous_root = tempfile::tempdir().unwrap();
-    let mut ambiguous_store = PersistentStore::open(ambiguous_root.path()).unwrap();
     let ambiguous = context(OPERATION_ID);
     PeerDeltaCompletionJournal::new(ambiguous_root.path())
         .store_activation_intent(&ambiguous)
         .unwrap();
 
-    let retained = retained_delta_completion(&mut ambiguous_store, ambiguous_root.path())
-        .unwrap()
-        .unwrap();
+    let retained = retained_status(ambiguous_root.path()).unwrap();
     assert_eq!(retained.witness, RetainedDeltaWitness::Ambiguous);
     // An unregistered source has no name to report.
     assert_eq!(retained.source_name, None);
@@ -940,7 +951,6 @@ fn retained_delta_completion_names_the_source_and_classifies_every_witness() {
 
     let uncommitted_root = tempfile::tempdir().unwrap();
     register_source(uncommitted_root.path(), 5);
-    let mut uncommitted_store = PersistentStore::open(uncommitted_root.path()).unwrap();
     let mut uncommitted = context(OPERATION_ID);
     uncommitted.pre_revision = 0;
     uncommitted.pre_common_base = None;
@@ -949,24 +959,43 @@ fn retained_delta_completion_names_the_source_and_classifies_every_witness() {
         .store_activation_intent(&uncommitted)
         .unwrap();
 
-    let retained = retained_delta_completion(&mut uncommitted_store, uncommitted_root.path())
-        .unwrap()
-        .unwrap();
+    let retained = retained_status(uncommitted_root.path()).unwrap();
     assert_eq!(retained.witness, RetainedDeltaWitness::Uncommitted);
     assert_eq!(retained.source_name.as_deref(), Some("source"));
 
     let committed_root = tempfile::tempdir().unwrap();
     register_source(committed_root.path(), 5);
-    let (mut committed_store, _cas, committed) = committed_context(committed_root.path());
+    let (committed_store, _cas, committed) = committed_context(committed_root.path());
     PeerDeltaCompletionJournal::new(committed_root.path())
         .store_activation_intent(&committed)
         .unwrap();
+    drop(committed_store);
 
-    let retained = retained_delta_completion(&mut committed_store, committed_root.path())
-        .unwrap()
-        .unwrap();
+    let retained = retained_status(committed_root.path()).unwrap();
     assert_eq!(retained.witness, RetainedDeltaWitness::Committed);
     assert_eq!(retained.source_name.as_deref(), Some("source"));
+}
+
+#[test]
+fn retained_delta_completion_survives_a_source_registry_it_cannot_read() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&context(OPERATION_ID))
+        .unwrap();
+    std::fs::write(
+        root.path().join("peer-sync/sources.json"),
+        b"{ not a registry",
+    )
+    .unwrap();
+    assert!(incoming_source_by_id(root.path(), SOURCE_ID).is_err());
+
+    // The other device's name is a courtesy. Losing it must never take the
+    // panel, and with it the only way out of the retention, down too.
+    let retained = retained_status(root.path()).unwrap();
+    assert_eq!(retained.source_name, None);
+    assert_eq!(retained.operation_id, OPERATION_ID);
+    assert_eq!(retained.witness, RetainedDeltaWitness::Ambiguous);
 }
 
 #[test]
@@ -989,24 +1018,19 @@ fn abandoning_an_ambiguous_retention_unblocks_pull_removal_and_registration() {
         .store_activation_intent(&operation)
         .unwrap();
     prepare_incoming_completion_delivery(root.path(), pending_delivery(&operation, 7)).unwrap();
-    assert_eq!(
-        retained_delta_completion(&mut store, root.path())
-            .unwrap()
-            .unwrap()
-            .witness,
-        RetainedDeltaWitness::Ambiguous
-    );
     let revision_before = store.revision().unwrap();
     let common_base_before = store
         .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, SOURCE_ID)
         .unwrap();
+    drop(store);
+    assert_eq!(
+        retained_status(root.path()).unwrap().witness,
+        RetainedDeltaWitness::Ambiguous
+    );
 
     abandon_retained_delta_completion(root.path(), OPERATION_ID).unwrap();
 
-    assert_eq!(
-        retained_delta_completion(&mut store, root.path()).unwrap(),
-        None
-    );
+    assert_eq!(retained_status(root.path()), None);
     assert!(!job_journal.exists());
     assert!(DurableCasJob::open(root.path(), &job_id(&operation)).is_err());
     assert!(
@@ -1017,6 +1041,7 @@ fn abandoning_an_ambiguous_retention_unblocks_pull_removal_and_registration() {
     assert!(!registered_delta_source_is_active(root.path(), Some(SOURCE_ID)).unwrap());
     // The cancellation is local cleanup only: the data this device holds is
     // exactly what it held before.
+    let store = PersistentStore::open(root.path()).unwrap();
     assert_eq!(store.revision().unwrap(), revision_before);
     assert_eq!(
         store
@@ -1024,6 +1049,7 @@ fn abandoning_an_ambiguous_retention_unblocks_pull_removal_and_registration() {
             .unwrap(),
         common_base_before
     );
+    drop(store);
 
     let lifecycle = lock_registered_source_lifecycle().unwrap();
     ensure_no_active_registered_source_work(&lifecycle, root.path()).unwrap();
@@ -1067,6 +1093,85 @@ fn abandoning_refuses_a_mismatched_operation_and_spares_another_operations_deliv
         .is_none());
     // Nothing retained is an idempotent success, not a failure.
     abandon_retained_delta_completion(root.path(), OPERATION_ID).unwrap();
+}
+
+#[test]
+fn abandoning_a_retention_whose_source_record_is_gone_still_clears_it() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    let operation = context(OPERATION_ID);
+    let mut job = DurableCasJob::begin(
+        root.path(),
+        &job_id(&operation),
+        CasJobKind::LogicalDeltaTarget,
+        1,
+    )
+    .unwrap();
+    job.seal(&mut store, 1).unwrap();
+    let job_journal = job.journal_path().to_path_buf();
+    drop(job);
+    drop(store);
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    let mut registry = IncomingSourceRegistry::load(root.path()).unwrap();
+    registry.remove(SOURCE_ID).unwrap();
+    registry.save().unwrap();
+
+    // No source record means no delivery to abandon, and the way out of a
+    // retention must not depend on the registry still naming the other device.
+    abandon_retained_delta_completion(root.path(), OPERATION_ID).unwrap();
+
+    assert!(PeerDeltaCompletionJournal::new(root.path())
+        .load()
+        .unwrap()
+        .is_none());
+    assert!(!job_journal.exists());
+    assert!(DurableCasJob::open(root.path(), &job_id(&operation)).is_err());
+}
+
+#[test]
+fn abandoning_a_committed_retention_leaves_the_store_and_common_base_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    register_source(root.path(), 5);
+    let (store, _cas, operation) = committed_context(root.path());
+    PeerDeltaCompletionJournal::new(root.path())
+        .store_activation_intent(&operation)
+        .unwrap();
+    prepare_incoming_completion_delivery(root.path(), pending_delivery(&operation, 7)).unwrap();
+    let revision_before = store.revision().unwrap();
+    let common_base_before = store
+        .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, SOURCE_ID)
+        .unwrap();
+    drop(store);
+    assert_eq!(
+        retained_status(root.path()).unwrap().witness,
+        RetainedDeltaWitness::Committed
+    );
+
+    abandon_retained_delta_completion(root.path(), OPERATION_ID).unwrap();
+
+    // A committed witness is the case with something to lose, and it loses
+    // nothing but this transfer's share of the source's cumulative totals.
+    assert_eq!(retained_status(root.path()), None);
+    assert!(
+        snapshot_incoming_completion_delivery(root.path(), SOURCE_ID, CompletionLane::Delta)
+            .unwrap()
+            .is_none()
+    );
+    let store = PersistentStore::open(root.path()).unwrap();
+    assert_eq!(store.revision().unwrap(), revision_before);
+    assert_eq!(
+        store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, SOURCE_ID)
+            .unwrap(),
+        common_base_before
+    );
+    assert_eq!(
+        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
+        5
+    );
 }
 
 #[test]

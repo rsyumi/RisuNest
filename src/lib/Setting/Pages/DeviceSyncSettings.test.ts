@@ -740,7 +740,68 @@ describe('DeviceSyncSettings', () => {
         await vi.waitFor(() => expect(controllerState.controller.pullRegisteredDelta).toHaveBeenCalledWith('source-a'))
     })
 
+    it.each([
+        ['a source that may no longer be read', [{ deviceId: 'source-a', name: 'Source A', permissions: [] as const }], [] as string[]],
+        ['an expired registration', registeredSourceA, ['source-a']],
+    ])('withholds continuing a retained delta from %s', async (_case, sources, expiredSourceIds) => {
+        await render(snapshot({
+            sources,
+            expiredSourceIds,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta({ witness: 'uncommitted' }) }, bidirectional: bidiBase },
+        }))
+
+        expect(button('Continue')).toBeUndefined()
+        expect(button('Abandon task')).toBeDefined()
+    })
+
+    it('shows the running pull instead of the retained panel', async () => {
+        await render(snapshot({
+            sources: registeredSourceA,
+            targets: {
+                clone: cloneBase,
+                delta: { ...deltaBase, retained: retainedDelta(), pullPhase: 'running' as const },
+                bidirectional: bidiBase,
+            },
+        }))
+
+        expect(target.querySelector('[data-delta-retained]')).toBeNull()
+        expect(button('Abandon task')).toBeUndefined()
+        expect(target.querySelector('[data-work-status]')!.textContent).toContain('Receiving 0%')
+    })
+
+    it('locks both retained delta actions while this device shares, but never the stop control', async () => {
+        const sharing = (phase: 'running' | 'idle') => snapshot({
+            source: { phase },
+            sources: registeredSourceA,
+            targets: {
+                clone: cloneBase,
+                delta: { ...deltaBase, retained: retainedDelta({ witness: 'uncommitted' }) },
+                bidirectional: bidiBase,
+            },
+        })
+        await render(sharing('running'))
+
+        expect(button('Continue')!.disabled).toBe(true)
+        expect(button('Abandon task')!.disabled).toBe(true)
+        expect(target.querySelector('[data-sync-card="work"]')!.textContent)
+            .toContain('Stop sharing to run a receive task.')
+        expect(button('Stop sharing')!.disabled).toBe(false)
+
+        controllerState.emit(sharing('idle')); await tick()
+
+        expect(button('Continue')!.disabled).toBe(false)
+        expect(button('Abandon task')!.disabled).toBe(false)
+    })
+
     it('confirms before abandoning a retained delta and then closes the panel', async () => {
+        const cleared = snapshot({
+            sources: registeredSourceA,
+            targets: { clone: cloneBase, delta: deltaBase, bidirectional: bidiBase },
+        })
+        controllerState.controller.abandonDelta.mockImplementationOnce(async () => {
+            controllerState.emit(cleared)
+            return undefined
+        })
         await render(snapshot({
             sources: registeredSourceA,
             targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta() }, bidirectional: bidiBase },
@@ -753,6 +814,21 @@ describe('DeviceSyncSettings', () => {
             "Cancel the pending update? Data on this device stays as it is, but the other device's transfer statistics may not update.",
         )
         await vi.waitFor(() => expect(target.querySelector('[data-work-status]')).toBeNull())
+    })
+
+    it('keeps the panel up when the target still reports the delta as retained', async () => {
+        await render(snapshot({
+            sources: registeredSourceA,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta() }, bidirectional: bidiBase },
+        }))
+
+        button('Abandon task')!.click()
+
+        await vi.waitFor(() => expect(controllerState.controller.abandonDelta).toHaveBeenCalledOnce())
+        await tick()
+        // The cancellation reported success without dropping the journal, so
+        // the only way out has to stay on screen.
+        expect(target.querySelector('[data-delta-retained]')).not.toBeNull()
     })
 
     it('keeps a declined retained delta abandonment untouched', async () => {

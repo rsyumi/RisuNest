@@ -433,6 +433,55 @@ describe('peer delta controller', () => {
         expect(controller.snapshot().error).toBe('')
     })
 
+    test('treats a re-read the abandonment outran as nothing left to report', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: 'Desk',
+            witness: 'ambiguous' as const,
+            transferredObjects: 0,
+            transferredBytes: 0,
+        }
+        const readRetained = vi.fn()
+            .mockResolvedValueOnce(retained)
+            .mockRejectedValue(new Error('state unavailable'))
+        const controller = createPeerDeltaController({
+            facade: facadeFixture({ retained: readRetained, abandonRetained: vi.fn(async () => undefined) }),
+        })
+
+        await controller.initializeTarget()
+        await controller.abandonRetained()
+
+        // The journal the retention named is already gone, so the target must
+        // not be left holding the state it just dropped.
+        expect(controller.snapshot().retained).toBeNull()
+        expect(controller.snapshot().pullPhase).toBe('idle')
+        expect(controller.snapshot().error).toBe('')
+    })
+
+    test('refuses a re-entrant registered pull while the retained refresh still runs', async () => {
+        let releaseRefresh = (): void => {}
+        const readRetained = vi.fn()
+            .mockResolvedValueOnce(null)
+            .mockImplementationOnce(() => new Promise((resolve) => { releaseRefresh = () => resolve(null) }))
+        const pullRegistered = vi.fn(async () => ({
+            kind: 'noChanges' as const, revision: 1, transferredObjects: 0, transferredBytes: 0,
+        }))
+        const controller = createPeerDeltaController({ facade: facadeFixture({ retained: readRetained, pullRegistered }) })
+
+        await controller.initializeTarget()
+        const pull = controller.pullRegistered('source')
+        await vi.waitFor(() => expect(readRetained).toHaveBeenCalledTimes(2))
+
+        // The fence outlives the refresh, so the second pull meets this
+        // controller rather than the native target guard.
+        await expect(controller.pullRegistered('source')).rejects.toThrow('A peer delta pull is already running')
+        releaseRefresh()
+        await pull
+
+        expect(pullRegistered).toHaveBeenCalledTimes(1)
+    })
+
     test('reports an abandonment failure on the target error channel', async () => {
         const retained = {
             operationId: '00000000-0000-4000-8000-000000000091',

@@ -606,11 +606,8 @@ pub(crate) fn recover_delta_completion(
             DELTA_COMPLETION_AMBIGUOUS.to_owned(),
         )),
         DeltaCommitWitness::Uncommitted => {
-            let job = open_uncommitted_job(app_root, &context.operation_id)?;
+            release_uncommitted_job(app_root, &context.operation_id)?;
             journal.remove_exact(&context)?;
-            if let Some(mut job) = job {
-                job.release(CasReleaseOutcome::Aborted)?;
-            }
             Ok(None)
         }
         DeltaCommitWitness::Committed => {
@@ -648,26 +645,37 @@ pub(crate) struct RetainedDeltaCompletion {
 
 /// Classifies the retained journal against the store the same way the pull path
 /// does. No network call and no side effect, so the interface can ask whenever
-/// it needs the state instead of polling for a failure to tell it.
+/// it needs the state instead of polling for a failure to tell it. `open_store`
+/// runs only once a journal is there, so the common case of no retention costs
+/// no store open.
 pub(crate) fn retained_delta_completion(
-    store: &mut PersistentStore,
     app_root: &Path,
+    open_store: impl FnOnce() -> Result<PersistentStore, PeerSyncError>,
 ) -> Result<Option<RetainedDeltaCompletion>, PeerSyncError> {
     let Some(operation) = PeerDeltaCompletionJournal::new(app_root).load()? else {
         return Ok(None);
     };
     let context = operation.context();
+    let store = open_store()?;
     let revision = store
         .revision()
         .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
     let common_base = store
         .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, &context.source_device_id)
         .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    // A registry this device can no longer read costs the retention its
+    // display name, never the way out of it.
+    let source_name = match incoming_source_by_id(app_root, &context.source_device_id) {
+        Ok(source) => source.map(|source| source.name),
+        Err(_) => {
+            crate::nlog!("warn", "retained delta completion source name unreadable");
+            None
+        }
+    };
     Ok(Some(RetainedDeltaCompletion {
         operation_id: context.operation_id.clone(),
         source_device_id: context.source_device_id.clone(),
-        source_name: incoming_source_by_id(app_root, &context.source_device_id)?
-            .map(|source| source.name),
+        source_name,
         witness: match context.classify_witness(revision, common_base.as_ref()) {
             DeltaCommitWitness::Committed => RetainedDeltaWitness::Committed,
             DeltaCommitWitness::Uncommitted => RetainedDeltaWitness::Uncommitted,
@@ -699,25 +707,36 @@ pub(crate) fn abandon_retained_delta_completion(
     if context.operation_id != operation_id {
         return invalid("another delta completion operation is retained");
     }
-    // A lease that belongs to another operation is not this one's to drop; an
-    // already durable or already missing delivery leaves nothing to drop.
-    if let Some(snapshot) = snapshot_incoming_completion_delivery(
-        app_root,
-        &context.source_device_id,
-        CompletionLane::Delta,
-    )?
-    .filter(|snapshot| snapshot.delivery.completion_lease_id == context.operation_id)
-    {
-        abandon_incoming_completion_delivery(app_root, &snapshot.delivery)?;
+    // A source record that is already gone owns no delivery, and the delivery
+    // read refuses outright without one. The way out of a retention must not
+    // depend on the registry still naming the other device.
+    if incoming_source_by_id(app_root, &context.source_device_id)?.is_some() {
+        // A lease that belongs to another operation is not this one's to drop;
+        // an already durable or already missing delivery leaves nothing to drop.
+        if let Some(snapshot) = snapshot_incoming_completion_delivery(
+            app_root,
+            &context.source_device_id,
+            CompletionLane::Delta,
+        )?
+        .filter(|snapshot| snapshot.delivery.completion_lease_id == context.operation_id)
+        {
+            abandon_incoming_completion_delivery(app_root, &snapshot.delivery)?;
+        }
     }
-    // Aborting removes the job journal alone. Objects the store references stay
-    // reachable through the store's own GC root, exactly as the per-pull reclaim
-    // of abandoned jobs already relies on.
-    if let Some(mut job) = open_uncommitted_job(app_root, &context.operation_id)? {
-        job.release(CasReleaseOutcome::Aborted)?;
-    }
+    release_uncommitted_job(app_root, &context.operation_id)?;
     journal.remove_exact(&context)?;
     crate::nlog!("warn", "retained delta completion abandoned by request");
+    Ok(())
+}
+
+/// Aborting removes the job journal alone. Objects the store references stay
+/// reachable through the store's own GC root, exactly as the per-pull reclaim of
+/// abandoned jobs already relies on. A job that is already gone has nothing left
+/// to release, so both callers treat that as done rather than as a failure.
+fn release_uncommitted_job(app_root: &Path, operation_id: &str) -> Result<(), PeerSyncError> {
+    if let Some(mut job) = open_uncommitted_job(app_root, operation_id)? {
+        job.release(CasReleaseOutcome::Aborted)?;
+    }
     Ok(())
 }
 

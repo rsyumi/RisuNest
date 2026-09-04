@@ -59,10 +59,16 @@
         || cloneRetryable
     )
     const deltaRetained = $derived(delta?.retained ?? null)
+    // Continuing runs the same registered pull, so it needs everything that
+    // pull needs: a resumable witness and a source that is still registered,
+    // still readable and not known to have expired.
     const deltaResumable = $derived(Boolean(
         deltaRetained
         && deltaRetained.witness !== 'ambiguous'
-        && snapshot.sources.some((source) => source.deviceId === deltaRetained.sourceDeviceId)
+        && !snapshot.expiredSourceIds.includes(deltaRetained.sourceDeviceId)
+        && snapshot.sources.some((source) => (
+            source.deviceId === deltaRetained.sourceDeviceId && source.permissions.includes('read')
+        ))
     ))
     const deltaBusy = $derived(
         workActionPending && activeWork === 'delta'
@@ -303,7 +309,13 @@
         workActionPending = true
         try {
             const confirmed = await alertConfirm(sync.work.deltaAbandonConfirm)
-            if (confirmed && await runAction(() => controller.abandonDelta(), 'work')) dismissWork()
+            // A cancellation the target reports as still retained leaves the
+            // panel up, so the only way out stays where the reader left it.
+            if (
+                confirmed
+                && await runAction(() => controller.abandonDelta(), 'work')
+                && !deltaRetained
+            ) dismissWork()
         } finally {
             workActionPending = false
         }
@@ -487,9 +499,9 @@
                         <p class="mt-1 text-sm text-textcolor2">{deltaRetained.witness === 'ambiguous' ? sync.work.deltaRetainedAmbiguous : sync.work.deltaRetainedResumable}</p>
                         <div class="mt-2 flex flex-wrap gap-2">
                             {#if deltaResumable}
-                                <Button size="sm" disabled={workActionPending} onclick={resumeRetainedDelta}>{sync.work.resume}</Button>
+                                <Button size="sm" disabled={workActionPending || sourceBusy} onclick={resumeRetainedDelta}>{sync.work.resume}</Button>
                             {/if}
-                            <Button size="sm" styled="danger" disabled={workActionPending} onclick={abandonRetainedDelta}>{sync.work.abandon}</Button>
+                            <Button size="sm" styled="danger" disabled={workActionPending || sourceBusy} onclick={abandonRetainedDelta}>{sync.work.abandon}</Button>
                         </div>
                     {:else if workActionPending || delta?.pullPhase === 'running'}<p class="text-sm">{format(sync.work.progress, 0)}</p>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'noChanges'}<p class="text-sm">{sync.work.doneUpToDate}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>

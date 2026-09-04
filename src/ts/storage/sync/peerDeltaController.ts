@@ -257,8 +257,11 @@ export function createPeerDeltaController(options: {
                 update({ pullPhase: 'failed' })
                 throw cause
             }).finally(async () => {
-                activePull = undefined
+                // The refresh runs before the fence drops, so a pull that starts
+                // during it meets this controller's own refusal instead of the
+                // native target guard.
                 await refreshRetainedAfterPull()
+                activePull = undefined
             })
             activePull = { pairingUri: `registered:${deviceId}`, promise }
             return promise
@@ -268,14 +271,21 @@ export function createPeerDeltaController(options: {
             if (!retained) throw new Error('No retained peer delta completion to abandon')
             try {
                 await options.facade.abandonRetained(retained.operationId)
-                const refreshed = await options.facade.retained()
-                pullError = ''
-                update({ retained: refreshed, pullPhase: 'idle', pullResult: undefined })
             } catch (cause) {
                 pullError = cause instanceof Error ? cause.message : String(cause)
                 update({ pullPhase: 'failed' })
                 throw cause
             }
+            let refreshed: RetainedDeltaCompletion | null = null
+            try {
+                refreshed = await options.facade.retained()
+            } catch {
+                // The abandonment already stands and the journal it named is
+                // gone, so a re-read that cannot answer must not put the target
+                // back on the state it just left.
+            }
+            pullError = ''
+            update({ retained: refreshed, pullPhase: 'idle', pullResult: undefined })
         },
     }
 }
