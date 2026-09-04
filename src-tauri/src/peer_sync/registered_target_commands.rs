@@ -229,14 +229,10 @@ fn registered_operation_failure(context: &str, error: impl fmt::Display) -> Stri
 }
 
 /// A failure past the hello round trip goes through the same mapping table as
-/// every other command boundary, so a refusal such as a rotated registration
-/// keeps its own code instead of collapsing to the generic one.
+/// every other command boundary, so a refusal such as a rotated registration or
+/// a blocked new registration keeps its own code instead of collapsing to the
+/// generic one.
 fn registered_target_operation_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
-    crate::nlog!("warn", "{context} failed: {error}");
-    code_for(&error)
-}
-
-fn registered_claim_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
     crate::nlog!("warn", "{context} failed: {error}");
     code_for(&error)
 }
@@ -292,7 +288,7 @@ pub async fn peer_sync_registered_hello(
     tauri::async_runtime::spawn_blocking(move || registered_hello(&root, &device_id))
         .await
         .map_err(|error| safe_command_failure("registered source hello worker", error))?
-        .map_err(|error| error.to_string())
+        .map_err(|code: PeerCommandCode| code.to_string())
 }
 
 #[tauri::command]
@@ -355,7 +351,9 @@ pub async fn peer_clone_claim_client(
             &manifest_id,
             &claim,
         )
-        .map_err(|error| registered_claim_failure("Android clone registration", error))?;
+        .map_err(|error| {
+            registered_target_operation_failure("Android clone registration", error)
+        })?;
         let source_device_id = client
             .registered_source_device_id()
             .ok_or(PeerCommandCode::OperationFailed)?
@@ -436,7 +434,7 @@ pub async fn peer_delta_pull_registered(
     })
     .await
     .map_err(|error| safe_command_failure("registered delta hello worker", error))?
-    .map_err(|error| error.to_string())?;
+    .map_err(|code: PeerCommandCode| code.to_string())?;
     let local_device_id = super::device_registry::load_or_create_device_id(&app_root(&app)?)
         .map_err(|error| {
             registered_target_operation_failure("registered delta local identity", error)
@@ -471,7 +469,7 @@ pub async fn peer_delta_pull_registered(
     })
     .await
     .map_err(|error| safe_command_failure("registered delta hello worker", error))?
-    .map_err(|error| error.to_string())?;
+    .map_err(|code: PeerCommandCode| code.to_string())?;
     let local_device_id = super::device_registry::load_or_create_device_id(&app_root(&app)?)
         .map_err(|error| {
             registered_target_operation_failure("registered delta local identity", error)
@@ -512,7 +510,7 @@ pub async fn peer_bidirectional_sync_registered(
     })
     .await
     .map_err(|error| safe_command_failure("registered bidirectional hello worker", error))?
-    .map_err(|error| error.to_string())?;
+    .map_err(|code: PeerCommandCode| code.to_string())?;
     peer_bidirectional_sync_registered_client(
         app,
         state,
@@ -544,7 +542,7 @@ pub async fn peer_bidirectional_resolve_registered(
     })
     .await
     .map_err(|error| safe_command_failure("registered resolution hello worker", error))?
-    .map_err(|error| error.to_string())?;
+    .map_err(|code: PeerCommandCode| code.to_string())?;
     peer_bidirectional_resolve_registered_client(
         app,
         state,
@@ -835,17 +833,17 @@ mod tests {
         assert_eq!(target.code(), "operationFailed");
         assert_ne!(target.code(), "transportUnavailable");
 
-        let claim_storage = registered_claim_failure(
+        let claim_storage = registered_target_operation_failure(
             "registered clone credential",
             PeerSyncError::Storage("local credential write failed".to_owned()),
         );
         assert_eq!(claim_storage.code(), "operationFailed");
-        let claim_validation = registered_claim_failure(
+        let claim_validation = registered_target_operation_failure(
             "registered incoming registry",
             PeerSyncError::Validation("local registry is invalid".to_owned()),
         );
         assert_eq!(claim_validation.code(), "operationFailed");
-        let claim_transport = registered_claim_failure(
+        let claim_transport = registered_target_operation_failure(
             "registered clone claim",
             PeerSyncError::Transport("source disconnected".to_owned()),
         );
@@ -862,31 +860,38 @@ mod tests {
 
     #[test]
     fn a_registered_target_failure_keeps_the_code_its_error_already_carries() {
-        let changed = registered_target_operation_failure(
-            "registered clone target",
-            PeerSyncError::Validation(
-                crate::peer_sync::registry_commands::REGISTERED_SOURCE_CHANGED.to_owned(),
+        for (context, error, expected) in [
+            (
+                "registered clone target",
+                PeerSyncError::Validation(
+                    crate::peer_sync::registry_commands::REGISTERED_SOURCE_CHANGED.to_owned(),
+                ),
+                "sourceChanged",
             ),
-        );
-        assert_eq!(changed.code(), "sourceChanged");
-
-        let transport = registered_target_operation_failure(
-            "registered clone target",
-            PeerSyncError::Transport("source disconnected".to_owned()),
-        );
-        assert_eq!(transport.code(), "transportUnavailable");
-    }
-
-    #[test]
-    fn a_refused_new_registration_keeps_its_own_code_for_the_interface() {
-        let blocked = registered_claim_failure(
-            "registered clone registration",
-            PeerSyncError::Validation(
-                crate::peer_sync::registry_commands::REGISTRATION_BLOCKED_BY_ACTIVE_WORK.to_owned(),
+            (
+                "registered clone registration",
+                PeerSyncError::Validation(
+                    crate::peer_sync::registry_commands::REGISTRATION_BLOCKED_BY_ACTIVE_WORK
+                        .to_owned(),
+                ),
+                "registrationBlockedByActiveWork",
             ),
-        );
-
-        assert_eq!(blocked.code(), "registrationBlockedByActiveWork");
+            (
+                "registered clone target",
+                PeerSyncError::Transport("source disconnected".to_owned()),
+                "transportUnavailable",
+            ),
+            (
+                "registered clone credential",
+                PeerSyncError::Storage("local credential write failed".to_owned()),
+                "operationFailed",
+            ),
+        ] {
+            assert_eq!(
+                registered_target_operation_failure(context, error).code(),
+                expected
+            );
+        }
     }
 
     #[test]

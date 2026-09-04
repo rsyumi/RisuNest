@@ -4,6 +4,8 @@
 use super::PeerSyncError;
 use std::fmt;
 
+// Every new variant must also be added to `ALL_CODES`, or `is_bounded_code`
+// silently folds it to `operationFailed` in the re-bounding stages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeerCommandCode {
     SourceMissing,
@@ -103,6 +105,21 @@ pub(crate) fn finish_peer_command<T>(
     })
 }
 
+/// Finishes a command whose work ran on a joined worker thread: a join
+/// failure is reported as a storage failure with a "worker join failed"
+/// marker so the native log can tell a panic from an ordinary failure.
+pub(crate) fn finish_peer_worker<T, E: std::fmt::Display>(
+    context: &str,
+    joined: Result<Result<T, PeerSyncError>, E>,
+) -> Result<T, String> {
+    finish_peer_command(
+        context,
+        joined
+            .map_err(|error| PeerSyncError::Storage(format!("worker join failed: {error}")))
+            .and_then(|result| result),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,10 +161,11 @@ mod tests {
                 "operationFailed",
             ]
         );
-        assert!(ALL_CODES
-            .iter()
-            .all(|code| is_bounded_code(code.code()) && code.to_string() == code.code()));
+        assert!(ALL_CODES.iter().all(|code| code.to_string() == code.code()));
+        assert!(is_bounded_code("sourceInUse"));
         assert!(!is_bounded_code("Validation(\"peer-source-in-use\")"));
+        assert!(!is_bounded_code("peer-source-in-use"));
+        assert!(!is_bounded_code("sourceinuse"));
     }
 
     #[test]
@@ -262,6 +280,35 @@ mod tests {
         assert_eq!(
             finish_peer_command("command-codes-fixture-success", Ok::<_, PeerSyncError>(7)),
             Ok(7)
+        );
+    }
+
+    #[test]
+    fn a_worker_that_never_returned_is_reported_as_a_generic_failure() {
+        let error = finish_peer_worker::<(), _>(
+            "command-codes-fixture-join clone target",
+            Err("task panicked while joining"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "operationFailed");
+        let entry = latest_command_code_log_containing("command-codes-fixture-join");
+        assert!(entry.message.contains("worker join failed"));
+        assert!(entry.message.contains("task panicked while joining"));
+
+        assert_eq!(
+            finish_peer_worker(
+                "command-codes-fixture-join-success",
+                Ok::<Result<_, PeerSyncError>, &str>(Ok(9)),
+            ),
+            Ok(9)
+        );
+        assert_eq!(
+            finish_peer_worker::<(), &str>(
+                "command-codes-fixture-join-refusal",
+                Ok(Err(PeerSyncError::Validation(SOURCE_IN_USE.to_owned()))),
+            ),
+            Err("sourceInUse".to_owned())
         );
     }
 }

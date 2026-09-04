@@ -13,7 +13,9 @@ use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase 
 #[cfg(desktop)]
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
-    command_codes::{code_for, finish_peer_command, is_bounded_code, PeerCommandCode},
+    command_codes::{
+        code_for, finish_peer_command, finish_peer_worker, is_bounded_code, PeerCommandCode,
+    },
     lan::{
         deliver_peer_completion, prepare_peer_logical_completion, validate_p5_desktop_endpoint,
         LanBidirectionalBackupReceipt, LanBidirectionalControl, LanBidirectionalGeneration,
@@ -5987,9 +5989,14 @@ fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<Stri
     super::tunnel_lifecycle::build_lane_pairing_uri("peer-sync", endpoint, pairing)
 }
 
+/// The application data directory both finishers below project. The failure
+/// stays unwrapped so each of them keeps the wording its own callers report.
+fn resolve_app_root(app: &AppHandle) -> Result<PathBuf, tauri::Error> {
+    app.path().app_data_dir()
+}
+
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    resolve_app_root(app)
         .map_err(|error| format!("failed to resolve application data directory: {error}"))
 }
 
@@ -5998,9 +6005,7 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
 fn bounded_app_root(app: &AppHandle) -> Result<PathBuf, String> {
     finish_peer_command(
         "bidirectional application data directory",
-        app.path()
-            .app_data_dir()
-            .map_err(|error| PeerSyncError::Storage(error.to_string())),
+        resolve_app_root(app).map_err(|error| PeerSyncError::Storage(error.to_string())),
     )
 }
 
@@ -7598,7 +7603,7 @@ pub async fn peer_bidirectional_resume(
     };
     let worker_state = state.clone();
     let root = bounded_app_root(&app)?;
-    let resumed = tauri::async_runtime::spawn_blocking(move || {
+    let joined = tauri::async_runtime::spawn_blocking(move || {
         let _guard = worker_state.begin_target()?;
         #[cfg(target_os = "android")]
         if cancellation.is_cancelled() {
@@ -7634,9 +7639,12 @@ pub async fn peer_bidirectional_resume(
         let mut store = open_command_store(&app)?;
         run_retained_remote_completion(&mut store, &root, &operation_id, expected_revision, None)
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    let outcome = finish_peer_command("bidirectional resume", resumed.and_then(|result| result));
+    .await;
+    // A worker that never returned leaves no outcome to publish, so it reports
+    // the join failure on its own and skips the Android terminal publication
+    // below, the way it did before the bounded codes landed.
+    let resumed = finish_peer_worker("bidirectional resume worker", joined.map(Ok))?;
+    let outcome = finish_peer_command("bidirectional resume", resumed);
     #[cfg(target_os = "android")]
     finish_peer_command(
         "bidirectional resume terminal state",

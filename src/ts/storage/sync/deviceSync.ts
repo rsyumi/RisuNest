@@ -29,38 +29,39 @@ export class DeviceSyncError extends Error {
     }
 }
 
+// The codes the shared session commands answer with, already in this file's own
+// shape. `safeDeviceSyncStatus` narrows a reported `latestError` to the same set.
+const SHARED_SESSION_CODES = [
+    'invalid-configuration',
+    'port-unavailable',
+    'preparation-failed',
+    'transport-unavailable',
+    'cleanup-failed',
+    'state-unavailable',
+] as const satisfies readonly DeviceSyncErrorCode[]
+
 // Every peer_sync command the page reaches returns one of these bounded codes
-// and nothing else, so the classification is an exact match. The shared session
-// commands already answer in this file's own code shape.
-const NATIVE_CODES: Readonly<Record<string, DeviceSyncErrorCode>> = {
-    registrationBlockedByActiveWork: 'registration-blocked-by-active-work',
-    sourceInUse: 'source-in-use',
-    sourceChanged: 'source-changed',
-    deltaCompletionRetained: 'delta-completion-retained',
-    peerOutdated: 'peer-outdated',
-    authorizationExpired: 'registration-expired',
-    sourceMissing: 'registration-expired',
-    identityMismatch: 'transport-changed',
-    transportUnavailable: 'transport-unavailable',
-    permissionDenied: 'operation-failed',
-    laneUnavailable: 'operation-failed',
-    operationFailed: 'operation-failed',
-    'invalid-configuration': 'invalid-configuration',
-    'port-unavailable': 'port-unavailable',
-    'preparation-failed': 'preparation-failed',
-    'transport-unavailable': 'transport-unavailable',
-    'cleanup-failed': 'cleanup-failed',
-    'state-unavailable': 'state-unavailable',
-}
+// and nothing else, so the classification is an exact match.
+const NATIVE_CODES: ReadonlyMap<string, DeviceSyncErrorCode> = new Map<string, DeviceSyncErrorCode>([
+    ['registrationBlockedByActiveWork', 'registration-blocked-by-active-work'],
+    ['sourceInUse', 'source-in-use'],
+    ['sourceChanged', 'source-changed'],
+    ['deltaCompletionRetained', 'delta-completion-retained'],
+    ['peerOutdated', 'peer-outdated'],
+    ['authorizationExpired', 'registration-expired'],
+    ['sourceMissing', 'registration-expired'],
+    ['identityMismatch', 'transport-changed'],
+    ['transportUnavailable', 'transport-unavailable'],
+    ['permissionDenied', 'operation-failed'],
+    ['laneUnavailable', 'operation-failed'],
+    ['operationFailed', 'operation-failed'],
+    ...SHARED_SESSION_CODES.map((code): [string, DeviceSyncErrorCode] => [code, code]),
+])
 
 export function classifyDeviceSyncFailure(error: unknown): DeviceSyncError {
     if (error instanceof DeviceSyncError) return error
     const message = error instanceof Error ? error.message : String(error)
-    return new DeviceSyncError(
-        Object.prototype.hasOwnProperty.call(NATIVE_CODES, message)
-            ? NATIVE_CODES[message]
-            : 'operation-failed',
-    )
+    return new DeviceSyncError(NATIVE_CODES.get(message) ?? 'operation-failed')
 }
 
 async function safeInvoke<T>(invoke: DeviceSyncInvoke, command: string, args?: Record<string, unknown>): Promise<T> {
@@ -243,12 +244,8 @@ export function safeDeviceSyncStatus(value: unknown): DeviceSyncStatus {
         ...(endpoint ? { endpoint } : {}),
         ...(pairingUri ? { pairingUri } : {}),
         ...(expiresAtMs === undefined ? {} : { expiresAtMs }),
-        ...(source.latestError === 'invalid-configuration'
-            || source.latestError === 'port-unavailable'
-            || source.latestError === 'preparation-failed'
-            || source.latestError === 'transport-unavailable'
-            || source.latestError === 'cleanup-failed'
-            || source.latestError === 'state-unavailable'
+        ...(typeof source.latestError === 'string'
+            && (SHARED_SESSION_CODES as readonly string[]).includes(source.latestError)
             ? { latestError: source.latestError as DeviceSyncErrorCode }
             : {}),
     }

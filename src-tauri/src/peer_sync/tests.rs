@@ -1667,31 +1667,97 @@ fn android_registered_clone_publication_serializes_source_removal_after_revalida
     let (removal_tx, removal_rx) = mpsc::channel();
     let removal_root = target_root.path().to_owned();
     let removal = thread::spawn(move || {
-        let result = (|| {
-            let _lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
-            if super::android_client::registered_clone_source_is_active(
-                &removal_root,
-                Some(&removal_source_device_id),
-            )? {
-                return Err(PeerSyncError::Validation(
-                    "registered Android clone source is used by an active job".to_owned(),
-                ));
-            }
-            super::device_registry::remove_incoming_source(&removal_root, &removal_source_device_id)
-        })();
+        let result = super::registry_commands::remove_incoming_source_if_inactive(
+            &removal_root,
+            &removal_source_device_id,
+        );
         removal_tx.send(result).unwrap();
     });
     assert!(removal_rx.recv_timeout(Duration::from_millis(100)).is_err());
     resume_publish.wait();
 
     worker.join().unwrap().unwrap();
-    assert!(matches!(
+    assert_eq!(
         removal_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-        Err(PeerSyncError::Validation(message))
-            if message == "registered Android clone source is used by an active job"
-    ));
+        Err(PeerSyncError::Validation(
+            super::registry_commands::SOURCE_IN_USE.to_owned()
+        ))
+    );
     removal.join().unwrap();
     assert!(registry.current().unwrap().is_some());
+    host.stop().unwrap();
+}
+
+/// The Android mirror of the desktop bearer rotation race: the rotation reaches
+/// the registry first, so the job that still carries the previous bearer is
+/// refused with the code the interface maps to its own wording, and it
+/// publishes nothing.
+#[test]
+fn bearer_rotation_wins_before_registered_android_publication() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    host.enable_v2_registry(
+        source_root.path(),
+        "Android source",
+        super::device_registry::DevicePermissions::read(),
+    )
+    .unwrap();
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let credential = target_root.path().join("registration-credential.json");
+    let _client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Android target",
+        &credential,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let source_device_id =
+        super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+    let registered =
+        super::device_registry::incoming_source_by_id(target_root.path(), &source_device_id)
+            .unwrap()
+            .unwrap();
+    let target_device_id =
+        super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+
+    super::registry_commands::register_incoming_source_if_compatible(
+        target_root.path(),
+        super::device_registry::IncomingSource {
+            bearer: "c".repeat(64),
+            ..registered.clone()
+        },
+    )
+    .unwrap();
+    let refusal = registry
+        .connect_registered(
+            &registered.endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &target_device_id,
+            &source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::V1,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        refusal,
+        PeerSyncError::Validation(super::registry_commands::REGISTERED_SOURCE_CHANGED.to_owned())
+    );
+    assert_eq!(
+        super::command_codes::code_for(&refusal).code(),
+        "sourceChanged"
+    );
+    assert!(registry.current().unwrap().is_none());
     host.stop().unwrap();
 }
 

@@ -1,7 +1,7 @@
 use super::{
     android_client::{AndroidCloneCurrentStatus, AndroidCloneJobRegistry, AndroidCloneJobStatus},
     android_jni,
-    command_codes::finish_peer_command,
+    command_codes::{finish_peer_command, finish_peer_worker},
     PeerSyncError,
 };
 use crate::{
@@ -92,12 +92,9 @@ pub(crate) async fn peer_clone_android_current(
     state: State<'_, AndroidPeerCloneCommandState>,
 ) -> Result<Option<AndroidCloneCurrentStatus>, String> {
     let registry = state.registry()?;
-    let current = tauri::async_runtime::spawn_blocking(move || registry.current_for_command())
-        .await
-        .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
+    finish_peer_worker(
         "Android peer clone status",
-        current.and_then(|result| result),
+        tauri::async_runtime::spawn_blocking(move || registry.current_for_command()).await,
     )
 }
 
@@ -124,12 +121,8 @@ pub(crate) async fn peer_clone_android_download(
             _ => Ok(()),
         }
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "Android peer clone foreground transfer",
-        downloaded.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("Android peer clone foreground transfer", downloaded)
 }
 
 #[tauri::command]
@@ -138,12 +131,9 @@ pub(crate) async fn peer_clone_android_request_cancel(
     job_id: String,
 ) -> Result<(), String> {
     let registry = state.registry()?;
-    let cancelled = tauri::async_runtime::spawn_blocking(move || registry.request_cancel(&job_id))
-        .await
-        .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
+    finish_peer_worker(
         "Android peer clone cancellation",
-        cancelled.and_then(|result| result),
+        tauri::async_runtime::spawn_blocking(move || registry.request_cancel(&job_id)).await,
     )
 }
 
@@ -163,12 +153,8 @@ pub(crate) async fn peer_clone_android_cancel_foreground(
                 )
             })
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "Android peer clone foreground cancellation",
-        cancelled.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("Android peer clone foreground cancellation", cancelled)
 }
 
 #[tauri::command]
@@ -202,12 +188,8 @@ pub(crate) async fn peer_clone_android_finalize(
         })
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "Android peer clone finalization",
-        finalized.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("Android peer clone finalization", finalized)
 }
 
 #[tauri::command]
@@ -223,12 +205,8 @@ pub(crate) async fn peer_clone_android_release(
         })
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "Android peer clone release",
-        released.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("Android peer clone release", released)
 }
 
 fn app_data_root_string(root: &std::path::Path) -> Result<String, String> {
@@ -264,6 +242,45 @@ mod tests {
                 http_transport_ready: true,
                 production_enabled: true,
             }
+        );
+    }
+
+    #[test]
+    fn a_registry_that_never_recovered_reports_only_a_bounded_code() {
+        let root = tempfile::tempdir().unwrap();
+        // A file where the app data directory belongs fails the recovery in a
+        // way no command may describe to the interface.
+        let occupied = root.path().join("occupied");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        let state = AndroidPeerCloneCommandState::initialize(occupied);
+
+        assert_eq!(state.registry().err(), Some("operationFailed".to_owned()));
+        assert!(!state.capabilities().production_enabled);
+    }
+
+    #[cfg(windows)]
+    fn path_the_worker_cannot_carry() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_wide(&[0x64, 0xd800]))
+    }
+
+    #[cfg(not(windows))]
+    fn path_the_worker_cannot_carry() -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(vec![0x64, 0x80]))
+    }
+
+    #[test]
+    fn an_app_data_path_the_worker_cannot_carry_reports_only_a_bounded_code() {
+        assert_eq!(
+            app_data_root_string(&path_the_worker_cannot_carry()).unwrap_err(),
+            "operationFailed"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            app_data_root_string(root.path()).unwrap(),
+            root.path().to_str().unwrap()
         );
     }
 

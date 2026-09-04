@@ -1,4 +1,4 @@
-use super::command_codes::finish_peer_command;
+use super::command_codes::{finish_peer_command, finish_peer_worker};
 use super::lan::{
     validate_device_sync_endpoint, validate_lan_endpoint, LanCloneHostControl,
     PeerCompletionCapability, NAMED_TUNNEL_ORIGIN_UNAVAILABLE,
@@ -1553,6 +1553,7 @@ impl PeerCloneCommandState {
                         && source.bearer == bearer
                         && source.permissions.allows_read()
                 }) {
+                    crate::nlog!("warn", "registered clone source changed before publication");
                     return Err(PeerSyncError::Validation(
                         REGISTERED_SOURCE_CHANGED.to_owned(),
                     ));
@@ -2431,6 +2432,10 @@ fn require_registered_clone_source_binding(
     let local_device_id = super::device_registry::load_or_create_device_id(app_root)?;
     let Some(source) = super::device_registry::incoming_source_by_id(app_root, source_device_id)?
     else {
+        crate::nlog!(
+            "warn",
+            "registered clone credential no longer binds a registered source"
+        );
         return Err(PeerSyncError::Validation(
             REGISTERED_SOURCE_CHANGED.to_owned(),
         ));
@@ -2447,6 +2452,10 @@ fn require_registered_clone_source_binding(
             &source.bearer,
         )?
     {
+        crate::nlog!(
+            "warn",
+            "registered clone credential no longer matches the registered source"
+        );
         return Err(PeerSyncError::Validation(
             REGISTERED_SOURCE_CHANGED.to_owned(),
         ));
@@ -3607,24 +3616,28 @@ fn as_store_error(error: PeerSyncError) -> StoreError {
     }
 }
 
+/// The application data directory and the peer clone root inside it. Both
+/// finishers below project this one resolution, so the directory lookup and the
+/// `peer-clone` name each live in a single place. The failure stays unwrapped so
+/// each finisher keeps the wording its own callers already report.
+fn resolve_peer_roots(app: &AppHandle) -> Result<(PathBuf, PathBuf), tauri::Error> {
+    let app_root = app.path().app_data_dir()?;
+    let peer_root = app_root.join("peer-clone");
+    Ok((app_root, peer_root))
+}
+
 fn app_peer_root(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
-    let app_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("failed to resolve application data directory: {error}"))?;
-    Ok((app_root.clone(), app_root.join("peer-clone")))
+    resolve_peer_roots(app)
+        .map_err(|error| format!("failed to resolve application data directory: {error}"))
 }
 
 /// The bounded-code twin of `app_peer_root`, for the clone target commands the
 /// device sync page reaches. Source lane commands keep their diagnostic text.
 fn bounded_app_peer_root(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
-    let app_root = finish_peer_command(
+    finish_peer_command(
         "peer clone application data directory",
-        app.path()
-            .app_data_dir()
-            .map_err(|error| PeerSyncError::Storage(error.to_string())),
-    )?;
-    Ok((app_root.clone(), app_root.join("peer-clone")))
+        resolve_peer_roots(app).map_err(|error| PeerSyncError::Storage(error.to_string())),
+    )
 }
 
 fn target_request(
@@ -3785,12 +3798,8 @@ pub async fn peer_clone_claim_v2_client(
     let claimed = tauri::async_runtime::spawn_blocking(move || {
         state.claim_strict_v2_target(&peer_root, &endpoint, &session_id, &manifest_id, &claim)
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "peer clone v2 target claim",
-        claimed.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("peer clone v2 target claim", claimed)
 }
 
 #[tauri::command(async)]
@@ -3825,12 +3834,8 @@ pub async fn peer_clone_resume(
     let resumed = tauri::async_runtime::spawn_blocking(move || {
         state.resume_target_download(&peer_root, request)
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "peer clone target resume",
-        resumed.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("peer clone target resume", resumed)
 }
 
 #[tauri::command]
@@ -3842,12 +3847,9 @@ pub async fn peer_clone_cancel(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     let request = target_request(endpoint, session_id, manifest_id);
-    let cancelled = tauri::async_runtime::spawn_blocking(move || state.cancel_target(&request))
-        .await
-        .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
+    finish_peer_worker(
         "peer clone target cancellation",
-        cancelled.and_then(|result| result),
+        tauri::async_runtime::spawn_blocking(move || state.cancel_target(&request)).await,
     )
 }
 
@@ -3898,12 +3900,8 @@ pub async fn peer_clone_finalize(
         })
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
     })
-    .await
-    .map_err(|error| PeerSyncError::Storage(error.to_string()));
-    finish_peer_command(
-        "peer clone target finalization",
-        finalized.and_then(|result| result),
-    )
+    .await;
+    finish_peer_worker("peer clone target finalization", finalized)
 }
 
 #[cfg(test)]
