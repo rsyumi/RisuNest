@@ -1,7 +1,7 @@
 #[cfg(target_os = "android")]
-use super::android_source_commands::AndroidPeerCloneSourceState;
-#[cfg(target_os = "android")]
 use super::shared_session::AndroidDeviceSyncSourceState;
+#[cfg(desktop)]
+use super::shared_session::DeviceSyncSourceState;
 use super::{
     bidirectional_commands::PeerBidirectionalCommandState,
     command_codes::finish_peer_command,
@@ -14,8 +14,6 @@ use super::{
     logical_completion::invalidate_outgoing_logical_completion_proofs,
     PeerSyncError,
 };
-#[cfg(desktop)]
-use super::{commands::PeerCloneCommandState, shared_session::DeviceSyncSourceState};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 
@@ -207,20 +205,17 @@ pub(crate) fn remove_incoming_source_if_inactive(
 #[tauri::command]
 pub fn peer_sync_revoke_outgoing_device(
     app: AppHandle,
-    clone: State<'_, PeerCloneCommandState>,
     delta: State<'_, PeerDeltaCommandState>,
     bidirectional: State<'_, PeerBidirectionalCommandState>,
     shared: State<'_, DeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
-    let clone = clone.inner().clone();
     let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
     finish_peer_command(
         "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            clone.revoke_registered_device(id);
             delta.revoke_registered_device(id);
             bidirectional.revoke_registered_device(id);
             shared.revoke_registered_device(id);
@@ -473,20 +468,17 @@ mod tests {
 #[tauri::command]
 pub fn peer_sync_revoke_outgoing_device(
     app: AppHandle,
-    clone: State<'_, AndroidPeerCloneSourceState>,
     delta: State<'_, PeerDeltaCommandState>,
     bidirectional: State<'_, PeerBidirectionalCommandState>,
     shared: State<'_, AndroidDeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
-    let clone = clone.inner().clone();
     let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
     finish_peer_command(
         "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            clone.revoke_registered_device(id);
             delta.revoke_registered_device(id);
             bidirectional.revoke_registered_device(id);
             shared.revoke_registered_device(id);

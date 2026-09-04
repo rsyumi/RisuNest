@@ -549,22 +549,6 @@ pub fn run() {
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_capabilities,
             #[cfg(desktop)]
-            peer_sync::commands::peer_clone_prepare,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_start,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_tunnel_start,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_status,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_tunnel_status,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_stop,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_tunnel_stop,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_revoke,
-            #[cfg(desktop)]
             peer_sync::commands::peer_clone_claim_v2_client,
             #[cfg(target_os = "android")]
             peer_sync::registered_target_commands::peer_clone_claim_v2_client,
@@ -817,8 +801,6 @@ pub fn run() {
     app.run(|app, event| {
         #[cfg(desktop)]
         if run_event_requires_peer_clone_shutdown(&event) {
-            app.state::<peer_sync::commands::PeerCloneCommandState>()
-                .shutdown_for_exit();
             app.state::<peer_sync::delta_commands::PeerDeltaCommandState>()
                 .shutdown_for_exit();
             app.state::<peer_sync::bidirectional_commands::PeerBidirectionalCommandState>()
