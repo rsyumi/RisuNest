@@ -22,6 +22,16 @@ export interface PeerSyncForegroundBridge {
     notificationsEnabled?(): boolean
 }
 
+declare global {
+    interface Window {
+        RisuPeerCloneBridge?: PeerSyncForegroundBridge & {
+            transferMode(): 'foreground' | 'uidt' | 'disabled'
+            schedule(jobId: string): 'scheduled' | 'disabled' | 'rejected'
+            cancel(jobId: string): boolean
+        }
+    }
+}
+
 /**
  * Returns false when the Android peer-sync Stop notification is suppressed
  * (notifications denied or the channel silenced), true when it can be shown,
