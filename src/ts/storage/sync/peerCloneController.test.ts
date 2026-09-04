@@ -35,7 +35,9 @@ describe('peer clone controller lifecycle', () => {
         await controller.initialize()
 
         expect(controller.snapshot().capabilities).toMatchObject({ productionEnabled: true })
-        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_status')).toBe(false)
+        // Initialization reads capabilities and nothing else: no target join and
+        // no progress poll happen before the page asks for one.
+        expect(invoke.mock.calls.map(([command]) => command)).toEqual(['peer_clone_capabilities'])
     })
 
     it('keeps retrying a committed renderer refresh after every view unsubscribes', async () => {

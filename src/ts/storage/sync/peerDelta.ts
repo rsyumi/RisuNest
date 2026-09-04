@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import { type PeerClonePlatform } from './peerClone'
+import type { PeerClonePlatform } from './peerClone'
 import { DeviceSyncError } from './deviceSync'
 import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 

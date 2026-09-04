@@ -1,18 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import {
-    parsePeerPairingUri,
-    type PeerClonePlatform,
-} from './peerClone'
-import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground'
+import type { PeerClonePlatform } from './peerClone'
 import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
-
-export interface PeerBidirectionalPairing {
-    endpoint: string
-    sessionId: string
-    manifestId: string
-    claim: string
-}
 
 export type PeerBidirectionalMutationRuntime = PeerSyncMutationRuntime
 
@@ -29,7 +18,7 @@ export interface PeerBidirectionalCapabilities {
 export type PeerBidirectionalForegroundBridge = PeerSyncForegroundBridge
 
 interface PeerBidirectionalForegroundIdentity {
-    lane: 'p5-source' | 'p5-target'
+    lane: 'p5-target'
     operationId: string
     generation: number
 }
@@ -39,21 +28,6 @@ interface PeerBidirectionalTargetForegroundStatus {
     phase: 'reserved' | 'running' | 'terminal'
     result?: PeerBidirectionalSyncResult
     error?: string
-}
-
-export interface PeerBidirectionalSourceStatus {
-    phase: 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'stopped'
-    sessionId?: string
-    manifestId?: string
-    pairingUri?: string
-    devices: readonly {
-        deviceId: string
-        transferredBytes: number
-        currentObject?: string
-        lastSeenAt: number
-        revoked: boolean
-    }[]
-    tunnel?: { kind: 'quick' | 'named'; experimental: boolean; oneShot: boolean }
 }
 
 export type PeerBidirectionalConflictType = 'sameRecord' | 'deleteVsEdit'
@@ -124,7 +98,6 @@ export type PeerBidirectionalDurableOperation =
       }
 
 export interface PeerBidirectionalStatus {
-    source: PeerBidirectionalSourceStatus
     operation?: PeerBidirectionalDurableOperation
 }
 
@@ -133,22 +106,8 @@ export type PeerBidirectionalInvoke = PeerSyncInvoke
 export interface PeerBidirectionalFacade {
     recoverTargetForeground?(): Promise<void>
     capabilities(): Promise<PeerBidirectionalCapabilities>
-    prepare(): Promise<PeerBidirectionalSourceStatus>
-    start(sessionId: string): Promise<PeerBidirectionalSourceStatus>
-    startQuickTunnel(sessionId: string): Promise<PeerBidirectionalSourceStatus>
-    startNamedTunnel(
-        sessionId: string,
-        token: string,
-        expectedPublicBaseUrl: string,
-    ): Promise<PeerBidirectionalSourceStatus>
     status(): Promise<PeerBidirectionalStatus>
-    stop(sessionId: string): Promise<void>
-    revoke(sessionId: string, deviceId: string): Promise<void>
     syncRegistered(deviceId: string): Promise<PeerBidirectionalSyncResult>
-    resolve(
-        operationId: string,
-        winner: 'local' | 'remote',
-    ): Promise<PeerBidirectionalSyncResult>
     resolveRegistered(
         deviceId: string,
         operationId: string,
@@ -156,21 +115,6 @@ export interface PeerBidirectionalFacade {
     ): Promise<PeerBidirectionalSyncResult>
     resume(operationId: string): Promise<PeerBidirectionalSyncResult>
     acknowledge(operationId: string): Promise<void>
-}
-
-function invalidPairingUri(): never {
-    throw new Error('Invalid peer sync pairing URI')
-}
-
-export function parsePeerBidirectionalUri(value: string): PeerBidirectionalPairing {
-    return parsePeerPairingUri(value, {
-        hostname: 'peer-sync',
-        pathname: '/v1',
-        invalid: invalidPairingUri,
-        claimRule: 'hex64Fragment',
-        allowLanEndpoint: true,
-        trimTrailingSlash: true,
-    })
 }
 
 function unsupported(platform: Exclude<PeerClonePlatform, 'desktop'>): never {
@@ -185,17 +129,11 @@ function completed(
 
 export class PeerBidirectionalRefreshError extends Error {
     readonly result: PeerBidirectionalSyncResult
-    readonly status?: PeerBidirectionalStatus
 
-    constructor(
-        result: PeerBidirectionalSyncResult,
-        cause: unknown,
-        status?: PeerBidirectionalStatus,
-    ) {
+    constructor(result: PeerBidirectionalSyncResult, cause: unknown) {
         super(cause instanceof Error ? cause.message : String(cause))
         this.name = 'PeerBidirectionalRefreshError'
         this.result = result
-        this.status = status
     }
 }
 
@@ -215,26 +153,8 @@ export function createPeerBidirectionalFacade(options: {
         foreground?: PeerBidirectionalForegroundIdentity
         rejection?: { cause: unknown }
     } | undefined
-    let sourceFence: MutationFence | undefined
-    let pendingSourceRefresh: {
-        key: string
-        revision: number
-        status: PeerBidirectionalStatus
-    } | undefined
-    let sourceRefreshInFlight: {
-        key: string
-        promise: Promise<PeerBidirectionalStatus>
-    } | undefined
-    let refreshedSourceOperation = ''
-    let sourceRefreshHighWater = -1
-    let sourcePrepareActive = false
-    let sourceStopCompleted = false
-    let sourceStopStatusPending = false
     let targetMutationActive = false
     const bridge = options.bridge ?? (typeof window === 'undefined' ? undefined : window.RisuPeerCloneBridge)
-    const requireDesktop = (): void => {
-        if (options.platform !== 'desktop') unsupported(options.platform)
-    }
     const requireNative = (): void => {
         if (options.platform === 'web') unsupported(options.platform)
     }
@@ -277,10 +197,7 @@ export function createPeerBidirectionalFacade(options: {
             ? operation.result.operationId
             : operation.operationId
         if (recoveredOperationId !== operationId) return false
-        if (
-            command === 'peer_bidirectional_resolve'
-            || command === 'peer_bidirectional_resolve_registered'
-        ) {
+        if (command === 'peer_bidirectional_resolve_registered') {
             return operation.phase === 'localCommitted' || operation.phase === 'completed'
         }
         return command === 'peer_bidirectional_resume' && operation.phase === 'completed'
@@ -291,23 +208,6 @@ export function createPeerBidirectionalFacade(options: {
     ): boolean => left.lane === right.lane
         && left.operationId === right.operationId
         && left.generation === right.generation
-    const p5SourceForeground = bridge
-        ? createPeerAndroidSourceForeground<
-              PeerBidirectionalForegroundIdentity,
-              PeerBidirectionalSourceStatus
-          >({
-              invoke: nativeInvoke,
-              bridge,
-              lane: 'p5-source',
-              reserveCommand: 'peer_bidirectional_source_reserve',
-              startCommand: 'peer_bidirectional_start',
-              startArgs: (sessionId, foreground) => ({ sessionId, foreground }),
-              staleIdentityError: 'Android bidirectional source foreground identity is stale',
-              serviceStartError: 'Android bidirectional foreground service could not start',
-              serviceStopError: 'Android bidirectional source foreground service could not stop',
-              cleanupFailureMessage: 'Android bidirectional foreground start and cleanup both failed',
-          })
-        : undefined
     const releaseTargetForeground = async (
         foreground: PeerBidirectionalForegroundIdentity,
     ): Promise<void> => {
@@ -393,7 +293,6 @@ export function createPeerBidirectionalFacade(options: {
         args: Record<string, unknown>,
     ): Promise<PeerBidirectionalSyncResult> => {
         requireNative()
-        if (sourceFence || sourcePrepareActive) throw new Error('A peer sync source is active')
         if (targetMutationActive) throw new Error('A peer sync target is active')
         const runtime = options.runtime
         if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
@@ -531,74 +430,6 @@ export function createPeerBidirectionalFacade(options: {
         }
     }
 
-    const releaseStoppedSourceFence = (): void => {
-        if (!sourceStopCompleted || sourceStopStatusPending || pendingSourceRefresh) return
-        const fence = sourceFence
-        sourceFence = undefined
-        pendingSourceRefresh = undefined
-        refreshedSourceOperation = ''
-        sourceRefreshHighWater = -1
-        sourceStopCompleted = false
-        sourceStopStatusPending = false
-        fence?.release()
-    }
-
-    const refreshSourceStatus = async (
-        status: PeerBidirectionalStatus,
-        key: string,
-        revision: number,
-    ): Promise<PeerBidirectionalStatus> => {
-        const fence = sourceFence
-        if (!fence || refreshedSourceOperation === key) {
-            releaseStoppedSourceFence()
-            return status
-        }
-        pendingSourceRefresh = { key, revision, status }
-        if (sourceRefreshInFlight) {
-            if (sourceRefreshInFlight.key === key) return sourceRefreshInFlight.promise
-            const previous = sourceRefreshInFlight
-            await previous.promise
-            if (sourceRefreshInFlight?.promise === previous.promise) {
-                sourceRefreshInFlight = undefined
-            }
-            return refreshSourceStatus(status, key, revision)
-        }
-        const promise = (async (): Promise<PeerBidirectionalStatus> => {
-            try {
-                await fence.refreshCommittedWorkingSet(revision)
-            } catch (cause) {
-                const operation = status.operation
-                if (operation?.phase !== 'completed') throw cause
-                throw new PeerBidirectionalRefreshError(operation.result, cause, status)
-            }
-            refreshedSourceOperation = key
-            if (pendingSourceRefresh?.key === key) pendingSourceRefresh = undefined
-            releaseStoppedSourceFence()
-            return status
-        })()
-        sourceRefreshInFlight = { key, promise }
-        try {
-            return await promise
-        } finally {
-            if (sourceRefreshInFlight?.promise === promise) sourceRefreshInFlight = undefined
-        }
-    }
-
-    const committedSourceOperation = (
-        status: PeerBidirectionalStatus,
-    ): { key: string; revision: number } | undefined => {
-        if (status.operation?.phase === 'completed') {
-            const revision = status.operation.result.revision
-            if (sourceFence && revision < sourceRefreshHighWater) return undefined
-            if (sourceFence) sourceRefreshHighWater = Math.max(sourceRefreshHighWater, revision)
-            return {
-                key: `${status.operation.result.operationId}:${revision}`,
-                revision,
-            }
-        }
-        return undefined
-    }
-
     return {
         recoverTargetForeground,
         async capabilities() {
@@ -614,140 +445,9 @@ export function createPeerBidirectionalFacade(options: {
                     && capabilities.durableStateReady,
             }
         },
-        async prepare() {
-            requireNative()
-            if (sourceFence || sourcePrepareActive || targetMutationActive || pendingRefresh) {
-                throw new Error('A peer sync source or target is already active')
-            }
-            const runtime = options.runtime
-            if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
-            sourcePrepareActive = true
-            let fence: MutationFence | undefined
-            try {
-                await runtime.flushPendingData('peer-bidirectional-source-prepare')
-                const token = await runtime.capturePersistentMutationToken('peer-bidirectional-source-prepare')
-                fence = await runtime.acquireDestructiveReplacementFence(token)
-                const status = await nativeInvoke<PeerBidirectionalSourceStatus>('peer_bidirectional_prepare', {
-                    expectedRevision: token.revision,
-                })
-                sourceFence = fence
-                refreshedSourceOperation = ''
-                sourceRefreshHighWater = -1
-                sourceStopCompleted = false
-                sourceStopStatusPending = false
-                return status
-            } catch (cause) {
-                fence?.release()
-                throw cause
-            } finally {
-                sourcePrepareActive = false
-            }
-        },
-        async start(sessionId) {
-            requireNative()
-            if (!sourceFence) throw new Error('Peer sync source is not prepared')
-            if (options.platform === 'desktop') return nativeInvoke('peer_bidirectional_start', { sessionId })
-            if (!p5SourceForeground) throw new Error('Android bidirectional foreground service is unavailable')
-            const started = await p5SourceForeground.start(sessionId)
-            return started.result
-        },
-        async startQuickTunnel(sessionId) {
-            requireDesktop()
-            if (!sourceFence) throw new Error('Peer sync source is not prepared')
-            return nativeInvoke('peer_bidirectional_tunnel_start', {
-                sessionId,
-                tunnel: { kind: 'quick' },
-            })
-        },
-        async startNamedTunnel(sessionId, token, expectedPublicBaseUrl) {
-            requireDesktop()
-            if (!sourceFence) throw new Error('Peer sync source is not prepared')
-            return nativeInvoke('peer_bidirectional_tunnel_start', {
-                sessionId,
-                tunnel: { kind: 'named', token, expectedPublicBaseUrl },
-            })
-        },
         async status() {
             requireNative()
-            if (pendingSourceRefresh && !sourceStopStatusPending) {
-                const pending = pendingSourceRefresh
-                return refreshSourceStatus(pending.status, pending.key, pending.revision)
-            }
-            const completesStopStatus = sourceStopStatusPending && sourceStopCompleted
-            const status = await nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
-            const committed = committedSourceOperation(status)
-            if (committed) {
-                const refreshed = refreshSourceStatus(status, committed.key, committed.revision)
-                if (completesStopStatus) sourceStopStatusPending = false
-                const result = await refreshed
-                releaseStoppedSourceFence()
-                return result
-            }
-            if (sourceStopStatusPending && pendingSourceRefresh) {
-                const pending = pendingSourceRefresh
-                const refreshed = refreshSourceStatus(pending.status, pending.key, pending.revision)
-                if (completesStopStatus) sourceStopStatusPending = false
-                await refreshed
-                releaseStoppedSourceFence()
-                return status
-            }
-            if (completesStopStatus) sourceStopStatusPending = false
-            releaseStoppedSourceFence()
-            return status
-        },
-        async stop(sessionId) {
-            requireNative()
-            sourceStopStatusPending = true
-            if (!sourceStopCompleted) {
-                try {
-                    const foreground = await nativeInvoke<PeerBidirectionalForegroundIdentity | null>(
-                        'peer_bidirectional_stop',
-                        { sessionId },
-                    )
-                    if (foreground && options.platform === 'android') {
-                        if (!bridge) {
-                            throw new Error('Android bidirectional foreground service is unavailable')
-                        }
-                        if (!bridge.stopSource(
-                            foreground.lane,
-                            foreground.operationId,
-                            foreground.generation,
-                        )) throw new Error('Android bidirectional foreground service could not stop')
-                        const released = await nativeInvoke<boolean>(
-                            'peer_bidirectional_source_release',
-                            { sessionId, foreground },
-                        )
-                        if (!released) {
-                            throw new Error('Android bidirectional source foreground identity is stale')
-                        }
-                    }
-                } catch (cause) {
-                    sourceStopStatusPending = false
-                    throw cause
-                }
-                sourceStopCompleted = true
-            }
-            const status = await nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
-            const committed = committedSourceOperation(status)
-            if (committed) {
-                const refreshed = refreshSourceStatus(status, committed.key, committed.revision)
-                sourceStopStatusPending = false
-                await refreshed
-                releaseStoppedSourceFence()
-            } else if (pendingSourceRefresh) {
-                const pending = pendingSourceRefresh
-                const refreshed = refreshSourceStatus(pending.status, pending.key, pending.revision)
-                sourceStopStatusPending = false
-                await refreshed
-                releaseStoppedSourceFence()
-            } else {
-                sourceStopStatusPending = false
-                releaseStoppedSourceFence()
-            }
-        },
-        async revoke(sessionId, deviceId) {
-            requireNative()
-            await nativeInvoke('peer_bidirectional_revoke', { sessionId, deviceId })
+            return nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
         },
         syncRegistered(deviceId) {
             return runMutation(
@@ -755,14 +455,6 @@ export function createPeerBidirectionalFacade(options: {
                 `registered:${deviceId}`,
                 'peer_bidirectional_sync_registered',
                 { deviceId },
-            )
-        },
-        resolve(operationId, winner) {
-            return runMutation(
-                'peer-bidirectional-resolve',
-                `operation:${operationId}:resolve:${winner}`,
-                'peer_bidirectional_resolve',
-                { operationId, winner },
             )
         },
         resolveRegistered(deviceId, operationId, winner) {

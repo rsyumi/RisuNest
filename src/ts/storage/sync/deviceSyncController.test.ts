@@ -14,9 +14,7 @@ const deltaSnapshot = (error = '') => ({
 })
 
 const bidirectionalSnapshot = (operationError = '') => ({
-    sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '',
-    operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false,
-    sourceError: '', operationError,
+    operationPhase: 'idle' as const, operationRetained: false, operationError,
 })
 
 const sourceFacade = (prepare = vi.fn(async () => ({ phase: 'prepared' as const }))) => ({

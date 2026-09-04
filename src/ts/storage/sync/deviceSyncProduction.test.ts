@@ -95,9 +95,7 @@ describe('production device sync composition', () => {
         }
         const bidirectional = {
             snapshot: () => ({
-                sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '',
-                operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false,
-                sourceError: '', operationError: '',
+                operationPhase: 'idle' as const, operationRetained: false, operationError: '',
             }),
             subscribe: () => () => undefined,
             initialize: vi.fn(async () => undefined),

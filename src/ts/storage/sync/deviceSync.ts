@@ -150,30 +150,19 @@ export interface StagedDeviceSyncLink {
 }
 
 export function parseDeviceSyncUri(uri: string): StagedDeviceSyncLink {
+    const invalid = (): never => {
+        throw new Error('Invalid device sync link')
+    }
     let value: URL
     try {
         value = new URL(uri)
     } catch {
-        throw new Error('Invalid device sync link')
+        return invalid()
     }
-    if (
-        value.protocol !== 'risuailocal:'
-        || value.hostname !== 'peer-clone'
-        || value.pathname !== '/v2'
-        || value.username !== ''
-        || value.password !== ''
-        || value.port !== ''
-    ) {
-        throw new Error('Invalid device sync link')
-    }
-    return parsePeerPairingUri(uri, {
-        hostname: 'peer-clone',
-        pathname: '/v2',
-        invalid: () => { throw new Error('Invalid device sync link') },
-        claimRule: 'hex64Fragment',
-        allowLanEndpoint: false,
-        trimTrailingSlash: false,
-    })
+    // The scheme, host, path, query and claim rules all live in the shared v2
+    // parser; only the authority credentials it does not look at stay here.
+    if (value.username !== '' || value.password !== '' || value.port !== '') return invalid()
+    return parsePeerPairingUri(uri, invalid)
 }
 
 export function safeDeviceSyncStatus(value: unknown): DeviceSyncStatus {

@@ -186,10 +186,6 @@ type ProductionFactories = {
     controller: typeof createDeviceSyncController
 }
 
-function targetOnly<T extends { initializeTarget(): Promise<void> }>(controller: T): T {
-    return { ...controller, initialize: () => controller.initializeTarget() }
-}
-
 function failClosedTarget<T extends { initialize(): Promise<void>; snapshot(): unknown }>(
     target: T,
     hasInitializationError: (snapshot: ReturnType<T['snapshot']>) => boolean,
@@ -225,7 +221,7 @@ const defaultFactories: ProductionFactories = {
     })),
     deltaDesktop: (runtime) => getDesktopPeerDeltaController(runtime),
     deltaAndroid: (runtime) => getAndroidPeerDeltaController(runtime),
-    bidirectional: (runtime) => targetOnly(getDesktopPeerBidirectionalController(runtime)),
+    bidirectional: (runtime) => getDesktopPeerBidirectionalController(runtime),
     controller: createDeviceSyncController,
 }
 
@@ -249,7 +245,7 @@ export function createProductionDeviceSyncController(options: {
     const delta = failClosedTarget(rawDelta, (snapshot) => Boolean(snapshot.error))
     const bidirectional = failClosedTarget(
         rawBidirectional,
-        (snapshot) => Boolean(snapshot.sourceError || snapshot.operationError),
+        (snapshot) => Boolean(snapshot.operationError),
     )
     return factories.controller({
         facade: options.facade ?? (platform === 'android'

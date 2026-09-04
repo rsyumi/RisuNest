@@ -24,11 +24,7 @@ export type SafePeerCloneControllerSnapshot = Omit<PeerCloneControllerSnapshot, 
 export type SafePeerDeltaControllerSnapshot = Omit<PeerDeltaControllerSnapshot, 'error'> & {
     error: DeviceSyncErrorCode | null
 }
-export type SafePeerBidirectionalControllerSnapshot = Omit<
-    PeerBidirectionalControllerSnapshot,
-    'sourceError' | 'operationError'
-> & {
-    sourceError: DeviceSyncErrorCode | null
+export type SafePeerBidirectionalControllerSnapshot = Omit<PeerBidirectionalControllerSnapshot, 'operationError'> & {
     operationError: DeviceSyncErrorCode | null
 }
 
@@ -120,7 +116,7 @@ function safeDelta(value: PeerDeltaControllerSnapshot): SafePeerDeltaControllerS
     return { ...value, error: safeCode(value.error) }
 }
 function safeBidirectional(value: PeerBidirectionalControllerSnapshot): SafePeerBidirectionalControllerSnapshot {
-    return { ...value, sourceError: safeCode(value.sourceError), operationError: safeCode(value.operationError) }
+    return { ...value, operationError: safeCode(value.operationError) }
 }
 
 export function createDeviceSyncController(options: {

@@ -145,7 +145,7 @@ function safeCurrentStatus(value: unknown): AndroidPeerCloneStatus | null {
 }
 
 function browserBridge(): AndroidPeerCloneBridge {
-    const bridge = (window as Window & { RisuPeerCloneBridge?: AndroidPeerCloneBridge }).RisuPeerCloneBridge
+    const bridge = window.RisuPeerCloneBridge
     return bridge ?? {
         transferMode: () => 'disabled',
         schedule: () => 'disabled',

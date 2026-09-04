@@ -112,10 +112,8 @@ export function reducePeerCloneState(state: PeerCloneState, event: PeerCloneEven
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const sha256Pattern = /^[0-9a-f]{64}$/
-const claimPattern = /^[0-9a-f]{64}$/
 const maximumPairingUriLength = 8192
 const maximumEndpointLength = 2048
-const maximumClaimLength = 512
 
 function invalidPairingUri(): never {
     throw new Error('Invalid peer clone pairing URI')
@@ -163,11 +161,6 @@ function isAllowedLanHost(hostname: string): boolean {
     return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80
 }
 
-function isLoopbackHost(hostname: string): boolean {
-    const ipv4 = parseIpv4(hostname)
-    return ipv4?.[0] === 127 || hostname === '[::1]'
-}
-
 function isAllowedPublicHttpsHost(hostname: string): boolean {
     if (parseIpv4(hostname) || /^\d+(?:\.\d+){3}$/.test(hostname)) return false
     return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(hostname)
@@ -208,81 +201,41 @@ export function parsePeerCloneEndpoint(value: string): string {
     return endpoint.toString()
 }
 
-export function parsePeerLanEndpoint(value: string): string {
-    const endpoint = parsePeerEndpoint(value)
-    if (endpoint.protocol !== 'http:'
-        || !hasExplicitValidPort(value)
-        || (!isAllowedLanHost(endpoint.hostname) && !isLoopbackHost(endpoint.hostname))
-    ) return invalidPairingUri()
-    return endpoint.toString()
-}
-
-export interface PeerPairingUriRules {
-    /** Lane hostname in `risuailocal://<hostname><pathname>`. */
-    hostname: string
-    /** Required path, `/v1` for the per-lane pairing URIs and `/v2` for device sync links. */
-    pathname: string
-    /** Lane-specific rejection, e.g. `throw new Error('Invalid peer delta pairing URI')`. */
-    invalid(): never
-    /**
-     * `hex64Fragment` requires a literal 64-hex claim in the fragment (delta, bidirectional);
-     * `encodedHex64` accepts a percent-encoded fragment that decodes to 64 hex (clone).
-     */
-    claimRule: 'hex64Fragment' | 'encodedHex64'
-    /** Whether loopback LAN endpoints are accepted as a fallback (delta, bidirectional). */
-    allowLanEndpoint: boolean
-    /** Whether the canonical endpoint's trailing slash is stripped (bidirectional wire format). */
-    trimTrailingSlash: boolean
-}
-
-export function parsePeerPairingUri(value: string, rules: PeerPairingUriRules): PeerClonePairing {
-    if (value.length === 0 || value.length > maximumPairingUriLength) return rules.invalid()
+/**
+ * Parses the single device sync link shape: `risuailocal://peer-clone/v2` with
+ * exactly `endpoint`, `session` and `manifest` query keys and a literal 64-hex
+ * claim fragment. `invalid` carries the caller's own rejection wording.
+ */
+export function parsePeerPairingUri(value: string, invalid: () => never): PeerClonePairing {
+    if (value.length === 0 || value.length > maximumPairingUriLength) return invalid()
     let uri: URL
     try {
         uri = new URL(value)
     } catch {
-        return rules.invalid()
+        return invalid()
     }
-    if (uri.protocol !== 'risuailocal:' || uri.hostname !== rules.hostname || uri.pathname !== rules.pathname) {
-        return rules.invalid()
+    if (uri.protocol !== 'risuailocal:' || uri.hostname !== 'peer-clone' || uri.pathname !== '/v2') {
+        return invalid()
     }
     const expectedKeys = ['endpoint', 'session', 'manifest']
     if (
         [...uri.searchParams.keys()].length !== expectedKeys.length
         || expectedKeys.some((key) => uri.searchParams.getAll(key).length !== 1)
         || [...uri.searchParams.keys()].some((key) => !expectedKeys.includes(key))
-    ) return rules.invalid()
+    ) return invalid()
 
     const sessionId = uri.searchParams.get('session')!
     const manifestId = uri.searchParams.get('manifest')!
     const fragment = uri.hash.slice(1)
-    if (!uuidPattern.test(sessionId) || !sha256Pattern.test(manifestId)) return rules.invalid()
-    let claim: string
-    if (rules.claimRule === 'encodedHex64') {
-        if (!/^claim=[^&=\s]+$/.test(fragment)) return rules.invalid()
-        try {
-            claim = decodeURIComponent(fragment.slice('claim='.length))
-        } catch {
-            return rules.invalid()
-        }
-        if (claim.length > maximumClaimLength || !claimPattern.test(claim)) return rules.invalid()
-    } else {
-        if (!/^claim=[0-9a-f]{64}$/.test(fragment)) return rules.invalid()
-        claim = fragment.slice('claim='.length)
-    }
-    const endpointValue = uri.searchParams.get('endpoint')!
+    if (!uuidPattern.test(sessionId) || !sha256Pattern.test(manifestId)) return invalid()
+    if (!/^claim=[0-9a-f]{64}$/.test(fragment)) return invalid()
+    const claim = fragment.slice('claim='.length)
     let endpoint: string
     try {
-        endpoint = parsePeerCloneEndpoint(endpointValue)
+        endpoint = parsePeerCloneEndpoint(uri.searchParams.get('endpoint')!)
     } catch {
-        if (!rules.allowLanEndpoint) return rules.invalid()
-        try {
-            endpoint = parsePeerLanEndpoint(endpointValue)
-        } catch {
-            return rules.invalid()
-        }
+        return invalid()
     }
-    if (rules.trimTrailingSlash && endpoint.endsWith('/')) endpoint = endpoint.slice(0, -1)
     return { endpoint, sessionId, manifestId, claim }
 }
 
@@ -305,9 +258,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     let finalization: Promise<PeerCloneTargetStatus> | undefined
     let targetIdentityEpoch = 0
     let warning = ''
-    let ownedTarget: { endpoint: string; sessionId: string; manifestId: string } | undefined
     let pendingRefresh: {
-        request: { endpoint: string; sessionId: string; manifestId: string }
         revision: number
         fence: Awaited<ReturnType<PeerCloneReplacementRuntime['acquireDestructiveReplacementFence']>>
         rendererRefreshed: boolean
@@ -320,13 +271,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         }
         const { endpoint, sessionId, manifestId } = state.target.pairing
         return { endpoint, sessionId, manifestId }
-    }
-    const ownTarget = (request: { endpoint: string; sessionId: string; manifestId: string }) => {
-        if (ownedTarget && !sameTargetRequest(ownedTarget, request)) {
-            throw new Error('Another peer clone target job is already owned')
-        }
-        ownedTarget ??= request
-        return request
     }
     const capabilities = async (): Promise<PeerCloneNativeCapabilities> => {
         supported()
@@ -348,9 +292,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             let backupPaths = pendingRefresh?.backupPaths
             let nativeStarted = revision !== undefined
             try {
-                if (pendingRefresh && !sameTargetRequest(pendingRefresh.request, request)) {
-                    throw new Error('Another peer clone target is awaiting renderer refresh')
-                }
                 if (!fence) {
                     const token = await runtime.capturePersistentMutationToken('peer-clone-target-finalize')
                     fence = await runtime.acquireDestructiveReplacementFence(token)
@@ -365,7 +306,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                     revision = result.revision
                     warning = result.warning ?? ''
                     backupPaths = result.backupPath === undefined ? undefined : [result.backupPath]
-                    pendingRefresh = { request, revision, fence, rendererRefreshed: false, backupPaths }
+                    pendingRefresh = { revision, fence, rendererRefreshed: false, backupPaths }
                     state = {
                         ...state,
                         target: {
@@ -385,7 +326,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 fence = undefined
                 const completed = { ...awaiting, phase: 'completed' as const }
                 state = reducePeerCloneState(state, { type: 'target-completed', backupPaths })
-                ownedTarget = undefined
                 return completed
             } catch (error) {
                 if (nativeStarted && !pendingRefresh) {
@@ -422,7 +362,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             const pairing: PeerClonePairing = { ...target, claim: '' }
             warning = ''
             targetIdentityEpoch += 1
-            ownedTarget = { ...target }
             state = reducePeerCloneState(state, { type: 'target-joined', pairing })
             return state
         },
@@ -437,11 +376,11 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             if (!state.target.destructiveConfirmed || !pairing) {
                 throw new Error('Peer clone target requires destructive replacement confirmation')
             }
-            const args = ownTarget({
+            const args = {
                 endpoint: pairing.endpoint,
                 sessionId: pairing.sessionId,
                 manifestId: pairing.manifestId,
-            })
+            }
             try {
                 await requireTargetReady()
                 await nativeInvoke('peer_clone_download', args)
@@ -453,14 +392,14 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         },
         async resume(): Promise<void> {
             supported()
-            const args = ownTarget(targetArgs())
+            const args = targetArgs()
             await requireTargetReady()
             await nativeInvoke('peer_clone_resume', args)
             state = reducePeerCloneState(state, { type: 'target-resumed' })
         },
         async cancel(): Promise<void> {
             supported()
-            await nativeInvoke('peer_clone_cancel', ownTarget(targetArgs()))
+            await nativeInvoke('peer_clone_cancel', targetArgs())
             state = reducePeerCloneState(state, { type: 'target-cancelled' })
         },
         async targetStatus(): Promise<PeerCloneTargetStatus> {
@@ -502,14 +441,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 state = reducePeerCloneState(state, { type: 'target-failed' })
             }
             return result
-        },
-        reportTargetProgress(completedBytes: number, totalBytes?: number): PeerCloneState {
-            state = reducePeerCloneState(state, { type: 'target-progress', completedBytes, totalBytes })
-            return state
-        },
-        reportTargetFailure(): PeerCloneState {
-            state = reducePeerCloneState(state, { type: 'target-failed' })
-            return state
         },
     }
 }

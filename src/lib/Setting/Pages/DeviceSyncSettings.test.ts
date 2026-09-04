@@ -53,7 +53,7 @@ const cloneBase = {
     state: { target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
 }
 const deltaBase = { pullPhase: 'idle' as const, retained: null, error: null }
-const bidiBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '', operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false, sourceError: null, operationError: null }
+const bidiBase = { operationPhase: 'idle' as const, operationRetained: false, operationError: null }
 const validRegistrationUri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F10.1.2.3%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
 
 function snapshot(partial: Partial<DeviceSyncControllerSnapshot> = {}): DeviceSyncControllerSnapshot {
