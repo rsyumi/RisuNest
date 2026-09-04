@@ -89,10 +89,7 @@ describe('production device sync composition', () => {
             initialize: initializeClone,
         }
         const delta = {
-            snapshot: () => ({
-                sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const },
-                sourcePairingUri: '', pullPhase: 'idle' as const, error: '',
-            }),
+            snapshot: () => ({ pullPhase: 'idle' as const, retained: null, error: '' }),
             subscribe: () => () => undefined,
             initialize: vi.fn(async () => undefined),
         }

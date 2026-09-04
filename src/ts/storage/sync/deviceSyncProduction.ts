@@ -223,8 +223,8 @@ const defaultFactories: ProductionFactories = {
             await plugins.loadPluginsAfterAuthoritativeRestore()
         },
     })),
-    deltaDesktop: (runtime) => targetOnly(getDesktopPeerDeltaController(runtime)),
-    deltaAndroid: (runtime) => targetOnly(getAndroidPeerDeltaController(runtime)),
+    deltaDesktop: (runtime) => getDesktopPeerDeltaController(runtime),
+    deltaAndroid: (runtime) => getAndroidPeerDeltaController(runtime),
     bidirectional: (runtime) => targetOnly(getDesktopPeerBidirectionalController(runtime)),
     controller: createDeviceSyncController,
 }

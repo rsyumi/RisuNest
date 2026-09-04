@@ -10,9 +10,7 @@ const cloneSnapshot = (error = '') => ({
 })
 
 const deltaSnapshot = (error = '') => ({
-    sourceStatus: { phase: 'idle' as const, devices: [] },
-    tunnelStatus: { phase: 'idle' as const },
-    sourcePairingUri: '', pullPhase: 'idle' as const, retained: null, error,
+    pullPhase: 'idle' as const, retained: null, error,
 })
 
 const bidirectionalSnapshot = (operationError = '') => ({

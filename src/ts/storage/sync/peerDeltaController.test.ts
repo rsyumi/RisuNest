@@ -15,36 +15,8 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
             authenticatedTransportReady: true,
             productionEnabled: true,
         })),
-        prepare: vi.fn(async () => ({
-            phase: 'prepared',
-            sessionId: 'session',
-            manifestId: 'a'.repeat(64),
-            devices: [],
-        })),
-        start: vi.fn(async () => ({
-            phase: 'running',
-            sessionId: 'session',
-            manifestId: 'a'.repeat(64),
-            pairingUri: 'risuailocal://peer-delta/v1',
-            devices: [],
-        })),
-        startQuickTunnel: vi.fn(async () => ({
-            phase: 'running', sessionId: 'session', manifestId: 'a'.repeat(64),
-            pairingUri: 'risuailocal://peer-delta/v1',
-            tunnel: { kind: 'quick', experimental: true, oneShot: true }, devices: [],
-        })),
-        startNamedTunnel: vi.fn(async () => ({
-            phase: 'running', sessionId: 'session', manifestId: 'a'.repeat(64),
-            pairingUri: 'risuailocal://peer-delta/v1',
-            tunnel: { kind: 'named', experimental: false, oneShot: false }, devices: [],
-        })),
-        tunnelStatus: vi.fn(async () => ({ phase: 'idle' })),
-        stopTunnel: vi.fn(async () => undefined),
-        status: vi.fn(async () => ({ phase: 'idle', devices: [] })),
         retained: vi.fn(async () => null),
         abandonRetained: vi.fn(async () => undefined),
-        stop: vi.fn(async () => undefined),
-        revoke: vi.fn(async () => undefined),
         pullRegistered: vi.fn(async () => ({
             kind: 'noChanges',
             revision: 1,
@@ -56,17 +28,6 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
 }
 
 describe('peer delta controller', () => {
-    test('initializes target recovery without reading or polling legacy source status', async () => {
-        const targetFacade = facadeFixture()
-        const controller = createPeerDeltaController({ facade: targetFacade })
-
-        await controller.initializeTarget()
-
-        expect(targetFacade.recoverTargetForeground).toHaveBeenCalledTimes(1)
-        expect(targetFacade.capabilities).toHaveBeenCalledTimes(1)
-        expect(targetFacade.status).not.toHaveBeenCalled()
-    })
-
     test('caches one module-level Android controller so retained pull fences survive settings remounts', () => {
         const runtime = (): PeerDeltaMutationRuntime => ({
             flushPendingData: vi.fn(async () => undefined),
@@ -83,7 +44,7 @@ describe('peer delta controller', () => {
         expect(second).toBe(first)
     })
 
-    test('recovers native Android target foreground ownership before reconstructed status', async () => {
+    test('recovers native Android target foreground ownership before the reconstructed target state', async () => {
         const events: string[] = []
         const controller = createPeerDeltaController({
             facade: facadeFixture({
@@ -99,9 +60,9 @@ describe('peer delta controller', () => {
                         tunnelReady: false,
                     }
                 }),
-                status: vi.fn(async () => {
-                    events.push('source-status')
-                    return { phase: 'stopped', devices: [] } as const
+                retained: vi.fn(async () => {
+                    events.push('retained')
+                    return null
                 }),
             }),
         })
@@ -109,78 +70,19 @@ describe('peer delta controller', () => {
         await controller.initialize()
 
         expect(events[0]).toBe('recover-target')
-        expect(events.slice(1).sort()).toEqual(['capabilities', 'source-status'])
-        expect(controller.snapshot().sourceStatus.phase).toBe('stopped')
+        expect(events.slice(1).sort()).toEqual(['capabilities', 'retained'])
+        expect(controller.snapshot().capabilities).toMatchObject({ desktop: false })
     })
 
-    test('refreshes exact native cleanup ownership after an uncertain tunnel start failure', async () => {
-        const stopping = {
-            phase: 'stopping', sessionId: 'session', manifestId: 'a'.repeat(64),
-            tunnel: { kind: 'quick', experimental: true, oneShot: true }, devices: [],
-        } as const
-        const controller = createPeerDeltaController({
-            facade: facadeFixture({
-                startQuickTunnel: vi.fn(async () => { throw new Error('tunnel failed to start') }),
-                status: vi.fn(async () => stopping),
-                tunnelStatus: vi.fn(async () => ({
-                    phase: 'stopping', sessionId: 'session', tunnel: stopping.tunnel,
-                } as const)),
-            }),
-            sourcePollMilliseconds: 60_000,
-        })
-
-        await expect(controller.startQuickTunnel('session')).rejects.toThrow('tunnel failed to start')
-        expect(controller.snapshot()).toMatchObject({
-            sourceStatus: stopping,
-            tunnelStatus: { phase: 'stopping', sessionId: 'session' },
-            sourcePairingUri: '',
-        })
-    })
-
-    test('owns tunnel polling, natural-exit cleanup, and exact stop retries', async () => {
-        vi.useFakeTimers()
-        const stopTunnel = vi.fn()
-            .mockRejectedValueOnce(new Error('tunnel cleanup failed'))
-            .mockResolvedValueOnce(undefined)
-        const status = vi.fn(async () => stopTunnel.mock.calls.length < 2
-            ? ({
-                phase: 'stopping', sessionId: 'session', manifestId: 'a'.repeat(64),
-                tunnel: { kind: 'quick', experimental: true, oneShot: true }, devices: [],
-            } as const)
-            : ({ phase: 'stopped', devices: [] } as const))
-        const controller = createPeerDeltaController({
-            facade: facadeFixture({
-                status,
-                tunnelStatus: vi.fn(async () => ({
-                    phase: 'stopped', sessionId: 'session',
-                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
-                } as const)),
-                stopTunnel,
-            }),
-            sourcePollMilliseconds: 10,
-        })
-
-        await controller.startQuickTunnel('session')
-        await vi.advanceTimersByTimeAsync(10)
-        await expect(controller.stop('session')).rejects.toThrow('tunnel cleanup failed')
-        expect(controller.snapshot().sourceStatus.phase).toBe('stopping')
-        await controller.stop('session')
-
-        expect(stopTunnel).toHaveBeenCalledTimes(2)
-        expect(controller.snapshot().sourcePairingUri).toBe('')
-        vi.useRealTimers()
-    })
-    test('keeps source ownership and one in-flight pull outside component subscriptions', async () => {
+    test('keeps one in-flight pull outside component subscriptions', async () => {
         let resolvePull!: (value: Awaited<ReturnType<Facade['pullRegistered']>>) => void
         const pullRegistered = vi.fn(() => new Promise<Awaited<ReturnType<Facade['pullRegistered']>>>((resolve) => {
             resolvePull = resolve
         }))
         const facade = facadeFixture({ pullRegistered })
-        const controller = createPeerDeltaController({ facade, sourcePollMilliseconds: 60_000 })
+        const controller = createPeerDeltaController({ facade })
         const unsubscribe = controller.subscribe(() => undefined)
         await controller.initialize()
-        await controller.prepare()
-        await controller.start('session')
 
         const first = controller.pullRegistered('source-device')
         await expect(controller.pullRegistered('source-device'))
@@ -199,7 +101,6 @@ describe('peer delta controller', () => {
         expect(controller.snapshot()).toMatchObject({
             pullPhase: 'completed',
             pullResult: { kind: 'updated', revision: 2 },
-            sourceStatus: { phase: 'running', sessionId: 'session' },
         })
     })
 
@@ -245,44 +146,7 @@ describe('peer delta controller', () => {
         resubscribe()
     })
 
-    test('retains a failed refresh error after a successful source poll', async () => {
-        vi.useFakeTimers()
-        const sourceStatus = {
-            phase: 'running',
-            sessionId: 'session',
-            manifestId: 'a'.repeat(64),
-            pairingUri: 'risuailocal://peer-delta/v1',
-            devices: [],
-        } as const
-        const controller = createPeerDeltaController({
-            facade: facadeFixture({
-                start: vi.fn(async () => sourceStatus),
-                status: vi.fn(async () => sourceStatus),
-                pullRegistered: vi.fn(async () => { throw new Error('renderer refresh failed') }),
-            }),
-            sourcePollMilliseconds: 10,
-        })
-        await controller.start('session')
-
-        await expect(controller.pullRegistered('source-device')).rejects.toThrow('renderer refresh failed')
-        await vi.advanceTimersByTimeAsync(10)
-
-        expect(controller.snapshot()).toMatchObject({
-            sourceStatus,
-            pullPhase: 'failed',
-            error: 'renderer refresh failed',
-        })
-        vi.useRealTimers()
-    })
-
-    test('retries initialization after failure and recovers the running pairing URI', async () => {
-        const sourceStatus = {
-            phase: 'running',
-            sessionId: 'session',
-            manifestId: 'a'.repeat(64),
-            pairingUri: 'risuailocal://peer-delta/v1?recovered=1',
-            devices: [],
-        } as const
+    test('retries initialization after a capabilities failure', async () => {
         const capabilities = vi.fn()
             .mockRejectedValueOnce(new Error('capabilities unavailable'))
             .mockResolvedValueOnce({
@@ -292,10 +156,7 @@ describe('peer delta controller', () => {
                 authenticatedTransportReady: true,
                 productionEnabled: true,
             })
-        const controller = createPeerDeltaController({
-            facade: facadeFixture({ capabilities, status: vi.fn(async () => sourceStatus) }),
-            sourcePollMilliseconds: 60_000,
-        })
+        const controller = createPeerDeltaController({ facade: facadeFixture({ capabilities }) })
 
         await controller.initialize()
         expect(controller.snapshot().error).toBe('capabilities unavailable')
@@ -303,32 +164,11 @@ describe('peer delta controller', () => {
 
         expect(capabilities).toHaveBeenCalledTimes(2)
         expect(controller.snapshot()).toMatchObject({
-            sourceStatus,
-            sourcePairingUri: sourceStatus.pairingUri,
+            capabilities: { productionEnabled: true },
             error: '',
         })
     })
 
-    test('recovers the native-owned source pairing link during initialization', async () => {
-        const sourceStatus = {
-            phase: 'running',
-            sessionId: 'session',
-            manifestId: 'a'.repeat(64),
-            pairingUri: 'risuailocal://peer-delta/v1?recovered=1',
-            devices: [],
-        } as const
-        const controller = createPeerDeltaController({
-            facade: facadeFixture({ status: vi.fn(async () => sourceStatus) }),
-            sourcePollMilliseconds: 60_000,
-        })
-
-        await controller.initialize()
-
-        expect(controller.snapshot()).toMatchObject({
-            sourceStatus,
-            sourcePairingUri: sourceStatus.pairingUri,
-        })
-    })
     test('reads the retained completion at target initialization and after every registered pull', async () => {
         const retained = {
             operationId: '00000000-0000-4000-8000-000000000091',
@@ -345,7 +185,7 @@ describe('peer delta controller', () => {
         })
         const controller = createPeerDeltaController({ facade })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         expect(controller.snapshot().retained).toEqual(retained)
         expect(readRetained).toHaveBeenCalledTimes(1)
 
@@ -367,7 +207,7 @@ describe('peer delta controller', () => {
         })
         const controller = createPeerDeltaController({ facade })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         await controller.pullRegistered('source')
 
         expect(readRetained).toHaveBeenCalledTimes(2)
@@ -393,7 +233,7 @@ describe('peer delta controller', () => {
         })
         const controller = createPeerDeltaController({ facade })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         await expect(controller.pullRegistered('source')).rejects.toThrow('deltaCompletionRetained')
 
         expect(controller.snapshot().retained).toEqual(retained)
@@ -421,7 +261,7 @@ describe('peer delta controller', () => {
         })
         const controller = createPeerDeltaController({ facade })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         await expect(controller.pullRegistered('source')).rejects.toThrow('deltaCompletionRetained')
         expect(controller.snapshot().pullPhase).toBe('failed')
 
@@ -449,7 +289,7 @@ describe('peer delta controller', () => {
             facade: facadeFixture({ retained: readRetained, abandonRetained: vi.fn(async () => undefined) }),
         })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         await controller.abandonRetained()
 
         // The journal the retention named is already gone, so the target must
@@ -469,7 +309,7 @@ describe('peer delta controller', () => {
         }))
         const controller = createPeerDeltaController({ facade: facadeFixture({ retained: readRetained, pullRegistered }) })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         const pull = controller.pullRegistered('source')
         await vi.waitFor(() => expect(readRetained).toHaveBeenCalledTimes(2))
 
@@ -498,10 +338,21 @@ describe('peer delta controller', () => {
             }),
         })
 
-        await controller.initializeTarget()
+        await controller.initialize()
         await expect(controller.abandonRetained()).rejects.toThrow('operationFailed')
 
         expect(controller.snapshot().error).toBe('operationFailed')
         expect(controller.snapshot().retained).toEqual(retained)
+    })
+})
+
+describe('peer delta controller surface', () => {
+    test('exposes only the target side', () => {
+        const controller = createPeerDeltaController({ facade: facadeFixture() })
+
+        expect(Object.keys(controller).sort()).toEqual([
+            'abandonRetained', 'initialize', 'pullRegistered', 'snapshot', 'subscribe',
+        ])
+        expect(controller.snapshot()).toEqual({ pullPhase: 'idle', retained: null, error: '' })
     })
 })

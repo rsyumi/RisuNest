@@ -1,28 +1,15 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import {
-    parsePeerPairingUri,
-    type PeerClonePlatform,
-    type PeerCloneTunnelMetadata,
-    type PeerCloneTunnelStatus,
-} from './peerClone'
+import { type PeerClonePlatform } from './peerClone'
 import { DeviceSyncError } from './deviceSync'
-import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground'
 import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
-
-export interface PeerDeltaPairing {
-    endpoint: string
-    sessionId: string
-    manifestId: string
-    claim: string
-}
 
 export type PeerDeltaInvoke = PeerSyncInvoke
 
 export type PeerDeltaForegroundBridge = PeerSyncForegroundBridge
 
 interface PeerDeltaForegroundIdentity {
-    lane: 'p4-source' | 'p4-target'
+    lane: 'p4-target'
     operationId: string
     generation: number
 }
@@ -43,21 +30,6 @@ export interface PeerDeltaCapabilities {
     authenticatedTransportReady: boolean
     productionEnabled: boolean
     tunnelReady: boolean
-}
-
-export interface PeerDeltaSourceStatus {
-    sessionId?: string
-    manifestId?: string
-    pairingUri?: string
-    phase: 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'stopped'
-    tunnel?: PeerCloneTunnelMetadata
-    devices: readonly {
-        deviceId: string
-        transferredBytes: number
-        currentObject?: string
-        lastSeenAt: number
-        revoked: boolean
-    }[]
 }
 
 export type PeerDeltaPullResult =
@@ -131,21 +103,6 @@ type CommittedPeerDeltaPullResult = Extract<
     { kind: 'noChanges' | 'updated' }
 >
 
-function invalidPairingUri(): never {
-    throw new Error('Invalid peer delta pairing URI')
-}
-
-export function parsePeerDeltaUri(value: string): PeerDeltaPairing {
-    return parsePeerPairingUri(value, {
-        hostname: 'peer-delta',
-        pathname: '/v1',
-        invalid: invalidPairingUri,
-        claimRule: 'hex64Fragment',
-        allowLanEndpoint: true,
-        trimTrailingSlash: false,
-    })
-}
-
 function unsupported(platform: Exclude<PeerClonePlatform, 'desktop'>): never {
     throw new Error(`Peer delta is unsupported on ${platform}`)
 }
@@ -163,27 +120,10 @@ export function createPeerDeltaFacade(options: {
         fence: Awaited<ReturnType<PeerDeltaMutationRuntime['acquireDestructiveReplacementFence']>>
         foreground?: PeerDeltaForegroundIdentity
     } | undefined
-    const requireDesktop = (): void => {
-        if (options.platform !== 'desktop') unsupported(options.platform)
-    }
     const requireNative = (): void => {
         if (options.platform === 'web') unsupported(options.platform)
     }
     const bridge = options.bridge ?? (typeof window === 'undefined' ? undefined : window.RisuPeerCloneBridge)
-    const p4SourceForeground = bridge
-        ? createPeerAndroidSourceForeground<PeerDeltaForegroundIdentity, PeerDeltaSourceStatus>({
-              invoke: nativeInvoke,
-              bridge,
-              lane: 'p4-source',
-              reserveCommand: 'peer_delta_source_reserve',
-              startCommand: 'peer_delta_start',
-              startArgs: (sessionId, foreground) => ({ sessionId, foreground }),
-              staleIdentityError: 'Android peer delta source foreground identity is stale',
-              serviceStartError: 'Android peer delta foreground service could not start',
-              serviceStopError: 'Android peer delta source foreground service could not stop',
-              cleanupFailureMessage: 'Android peer delta foreground start and cleanup both failed',
-          })
-        : undefined
     const releaseAndroidTargetForeground = async (
         foreground: PeerDeltaForegroundIdentity,
     ): Promise<void> => {
@@ -330,65 +270,6 @@ export function createPeerDeltaFacade(options: {
         async capabilities(): Promise<PeerDeltaCapabilities> {
             requireNative()
             return nativeInvoke('peer_delta_capabilities')
-        },
-        async prepare(): Promise<PeerDeltaSourceStatus> {
-            requireNative()
-            const runtime = options.runtime
-            if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
-            await runtime.flushPendingData('peer-delta-source-prepare')
-            return nativeInvoke('peer_delta_prepare')
-        },
-        async start(sessionId: string): Promise<PeerDeltaSourceStatus> {
-            requireNative()
-            if (options.platform === 'desktop') return nativeInvoke('peer_delta_start', { sessionId })
-            if (!p4SourceForeground) throw new Error('Android peer delta foreground service is unavailable')
-            const started = await p4SourceForeground.start(sessionId)
-            return started.result
-        },
-        async startQuickTunnel(sessionId: string): Promise<PeerDeltaSourceStatus> {
-            requireDesktop()
-            return nativeInvoke('peer_delta_tunnel_start', {
-                sessionId,
-                tunnel: { kind: 'quick' },
-            })
-        },
-        async startNamedTunnel(
-            sessionId: string,
-            token: string,
-            expectedPublicBaseUrl: string,
-        ): Promise<PeerDeltaSourceStatus> {
-            requireDesktop()
-            return nativeInvoke('peer_delta_tunnel_start', {
-                sessionId,
-                tunnel: { kind: 'named', token, expectedPublicBaseUrl },
-            })
-        },
-        async tunnelStatus(): Promise<PeerCloneTunnelStatus> {
-            requireDesktop()
-            return nativeInvoke('peer_delta_tunnel_status')
-        },
-        async stopTunnel(sessionId: string): Promise<void> {
-            requireDesktop()
-            await nativeInvoke('peer_delta_tunnel_stop', { sessionId })
-        },
-        async status(): Promise<PeerDeltaSourceStatus> {
-            requireNative()
-            return nativeInvoke('peer_delta_status')
-        },
-        async stop(sessionId: string): Promise<void> {
-            requireNative()
-            if (options.platform === 'desktop') return nativeInvoke('peer_delta_stop', { sessionId })
-            const foreground = await nativeInvoke<PeerDeltaForegroundIdentity | null>('peer_delta_stop', { sessionId })
-            if (foreground) {
-                if (!bridge) throw new Error('Android peer delta foreground service is unavailable')
-                if (!bridge.stopSource(foreground.lane, foreground.operationId, foreground.generation)) {
-                    throw new Error('Android peer delta source foreground service could not stop')
-                }
-            }
-        },
-        async revoke(sessionId: string, deviceId: string): Promise<void> {
-            requireNative()
-            return nativeInvoke('peer_delta_revoke', { sessionId, deviceId })
         },
         async pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
             return runPull(`registered:${deviceId}`, 'peer_delta_pull_registered', { deviceId })

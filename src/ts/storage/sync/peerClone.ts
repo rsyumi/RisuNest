@@ -27,18 +27,6 @@ export interface PeerCloneFacadeOptions {
 
 export type PeerCloneReplacementRuntime = PeerSyncMutationRuntime
 
-export interface PeerCloneTunnelMetadata {
-    kind: 'quick' | 'named'
-    experimental: boolean
-    oneShot: boolean
-}
-
-export interface PeerCloneTunnelStatus {
-    sessionId?: string
-    phase: 'idle' | 'starting' | 'running' | 'stopping' | 'stopped'
-    tunnel?: PeerCloneTunnelMetadata
-}
-
 export interface PeerCloneTargetStatus {
     phase: 'idle' | 'downloading' | 'cancelling' | 'awaitingActivation' | 'activating' | 'cancelled' | 'completed' | 'failed'
     completedBytes: number
