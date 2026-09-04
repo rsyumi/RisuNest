@@ -460,6 +460,30 @@ fn android_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
 }
 
 #[test]
+fn android_clone_backup_whose_stem_is_not_a_job_id_is_deletable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+    let job_id = "00000000-0000-4000-8000-000000000209";
+    let backup = root.join("peer-clone-activation/backups/pre-clone-not-a-job-id.lossless");
+    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
+    fs::write(&backup, b"unowned Android backup").expect("write Android backup");
+    let jobs_root = root.join("peer-clone-jobs");
+    fs::create_dir_all(&jobs_root).expect("create Android jobs root");
+    fs::write(
+        jobs_root.join("current.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "risunest.android-peer-clone-registry/v1",
+            "jobId": job_id,
+        }))
+        .expect("serialize Android job record"),
+    )
+    .expect("write Android job record");
+
+    delete_backup(root, &backup).expect("backup with an unparsable job stem is deletable");
+    assert!(!backup.exists());
+}
+
+#[test]
 fn current_android_clone_backup_remains_protected_after_cas_release() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root = directory.path();

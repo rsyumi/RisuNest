@@ -2504,6 +2504,28 @@ fn v1_zero_byte_completion_retains_a_target_receipt_without_changing_its_total()
 }
 
 #[test]
+fn bidirectional_completion_refuses_an_operation_whose_registered_source_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let operation_id = "123e4567-e89b-42d3-a456-426614174097";
+    let result = PeerBidirectionalCompletedResult {
+        kind: "updated".to_owned(),
+        operation_id: operation_id.to_owned(),
+        revision: 8,
+        remote_revision: 4,
+        transferred_objects: 3,
+        transferred_bytes: 27,
+        backups: Vec::new(),
+    };
+    let mut retained_context = context(operation_id);
+    retained_context.completion_mode = PeerBidirectionalCompletionMode::Unsupported;
+
+    assert_eq!(
+        record_bidirectional_completion(directory.path(), &retained_context, &result).unwrap_err(),
+        PeerSyncError::Validation("registered bidirectional source is missing".to_owned())
+    );
+}
+
+#[test]
 fn bidirectional_completion_accounting_overflow_preserves_the_terminal_journal() {
     let directory = tempfile::tempdir().unwrap();
     register_bidirectional_accounting_source(directory.path(), u64::MAX, 7);
