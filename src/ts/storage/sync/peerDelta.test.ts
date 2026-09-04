@@ -1021,4 +1021,47 @@ describe('peer logical delta product facade', () => {
         expect(runtime.flushPendingData).toHaveBeenCalledOnce()
         expect(runtime.acquireDestructiveReplacementFence).toHaveBeenCalledOnce()
     })
+    test('passes a well formed retained completion through and refuses any other shape', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: 'Desk',
+            witness: 'ambiguous',
+            transferredObjects: 2,
+            transferredBytes: 4096,
+        }
+        let response: unknown = retained
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_delta_target_retained') return response as T
+            return undefined as T
+        }) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'desktop', invoke })
+
+        await expect(facade.retained()).resolves.toEqual(retained)
+
+        response = null
+        await expect(facade.retained()).resolves.toBeNull()
+
+        for (const invalid of [
+            { ...retained, witness: 'unknown' },
+            { ...retained, operationId: 'not-a-uuid' },
+            { ...retained, transferredBytes: -1 },
+            { ...retained, endpoint: 'http://192.168.0.9:32145' },
+            'retained',
+        ]) {
+            response = invalid
+            await expect(facade.retained()).rejects.toMatchObject({ code: 'state-unavailable' })
+        }
+    })
+
+    test('abandons the retained completion by its exact operation identifier', async () => {
+        const invoke = vi.fn(async () => undefined) as unknown as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'android', invoke })
+
+        await facade.abandonRetained('00000000-0000-4000-8000-000000000091')
+
+        expect(invoke).toHaveBeenCalledWith('peer_delta_target_abandon', {
+            operationId: '00000000-0000-4000-8000-000000000091',
+        })
+    })
 })

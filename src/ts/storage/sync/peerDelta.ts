@@ -6,6 +6,7 @@ import {
     type PeerCloneTunnelMetadata,
     type PeerCloneTunnelStatus,
 } from './peerClone'
+import { DeviceSyncError } from './deviceSync'
 import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground'
 import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
 
@@ -74,6 +75,56 @@ export type PeerDeltaPullResult =
           kind: 'conflict'
           reason: 'localAndRemoteChanged' | 'staleRevision'
       }
+
+export type RetainedDeltaWitness = 'committed' | 'uncommitted' | 'ambiguous'
+
+// The delta completion the target still holds after a pull ended without
+// resolving it. It carries the other device's name and the transfer size only:
+// no credential and no endpoint.
+export interface RetainedDeltaCompletion {
+    operationId: string
+    sourceDeviceId: string
+    sourceName: string | null
+    witness: RetainedDeltaWitness
+    transferredObjects: number
+    transferredBytes: number
+}
+
+const canonicalDeltaOperationUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const canonicalDeltaSourceUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const retainedWitnesses: readonly RetainedDeltaWitness[] = ['committed', 'uncommitted', 'ambiguous']
+
+function safeRetainedCompletion(value: unknown): RetainedDeltaCompletion | null {
+    if (value === null || value === undefined) return null
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new DeviceSyncError('state-unavailable')
+    }
+    const source = value as Record<string, unknown>
+    const allowed = new Set([
+        'operationId', 'sourceDeviceId', 'sourceName', 'witness', 'transferredObjects', 'transferredBytes',
+    ])
+    if (
+        Object.keys(source).some((key) => !allowed.has(key))
+        || typeof source.operationId !== 'string'
+        || !canonicalDeltaOperationUuid.test(source.operationId)
+        || typeof source.sourceDeviceId !== 'string'
+        || !canonicalDeltaSourceUuid.test(source.sourceDeviceId)
+        || (source.sourceName !== null && source.sourceName !== undefined && typeof source.sourceName !== 'string')
+        || !retainedWitnesses.includes(source.witness as RetainedDeltaWitness)
+        || !Number.isSafeInteger(source.transferredObjects)
+        || !Number.isSafeInteger(source.transferredBytes)
+        || (source.transferredObjects as number) < 0
+        || (source.transferredBytes as number) < 0
+    ) throw new DeviceSyncError('state-unavailable')
+    return {
+        operationId: source.operationId,
+        sourceDeviceId: source.sourceDeviceId,
+        sourceName: typeof source.sourceName === 'string' ? source.sourceName : null,
+        witness: source.witness as RetainedDeltaWitness,
+        transferredObjects: source.transferredObjects as number,
+        transferredBytes: source.transferredBytes as number,
+    }
+}
 
 type CommittedPeerDeltaPullResult = Extract<
     PeerDeltaPullResult,
@@ -344,6 +395,14 @@ export function createPeerDeltaFacade(options: {
         },
         async pullRegistered(deviceId: string): Promise<PeerDeltaPullResult> {
             return runPull(`registered:${deviceId}`, 'peer_delta_pull_registered', { deviceId })
+        },
+        async retained(): Promise<RetainedDeltaCompletion | null> {
+            requireNative()
+            return safeRetainedCompletion(await nativeInvoke<unknown>('peer_delta_target_retained'))
+        },
+        async abandonRetained(operationId: string): Promise<void> {
+            requireNative()
+            await nativeInvoke('peer_delta_target_abandon', { operationId })
         },
     }
     return facade

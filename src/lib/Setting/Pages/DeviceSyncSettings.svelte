@@ -58,7 +58,17 @@
         || cloneTarget?.phase === 'confirmed'
         || cloneRetryable
     )
-    const deltaBusy = $derived(workActionPending && activeWork === 'delta' || delta?.pullPhase === 'running')
+    const deltaRetained = $derived(delta?.retained ?? null)
+    const deltaResumable = $derived(Boolean(
+        deltaRetained
+        && deltaRetained.witness !== 'ambiguous'
+        && snapshot.sources.some((source) => source.deviceId === deltaRetained.sourceDeviceId)
+    ))
+    const deltaBusy = $derived(
+        workActionPending && activeWork === 'delta'
+        || delta?.pullPhase === 'running'
+        || Boolean(deltaRetained)
+    )
     const bidiBusy = $derived(
         workActionPending && activeWork === 'bidirectional'
         || ['running', 'awaitingConflict', 'sourcePrepared', 'targetPrepared', 'localCommitted', 'sourceUnavailable', 'refreshPending'].includes(bidiPhase)
@@ -83,6 +93,7 @@
         const cloneActive = cloneValue && (cloneValue.resumeAvailable || ['joined', 'confirmed', 'downloading', 'cancelled'].includes(clonePhase ?? 'idle'))
         if (bidiActive) return 'bidirectional'
         if (cloneActive) return 'clone'
+        if (value.targets.delta?.retained) return 'delta'
         if (value.targets.delta?.pullPhase === 'running') return 'delta'
         if (value.activeBidirectionalSourceDeviceId && bidiValue?.operationPhase !== 'idle') return 'bidirectional'
         if (value.activeCloneSourceDeviceId && clonePhase !== 'idle') return 'clone'
@@ -282,6 +293,21 @@
             workActionPending = false
         }
     }
+    async function resumeRetainedDelta(): Promise<void> {
+        const sourceDeviceId = deltaRetained?.sourceDeviceId
+        if (!sourceDeviceId) return
+        await runWorkAction(() => controller.pullRegisteredDelta(sourceDeviceId))
+    }
+    async function abandonRetainedDelta(): Promise<void> {
+        if (workActionPending) return
+        workActionPending = true
+        try {
+            const confirmed = await alertConfirm(sync.work.deltaAbandonConfirm)
+            if (confirmed && await runAction(() => controller.abandonDelta(), 'work')) dismissWork()
+        } finally {
+            workActionPending = false
+        }
+    }
     async function acknowledgeBidi(): Promise<void> {
         if (await runWorkAction(() => controller.acknowledgeBidirectional())) dismissWork()
     }
@@ -456,7 +482,16 @@
                         <Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {/if}
                 {:else if activeWork === 'delta'}
-                    {#if workActionPending || delta?.pullPhase === 'running'}<p class="text-sm">{format(sync.work.progress, 0)}</p>
+                    {#if deltaRetained && delta?.pullPhase !== 'running'}
+                        <p data-delta-retained class="text-sm">{format(sync.work.deltaRetained, deltaRetained.sourceName || sync.work.unknownDevice)}</p>
+                        <p class="mt-1 text-sm text-textcolor2">{deltaRetained.witness === 'ambiguous' ? sync.work.deltaRetainedAmbiguous : sync.work.deltaRetainedResumable}</p>
+                        <div class="mt-2 flex flex-wrap gap-2">
+                            {#if deltaResumable}
+                                <Button size="sm" disabled={workActionPending} onclick={resumeRetainedDelta}>{sync.work.resume}</Button>
+                            {/if}
+                            <Button size="sm" styled="danger" disabled={workActionPending} onclick={abandonRetainedDelta}>{sync.work.abandon}</Button>
+                        </div>
+                    {:else if workActionPending || delta?.pullPhase === 'running'}<p class="text-sm">{format(sync.work.progress, 0)}</p>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'noChanges'}<p class="text-sm">{sync.work.doneUpToDate}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'updated'}<p class="text-sm">{format(sync.work.doneUpdated, delta.pullResult.transferredObjects, formatRisuNestStorageBytes(delta.pullResult.transferredBytes))}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'fullCloneRequired'}<p class="text-sm">{sync.work.needClone}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>

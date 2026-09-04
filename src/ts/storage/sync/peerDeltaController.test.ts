@@ -41,6 +41,8 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
         tunnelStatus: vi.fn(async () => ({ phase: 'idle' })),
         stopTunnel: vi.fn(async () => undefined),
         status: vi.fn(async () => ({ phase: 'idle', devices: [] })),
+        retained: vi.fn(async () => null),
+        abandonRetained: vi.fn(async () => undefined),
         stop: vi.fn(async () => undefined),
         revoke: vi.fn(async () => undefined),
         pull: vi.fn(async () => ({
@@ -326,5 +328,131 @@ describe('peer delta controller', () => {
             sourceStatus,
             sourcePairingUri: sourceStatus.pairingUri,
         })
+    })
+    test('reads the retained completion at target initialization and after every registered pull', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: 'Desk',
+            witness: 'uncommitted' as const,
+            transferredObjects: 2,
+            transferredBytes: 4096,
+        }
+        const readRetained = vi.fn(async () => retained)
+        const facade = facadeFixture({
+            retained: readRetained,
+            pullRegistered: vi.fn(async () => { throw new Error('deltaCompletionRetained') }),
+        })
+        const controller = createPeerDeltaController({ facade })
+
+        await controller.initializeTarget()
+        expect(controller.snapshot().retained).toEqual(retained)
+        expect(readRetained).toHaveBeenCalledTimes(1)
+
+        await expect(controller.pullRegistered('source')).rejects.toThrow('deltaCompletionRetained')
+
+        // A failed pull is exactly when the journal is most likely to be retained.
+        expect(readRetained).toHaveBeenCalledTimes(2)
+        expect(controller.snapshot().pullPhase).toBe('failed')
+        expect(controller.snapshot().retained).toEqual(retained)
+    })
+
+    test('re-reads the retained completion after a registered pull succeeds', async () => {
+        const readRetained = vi.fn(async () => null)
+        const facade = facadeFixture({
+            retained: readRetained,
+            pullRegistered: vi.fn(async () => ({
+                kind: 'updated' as const, revision: 3, transferredObjects: 1, transferredBytes: 8,
+            })),
+        })
+        const controller = createPeerDeltaController({ facade })
+
+        await controller.initializeTarget()
+        await controller.pullRegistered('source')
+
+        expect(readRetained).toHaveBeenCalledTimes(2)
+        expect(controller.snapshot().retained).toBeNull()
+        expect(controller.snapshot().pullPhase).toBe('completed')
+    })
+
+    test('keeps the last known retained state when the refresh after a pull cannot be read', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: null,
+            witness: 'ambiguous' as const,
+            transferredObjects: 0,
+            transferredBytes: 0,
+        }
+        const readRetained = vi.fn()
+            .mockResolvedValueOnce(retained)
+            .mockRejectedValueOnce(new Error('state unavailable'))
+        const facade = facadeFixture({
+            retained: readRetained,
+            pullRegistered: vi.fn(async () => { throw new Error('deltaCompletionRetained') }),
+        })
+        const controller = createPeerDeltaController({ facade })
+
+        await controller.initializeTarget()
+        await expect(controller.pullRegistered('source')).rejects.toThrow('deltaCompletionRetained')
+
+        expect(controller.snapshot().retained).toEqual(retained)
+        expect(controller.snapshot().error).toBe('deltaCompletionRetained')
+    })
+
+    test('returns the target to idle with no error once the retained completion is abandoned', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: 'Desk',
+            witness: 'ambiguous' as const,
+            transferredObjects: 0,
+            transferredBytes: 0,
+        }
+        const readRetained = vi.fn()
+            .mockResolvedValueOnce(retained)
+            .mockResolvedValueOnce(retained)
+            .mockResolvedValue(null)
+        const abandonRetained = vi.fn(async () => undefined)
+        const facade = facadeFixture({
+            retained: readRetained,
+            abandonRetained,
+            pullRegistered: vi.fn(async () => { throw new Error('deltaCompletionRetained') }),
+        })
+        const controller = createPeerDeltaController({ facade })
+
+        await controller.initializeTarget()
+        await expect(controller.pullRegistered('source')).rejects.toThrow('deltaCompletionRetained')
+        expect(controller.snapshot().pullPhase).toBe('failed')
+
+        await controller.abandonRetained()
+
+        expect(abandonRetained).toHaveBeenCalledWith(retained.operationId)
+        expect(controller.snapshot().retained).toBeNull()
+        expect(controller.snapshot().pullPhase).toBe('idle')
+        expect(controller.snapshot().error).toBe('')
+    })
+
+    test('reports an abandonment failure on the target error channel', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: 'Desk',
+            witness: 'ambiguous' as const,
+            transferredObjects: 0,
+            transferredBytes: 0,
+        }
+        const controller = createPeerDeltaController({
+            facade: facadeFixture({
+                retained: vi.fn(async () => retained),
+                abandonRetained: vi.fn(async () => { throw new Error('operationFailed') }),
+            }),
+        })
+
+        await controller.initializeTarget()
+        await expect(controller.abandonRetained()).rejects.toThrow('operationFailed')
+
+        expect(controller.snapshot().error).toBe('operationFailed')
+        expect(controller.snapshot().retained).toEqual(retained)
     })
 })

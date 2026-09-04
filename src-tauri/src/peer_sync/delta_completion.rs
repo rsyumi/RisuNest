@@ -1,3 +1,5 @@
+#[cfg(any(desktop, target_os = "android"))]
+use super::device_registry::abandon_incoming_completion_delivery;
 use super::device_registry::{
     completion_receipt_id, finalize_incoming_completion_delivery,
     incoming_completed_operation_bytes_for_lane, incoming_completion_is_durable,
@@ -27,9 +29,9 @@ use std::{
 };
 
 /// Stable code the interface maps to its own wording; never shown as native
-/// text. The recovery path that produces it lands with retained completion
-/// recovery.
-#[cfg(any(desktop, target_os = "android"))]
+/// text. `recover_delta_completion` raises it when the store no longer
+/// witnesses either side of the commit, so the journal has to stay and only the
+/// interface can resolve it.
 pub(crate) const DELTA_COMPLETION_AMBIGUOUS: &str = "peer-delta-completion-ambiguous";
 const DELTA_COMPLETION_SCHEMA: &str = "risunest.peer-delta-completion/v1";
 const DELTA_COMPLETION_FILE: &str = "completion-operation.json";
@@ -600,7 +602,9 @@ pub(crate) fn recover_delta_completion(
         .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
 
     match context.classify_witness(revision, common_base.as_ref()) {
-        DeltaCommitWitness::Unknown => invalid("delta completion commit witness is ambiguous"),
+        DeltaCommitWitness::Unknown => Err(PeerSyncError::Validation(
+            DELTA_COMPLETION_AMBIGUOUS.to_owned(),
+        )),
         DeltaCommitWitness::Uncommitted => {
             let job = open_uncommitted_job(app_root, &context.operation_id)?;
             journal.remove_exact(&context)?;
@@ -618,6 +622,103 @@ pub(crate) fn recover_delta_completion(
             }))
         }
     }
+}
+
+/// What the store still witnesses about a retained completion. `Ambiguous` is
+/// the `Unknown` witness under the name the interface reports, and the only one
+/// that no longer has a resumable path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedDeltaWitness {
+    Committed,
+    Uncommitted,
+    Ambiguous,
+}
+
+/// The retained journal as the interface needs it: enough to name the other
+/// device and the transfer, and no credential or endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedDeltaCompletion {
+    pub(crate) operation_id: String,
+    pub(crate) source_device_id: String,
+    pub(crate) source_name: Option<String>,
+    pub(crate) witness: RetainedDeltaWitness,
+    pub(crate) transferred_objects: u64,
+    pub(crate) transferred_bytes: u64,
+}
+
+/// Classifies the retained journal against the store the same way the pull path
+/// does. No network call and no side effect, so the interface can ask whenever
+/// it needs the state instead of polling for a failure to tell it.
+pub(crate) fn retained_delta_completion(
+    store: &mut PersistentStore,
+    app_root: &Path,
+) -> Result<Option<RetainedDeltaCompletion>, PeerSyncError> {
+    let Some(operation) = PeerDeltaCompletionJournal::new(app_root).load()? else {
+        return Ok(None);
+    };
+    let context = operation.context();
+    let revision = store
+        .revision()
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    let common_base = store
+        .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, &context.source_device_id)
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+    Ok(Some(RetainedDeltaCompletion {
+        operation_id: context.operation_id.clone(),
+        source_device_id: context.source_device_id.clone(),
+        source_name: incoming_source_by_id(app_root, &context.source_device_id)?
+            .map(|source| source.name),
+        witness: match context.classify_witness(revision, common_base.as_ref()) {
+            DeltaCommitWitness::Committed => RetainedDeltaWitness::Committed,
+            DeltaCommitWitness::Uncommitted => RetainedDeltaWitness::Uncommitted,
+            DeltaCommitWitness::Unknown => RetainedDeltaWitness::Ambiguous,
+        },
+        transferred_objects: context.transferred_objects,
+        transferred_bytes: context.transferred_bytes,
+    }))
+}
+
+/// Drops the retained journal and only the local state it owns, so the pull,
+/// removal and registration paths it blocks open again. The store's revision,
+/// common base and logical records are never touched and the source is never
+/// asked for anything, whatever the witness says. The one loss is that this
+/// transfer never reaches the source's cumulative totals.
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) fn abandon_retained_delta_completion(
+    app_root: &Path,
+    operation_id: &str,
+) -> Result<(), PeerSyncError> {
+    // Serializes with registration, removal and a first publication, so no lane
+    // can bind to this source between the check and the removal.
+    let _lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
+    let journal = PeerDeltaCompletionJournal::new(app_root);
+    let Some(operation) = journal.load()? else {
+        return Ok(());
+    };
+    let context = operation.context().clone();
+    if context.operation_id != operation_id {
+        return invalid("another delta completion operation is retained");
+    }
+    // A lease that belongs to another operation is not this one's to drop; an
+    // already durable or already missing delivery leaves nothing to drop.
+    if let Some(snapshot) = snapshot_incoming_completion_delivery(
+        app_root,
+        &context.source_device_id,
+        CompletionLane::Delta,
+    )?
+    .filter(|snapshot| snapshot.delivery.completion_lease_id == context.operation_id)
+    {
+        abandon_incoming_completion_delivery(app_root, &snapshot.delivery)?;
+    }
+    // Aborting removes the job journal alone. Objects the store references stay
+    // reachable through the store's own GC root, exactly as the per-pull reclaim
+    // of abandoned jobs already relies on.
+    if let Some(mut job) = open_uncommitted_job(app_root, &context.operation_id)? {
+        job.release(CasReleaseOutcome::Aborted)?;
+    }
+    journal.remove_exact(&context)?;
+    crate::nlog!("warn", "retained delta completion abandoned by request");
+    Ok(())
 }
 
 fn open_uncommitted_job(

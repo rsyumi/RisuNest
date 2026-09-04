@@ -4,6 +4,7 @@ import {
     type PeerDeltaMutationRuntime,
     type PeerDeltaPullResult,
     type PeerDeltaSourceStatus,
+    type RetainedDeltaCompletion,
 } from './peerDelta'
 import { createPeerSourcePolling } from './peerSourcePolling'
 import type { PeerCloneTunnelStatus } from './peerClone'
@@ -17,6 +18,7 @@ export interface PeerDeltaControllerSnapshot {
     sourcePairingUri: string
     pullPhase: 'idle' | 'running' | 'completed' | 'fullCloneRequired' | 'conflict' | 'failed'
     pullResult?: PeerDeltaPullResult
+    retained: RetainedDeltaCompletion | null
     error: string
 }
 
@@ -30,6 +32,7 @@ export function createPeerDeltaController(options: {
         tunnelStatus: { phase: 'idle' },
         sourcePairingUri: '',
         pullPhase: 'idle',
+        retained: null,
         error: '',
     }
     let initialized = false
@@ -85,6 +88,16 @@ export function createPeerDeltaController(options: {
         }
         },
     })
+    // The retained completion journal only changes when a pull ends, so it is
+    // read there and at target initialization rather than on a timer.
+    const refreshRetainedAfterPull = async (): Promise<void> => {
+        try {
+            update({ retained: await options.facade.retained() })
+        } catch {
+            // The pull outcome stands on its own. The refusal wording covers the
+            // moment the retained state could not be read.
+        }
+    }
     const beginSourcePolling = (): void => sourcePolling.start()
     const stopSourcePolling = (): void => sourcePolling.stop()
     const run = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -151,10 +164,10 @@ export function createPeerDeltaController(options: {
             if (targetInitialized) return targetInitialization ?? Promise.resolve()
             targetInitialized = true
             targetInitialization = options.facade.recoverTargetForeground().then(
-                () => options.facade.capabilities(),
-            ).then((capabilities) => {
+                () => Promise.all([options.facade.capabilities(), options.facade.retained()]),
+            ).then(([capabilities, retained]) => {
                 sourceError = ''
-                update({ capabilities })
+                update({ capabilities, retained })
             }).catch((cause) => {
                 sourceError = cause instanceof Error ? cause.message : String(cause)
                 targetInitialized = false
@@ -243,9 +256,26 @@ export function createPeerDeltaController(options: {
                 pullError = cause instanceof Error ? cause.message : String(cause)
                 update({ pullPhase: 'failed' })
                 throw cause
-            }).finally(() => { activePull = undefined })
+            }).finally(async () => {
+                activePull = undefined
+                await refreshRetainedAfterPull()
+            })
             activePull = { pairingUri: `registered:${deviceId}`, promise }
             return promise
+        },
+        async abandonRetained(): Promise<void> {
+            const retained = snapshot.retained
+            if (!retained) throw new Error('No retained peer delta completion to abandon')
+            try {
+                await options.facade.abandonRetained(retained.operationId)
+                const refreshed = await options.facade.retained()
+                pullError = ''
+                update({ retained: refreshed, pullPhase: 'idle', pullResult: undefined })
+            } catch (cause) {
+                pullError = cause instanceof Error ? cause.message : String(cause)
+                update({ pullPhase: 'failed' })
+                throw cause
+            }
         },
     }
 }

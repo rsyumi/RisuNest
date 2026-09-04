@@ -98,6 +98,8 @@ describe('RisuNest native command integration', () => {
         'peer_sync_registered_hello',
         'peer_clone_claim_registered_client',
         'peer_delta_pull_registered',
+        'peer_delta_target_retained',
+        'peer_delta_target_abandon',
         'peer_bidirectional_sync_registered',
         'peer_bidirectional_resolve_registered',
     ]
@@ -156,6 +158,13 @@ describe('RisuNest native command integration', () => {
         }
     })
 
+    it('exposes the retained delta completion commands on desktop and Android', () => {
+        for (const command of ['peer_delta_target_retained', 'peer_delta_target_abandon']) {
+            expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
+            peer_sync::delta_commands::${command},`)
+        }
+    })
+
     it('preserves directional registry commands on desktop and Android', () => {
         for (const command of [
             'peer_sync_outgoing_devices',
@@ -170,7 +179,7 @@ describe('RisuNest native command integration', () => {
 })
 
 describe('RisuNest sync language schema', () => {
-    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'lanWarning', 'androidLanOnly']
+    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'lanWarning', 'androidLanOnly']
 
     it.each([languageEnglish, languageKorean])('contains every required nested sync branch', (translation) => {
         for (const path of required) {

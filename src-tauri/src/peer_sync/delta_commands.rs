@@ -18,10 +18,12 @@ use super::target_foreground_transition::{
     AndroidTargetForegroundTransition, AndroidTargetForegroundTransitionError,
 };
 use super::{
-    command_codes::{code_for, is_bounded_code, PeerCommandCode},
+    command_codes::{code_for, finish_peer_worker, is_bounded_code, PeerCommandCode},
     delta_completion::{
-        recover_delta_completion, DeltaCompletionContext, DeltaCompletionMode,
-        LanDeltaCompletionTransport, PeerDeltaCompletionJournal, RecoveredDeltaCompletion,
+        abandon_retained_delta_completion, recover_delta_completion, retained_delta_completion,
+        DeltaCompletionContext, DeltaCompletionMode, LanDeltaCompletionTransport,
+        PeerDeltaCompletionJournal, RecoveredDeltaCompletion, RetainedDeltaCompletion,
+        RetainedDeltaWitness,
     },
     lan::{
         LanCloneHostControl, LanLogicalDeltaClient, PeerCompletionCapability,
@@ -1824,6 +1826,111 @@ pub fn peer_delta_status(
     state.status().map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PeerDeltaRetainedWitness {
+    Committed,
+    Uncommitted,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedDeltaCompletionStatus {
+    operation_id: String,
+    source_device_id: String,
+    source_name: Option<String>,
+    witness: PeerDeltaRetainedWitness,
+    transferred_objects: u64,
+    transferred_bytes: u64,
+}
+
+impl From<RetainedDeltaCompletion> for RetainedDeltaCompletionStatus {
+    fn from(value: RetainedDeltaCompletion) -> Self {
+        Self {
+            operation_id: value.operation_id,
+            source_device_id: value.source_device_id,
+            source_name: value.source_name,
+            witness: match value.witness {
+                RetainedDeltaWitness::Committed => PeerDeltaRetainedWitness::Committed,
+                RetainedDeltaWitness::Uncommitted => PeerDeltaRetainedWitness::Uncommitted,
+                RetainedDeltaWitness::Ambiguous => PeerDeltaRetainedWitness::Ambiguous,
+            },
+            transferred_objects: value.transferred_objects,
+            transferred_bytes: value.transferred_bytes,
+        }
+    }
+}
+
+/// The pull owns the same journal, so its guard is what keeps a status read and
+/// a running pull apart. The store is opened under the guard, never before it.
+fn retained_completion_under_pull_guard(
+    state: &PeerDeltaCommandState,
+    app_root: &Path,
+    open_store: impl FnOnce() -> Result<PersistentStore, PeerSyncError>,
+) -> Result<Option<RetainedDeltaCompletionStatus>, PeerSyncError> {
+    let _guard = state.begin_pull()?;
+    let mut store = open_store()?;
+    retained_delta_completion(&mut store, app_root)
+        .map(|retained| retained.map(RetainedDeltaCompletionStatus::from))
+}
+
+fn abandon_retained_completion_under_pull_guard(
+    state: &PeerDeltaCommandState,
+    app_root: &Path,
+    operation_id: &str,
+) -> Result<(), PeerSyncError> {
+    let _guard = state.begin_pull()?;
+    abandon_retained_delta_completion(app_root, operation_id)
+}
+
+/// Names the retained delta completion this target still holds, so the
+/// interface can offer resuming or cancelling it instead of only meeting the
+/// refusal it causes. A local read, so it needs no Android foreground service.
+#[tauri::command]
+pub async fn peer_delta_target_retained(
+    app: AppHandle,
+    state: State<'_, PeerDeltaCommandState>,
+) -> Result<Option<RetainedDeltaCompletionStatus>, String> {
+    let state = state.inner().clone();
+    finish_peer_worker(
+        "peer delta retained completion status",
+        tauri::async_runtime::spawn_blocking(move || {
+            let app_root = delta_app_data_root(&app)?;
+            retained_completion_under_pull_guard(&state, &app_root, || {
+                persistent_store::commands::with_store_mut(app.state(), |store| {
+                    open_peer_delta_store(store)
+                })
+                .map_err(store_error)
+            })
+        })
+        .await,
+    )
+}
+
+/// Drops the retained delta completion named by `operation_id`. Local cleanup
+/// only: this device's data is left exactly as it is and the source is never
+/// asked for anything, so it needs no Android foreground service either.
+#[tauri::command]
+pub async fn peer_delta_target_abandon(
+    app: AppHandle,
+    state: State<'_, PeerDeltaCommandState>,
+    operation_id: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    finish_peer_worker(
+        "peer delta retained completion abandonment",
+        tauri::async_runtime::spawn_blocking(move || {
+            abandon_retained_completion_under_pull_guard(
+                &state,
+                &delta_app_data_root(&app)?,
+                &operation_id,
+            )
+        })
+        .await,
+    )
+}
+
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn peer_delta_stop(
@@ -2216,6 +2323,14 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("failed to resolve application data directory: {error}"))
+}
+
+/// The same directory for the commands that finish through a bounded code, so
+/// the resolver failure stays a `PeerSyncError` all the way to the boundary.
+fn delta_app_data_root(app: &AppHandle) -> Result<PathBuf, PeerSyncError> {
+    app.path()
+        .app_data_dir()
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
@@ -4542,5 +4657,38 @@ mod tests {
         );
         assert_eq!(store.revision().unwrap(), 1);
         assert_eq!(source.reads, 0);
+    }
+
+    #[test]
+    fn a_running_pull_excludes_the_retained_status_and_abandon_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id = "00000000-0000-4000-8000-000000000031";
+        let state = PeerDeltaCommandState::default();
+        let held = state.begin_pull().unwrap();
+
+        assert!(
+            retained_completion_under_pull_guard(&state, directory.path(), || {
+                panic!("the store must not be opened while a pull owns the target")
+            })
+            .is_err()
+        );
+        assert!(abandon_retained_completion_under_pull_guard(
+            &state,
+            directory.path(),
+            operation_id
+        )
+        .is_err());
+
+        drop(held);
+
+        assert_eq!(
+            retained_completion_under_pull_guard(&state, directory.path(), || {
+                PersistentStore::open(directory.path()).map_err(store_error)
+            })
+            .unwrap(),
+            None
+        );
+        abandon_retained_completion_under_pull_guard(&state, directory.path(), operation_id)
+            .unwrap();
     }
 }

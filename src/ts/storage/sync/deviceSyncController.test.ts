@@ -17,7 +17,7 @@ const cloneSnapshot = (error = '') => ({
 const deltaSnapshot = (error = '') => ({
     sourceStatus: { phase: 'idle' as const, devices: [] },
     tunnelStatus: { phase: 'idle' as const },
-    sourcePairingUri: '', pullPhase: 'idle' as const, error,
+    sourcePairingUri: '', pullPhase: 'idle' as const, retained: null, error,
 })
 
 const bidirectionalSnapshot = (operationError = '') => ({
@@ -286,7 +286,7 @@ describe('device sync controller', () => {
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
                 revokeOutgoing: async () => undefined, claimStagedClone,
             },
-            targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered } },
+            targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() } },
         })
         await controller.initialize()
         controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
@@ -323,7 +323,7 @@ describe('device sync controller', () => {
                     },
                     delta: {
                         snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                        initialize: async () => undefined, pullRegistered,
+                        initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                     },
                     bidirectional: {
                         snapshot: () => bidirectionalSnapshot(), subscribe: () => () => undefined,
@@ -383,7 +383,7 @@ describe('device sync controller', () => {
                     },
                     delta: {
                         snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                        initialize: async () => undefined, pullRegistered,
+                        initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                     },
                     bidirectional: {
                         snapshot: () => bidirectionalSnapshot(), subscribe: () => () => undefined,
@@ -436,7 +436,7 @@ describe('device sync controller', () => {
             targets: {
                 delta: {
                     snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                    initialize: async () => undefined, pullRegistered,
+                    initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                 },
             },
         })
@@ -461,7 +461,7 @@ describe('device sync controller', () => {
             initialize: vi.fn(async () => { events.push(name) }),
         })
         const clone = { ...target('clone', cloneSnapshot()), joinClaimed: vi.fn(), confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn() }
-        const delta = { ...target('delta', deltaSnapshot()), pullRegistered: vi.fn() }
+        const delta = { ...target('delta', deltaSnapshot()), pullRegistered: vi.fn(), abandonRetained: vi.fn() }
         const bidirectional = {
             ...target('bidirectional', bidirectionalSnapshot()), syncRegistered: vi.fn(), resolveRegistered: vi.fn(),
             resume: vi.fn(), acknowledge: vi.fn(), abandon: vi.fn(),
@@ -495,7 +495,7 @@ describe('device sync controller', () => {
             },
             targets: {
                 clone: { snapshot: () => cloneSnapshot('bearer secret'), subscribe: (listener) => { listener(cloneSnapshot('bearer secret')); return () => undefined }, initialize: async () => undefined, joinClaimed: vi.fn(), confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn() },
-                delta: { snapshot: () => deltaSnapshot('http://private'), subscribe: (listener) => { listener(deltaSnapshot('http://private')); return () => undefined }, initialize: async () => undefined, pullRegistered: vi.fn() },
+                delta: { snapshot: () => deltaSnapshot('http://private'), subscribe: (listener) => { listener(deltaSnapshot('http://private')); return () => undefined }, initialize: async () => undefined, pullRegistered: vi.fn(), abandonRetained: vi.fn() },
                 bidirectional: { snapshot: () => bidirectionalSnapshot('Authorization: secret'), subscribe: (listener) => { listener(bidirectionalSnapshot('Authorization: secret')); return () => undefined }, initialize: async () => undefined, syncRegistered: vi.fn(), resolveRegistered: vi.fn(), resume: vi.fn(), acknowledge: vi.fn(), abandon: vi.fn() },
             },
         })
@@ -521,7 +521,7 @@ describe('device sync controller', () => {
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
                 revokeOutgoing: async () => undefined, claimStagedClone,
             },
-            targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered } },
+            targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() } },
         })
         await controller.initialize()
         controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
@@ -546,7 +546,7 @@ describe('device sync controller', () => {
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
                 revokeOutgoing: async () => undefined,
             },
-            targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered: vi.fn() } },
+            targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered: vi.fn(), abandonRetained: vi.fn() } },
         })
         await controller.initialize()
         const preparing = controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
@@ -632,7 +632,7 @@ describe('device sync controller', () => {
         const delta = {
             snapshot: () => ({ ...deltaSnapshot(), pullPhase: 'running' as const }),
             subscribe: () => () => undefined, initialize: async () => undefined,
-            pullRegistered: vi.fn(async () => ({ kind: 'noChanges' })),
+            pullRegistered: vi.fn(async () => ({ kind: 'noChanges' })), abandonRetained: vi.fn(),
         }
         const controller = createDeviceSyncController({ facade: sourceFacade(prepare), targets: { delta } })
         await controller.initialize()
@@ -710,7 +710,7 @@ describe('device sync controller', () => {
             targets: {
                 delta: {
                     snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                    initialize: async () => undefined, pullRegistered,
+                    initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                 },
             },
         })
@@ -739,7 +739,7 @@ describe('device sync controller', () => {
             },
             targets: {
                 clone,
-                delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered },
+                delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() },
             },
         })
         await controller.initialize()
@@ -763,7 +763,7 @@ describe('device sync controller', () => {
             targets: {
                 delta: {
                     snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                    initialize: async () => undefined, pullRegistered,
+                    initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                 },
             },
         })
@@ -788,7 +788,7 @@ describe('device sync controller', () => {
             targets: {
                 delta: {
                     snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                    initialize: async () => undefined, pullRegistered,
+                    initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                 },
             },
         })
@@ -923,7 +923,7 @@ describe('device sync controller', () => {
         }
         const delta = {
             snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: vi.fn(async () => undefined),
-            pullRegistered: vi.fn(async () => ({ kind: 'noChanges' })),
+            pullRegistered: vi.fn(async () => ({ kind: 'noChanges' })), abandonRetained: vi.fn(),
         }
         const bidirectional = {
             snapshot: () => bidirectionalSnapshot(), subscribe: () => () => undefined, initialize: vi.fn(async () => undefined),
@@ -1009,7 +1009,7 @@ describe('device sync controller', () => {
             targets: {
                 delta: {
                     snapshot: () => deltaSnapshot(), subscribe: () => () => undefined,
-                    initialize: async () => undefined, pullRegistered,
+                    initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn(),
                 },
             },
             deepLinks: { consumePending: () => uri, subscribe: () => () => undefined },
@@ -1102,5 +1102,55 @@ describe('device sync controller', () => {
         await expect(controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
             .rejects.toMatchObject({ code: 'operation-failed' })
         expect(controller.snapshot()).toMatchObject({ sourceError: 'operation-failed', workError: 'operation-failed' })
+    })
+    it('passes the retained delta completion through and delegates abandoning it', async () => {
+        const retained = {
+            operationId: '00000000-0000-4000-8000-000000000091',
+            sourceDeviceId: '00000000-0000-4000-8000-000000000093',
+            sourceName: 'Desk',
+            witness: 'ambiguous' as const,
+            transferredObjects: 2,
+            transferredBytes: 4096,
+        }
+        const withRetained = { ...deltaSnapshot(), retained }
+        const abandonRetained = vi.fn(async () => undefined)
+        const controller = createDeviceSyncController({
+            facade: sourceFacade(),
+            targets: {
+                delta: {
+                    snapshot: () => withRetained,
+                    subscribe: (listener) => { listener(withRetained); return () => undefined },
+                    initialize: async () => undefined,
+                    pullRegistered: vi.fn(), abandonRetained,
+                },
+            },
+        })
+
+        // The device name and the transfer size carry no credential, so they
+        // reach the page unchanged.
+        expect(controller.snapshot().targets.delta?.retained).toEqual(retained)
+
+        await controller.abandonDelta()
+
+        expect(abandonRetained).toHaveBeenCalledOnce()
+        expect(controller.snapshot().workError).toBeNull()
+    })
+
+    it('reports an abandoned delta failure as a safe work error', async () => {
+        const controller = createDeviceSyncController({
+            facade: sourceFacade(),
+            targets: {
+                delta: {
+                    snapshot: () => deltaSnapshot(),
+                    subscribe: () => () => undefined,
+                    initialize: async () => undefined,
+                    pullRegistered: vi.fn(),
+                    abandonRetained: vi.fn(async () => { throw new Error('http://private.example bearer secret') }),
+                },
+            },
+        })
+
+        await expect(controller.abandonDelta()).rejects.toMatchObject({ code: 'operation-failed' })
+        expect(controller.snapshot().workError).toBe('operation-failed')
     })
 })

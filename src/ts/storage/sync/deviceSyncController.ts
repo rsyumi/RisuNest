@@ -66,6 +66,7 @@ export type DeviceSyncDeltaTarget = {
     subscribe(listener: (snapshot: PeerDeltaControllerSnapshot) => void): () => void
     initialize(): Promise<void>
     pullRegistered(deviceId: string): Promise<unknown>
+    abandonRetained(): Promise<void>
 }
 export type DeviceSyncBidirectionalTarget = {
     snapshot(): PeerBidirectionalControllerSnapshot
@@ -591,6 +592,12 @@ export function createDeviceSyncController(options: {
                 await options.targets.bidirectional.acknowledge()
                 update({ activeBidirectionalSourceDeviceId: null })
             }, snapshot.activeBidirectionalSourceDeviceId ?? undefined))
+        },
+        abandonDelta(): Promise<void> {
+            return runExclusive(() => receive(async () => {
+                if (!options.targets?.delta) throw new DeviceSyncError('unavailable')
+                await options.targets.delta.abandonRetained()
+            }))
         },
         abandonBidirectional(): Promise<void> {
             return runExclusive(() => receive(async () => {

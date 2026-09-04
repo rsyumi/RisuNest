@@ -25,7 +25,7 @@ const controllerState = vi.hoisted(() => {
         revokeIncoming: vi.fn(async () => undefined), revokeOutgoing: vi.fn(async () => undefined), stageLink: vi.fn(), clearStagedLink: vi.fn(), claimStagedClone: vi.fn(async () => undefined), selectRegisteredClone: vi.fn(async () => undefined),
         confirmCloneReplace: vi.fn(async () => undefined), downloadClone: vi.fn(async () => undefined), resumeClone: vi.fn(async () => undefined), cancelClone: vi.fn(async () => undefined),
         pullStagedDelta: vi.fn(async () => undefined), pullRegisteredDelta: vi.fn(async () => undefined), syncStagedBidirectional: vi.fn(async () => undefined), syncRegisteredBidirectional: vi.fn(async () => undefined),
-        resolveRegisteredBidirectional: vi.fn(async () => undefined), resumeBidirectional: vi.fn(async () => undefined), rehostBidirectionalSource: vi.fn(async () => undefined), acknowledgeBidirectional: vi.fn(async () => undefined), abandonBidirectional: vi.fn(async () => undefined),
+        resolveRegisteredBidirectional: vi.fn(async () => undefined), resumeBidirectional: vi.fn(async () => undefined), rehostBidirectionalSource: vi.fn(async () => undefined), acknowledgeBidirectional: vi.fn(async () => undefined), abandonBidirectional: vi.fn(async () => undefined), abandonDelta: vi.fn(async () => undefined),
     }
     return { controller, emit: (snapshot: unknown) => listener?.(snapshot) }
 })
@@ -52,7 +52,7 @@ const cloneBase = {
     sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const }, sourcePairingUri: '', targetPhase: 'idle' as const, error: null, warning: null,
     state: { source: { phase: 'idle' as const, revokedDeviceIds: [] }, target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
 }
-const deltaBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const }, sourcePairingUri: '', pullPhase: 'idle' as const, error: null }
+const deltaBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const }, sourcePairingUri: '', pullPhase: 'idle' as const, retained: null, error: null }
 const bidiBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '', operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false, sourceError: null, operationError: null }
 const validRegistrationUri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F10.1.2.3%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
 
@@ -686,5 +686,100 @@ describe('DeviceSyncSettings', () => {
         button('Dismiss')!.click()
         await vi.waitFor(() => expect(target.querySelector('[data-work-status]')).toBeNull())
         expect(controllerState.controller.acknowledgeBidirectional).toHaveBeenCalledOnce()
+    })
+    const retainedDelta = (overrides: Record<string, unknown> = {}) => ({
+        operationId: '00000000-0000-4000-8000-000000000091',
+        sourceDeviceId: 'source-a',
+        sourceName: 'Desk',
+        witness: 'ambiguous' as const,
+        transferredObjects: 2,
+        transferredBytes: 4096,
+        ...overrides,
+    })
+    const registeredSourceA = [{ deviceId: 'source-a', name: 'Source A', permissions: ['read'] as const }]
+
+    it.each([
+        ['ambiguous' as const, 'cannot continue', 'Turn the other device back on'],
+        ['uncommitted' as const, 'Turn the other device back on', 'cannot continue'],
+        ['committed' as const, 'Turn the other device back on', 'cannot continue'],
+    ])('explains a retained %s delta by the other device name', async (witness, shown, hidden) => {
+        await render(snapshot({
+            sources: registeredSourceA,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta({ witness }) }, bidirectional: bidiBase },
+        }))
+
+        const retained = target.querySelector('[data-delta-retained]')!
+        expect(retained.textContent).toContain('An earlier update from Desk did not finish.')
+        expect(target.querySelector('[data-work-status]')!.textContent).toContain(shown)
+        expect(target.querySelector('[data-work-status]')!.textContent).not.toContain(hidden)
+    })
+
+    it('falls back to the unknown device wording when the source is no longer registered', async () => {
+        await render(snapshot({
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta({ sourceName: null }) }, bidirectional: bidiBase },
+        }))
+
+        expect(target.querySelector('[data-delta-retained]')!.textContent)
+            .toContain('An earlier update from Unknown device did not finish.')
+    })
+
+    it.each([
+        ['uncommitted' as const, registeredSourceA, true],
+        ['ambiguous' as const, registeredSourceA, false],
+        ['uncommitted' as const, [], false],
+    ])('offers continuing a retained %s delta only for a still registered source', async (witness, sources, offered) => {
+        await render(snapshot({
+            sources,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta({ witness }) }, bidirectional: bidiBase },
+        }))
+
+        expect(Boolean(button('Continue'))).toBe(offered)
+        expect(button('Abandon task')).toBeDefined()
+        if (!offered) return
+        button('Continue')!.click()
+        await vi.waitFor(() => expect(controllerState.controller.pullRegisteredDelta).toHaveBeenCalledWith('source-a'))
+    })
+
+    it('confirms before abandoning a retained delta and then closes the panel', async () => {
+        await render(snapshot({
+            sources: registeredSourceA,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta() }, bidirectional: bidiBase },
+        }))
+
+        button('Abandon task')!.click()
+
+        await vi.waitFor(() => expect(controllerState.controller.abandonDelta).toHaveBeenCalledOnce())
+        expect(alerts.alertConfirm).toHaveBeenCalledWith(
+            "Cancel the pending update? Data on this device stays as it is, but the other device's transfer statistics may not update.",
+        )
+        await vi.waitFor(() => expect(target.querySelector('[data-work-status]')).toBeNull())
+    })
+
+    it('keeps a declined retained delta abandonment untouched', async () => {
+        alerts.alertConfirm.mockResolvedValueOnce(false)
+        await render(snapshot({
+            sources: registeredSourceA,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta() }, bidirectional: bidiBase },
+        }))
+
+        button('Abandon task')!.click()
+        await tick()
+
+        expect(controllerState.controller.abandonDelta).not.toHaveBeenCalled()
+        expect(target.querySelector('[data-delta-retained]')).not.toBeNull()
+    })
+
+    it('locks every receive task while a delta stays retained but never the device removal', async () => {
+        await render(snapshot({
+            sources: registeredSourceA,
+            targets: { clone: cloneBase, delta: { ...deltaBase, retained: retainedDelta() }, bidirectional: bidiBase },
+        }))
+
+        for (const name of ['Copy everything', 'Get changes only', 'Two-way sync']) {
+            expect(button(name)?.disabled).toBe(true)
+        }
+        const removal = [...target.querySelectorAll<HTMLButtonElement>('[data-sync-card="devices"] button')]
+        expect(removal.length).toBeGreaterThan(0)
+        expect(removal.every((candidate) => candidate.disabled)).toBe(false)
     })
 })
