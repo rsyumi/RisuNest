@@ -172,7 +172,7 @@ pub struct LanCloneClient {
     session_url: String,
     pub device_id: String,
     bearer: String,
-    source_device_id: Option<String>,
+    source_device_id: String,
     manifest_id: Option<String>,
 }
 
@@ -285,7 +285,7 @@ impl LanCloneClient {
             session_url,
             device_id: target_device_id.to_owned(),
             bearer: bearer.to_owned(),
-            source_device_id: Some(source_device_id.to_owned()),
+            source_device_id: source_device_id.to_owned(),
             manifest_id: Some(manifest_id.to_owned()),
         };
         client.persist(credential_path)?;
@@ -387,7 +387,7 @@ impl LanCloneClient {
             session_url,
             device_id: response.device_id,
             bearer: response.bearer,
-            source_device_id: Some(source_device_id),
+            source_device_id,
             manifest_id: None,
         })
     }
@@ -401,11 +401,7 @@ impl LanCloneClient {
         &self,
         hello: PeerHello,
     ) -> Result<IncomingSource, PeerSyncError> {
-        if self
-            .source_device_id
-            .as_deref()
-            .is_some_and(|source_id| source_id != hello.device_id)
-        {
+        if self.source_device_id != hello.device_id {
             return Err(PeerSyncError::Protocol(
                 "v2 claim source device identity differs from authenticated hello".to_owned(),
             ));
@@ -460,7 +456,6 @@ impl LanCloneClient {
             reqwest::Url,
             String,
             Option<String>,
-            Option<String>,
         ),
         PeerSyncError,
     > {
@@ -472,7 +467,6 @@ impl LanCloneClient {
             session_url,
             self.bearer,
             self.manifest_id,
-            self.source_device_id,
         ))
     }
 
@@ -490,8 +484,8 @@ impl LanCloneClient {
         Ok((&self.endpoint, &self.session_id, manifest_id))
     }
 
-    pub(crate) fn registered_source_device_id(&self) -> Option<&str> {
-        self.source_device_id.as_deref()
+    pub(crate) fn registered_source_device_id(&self) -> &str {
+        &self.source_device_id
     }
 
     pub(crate) fn matches_registered_credential(
@@ -507,7 +501,7 @@ impl LanCloneClient {
             && self.session_id == session_id
             && self.manifest_id.as_deref() == Some(manifest_id)
             && self.device_id == target_device_id
-            && self.source_device_id.as_deref() == Some(source_device_id)
+            && self.source_device_id == source_device_id
             && constant_time_eq(&digest(self.bearer.as_bytes()), &digest(bearer.as_bytes())))
     }
 
@@ -802,8 +796,7 @@ struct PersistedLanCredential {
     manifest_id: String,
     device_id: String,
     bearer: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_device_id: Option<String>,
+    source_device_id: String,
     permission: String,
 }
 
@@ -814,10 +807,7 @@ impl PersistedLanCredential {
             || !is_canonical_uuid(&self.device_id)
             || !is_lower_hex_256(&self.manifest_id)
             || !is_lower_hex_256(&self.bearer)
-            || self
-                .source_device_id
-                .as_deref()
-                .is_some_and(|source_id| !is_canonical_uuid(source_id))
+            || !is_canonical_uuid(&self.source_device_id)
             || self.permission != "clone-read"
         {
             return Err(PeerSyncError::Protocol(
@@ -1092,7 +1082,8 @@ fn session_by_id<'a>(shared: &'a LanShared, session_id: &str) -> Option<&'a LanS
 
 #[cfg(any(desktop, target_os = "android"))]
 fn primary_session(shared: &LanShared) -> &LanSession {
-    // Every legacy host and shared host requires at least the clone session.
+    // Every host is prepared with at least one session, and a shared host lists the
+    // clone session first, so the pairing link always names this session.
     &shared.sessions[0]
 }
 
@@ -1263,8 +1254,9 @@ impl LanCloneHost {
         })
     }
 
-    // Opt-in protocol v2 state for the existing single-lane host. Keeping it
-    // explicit avoids changing legacy pairing links or their response shape.
+    // Decides what a claim on this host does: a registered clone or shared host
+    // registers the caller as an outgoing device, while a host that only opens a
+    // lane for a single operation issues a bearer for that lane and nothing else.
     pub(crate) fn enable_v2_registry(
         &mut self,
         app_root: &Path,
@@ -3720,6 +3712,32 @@ mod endpoint_tests {
     }
 
     #[test]
+    fn persisted_clone_credentials_require_their_registered_source_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("credential.json");
+        let mut credential = serde_json::json!({
+            "schema": PERSISTED_CREDENTIAL_SCHEMA,
+            "endpoint": "http://127.0.0.1:32145",
+            "sessionId": "00000000-0000-4000-8000-000000000001",
+            "manifestId": "a".repeat(64),
+            "deviceId": "00000000-0000-4000-8000-000000000002",
+            "bearer": "b".repeat(64),
+            "sourceDeviceId": "00000000-0000-4000-8000-000000000003",
+            "permission": "clone-read",
+        });
+        fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+        LanCloneClient::open_persisted(&path).unwrap();
+
+        credential
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceDeviceId")
+            .unwrap();
+        fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+        assert!(LanCloneClient::open_persisted(&path).is_err());
+    }
+
+    #[test]
     fn p4_delta_policy_accepts_private_lan_and_only_canonical_public_https() {
         assert_eq!(
             validate_p4_logical_delta_endpoint("http://192.168.1.2:8080").unwrap(),
@@ -4227,7 +4245,7 @@ mod timeout_tests {
             session_url,
             device_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             bearer: TEST_BEARER.to_owned(),
-            source_device_id: None,
+            source_device_id: "00000000-0000-4000-8000-000000000002".to_owned(),
             manifest_id: None,
         }
     }
@@ -4580,6 +4598,49 @@ mod timeout_tests {
     }
 
     #[test]
+    fn single_operation_lane_claim_reports_peer_outdated_without_registered_identity() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let device_id = "00000000-0000-4000-8000-000000000078";
+
+        for response in [
+            serde_json::json!({
+                "deviceId": device_id,
+                "bearer": "c".repeat(64),
+                "permission": "logical-read",
+                "permissions": ["read"],
+            }),
+            serde_json::json!({
+                "deviceId": device_id,
+                "bearer": "c".repeat(64),
+                "permission": "logical-read",
+                "sourceDeviceId": "00000000-0000-4000-8000-000000000079",
+            }),
+        ] {
+            let (endpoint, _calls, server) = canned_claim_response_server(response);
+            let claimed = LanLogicalDeltaClient::claim_with_timeouts_and_device(
+                &endpoint,
+                TEST_SESSION_ID,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                device_id,
+                "logical-read",
+                LogicalClientTimeouts {
+                    control_request: CONTROL_REQUEST_TIMEOUT,
+                    object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+                },
+            );
+            server.join().unwrap();
+
+            assert!(matches!(
+                claimed.err(),
+                Some(PeerSyncError::Validation(code)) if code == PEER_OUTDATED
+            ));
+        }
+    }
+
+    #[test]
     fn clone_claim_reports_peer_outdated_when_the_response_omits_registered_identity() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -4881,7 +4942,7 @@ mod timeout_tests {
             session_url: format!("{endpoint}/v1/sessions/{session_id}"),
             device_id: "00000000-0000-4000-8000-000000000121".to_owned(),
             bearer: TEST_BEARER.to_owned(),
-            source_device_id: Some("00000000-0000-4000-8000-000000000122".to_owned()),
+            source_device_id: "00000000-0000-4000-8000-000000000122".to_owned(),
             manifest_id: Some(manifest_id.clone()),
         };
 
@@ -6878,6 +6939,49 @@ mod timeout_tests {
     }
 
     #[test]
+    fn invalid_claim_fields_do_not_consume_an_unregistered_lane_claim() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        // No `enable_v2_registry`: this host only opens a lane for one operation.
+        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
+            "00000000-0000-4000-8000-000000000094",
+            &source_id,
+        ));
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let url = format!("{endpoint}/v1/sessions/{}/claim", pairing.session_id);
+        let target_id =
+            super::super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+        let raw = reqwest::blocking::Client::new();
+
+        for body in [
+            // The shape a build that predates the registered claim sends.
+            serde_json::json!({"claim": pairing.claim}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 2}),
+            serde_json::json!({"claim": pairing.claim, "deviceId": target_id}),
+        ] {
+            assert_eq!(
+                raw.post(&url).json(&body).send().unwrap().status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            raw.post(&url)
+                .json(&serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": target_id}))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
     fn changed_bearer_claim_requires_revoke_and_preserves_completion_replay() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -8306,9 +8410,15 @@ impl LanLogicalDeltaClient {
         }
         let response: ClaimResponseOwned = serde_json::from_slice(&body)
             .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-        let source_device_id = response.source_device_id.ok_or_else(|| {
-            PeerSyncError::Protocol("logical delta source device identity is missing".to_owned())
-        })?;
+        // A single-operation lane registers nothing, so the granted permissions only
+        // prove that the source answers the registered claim; the lane itself is
+        // authorized by the bearer this response carries.
+        let (Some(source_device_id), Some(granted)) =
+            (response.source_device_id, response.permissions)
+        else {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        };
+        DevicePermissions::from_values(granted)?;
         if response.device_id != device_id
             || !is_canonical_uuid(&source_device_id)
             || !is_lower_hex_256(&response.bearer)

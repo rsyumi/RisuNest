@@ -40,13 +40,17 @@ use crate::{
         },
         PayloadCas,
     },
-    local_backup::{CancellationProbe, NeverCancelled},
+    local_backup::CancellationProbe,
     persistent_store::{
         self, establish_logical_common_base_with_commit_intent,
         logical_delta_source::LogicalDeltaSourceSession, PersistentLogicalDeltaTarget,
         PersistentStore, StoreError, SyncGenerationIdentity, PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
+// The delta pull without completion accounting is test-only, and the registered
+// desktop pull is the one product caller that never cancels.
+#[cfg(any(desktop, test))]
+use crate::local_backup::NeverCancelled;
 use serde::Serialize;
 #[cfg(test)]
 use std::fs;
@@ -1243,7 +1247,7 @@ impl Read for MeasuredLogicalDeltaReader {
 }
 
 // Test-facing wrapper around the cancellation-aware pull entry point.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
@@ -1266,6 +1270,9 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     )
 }
 
+// The engine tests drive a pull without completion accounting; every product
+// caller reaches the pull through `pull_logical_delta_with_completion`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,

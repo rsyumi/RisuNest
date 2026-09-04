@@ -354,10 +354,7 @@ pub async fn peer_clone_claim_v2_client(
         .map_err(|error| {
             registered_target_operation_failure("Android clone registration", error)
         })?;
-        let source_device_id = client
-            .registered_source_device_id()
-            .ok_or(PeerCommandCode::OperationFailed)?
-            .to_owned();
+        let source_device_id = client.registered_source_device_id().to_owned();
         Ok(AndroidPeerCloneClaimResult {
             source_device_id,
             endpoint,
@@ -1027,7 +1024,7 @@ mod tests {
                 PeerCompletionCapability::Unsupported,
             )
             .unwrap();
-        assert_eq!(target.source_device_id.as_deref(), Some(SOURCE_ID));
+        assert_eq!(target.source_device_id, SOURCE_ID);
         assert!(
             serde_json::to_string(&state.target_status_current().unwrap())
                 .unwrap()

@@ -66,7 +66,7 @@ pub(crate) fn prepare_and_deliver_registered_clone_completion(
     let target_device_id = load_or_create_device_id(app_root)?;
     if delivery.lane != CompletionLane::Clone.as_str()
         || delivery.manifest_id != manifest_id
-        || lan.registered_source_device_id() != Some(delivery.source_device_id.as_str())
+        || lan.registered_source_device_id() != delivery.source_device_id
         || snapshot.source.device_id != delivery.source_device_id
         || snapshot.source.endpoint != endpoint
         || !snapshot.source.permissions.allows_read()
@@ -200,7 +200,6 @@ pub struct LoopbackCloneClient {
     root: PathBuf,
     transport: HttpCloneTransport,
     required_manifest_id: Option<String>,
-    source_device_id: Option<String>,
     manifest: Option<CloneManifest>,
     manifest_id: Option<String>,
     ledger: LedgerState,
@@ -306,7 +305,6 @@ impl LoopbackCloneClient {
                 bearer: None,
             },
             required_manifest_id: None,
-            source_device_id: None,
             manifest: None,
             manifest_id: None,
             ledger,
@@ -342,7 +340,7 @@ impl LoopbackCloneClient {
                 ))
             }
         };
-        let (http, ranges, session_url, bearer, persisted_manifest_id, source_device_id) =
+        let (http, ranges, session_url, bearer, persisted_manifest_id) =
             lan.into_resumable_parts()?;
         if persisted_manifest_id
             .as_deref()
@@ -365,7 +363,6 @@ impl LoopbackCloneClient {
                 bearer: Some(bearer),
             },
             required_manifest_id: Some(expected_manifest_id.to_owned()),
-            source_device_id,
             manifest: None,
             manifest_id: None,
             ledger,
@@ -380,10 +377,6 @@ impl LoopbackCloneClient {
             #[cfg(test)]
             fail_record_activation: false,
         })
-    }
-
-    pub(crate) fn source_device_id(&self) -> Option<&str> {
-        self.source_device_id.as_deref()
     }
 
     pub(crate) fn prepare_completion_manifest(&mut self) -> Result<Option<String>, PeerSyncError> {
@@ -1573,7 +1566,6 @@ mod timeout_tests {
                 bearer: Some("registered-bearer".to_owned()),
             },
             required_manifest_id: Some(manifest_id.clone()),
-            source_device_id: Some("00000000-0000-4000-8000-000000000403".to_owned()),
             manifest: Some(manifest),
             manifest_id: Some(manifest_id.clone()),
             ledger,
@@ -1861,7 +1853,6 @@ mod timeout_tests {
                 bearer: Some("registered-bearer".to_owned()),
             },
             required_manifest_id: Some(manifest_id),
-            source_device_id: Some("00000000-0000-4000-8000-000000000403".to_owned()),
             manifest: None,
             manifest_id: None,
             ledger: LedgerState::default(),
