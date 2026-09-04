@@ -583,8 +583,6 @@ pub fn run() {
             #[cfg(target_os = "android")]
             peer_sync::android_commands::peer_clone_android_capabilities,
             #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_claim,
-            #[cfg(target_os = "android")]
             peer_sync::android_commands::peer_clone_android_current,
             #[cfg(target_os = "android")]
             peer_sync::android_commands::peer_clone_android_download,

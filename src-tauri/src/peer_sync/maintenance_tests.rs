@@ -460,38 +460,16 @@ fn android_clone_backup_only_blocks_its_matching_unreleased_peer_clone_job() {
 }
 
 #[test]
-fn released_legacy_android_clone_backup_remains_deletable() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let root = directory.path();
-    let id = "00000000-0000-4000-8000-000000000204";
-    let backup = root.join(format!(
-        "peer-clone-activation/backups/pre-clone-{}-{id}.lossless",
-        "a".repeat(64)
-    ));
-    fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
-    fs::write(&backup, b"legacy Android backup").expect("write legacy Android backup");
-    let mut matching =
-        DurableCasJob::begin(root, id, CasJobKind::PeerClone, 0).expect("matching job");
-    matching
-        .release(CasReleaseOutcome::Aborted)
-        .expect("release matching job");
-
-    delete_backup(root, &backup).expect("released legacy Android backup can be deleted");
-    assert!(!backup.exists());
-}
-
-#[test]
-fn current_legacy_android_clone_backup_remains_protected_after_cas_release() {
+fn current_android_clone_backup_remains_protected_after_cas_release() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root = directory.path();
     let job_id = "00000000-0000-4000-8000-000000000205";
     let manifest_id = "b".repeat(64);
     let backup = root.join(format!(
-        "peer-clone-activation/backups/pre-clone-{}-{job_id}.lossless",
-        "c".repeat(64)
+        "peer-clone-activation/backups/pre-clone-{job_id}.lossless"
     ));
     fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backups");
-    fs::write(&backup, b"current legacy Android backup").expect("write legacy backup");
+    fs::write(&backup, b"current Android backup").expect("write Android backup");
     let mut matching =
         DurableCasJob::begin(root, job_id, CasJobKind::PeerClone, 0).expect("matching job");
     matching
@@ -539,34 +517,19 @@ fn current_legacy_android_clone_backup_remains_protected_after_cas_release() {
             "totalBytes": 1,
             "error": null,
             "committedRevision": 2,
-            "backupPath": null,
-        }),
-    );
-
-    delete_backup(root, &backup).expect("source-less legacy job does not own stale backup");
-    fs::write(&backup, b"current legacy Android backup").expect("recreate legacy backup");
-    write_json(
-        &job_root.join("status.json"),
-        serde_json::json!({
-            "schema": "risunest.android-peer-clone-status/v1",
-            "phase": "awaitingActivation",
-            "completedBytes": 1,
-            "totalBytes": 1,
-            "error": null,
-            "committedRevision": 2,
             "backupPath": backup,
             "completionAcknowledged": false,
         }),
     );
 
     assert_eq!(
-        delete_backup(root, &backup).expect_err("current legacy backup must remain"),
+        delete_backup(root, &backup).expect_err("current backup must remain"),
         PeerSyncError::Validation("peer-backup-in-use".to_owned())
     );
     assert!(backup.is_file());
 
     fs::remove_file(jobs_root.join("current.json")).expect("release current Android job");
-    delete_backup(root, &backup).expect("released legacy backup can be deleted");
+    delete_backup(root, &backup).expect("released backup can be deleted");
     assert!(!backup.exists());
 }
 

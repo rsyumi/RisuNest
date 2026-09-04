@@ -429,6 +429,75 @@ fn prepare(source: &FixtureSource, root: &Path) -> PreparedCloneSession {
     prepare_clone_session(source, root).unwrap()
 }
 
+/// Everything an Android clone job needs to reach a source this device is
+/// registered with.
+struct RegisteredAndroidSource {
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    target_device_id: String,
+    source_device_id: String,
+    bearer: String,
+}
+
+/// Enables the v2 registry on a prepared host, starts it, and registers
+/// `app_root` with it. Android clone jobs only ever start from a registered
+/// source, so every job fixture goes through this.
+fn register_android_clone_source(
+    host: &mut LanCloneHost,
+    source_root: &Path,
+    app_root: &Path,
+) -> RegisteredAndroidSource {
+    host.enable_v2_registry(
+        source_root,
+        "Android source",
+        super::device_registry::DevicePermissions::read(),
+    )
+    .unwrap();
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    super::lan::LanCloneClient::claim_strict_v2_and_persist_and_register(
+        app_root,
+        "Android target",
+        &app_root.join("registration-credential.json"),
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    let source_device_id = super::device_registry::load_or_create_device_id(source_root).unwrap();
+    let registered = super::device_registry::incoming_source_by_id(app_root, &source_device_id)
+        .unwrap()
+        .unwrap();
+    RegisteredAndroidSource {
+        endpoint: registered.endpoint,
+        session_id: pairing.session_id,
+        manifest_id: pairing.manifest_id,
+        target_device_id: super::device_registry::load_or_create_device_id(app_root).unwrap(),
+        source_device_id,
+        bearer: registered.bearer,
+    }
+}
+
+/// The registered equivalent of the removed v1 job claim, for job-level fixtures
+/// that own their job root directly instead of going through the registry.
+fn registered_android_clone_job(
+    job_root: &Path,
+    source: &RegisteredAndroidSource,
+) -> Result<AndroidResumableCloneJob, PeerSyncError> {
+    AndroidResumableCloneJob::from_registered(
+        job_root,
+        &source.endpoint,
+        &source.session_id,
+        &source.manifest_id,
+        &source.target_device_id,
+        &source.source_device_id,
+        &source.bearer,
+        super::lan::PeerCompletionCapability::Unsupported,
+    )
+}
+
 fn payload_hash(session: &PreparedCloneSession, index: usize) -> String {
     session.manifest().payloads[index].object.clone()
 }
@@ -1055,22 +1124,16 @@ fn persisted_lan_credential_is_owner_only_on_unix() {
 fn android_clone_job_resumes_from_a_verified_chunk_after_actual_process_kill() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
     let jobs_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[(CLONE_CHUNK_SIZE * 2 + 97) as usize]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
     let job_root = jobs_root
         .path()
         .join("99999999-9999-4999-8999-999999999999");
-    let job = AndroidResumableCloneJob::claim(
-        &job_root,
-        &endpoint,
-        &pairing.session_id,
-        &pairing.manifest_id,
-        &pairing.claim,
-    )
-    .unwrap();
+    let job = registered_android_clone_job(&job_root, &registered).unwrap();
     drop(job);
     let marker = jobs_root.path().join("verified-chunk.kill-ready");
     let mut child = spawn_android_clone_kill_child(&job_root, &marker);
@@ -1113,19 +1176,11 @@ fn android_clone_rejects_a_missing_backup_before_receipt_publication() {
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[97]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let job_id = "99999999-9999-4999-8999-999999999998";
     let job_root = app_root.path().join("peer-clone-jobs").join(job_id);
     fs::create_dir_all(job_root.parent().unwrap()).unwrap();
-    let job = AndroidResumableCloneJob::claim(
-        &job_root,
-        &endpoint,
-        &pairing.session_id,
-        &pairing.manifest_id,
-        &pairing.claim,
-    )
-    .unwrap();
+    let job = registered_android_clone_job(&job_root, &registered).unwrap();
     let backup_path = app_root
         .path()
         .join("peer-clone-activation/backups")
@@ -1155,22 +1210,16 @@ fn android_clone_progress_status_failure_pauses_and_resumes_without_redownloadin
     let mut completed = None;
     for attempt in 0..4 {
         let session_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
         let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-        let pairing = host.start().unwrap();
-        let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+        let registered =
+            register_android_clone_source(&mut host, source_root.path(), target_root.path());
         let job_root = jobs_root
             .path()
             .join(format!("66666666-6666-4666-8666-66666666666{attempt}"));
         let status_path = job_root.join("status.json");
         let status_backup = job_root.join("status.backup.json");
-        let mut job = AndroidResumableCloneJob::claim(
-            &job_root,
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
-        )
-        .unwrap();
+        let mut job = registered_android_clone_job(&job_root, &registered).unwrap();
         let cancellation = TransferCancellation::new();
         let mut sabotaged = false;
         let mut restored = false;
@@ -1230,6 +1279,7 @@ fn android_clone_progress_status_failure_pauses_and_resumes_without_redownloadin
 fn android_clone_progress_and_pause_status_failures_preserve_both_error_contexts() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
     let jobs_root = tempfile::tempdir().unwrap();
     // A small multi-callback object suffices: the sabotage fires on the first progress
     // callback, and the completion callback always attempts a status persist (the 4MiB
@@ -1237,21 +1287,14 @@ fn android_clone_progress_and_pause_status_failures_preserve_both_error_contexts
     // failure is exercised without a multi-chunk transfer.
     let source = fixture_source(source_root.path(), &[256 * 1024 + 97]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
     let job_root = jobs_root
         .path()
         .join("55555555-5555-4555-8555-555555555555");
     let status_path = job_root.join("status.json");
     let status_backup = job_root.join("status.backup.json");
-    let mut job = AndroidResumableCloneJob::claim(
-        &job_root,
-        &endpoint,
-        &pairing.session_id,
-        &pairing.manifest_id,
-        &pairing.claim,
-    )
-    .unwrap();
+    let mut job = registered_android_clone_job(&job_root, &registered).unwrap();
     let mut sabotaged = false;
 
     let result = job.download_with_progress(&TransferCancellation::new(), |_| {
@@ -1275,14 +1318,15 @@ fn android_clone_progress_and_pause_status_failures_preserve_both_error_contexts
 fn android_clone_explicit_cancel_removes_only_the_owned_job_root() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
     let jobs_root = tempfile::tempdir().unwrap();
     let source = fixture_source(
         source_root.path(),
         &[64 * 1024, (CLONE_CHUNK_SIZE + 17) as usize],
     );
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
     let job_root = jobs_root
         .path()
         .join("88888888-8888-4888-8888-888888888888");
@@ -1290,14 +1334,7 @@ fn android_clone_explicit_cancel_removes_only_the_owned_job_root() {
     fs::write(&unrelated, b"keep").unwrap();
     let cancellation = TransferCancellation::new();
     let cancellation_for_progress = cancellation.clone();
-    let mut job = AndroidResumableCloneJob::claim(
-        &job_root,
-        &endpoint,
-        &pairing.session_id,
-        &pairing.manifest_id,
-        &pairing.claim,
-    )
-    .unwrap();
+    let mut job = registered_android_clone_job(&job_root, &registered).unwrap();
 
     let result = job.download_with_progress(&cancellation, move |bytes| {
         if bytes >= 128 * 1024 {
@@ -1316,24 +1353,18 @@ fn android_clone_explicit_cancel_removes_only_the_owned_job_root() {
 fn android_clone_cancel_marker_survives_reopen_before_owned_cleanup() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
     let jobs_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
     let job_root = jobs_root
         .path()
         .join("77777777-7777-4777-8777-777777777777");
     let unrelated = jobs_root.path().join("keep.txt");
     fs::write(&unrelated, b"keep").unwrap();
-    let job = AndroidResumableCloneJob::claim(
-        &job_root,
-        &endpoint,
-        &pairing.session_id,
-        &pairing.manifest_id,
-        &pairing.claim,
-    )
-    .unwrap();
+    let job = registered_android_clone_job(&job_root, &registered).unwrap();
 
     job.request_cancel().unwrap();
     drop(job);
@@ -1368,33 +1399,35 @@ fn android_clone_registry_recovers_one_persisted_job_without_exposing_the_bearer
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
 
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
 
     assert_eq!(claimed.phase, AndroidCloneJobPhase::Ready);
-    assert_eq!(claimed.endpoint, endpoint);
-    assert_eq!(claimed.session_id, pairing.session_id);
-    assert_eq!(claimed.manifest_id, pairing.manifest_id);
+    assert_eq!(claimed.endpoint, registered.endpoint);
+    assert_eq!(claimed.session_id, registered.session_id);
+    assert_eq!(claimed.manifest_id, registered.manifest_id);
     assert!(!serde_json::to_string(&claimed).unwrap().contains("bearer"));
-    let legacy_job_root = app_root
+    let job_root = app_root
         .path()
         .join("peer-clone-jobs")
         .join(&claimed.job_id);
     let descriptor: Value =
-        serde_json::from_slice(&fs::read(legacy_job_root.join("job.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(job_root.join("job.json")).unwrap()).unwrap();
     let status: Value =
-        serde_json::from_slice(&fs::read(legacy_job_root.join("status.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(job_root.join("status.json")).unwrap()).unwrap();
     assert!(descriptor.get("completionCapability").is_none());
     assert!(status.get("completionLeaseId").is_none());
     drop(registry);
@@ -2063,6 +2096,55 @@ fn android_clone_recovery_discards_an_unpublished_registered_source_orphan() {
 }
 
 #[test]
+fn android_clone_recovery_discards_a_job_whose_credential_lost_its_source_identity() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
+        )
+        .unwrap();
+    drop(registry);
+    let jobs_root = app_root.path().join("peer-clone-jobs");
+    let job_root = jobs_root.join(&claimed.job_id);
+    let credential_path = job_root.join("credential.json");
+    let mut credential: Value =
+        serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
+    assert!(credential
+        .as_object_mut()
+        .unwrap()
+        .remove("sourceDeviceId")
+        .is_some());
+    fs::write(&credential_path, serde_json::to_vec(&credential).unwrap()).unwrap();
+    assert!(job_root.join("status.json").is_file());
+    assert!(jobs_root.join("current.json").is_file());
+
+    let recovered =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+
+    assert!(!job_root.exists());
+    assert!(!jobs_root
+        .join(format!(".deleting-{}", claimed.job_id))
+        .exists());
+    assert!(!jobs_root.join("current.json").exists());
+    assert!(recovered.current().unwrap().is_none());
+    assert!(recovered.current_for_command().unwrap().is_none());
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_registration_claim_is_strict_v2_and_does_not_consume_a_legacy_claim() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
@@ -2105,16 +2187,18 @@ fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery(
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     fs::write(
@@ -2235,16 +2319,18 @@ fn android_clone_registry_recovers_a_renamed_deletion_tombstone() {
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     drop(registry);
@@ -2271,25 +2357,30 @@ fn android_clone_registry_rejects_a_second_target_until_the_owned_job_is_resolve
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
     registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
 
     let error = registry
-        .claim(
-            &endpoint,
+        .connect_registered(
+            &registered.endpoint,
             "22222222-2222-4222-8222-222222222222",
             &"c".repeat(64),
-            &"d".repeat(64),
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap_err();
 
@@ -2304,16 +2395,18 @@ fn android_clone_registry_marks_a_transport_interruption_paused_for_foreground_r
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     host.stop().unwrap();
@@ -2335,16 +2428,18 @@ fn android_clone_registry_reclaims_a_durable_cancel_marker_during_restart() {
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry.request_cancel(&claimed.job_id).unwrap();
@@ -2369,16 +2464,18 @@ fn android_clone_registry_retains_live_cancelled_ownership_until_native_cleanup(
     let app_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
 
@@ -2963,9 +3060,6 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
     );
     assert!(registry.release(&claimed.job_id, &target_store).is_err());
     assert!(status_path.is_file());
-    target_store
-        .remove_app_kv("peerCloneAndroidActiveOperation")
-        .unwrap();
     let mut post_activation_root = target_store.read_root(None).unwrap().value;
     post_activation_root["username"] = Value::from("Post activation edit");
     let ordinary_commit: crate::persistent_store::WorkingSetCommit =
@@ -2977,13 +3071,6 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
     target_store.commit(&ordinary_commit).unwrap();
     assert_eq!(target_store.revision().unwrap(), 3);
     drop(registry);
-    let mut legacy_status: Value =
-        serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
-    legacy_status
-        .as_object_mut()
-        .unwrap()
-        .remove("completionAcknowledged");
-    fs::write(&status_path, serde_json::to_vec(&legacy_status).unwrap()).unwrap();
 
     let restarted =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
@@ -3039,16 +3126,19 @@ fn android_clone_registry_rebuilds_verified_missing_status_from_transfer_ledger(
     )
     .unwrap();
     let mut host = LanCloneHost::prepare(prepared);
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry
@@ -3263,35 +3353,19 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .unwrap_or(0),
         0
     );
-    target_store
-        .remove_app_kv("peerCloneAndroidActiveOperation")
-        .unwrap();
-    let legacy_status_path = target_root
-        .path()
-        .join("peer-clone-jobs")
-        .join(&legacy_no_backup.job_id)
-        .join("status.json");
-    let mut legacy_status: Value =
-        serde_json::from_slice(&fs::read(&legacy_status_path).unwrap()).unwrap();
-    legacy_status["completionAcknowledged"] = Value::Bool(false);
-    fs::write(
-        &legacy_status_path,
-        serde_json::to_vec(&legacy_status).unwrap(),
-    )
-    .unwrap();
     drop(registry);
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
     registry
         .release(&legacy_no_backup.job_id, &target_store)
         .unwrap();
-    let migrated_witness = target_store
+    let witness = target_store
         .get_app_kv("peerCloneAndroidActiveOperation")
         .unwrap()
         .unwrap();
-    assert_eq!(migrated_witness["jobId"], legacy_no_backup.job_id);
-    assert_eq!(migrated_witness["manifestId"], pairing.manifest_id);
-    assert_eq!(migrated_witness["revision"], 4);
+    assert_eq!(witness["jobId"], legacy_no_backup.job_id);
+    assert_eq!(witness["manifestId"], pairing.manifest_id);
+    assert_eq!(witness["revision"], 4);
     let mut post_clone_root = target_store.read_root(None).unwrap().value;
     post_clone_root["username"] = Value::from("Edited after first clone");
     let ordinary_commit: crate::persistent_store::WorkingSetCommit =
@@ -3482,16 +3556,19 @@ fn android_clone_registry_retries_after_backup_receipt_persistence_fails() {
     )
     .unwrap();
     let mut host = LanCloneHost::prepare(prepared);
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
     let registry =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
     let claimed = registry
-        .claim(
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry
@@ -3539,54 +3616,7 @@ fn android_clone_registry_retries_after_backup_receipt_persistence_fails() {
         1
     );
     registry.release(&claimed.job_id, &target_store).unwrap();
-    let legacy_pairing = host.rotate_pairing_link().unwrap();
-    let legacy = registry
-        .claim(
-            &endpoint,
-            &legacy_pairing.session_id,
-            &legacy_pairing.manifest_id,
-            &legacy_pairing.claim,
-        )
-        .unwrap();
-    registry
-        .download(&legacy.job_id, &TransferCancellation::new())
-        .unwrap();
-    let legacy_receipt = registry
-        .finalize(
-            &legacy.job_id,
-            &mut target_store,
-            &target_cas,
-            &activation_root,
-            2,
-            &crate::local_backup::NeverCancelled,
-        )
-        .unwrap();
-    assert_eq!(legacy_receipt.revision, 2);
-    assert_eq!(legacy_receipt.backup_path, None);
-    target_store
-        .remove_app_kv("peerCloneAndroidActiveOperation")
-        .unwrap();
-    let legacy_status_path = target_root
-        .path()
-        .join("peer-clone-jobs")
-        .join(&legacy.job_id)
-        .join("status.json");
-    let mut legacy_status: Value =
-        serde_json::from_slice(&fs::read(&legacy_status_path).unwrap()).unwrap();
-    legacy_status
-        .as_object_mut()
-        .unwrap()
-        .remove("completionAcknowledged");
-    fs::write(
-        &legacy_status_path,
-        serde_json::to_vec(&legacy_status).unwrap(),
-    )
-    .unwrap();
-    drop(registry);
-    let restarted =
-        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
-    restarted.release(&legacy.job_id, &target_store).unwrap();
-    assert!(restarted.current().unwrap().is_none());
+    assert!(registry.current().unwrap().is_none());
     host.stop().unwrap();
 }
 

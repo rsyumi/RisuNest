@@ -107,14 +107,6 @@ pub(crate) struct AndroidCloneJobStatus {
     pub(crate) backup_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-#[cfg(any(target_os = "android", test))]
-pub(crate) enum AndroidCloneCurrentStatus {
-    Legacy(AndroidCloneJobStatus),
-    Registered(super::registered_target_commands::AndroidRegisteredCloneStatus),
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AndroidCloneJobDescriptor {
@@ -222,17 +214,10 @@ pub(crate) fn current_android_clone_job_references_backup(
     else {
         return Ok(false);
     };
-    let (job_id, legacy_name) = if validate_job_id(stem).is_ok() {
-        (stem, false)
-    } else {
-        let Some((manifest_id, job_id)) = stem.split_once('-') else {
-            return Ok(false);
-        };
-        if !is_sha256(manifest_id) || validate_job_id(job_id).is_err() {
-            return Ok(false);
-        }
-        (job_id, true)
-    };
+    if validate_job_id(stem).is_err() {
+        return Ok(false);
+    }
+    let job_id = stem;
 
     let backup_root = fs::canonicalize(app_root.join("peer-clone-activation/backups"))?;
     let backup = fs::canonicalize(backup)?;
@@ -274,7 +259,7 @@ pub(crate) fn current_android_clone_job_references_backup(
         read_bounded_json(&job_root.join("status.json"), MAX_JOB_RECORD_BYTES)?;
     status.validate()?;
     let Some(receipt) = status.backup_path else {
-        return Ok(!legacy_name);
+        return Ok(true);
     };
     if fs::canonicalize(receipt)? != backup {
         return Err(PeerSyncError::Validation(
@@ -300,67 +285,7 @@ pub struct AndroidResumableCloneJob {
 }
 
 impl AndroidResumableCloneJob {
-    pub fn claim(
-        job_root: impl AsRef<Path>,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-    ) -> Result<Self, PeerSyncError> {
-        let job_root = job_root.as_ref();
-        let job_id = validate_job_id_from_path(job_root)?;
-        fs::create_dir(job_root)?;
-        let root = fs::canonicalize(job_root)?;
-        let result = (|| {
-            write_new_json(
-                &root.join("ownership.json"),
-                &AndroidCloneJobOwnership {
-                    schema: JOB_OWNERSHIP_SCHEMA.to_owned(),
-                    job_id: job_id.clone(),
-                },
-            )?;
-            let descriptor = AndroidCloneJobDescriptor {
-                schema: JOB_SCHEMA.to_owned(),
-                job_id: job_id.clone(),
-                manifest_id: manifest_id.to_owned(),
-                completion_capability: None,
-            };
-            write_new_json(&root.join("job.json"), &descriptor)?;
-            let lan = LanCloneClient::claim_and_persist(
-                &root.join("credential.json"),
-                endpoint,
-                session_id,
-                manifest_id,
-                claim,
-            )?;
-            let (endpoint, session_id, persisted_manifest_id) = lan.target_identity()?;
-            if persisted_manifest_id != descriptor.manifest_id {
-                return Err(PeerSyncError::Storage(
-                    "Android clone job target identity is inconsistent".to_owned(),
-                ));
-            }
-            let endpoint = endpoint.to_owned();
-            let session_id = session_id.to_owned();
-            let client = LoopbackCloneClient::from_lan(&root, lan, manifest_id)?;
-            write_new_json(
-                &root.join("status.json"),
-                &AndroidClonePersistedStatus::ready(None),
-            )?;
-            Ok(Self {
-                root: root.clone(),
-                descriptor,
-                endpoint,
-                session_id,
-                client,
-            })
-        })();
-        if result.is_err() {
-            let _ = cleanup_unpublished_job(&root, &job_id);
-        }
-        result
-    }
-
-    fn from_registered(
+    pub(crate) fn from_registered(
         job_root: impl AsRef<Path>,
         endpoint: &str,
         session_id: &str,
@@ -758,7 +683,7 @@ impl AndroidResumableCloneJob {
             let app_root = self.root.parent().and_then(Path::parent).ok_or_else(|| {
                 PeerSyncError::Storage("Android clone job has no app root".to_owned())
             })?;
-            if !legacy_backup_owns_activation(
+            if !backup_receipt_owns_activation(
                 Some(backup_path),
                 &app_root.join("peer-clone-activation"),
                 &self.descriptor.job_id,
@@ -908,38 +833,6 @@ impl AndroidCloneJobRegistry {
         Ok(registry)
     }
 
-    pub(crate) fn claim(
-        &self,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-    ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
-        let endpoint = validate_lan_endpoint(endpoint)?;
-        validate_session_id(session_id)?;
-        if !is_sha256(manifest_id) {
-            return Err(PeerSyncError::Protocol(
-                "invalid LAN manifest identity".to_owned(),
-            ));
-        }
-        let state = self.lock()?;
-        self.recover_locked(&state, false)?;
-        if self.read_current_id()?.is_some() {
-            return Err(PeerSyncError::Validation(
-                "Android clone target already owns a job".to_owned(),
-            ));
-        }
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let job_root = self.jobs_root.join(&job_id);
-        let job =
-            AndroidResumableCloneJob::claim(&job_root, &endpoint, session_id, manifest_id, claim)?;
-        if let Err(error) = self.write_current_id(&job_id) {
-            let _ = job.discard();
-            return Err(error);
-        }
-        job.status()
-    }
-
     pub(crate) fn connect_registered(
         &self,
         endpoint: &str,
@@ -1056,7 +949,10 @@ impl AndroidCloneJobRegistry {
     #[cfg(any(target_os = "android", test))]
     pub(crate) fn current_for_command(
         &self,
-    ) -> Result<Option<AndroidCloneCurrentStatus>, PeerSyncError> {
+    ) -> Result<
+        Option<super::registered_target_commands::AndroidRegisteredCloneStatus>,
+        PeerSyncError,
+    > {
         let state = self.lock()?;
         self.recover_locked(&state, false)?;
         let Some(job_id) = self.read_current_id()? else {
@@ -1072,15 +968,14 @@ impl AndroidCloneJobRegistry {
         if job.cancel_requested()? {
             status.phase = AndroidCloneJobPhase::Cancelled;
         }
-        Ok(Some(match job.client.source_device_id() {
-            Some(source_device_id) => AndroidCloneCurrentStatus::Registered(
-                super::registered_target_commands::safe_android_clone_status(
-                    source_device_id,
-                    &status,
-                ),
-            ),
-            None => AndroidCloneCurrentStatus::Legacy(status),
-        }))
+        // Every job is created from a registered source, so recovery has already
+        // released any job whose credential lost that binding.
+        let source_device_id = job.client.source_device_id().ok_or_else(|| {
+            PeerSyncError::Storage("Android clone job has no registered source".to_owned())
+        })?;
+        Ok(Some(
+            super::registered_target_commands::safe_android_clone_status(source_device_id, &status),
+        ))
     }
 
     #[cfg(test)]
@@ -1112,17 +1007,7 @@ impl AndroidCloneJobRegistry {
         let job = AndroidResumableCloneJob::open(&root)?;
         let status = job.status()?;
         if let Some(committed_revision) = status.committed_revision {
-            let legacy_receipt = self.legacy_registered_completion_recorded(&job, job_id)?;
-            validate_committed_activation(
-                store,
-                &status.manifest_id,
-                job_id,
-                committed_revision,
-                status.backup_path.as_deref(),
-                activation_root,
-                legacy_receipt,
-                false,
-            )?;
+            validate_committed_activation(store, &status.manifest_id, job_id, committed_revision)?;
             self.finish_durable_completion(&root, job_id, activation_root)?;
             let status = AndroidResumableCloneJob::open(&root)?.status()?;
             return Ok(AndroidCloneFinalizeReceipt {
@@ -1195,17 +1080,7 @@ impl AndroidCloneJobRegistry {
             })?;
         record_activation_witness(store, job_id, &manifest_id, committed_revision)?;
         AndroidResumableCloneJob::open(&root)?.mark_committed(committed_revision)?;
-        let committed = AndroidResumableCloneJob::open(&root)?.status()?;
-        validate_committed_activation(
-            store,
-            &manifest_id,
-            job_id,
-            committed_revision,
-            committed.backup_path.as_deref(),
-            activation_root,
-            false,
-            false,
-        )?;
+        validate_committed_activation(store, &manifest_id, job_id, committed_revision)?;
         self.finish_durable_completion(&root, job_id, activation_root)?;
         let status = AndroidResumableCloneJob::open(&root)?.status()?;
         Ok(AndroidCloneFinalizeReceipt {
@@ -1229,7 +1104,7 @@ impl AndroidCloneJobRegistry {
         }
         let completion_capability = descriptor_completion_capability(&job.descriptor)?;
         if job.client.source_device_id().is_some()
-            && !legacy_backup_owns_activation(
+            && !backup_receipt_owns_activation(
                 persisted.backup_path.as_deref(),
                 activation_root,
                 job_id,
@@ -1334,47 +1209,6 @@ impl AndroidCloneJobRegistry {
         job.acknowledge_completion()
     }
 
-    fn legacy_registered_completion_recorded(
-        &self,
-        job: &AndroidResumableCloneJob,
-        job_id: &str,
-    ) -> Result<bool, PeerSyncError> {
-        let Some(source_device_id) = job.client.source_device_id() else {
-            return Ok(false);
-        };
-        let app_root = self.jobs_root.parent().ok_or_else(|| {
-            PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
-        })?;
-        let receipt_id = super::device_registry::completion_receipt_id(
-            "clone",
-            job_id,
-            &job.descriptor.manifest_id,
-        );
-        super::device_registry::incoming_completed_operation_recorded(
-            app_root,
-            source_device_id,
-            &receipt_id,
-        )
-    }
-
-    fn legacy_source_less_completion_ready(
-        &self,
-        job: &mut AndroidResumableCloneJob,
-    ) -> Result<bool, PeerSyncError> {
-        if job.client.source_device_id().is_some() {
-            return Ok(false);
-        }
-        let status = job.read_status()?;
-        let (completed_bytes, total_bytes) = job.client.transfer_progress()?;
-        Ok(status.committed_revision.is_some()
-            && completed_bytes == total_bytes
-            && status.completed_bytes == completed_bytes
-            && status.total_bytes == Some(total_bytes)
-            && job
-                .client
-                .all_objects_verified(&TransferCancellation::new())?)
-    }
-
     #[cfg(test)]
     pub(crate) fn leave_activation_stage_after_commit_once_for_test(&self) {
         self.leave_activation_stage_after_commit
@@ -1420,15 +1254,13 @@ impl AndroidCloneJobRegistry {
     ) -> Result<(), PeerSyncError> {
         let state = self.lock()?;
         let root = self.owned_job_root_locked(job_id, &state)?;
-        let mut job = AndroidResumableCloneJob::open(root)?;
+        let job = AndroidResumableCloneJob::open(root)?;
         let status = job.read_status()?;
         let Some(committed_revision) = status.committed_revision else {
             return Err(PeerSyncError::Validation(
                 "Android clone job cannot be released before durable completion".to_owned(),
             ));
         };
-        let legacy_receipt = self.legacy_registered_completion_recorded(&job, job_id)?;
-        let legacy_source_less = self.legacy_source_less_completion_ready(&mut job)?;
         let activation_root = self
             .jobs_root
             .parent()
@@ -1441,10 +1273,6 @@ impl AndroidCloneJobRegistry {
             &job.descriptor.manifest_id,
             job_id,
             committed_revision,
-            status.backup_path.as_deref(),
-            &activation_root,
-            legacy_receipt,
-            legacy_source_less,
         )?;
         self.finish_durable_completion(&job.root, job_id, &activation_root)?;
         let completed = AndroidResumableCloneJob::open(&job.root)?;
@@ -1514,16 +1342,19 @@ impl AndroidCloneJobRegistry {
                 }
                 Err(error) => return Err(error),
             };
+            // Every job is created from a registered source, so a job directory
+            // whose credential has no source identity is corrupt: release it the
+            // same way an orphaned job is released.
+            if job.client.source_device_id().is_none() {
+                job.discard()?;
+                continue;
+            }
             let status = job.read_status()?;
-            if status.committed_revision.is_none()
-                && job.client.source_device_id().is_some()
-                && pointer.as_deref() != Some(job_id.as_str())
-            {
+            if status.committed_revision.is_none() && pointer.as_deref() != Some(job_id.as_str()) {
                 job.discard()?;
                 continue;
             }
             if status.committed_revision.is_none()
-                && job.client.source_device_id().is_some()
                 && !registered_android_job_source_is_current(&self.jobs_root, &job)?
             {
                 job.discard()?;
@@ -1605,9 +1436,9 @@ fn registered_android_job_source_is_current(
         PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
     })?;
     let credential = LanCloneClient::open_persisted(&job.root.join("credential.json"))?;
-    let Some(source_device_id) = credential.registered_source_device_id() else {
-        return Ok(true);
-    };
+    let source_device_id = credential.registered_source_device_id().ok_or_else(|| {
+        PeerSyncError::Storage("Android clone job has no registered source".to_owned())
+    })?;
     let Some(source) = super::device_registry::incoming_source_by_id(app_root, source_device_id)?
     else {
         return Ok(false);
@@ -1655,10 +1486,6 @@ fn validate_committed_activation(
     manifest_id: &str,
     job_id: &str,
     committed_revision: u64,
-    backup_path: Option<&Path>,
-    activation_root: &Path,
-    legacy_registered_receipt: bool,
-    legacy_source_less_cleanup: bool,
 ) -> Result<(), PeerSyncError> {
     let committed_revision = i64::try_from(committed_revision).map_err(|_| {
         PeerSyncError::Validation(
@@ -1686,25 +1513,15 @@ fn validate_committed_activation(
                 && witness.manifest_id == manifest_id
                 && witness.revision == committed_revision
         });
-    let legacy_backup = legacy_backup_owns_activation(backup_path, activation_root, job_id)?;
-    let legacy_source_less_cleanup = legacy_source_less_cleanup && revision == committed_revision;
-    if !marker_valid
-        || (!witness_valid
-            && !legacy_backup
-            && !legacy_registered_receipt
-            && !legacy_source_less_cleanup)
-    {
+    if !marker_valid || !witness_valid {
         return Err(PeerSyncError::Validation(
             "Android clone committed activation evidence is invalid".to_owned(),
         ));
     }
-    if !witness_valid && (legacy_registered_receipt || legacy_source_less_cleanup) {
-        record_activation_witness(store, job_id, manifest_id, committed_revision as u64)?;
-    }
     Ok(())
 }
 
-fn legacy_backup_owns_activation(
+fn backup_receipt_owns_activation(
     backup_path: Option<&Path>,
     activation_root: &Path,
     job_id: &str,

@@ -1,7 +1,8 @@
 use super::{
-    android_client::{AndroidCloneCurrentStatus, AndroidCloneJobRegistry, AndroidCloneJobStatus},
+    android_client::AndroidCloneJobRegistry,
     android_jni,
     command_codes::{finish_peer_command, finish_peer_worker},
+    registered_target_commands::AndroidRegisteredCloneStatus,
     PeerSyncError,
 };
 use crate::{
@@ -71,26 +72,9 @@ pub(crate) fn peer_clone_android_capabilities(
 }
 
 #[tauri::command]
-pub(crate) async fn peer_clone_android_claim(
-    state: State<'_, AndroidPeerCloneCommandState>,
-    endpoint: String,
-    session_id: String,
-    manifest_id: String,
-    claim: String,
-) -> Result<AndroidCloneJobStatus, String> {
-    let registry = state.registry()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        registry.claim(&endpoint, &session_id, &manifest_id, &claim)
-    })
-    .await
-    .map_err(|error| format!("Android peer clone claim worker failed: {error}"))?
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub(crate) async fn peer_clone_android_current(
     state: State<'_, AndroidPeerCloneCommandState>,
-) -> Result<Option<AndroidCloneCurrentStatus>, String> {
+) -> Result<Option<AndroidRegisteredCloneStatus>, String> {
     let registry = state.registry()?;
     finish_peer_worker(
         "Android peer clone status",
