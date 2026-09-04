@@ -8922,10 +8922,6 @@ fn bidirectional_restart_uses_the_canonical_source_identity_for_durable_checks()
     let directory = tempfile::tempdir().unwrap();
     let canonical =
         super::super::device_registry::load_or_create_device_id(directory.path()).unwrap();
-    let legacy = directory.path().join("peer-delta").join("source-device-id");
-    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    fs::write(&legacy, "123e4567-e89b-42d3-a456-426614174199").unwrap();
-    fs::remove_file(&legacy).unwrap();
     let source_device_id =
         super::super::delta_commands::canonical_source_device_id(directory.path()).unwrap();
     let operation = PeerBidirectionalDurableOperation::SourcePrepared {
@@ -8955,7 +8951,6 @@ fn bidirectional_restart_uses_the_canonical_source_identity_for_durable_checks()
     assert_eq!(source_device_id, canonical);
     assert_eq!(restarted, canonical);
     assert!(retained_allows_source_prepare(&operation, &restarted));
-    assert!(!legacy.exists());
 }
 
 #[test]

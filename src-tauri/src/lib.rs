@@ -641,8 +641,6 @@ pub fn run() {
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_revoke,
             #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_pull,
-            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_target_retained,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_target_abandon,

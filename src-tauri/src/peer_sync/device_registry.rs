@@ -1772,17 +1772,8 @@ pub(crate) fn load_or_create_device_id(app_root: &Path) -> Result<String, PeerSy
     if path_exists(&current)? {
         return read_device_id(&current);
     }
-    let legacy = app_root.join("peer-delta/source-device-id");
-    let has_legacy = path_exists(&legacy)?;
-    let device_id = if has_legacy {
-        read_device_id(&legacy)?
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
+    let device_id = uuid::Uuid::new_v4().to_string();
     write_owner_only(&current, device_id.as_bytes())?;
-    if has_legacy {
-        fs::remove_file(legacy)?;
-    }
     Ok(device_id)
 }
 

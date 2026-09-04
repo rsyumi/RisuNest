@@ -1037,7 +1037,7 @@ fn completion_lease_issue_rejects_impossible_measurement_states() {
 }
 
 #[test]
-fn stable_device_id_migrates_once_and_is_idempotent() {
+fn stable_device_id_is_idempotent_and_never_reads_a_legacy_delta_file() {
     let root = tempfile::tempdir().unwrap();
     let legacy = root.path().join("peer-delta").join("source-device-id");
     fs::create_dir_all(legacy.parent().unwrap()).unwrap();
@@ -1046,13 +1046,17 @@ fn stable_device_id_migrates_once_and_is_idempotent() {
     let first = super::device_registry::load_or_create_device_id(root.path()).unwrap();
     let second = super::device_registry::load_or_create_device_id(root.path()).unwrap();
 
-    assert_eq!(first, SOURCE_ID);
+    assert_ne!(first, SOURCE_ID);
+    assert_eq!(uuid::Uuid::parse_str(&first).unwrap().to_string(), first);
     assert_eq!(second, first);
     assert_eq!(
         fs::read_to_string(root.path().join("peer-sync/device-id")).unwrap(),
         first
     );
-    assert!(!legacy.exists());
+    assert_eq!(
+        fs::read_to_string(&legacy).unwrap(),
+        format!("{SOURCE_ID}\n")
+    );
 }
 
 #[test]
@@ -2014,12 +2018,6 @@ fn device_ids_are_bounded_regular_canonical_files() {
     assert!(super::device_registry::load_or_create_device_id(root.path()).is_err());
 
     fs::write(&current, "B8E9D6D7-6D4C-43D8-B00A-80C8F34478B6").unwrap();
-    assert!(super::device_registry::load_or_create_device_id(root.path()).is_err());
-
-    fs::remove_file(&current).unwrap();
-    let legacy = root.path().join("peer-delta/source-device-id");
-    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    fs::write(&legacy, "x".repeat(65)).unwrap();
     assert!(super::device_registry::load_or_create_device_id(root.path()).is_err());
 }
 

@@ -64,8 +64,6 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 
-#[cfg(test)]
-const SOURCE_DEVICE_ID_FILE: &str = "source-device-id";
 const P4_DELTA_TARGET_JOB_PREFIX: &str = "p4-delta-target-";
 const P4_SOURCE_PIN_PREFIX: &str = "logical-session-p4-source-";
 
@@ -1968,42 +1966,6 @@ pub fn peer_delta_revoke(
         .map_err(|error| error.to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn peer_delta_pull_with_cancellation<C: CancellationProbe + Send + 'static>(
-    app: AppHandle,
-    state: State<'_, PeerDeltaCommandState>,
-    endpoint: String,
-    session_id: String,
-    manifest_id: String,
-    claim: String,
-    expected_revision: i64,
-    cancellation: C,
-) -> Result<PeerDeltaPullResult, String> {
-    let state = state.inner().clone();
-    peer_delta_pull_with_client_factory(
-        app,
-        state,
-        expected_revision,
-        cancellation,
-        false,
-        move |app_root| match LanLogicalDeltaClient::claim_v2_and_register(
-            app_root,
-            super::device_registry::platform_device_name(),
-            &endpoint,
-            &session_id,
-            &manifest_id,
-            &claim,
-        ) {
-            Ok(client) => Ok(client),
-            Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
-                LanLogicalDeltaClient::claim_p4(&endpoint, &session_id, &manifest_id, &claim)
-            }
-            Err(error) => Err(error),
-        },
-    )
-    .await
-}
-
 #[cfg(desktop)]
 pub(crate) async fn peer_delta_pull_registered_client(
     app: AppHandle,
@@ -2011,14 +1973,9 @@ pub(crate) async fn peer_delta_pull_registered_client(
     client: LanLogicalDeltaClient,
     expected_revision: i64,
 ) -> Result<PeerDeltaPullResult, String> {
-    peer_delta_pull_with_client_factory(
-        app,
-        state,
-        expected_revision,
-        NeverCancelled,
-        true,
-        move |_| Ok(client),
-    )
+    peer_delta_pull_with_client_factory(app, state, expected_revision, NeverCancelled, move |_| {
+        Ok(client)
+    })
     .await
 }
 
@@ -2037,7 +1994,6 @@ pub(crate) async fn peer_delta_pull_registered_client(
             operation_state,
             expected_revision,
             cancellation,
-            true,
             move |_| Ok(client),
         )
         .await
@@ -2082,31 +2038,9 @@ fn registered_local_operation_failure(context: &str, error: impl std::fmt::Displ
     PeerCommandCode::OperationFailed.code().to_owned()
 }
 
-fn peer_operation_failure(context: &str, error: PeerSyncError, registered: bool) -> String {
-    if !registered {
-        return error.to_string();
-    }
+fn peer_operation_failure(context: &str, error: PeerSyncError) -> String {
     crate::nlog!("warn", "{context} failed: {error}");
     code_for(&error).code().to_owned()
-}
-
-fn local_operation_failure(
-    context: &str,
-    error: impl std::fmt::Display,
-    registered: bool,
-) -> String {
-    if !registered {
-        return error.to_string();
-    }
-    registered_local_operation_failure(context, error)
-}
-
-fn delta_worker_failure(error: impl std::fmt::Display, registered: bool) -> String {
-    if registered {
-        local_operation_failure("peer delta pull worker", error, true)
-    } else {
-        format!("peer delta pull worker failed: {error}")
-    }
 }
 
 fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T, String> {
@@ -2121,10 +2055,7 @@ fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T
 
 fn fetch_delta_manifest_and_completion(
     client: &LanLogicalDeltaClient,
-) -> Result<(Vec<u8>, Option<DeltaCompletionAttempt>), PeerSyncError> {
-    if !client.is_v2_registered() {
-        return client.fetch_manifest().map(|manifest| (manifest, None));
-    }
+) -> Result<(Vec<u8>, DeltaCompletionAttempt), PeerSyncError> {
     let observed = client.hello_with_capabilities()?;
     if observed.hello.device_id != client.source_device_id()
         || !observed.hello.permissions.allows_read()
@@ -2154,7 +2085,7 @@ fn fetch_delta_manifest_and_completion(
             ))
         }
     };
-    Ok((manifest.bytes, Some(attempt)))
+    Ok((manifest.bytes, attempt))
 }
 
 fn recovered_delta_result(completed: RecoveredDeltaCompletion) -> PeerDeltaPullResult {
@@ -2188,40 +2119,37 @@ async fn peer_delta_pull_with_client_factory<
     state: PeerDeltaCommandState,
     expected_revision: i64,
     cancellation: C,
-    registered: bool,
     client_factory: F,
 ) -> Result<PeerDeltaPullResult, String> {
     let app_root = app_root(&app)
-        .map_err(|error| local_operation_failure("peer delta app root", error, registered))?;
+        .map_err(|error| registered_local_operation_failure("peer delta app root", error))?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = state.begin_pull().map_err(|error| {
-            local_operation_failure("peer delta target state", error, registered)
+            registered_local_operation_failure("peer delta target state", error)
         })?;
         let mut store = persistent_store::commands::with_store_mut(app.state(), |store| {
             open_peer_delta_store(store)
         })
-        .map_err(|error| local_operation_failure("peer delta store", error, registered))?;
+        .map_err(|error| registered_local_operation_failure("peer delta store", error))?;
         let mut completion_transport = LanDeltaCompletionTransport;
         let recovered = recover_delta_completion(&mut store, &app_root, &mut completion_transport)
-            .map_err(|error| {
-                peer_operation_failure("peer delta completion recovery", error, registered)
-            })?;
+            .map_err(|error| peer_operation_failure("peer delta completion recovery", error))?;
         reclaim_abandoned_durable_cas_jobs(
             &app_root,
             P4_DELTA_TARGET_JOB_PREFIX,
             CasJobKind::LogicalDeltaTarget,
         )
-        .map_err(|error| local_operation_failure("peer delta recovery", error, registered))?;
+        .map_err(|error| registered_local_operation_failure("peer delta recovery", error))?;
         if let Some(completed) = recovered {
             return Ok(recovered_delta_result(completed));
         }
         let mut client = client_factory(&app_root)
-            .map_err(|error| peer_operation_failure("peer delta client", error, registered))?;
+            .map_err(|error| peer_operation_failure("peer delta client", error))?;
         let (manifest, completion) = fetch_delta_manifest_and_completion(&client)
-            .map_err(|error| peer_operation_failure("peer delta manifest", error, registered))?;
+            .map_err(|error| peer_operation_failure("peer delta manifest", error))?;
         let source_device_id = client.source_device_id().to_owned();
         let cas = PayloadCas::new(&app_root)
-            .map_err(|error| local_operation_failure("peer delta CAS", error, registered))?;
+            .map_err(|error| registered_local_operation_failure("peer delta CAS", error))?;
         let pulled = pull_logical_delta_with_completion(
             &mut store,
             &cas,
@@ -2231,92 +2159,32 @@ async fn peer_delta_pull_with_client_factory<
             &manifest,
             &mut client,
             &cancellation,
-            completion.as_ref(),
+            Some(&completion),
         );
         let recovered = recover_delta_completion(&mut store, &app_root, &mut completion_transport)
-            .map_err(|error| peer_operation_failure("peer delta completion", error, registered))?;
+            .map_err(|error| peer_operation_failure("peer delta completion", error))?;
         reclaim_abandoned_durable_cas_jobs(
             &app_root,
             P4_DELTA_TARGET_JOB_PREFIX,
             CasJobKind::LogicalDeltaTarget,
         )
-        .map_err(|error| local_operation_failure("peer delta recovery", error, registered))?;
+        .map_err(|error| registered_local_operation_failure("peer delta recovery", error))?;
         if let Some(completed) = recovered {
             return Ok(recovered_delta_result(completed));
         }
         match pulled {
-            Ok(result) if completion.is_some() && is_successful_delta_result(&result) => {
+            Ok(result) if is_successful_delta_result(&result) => {
                 Err(registered_local_operation_failure(
                     "registered delta completion",
                     "durable completion journal is missing",
                 ))
             }
             Ok(result) => Ok(result),
-            Err(error) => Err(peer_operation_failure("peer delta pull", error, registered)),
+            Err(error) => Err(peer_operation_failure("peer delta pull", error)),
         }
     })
     .await
-    .map_err(|error| delta_worker_failure(error, registered))?
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn peer_delta_pull(
-    app: AppHandle,
-    state: State<'_, PeerDeltaCommandState>,
-    endpoint: String,
-    session_id: String,
-    manifest_id: String,
-    claim: String,
-    expected_revision: i64,
-) -> Result<PeerDeltaPullResult, String> {
-    peer_delta_pull_with_cancellation(
-        app,
-        state,
-        endpoint,
-        session_id,
-        manifest_id,
-        claim,
-        expected_revision,
-        NeverCancelled,
-    )
-    .await
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn peer_delta_pull(
-    app: AppHandle,
-    state: State<'_, PeerDeltaCommandState>,
-    endpoint: String,
-    session_id: String,
-    manifest_id: String,
-    claim: String,
-    expected_revision: i64,
-    foreground: AndroidForegroundKey,
-) -> Result<PeerDeltaPullResult, String> {
-    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Target).await?;
-    let state_owner = state.inner().clone();
-    state_owner
-        .mark_target_running_exact(&foreground)
-        .map_err(|error| error.to_string())?;
-    let outcome = peer_delta_pull_with_cancellation(
-        app,
-        state,
-        endpoint,
-        session_id,
-        manifest_id,
-        claim,
-        expected_revision,
-        cancellation,
-    )
-    .await;
-    state_owner
-        .publish_target_terminal_exact(&foreground, outcome.clone())
-        .map_err(|error| error.to_string())?;
-    outcome
+    .map_err(|error| registered_local_operation_failure("peer delta pull worker", error))?
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2340,28 +2208,6 @@ fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<Stri
 pub(crate) fn canonical_source_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
     super::device_registry::load_or_create_device_id(app_root)
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
-}
-
-#[cfg(test)]
-pub(crate) fn load_or_create_source_device_id(path: &Path) -> Result<String, PeerSyncError> {
-    if let Ok(value) = fs::read_to_string(path) {
-        let value = value.trim_end_matches(['\r', '\n']);
-        if uuid::Uuid::parse_str(value)
-            .map(|parsed| parsed.to_string() != value)
-            .unwrap_or(true)
-        {
-            return Err(PeerSyncError::Storage(
-                "invalid persisted source device identity".to_owned(),
-            ));
-        }
-    }
-    let legacy_parent = path.parent().ok_or_else(|| {
-        PeerSyncError::Storage("source device identity path has no parent".to_owned())
-    })?;
-    let app_root = legacy_parent.parent().ok_or_else(|| {
-        PeerSyncError::Storage("source device identity path has no app root".to_owned())
-    })?;
-    canonical_source_device_id(app_root)
 }
 
 fn now_millis() -> Result<i64, PeerSyncError> {
@@ -2815,7 +2661,6 @@ mod tests {
             peer_operation_failure(
                 "registered delta transport",
                 PeerSyncError::Transport("http://192.168.1.7/session/secret".to_owned()),
-                true,
             ),
             "transportUnavailable"
         );
@@ -2823,16 +2668,11 @@ mod tests {
             peer_operation_failure(
                 "registered delta local",
                 PeerSyncError::Storage("C:\\private\\store".to_owned()),
-                true,
             ),
             "operationFailed"
         );
         assert_eq!(
-            delta_worker_failure("cancelled worker", false),
-            "peer delta pull worker failed: cancelled worker"
-        );
-        assert_eq!(
-            delta_worker_failure("cancelled worker", true),
+            registered_local_operation_failure("peer delta pull worker", "cancelled worker"),
             "operationFailed"
         );
     }
@@ -3000,10 +2840,9 @@ mod tests {
     #[test]
     fn source_device_identity_is_stable_and_outside_the_persistent_store() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("peer-delta").join(SOURCE_DEVICE_ID_FILE);
 
-        let first = load_or_create_source_device_id(&path).unwrap();
-        let second = load_or_create_source_device_id(&path).unwrap();
+        let first = canonical_source_device_id(root.path()).unwrap();
+        let second = canonical_source_device_id(root.path()).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(uuid::Uuid::parse_str(&first).unwrap().to_string(), first);
@@ -3011,7 +2850,7 @@ mod tests {
             fs::read_to_string(root.path().join("peer-sync").join("device-id")).unwrap(),
             first
         );
-        assert!(!path.exists());
+        assert!(!root.path().join("peer-delta").exists());
     }
 
     #[test]
@@ -3020,13 +2859,6 @@ mod tests {
         let target_root = tempfile::tempdir().unwrap();
         let canonical =
             super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
-        let legacy = source_root
-            .path()
-            .join("peer-delta")
-            .join(SOURCE_DEVICE_ID_FILE);
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, "00000000-0000-4000-8000-000000000099").unwrap();
-        fs::remove_file(&legacy).unwrap();
 
         let state = PeerDeltaCommandState::default();
         for _ in 0..2 {
@@ -3074,17 +2906,17 @@ mod tests {
                 .stop_source(prepared.session_id.as_deref().unwrap())
                 .unwrap();
         }
-        assert!(!legacy.exists());
     }
 
     #[test]
     fn invalid_persisted_source_device_identity_fails_closed() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join(SOURCE_DEVICE_ID_FILE);
+        let path = root.path().join("peer-sync").join("device-id");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"not-a-device-id\n").unwrap();
 
         assert!(matches!(
-            load_or_create_source_device_id(&path),
+            canonical_source_device_id(root.path()),
             Err(PeerSyncError::Storage(_))
         ));
     }
@@ -4156,8 +3988,7 @@ mod tests {
             claim,
         )
         .unwrap();
-        let (remote_manifest, completion) = fetch_delta_manifest_and_completion(&client).unwrap();
-        let attempt = completion.unwrap();
+        let (remote_manifest, attempt) = fetch_delta_manifest_and_completion(&client).unwrap();
         assert_eq!(attempt.mode, DeltaCompletionMode::CompletionV1);
 
         let mut target_store = PersistentStore::open(target_root.path()).unwrap();
@@ -4309,9 +4140,8 @@ mod tests {
             claim,
         )
         .unwrap();
-        let (remote_manifest, first_completion) =
+        let (remote_manifest, first_attempt) =
             fetch_delta_manifest_and_completion(&client).unwrap();
-        let first_attempt = first_completion.unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = AtomicCancellation::new(Arc::clone(&cancelled));
         let mut cancelling_source = CancellingLanSource {
@@ -4340,9 +4170,7 @@ mod tests {
             .is_none());
         assert_eq!(accounting_source(target_root.path()).total_bytes, 0);
 
-        let (retry_manifest, retry_completion) =
-            fetch_delta_manifest_and_completion(&client).unwrap();
-        let retry_attempt = retry_completion.unwrap();
+        let (retry_manifest, retry_attempt) = fetch_delta_manifest_and_completion(&client).unwrap();
         assert_eq!(retry_attempt.operation_id, first_attempt.operation_id);
         assert!(matches!(
             pull_logical_delta_with_completion(
