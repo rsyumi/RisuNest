@@ -2700,6 +2700,11 @@ fn sweep_unpublished_registered_target_orphans(peer_root: &Path) -> Result<(), P
         let Some(bytes) =
             read_target_operation_marker_bytes(&entry.path().join(TARGET_OPERATION_MARKER_FILE))?
         else {
+            // Unlike Android recovery, which releases the owned job because its
+            // credential is corrupt, this sweep deletes only on positive evidence
+            // that the directory is an orphan, and a credential it can open is
+            // that evidence; a credential it cannot read is never evidence, so it
+            // is left alone instead of aborting the whole sweep.
             if LanCloneClient::open_persisted(&entry.path().join("credential.json")).is_ok() {
                 remove_directory_if_exists(&entry.path())?;
             }
@@ -2725,6 +2730,10 @@ fn sweep_unpublished_registered_target_orphans(peer_root: &Path) -> Result<(), P
         {
             continue;
         }
+        // The deletion below is decided by comparing this credential against the
+        // registered source, so a credential the sweep cannot read decides
+        // nothing. Skipping keeps the sweep best-effort over the other targets;
+        // corruption is not the release trigger here as it is on Android.
         let credential = match LanCloneClient::open_persisted(&entry.path().join("credential.json"))
         {
             Ok(credential) => credential,
@@ -3854,7 +3863,7 @@ mod tests {
 
     fn write_clone_credential(path: &Path, request: &PeerCloneTargetRequest) -> Vec<u8> {
         let bytes = serde_json::to_vec(&json!({
-            "schema": "risunest.peer-clone-credential/v1",
+            "schema": super::super::lan::PERSISTED_CREDENTIAL_SCHEMA,
             "endpoint": request.endpoint,
             "sessionId": request.session_id,
             "manifestId": request.manifest_id,

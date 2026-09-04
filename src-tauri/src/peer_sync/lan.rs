@@ -142,7 +142,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(any(desktop, target_os = "android"))]
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
-const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
+pub(crate) const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PEER_COMPLETION_SCHEMA: &str = "risunest.peer-completion/v1";
 const PEER_COMPLETION_PREPARED_SCHEMA: &str = "risunest.peer-completion-prepared/v1";
@@ -293,7 +293,28 @@ impl LanCloneClient {
     }
 
     pub fn open_persisted(credential_path: &Path) -> Result<Self, PeerSyncError> {
-        let metadata = fs::symlink_metadata(credential_path)?;
+        let Some(bytes) = Self::read_persisted_credential_bytes(credential_path)? else {
+            return Err(PeerSyncError::Storage(
+                "persisted LAN clone credential is missing".to_owned(),
+            ));
+        };
+        let persisted: PersistedLanCredential = serde_json::from_slice(&bytes)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        persisted.validate()?;
+        Self::from_persisted(persisted)
+    }
+
+    /// Reads a persisted clone credential within its size bound, rejecting
+    /// anything that is not a plain file. `Ok(None)` means the credential does
+    /// not exist; every other I/O failure is reported as an error.
+    fn read_persisted_credential_bytes(
+        credential_path: &Path,
+    ) -> Result<Option<Vec<u8>>, PeerSyncError> {
+        let metadata = match fs::symlink_metadata(credential_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
             || metadata.len() > MAX_PERSISTED_CREDENTIAL_BYTES
@@ -302,19 +323,43 @@ impl LanCloneClient {
                 "invalid persisted LAN clone credential file".to_owned(),
             ));
         }
+        let file = match File::open(credential_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(credential_path)?
-            .take(MAX_PERSISTED_CREDENTIAL_BYTES + 1)
+        file.take(MAX_PERSISTED_CREDENTIAL_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_PERSISTED_CREDENTIAL_BYTES {
             return Err(PeerSyncError::Storage(
                 "persisted LAN clone credential is too large".to_owned(),
             ));
         }
-        let persisted: PersistedLanCredential = serde_json::from_slice(&bytes)
-            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
-        persisted.validate()?;
-        Self::from_persisted(persisted)
+        Ok(Some(bytes))
+    }
+
+    /// Reports how the persisted clone credential at `credential_path` is
+    /// corrupt, or `None` when its content is intact. Only content decides the
+    /// verdict: a credential that is gone counts as corrupt, while every other
+    /// I/O failure propagates so a locked, permission-denied, or otherwise
+    /// temporarily unreadable file is never mistaken for corruption. Unlike
+    /// `open_persisted` the verdict does not depend on the HTTP clients this
+    /// process can build right now.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn persisted_credential_corruption(
+        credential_path: &Path,
+    ) -> Result<Option<PersistedCredentialCorruption>, PeerSyncError> {
+        let Some(bytes) = Self::read_persisted_credential_bytes(credential_path)? else {
+            return Ok(Some(PersistedCredentialCorruption::Missing));
+        };
+        let Ok(persisted) = serde_json::from_slice::<PersistedLanCredential>(&bytes) else {
+            return Ok(Some(PersistedCredentialCorruption::Unparsable));
+        };
+        if persisted.validate().is_err() {
+            return Ok(Some(PersistedCredentialCorruption::Invalid));
+        }
+        Ok(None)
     }
 
     fn claim_v2_with_device(
@@ -367,7 +412,12 @@ impl LanCloneClient {
         let source_name = response.source_device_name.ok_or_else(|| {
             PeerSyncError::Protocol("v2 source device name is missing".to_owned())
         })?;
-        DevicePermissions::from_values(permissions)?;
+        // A permission this build cannot name reads the same as a response that
+        // omits the registered identity: the peer grants something this claim
+        // does not understand, so it is reported as outdated rather than failed.
+        if DevicePermissions::from_values(permissions).is_err() {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        }
         if response.device_id != device_id
             || !is_canonical_uuid(&source_device_id)
             || validate_device_name(&source_name).is_err()
@@ -784,6 +834,29 @@ impl LanCloneClient {
             source_device_id: persisted.source_device_id,
             manifest_id: Some(persisted.manifest_id),
         })
+    }
+}
+
+/// Why a persisted clone credential is unusable on its content alone.
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PersistedCredentialCorruption {
+    /// The credential file is gone.
+    Missing,
+    /// The bytes are not a persisted clone credential.
+    Unparsable,
+    /// The credential parses but fails its own validation.
+    Invalid,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PersistedCredentialCorruption {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unparsable => "unparsable",
+            Self::Invalid => "invalid",
+        }
     }
 }
 
@@ -3738,6 +3811,65 @@ mod endpoint_tests {
     }
 
     #[test]
+    fn persisted_credential_corruption_reads_content_and_never_a_read_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("credential.json");
+        let credential = serde_json::json!({
+            "schema": PERSISTED_CREDENTIAL_SCHEMA,
+            "endpoint": "http://127.0.0.1:32145",
+            "sessionId": "00000000-0000-4000-8000-000000000001",
+            "manifestId": "a".repeat(64),
+            "deviceId": "00000000-0000-4000-8000-000000000002",
+            "bearer": "b".repeat(64),
+            "sourceDeviceId": "00000000-0000-4000-8000-000000000003",
+            "permission": "clone-read",
+        });
+
+        assert_eq!(
+            LanCloneClient::persisted_credential_corruption(&path).unwrap(),
+            Some(PersistedCredentialCorruption::Missing)
+        );
+
+        fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+        assert_eq!(
+            LanCloneClient::persisted_credential_corruption(&path).unwrap(),
+            None
+        );
+
+        fs::write(&path, b"not a credential").unwrap();
+        assert_eq!(
+            LanCloneClient::persisted_credential_corruption(&path).unwrap(),
+            Some(PersistedCredentialCorruption::Unparsable)
+        );
+
+        let mut without_source = credential.clone();
+        without_source
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceDeviceId")
+            .unwrap();
+        fs::write(&path, serde_json::to_vec(&without_source).unwrap()).unwrap();
+        assert_eq!(
+            LanCloneClient::persisted_credential_corruption(&path).unwrap(),
+            Some(PersistedCredentialCorruption::Unparsable)
+        );
+
+        let mut foreign_endpoint = credential.clone();
+        foreign_endpoint["endpoint"] = serde_json::json!("http://8.8.8.8:32145");
+        fs::write(&path, serde_json::to_vec(&foreign_endpoint).unwrap()).unwrap();
+        assert_eq!(
+            LanCloneClient::persisted_credential_corruption(&path).unwrap(),
+            Some(PersistedCredentialCorruption::Invalid)
+        );
+
+        // A directory in the credential's place fails every read deterministically
+        // on both Windows and Unix without being a corruption verdict.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(LanCloneClient::persisted_credential_corruption(&path).is_err());
+    }
+
+    #[test]
     fn p4_delta_policy_accepts_private_lan_and_only_canonical_public_https() {
         assert_eq!(
             validate_p4_logical_delta_endpoint("http://192.168.1.2:8080").unwrap(),
@@ -4616,6 +4748,13 @@ mod timeout_tests {
                 "bearer": "c".repeat(64),
                 "permission": "logical-read",
                 "sourceDeviceId": "00000000-0000-4000-8000-000000000079",
+            }),
+            serde_json::json!({
+                "deviceId": device_id,
+                "bearer": "c".repeat(64),
+                "permission": "logical-read",
+                "sourceDeviceId": "00000000-0000-4000-8000-000000000079",
+                "permissions": ["write"],
             }),
         ] {
             let (endpoint, _calls, server) = canned_claim_response_server(response);
@@ -8280,7 +8419,12 @@ impl LanLogicalDeltaClient {
         let source_name = response.source_device_name.ok_or_else(|| {
             PeerSyncError::Protocol("v2 source device name is missing".to_owned())
         })?;
-        DevicePermissions::from_values(granted)?;
+        // A permission this build cannot name reads the same as a response that
+        // omits the registered identity: the peer grants something this claim
+        // does not understand, so it is reported as outdated rather than failed.
+        if DevicePermissions::from_values(granted).is_err() {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        }
         if response.device_id != target_device_id
             || !is_canonical_uuid(&source_device_id)
             || validate_device_name(&source_name).is_err()
@@ -8418,7 +8562,12 @@ impl LanLogicalDeltaClient {
         else {
             return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
         };
-        DevicePermissions::from_values(granted)?;
+        // A permission this build cannot name reads the same as a response that
+        // omits the registered identity: the peer grants something this claim
+        // does not understand, so it is reported as outdated rather than failed.
+        if DevicePermissions::from_values(granted).is_err() {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        }
         if response.device_id != device_id
             || !is_canonical_uuid(&source_device_id)
             || !is_lower_hex_256(&response.bearer)

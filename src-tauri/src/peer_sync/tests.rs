@@ -2214,6 +2214,50 @@ fn android_clone_recovery_discards_a_job_whose_credential_lost_its_source_identi
 }
 
 #[test]
+fn android_clone_recovery_keeps_a_job_whose_credential_only_fails_to_be_read() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let registered = register_android_clone_source(&mut host, source_root.path(), app_root.path());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+            super::lan::PeerCompletionCapability::Unsupported,
+        )
+        .unwrap();
+    drop(registry);
+    let jobs_root = app_root.path().join("peer-clone-jobs");
+    let job_root = jobs_root.join(&claimed.job_id);
+    let credential_path = job_root.join("credential.json");
+    // A directory in the credential's place fails every read deterministically on
+    // both Windows and Unix, standing in for the transient read failures a
+    // backup or antivirus tool causes, without corrupting any credential content.
+    fs::remove_file(&credential_path).unwrap();
+    fs::create_dir(&credential_path).unwrap();
+
+    let recovered = super::android_client::AndroidCloneJobRegistry::initialize(app_root.path());
+
+    assert!(recovered.is_err());
+    assert!(job_root.is_dir());
+    assert!(job_root.join("ownership.json").is_file());
+    assert!(job_root.join("status.json").is_file());
+    assert!(jobs_root.join("current.json").is_file());
+    assert!(!jobs_root
+        .join(format!(".deleting-{}", claimed.job_id))
+        .exists());
+    host.stop().unwrap();
+}
+
+#[test]
 fn clone_claim_against_a_source_without_the_v2_registry_reports_peer_outdated() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();

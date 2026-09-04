@@ -1331,24 +1331,34 @@ impl AndroidCloneJobRegistry {
             let job = match AndroidResumableCloneJob::open(entry.path()) {
                 Ok(job) => job,
                 Err(error) => {
-                    // Every job is created from a registered source, so a job
-                    // directory whose credential cannot be read is corrupt: release
-                    // it the same way an orphaned job is released.
-                    let credential_unreadable =
-                        LanCloneClient::open_persisted(&entry.path().join("credential.json"))
-                            .is_err();
-                    if credential_unreadable {
-                        crate::nlog!(
-                            "warn",
-                            "android clone job credential unreadable, discarding job"
-                        );
+                    if pointer.as_deref() != Some(job_id.as_str()) {
+                        // A job the registry never published is an orphan whatever
+                        // broke it, so it is released exactly as it was before the
+                        // credential carried the registered source.
+                        if cleanup_unpublished_job(&entry.path(), &job_id).is_ok() {
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    if (credential_unreadable || pointer.as_deref() != Some(job_id.as_str()))
-                        && cleanup_unpublished_job(&entry.path(), &job_id).is_ok()
-                    {
-                        continue;
-                    }
-                    return Err(error);
+                    // Every job is created from a registered source, so the owned
+                    // job is released only when the credential content itself is
+                    // corrupt. A credential this process merely cannot read right
+                    // now (another process holds the file, the descriptor table is
+                    // exhausted, the HTTP client fails to build) propagates instead
+                    // of costing the job.
+                    let Some(corruption) = LanCloneClient::persisted_credential_corruption(
+                        &entry.path().join("credential.json"),
+                    )?
+                    else {
+                        return Err(error);
+                    };
+                    discard_corrupt_owned_job(&entry.path(), &job_id)?;
+                    crate::nlog!(
+                        "warn",
+                        "discarded Android clone job {job_id}: credential is {}",
+                        corruption.as_str()
+                    );
+                    continue;
                 }
             };
             let status = job.read_status()?;
@@ -1853,6 +1863,48 @@ fn cleanup_owned_job(root: &Path, expected_job_id: &str) -> Result<(), PeerSyncE
 
 fn cleanup_unpublished_job(root: &Path, expected_job_id: &str) -> Result<(), PeerSyncError> {
     cleanup_job_directory(root, expected_job_id, false)
+}
+
+/// Releases the owned job whose credential content is corrupt, keeping the
+/// ownership guard a normal discard applies. The weaker unpublished cleanup is
+/// the fallback for exactly one condition: `ownership.json` is gone, or its
+/// bytes are not an ownership record at all, which is the single ownership
+/// failure the guarded cleanup can never get past. Everything else keeps the
+/// guard and propagates: an ownership record this process cannot read right now,
+/// one that names another job, and any failure after ownership already passed.
+fn discard_corrupt_owned_job(root: &Path, expected_job_id: &str) -> Result<(), PeerSyncError> {
+    match cleanup_owned_job(root, expected_job_id) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if !ownership_record_is_corrupt(root)? {
+                return Err(error);
+            }
+            cleanup_unpublished_job(root, expected_job_id)
+        }
+    }
+}
+
+/// Reports whether the job's ownership record is missing or is not an ownership
+/// record at all. A record this process cannot read right now is an error, not a
+/// corruption verdict.
+fn ownership_record_is_corrupt(root: &Path) -> Result<bool, PeerSyncError> {
+    let path = root.join("ownership.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_JOB_RECORD_BYTES
+    {
+        return Ok(true);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&path)?
+        .take(MAX_JOB_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(serde_json::from_slice::<AndroidCloneJobOwnership>(&bytes).is_err())
 }
 
 fn cleanup_job_directory(

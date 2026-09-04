@@ -469,10 +469,13 @@ fn android_clone_backup_whose_stem_is_not_a_job_id_is_deletable() {
     fs::write(&backup, b"unowned Android backup").expect("write Android backup");
     let jobs_root = root.join("peer-clone-jobs");
     fs::create_dir_all(&jobs_root).expect("create Android jobs root");
+    // The current job record carries a deliberately invalid schema, so reading it
+    // raises: the backup is deletable only because the unparsable job stem is
+    // rejected before the current job is ever consulted.
     fs::write(
         jobs_root.join("current.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schema": "risunest.android-peer-clone-registry/v1",
+            "schema": "risunest.android-peer-clone-registry/not-a-schema",
             "jobId": job_id,
         }))
         .expect("serialize Android job record"),
