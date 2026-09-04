@@ -1,6 +1,8 @@
 use super::{
     android_client::{AndroidCloneCurrentStatus, AndroidCloneJobRegistry, AndroidCloneJobStatus},
-    android_jni, PeerSyncError,
+    android_jni,
+    command_codes::finish_peer_command,
+    PeerSyncError,
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -18,9 +20,10 @@ pub(crate) struct AndroidPeerCloneCommandState {
 
 impl AndroidPeerCloneCommandState {
     pub(crate) fn initialize(app_data_root: PathBuf) -> Self {
-        let registry = AndroidCloneJobRegistry::initialize(&app_data_root)
-            .map(Arc::new)
-            .map_err(|error| error.to_string());
+        let registry = finish_peer_command(
+            "Android clone registry recovery",
+            AndroidCloneJobRegistry::initialize(&app_data_root).map(Arc::new),
+        );
         Self {
             app_data_root,
             registry,
@@ -89,10 +92,13 @@ pub(crate) async fn peer_clone_android_current(
     state: State<'_, AndroidPeerCloneCommandState>,
 ) -> Result<Option<AndroidCloneCurrentStatus>, String> {
     let registry = state.registry()?;
-    tauri::async_runtime::spawn_blocking(move || registry.current_for_command())
+    let current = tauri::async_runtime::spawn_blocking(move || registry.current_for_command())
         .await
-        .map_err(|error| format!("Android peer clone status worker failed: {error}"))?
-        .map_err(|error| error.to_string())
+        .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    finish_peer_command(
+        "Android peer clone status",
+        current.and_then(|result| result),
+    )
 }
 
 #[tauri::command]
@@ -102,7 +108,7 @@ pub(crate) async fn peer_clone_android_download(
 ) -> Result<(), String> {
     let registry = state.registry()?;
     let app_data_root = app_data_root_string(&state.app_data_root)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let downloaded = tauri::async_runtime::spawn_blocking(move || {
         let current = registry.current()?.ok_or_else(|| {
             PeerSyncError::Validation("Android clone job is unavailable".to_owned())
         })?;
@@ -119,8 +125,11 @@ pub(crate) async fn peer_clone_android_download(
         }
     })
     .await
-    .map_err(|error| format!("Android peer clone foreground worker failed: {error}"))?
-    .map_err(|error| error.to_string())
+    .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    finish_peer_command(
+        "Android peer clone foreground transfer",
+        downloaded.and_then(|result| result),
+    )
 }
 
 #[tauri::command]
@@ -129,10 +138,13 @@ pub(crate) async fn peer_clone_android_request_cancel(
     job_id: String,
 ) -> Result<(), String> {
     let registry = state.registry()?;
-    tauri::async_runtime::spawn_blocking(move || registry.request_cancel(&job_id))
+    let cancelled = tauri::async_runtime::spawn_blocking(move || registry.request_cancel(&job_id))
         .await
-        .map_err(|error| format!("Android peer clone cancellation worker failed: {error}"))?
-        .map_err(|error| error.to_string())
+        .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    finish_peer_command(
+        "Android peer clone cancellation",
+        cancelled.and_then(|result| result),
+    )
 }
 
 #[tauri::command]
@@ -142,13 +154,21 @@ pub(crate) async fn peer_clone_android_cancel_foreground(
 ) -> Result<(), String> {
     state.registry()?;
     let app_data_root = app_data_root_string(&state.app_data_root)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let cancelled = tauri::async_runtime::spawn_blocking(move || {
         android_jni::cancel_and_cleanup_job(&job_id, &app_data_root)
             .then_some(())
-            .ok_or_else(|| "Android peer clone foreground cancellation failed".to_owned())
+            .ok_or_else(|| {
+                PeerSyncError::Storage(
+                    "Android peer clone foreground cancellation failed".to_owned(),
+                )
+            })
     })
     .await
-    .map_err(|error| format!("Android peer clone cancellation worker failed: {error}"))?
+    .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    finish_peer_command(
+        "Android peer clone foreground cancellation",
+        cancelled.and_then(|result| result),
+    )
 }
 
 #[tauri::command]
@@ -160,8 +180,9 @@ pub(crate) async fn peer_clone_android_finalize(
 ) -> Result<AndroidPeerCloneFinalizeResult, String> {
     let registry = state.registry()?;
     let app_data_root = state.app_data_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let cas = PayloadCas::new(&app_data_root).map_err(|error| error.to_string())?;
+    let finalized = tauri::async_runtime::spawn_blocking(move || {
+        let cas = PayloadCas::new(&app_data_root)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
         let activation_root = app_data_root.join("peer-clone-activation");
         persistent_store::commands::with_store_mut(app.state(), |store| {
             registry
@@ -179,10 +200,14 @@ pub(crate) async fn peer_clone_android_finalize(
                 })
                 .map_err(as_store_error)
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
     })
     .await
-    .map_err(|error| format!("Android peer clone finalization worker failed: {error}"))?
+    .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    finish_peer_command(
+        "Android peer clone finalization",
+        finalized.and_then(|result| result),
+    )
 }
 
 #[tauri::command]
@@ -192,20 +217,27 @@ pub(crate) async fn peer_clone_android_release(
     job_id: String,
 ) -> Result<(), String> {
     let registry = state.registry()?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let released = tauri::async_runtime::spawn_blocking(move || {
         persistent_store::commands::with_store_mut(app.state(), |store| {
             registry.release(&job_id, store).map_err(as_store_error)
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| PeerSyncError::Storage(error.to_string()))
     })
     .await
-    .map_err(|error| format!("Android peer clone release worker failed: {error}"))?
+    .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    finish_peer_command(
+        "Android peer clone release",
+        released.and_then(|result| result),
+    )
 }
 
 fn app_data_root_string(root: &std::path::Path) -> Result<String, String> {
-    root.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "Android app data path is not valid UTF-8".to_owned())
+    finish_peer_command(
+        "Android app data path",
+        root.to_str().map(str::to_owned).ok_or_else(|| {
+            PeerSyncError::Storage("Android app data path is not valid UTF-8".to_owned())
+        }),
+    )
 }
 
 fn as_store_error(error: PeerSyncError) -> StoreError {

@@ -4,6 +4,7 @@ use super::android_source_commands::AndroidPeerCloneSourceState;
 use super::shared_session::AndroidDeviceSyncSourceState;
 use super::{
     bidirectional_commands::PeerBidirectionalCommandState,
+    command_codes::finish_peer_command,
     delta_commands::PeerDeltaCommandState,
     device_registry::{
         incoming_source_by_id, incoming_source_summaries, outgoing_device_summaries,
@@ -23,11 +24,22 @@ fn registered_source_lifecycle_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Proof that the caller holds the registered-source lifecycle hold. Only
+/// `lock_registered_source_lifecycle` can make one, so a lifecycle-guarded
+/// function cannot be handed an unrelated guard by mistake.
+pub(crate) struct RegisteredSourceLifecycleGuard(
+    // Held only for its Drop: releasing the lifecycle hold is the whole value.
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
 pub(crate) fn lock_registered_source_lifecycle(
-) -> Result<std::sync::MutexGuard<'static, ()>, super::PeerSyncError> {
-    registered_source_lifecycle_lock().lock().map_err(|_| {
-        super::PeerSyncError::Storage("registered source lifecycle lock failed".to_owned())
-    })
+) -> Result<RegisteredSourceLifecycleGuard, super::PeerSyncError> {
+    registered_source_lifecycle_lock()
+        .lock()
+        .map(RegisteredSourceLifecycleGuard)
+        .map_err(|_| {
+            super::PeerSyncError::Storage("registered source lifecycle lock failed".to_owned())
+        })
 }
 
 #[cfg(test)]
@@ -38,37 +50,28 @@ pub(crate) fn registered_source_lifecycle_is_locked() -> bool {
     )
 }
 
-/// Stable code the interface maps to its own wording; never shown as native text.
+/// Stable codes the interface maps to its own wording; never shown as native text.
 pub(crate) const REGISTRATION_BLOCKED_BY_ACTIVE_WORK: &str =
     "peer-registration-blocked-by-active-work";
+pub(crate) const SOURCE_IN_USE: &str = "peer-source-in-use";
 
 trait RegistryAppRootResolver {
-    fn resolve_registry_app_root(&self) -> Result<PathBuf, String>;
+    fn resolve_registry_app_root(&self) -> Result<PathBuf, PeerSyncError>;
 }
 
 impl RegistryAppRootResolver for AppHandle {
-    fn resolve_registry_app_root(&self) -> Result<PathBuf, String> {
+    fn resolve_registry_app_root(&self) -> Result<PathBuf, PeerSyncError> {
         self.path()
             .app_data_dir()
-            .map_err(|error| error.to_string())
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))
     }
 }
 
 fn app_root(app: &impl RegistryAppRootResolver) -> Result<PathBuf, String> {
-    finish_registry_command(
-        "application data directory",
+    finish_peer_command(
+        "peer sync registry application data directory",
         app.resolve_registry_app_root(),
     )
-}
-
-fn finish_registry_command<T, E>(operation: &str, result: Result<T, E>) -> Result<T, String>
-where
-    E: std::fmt::Display,
-{
-    result.map_err(|error| {
-        crate::nlog!("error", "peer sync registry {operation} failed: {error}");
-        error.to_string()
-    })
 }
 
 fn revoke_outgoing_device_with_logical_cleanup(
@@ -84,15 +87,15 @@ fn revoke_outgoing_device_with_logical_cleanup(
 
 #[tauri::command]
 pub fn peer_sync_outgoing_devices(app: AppHandle) -> Result<Vec<OutgoingDeviceSummary>, String> {
-    finish_registry_command(
-        "outgoing device list",
+    finish_peer_command(
+        "peer sync registry outgoing device list",
         outgoing_device_summaries(&app_root(&app)?),
     )
 }
 #[tauri::command]
 pub fn peer_sync_incoming_sources(app: AppHandle) -> Result<Vec<IncomingSourceSummary>, String> {
-    finish_registry_command(
-        "incoming source list",
+    finish_peer_command(
+        "peer sync registry incoming source list",
         incoming_source_summaries(&app_root(&app)?),
     )
 }
@@ -100,8 +103,8 @@ pub fn peer_sync_incoming_sources(app: AppHandle) -> Result<Vec<IncomingSourceSu
 // must not run on the main thread.
 #[tauri::command(async)]
 pub fn peer_sync_remove_incoming_source(app: AppHandle, device_id: String) -> Result<(), String> {
-    finish_registry_command(
-        "incoming source removal",
+    finish_peer_command(
+        "peer sync registry incoming source removal",
         remove_incoming_source_if_inactive(&app_root(&app)?, &device_id),
     )
 }
@@ -144,7 +147,7 @@ fn active_registered_source_lane(
 /// The caller must already hold the registered-source lifecycle guard, so that no
 /// lane can start between this check and the registration that follows it.
 pub(crate) fn ensure_no_active_registered_source_work(
-    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    _lifecycle: &RegisteredSourceLifecycleGuard,
     app_root: &Path,
 ) -> Result<(), PeerSyncError> {
     if let Some(lane) = active_registered_source_lane(app_root, None)? {
@@ -167,7 +170,7 @@ pub(crate) fn register_incoming_source_if_compatible(
 /// The lock-held half of the guard, for callers that already hold the lifecycle
 /// guard across a wider span than a single registration.
 pub(crate) fn register_incoming_source_if_compatible_locked(
-    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    _lifecycle: &RegisteredSourceLifecycleGuard,
     app_root: &Path,
     source: IncomingSource,
 ) -> Result<(), PeerSyncError> {
@@ -177,7 +180,8 @@ pub(crate) fn register_incoming_source_if_compatible_locked(
         return register_incoming_source(app_root, source);
     }
     if let Some(lane) = active_registered_source_lane(app_root, Some(&source.device_id))? {
-        return Err(PeerSyncError::Validation(lane.to_owned()));
+        crate::nlog!("warn", "registered source rotation refused: {lane}");
+        return Err(PeerSyncError::Validation(SOURCE_IN_USE.to_owned()));
     }
     register_incoming_source(app_root, source)
 }
@@ -188,7 +192,8 @@ pub(crate) fn remove_incoming_source_if_inactive(
 ) -> Result<(), super::PeerSyncError> {
     let _lifecycle = lock_registered_source_lifecycle()?;
     if let Some(lane) = active_registered_source_lane(app_root, Some(device_id))? {
-        return Err(super::PeerSyncError::Validation(lane.to_owned()));
+        crate::nlog!("warn", "registered source removal refused: {lane}");
+        return Err(super::PeerSyncError::Validation(SOURCE_IN_USE.to_owned()));
     }
     remove_incoming_source(app_root, device_id)
 }
@@ -207,8 +212,8 @@ pub fn peer_sync_revoke_outgoing_device(
     let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
-    finish_registry_command(
-        "outgoing device revocation",
+    finish_peer_command(
+        "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
             clone.revoke_registered_device(id);
             delta.revoke_registered_device(id);
@@ -280,11 +285,22 @@ mod tests {
                 entry.target.ends_with("peer_sync::registry_commands")
                     && entry.message.contains(marker)
             })
+            .expect("registry refusal log")
+    }
+
+    fn latest_command_code_log_containing(marker: &str) -> crate::native_log::LogEntry {
+        crate::native_log::global_state()
+            .tail(None)
+            .into_iter()
+            .rev()
+            .find(|entry| {
+                entry.target.ends_with("peer_sync::command_codes") && entry.message.contains(marker)
+            })
             .expect("registry failure log")
     }
 
     #[test]
-    fn underlying_registry_failure_is_logged_without_changing_the_returned_string() {
+    fn an_underlying_registry_failure_reaches_the_interface_as_a_bounded_code() {
         let directory = tempfile::tempdir().unwrap();
         let invalid_root = directory.path().join("not-a-directory");
         fs::write(&invalid_root, b"file").unwrap();
@@ -292,51 +308,34 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        let error = finish_registry_command::<(), _>(
-            "outgoing device list registry-fixture-underlying",
+        let error = finish_peer_command(
+            "peer sync registry outgoing device list registry-fixture-underlying",
             outgoing_device_summaries(&invalid_root).map(|_| ()),
         )
         .unwrap_err();
 
-        assert_eq!(error, raw);
-        let entry = latest_registry_log_containing("registry-fixture-underlying");
+        assert_eq!(error, "operationFailed");
+        let entry = latest_command_code_log_containing("registry-fixture-underlying");
         assert!(entry.message.contains("outgoing device list"));
         assert!(entry.message.contains(&raw));
     }
 
     #[test]
-    fn registry_failure_detail_is_masked_only_in_the_native_log() {
-        let raw =
-            "registry-fixture-masking Authorization: Bearer fixture-registry-secret".to_owned();
-
-        let error = finish_registry_command::<(), _>(
-            "outgoing device list registry-fixture-masking",
-            Err(raw.clone()),
-        )
-        .unwrap_err();
-
-        assert_eq!(error, raw);
-        let entry = latest_registry_log_containing("registry-fixture-masking");
-        assert!(entry.message.contains("Authorization: ***"));
-        assert!(!entry.message.contains("fixture-registry-secret"));
-    }
-
-    #[test]
-    fn app_root_failure_is_logged_without_changing_the_returned_string() {
+    fn app_root_failure_is_logged_and_returns_only_the_bounded_code() {
         struct FailingResolver;
 
         impl RegistryAppRootResolver for FailingResolver {
-            fn resolve_registry_app_root(&self) -> Result<PathBuf, String> {
-                Err("registry-fixture-app-root path resolver unavailable".to_owned())
+            fn resolve_registry_app_root(&self) -> Result<PathBuf, PeerSyncError> {
+                Err(PeerSyncError::Storage(
+                    "registry-fixture-app-root path resolver unavailable".to_owned(),
+                ))
             }
         }
 
-        let raw = "registry-fixture-app-root path resolver unavailable".to_owned();
-
         let error = app_root(&FailingResolver).unwrap_err();
 
-        assert_eq!(error, raw);
-        let entry = latest_registry_log_containing("registry-fixture-app-root");
+        assert_eq!(error, "operationFailed");
+        let entry = latest_command_code_log_containing("registry-fixture-app-root");
         assert!(entry.message.contains("path resolver unavailable"));
     }
 
@@ -362,18 +361,12 @@ mod tests {
         assert!(!proof.exists());
     }
 
-    #[test]
-    fn a_new_registration_is_refused_by_work_that_belongs_to_a_different_source() {
-        let root = tempfile::tempdir().unwrap();
-        let lifecycle = lock_registered_source_lifecycle().unwrap();
-
-        ensure_no_active_registered_source_work(&lifecycle, root.path()).unwrap();
-
-        crate::peer_sync::delta_completion::PeerDeltaCompletionJournal::new(root.path())
+    fn store_active_delta_intent(root: &std::path::Path, source_device_id: &str) {
+        crate::peer_sync::delta_completion::PeerDeltaCompletionJournal::new(root)
             .store_activation_intent(
                 &crate::peer_sync::delta_completion::DeltaCompletionContext {
                     operation_id: "00000000-0000-4000-8000-000000000207".to_owned(),
-                    source_device_id: OTHER_SOURCE_ID.to_owned(),
+                    source_device_id: source_device_id.to_owned(),
                     manifest_id: MANIFEST_ID.to_owned(),
                     mode: crate::peer_sync::delta_completion::DeltaCompletionMode::CompletionV1,
                     pre_revision: 1,
@@ -389,10 +382,66 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn registered_source(bearer: &str) -> IncomingSource {
+        IncomingSource {
+            device_id: DEVICE_ID.to_owned(),
+            name: "Source".to_owned(),
+            endpoint: "http://192.168.0.21:32145".to_owned(),
+            bearer: bearer.to_owned(),
+            permissions: DevicePermissions::read(),
+            last_seen_ms: 3,
+            total_bytes: 5,
+        }
+    }
+
+    #[test]
+    fn a_new_registration_is_refused_by_work_that_belongs_to_a_different_source() {
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = lock_registered_source_lifecycle().unwrap();
+
+        ensure_no_active_registered_source_work(&lifecycle, root.path()).unwrap();
+
+        store_active_delta_intent(root.path(), OTHER_SOURCE_ID);
 
         assert_eq!(
             ensure_no_active_registered_source_work(&lifecycle, root.path()).unwrap_err(),
             PeerSyncError::Validation(REGISTRATION_BLOCKED_BY_ACTIVE_WORK.to_owned())
+        );
+    }
+
+    #[test]
+    fn removal_and_source_rotation_refuse_with_one_code_and_log_only_the_lane() {
+        let root = tempfile::tempdir().unwrap();
+        register_incoming_source(root.path(), registered_source(&"b".repeat(64))).unwrap();
+        store_active_delta_intent(root.path(), DEVICE_ID);
+
+        let removal = remove_incoming_source_if_inactive(root.path(), DEVICE_ID).unwrap_err();
+        let rotation =
+            register_incoming_source_if_compatible(root.path(), registered_source(&"c".repeat(64)))
+                .unwrap_err();
+
+        assert_eq!(removal, PeerSyncError::Validation(SOURCE_IN_USE.to_owned()));
+        assert_eq!(
+            rotation,
+            PeerSyncError::Validation(SOURCE_IN_USE.to_owned())
+        );
+        for message in [removal.to_string(), rotation.to_string()] {
+            assert!(!message.contains("active target"), "{message}");
+        }
+        for marker in ["removal refused", "rotation refused"] {
+            let entry = latest_registry_log_containing(marker);
+            assert!(entry
+                .message
+                .contains("registered delta source is used by an active target"));
+        }
+        assert_eq!(
+            incoming_source_by_id(root.path(), DEVICE_ID)
+                .unwrap()
+                .unwrap()
+                .bearer,
+            "b".repeat(64)
         );
     }
 
@@ -429,8 +478,8 @@ pub fn peer_sync_revoke_outgoing_device(
     let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
-    finish_registry_command(
-        "outgoing device revocation",
+    finish_peer_command(
+        "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
             clone.revoke_registered_device(id);
             delta.revoke_registered_device(id);

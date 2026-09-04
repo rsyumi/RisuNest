@@ -183,14 +183,26 @@ describe('device sync facade', () => {
     })
 
     it.each([
+        ['registrationBlockedByActiveWork', 'registration-blocked-by-active-work'],
+        ['sourceInUse', 'source-in-use'],
+        ['sourceChanged', 'source-changed'],
+        ['deltaCompletionRetained', 'delta-completion-retained'],
+        ['peerOutdated', 'peer-outdated'],
         ['authorizationExpired', 'registration-expired'],
         ['sourceMissing', 'registration-expired'],
         ['identityMismatch', 'transport-changed'],
         ['transportUnavailable', 'transport-unavailable'],
         ['permissionDenied', 'operation-failed'],
         ['laneUnavailable', 'operation-failed'],
+        ['operationFailed', 'operation-failed'],
+        ['invalid-configuration', 'invalid-configuration'],
+        ['port-unavailable', 'port-unavailable'],
+        ['preparation-failed', 'preparation-failed'],
+        ['transport-unavailable', 'transport-unavailable'],
+        ['cleanup-failed', 'cleanup-failed'],
+        ['state-unavailable', 'state-unavailable'],
         ['private native detail', 'operation-failed'],
-    ])('maps registered rejection %s to safe category %s', async (nativeError, category) => {
+    ])('maps bounded native code %s to safe category %s', async (nativeError, category) => {
         const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }) })
 
         await expect(facade.reconnectRegisteredClone('source')).rejects.toMatchObject({ code: category })
@@ -199,9 +211,23 @@ describe('device sync facade', () => {
     it.each([
         'peer-registration-blocked-by-active-work',
         'Validation("peer-registration-blocked-by-active-work")',
-        'registrationBlockedByActiveWork',
-    ])('maps the native registration refusal %s to its own category', async (nativeError) => {
+        'registrationBlockedByActiveWork detail',
+        'peer-source-in-use',
+        'toString',
+        'constructor',
+    ])('no longer gives the unbounded native string %s a category of its own', async (nativeError) => {
         const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }) })
+
+        await expect(facade.claimStagedClone({
+            endpoint: 'http://10.1.2.3:32145',
+            sessionId: '00000000-0000-4000-8000-000000000001',
+            manifestId: 'a'.repeat(64),
+            claim: 'b'.repeat(64),
+        })).rejects.toMatchObject({ code: 'operation-failed' })
+    })
+
+    it('keeps the refusal category for the bounded registration code', async () => {
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error('registrationBlockedByActiveWork') }) })
 
         await expect(facade.claimStagedClone({
             endpoint: 'http://10.1.2.3:32145',

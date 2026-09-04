@@ -620,6 +620,21 @@ describe('DeviceSyncSettings', () => {
             .not.toContain('registration-blocked-by-active-work')
     })
 
+    it.each([
+        ['source-in-use' as const, 'A sync task is still using this device. Finish or cancel it, then try again.'],
+        ['source-changed' as const, "This device's registration changed. Select the target device again and retry."],
+        ['delta-completion-retained' as const, 'An unfinished earlier update is still pending. Continue or cancel it under Sync tasks.'],
+        ['peer-outdated' as const, 'The other device runs an older RisuNest. Update both devices to the same version and try again.'],
+    ])('renders the localized wording for the bounded work failure %s', async (code, wording) => {
+        await render(snapshot({
+            workError: code,
+            targets: { clone: cloneBase, delta: { ...deltaBase, pullPhase: 'failed' }, bidirectional: bidiBase },
+        }))
+
+        expect(target.querySelector('[data-sync-card="work"] [data-work-error]')?.textContent).toBe(wording)
+        expect(target.querySelector('[data-sync-card="work"]')?.textContent).not.toContain(code)
+    })
+
     it('renders one work alert when the selected source and operation are both expired', async () => {
         await render(snapshot({
             sources: [{ deviceId: 'source-a', name: 'Source A', permissions: ['read'] }],

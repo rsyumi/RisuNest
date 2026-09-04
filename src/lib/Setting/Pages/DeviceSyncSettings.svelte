@@ -11,6 +11,7 @@
     import { getProductionDeviceSyncController } from 'src/ts/storage/sync/deviceSyncProduction'
     import type { DeviceSyncControllerSnapshot } from 'src/ts/storage/sync/deviceSyncController'
     import { classifyDeviceSyncFailure, parseDeviceSyncUri } from 'src/ts/storage/sync/deviceSync'
+    import type { DeviceSyncErrorCode } from 'src/ts/storage/sync/deviceSync'
     import { androidPeerSyncNotificationsEnabled } from 'src/ts/storage/sync/peerSyncShared'
     import Button from 'src/lib/UI/GUI/Button.svelte'
 
@@ -124,16 +125,14 @@
     }
     function safeError(code: unknown): string {
         const safeCode = classifyDeviceSyncFailure(code).code
-        if (
-            code === 'registration-expired'
-            || code === 'transport-changed'
-            || safeCode === 'registration-expired'
-            || safeCode === 'transport-changed'
-        ) return sync.registrationExpired
-        if (
-            code === 'registration-blocked-by-active-work'
-            || safeCode === 'registration-blocked-by-active-work'
-        ) return sync.work.registerBlockedByActiveWork
+        // The controller stores its own classified code, so both shapes reach here.
+        const is = (value: DeviceSyncErrorCode) => code === value || safeCode === value
+        if (is('registration-expired') || is('transport-changed')) return sync.registrationExpired
+        if (is('registration-blocked-by-active-work')) return sync.work.registerBlockedByActiveWork
+        if (is('source-in-use')) return sync.work.sourceInUse
+        if (is('source-changed')) return sync.work.sourceChanged
+        if (is('delta-completion-retained')) return sync.work.deltaBlockedByRetained
+        if (is('peer-outdated')) return sync.work.peerOutdated
         if (safeCode === 'port-unavailable') return sync.share.errorPortUnavailable
         if (safeCode === 'invalid-configuration') return sync.share.errorInvalidConfiguration
         if (safeCode === 'cleanup-failed') return sync.share.errorCleanupFailed

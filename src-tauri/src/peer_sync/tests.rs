@@ -1923,9 +1923,7 @@ fn source_removal_is_refused_while_an_android_clone_job_uses_the_source() {
 
     assert_eq!(
         refused,
-        PeerSyncError::Validation(
-            "registered Android clone source is used by an active job".to_owned()
-        )
+        PeerSyncError::Validation(super::registry_commands::SOURCE_IN_USE.to_owned())
     );
     assert_eq!(peers.incoming_bytes(), incoming_before);
     peers.host.stop().unwrap();

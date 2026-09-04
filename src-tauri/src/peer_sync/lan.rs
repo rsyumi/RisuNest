@@ -67,6 +67,10 @@ fn recovered_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+/// Stable code the interface maps to its own wording; never shown as native
+/// text. The claim paths that produce it land with the peer version check.
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) const PEER_OUTDATED: &str = "peer-outdated";
 #[cfg(desktop)]
 pub(crate) const NAMED_TUNNEL_ORIGIN_PORT: u16 = 32145;
 #[cfg(desktop)]

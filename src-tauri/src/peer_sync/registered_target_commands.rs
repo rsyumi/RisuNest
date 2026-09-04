@@ -1,6 +1,7 @@
 #[cfg(any(target_os = "android", test))]
 use super::android_client::{AndroidCloneJobPhase, AndroidCloneJobStatus};
 use super::{
+    command_codes::{code_for, PeerCommandCode},
     device_registry::{incoming_source_by_id, DevicePermissions, IncomingSource},
     lan::{
         authenticated_peer_hello_status, authenticated_peer_hello_with_capabilities,
@@ -186,44 +187,11 @@ fn safe_hello(hello: &PeerHello) -> RegisteredSourceHello {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RegisteredTargetError {
-    SourceMissing,
-    AuthorizationExpired,
-    PermissionDenied,
-    LaneUnavailable,
-    IdentityMismatch,
-    TransportUnavailable,
-    RegistrationBlockedByActiveWork,
-    OperationFailed,
-}
-
-impl RegisteredTargetError {
-    fn code(self) -> &'static str {
-        match self {
-            Self::SourceMissing => "sourceMissing",
-            Self::AuthorizationExpired => "authorizationExpired",
-            Self::PermissionDenied => "permissionDenied",
-            Self::LaneUnavailable => "laneUnavailable",
-            Self::IdentityMismatch => "identityMismatch",
-            Self::TransportUnavailable => "transportUnavailable",
-            Self::RegistrationBlockedByActiveWork => "registrationBlockedByActiveWork",
-            Self::OperationFailed => "operationFailed",
-        }
-    }
-}
-
-impl fmt::Display for RegisteredTargetError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.code())
-    }
-}
-
 fn resolve_registered_source(
     app_root: &Path,
     device_id: &str,
     lane: RegisteredLane,
-) -> Result<RegisteredSourceConnection, RegisteredTargetError> {
+) -> Result<RegisteredSourceConnection, PeerCommandCode> {
     let mut connection =
         resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello_status)?;
     if lane == RegisteredLane::Clone {
@@ -237,7 +205,7 @@ fn resolve_registered_source(
                 "warn",
                 "registered clone capability hello changed its authenticated identity"
             );
-            return Err(RegisteredTargetError::IdentityMismatch);
+            return Err(PeerCommandCode::IdentityMismatch);
         }
         connection.completion = observed.completion;
     }
@@ -252,42 +220,30 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn safe_command_failure(context: &str, error: impl fmt::Display) -> String {
     crate::nlog!("warn", "{context} failed: {error}");
-    "transportUnavailable".to_owned()
+    PeerCommandCode::TransportUnavailable.code().to_owned()
 }
 
 fn registered_operation_failure(context: &str, error: impl fmt::Display) -> String {
     crate::nlog!("warn", "{context} failed: {error}");
-    "operationFailed".to_owned()
+    PeerCommandCode::OperationFailed.code().to_owned()
 }
 
-fn registered_target_operation_failure(
-    context: &str,
-    error: PeerSyncError,
-) -> RegisteredTargetError {
+/// A failure past the hello round trip is local work, never the connection, so
+/// it stays generic instead of taking the transport code.
+fn registered_target_operation_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
     crate::nlog!("warn", "{context} failed: {error}");
-    RegisteredTargetError::OperationFailed
+    PeerCommandCode::OperationFailed
 }
 
-fn registered_claim_failure(context: &str, error: PeerSyncError) -> RegisteredTargetError {
+fn registered_claim_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
     crate::nlog!("warn", "{context} failed: {error}");
-    match error {
-        PeerSyncError::Transport(_) => RegisteredTargetError::TransportUnavailable,
-        // The user has to finish or stop their operation first, so this refusal
-        // needs its own code instead of the generic failure.
-        PeerSyncError::Validation(message)
-            if message
-                == crate::peer_sync::registry_commands::REGISTRATION_BLOCKED_BY_ACTIVE_WORK =>
-        {
-            RegisteredTargetError::RegistrationBlockedByActiveWork
-        }
-        _ => RegisteredTargetError::OperationFailed,
-    }
+    code_for(&error)
 }
 
 fn registered_hello(
     app_root: &Path,
     device_id: &str,
-) -> Result<RegisteredSourceHello, RegisteredTargetError> {
+) -> Result<RegisteredSourceHello, PeerCommandCode> {
     registered_hello_with(
         app_root,
         device_id,
@@ -301,13 +257,13 @@ fn registered_hello_with<F>(
     device_id: &str,
     require_android_lan: bool,
     transport: F,
-) -> Result<RegisteredSourceHello, RegisteredTargetError>
+) -> Result<RegisteredSourceHello, PeerCommandCode>
 where
     F: FnOnce(&str, &str) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
 {
     let source = incoming_source_by_id(app_root, device_id)
         .map_err(|error| safe_failure("registered source lookup", error))?
-        .ok_or(RegisteredTargetError::SourceMissing)?;
+        .ok_or(PeerCommandCode::SourceMissing)?;
     if require_android_lan {
         validate_android_registered_source_endpoint(&source.endpoint)
             .map_err(|error| safe_failure("registered Android hello endpoint", error))?;
@@ -321,7 +277,7 @@ where
             "warn",
             "registered source hello returned a different device identity"
         );
-        return Err(RegisteredTargetError::IdentityMismatch);
+        return Err(PeerCommandCode::IdentityMismatch);
     }
     Ok(safe_hello(&current))
 }
@@ -366,7 +322,7 @@ pub async fn peer_clone_claim_registered_client(
     })
     .await
     .map_err(|error| registered_operation_failure("registered clone target worker", error))?
-    .map_err(|error: RegisteredTargetError| error.to_string())
+    .map_err(|code: PeerCommandCode| code.to_string())
 }
 
 #[tauri::command]
@@ -401,7 +357,7 @@ pub async fn peer_clone_claim_client(
         .map_err(|error| registered_claim_failure("Android clone registration", error))?;
         let source_device_id = client
             .registered_source_device_id()
-            .ok_or(RegisteredTargetError::OperationFailed)?
+            .ok_or(PeerCommandCode::OperationFailed)?
             .to_owned();
         Ok(AndroidPeerCloneClaimResult {
             source_device_id,
@@ -412,7 +368,7 @@ pub async fn peer_clone_claim_client(
     })
     .await
     .map_err(|error| registered_operation_failure("Android clone registration worker", error))?
-    .map_err(|error: RegisteredTargetError| error.to_string())
+    .map_err(|code: PeerCommandCode| code.to_string())
 }
 
 #[tauri::command]
@@ -462,7 +418,7 @@ pub async fn peer_clone_claim_registered_client(
     })
     .await
     .map_err(|error| registered_operation_failure("registered Android clone worker", error))?
-    .map_err(|error: RegisteredTargetError| error.to_string())
+    .map_err(|code: PeerCommandCode| code.to_string())
 }
 
 #[tauri::command]
@@ -609,10 +565,10 @@ fn resolve_registered_source_with(
     device_id: &str,
     lane: RegisteredLane,
     hello: impl FnOnce(&str, &str) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
-) -> Result<RegisteredSourceConnection, RegisteredTargetError> {
+) -> Result<RegisteredSourceConnection, PeerCommandCode> {
     let source = incoming_source_by_id(app_root, device_id)
         .map_err(|error| safe_failure("registered source lookup", error))?
-        .ok_or(RegisteredTargetError::SourceMissing)?;
+        .ok_or(PeerCommandCode::SourceMissing)?;
     #[cfg(target_os = "android")]
     validate_android_registered_source_endpoint(&source.endpoint)
         .map_err(|error| safe_failure("registered Android LAN endpoint", error))?;
@@ -625,21 +581,21 @@ fn resolve_registered_source_with(
             "warn",
             "registered source hello returned a different device identity"
         );
-        return Err(RegisteredTargetError::IdentityMismatch);
+        return Err(PeerCommandCode::IdentityMismatch);
     }
     let granted = match lane {
         RegisteredLane::Clone | RegisteredLane::Delta => current.permissions.allows_read(),
         RegisteredLane::Bidirectional => current.permissions.allows_bidirectional(),
     };
     if !granted {
-        return Err(RegisteredTargetError::PermissionDenied);
+        return Err(PeerCommandCode::PermissionDenied);
     }
     let descriptor = match lane {
         RegisteredLane::Clone => current.lanes.clone.clone(),
         RegisteredLane::Delta => current.lanes.delta.clone(),
         RegisteredLane::Bidirectional => current.lanes.bidirectional.clone(),
     }
-    .ok_or(RegisteredTargetError::LaneUnavailable)?;
+    .ok_or(PeerCommandCode::LaneUnavailable)?;
     Ok(RegisteredSourceConnection {
         source,
         lane: descriptor,
@@ -648,20 +604,20 @@ fn resolve_registered_source_with(
     })
 }
 
-fn safe_failure(context: &str, error: PeerSyncError) -> RegisteredTargetError {
+fn safe_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
     crate::nlog!("warn", "{context} failed: {error}");
-    RegisteredTargetError::TransportUnavailable
+    PeerCommandCode::TransportUnavailable
 }
 
 fn registered_hello_outcome(
     context: &str,
     outcome: Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
-) -> Result<PeerHello, RegisteredTargetError> {
+) -> Result<PeerHello, PeerCommandCode> {
     match outcome {
         Ok(AuthenticatedPeerHelloOutcome::Hello(hello)) => Ok(hello),
         Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired) => {
             crate::nlog!("warn", "{context} failed: HTTP 401 Unauthorized");
-            Err(RegisteredTargetError::AuthorizationExpired)
+            Err(PeerCommandCode::AuthorizationExpired)
         }
         Err(error) => Err(safe_failure(context, error)),
     }

@@ -15,6 +15,10 @@ export type DeviceSyncErrorCode =
     | 'state-unavailable'
     | 'registration-expired'
     | 'registration-blocked-by-active-work'
+    | 'source-in-use'
+    | 'source-changed'
+    | 'delta-completion-retained'
+    | 'peer-outdated'
     | 'transport-changed'
     | 'operation-failed'
     | 'unavailable'
@@ -25,38 +29,38 @@ export class DeviceSyncError extends Error {
     }
 }
 
-// The native side reports this refusal by a stable code, which its own error
-// wrapping may surround with detail that must never reach the user. Registered
-// target commands report the same refusal by their own bounded code.
-const NATIVE_REGISTRATION_BLOCKED = 'peer-registration-blocked-by-active-work'
-const REGISTERED_TARGET_REGISTRATION_BLOCKED = 'registrationBlockedByActiveWork'
+// Every peer_sync command the page reaches returns one of these bounded codes
+// and nothing else, so the classification is an exact match. The shared session
+// commands already answer in this file's own code shape.
+const NATIVE_CODES: Readonly<Record<string, DeviceSyncErrorCode>> = {
+    registrationBlockedByActiveWork: 'registration-blocked-by-active-work',
+    sourceInUse: 'source-in-use',
+    sourceChanged: 'source-changed',
+    deltaCompletionRetained: 'delta-completion-retained',
+    peerOutdated: 'peer-outdated',
+    authorizationExpired: 'registration-expired',
+    sourceMissing: 'registration-expired',
+    identityMismatch: 'transport-changed',
+    transportUnavailable: 'transport-unavailable',
+    permissionDenied: 'operation-failed',
+    laneUnavailable: 'operation-failed',
+    operationFailed: 'operation-failed',
+    'invalid-configuration': 'invalid-configuration',
+    'port-unavailable': 'port-unavailable',
+    'preparation-failed': 'preparation-failed',
+    'transport-unavailable': 'transport-unavailable',
+    'cleanup-failed': 'cleanup-failed',
+    'state-unavailable': 'state-unavailable',
+}
 
 export function classifyDeviceSyncFailure(error: unknown): DeviceSyncError {
     if (error instanceof DeviceSyncError) return error
     const message = error instanceof Error ? error.message : String(error)
-    if (
-        message === REGISTERED_TARGET_REGISTRATION_BLOCKED
-        || message.includes(NATIVE_REGISTRATION_BLOCKED)
-    ) {
-        return new DeviceSyncError('registration-blocked-by-active-work')
-    }
-    if (message === 'authorizationExpired' || message === 'sourceMissing') {
-        return new DeviceSyncError('registration-expired')
-    }
-    if (message === 'identityMismatch') return new DeviceSyncError('transport-changed')
-    if (message === 'transportUnavailable') return new DeviceSyncError('transport-unavailable')
-    if (message === 'permissionDenied' || message === 'laneUnavailable') {
-        return new DeviceSyncError('operation-failed')
-    }
-    if (
-        message === 'invalid-configuration'
-        || message === 'port-unavailable'
-        || message === 'preparation-failed'
-        || message === 'transport-unavailable'
-        || message === 'cleanup-failed'
-        || message === 'state-unavailable'
-    ) return new DeviceSyncError(message)
-    return new DeviceSyncError('operation-failed')
+    return new DeviceSyncError(
+        Object.prototype.hasOwnProperty.call(NATIVE_CODES, message)
+            ? NATIVE_CODES[message]
+            : 'operation-failed',
+    )
 }
 
 async function safeInvoke<T>(invoke: DeviceSyncInvoke, command: string, args?: Record<string, unknown>): Promise<T> {

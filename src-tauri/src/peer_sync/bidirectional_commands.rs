@@ -13,6 +13,7 @@ use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase 
 #[cfg(desktop)]
 use super::tunnel::{self, RunningTunnelLifecycle, SystemTunnelProcess, TunnelStartFailure};
 use super::{
+    command_codes::{code_for, finish_peer_command, is_bounded_code, PeerCommandCode},
     lan::{
         deliver_peer_completion, prepare_peer_logical_completion, validate_p5_desktop_endpoint,
         LanBidirectionalBackupReceipt, LanBidirectionalControl, LanBidirectionalGeneration,
@@ -5941,9 +5942,10 @@ pub fn peer_bidirectional_source_reserve() -> Result<AndroidForegroundKey, Strin
 pub fn peer_bidirectional_target_reserve(
     state: State<'_, PeerBidirectionalCommandState>,
 ) -> Result<AndroidForegroundKey, String> {
-    state
-        .reserve_target_foreground()
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "bidirectional target foreground reservation",
+        state.reserve_target_foreground(),
+    )
 }
 
 #[cfg(target_os = "android")]
@@ -5951,9 +5953,10 @@ pub fn peer_bidirectional_target_reserve(
 pub fn peer_bidirectional_target_foreground_status(
     state: State<'_, PeerBidirectionalCommandState>,
 ) -> Result<Option<AndroidBidirectionalTargetStatus>, String> {
-    state
-        .target_foreground_status()
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "bidirectional target foreground status",
+        state.target_foreground_status(),
+    )
 }
 
 #[cfg(target_os = "android")]
@@ -5962,9 +5965,10 @@ pub fn peer_bidirectional_target_foreground_cancel(
     state: State<'_, PeerBidirectionalCommandState>,
     foreground: AndroidForegroundKey,
 ) -> Result<bool, String> {
-    state
-        .cancel_target_foreground_exact(&foreground)
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "bidirectional target foreground cancellation",
+        state.cancel_target_foreground_exact(&foreground),
+    )
 }
 
 #[cfg(target_os = "android")]
@@ -5973,9 +5977,10 @@ pub fn peer_bidirectional_target_foreground_release(
     state: State<'_, PeerBidirectionalCommandState>,
     foreground: AndroidForegroundKey,
 ) -> Result<bool, String> {
-    state
-        .release_target_foreground_exact(&foreground)
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "bidirectional target foreground release",
+        state.release_target_foreground_exact(&foreground),
+    )
 }
 
 fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
@@ -5986,6 +5991,17 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("failed to resolve application data directory: {error}"))
+}
+
+/// The bounded-code twin of `app_root`, for the target commands the device sync
+/// page reaches. Source lane commands keep their own diagnostic text.
+fn bounded_app_root(app: &AppHandle) -> Result<PathBuf, String> {
+    finish_peer_command(
+        "bidirectional application data directory",
+        app.path()
+            .app_data_dir()
+            .map_err(|error| PeerSyncError::Storage(error.to_string())),
+    )
 }
 
 fn open_command_store(app: &AppHandle) -> Result<PersistentStore, PeerSyncError> {
@@ -6649,10 +6665,11 @@ pub fn peer_bidirectional_status(
     app: AppHandle,
     state: State<'_, PeerBidirectionalCommandState>,
 ) -> Result<PeerBidirectionalStatus, String> {
-    let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
-    state
-        .status(&app_root(&app)?, &mut store)
-        .map_err(|error| error.to_string())
+    let mut store = finish_peer_command("bidirectional status store", open_command_store(&app))?;
+    finish_peer_command(
+        "bidirectional status",
+        state.status(&bounded_app_root(&app)?, &mut store),
+    )
 }
 
 #[cfg(desktop)]
@@ -6811,10 +6828,7 @@ fn bidirectional_peer_operation_failure(
         return error.to_string();
     }
     crate::nlog!("warn", "{context} failed: {error}");
-    match error {
-        PeerSyncError::Transport(_) => "transportUnavailable".to_owned(),
-        _ => "operationFailed".to_owned(),
-    }
+    code_for(&error).code().to_owned()
 }
 
 fn bound_registered_bidirectional_outcome<T>(
@@ -6825,11 +6839,11 @@ fn bound_registered_bidirectional_outcome<T>(
         return outcome;
     }
     outcome.map_err(|error| {
-        if error == "transportUnavailable" {
+        if is_bounded_code(&error) {
             error
         } else {
             crate::nlog!("warn", "registered bidirectional operation failed: {error}");
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         }
     })
 }
@@ -6849,7 +6863,7 @@ async fn peer_bidirectional_sync_with_factory<
     let foreground = foreground.ok_or_else(|| {
         if registered {
             crate::nlog!("warn", "registered bidirectional foreground is missing");
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         } else {
             "Android bidirectional target foreground is required".to_owned()
         }
@@ -6873,7 +6887,7 @@ async fn peer_bidirectional_sync_with_factory<
     let root = app_root(&app).map_err(|error| {
         if registered {
             crate::nlog!("warn", "registered bidirectional app root failed: {error}");
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         } else {
             error
         }
@@ -7211,7 +7225,7 @@ async fn peer_bidirectional_sync_with_factory<
     .map_err(|error| {
         if registered {
             crate::nlog!("warn", "registered bidirectional worker failed: {error}");
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         } else {
             format!("peer bidirectional sync worker failed: {error}")
         }
@@ -7408,7 +7422,7 @@ async fn peer_bidirectional_resolve_with_factory<
     let foreground = foreground.ok_or_else(|| {
         if registered {
             crate::nlog!("warn", "registered bidirectional foreground is missing");
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         } else {
             "Android bidirectional target foreground is required".to_owned()
         }
@@ -7432,7 +7446,7 @@ async fn peer_bidirectional_resolve_with_factory<
     let root = app_root(&app).map_err(|error| {
         if registered {
             crate::nlog!("warn", "registered bidirectional app root failed: {error}");
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         } else {
             error
         }
@@ -7539,7 +7553,7 @@ async fn peer_bidirectional_resolve_with_factory<
                 "warn",
                 "registered bidirectional resolution worker failed: {error}"
             );
-            "operationFailed".to_owned()
+            PeerCommandCode::OperationFailed.code().to_owned()
         } else {
             format!("peer bidirectional linked resolution worker failed: {error}")
         }
@@ -7564,37 +7578,41 @@ pub async fn peer_bidirectional_resume(
 ) -> Result<PeerBidirectionalSyncResult, String> {
     let state = state.inner().clone();
     #[cfg(target_os = "android")]
-    let foreground = foreground
-        .ok_or_else(|| "Android bidirectional target foreground is required".to_owned())?;
+    let foreground = finish_peer_command(
+        "bidirectional resume foreground",
+        foreground.ok_or_else(|| {
+            PeerSyncError::Protocol(
+                "Android bidirectional target foreground is required".to_owned(),
+            )
+        }),
+    )?;
     #[cfg(target_os = "android")]
-    let cancellation = state
-        .mark_target_running_exact(&foreground)
-        .map_err(|error| error.to_string())?;
+    let cancellation = finish_peer_command(
+        "bidirectional resume target foreground",
+        state.mark_target_running_exact(&foreground),
+    )?;
     #[cfg(desktop)]
     let cancellation = {
         let _ = foreground;
         NeverCancelled
     };
     let worker_state = state.clone();
-    let root = app_root(&app)?;
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = worker_state
-            .begin_target()
-            .map_err(|error| error.to_string())?;
+    let root = bounded_app_root(&app)?;
+    let resumed = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = worker_state.begin_target()?;
         #[cfg(target_os = "android")]
         if cancellation.is_cancelled() {
-            return Err("Android foreground service was cancelled".to_owned());
+            return Err(PeerSyncError::Cancelled);
         }
-        let retained = PeerBidirectionalOperationJournal::new(&root)
-            .load()
-            .map_err(|error| error.to_string())?;
+        let retained = PeerBidirectionalOperationJournal::new(&root).load()?;
         if let Some(PeerBidirectionalDurableOperation::TargetPrepared { context, .. }) = retained {
             if context.operation_id != operation_id {
-                return Err("another bidirectional operation is retained".to_owned());
+                return Err(PeerSyncError::Validation(
+                    "another bidirectional operation is retained".to_owned(),
+                ));
             }
-            let mut client = LanBidirectionalLogicalClient::resume(context.credential)
-                .map_err(|error| error.to_string())?;
-            let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
+            let mut client = LanBidirectionalLogicalClient::resume(context.credential)?;
+            let mut store = open_command_store(&app)?;
             return recover_target_prepared_with_client(
                 &mut store,
                 &root,
@@ -7603,27 +7621,27 @@ pub async fn peer_bidirectional_resume(
                 false,
                 &mut client,
                 &cancellation,
-            )
-            .map_err(|error| error.to_string());
+            );
         }
         if cancellation.is_cancelled() {
             return retained
                 .as_ref()
-                .ok_or_else(|| "bidirectional operation is not retained".to_owned())
-                .and_then(|operation| {
-                    retained_result(operation).map_err(|error| error.to_string())
-                });
+                .ok_or_else(|| {
+                    PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
+                })
+                .and_then(retained_result);
         }
-        let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
+        let mut store = open_command_store(&app)?;
         run_retained_remote_completion(&mut store, &root, &operation_id, expected_revision, None)
-            .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| format!("peer bidirectional resume worker failed: {error}"))?;
+    .map_err(|error| PeerSyncError::Storage(error.to_string()));
+    let outcome = finish_peer_command("bidirectional resume", resumed.and_then(|result| result));
     #[cfg(target_os = "android")]
-    state
-        .publish_target_terminal_exact(&foreground, outcome.clone())
-        .map_err(|error| error.to_string())?;
+    finish_peer_command(
+        "bidirectional resume terminal state",
+        state.publish_target_terminal_exact(&foreground, outcome.clone()),
+    )?;
     outcome
 }
 
@@ -7633,11 +7651,15 @@ pub fn peer_bidirectional_acknowledge(
     state: State<'_, PeerBidirectionalCommandState>,
     operation_id: String,
 ) -> Result<(), String> {
-    let root = app_root(&app)?;
-    let mut store = open_command_store(&app).map_err(|error| error.to_string())?;
-    state
-        .acknowledge(&root, &mut store, &operation_id)
-        .map_err(|error| error.to_string())
+    let root = bounded_app_root(&app)?;
+    let mut store = finish_peer_command(
+        "bidirectional acknowledgement store",
+        open_command_store(&app),
+    )?;
+    finish_peer_command(
+        "bidirectional acknowledgement",
+        state.acknowledge(&root, &mut store, &operation_id),
+    )
 }
 
 enum PeerBidirectionalGuardKind {

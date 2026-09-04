@@ -17,6 +17,8 @@ pub(crate) mod android_source_commands;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod bidirectional_commands;
 mod client;
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) mod command_codes;
 #[cfg(desktop)]
 pub(crate) mod commands;
 #[cfg(any(desktop, target_os = "android"))]

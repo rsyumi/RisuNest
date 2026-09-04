@@ -26,6 +26,11 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+/// Stable code the interface maps to its own wording; never shown as native
+/// text. The recovery path that produces it lands with retained completion
+/// recovery.
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) const DELTA_COMPLETION_AMBIGUOUS: &str = "peer-delta-completion-ambiguous";
 const DELTA_COMPLETION_SCHEMA: &str = "risunest.peer-delta-completion/v1";
 const DELTA_COMPLETION_FILE: &str = "completion-operation.json";
 const DELTA_COMPLETION_TOMBSTONE: &str = ".completion-operation.deleted";

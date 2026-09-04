@@ -4,6 +4,8 @@ use super::android_foreground::test_registry_guard;
 use super::android_foreground::{
     registry, AndroidCancellationProbe, AndroidForegroundKey, AndroidForegroundLane,
 };
+#[cfg(target_os = "android")]
+use super::command_codes::finish_peer_command;
 #[cfg(desktop)]
 use super::lan::discover_lan_ipv4;
 #[cfg(desktop)]
@@ -16,6 +18,7 @@ use super::target_foreground_transition::{
     AndroidTargetForegroundTransition, AndroidTargetForegroundTransitionError,
 };
 use super::{
+    command_codes::{code_for, is_bounded_code, PeerCommandCode},
     delta_completion::{
         recover_delta_completion, DeltaCompletionContext, DeltaCompletionMode,
         LanDeltaCompletionTransport, PeerDeltaCompletionJournal, RecoveredDeltaCompletion,
@@ -1688,9 +1691,10 @@ pub fn peer_delta_source_reserve() -> Result<AndroidForegroundKey, String> {
 pub fn peer_delta_target_reserve(
     state: State<'_, PeerDeltaCommandState>,
 ) -> Result<AndroidForegroundKey, String> {
-    state
-        .reserve_target_foreground()
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "peer delta target foreground reservation",
+        state.reserve_target_foreground(),
+    )
 }
 
 #[tauri::command]
@@ -1698,9 +1702,10 @@ pub fn peer_delta_target_reserve(
 pub fn peer_delta_target_foreground_status(
     state: State<'_, PeerDeltaCommandState>,
 ) -> Result<Option<AndroidTargetForegroundStatus>, String> {
-    state
-        .target_foreground_status()
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "peer delta target foreground status",
+        state.target_foreground_status(),
+    )
 }
 
 #[tauri::command]
@@ -1709,9 +1714,10 @@ pub fn peer_delta_target_foreground_release(
     state: State<'_, PeerDeltaCommandState>,
     foreground: AndroidForegroundKey,
 ) -> Result<bool, String> {
-    state
-        .release_target_foreground_exact(&foreground)
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "peer delta target foreground release",
+        state.release_target_foreground_exact(&foreground),
+    )
 }
 
 #[tauri::command]
@@ -1720,9 +1726,10 @@ pub fn peer_delta_target_foreground_cancel(
     state: State<'_, PeerDeltaCommandState>,
     foreground: AndroidForegroundKey,
 ) -> Result<bool, String> {
-    state
-        .cancel_target_foreground_exact(&foreground)
-        .map_err(|error| error.to_string())
+    finish_peer_command(
+        "peer delta target foreground cancellation",
+        state.cancel_target_foreground_exact(&foreground),
+    )
 }
 
 #[cfg(desktop)]
@@ -1961,9 +1968,11 @@ where
     outcome
 }
 
+/// A local failure carries no peer classification of its own, so it always
+/// leaves the boundary as the generic code.
 fn registered_local_operation_failure(context: &str, error: impl std::fmt::Display) -> String {
     crate::nlog!("warn", "{context} failed: {error}");
-    "operationFailed".to_owned()
+    PeerCommandCode::OperationFailed.code().to_owned()
 }
 
 fn peer_operation_failure(context: &str, error: PeerSyncError, registered: bool) -> String {
@@ -1971,10 +1980,7 @@ fn peer_operation_failure(context: &str, error: PeerSyncError, registered: bool)
         return error.to_string();
     }
     crate::nlog!("warn", "{context} failed: {error}");
-    match error {
-        PeerSyncError::Transport(_) => "transportUnavailable".to_owned(),
-        _ => "operationFailed".to_owned(),
-    }
+    code_for(&error).code().to_owned()
 }
 
 fn local_operation_failure(
@@ -1998,7 +2004,7 @@ fn delta_worker_failure(error: impl std::fmt::Display, registered: bool) -> Stri
 
 fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T, String> {
     outcome.map_err(|error| {
-        if error == "transportUnavailable" {
+        if is_bounded_code(&error) {
             error
         } else {
             registered_local_operation_failure("registered delta operation", error)
