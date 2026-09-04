@@ -1197,7 +1197,7 @@ impl PeerCloneCommandState {
             let pending_marker =
                 persisted_marker.unwrap_or_else(|| TargetOperationMarker::new(&request));
             let operation_id = pending_marker.operation_id.clone();
-            let lan = LanCloneClient::claim_strict_v2_and_persist_and_register(
+            let lan = LanCloneClient::claim_v2_and_persist_and_register(
                 app_root,
                 super::device_registry::platform_device_name(),
                 &paths.credential,
@@ -4456,10 +4456,12 @@ mod tests {
         };
         let paths = target_paths(&peer_root, &request).unwrap();
         let original_credential = write_legacy_clone_credential(&paths.credential, &request);
-        let client = LoopbackCloneClient::from_lan(
+        let client = LoopbackCloneClient::from_lan_with_completion(
             &paths.transfer,
             LanCloneClient::open_persisted(&paths.credential).unwrap(),
             &request.manifest_id,
+            PeerCompletionCapability::Unsupported,
+            None,
         )
         .unwrap();
         let state = PeerCloneCommandState::default();
@@ -4575,10 +4577,12 @@ mod tests {
         let target_peer_root = target_root.path().join("peer-sync");
         let paths = target_paths(&target_peer_root, &request).unwrap();
         let original_credential = write_legacy_clone_credential(&paths.credential, &request);
-        let client = LoopbackCloneClient::from_lan(
+        let client = LoopbackCloneClient::from_lan_with_completion(
             &paths.transfer,
             LanCloneClient::open_persisted(&paths.credential).unwrap(),
             &request.manifest_id,
+            PeerCompletionCapability::Unsupported,
+            None,
         )
         .unwrap();
         let target = PeerCloneCommandState::default();
@@ -4620,7 +4624,7 @@ mod tests {
                 .len(),
             1
         );
-        assert!(LanCloneClient::claim_strict_v2_and_persist_and_register(
+        assert!(LanCloneClient::claim_v2_and_persist_and_register(
             verifier_root.path(),
             "Verifier",
             &verifier_root.path().join("credential.json"),
@@ -4718,7 +4722,7 @@ mod tests {
             super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap()
         );
         let verifier_root = tempfile::tempdir().unwrap();
-        assert!(LanCloneClient::claim_strict_v2_and_persist_and_register(
+        assert!(LanCloneClient::claim_v2_and_persist_and_register(
             verifier_root.path(),
             "Verifier",
             &verifier_root.path().join("credential.json"),
@@ -6961,7 +6965,7 @@ mod tests {
         );
         let target_app_root = tempfile::tempdir().unwrap();
         let credential_path = target_app_root.path().join("first-credential.json");
-        LanCloneClient::claim_strict_v2_and_persist_and_register(
+        LanCloneClient::claim_v2_and_persist_and_register(
             target_app_root.path(),
             "Registered target",
             &credential_path,
@@ -7006,7 +7010,7 @@ mod tests {
             reopened.source_bind_address().unwrap().unwrap().port()
         );
         let second_credential_path = target_app_root.path().join("second-credential.json");
-        LanCloneClient::claim_strict_v2_and_persist_and_register(
+        LanCloneClient::claim_v2_and_persist_and_register(
             target_app_root.path(),
             "Registered target",
             &second_credential_path,

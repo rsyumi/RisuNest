@@ -429,6 +429,24 @@ fn prepare(source: &FixtureSource, root: &Path) -> PreparedCloneSession {
     prepare_clone_session(source, root).unwrap()
 }
 
+/// Enables the v2 registry on a prepared clone host and starts it. Every clone
+/// target reaches a source through the registered claim, so clone fixtures start
+/// their host this way.
+fn start_registered_clone_source(
+    host: &mut LanCloneHost,
+    source_root: &Path,
+) -> (super::lan::LanPairing, String) {
+    host.enable_v2_registry(
+        source_root,
+        "Clone source",
+        super::device_registry::DevicePermissions::read(),
+    )
+    .unwrap();
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    (pairing, endpoint)
+}
+
 /// Everything an Android clone job needs to reach a source this device is
 /// registered with.
 struct RegisteredAndroidSource {
@@ -456,7 +474,7 @@ fn register_android_clone_source(
     .unwrap();
     let pairing = host.start().unwrap();
     let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
-    super::lan::LanCloneClient::claim_strict_v2_and_persist_and_register(
+    super::lan::LanCloneClient::claim_v2_and_persist_and_register(
         app_root,
         "Android target",
         &app_root.join("registration-credential.json"),
@@ -937,19 +955,33 @@ fn lan_object_routes_only_serve_exact_manifest_chunk_boundaries() {
 fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_reads() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, endpoint) = start_registered_clone_source(&mut host, source_root.path());
+    let credential_path = target_root.path().join("lan-credential.json");
     assert!(matches!(
-        LanCloneClient::claim(
+        LanCloneClient::claim_v2_and_persist_and_register(
+            target_root.path(),
+            "Clone target",
+            &credential_path,
             "http://example.com:43123",
             &pairing.session_id,
+            &pairing.manifest_id,
             &pairing.claim,
         ),
         Err(PeerSyncError::Protocol(_))
     ));
-    let client = LanCloneClient::claim(&endpoint, &pairing.session_id, &pairing.claim).unwrap();
+    let client = LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Clone target",
+        &credential_path,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
     assert!(!client.session_url().contains(&pairing.claim));
     fs::write(
         session_root.path().join("manifest.json"),
@@ -967,8 +999,10 @@ fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_re
     assert_eq!(client.fetch_chunk(&object, 0, 63).unwrap().len(), 64);
     client.report_progress(64, Some(&object)).unwrap();
     assert!(host.revoke(&client.device_id));
+    // A registered source drops the revoked device outright, so its bearer is no
+    // longer a known authorization rather than a rejected one.
     assert!(
-        matches!(client.head_object(&object), Err(PeerSyncError::Transport(message)) if message.contains("403"))
+        matches!(client.head_object(&object), Err(PeerSyncError::Transport(message)) if message.contains("401"))
     );
     host.stop().unwrap();
 }
@@ -983,10 +1017,11 @@ fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
         &[(CLONE_CHUNK_SIZE + 256 * 1024) as usize],
     );
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, endpoint) = start_registered_clone_source(&mut host, source_root.path());
     let credential_path = client_root.path().join("lan-credential.json");
-    let claimed = LanCloneClient::claim_and_persist(
+    let claimed = LanCloneClient::claim_v2_and_persist_and_register(
+        client_root.path(),
+        "Clone target",
         &credential_path,
         &endpoint,
         &pairing.session_id,
@@ -997,8 +1032,14 @@ fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
 
     let cancellation = TransferCancellation::new();
     let cancel_after_verified_chunk = cancellation.clone();
-    let mut first =
-        LoopbackCloneClient::from_lan(client_root.path(), claimed, &pairing.manifest_id).unwrap();
+    let mut first = LoopbackCloneClient::from_lan_with_completion(
+        client_root.path(),
+        claimed,
+        &pairing.manifest_id,
+        super::lan::PeerCompletionCapability::Unsupported,
+        None,
+    )
+    .unwrap();
     assert!(matches!(
         first.download_with_progress(&cancellation, move |bytes| {
             if bytes > CLONE_CHUNK_SIZE {
@@ -1012,8 +1053,14 @@ fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
     drop(first);
 
     let persisted = LanCloneClient::open_persisted(&credential_path).unwrap();
-    let mut restarted =
-        LoopbackCloneClient::from_lan(client_root.path(), persisted, &pairing.manifest_id).unwrap();
+    let mut restarted = LoopbackCloneClient::from_lan_with_completion(
+        client_root.path(),
+        persisted,
+        &pairing.manifest_id,
+        super::lan::PeerCompletionCapability::Unsupported,
+        None,
+    )
+    .unwrap();
     let report = restarted.download(&TransferCancellation::new()).unwrap();
     assert!(report.transferred_bytes < CLONE_CHUNK_SIZE);
     assert_eq!(report.maximum_buffer_bytes, 64 * 1024);
@@ -1032,13 +1079,17 @@ fn persisted_lan_credential_rotates_atomically_over_an_existing_file() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
     let credential_root = tempfile::tempdir().unwrap();
+    let first_target_root = tempfile::tempdir().unwrap();
+    let second_target_root = tempfile::tempdir().unwrap();
     let credential_path = credential_root.path().join("lan-credential.json");
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
 
-    let first_pairing = host.start().unwrap();
-    let first_endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
-    let first = LanCloneClient::claim_and_persist(
+    let (first_pairing, first_endpoint) =
+        start_registered_clone_source(&mut host, source_root.path());
+    let first = LanCloneClient::claim_v2_and_persist_and_register(
+        first_target_root.path(),
+        "First target",
         &credential_path,
         &first_endpoint,
         &first_pairing.session_id,
@@ -1050,9 +1101,11 @@ fn persisted_lan_credential_rotates_atomically_over_an_existing_file() {
     let first_bytes = fs::read(&credential_path).unwrap();
     host.stop().unwrap();
 
-    let second_pairing = host.start().unwrap();
-    let second_endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
-    let second = LanCloneClient::claim_and_persist(
+    let (second_pairing, second_endpoint) =
+        start_registered_clone_source(&mut host, source_root.path());
+    let second = LanCloneClient::claim_v2_and_persist_and_register(
+        second_target_root.path(),
+        "Second target",
         &credential_path,
         &second_endpoint,
         &second_pairing.session_id,
@@ -1089,14 +1142,16 @@ fn persisted_lan_credential_is_owner_only_on_unix() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
     let credential_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
     let credential_parent = credential_root.path().join("peer-private");
     let credential_path = credential_parent.join("lan-credential.json");
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, endpoint) = start_registered_clone_source(&mut host, source_root.path());
 
-    LanCloneClient::claim_and_persist(
+    LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Clone target",
         &credential_path,
         &endpoint,
         &pairing.session_id,
@@ -2145,7 +2200,7 @@ fn android_clone_recovery_discards_a_job_whose_credential_lost_its_source_identi
 }
 
 #[test]
-fn android_registration_claim_is_strict_v2_and_does_not_consume_a_legacy_claim() {
+fn clone_claim_against_a_source_without_the_v2_registry_reports_peer_outdated() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
@@ -2155,28 +2210,26 @@ fn android_registration_claim_is_strict_v2_and_does_not_consume_a_legacy_claim()
     let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
     let credential = target_root.path().join("strict-v2-credential.json");
 
-    assert!(
-        super::lan::LanCloneClient::claim_strict_v2_and_persist_and_register(
-            target_root.path(),
-            "Android target",
-            &credential,
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
-        )
-        .is_err()
+    let claimed = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
+        target_root.path(),
+        "Android target",
+        &credential,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
     );
+
+    assert!(matches!(
+        claimed.err(),
+        Some(PeerSyncError::Validation(code)) if code == super::lan::PEER_OUTDATED
+    ));
     assert!(!credential.exists());
     assert!(
         super::device_registry::incoming_source_summaries(target_root.path())
             .unwrap()
             .is_empty()
     );
-
-    let legacy =
-        super::lan::LanCloneClient::claim(&endpoint, &pairing.session_id, &pairing.claim).unwrap();
-    assert!(legacy.registered_source_device_id().is_none());
     host.stop().unwrap();
 }
 
@@ -4015,9 +4068,21 @@ fn lan_client_bounds_an_incomplete_oversized_claim_response() {
     let endpoint = format!("http://{address}");
     let session_id = uuid::Uuid::new_v4().to_string();
     let claim = "a".repeat(64);
+    let manifest_id = "b".repeat(64);
+    let target_root = tempfile::tempdir().unwrap();
+    let app_root = target_root.path().to_path_buf();
+    let credential = app_root.join("lan-credential.json");
     let (result_tx, result_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let _ = result_tx.send(LanCloneClient::claim(&endpoint, &session_id, &claim));
+        let _ = result_tx.send(LanCloneClient::claim_v2_and_persist_and_register(
+            &app_root,
+            "Clone target",
+            &credential,
+            &endpoint,
+            &session_id,
+            &manifest_id,
+            &claim,
+        ));
     });
 
     // Generous hang guard only; a client that waited for the oversized body would fail

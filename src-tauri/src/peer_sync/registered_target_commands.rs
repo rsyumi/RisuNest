@@ -342,7 +342,7 @@ pub async fn peer_clone_claim_v2_client(
                 PeerSyncError::from(error),
             )
         })?;
-        let client = super::lan::LanCloneClient::claim_strict_v2_and_persist_and_register(
+        let client = super::lan::LanCloneClient::claim_v2_and_persist_and_register(
             &root,
             super::device_registry::platform_device_name(),
             &credential_root.join("credential.json"),

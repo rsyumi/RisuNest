@@ -163,6 +163,7 @@ pub(crate) fn ensure_no_active_registered_source_work(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn register_incoming_source_if_compatible(
     app_root: &Path,
     source: IncomingSource,

@@ -19,7 +19,7 @@ use super::{
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
     registry_commands::{
         ensure_no_active_registered_source_work, lock_registered_source_lifecycle,
-        register_incoming_source_if_compatible, register_incoming_source_if_compatible_locked,
+        register_incoming_source_if_compatible_locked,
     },
     PeerSyncError,
 };
@@ -205,108 +205,6 @@ pub(super) fn parse_completion_lease_headers(
 }
 
 impl LanCloneClient {
-    pub fn claim(endpoint: &str, session_id: &str, claim: &str) -> Result<Self, PeerSyncError> {
-        Self::claim_with_timeout(endpoint, session_id, claim, CONTROL_REQUEST_TIMEOUT)
-    }
-
-    fn claim_with_timeout(
-        endpoint: &str,
-        session_id: &str,
-        claim: &str,
-        control_timeout: Duration,
-    ) -> Result<Self, PeerSyncError> {
-        if endpoint.len() > MAX_URL_BYTES
-            || uuid::Uuid::parse_str(session_id)
-                .map(|value| value.to_string() != session_id)
-                .unwrap_or(true)
-            || !is_lower_hex_256(claim)
-        {
-            return Err(PeerSyncError::Protocol(
-                "invalid LAN pairing data".to_owned(),
-            ));
-        }
-        let endpoint = validate_lan_endpoint(endpoint)?;
-        let session_url = format!("{endpoint}/v1/sessions/{session_id}");
-        if session_url.len() > MAX_URL_BYTES {
-            return Err(PeerSyncError::Protocol(
-                "LAN session URL is too long".to_owned(),
-            ));
-        }
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(control_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(transport)?;
-        let ranges = HttpRangeStream::new(Duration::from_secs(3))?;
-        let response = client
-            .post(format!("{session_url}/claim"))
-            .json(&ClaimRequest {
-                claim: claim.to_owned(),
-                device_id: None,
-                protocol_version: None,
-                device_name: None,
-                permissions: None,
-            })
-            .timeout(control_timeout)
-            .send()
-            .map_err(transport)?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(PeerSyncError::Transport(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-        let mut body = Vec::new();
-        response
-            .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
-            .read_to_end(&mut body)
-            .map_err(transport)?;
-        if body.len() > MAX_CLAIM_RESPONSE_BYTES {
-            return Err(PeerSyncError::Protocol(
-                "LAN claim response is too large".to_owned(),
-            ));
-        }
-        let response: ClaimResponseOwned = serde_json::from_slice(&body)
-            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-        if !is_canonical_uuid(&response.device_id)
-            || response.bearer.len() != 64
-            || !is_lower_hex_256(&response.bearer)
-            || response.permission != "clone-read"
-        {
-            return Err(PeerSyncError::Protocol(
-                "invalid LAN claim response".to_owned(),
-            ));
-        }
-        Ok(Self {
-            client,
-            ranges,
-            control_timeout,
-            endpoint,
-            session_id: session_id.to_owned(),
-            session_url,
-            device_id: response.device_id,
-            bearer: response.bearer,
-            source_device_id: None,
-            manifest_id: None,
-        })
-    }
-
-    pub fn claim_and_persist(
-        credential_path: &Path,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-    ) -> Result<Self, PeerSyncError> {
-        validate_object_hash(manifest_id)?;
-        let mut client = Self::claim(endpoint, session_id, claim)?;
-        client.manifest_id = Some(manifest_id.to_owned());
-        client.persist(credential_path)?;
-        Ok(client)
-    }
-
     pub(crate) fn claim_v2_and_persist_and_register(
         app_root: &Path,
         target_name: &str,
@@ -316,50 +214,6 @@ impl LanCloneClient {
         manifest_id: &str,
         claim: &str,
     ) -> Result<Self, PeerSyncError> {
-        Self::claim_v2_and_persist_and_register_mode(
-            app_root,
-            target_name,
-            credential_path,
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            true,
-        )
-    }
-
-    pub(crate) fn claim_strict_v2_and_persist_and_register(
-        app_root: &Path,
-        target_name: &str,
-        credential_path: &Path,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-    ) -> Result<Self, PeerSyncError> {
-        Self::claim_v2_and_persist_and_register_mode(
-            app_root,
-            target_name,
-            credential_path,
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn claim_v2_and_persist_and_register_mode(
-        app_root: &Path,
-        target_name: &str,
-        credential_path: &Path,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        allow_legacy_fallback: bool,
-    ) -> Result<Self, PeerSyncError> {
         validate_object_hash(manifest_id)?;
         validate_device_name(target_name)?;
         let target_device_id = load_or_create_device_id(app_root)?;
@@ -368,39 +222,28 @@ impl LanCloneClient {
         // lane cannot start in the middle and lose the authorization it is using.
         let lifecycle = lock_registered_source_lifecycle()?;
         ensure_no_active_registered_source_work(&lifecycle, app_root)?;
-        let (mut client, registered_v2) = Self::claim_v2_with_device(
+        let mut client = Self::claim_v2_with_device(
             endpoint,
             session_id,
             claim,
             &target_device_id,
             target_name,
-            allow_legacy_fallback,
         )?;
         client.manifest_id = Some(manifest_id.to_owned());
-        let registration = if registered_v2 {
-            Some(client.incoming_source()?)
-        } else {
-            None
-        };
-        let previous_credential = if registration.is_some() {
-            snapshot_credential(credential_path)?
-        } else {
-            None
-        };
+        let registration = client.incoming_source()?;
+        let previous_credential = snapshot_credential(credential_path)?;
         client.persist(credential_path)?;
-        if let Some(source) = registration {
-            if let Err(error) =
-                register_incoming_source_if_compatible_locked(&lifecycle, app_root, source)
-            {
-                restore_credential(credential_path, previous_credential.as_deref()).map_err(
-                    |rollback| {
-                        PeerSyncError::Storage(format!(
-                            "registered clone credential rollback failed: {rollback}"
-                        ))
-                    },
-                )?;
-                return Err(error);
-            }
+        if let Err(error) =
+            register_incoming_source_if_compatible_locked(&lifecycle, app_root, registration)
+        {
+            restore_credential(credential_path, previous_credential.as_deref()).map_err(
+                |rollback| {
+                    PeerSyncError::Storage(format!(
+                        "registered clone credential rollback failed: {rollback}"
+                    ))
+                },
+            )?;
+            return Err(error);
         }
         Ok(client)
     }
@@ -472,25 +315,13 @@ impl LanCloneClient {
         Self::from_persisted(persisted)
     }
 
-    pub(crate) fn try_migrate_persisted_credential(
-        &self,
-        app_root: &Path,
-    ) -> Result<bool, PeerSyncError> {
-        match self.register_incoming_source(app_root) {
-            Ok(()) => Ok(true),
-            Err(PeerSyncError::Transport(_) | PeerSyncError::Protocol(_)) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
     fn claim_v2_with_device(
         endpoint: &str,
         session_id: &str,
         claim: &str,
         device_id: &str,
         device_name: &str,
-        allow_legacy_fallback: bool,
-    ) -> Result<(Self, bool), PeerSyncError> {
+    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(claim)
@@ -521,61 +352,20 @@ impl LanCloneClient {
             .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .map_err(transport)?;
+        // A source that predates the registered claim refuses the request outright.
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
-            if !allow_legacy_fallback {
-                return Err(PeerSyncError::Protocol(
-                    "source does not support registered v2 clone claims".to_owned(),
-                ));
-            }
-            return Self::claim_with_timeout(
-                endpoint.as_str(),
-                session_id,
-                claim,
-                CONTROL_REQUEST_TIMEOUT,
-            )
-            .map(|client| (client, false));
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
         }
         let response = read_claim_response(response, "LAN")?;
-        if is_legacy_shaped_claim_response(&response) && response.source_device_id.is_none() {
-            if !allow_legacy_fallback {
-                return Err(PeerSyncError::Protocol(
-                    "source returned a legacy clone claim to a registered v2 request".to_owned(),
-                ));
-            }
-            if !is_canonical_uuid(&response.device_id)
-                || !is_lower_hex_256(&response.bearer)
-                || response.permission != "clone-read"
-            {
-                return Err(PeerSyncError::Protocol(
-                    "invalid LAN claim response".to_owned(),
-                ));
-            }
-            return Ok((
-                Self {
-                    client,
-                    ranges: HttpRangeStream::new(Duration::from_secs(3))?,
-                    control_timeout: CONTROL_REQUEST_TIMEOUT,
-                    endpoint,
-                    session_id: session_id.to_owned(),
-                    session_url,
-                    device_id: response.device_id,
-                    bearer: response.bearer,
-                    source_device_id: None,
-                    manifest_id: None,
-                },
-                false,
-            ));
-        }
-        let source_device_id = response.source_device_id.ok_or_else(|| {
-            PeerSyncError::Protocol("v2 source device identity is missing".to_owned())
-        })?;
+        let (Some(source_device_id), Some(permissions)) =
+            (response.source_device_id, response.permissions)
+        else {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        };
         let source_name = response.source_device_name.ok_or_else(|| {
             PeerSyncError::Protocol("v2 source device name is missing".to_owned())
         })?;
-        let _permissions =
-            DevicePermissions::from_values(response.permissions.ok_or_else(|| {
-                PeerSyncError::Protocol("v2 permissions are missing".to_owned())
-            })?)?;
+        DevicePermissions::from_values(permissions)?;
         if response.device_id != device_id
             || !is_canonical_uuid(&source_device_id)
             || validate_device_name(&source_name).is_err()
@@ -586,25 +376,18 @@ impl LanCloneClient {
                 "invalid LAN v2 claim response".to_owned(),
             ));
         }
-        Ok((
-            Self {
-                client,
-                ranges: HttpRangeStream::new(Duration::from_secs(3))?,
-                control_timeout: CONTROL_REQUEST_TIMEOUT,
-                endpoint,
-                session_id: session_id.to_owned(),
-                session_url,
-                device_id: response.device_id,
-                bearer: response.bearer,
-                source_device_id: Some(source_device_id),
-                manifest_id: None,
-            },
-            true,
-        ))
-    }
-
-    fn register_incoming_source(&self, app_root: &Path) -> Result<(), PeerSyncError> {
-        register_incoming_source_if_compatible(app_root, self.incoming_source()?)
+        Ok(Self {
+            client,
+            ranges: HttpRangeStream::new(Duration::from_secs(3))?,
+            control_timeout: CONTROL_REQUEST_TIMEOUT,
+            endpoint,
+            session_id: session_id.to_owned(),
+            session_url,
+            device_id: response.device_id,
+            bearer: response.bearer,
+            source_device_id: Some(source_device_id),
+            manifest_id: None,
+        })
     }
 
     fn incoming_source(&self) -> Result<IncomingSource, PeerSyncError> {
@@ -744,14 +527,6 @@ impl LanCloneClient {
         Ok(self
             .fetch_manifest_request(expected_manifest_id, false, None)?
             .bytes)
-    }
-
-    pub(crate) fn fetch_manifest_with_completion_lease(
-        &self,
-        expected_manifest_id: &str,
-        resume_lease_id: Option<&CompletionLeaseId>,
-    ) -> Result<LanCompletionManifestResponse, PeerSyncError> {
-        self.fetch_manifest_request(expected_manifest_id, true, resume_lease_id)
     }
 
     fn fetch_manifest_request(
@@ -3377,10 +3152,6 @@ fn read_claim_response(
     serde_json::from_slice(&body).map_err(|error| PeerSyncError::Protocol(error.to_string()))
 }
 
-fn is_legacy_shaped_claim_response(response: &ClaimResponseOwned) -> bool {
-    response.source_device_name.is_none() && response.permissions.is_none()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PeerHello {
     pub(crate) device_id: String,
@@ -4535,7 +4306,9 @@ mod timeout_tests {
         })
     }
 
-    fn tolerant_legacy_claim_server(
+    /// Answers one claim request with a fixed body, so a client can be pointed at a
+    /// response shape the source itself would never produce.
+    fn canned_claim_response_server(
         response: serde_json::Value,
     ) -> (String, mpsc::Receiver<usize>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -4555,41 +4328,6 @@ mod timeout_tests {
             stream.write_all(&body).unwrap();
             stream.flush().unwrap();
             finish_response(&mut stream);
-        });
-        (endpoint, calls_rx, server)
-    }
-
-    fn legacy_retry_claim_server(
-        response: serde_json::Value,
-    ) -> (String, mpsc::Receiver<usize>, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (calls_tx, calls_rx) = mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut rejected, _) = listener.accept().unwrap();
-            assert!(read_request_head(&mut rejected).starts_with("POST "));
-            calls_tx.send(1).unwrap();
-            rejected
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-            rejected.flush().unwrap();
-            finish_response(&mut rejected);
-
-            let (mut accepted, _) = listener.accept().unwrap();
-            assert!(read_request_head(&mut accepted).starts_with("POST "));
-            calls_tx.send(2).unwrap();
-            let body = serde_json::to_vec(&response).unwrap();
-            write!(
-                accepted,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            accepted.write_all(&body).unwrap();
-            accepted.flush().unwrap();
-            finish_response(&mut accepted);
         });
         (endpoint, calls_rx, server)
     }
@@ -4689,82 +4427,6 @@ mod timeout_tests {
     }
 
     #[test]
-    fn v2_clients_keep_a_tolerant_legacy_claim_response_without_retrying() {
-        let _guard = LOGICAL_LAN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let target_root = tempfile::tempdir().unwrap();
-        let session_id = "00000000-0000-4000-8000-000000000097";
-        let manifest_id = "a".repeat(64);
-        let claim = "b".repeat(64);
-        let bearer = "c".repeat(64);
-
-        let (endpoint, calls, server) = tolerant_legacy_claim_server(serde_json::json!({
-            "deviceId": "00000000-0000-4000-8000-000000000098",
-            "bearer": bearer,
-            "permission": "clone-read"
-        }));
-        let credential = target_root.path().join("clone-credential.json");
-        let clone = LanCloneClient::claim_v2_and_persist_and_register(
-            target_root.path(),
-            "Android",
-            &credential,
-            &endpoint,
-            session_id,
-            &manifest_id,
-            &claim,
-        )
-        .unwrap();
-        assert_eq!(clone.device_id, "00000000-0000-4000-8000-000000000098");
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        server.join().unwrap();
-
-        let (endpoint, calls, server) = tolerant_legacy_claim_server(serde_json::json!({
-            "deviceId": "00000000-0000-4000-8000-000000000099",
-            "bearer": "d".repeat(64),
-            "permission": "logical-read",
-            "sourceDeviceId": "00000000-0000-4000-8000-000000000100"
-        }));
-        let delta = LanLogicalDeltaClient::claim_v2_and_register(
-            target_root.path(),
-            "Android",
-            &endpoint,
-            session_id,
-            &manifest_id,
-            &claim,
-        )
-        .unwrap();
-        assert_eq!(
-            delta.source_device_id(),
-            "00000000-0000-4000-8000-000000000100"
-        );
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        server.join().unwrap();
-
-        let (endpoint, calls, server) = tolerant_legacy_claim_server(serde_json::json!({
-            "deviceId": "00000000-0000-4000-8000-000000000101",
-            "bearer": "e".repeat(64),
-            "permission": "logical-bidirectional",
-            "sourceDeviceId": "00000000-0000-4000-8000-000000000102"
-        }));
-        let bidirectional = LanBidirectionalLogicalClient::claim_v2_and_register(
-            target_root.path(),
-            "Android",
-            &endpoint,
-            session_id,
-            &manifest_id,
-            &claim,
-        )
-        .unwrap();
-        assert_eq!(
-            bidirectional.source_device_id(),
-            "00000000-0000-4000-8000-000000000102"
-        );
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        server.join().unwrap();
-    }
-
-    #[test]
     fn clone_v2_registration_rejects_hello_with_a_different_claimed_source_identity() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -4842,85 +4504,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn v2_clients_retry_an_actual_bad_request_with_the_legacy_claim_shape() {
-        let _guard = LOGICAL_LAN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let target_root = tempfile::tempdir().unwrap();
-        let session_id = "00000000-0000-4000-8000-000000000097";
-        let manifest_id = "a".repeat(64);
-        let claim = "b".repeat(64);
-
-        let (endpoint, calls, server) = legacy_retry_claim_server(serde_json::json!({
-            "deviceId": "00000000-0000-4000-8000-000000000098",
-            "bearer": "c".repeat(64),
-            "permission": "clone-read"
-        }));
-        let credential = target_root.path().join("clone-credential.json");
-        let clone = LanCloneClient::claim_v2_and_persist_and_register(
-            target_root.path(),
-            "Android",
-            &credential,
-            &endpoint,
-            session_id,
-            &manifest_id,
-            &claim,
-        )
-        .unwrap();
-        assert_eq!(clone.device_id, "00000000-0000-4000-8000-000000000098");
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
-        server.join().unwrap();
-
-        let (endpoint, calls, server) = legacy_retry_claim_server(serde_json::json!({
-            "deviceId": "00000000-0000-4000-8000-000000000099",
-            "bearer": "d".repeat(64),
-            "permission": "logical-read",
-            "sourceDeviceId": "00000000-0000-4000-8000-000000000100"
-        }));
-        let delta = LanLogicalDeltaClient::claim_v2_and_register(
-            target_root.path(),
-            "Android",
-            &endpoint,
-            session_id,
-            &manifest_id,
-            &claim,
-        )
-        .unwrap();
-        assert_eq!(
-            delta.source_device_id(),
-            "00000000-0000-4000-8000-000000000100"
-        );
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
-        server.join().unwrap();
-
-        let (endpoint, calls, server) = legacy_retry_claim_server(serde_json::json!({
-            "deviceId": "00000000-0000-4000-8000-000000000101",
-            "bearer": "e".repeat(64),
-            "permission": "logical-bidirectional",
-            "sourceDeviceId": "00000000-0000-4000-8000-000000000102"
-        }));
-        let bidirectional = LanBidirectionalLogicalClient::claim_v2_and_register(
-            target_root.path(),
-            "Android",
-            &endpoint,
-            session_id,
-            &manifest_id,
-            &claim,
-        )
-        .unwrap();
-        assert_eq!(
-            bidirectional.source_device_id(),
-            "00000000-0000-4000-8000-000000000102"
-        );
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn strict_v2_clone_stops_after_one_bad_request_without_persisting() {
+    fn clone_claim_reports_peer_outdated_on_a_bad_request_without_persisting() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4928,7 +4512,7 @@ mod timeout_tests {
         let credential = target_root.path().join("strict-v2-credential.json");
         let (endpoint, calls, server) = rejecting_v2_claim_server();
 
-        let result = LanCloneClient::claim_strict_v2_and_persist_and_register(
+        let result = LanCloneClient::claim_v2_and_persist_and_register(
             target_root.path(),
             "Windows target",
             &credential,
@@ -4938,10 +4522,75 @@ mod timeout_tests {
             &"b".repeat(64),
         );
 
-        assert!(matches!(result, Err(PeerSyncError::Protocol(_))));
+        assert!(matches!(
+            result.err(),
+            Some(PeerSyncError::Validation(code)) if code == PEER_OUTDATED
+        ));
         assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
         server.join().unwrap();
         assert!(calls.try_recv().is_err());
+        assert!(!credential.exists());
+        assert!(IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()
+            .is_empty());
+    }
+
+    #[test]
+    fn clone_claim_reports_peer_outdated_when_the_response_omits_registered_identity() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target_root = tempfile::tempdir().unwrap();
+        let credential = target_root.path().join("clone-credential.json");
+        let device_id =
+            super::super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+
+        let (endpoint, _calls, server) = canned_claim_response_server(serde_json::json!({
+            "deviceId": device_id,
+            "bearer": "c".repeat(64),
+            "permission": "clone-read",
+            "sourceDeviceName": "Source",
+            "permissions": ["read"],
+        }));
+        let missing_source = LanCloneClient::claim_v2_and_persist_and_register(
+            target_root.path(),
+            "Windows target",
+            &credential,
+            &endpoint,
+            TEST_SESSION_ID,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            missing_source.err(),
+            Some(PeerSyncError::Validation(code)) if code == PEER_OUTDATED
+        ));
+
+        let (endpoint, _calls, server) = canned_claim_response_server(serde_json::json!({
+            "deviceId": device_id,
+            "bearer": "c".repeat(64),
+            "permission": "clone-read",
+            "sourceDeviceId": "00000000-0000-4000-8000-000000000131",
+            "sourceDeviceName": "Source",
+        }));
+        let missing_permissions = LanCloneClient::claim_v2_and_persist_and_register(
+            target_root.path(),
+            "Windows target",
+            &credential,
+            &endpoint,
+            TEST_SESSION_ID,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            missing_permissions.err(),
+            Some(PeerSyncError::Validation(code)) if code == PEER_OUTDATED
+        ));
         assert!(!credential.exists());
         assert!(IncomingSourceRegistry::load(target_root.path())
             .unwrap()
@@ -4991,7 +4640,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn stalled_claim_uses_the_short_control_timeout() {
+    fn stalled_claim_uses_the_bounded_control_timeout() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         // The server holds the claim response until the client has already failed, so
@@ -5007,11 +4656,12 @@ mod timeout_tests {
         });
         let started = Instant::now();
 
-        let error = LanCloneClient::claim_with_timeout(
+        let error = LanCloneClient::claim_v2_with_device(
             &endpoint,
             "00000000-0000-4000-8000-000000000000",
             "0000000000000000000000000000000000000000000000000000000000000000",
-            Duration::from_millis(150),
+            "00000000-0000-4000-8000-000000000001",
+            "Target",
         )
         .err()
         .unwrap();
@@ -5021,7 +4671,7 @@ mod timeout_tests {
 
         assert!(matches!(error, PeerSyncError::Transport(_)));
         // Generous hang guard only; the held socket proves a bounded timeout fired.
-        assert!(elapsed < Duration::from_secs(5));
+        assert!(elapsed < CONTROL_REQUEST_TIMEOUT * 4);
     }
 
     #[test]
@@ -5193,7 +4843,7 @@ mod timeout_tests {
         };
 
         let observed = client
-            .fetch_manifest_with_completion_lease(&manifest_id, None)
+            .fetch_manifest_request(&manifest_id, true, None)
             .unwrap();
         server.join().unwrap();
         assert!(observed.completion_lease_id.is_none());
@@ -7075,77 +6725,6 @@ mod timeout_tests {
     }
 
     #[test]
-    fn legacy_clone_credential_migrates_only_after_authenticated_hello_and_keeps_bytes() {
-        let _guard = LOGICAL_LAN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let source_root = tempfile::tempdir().unwrap();
-        let target_root = tempfile::tempdir().unwrap();
-        let source_id =
-            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
-        let mut host = LanCloneHost::prepare_logical(prepared_logical_session(
-            "00000000-0000-4000-8000-000000000096",
-            &source_id,
-        ));
-        host.enable_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
-            .unwrap();
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
-        let claimed = LanLogicalDeltaClient::claim_v2_and_register(
-            target_root.path(),
-            "Android",
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
-        )
-        .unwrap();
-        fs::remove_file(target_root.path().join("peer-sync/sources.json")).unwrap();
-        let credential_path = target_root.path().join("legacy-credential.json");
-        let credential_bytes = b"legacy credential bytes";
-        fs::write(&credential_path, credential_bytes).unwrap();
-        let legacy = LanCloneClient {
-            client: build_clone_http_client(CONTROL_REQUEST_TIMEOUT).unwrap(),
-            ranges: HttpRangeStream::new(Duration::from_secs(1)).unwrap(),
-            control_timeout: CONTROL_REQUEST_TIMEOUT,
-            endpoint,
-            session_id: pairing.session_id,
-            session_url: String::new(),
-            device_id: claimed.device_id,
-            bearer: claimed.bearer,
-            source_device_id: None,
-            manifest_id: None,
-        };
-
-        assert!(legacy
-            .try_migrate_persisted_credential(target_root.path())
-            .unwrap());
-        assert_eq!(fs::read(&credential_path).unwrap(), credential_bytes);
-        let incoming = IncomingSourceRegistry::load(target_root.path()).unwrap();
-        assert_eq!(incoming.sources().len(), 1);
-        assert_eq!(incoming.sources()[0].device_id, source_id);
-        host.stop().unwrap();
-    }
-
-    #[test]
-    fn failed_legacy_credential_migration_leaves_credential_and_registry_unchanged() {
-        let target_root = tempfile::tempdir().unwrap();
-        let credential_path = target_root.path().join("legacy-credential.json");
-        let credential_bytes = b"legacy credential bytes";
-        fs::write(&credential_path, credential_bytes).unwrap();
-        let legacy = direct_client(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
-
-        assert!(!legacy
-            .try_migrate_persisted_credential(target_root.path())
-            .unwrap());
-        assert_eq!(fs::read(&credential_path).unwrap(), credential_bytes);
-        assert!(IncomingSourceRegistry::load(target_root.path())
-            .unwrap()
-            .sources()
-            .is_empty());
-    }
-
-    #[test]
     fn strict_v2_clone_does_not_persist_when_post_claim_hello_disconnects() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
@@ -7188,7 +6767,7 @@ mod timeout_tests {
         });
         let credential = target_root.path().join("strict-v2-credential.json");
 
-        assert!(LanCloneClient::claim_strict_v2_and_persist_and_register(
+        assert!(LanCloneClient::claim_v2_and_persist_and_register(
             target_root.path(),
             "Android target",
             &credential,
@@ -8566,7 +8145,7 @@ impl LanLogicalDeltaClient {
         }
         let response: ClaimResponseOwned = serde_json::from_slice(&body)
             .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-        if is_legacy_shaped_claim_response(&response) {
+        if response.source_device_name.is_none() && response.permissions.is_none() {
             let source_device_id = response.source_device_id.ok_or_else(|| {
                 PeerSyncError::Protocol(
                     "logical delta source device identity is missing".to_owned(),

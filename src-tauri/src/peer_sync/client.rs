@@ -323,20 +323,6 @@ impl LoopbackCloneClient {
         })
     }
 
-    pub fn from_lan(
-        staging_root: impl AsRef<Path>,
-        lan: LanCloneClient,
-        expected_manifest_id: &str,
-    ) -> Result<Self, PeerSyncError> {
-        Self::from_lan_with_completion(
-            staging_root,
-            lan,
-            expected_manifest_id,
-            PeerCompletionCapability::Unsupported,
-            None,
-        )
-    }
-
     pub(crate) fn from_lan_with_completion(
         staging_root: impl AsRef<Path>,
         lan: LanCloneClient,
