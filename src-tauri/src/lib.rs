@@ -673,11 +673,7 @@ pub fn run() {
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_revoke,
             #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_sync,
-            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_resolve,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_resolve_with_link,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_resume,
             #[cfg(any(desktop, target_os = "android"))]

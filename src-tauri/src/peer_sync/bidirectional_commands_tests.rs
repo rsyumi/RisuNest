@@ -47,10 +47,9 @@ fn registered_bidirectional_terminal_projection_bounds_transport_and_local_error
     assert!(registry().attach_exact(&foreground));
     state.mark_target_running_exact(&foreground).unwrap();
 
-    let local = bound_registered_bidirectional_outcome::<PeerBidirectionalSyncResult>(
-        Err("C:\\private\\store and bearer secret".to_owned()),
-        true,
-    );
+    let local = bound_registered_bidirectional_outcome::<PeerBidirectionalSyncResult>(Err(
+        "C:\\private\\store and bearer secret".to_owned(),
+    ));
     assert_eq!(local.as_ref().unwrap_err(), "operationFailed");
     state
         .publish_target_terminal_exact(&foreground, local)
@@ -63,7 +62,6 @@ fn registered_bidirectional_terminal_projection_bounds_transport_and_local_error
         bidirectional_peer_operation_failure(
             "registered bidirectional transport",
             PeerSyncError::Transport("http://192.168.1.7/session/secret".to_owned()),
-            true,
         ),
         "transportUnavailable"
     );
@@ -73,20 +71,19 @@ fn registered_bidirectional_terminal_projection_bounds_transport_and_local_error
 fn re_bounding_a_bidirectional_outcome_keeps_a_code_the_lane_already_produced() {
     for code in ["sourceInUse", "deltaCompletionRetained", "peerOutdated"] {
         assert_eq!(
-            bound_registered_bidirectional_outcome::<()>(Err(code.to_owned()), true).unwrap_err(),
+            bound_registered_bidirectional_outcome::<()>(Err(code.to_owned())).unwrap_err(),
             code
         );
     }
     assert_eq!(
-        bound_registered_bidirectional_outcome::<()>(
-            Err("C:\\private\\store and bearer secret".to_owned()),
-            true,
-        )
+        bound_registered_bidirectional_outcome::<()>(Err(
+            "C:\\private\\store and bearer secret".to_owned()
+        ))
         .unwrap_err(),
         "operationFailed"
     );
     assert_eq!(
-        bound_registered_bidirectional_outcome(Ok::<_, String>(4), true),
+        bound_registered_bidirectional_outcome(Ok::<_, String>(4)),
         Ok(4)
     );
 }
@@ -427,9 +424,57 @@ fn context(operation_id: &str) -> PeerBidirectionalOperationContext {
         previous_shared: previous.clone(),
         previous_local: previous,
         durable_job_id: "123e4567-e89b-42d3-a456-426614174003".to_owned(),
-        completion_mode: PeerBidirectionalCompletionMode::Legacy,
+        completion_mode: PeerBidirectionalCompletionMode::Unsupported,
         completion_delivery: None,
     }
+}
+
+/// The registered incoming source every bidirectional target operation now
+/// needs, derived from the credential the fixture merges against.
+fn register_bidirectional_source_for_credential(
+    root: &Path,
+    credential: &LanBidirectionalLogicalCredential,
+) {
+    let mut registry = super::super::device_registry::IncomingSourceRegistry::load(root).unwrap();
+    registry
+        .upsert(super::super::device_registry::IncomingSource {
+            device_id: credential.source_device_id.clone(),
+            name: "bidirectional source".to_owned(),
+            endpoint: "http://192.168.0.98:32146".to_owned(),
+            bearer: if credential.bearer.is_empty() {
+                "c".repeat(64)
+            } else {
+                credential.bearer.clone()
+            },
+            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 0,
+            total_bytes: 0,
+        })
+        .unwrap();
+    registry.save().unwrap();
+}
+
+/// The registered-target twin of `begin_bidirectional_local_merge`: the source
+/// the target reports its completion to is registered first.
+fn begin_registered_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    credential: LanBidirectionalLogicalCredential,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+) -> Result<LocalMergeOutcome, PeerSyncError> {
+    register_bidirectional_source_for_credential(app_root, &credential);
+    begin_bidirectional_local_merge(
+        store,
+        cas,
+        app_root,
+        credential,
+        expected_revision,
+        remote_manifest_bytes,
+        remote_source,
+    )
 }
 
 const BIDIRECTIONAL_ACCOUNTING_SOURCE_ID: &str = "123e4567-e89b-42d3-a456-426614174002";
@@ -816,7 +861,7 @@ fn public_conflict_fixture() -> (
         &remote.manifest.generation,
     )
     .unwrap();
-    let conflict = match begin_bidirectional_local_merge(
+    let conflict = match begin_registered_bidirectional_local_merge(
         &mut local_store,
         &local_cas,
         local_directory.path(),
@@ -1876,6 +1921,7 @@ impl CancellationProbe for CancelOnProbeCall {
 #[test]
 fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable_boundaries() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
+    register_bidirectional_source_for_credential(directory.path(), &credential);
     let mut source = fixture_source(&remote);
     let before_journal = CancelOnProbeCall {
         calls: Cell::new(0),
@@ -1892,7 +1938,7 @@ fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable
             &mut source,
             &before_journal,
             None,
-            PeerBidirectionalCompletionMode::Legacy,
+            PeerBidirectionalCompletionMode::Unsupported,
         ),
         Err(PeerSyncError::Cancelled),
     );
@@ -1903,6 +1949,7 @@ fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable
     assert_eq!(store.revision().unwrap(), 1);
 
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
+    register_bidirectional_source_for_credential(directory.path(), &credential);
     let mut source = fixture_source(&remote);
     let after_prepared = CancelOnProbeCall {
         calls: Cell::new(0),
@@ -1919,7 +1966,7 @@ fn android_p5_cancellation_before_and_after_target_preparation_preserves_durable
             &mut source,
             &after_prepared,
             None,
-            PeerBidirectionalCompletionMode::Legacy,
+            PeerBidirectionalCompletionMode::Unsupported,
         ),
         Err(PeerSyncError::Cancelled),
     );
@@ -2137,29 +2184,6 @@ fn bidirectional_durable_completion_accounts_once_and_retained_retry_does_not() 
 }
 
 #[test]
-fn migrated_legacy_completion_does_not_create_new_accounting() {
-    let directory = tempfile::tempdir().unwrap();
-    register_bidirectional_accounting_source(directory.path(), 40, 7);
-    let operation_id = "123e4567-e89b-42d3-a456-426614174093";
-    let result = PeerBidirectionalCompletedResult {
-        kind: "updated".to_owned(),
-        operation_id: operation_id.to_owned(),
-        revision: 8,
-        remote_revision: 4,
-        transferred_objects: 1,
-        transferred_bytes: 27,
-        backups: vec![],
-    };
-
-    record_bidirectional_completion(directory.path(), &context(operation_id), &result).unwrap();
-
-    assert_eq!(
-        bidirectional_accounting_source(directory.path()).total_bytes,
-        40
-    );
-}
-
-#[test]
 fn registered_source_removal_waits_for_the_bidirectional_target_journal() {
     let directory = tempfile::tempdir().unwrap();
     register_bidirectional_accounting_source(directory.path(), 0, 7);
@@ -2267,43 +2291,7 @@ fn initial_registered_target_publication_revalidates_credential_before_store() {
 }
 
 #[test]
-fn legacy_target_journal_does_not_claim_registered_source_activity() {
-    let directory = tempfile::tempdir().unwrap();
-    register_bidirectional_accounting_source(directory.path(), 0, 7);
-    let operation_id = "123e4567-e89b-42d3-a456-426614174096";
-    let mut retained_context = context(operation_id);
-    retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
-    retained_context.expected_remote_generation.manifest_hash =
-        retained_context.credential.manifest_id.clone();
-    PeerBidirectionalOperationJournal::new(directory.path())
-        .store(&PeerBidirectionalDurableOperation::TargetPrepared {
-            schema: OPERATION_SCHEMA.to_owned(),
-            context: retained_context,
-            local_generation: generation("local", "1", 'e'),
-            conflict_policy: TargetPreparedConflictPolicy::Reject,
-            changed: false,
-            remote_backup_required: false,
-            transferred_objects: 0,
-            transferred_bytes: 0,
-            backups: vec![],
-        })
-        .unwrap();
-
-    assert!(!registered_bidirectional_source_is_active(
-        directory.path(),
-        Some(BIDIRECTIONAL_ACCOUNTING_SOURCE_ID),
-    )
-    .unwrap());
-    assert!(!registered_bidirectional_source_is_active(directory.path(), None).unwrap());
-    super::super::registry_commands::remove_incoming_source_if_inactive(
-        directory.path(),
-        BIDIRECTIONAL_ACCOUNTING_SOURCE_ID,
-    )
-    .unwrap();
-}
-
-#[test]
-fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
+fn registration_blocks_active_bidirectional_target_phases_until_completion() {
     let directory = tempfile::tempdir().unwrap();
     register_bidirectional_accounting_source(directory.path(), 40, 7);
     let operation_id = "123e4567-e89b-42d3-a456-426614174096";
@@ -2355,38 +2343,6 @@ fn registration_blocks_only_nonlegacy_active_bidirectional_target_phases() {
     );
     assert_eq!(fs::read(&sources_path).unwrap(), before);
     assert!(preflight().is_err());
-
-    let mut legacy_context = context(operation_id);
-    legacy_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
-    legacy_context.expected_remote_generation.manifest_hash =
-        legacy_context.credential.manifest_id.clone();
-    journal
-        .store(&PeerBidirectionalDurableOperation::TargetPrepared {
-            schema: OPERATION_SCHEMA.to_owned(),
-            context: legacy_context,
-            local_generation: generation("local", "1", 'e'),
-            conflict_policy: TargetPreparedConflictPolicy::Reject,
-            changed: false,
-            remote_backup_required: false,
-            transferred_objects: 0,
-            transferred_bytes: 0,
-            backups: vec![],
-        })
-        .unwrap();
-    super::super::registry_commands::register_incoming_source_if_compatible(
-        directory.path(),
-        super::super::device_registry::IncomingSource {
-            device_id: BIDIRECTIONAL_ACCOUNTING_SOURCE_ID.to_owned(),
-            name: "legacy rotation".to_owned(),
-            endpoint: "http://192.168.0.99:32146".to_owned(),
-            bearer: "d".repeat(64),
-            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
-            last_seen_ms: 9,
-            total_bytes: 0,
-        },
-    )
-    .unwrap();
-    preflight().unwrap();
 
     journal
         .store(&PeerBidirectionalDurableOperation::Completed {
@@ -2988,6 +2944,7 @@ fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
     retained_context.expected_remote_revision = 4;
     retained_context.previous_shared = previous.clone();
     retained_context.previous_local = previous.clone();
+    register_bidirectional_source_for_credential(directory.path(), &retained_context.credential);
     PeerBidirectionalOperationJournal::new(directory.path())
         .store(&PeerBidirectionalDurableOperation::LocalCommitted {
             schema: OPERATION_SCHEMA.to_owned(),
@@ -3127,45 +3084,44 @@ fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
     );
 }
 
-#[test]
-fn legacy_local_committed_journal_requires_remote_backup_conservatively() {
-    let directory = tempfile::tempdir().unwrap();
-    let operation_root = directory.path().join("peer-bidirectional");
-    fs::create_dir_all(&operation_root).unwrap();
-    let operation_id = "123e4567-e89b-42d3-a456-426614174004";
-    let legacy_operation = json!({
+fn local_committed_journal_json(completion_mode: Option<&str>) -> serde_json::Value {
+    let mut context = json!({
+        "operationId": "123e4567-e89b-42d3-a456-426614174004",
+        "credential": {
+            "endpoint": "http://192.168.1.2:32146",
+            "sessionId": "123e4567-e89b-42d3-a456-426614174000",
+            "manifestId": "b".repeat(64),
+            "deviceId": "123e4567-e89b-42d3-a456-426614174001",
+            "sourceDeviceId": "123e4567-e89b-42d3-a456-426614174002",
+            "bearer": "c".repeat(64),
+        },
+        "libraryId": "risunest-product",
+        "expectedLocalRevision": 7,
+        "expectedRemoteRevision": 7,
+        "expectedRemoteGeneration": {
+            "generationId": "remote-r",
+            "manifestHash": "d".repeat(64),
+            "generationSequence": "2",
+        },
+        "previousShared": {
+            "generationId": "shared-c",
+            "manifestHash": "a".repeat(64),
+            "generationSequence": "1",
+        },
+        "previousLocal": {
+            "generationId": "shared-c",
+            "manifestHash": "a".repeat(64),
+            "generationSequence": "1",
+        },
+        "durableJobId": "123e4567-e89b-42d3-a456-426614174003",
+    });
+    if let Some(mode) = completion_mode {
+        context["completionMode"] = json!(mode);
+    }
+    json!({
         "phase": "localCommitted",
         "schema": "risunest.peer-bidirectional-operation/v1",
-        "context": {
-            "operationId": operation_id,
-            "credential": {
-                "endpoint": "http://192.168.1.2:32146",
-                "sessionId": "123e4567-e89b-42d3-a456-426614174000",
-                "manifestId": "b".repeat(64),
-                "deviceId": "123e4567-e89b-42d3-a456-426614174001",
-                "sourceDeviceId": "123e4567-e89b-42d3-a456-426614174002",
-                "bearer": "c".repeat(64),
-            },
-            "libraryId": "risunest-product",
-            "expectedLocalRevision": 7,
-            "expectedRemoteRevision": 7,
-            "expectedRemoteGeneration": {
-                "generationId": "remote-r",
-                "manifestHash": "d".repeat(64),
-                "generationSequence": "2",
-            },
-            "previousShared": {
-                "generationId": "shared-c",
-                "manifestHash": "a".repeat(64),
-                "generationSequence": "1",
-            },
-            "previousLocal": {
-                "generationId": "shared-c",
-                "manifestHash": "a".repeat(64),
-                "generationSequence": "1",
-            },
-            "durableJobId": "123e4567-e89b-42d3-a456-426614174003",
-        },
+        "context": context,
         "committed_revision": 8,
         "shared_generation": {
             "generationId": "local-a",
@@ -3176,10 +3132,17 @@ fn legacy_local_committed_journal_requires_remote_backup_conservatively() {
         "transferred_objects": 2,
         "transferred_bytes": 19,
         "backups": [],
-    });
+    })
+}
+
+#[test]
+fn local_committed_journal_without_a_backup_flag_requires_remote_backup_conservatively() {
+    let directory = tempfile::tempdir().unwrap();
+    let operation_root = directory.path().join("peer-bidirectional");
+    fs::create_dir_all(&operation_root).unwrap();
     fs::write(
         operation_root.join(OPERATION_FILE),
-        serde_json::to_vec(&legacy_operation).unwrap(),
+        serde_json::to_vec(&local_committed_journal_json(Some("unsupported"))).unwrap(),
     )
     .unwrap();
 
@@ -3192,6 +3155,22 @@ fn legacy_local_committed_journal_requires_remote_backup_conservatively() {
             remote_backup_required: true,
             ..
         }
+    ));
+}
+
+#[test]
+fn a_journal_without_a_completion_mode_is_not_deserializable() {
+    let bytes = serde_json::to_vec(&local_committed_journal_json(None)).unwrap();
+    assert!(serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes).is_err());
+
+    let directory = tempfile::tempdir().unwrap();
+    let operation_root = directory.path().join("peer-bidirectional");
+    fs::create_dir_all(&operation_root).unwrap();
+    fs::write(operation_root.join(OPERATION_FILE), &bytes).unwrap();
+
+    assert!(matches!(
+        PeerBidirectionalOperationJournal::new(directory.path()).load(),
+        Err(PeerSyncError::Storage(_))
     ));
 }
 
@@ -3238,6 +3217,7 @@ fn zero_transfer_remote_revision_advance_completes_as_updated() {
     retained_context.expected_remote_revision = 4;
     retained_context.previous_shared = shared.clone();
     retained_context.previous_local = shared.clone();
+    register_bidirectional_source_for_credential(directory.path(), &retained_context.credential);
     let retained = PeerBidirectionalDurableOperation::LocalCommitted {
         schema: OPERATION_SCHEMA.to_owned(),
         context: retained_context,
@@ -4967,6 +4947,7 @@ fn deferred_already_active_is_retained_as_a_changed_local_commit() {
     retained_context.expected_remote_revision = 4;
     retained_context.previous_shared = shared.clone();
     retained_context.previous_local = shared.clone();
+    register_bidirectional_source_for_credential(directory.path(), &retained_context.credential);
     let job = RefCell::new(
         DurableCasJob::begin(
             directory.path(),
@@ -5536,7 +5517,7 @@ fn reject_conflict_is_durable_and_mutates_neither_side() {
     )
     .unwrap();
     TARGET_CONFLICT_STORE_FAILPOINT.with(|enabled| enabled.set(true));
-    let store_error = begin_bidirectional_local_merge(
+    let store_error = begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -5557,7 +5538,7 @@ fn reject_conflict_is_durable_and_mutates_neither_side() {
         .unwrap()
         .is_none());
     assert!(durable_job_journal_ids(directory.path()).is_empty());
-    let conflict = match begin_bidirectional_local_merge(
+    let conflict = match begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -6187,7 +6168,7 @@ fn local_winner_backs_up_remote_before_replacement_and_retains_receipt() {
         &remote.manifest.generation,
     )
     .unwrap();
-    let conflict = match begin_bidirectional_local_merge(
+    let conflict = match begin_registered_bidirectional_local_merge(
         &mut local_store,
         &local_cas,
         &local_root,
@@ -6467,7 +6448,7 @@ fn target_prepared_store_failure_precedes_source_reads_and_local_mutation() {
     let mut source = fixture_source(&remote);
     TARGET_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
 
-    let error = begin_bidirectional_local_merge(
+    let error = begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -6501,7 +6482,7 @@ fn target_prepared_store_owns_the_deterministic_job_before_job_begin() {
     let mut source = fixture_source(&remote);
     TARGET_AFTER_PREPARED_STORE_FAILPOINT.with(|enabled| enabled.set(true));
 
-    let error = begin_bidirectional_local_merge(
+    let error = begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -6570,7 +6551,7 @@ fn target_transfer_failure_reopens_with_the_same_operation_and_job() {
         reads: 0,
     };
     assert!(matches!(
-        begin_bidirectional_local_merge(
+        begin_registered_bidirectional_local_merge(
             &mut store,
             &cas,
             directory.path(),
@@ -6649,7 +6630,7 @@ fn target_partial_transfer_reopens_the_same_job_and_requests_only_remaining_obje
         fail_after: 40,
     };
     assert!(matches!(
-        begin_bidirectional_local_merge(
+        begin_registered_bidirectional_local_merge(
             &mut store,
             &cas,
             directory.path(),
@@ -6725,7 +6706,7 @@ fn target_changed_activation_crash_recovers_without_a_second_download() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
-    let error = begin_bidirectional_local_merge(
+    let error = begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -6827,7 +6808,7 @@ fn target_completion_retries_job_release_before_dropping_its_job_identity() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_JOB_RELEASE_FAILPOINT.with(|enabled| enabled.set(true));
-    let error = begin_bidirectional_local_merge(
+    let error = begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -6928,7 +6909,7 @@ fn target_completion_retains_local_committed_when_its_job_has_the_wrong_kind() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_JOB_RELEASE_FAILPOINT.with(|enabled| enabled.set(true));
-    assert!(begin_bidirectional_local_merge(
+    assert!(begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -7006,7 +6987,7 @@ fn target_postactivation_status_promotes_only_an_exact_committed_witness() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
-    assert!(begin_bidirectional_local_merge(
+    assert!(begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -7069,7 +7050,7 @@ fn target_postactivation_status_rejects_malformed_public_https_without_mutation(
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
-    assert!(begin_bidirectional_local_merge(
+    assert!(begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -7110,7 +7091,7 @@ fn target_exact_seal_race_retains_prepared_and_preserves_the_descendant() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
-    assert!(begin_bidirectional_local_merge(
+    assert!(begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -7227,7 +7208,7 @@ fn target_no_op_activation_crash_recovers_at_the_same_revision() {
     };
     TARGET_AFTER_ACTIVATION_FAILPOINT.with(|enabled| enabled.set(true));
     assert!(matches!(
-        begin_bidirectional_local_merge(
+        begin_registered_bidirectional_local_merge(
             &mut store,
             &cas,
             directory.path(),
@@ -7347,7 +7328,7 @@ fn disjoint_merge_commits_shared_a_and_retains_peer_state_at_c() {
     let mut source = fixture_source(&remote);
 
     assert_eq!(
-        begin_bidirectional_local_merge(
+        begin_registered_bidirectional_local_merge(
             &mut store,
             &cas,
             directory.path(),
@@ -7510,7 +7491,7 @@ fn remote_apply_response_loss_reissues_shared_a_without_redownload() {
         bearer: "e".repeat(64),
     };
     assert_eq!(
-        begin_bidirectional_local_merge(
+        begin_registered_bidirectional_local_merge(
             &mut local_store,
             &local_cas,
             &local_root,
@@ -8665,6 +8646,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
     )
     .unwrap();
     completed_job.release(CasReleaseOutcome::Aborted).unwrap();
+    register_bidirectional_source_for_credential(remote_directory.path(), &client.credential());
     PeerBidirectionalOperationJournal::new(remote_directory.path())
         .store(&PeerBidirectionalDurableOperation::LocalCommitted {
             schema: OPERATION_SCHEMA.to_owned(),
@@ -8678,7 +8660,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
                 previous_shared: common,
                 previous_local: target_previous.local_identity,
                 durable_job_id: durable_job_id.to_owned(),
-                completion_mode: PeerBidirectionalCompletionMode::Legacy,
+                completion_mode: PeerBidirectionalCompletionMode::Unsupported,
                 completion_delivery: None,
             },
             committed_revision: target_revision,
@@ -11075,7 +11057,7 @@ fn bidirectional_network_transfer_does_not_hold_the_managed_store_mutex() {
             opened: opened_tx,
             release: release_rx,
         };
-        begin_bidirectional_local_merge(
+        begin_registered_bidirectional_local_merge(
             &mut store,
             &cas,
             &root,
@@ -11109,7 +11091,6 @@ fn bidirectional_network_transfer_does_not_hold_the_managed_store_mutex() {
 #[test]
 fn public_tunnel_url_is_not_persisted_and_remote_receipt_stays_local_committed() {
     for completion_mode in [
-        PeerBidirectionalCompletionMode::Legacy,
         PeerBidirectionalCompletionMode::Unsupported,
         PeerBidirectionalCompletionMode::V1,
     ] {
@@ -11222,7 +11203,7 @@ fn reverse_cleanup_failure_retains_exact_owner_and_retry_completes_without_remot
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_JOB_RELEASE_FAILPOINT.with(|enabled| enabled.set(true));
-    assert!(begin_bidirectional_local_merge(
+    assert!(begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
@@ -11375,7 +11356,7 @@ fn receipt_store_failure_still_retains_and_retries_exact_reverse_cleanup() {
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
     let mut source = fixture_source(&remote);
     TARGET_JOB_RELEASE_FAILPOINT.with(|enabled| enabled.set(true));
-    assert!(begin_bidirectional_local_merge(
+    assert!(begin_registered_bidirectional_local_merge(
         &mut store,
         &cas,
         directory.path(),
