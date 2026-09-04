@@ -228,11 +228,12 @@ fn registered_operation_failure(context: &str, error: impl fmt::Display) -> Stri
     PeerCommandCode::OperationFailed.code().to_owned()
 }
 
-/// A failure past the hello round trip is local work, never the connection, so
-/// it stays generic instead of taking the transport code.
+/// A failure past the hello round trip goes through the same mapping table as
+/// every other command boundary, so a refusal such as a rotated registration
+/// keeps its own code instead of collapsing to the generic one.
 fn registered_target_operation_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
     crate::nlog!("warn", "{context} failed: {error}");
-    PeerCommandCode::OperationFailed
+    code_for(&error)
 }
 
 fn registered_claim_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
@@ -826,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_post_hello_failures_are_not_reported_as_connection_failures() {
+    fn registered_local_failures_are_not_reported_as_connection_failures() {
         let target = registered_target_operation_failure(
             "registered clone target",
             PeerSyncError::Storage("local target state is unavailable".to_owned()),
@@ -857,6 +858,23 @@ mod tests {
         assert_eq!(code, "operationFailed");
         assert_ne!(code, "transportUnavailable");
         assert!(!code.contains("revision"));
+    }
+
+    #[test]
+    fn a_registered_target_failure_keeps_the_code_its_error_already_carries() {
+        let changed = registered_target_operation_failure(
+            "registered clone target",
+            PeerSyncError::Validation(
+                crate::peer_sync::registry_commands::REGISTERED_SOURCE_CHANGED.to_owned(),
+            ),
+        );
+        assert_eq!(changed.code(), "sourceChanged");
+
+        let transport = registered_target_operation_failure(
+            "registered clone target",
+            PeerSyncError::Transport("source disconnected".to_owned()),
+        );
+        assert_eq!(transport.code(), "transportUnavailable");
     }
 
     #[test]

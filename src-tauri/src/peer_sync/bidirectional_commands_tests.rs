@@ -70,6 +70,28 @@ fn registered_bidirectional_terminal_projection_bounds_transport_and_local_error
 }
 
 #[test]
+fn re_bounding_a_bidirectional_outcome_keeps_a_code_the_lane_already_produced() {
+    for code in ["sourceInUse", "deltaCompletionRetained", "peerOutdated"] {
+        assert_eq!(
+            bound_registered_bidirectional_outcome::<()>(Err(code.to_owned()), true).unwrap_err(),
+            code
+        );
+    }
+    assert_eq!(
+        bound_registered_bidirectional_outcome::<()>(
+            Err("C:\\private\\store and bearer secret".to_owned()),
+            true,
+        )
+        .unwrap_err(),
+        "operationFailed"
+    );
+    assert_eq!(
+        bound_registered_bidirectional_outcome(Ok::<_, String>(4), true),
+        Ok(4)
+    );
+}
+
+#[test]
 fn android_p5_source_release_consumes_exact_full_stop_after_notification_callback() {
     let _registry_guard = super::super::android_foreground::test_registry_guard();
     let directory = tempfile::tempdir().unwrap();

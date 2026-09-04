@@ -54,6 +54,10 @@ pub(crate) fn registered_source_lifecycle_is_locked() -> bool {
 pub(crate) const REGISTRATION_BLOCKED_BY_ACTIVE_WORK: &str =
     "peer-registration-blocked-by-active-work";
 pub(crate) const SOURCE_IN_USE: &str = "peer-source-in-use";
+/// A registered clone target publishes only while the incoming source it bound
+/// to is still the registered one. Both the desktop and the Android target
+/// raise this, so it lives beside the other lifecycle codes.
+pub(crate) const REGISTERED_SOURCE_CHANGED: &str = "peer-registered-source-changed";
 
 trait RegistryAppRootResolver {
     fn resolve_registry_app_root(&self) -> Result<PathBuf, PeerSyncError>;

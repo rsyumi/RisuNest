@@ -992,8 +992,12 @@ impl AndroidCloneJobRegistry {
         let published = (|| {
             let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
             if !registered_android_job_source_is_current(&self.jobs_root, &job)? {
+                crate::nlog!(
+                    "warn",
+                    "registered Android clone job no longer binds the registered source"
+                );
                 return Err(PeerSyncError::Validation(
-                    "registered Android clone source is unavailable".to_owned(),
+                    super::registry_commands::REGISTERED_SOURCE_CHANGED.to_owned(),
                 ));
             }
             let app_root = self.jobs_root.parent().ok_or_else(|| {
@@ -1006,8 +1010,12 @@ impl AndroidCloneJobRegistry {
                     && source.bearer == bearer
                     && source.permissions.allows_read()
             }) {
+                crate::nlog!(
+                    "warn",
+                    "registered Android clone source changed before publication"
+                );
                 return Err(PeerSyncError::Validation(
-                    "registered Android clone source is unavailable".to_owned(),
+                    super::registry_commands::REGISTERED_SOURCE_CHANGED.to_owned(),
                 ));
             }
             #[cfg(test)]

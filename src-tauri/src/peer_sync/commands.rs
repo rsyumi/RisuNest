@@ -4,6 +4,7 @@ use super::lan::{
     PeerCompletionCapability, NAMED_TUNNEL_ORIGIN_UNAVAILABLE,
 };
 use super::production::prepare_unified_clone_source;
+use super::registry_commands::REGISTERED_SOURCE_CHANGED;
 use super::{
     activate_downloaded_clone, CloneTargetAdapter, LanCloneClient, LanCloneHost,
     LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError, TransferCancellation,
@@ -24,11 +25,6 @@ use std::{
     thread::{self, JoinHandle},
 };
 use tauri::{AppHandle, Manager, State};
-
-/// Stable code the interface maps to its own wording; never shown as native
-/// text. A registered clone target publishes only while the incoming source it
-/// bound to is still the registered one.
-pub(crate) const REGISTERED_SOURCE_CHANGED: &str = "peer-registered-source-changed";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -6594,9 +6590,14 @@ mod tests {
         .unwrap();
         pause.wait();
 
+        let refusal = worker.join().unwrap().unwrap_err();
         assert_eq!(
-            worker.join().unwrap().unwrap_err(),
+            refusal,
             PeerSyncError::Validation(REGISTERED_SOURCE_CHANGED.to_owned())
+        );
+        assert_eq!(
+            super::super::command_codes::code_for(&refusal).code(),
+            "sourceChanged"
         );
         let marker_path = target_paths(&peer_root, &request)
             .unwrap()

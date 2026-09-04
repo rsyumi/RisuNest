@@ -83,8 +83,7 @@ fn validation_code(payload: &str) -> PeerCommandCode {
             PeerCommandCode::RegistrationBlockedByActiveWork
         }
         super::registry_commands::SOURCE_IN_USE => PeerCommandCode::SourceInUse,
-        #[cfg(desktop)]
-        super::commands::REGISTERED_SOURCE_CHANGED => PeerCommandCode::SourceChanged,
+        super::registry_commands::REGISTERED_SOURCE_CHANGED => PeerCommandCode::SourceChanged,
         super::delta_completion::DELTA_COMPLETION_AMBIGUOUS => {
             PeerCommandCode::DeltaCompletionRetained
         }
@@ -108,9 +107,11 @@ pub(crate) fn finish_peer_command<T>(
 mod tests {
     use super::*;
     use crate::peer_sync::{
-        commands::REGISTERED_SOURCE_CHANGED, delta_completion::DELTA_COMPLETION_AMBIGUOUS,
-        lan::PEER_OUTDATED, registry_commands::REGISTRATION_BLOCKED_BY_ACTIVE_WORK,
-        registry_commands::SOURCE_IN_USE,
+        delta_completion::DELTA_COMPLETION_AMBIGUOUS,
+        lan::PEER_OUTDATED,
+        registry_commands::{
+            REGISTERED_SOURCE_CHANGED, REGISTRATION_BLOCKED_BY_ACTIVE_WORK, SOURCE_IN_USE,
+        },
     };
 
     fn latest_command_code_log_containing(marker: &str) -> crate::native_log::LogEntry {

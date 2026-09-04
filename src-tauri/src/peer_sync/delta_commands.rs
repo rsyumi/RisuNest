@@ -2723,6 +2723,27 @@ mod tests {
     }
 
     #[test]
+    fn re_bounding_a_delta_outcome_keeps_a_code_the_lane_already_produced() {
+        for code in ["sourceInUse", "deltaCompletionRetained", "peerOutdated"] {
+            assert_eq!(
+                bound_registered_operation_outcome::<()>(Err(code.to_owned())).unwrap_err(),
+                code
+            );
+        }
+        assert_eq!(
+            bound_registered_operation_outcome::<()>(Err(
+                "C:\\private\\store and bearer secret".to_owned()
+            ))
+            .unwrap_err(),
+            "operationFailed"
+        );
+        assert_eq!(
+            bound_registered_operation_outcome(Ok::<_, String>(4)),
+            Ok(4)
+        );
+    }
+
+    #[test]
     fn committed_target_stays_running_during_terminal_publication_pause() {
         let _registry_guard = test_registry_guard();
         let state = PeerDeltaCommandState::default();
