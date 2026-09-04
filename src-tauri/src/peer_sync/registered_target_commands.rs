@@ -995,7 +995,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(delta.source_device_id(), SOURCE_ID);
-        assert!(delta.is_v2_registered());
+        assert_eq!(delta.registered_source_bearer(), BEARER);
 
         let bidirectional = crate::peer_sync::lan::LanBidirectionalLogicalClient::from_registered(
             "http://127.0.0.1:32145",

@@ -2064,9 +2064,7 @@ fn fetch_delta_manifest_and_completion(
             "registered delta source identity or permission changed".to_owned(),
         ));
     }
-    let source_bearer = client.registered_source_bearer().ok_or_else(|| {
-        PeerSyncError::Protocol("registered delta source credential is missing".to_owned())
-    })?;
+    let source_bearer = client.registered_source_bearer();
     let manifest = client.fetch_manifest_with_completion_lease(None)?;
     let attempt = match (observed.completion, manifest.completion_lease_id) {
         (PeerCompletionCapability::V1, Some(lease)) => DeltaCompletionAttempt {

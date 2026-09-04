@@ -4016,30 +4016,6 @@ fn transport(error: impl std::fmt::Display) -> PeerSyncError {
     PeerSyncError::Transport(error.to_string())
 }
 
-pub(crate) fn v2_claim_is_unsupported(error: &PeerSyncError) -> bool {
-    matches!(
-        error,
-        PeerSyncError::Transport(status) if http_status_code(status) == Some(400)
-    ) || matches!(
-        error,
-        PeerSyncError::Protocol(message)
-            if matches!(
-                message.as_str(),
-                "v2 source device identity is missing"
-                    | "v2 source device name is missing"
-                    | "v2 permissions are missing"
-            )
-    )
-}
-
-fn http_status_code(value: &str) -> Option<u16> {
-    value
-        .strip_prefix("HTTP ")?
-        .split_ascii_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
 #[cfg(any(desktop, target_os = "android"))]
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
@@ -4274,7 +4250,6 @@ mod timeout_tests {
             bearer: TEST_BEARER.to_owned(),
             source_device_id: "00000000-0000-4000-8000-000000000002".to_owned(),
             manifest_id: "a".repeat(64),
-            registered_v2: false,
             progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
         }
     }
@@ -4530,6 +4505,72 @@ mod timeout_tests {
         server.join().unwrap();
         assert!(calls.try_recv().is_err());
         assert!(!credential.exists());
+        assert!(IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()
+            .is_empty());
+    }
+
+    #[test]
+    fn logical_claim_reports_peer_outdated_on_a_bad_request_without_registering() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target_root = tempfile::tempdir().unwrap();
+        let (endpoint, calls, server) = rejecting_v2_claim_server();
+
+        let result = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Windows target",
+            &endpoint,
+            TEST_SESSION_ID,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        );
+
+        assert!(matches!(
+            result.err(),
+            Some(PeerSyncError::Validation(code)) if code == PEER_OUTDATED
+        ));
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        server.join().unwrap();
+        assert!(calls.try_recv().is_err());
+        assert!(IncomingSourceRegistry::load(target_root.path())
+            .unwrap()
+            .sources()
+            .is_empty());
+    }
+
+    #[test]
+    fn logical_claim_reports_peer_outdated_when_the_response_omits_registered_identity() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target_root = tempfile::tempdir().unwrap();
+        let device_id =
+            super::super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+
+        let (endpoint, _calls, server) = canned_claim_response_server(serde_json::json!({
+            "deviceId": device_id,
+            "bearer": "c".repeat(64),
+            "permission": "logical-read",
+            "sourceDeviceName": "Source",
+            "permissions": ["read"],
+        }));
+        let missing_source = LanLogicalDeltaClient::claim_v2_and_register(
+            target_root.path(),
+            "Windows target",
+            &endpoint,
+            TEST_SESSION_ID,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            missing_source.err(),
+            Some(PeerSyncError::Validation(code)) if code == PEER_OUTDATED
+        ));
         assert!(IncomingSourceRegistry::load(target_root.path())
             .unwrap()
             .sources()
@@ -7879,7 +7920,6 @@ pub struct LanLogicalDeltaClient {
     bearer: String,
     source_device_id: String,
     manifest_id: String,
-    registered_v2: bool,
     progress: Arc<Mutex<LogicalClientProgress>>,
 }
 
@@ -7977,11 +8017,11 @@ impl LanLogicalDeltaClient {
             bearer: bearer.to_owned(),
             source_device_id: source_device_id.to_owned(),
             manifest_id: manifest_id.to_owned(),
-            registered_v2: true,
             progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_v2_and_register(
         app_root: &Path,
         target_name: &str,
@@ -7999,7 +8039,6 @@ impl LanLogicalDeltaClient {
             claim,
             "logical-read",
         )
-        .map(|(client, _)| client)
     }
 
     pub(crate) fn hello(&self) -> Result<PeerHello, PeerSyncError> {
@@ -8063,6 +8102,7 @@ impl LanLogicalDeltaClient {
         )
     }
 
+    #[cfg(test)]
     fn claim_v2_and_register_with_permission(
         app_root: &Path,
         target_name: &str,
@@ -8071,7 +8111,7 @@ impl LanLogicalDeltaClient {
         manifest_id: &str,
         claim: &str,
         expected_permission: &str,
-    ) -> Result<(Self, bool), PeerSyncError> {
+    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
@@ -8113,78 +8153,19 @@ impl LanLogicalDeltaClient {
             .timeout(timeouts.control_request)
             .send()
             .map_err(transport)?;
+        // A source that predates the registered claim refuses the request outright.
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
-            return Self::claim_with_timeouts_and_policy(
-                endpoint.as_str(),
-                session_id,
-                manifest_id,
-                claim,
-                Some(&target_device_id),
-                false,
-                expected_permission,
-                timeouts,
-                validate_p4_logical_delta_endpoint,
-            )
-            .map(|client| (client, false));
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
         }
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(PeerSyncError::Transport(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-        let mut body = Vec::new();
-        response
-            .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
-            .read_to_end(&mut body)
-            .map_err(transport)?;
-        if body.len() > MAX_CLAIM_RESPONSE_BYTES {
-            return Err(PeerSyncError::Protocol(
-                "logical delta claim response is too large".to_owned(),
-            ));
-        }
-        let response: ClaimResponseOwned = serde_json::from_slice(&body)
-            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-        if response.source_device_name.is_none() && response.permissions.is_none() {
-            let source_device_id = response.source_device_id.ok_or_else(|| {
-                PeerSyncError::Protocol(
-                    "logical delta source device identity is missing".to_owned(),
-                )
-            })?;
-            if !is_canonical_uuid(&response.device_id)
-                || !is_canonical_uuid(&source_device_id)
-                || !is_lower_hex_256(&response.bearer)
-                || response.permission != expected_permission
-            {
-                return Err(PeerSyncError::Protocol(
-                    "invalid logical delta claim response".to_owned(),
-                ));
-            }
-            return Ok((
-                Self {
-                    control_client,
-                    object_client,
-                    control_timeout: timeouts.control_request,
-                    session_url,
-                    device_id: response.device_id,
-                    bearer: response.bearer,
-                    source_device_id,
-                    manifest_id: manifest_id.to_owned(),
-                    registered_v2: false,
-                    progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
-                },
-                false,
-            ));
-        }
-        let source_device_id = response.source_device_id.ok_or_else(|| {
-            PeerSyncError::Protocol("v2 source device identity is missing".to_owned())
-        })?;
+        let response = read_claim_response(response, "logical delta")?;
+        let (Some(source_device_id), Some(granted)) =
+            (response.source_device_id, response.permissions)
+        else {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        };
         let source_name = response.source_device_name.ok_or_else(|| {
             PeerSyncError::Protocol("v2 source device name is missing".to_owned())
         })?;
-        let granted = response
-            .permissions
-            .ok_or_else(|| PeerSyncError::Protocol("v2 permissions are missing".to_owned()))?;
         DevicePermissions::from_values(granted)?;
         if response.device_id != target_device_id
             || !is_canonical_uuid(&source_device_id)
@@ -8215,21 +8196,17 @@ impl LanLogicalDeltaClient {
                 total_bytes: 0,
             },
         )?;
-        Ok((
-            Self {
-                control_client,
-                object_client,
-                control_timeout: timeouts.control_request,
-                session_url,
-                device_id: response.device_id,
-                bearer: response.bearer,
-                source_device_id,
-                manifest_id: manifest_id.to_owned(),
-                registered_v2: true,
-                progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
-            },
-            true,
-        ))
+        Ok(Self {
+            control_client,
+            object_client,
+            control_timeout: timeouts.control_request,
+            session_url,
+            device_id: response.device_id,
+            bearer: response.bearer,
+            source_device_id,
+            manifest_id: manifest_id.to_owned(),
+            progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
+        })
     }
 
     pub fn claim(
@@ -8247,28 +8224,6 @@ impl LanLogicalDeltaClient {
                 control_request: CONTROL_REQUEST_TIMEOUT,
                 object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
             },
-        )
-    }
-
-    pub(crate) fn claim_p4(
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-    ) -> Result<Self, PeerSyncError> {
-        Self::claim_with_timeouts_and_policy(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            None,
-            true,
-            "logical-read",
-            LogicalClientTimeouts {
-                control_request: CONTROL_REQUEST_TIMEOUT,
-                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
-            },
-            validate_p4_logical_delta_endpoint,
         )
     }
 
@@ -8299,31 +8254,6 @@ impl LanLogicalDeltaClient {
         permission: &str,
         timeouts: LogicalClientTimeouts,
     ) -> Result<Self, PeerSyncError> {
-        Self::claim_with_timeouts_and_policy(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            device_id,
-            true,
-            permission,
-            timeouts,
-            validate_private_lan_endpoint,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn claim_with_timeouts_and_policy(
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        device_id: Option<&str>,
-        require_response_device_id: bool,
-        permission: &str,
-        timeouts: LogicalClientTimeouts,
-        validate_endpoint: fn(&str) -> Result<String, PeerSyncError>,
-    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
@@ -8334,7 +8264,7 @@ impl LanLogicalDeltaClient {
                 "invalid logical delta pairing data".to_owned(),
             ));
         }
-        let endpoint = validate_endpoint(endpoint)?;
+        let endpoint = validate_private_lan_endpoint(endpoint)?;
         let session_url = format!("{endpoint}/v1/sessions/{session_id}");
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(
@@ -8378,8 +8308,7 @@ impl LanLogicalDeltaClient {
             PeerSyncError::Protocol("logical delta source device identity is missing".to_owned())
         })?;
         if !is_canonical_uuid(&response.device_id)
-            || (require_response_device_id
-                && device_id.is_some_and(|expected| response.device_id.as_str() != expected))
+            || device_id.is_some_and(|expected| response.device_id.as_str() != expected)
             || !is_canonical_uuid(&source_device_id)
             || !is_lower_hex_256(&response.bearer)
             || response.permission != permission
@@ -8397,7 +8326,6 @@ impl LanLogicalDeltaClient {
             bearer: response.bearer,
             source_device_id,
             manifest_id: manifest_id.to_owned(),
-            registered_v2: false,
             progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
         })
     }
@@ -8406,12 +8334,8 @@ impl LanLogicalDeltaClient {
         &self.source_device_id
     }
 
-    pub(crate) fn registered_source_bearer(&self) -> Option<&str> {
-        self.registered_v2.then_some(self.bearer.as_str())
-    }
-
-    pub(crate) fn is_v2_registered(&self) -> bool {
-        self.registered_v2
+    pub(crate) fn registered_source_bearer(&self) -> &str {
+        &self.bearer
     }
 
     pub fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
@@ -8645,6 +8569,7 @@ impl LanBidirectionalLogicalClient {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_v2_and_register(
         app_root: &Path,
         target_name: &str,
@@ -8653,7 +8578,7 @@ impl LanBidirectionalLogicalClient {
         manifest_id: &str,
         claim: &str,
     ) -> Result<Self, PeerSyncError> {
-        let (inner, _) = LanLogicalDeltaClient::claim_v2_and_register_with_permission(
+        let inner = LanLogicalDeltaClient::claim_v2_and_register_with_permission(
             app_root,
             target_name,
             endpoint,
@@ -8710,8 +8635,9 @@ impl LanBidirectionalLogicalClient {
         )
     }
 
-    // Android targets claim over trusted-LAN endpoints.
-    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
+    // Only the engine tests reach a bidirectional session through a pairing link;
+    // product flows resume a registered device instead.
+    #[cfg(test)]
     pub(crate) fn claim(
         endpoint: &str,
         session_id: &str,
@@ -8737,48 +8663,6 @@ impl LanBidirectionalLogicalClient {
             session_id: session_id.to_owned(),
             inner,
         })
-    }
-
-    // Desktop targets may claim through tunnel endpoints.
-    #[cfg_attr(target_os = "android", allow(dead_code))]
-    pub(crate) fn claim_p5_desktop(
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        device_id: &str,
-    ) -> Result<Self, PeerSyncError> {
-        let inner = LanLogicalDeltaClient::claim_with_timeouts_and_policy(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            Some(device_id),
-            true,
-            "logical-bidirectional",
-            LogicalClientTimeouts {
-                control_request: CONTROL_REQUEST_TIMEOUT,
-                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
-            },
-            validate_p5_desktop_endpoint,
-        )?;
-        Ok(Self {
-            remote_apply_client: build_bidirectional_remote_apply_client()?,
-            endpoint: validate_p5_desktop_endpoint(endpoint)?,
-            session_id: session_id.to_owned(),
-            inner,
-        })
-    }
-
-    #[cfg(target_os = "android")]
-    pub(crate) fn claim_p5_android(
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        device_id: &str,
-    ) -> Result<Self, PeerSyncError> {
-        Self::claim(endpoint, session_id, manifest_id, claim, device_id)
     }
 
     pub(crate) fn resume(
@@ -8809,7 +8693,6 @@ impl LanBidirectionalLogicalClient {
                 bearer: credential.bearer,
                 source_device_id: credential.source_device_id,
                 manifest_id: credential.manifest_id,
-                registered_v2: false,
                 progress: Arc::new(Mutex::new(LogicalClientProgress::default())),
             },
             endpoint,
