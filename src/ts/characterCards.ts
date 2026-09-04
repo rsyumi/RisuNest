@@ -21,7 +21,7 @@ import { open } from "@tauri-apps/plugin-dialog"
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
 import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
-import { publishPeerCloneUri, receiveDeviceSyncUri } from "./storage/sync/peerCloneDeepLink"
+import { receiveDeviceSyncUri } from "./storage/sync/peerCloneDeepLink"
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
 import {
@@ -599,11 +599,6 @@ export async function characterURLImport() {
             for(const url of urls){
                 dispatchRisuLocalUrl(url, {
                     onRealm: (id) => void downloadRisuHub(id),
-                    onPeerClone: (uri) => {
-                        publishPeerCloneUri(uri)
-                        SettingsMenuIndex.set(0)
-                        settingsOpen.set(true)
-                    },
                     onDeviceSync: (uri) => {
                         receiveDeviceSyncUri(uri, (menuIndex) => {
                             SettingsMenuIndex.set(menuIndex)
