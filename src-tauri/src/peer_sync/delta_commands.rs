@@ -6,10 +6,6 @@ use super::android_foreground::{
 };
 #[cfg(target_os = "android")]
 use super::command_codes::finish_peer_command;
-#[cfg(desktop)]
-use super::lan::discover_lan_ipv4;
-#[cfg(desktop)]
-use super::lan::{validate_lan_endpoint, NAMED_TUNNEL_ORIGIN_UNAVAILABLE};
 use super::logical_delta_transfer::execute_logical_delta_pull_with_commit_intent;
 #[cfg(test)]
 use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase as AndroidTargetForegroundPhase;
@@ -25,13 +21,10 @@ use super::{
         PeerDeltaCompletionJournal, RecoveredDeltaCompletion, RetainedDeltaCompletion,
         RetainedDeltaWitness,
     },
-    lan::{
-        LanCloneHostControl, LanLogicalDeltaClient, PeerCompletionCapability,
-        PreparedLogicalLanSession,
-    },
+    lan::{LanLogicalDeltaClient, PeerCompletionCapability, PreparedLogicalLanSession},
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
-    LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
-    PeerSyncError, ReadyLogicalDeltaPlan,
+    LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError,
+    ReadyLogicalDeltaPlan,
 };
 use crate::{
     asset_repository::{
@@ -60,7 +53,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     io::{self, Read},
-    net::Ipv4Addr,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
@@ -69,7 +61,7 @@ use std::{
 use tauri::{AppHandle, Manager, State};
 
 const P4_DELTA_TARGET_JOB_PREFIX: &str = "p4-delta-target-";
-const P4_SOURCE_PIN_PREFIX: &str = "logical-session-p4-source-";
+pub(crate) const P4_SOURCE_PIN_PREFIX: &str = "logical-session-p4-source-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,105 +86,8 @@ pub fn peer_delta_capabilities() -> PeerDeltaCapabilities {
     }
 }
 
-#[cfg(target_os = "android")]
-use super::android_foreground::acquire_foreground_lane as acquire_foreground;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum PeerDeltaSourcePhase {
-    Idle,
-    Prepared,
-    Starting,
-    Running,
-    Stopping,
-    Stopped,
-}
-
-#[cfg(desktop)]
-pub use super::tunnel_lifecycle::PeerTunnelStart as PeerDeltaTunnelStart;
-#[cfg(desktop)]
-use super::tunnel_lifecycle::{
-    PeerTunnelKind as PeerDeltaTunnelKind, PeerTunnelMetadata as PeerDeltaTunnelMetadata,
-    PeerTunnelPhase as PeerDeltaTunnelPhase,
-};
-
-#[cfg(desktop)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerDeltaTunnelStatus {
-    session_id: Option<String>,
-    phase: PeerDeltaTunnelPhase,
-    tunnel: Option<PeerDeltaTunnelMetadata>,
-}
-
-#[cfg(desktop)]
-use super::tunnel_lifecycle::{
-    FailedPeerTunnel as FailedDeltaTunnel, PeerTunnel as DeltaTunnel,
-    PeerTunnelLauncher as DeltaTunnelLauncher, PeerTunnelLifecycle as DeltaTunnelLifecycle,
-    SystemPeerTunnelLauncher,
-};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PeerDeltaSourceDevice {
-    device_id: String,
-    transferred_bytes: u64,
-    current_object: Option<String>,
-    last_seen_at: u64,
-    revoked: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerDeltaSourceStatus {
-    session_id: Option<String>,
-    manifest_id: Option<String>,
-    pairing_uri: Option<String>,
-    phase: PeerDeltaSourcePhase,
-    devices: Vec<PeerDeltaSourceDevice>,
-    #[cfg(desktop)]
-    tunnel: Option<PeerDeltaTunnelMetadata>,
-}
-
-impl PeerDeltaSourceStatus {
-    fn idle(phase: PeerDeltaSourcePhase) -> Self {
-        Self {
-            session_id: None,
-            manifest_id: None,
-            pairing_uri: None,
-            phase,
-            devices: Vec::new(),
-            #[cfg(desktop)]
-            tunnel: None,
-        }
-    }
-}
-
-struct DeltaSourceRuntime {
-    session_id: String,
-    manifest_id: String,
-    host: Option<LanCloneHost>,
-    control: LanCloneHostControl,
-    phase: PeerDeltaSourcePhase,
-    #[cfg(desktop)]
-    tunnel: Option<Box<dyn DeltaTunnel>>,
-    #[cfg(desktop)]
-    failed_tunnel: Option<Box<dyn FailedDeltaTunnel>>,
-    #[cfg(desktop)]
-    tunnel_metadata: Option<PeerDeltaTunnelMetadata>,
-    pairing_uri: Option<String>,
-    // Read by the desktop stop/status interlock.
-    #[cfg_attr(target_os = "android", allow(dead_code))]
-    stop_in_progress: bool,
-    #[cfg(any(target_os = "android", test))]
-    foreground: Option<AndroidForegroundKey>,
-}
-
 #[derive(Default)]
 struct PeerDeltaRuntime {
-    source_preparing: bool,
-    source: Option<DeltaSourceRuntime>,
-    stopped: bool,
     pull_in_progress: bool,
     #[cfg(any(target_os = "android", test))]
     target_foreground: Option<AndroidTargetForegroundStatus>,
@@ -203,19 +98,9 @@ struct PeerDeltaRuntime {
 /// source cleanup drops the transport.
 pub(crate) struct PreparedSharedDeltaSource {
     session: Option<PreparedLogicalLanSession>,
-    session_id: String,
-    manifest_id: String,
 }
 
 impl PreparedSharedDeltaSource {
-    pub(crate) fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    pub(crate) fn manifest_id(&self) -> &str {
-        &self.manifest_id
-    }
-
     pub(crate) fn take_session(&mut self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
         self.session.take().ok_or_else(|| {
             PeerSyncError::Protocol("shared delta source session is unavailable".to_owned())
@@ -253,15 +138,13 @@ pub(crate) fn prepare_shared_delta_source(
     let prepared = PreparedLogicalLanSession::new(
         &transport_session_id,
         &source_device_id,
-        manifest_id.clone(),
+        manifest_id,
         built.manifest_bytes,
         objects,
         Box::new(session),
     )?;
     Ok(PreparedSharedDeltaSource {
         session: Some(prepared),
-        session_id: transport_session_id,
-        manifest_id,
     })
 }
 
@@ -271,32 +154,24 @@ type AndroidTargetForegroundStatus = AndroidTargetForegroundTransition<PeerDelta
 #[derive(Clone)]
 pub struct PeerDeltaCommandState {
     runtime: Arc<Mutex<PeerDeltaRuntime>>,
+    // Serializes the Android target foreground lifecycle; the desktop lane has
+    // no foreground service to keep in step with the runtime.
+    #[cfg(any(target_os = "android", test))]
     lifecycle_operation: Arc<Mutex<()>>,
-    #[cfg(desktop)]
-    tunnel_launcher: Arc<dyn DeltaTunnelLauncher>,
 }
 
 impl Default for PeerDeltaCommandState {
     fn default() -> Self {
         Self {
             runtime: Arc::new(Mutex::new(PeerDeltaRuntime::default())),
+            #[cfg(any(target_os = "android", test))]
             lifecycle_operation: Arc::new(Mutex::new(())),
-            #[cfg(desktop)]
-            tunnel_launcher: Arc::new(SystemPeerTunnelLauncher { lane: "delta" }),
         }
     }
 }
 
 impl PeerDeltaCommandState {
-    #[cfg(all(test, desktop))]
-    fn with_tunnel_launcher(tunnel_launcher: Arc<dyn DeltaTunnelLauncher>) -> Self {
-        Self {
-            runtime: Arc::new(Mutex::new(PeerDeltaRuntime::default())),
-            lifecycle_operation: Arc::new(Mutex::new(())),
-            tunnel_launcher,
-        }
-    }
-
+    #[cfg(any(target_os = "android", test))]
     fn lock_lifecycle_operation(&self) -> Result<MutexGuard<'_, ()>, PeerSyncError> {
         self.lifecycle_operation.lock().map_err(|error| {
             PeerSyncError::Storage(format!("peer delta lifecycle mutex poisoned: {error}"))
@@ -440,516 +315,6 @@ impl PeerDeltaCommandState {
         Ok(true)
     }
 
-    fn install_source(
-        &self,
-        session: LogicalDeltaSourceSession,
-        source_device_id: &str,
-        manifest_bytes: Vec<u8>,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        self.install_source_inner(session, source_device_id, manifest_bytes)
-    }
-
-    fn install_source_inner(
-        &self,
-        session: LogicalDeltaSourceSession,
-        source_device_id: &str,
-        manifest_bytes: Vec<u8>,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let transport_session_id = uuid::Uuid::new_v4().to_string();
-        let manifest_id = session.manifest_hash().to_owned();
-        let objects = session.objects().to_vec();
-        let prepared = PreparedLogicalLanSession::new(
-            &transport_session_id,
-            source_device_id,
-            manifest_id.clone(),
-            manifest_bytes,
-            objects,
-            Box::new(session),
-        )?;
-        self.install_prepared_source_inner(
-            LanCloneHost::prepare_logical(prepared),
-            transport_session_id,
-            manifest_id,
-        )
-    }
-
-    fn install_prepared_shared_source(
-        &self,
-        mut prepared: PreparedSharedDeltaSource,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        let session_id = prepared.session_id().to_owned();
-        let manifest_id = prepared.manifest_id().to_owned();
-        self.install_prepared_source_inner(
-            LanCloneHost::prepare_logical(prepared.take_session()?),
-            session_id,
-            manifest_id,
-        )
-    }
-
-    fn install_prepared_source_inner(
-        &self,
-        host: LanCloneHost,
-        session_id: String,
-        manifest_id: String,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let control = host.control();
-        let mut runtime = self.lock()?;
-        runtime.source_preparing = false;
-        runtime.stopped = false;
-        runtime.source = Some(DeltaSourceRuntime {
-            session_id,
-            manifest_id,
-            host: Some(host),
-            control,
-            phase: PeerDeltaSourcePhase::Prepared,
-            #[cfg(desktop)]
-            tunnel: None,
-            #[cfg(desktop)]
-            failed_tunnel: None,
-            #[cfg(desktop)]
-            tunnel_metadata: None,
-            pairing_uri: None,
-            stop_in_progress: false,
-            #[cfg(any(target_os = "android", test))]
-            foreground: None,
-        });
-        source_status(&runtime)
-    }
-
-    fn start_source(
-        &self,
-        session_id: &str,
-        advertised_ip: Ipv4Addr,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        self.start_source_inner(session_id, advertised_ip)
-    }
-
-    fn start_source_inner(
-        &self,
-        session_id: &str,
-        advertised_ip: Ipv4Addr,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let mut host = self.take_prepared_host(session_id)?;
-        #[cfg(desktop)]
-        let started = host.start();
-        #[cfg(target_os = "android")]
-        let started = host.start_private_lan(advertised_ip);
-        let pairing = match started {
-            Ok(pairing) => pairing,
-            Err(error) => {
-                self.restore_clean_start(session_id, host)?;
-                return Err(error);
-            }
-        };
-        let address = host.address().ok_or_else(|| {
-            PeerSyncError::Transport("peer delta source address is unavailable".to_owned())
-        })?;
-        let endpoint = format!("http://{advertised_ip}:{}", address.port());
-        let pairing_uri = build_pairing_uri(&endpoint, &pairing)?;
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        source.host = Some(host);
-        source.pairing_uri = Some(pairing_uri);
-        source.phase = PeerDeltaSourcePhase::Running;
-        source_status(&runtime)
-    }
-
-    fn take_prepared_host(&self, session_id: &str) -> Result<LanCloneHost, PeerSyncError> {
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        if source.phase != PeerDeltaSourcePhase::Prepared {
-            return Err(PeerSyncError::Protocol(
-                "peer delta source is not prepared".to_owned(),
-            ));
-        }
-        let host = source.host.take().ok_or_else(|| {
-            PeerSyncError::Protocol("peer delta source host is unavailable".to_owned())
-        })?;
-        source.phase = PeerDeltaSourcePhase::Starting;
-        Ok(host)
-    }
-
-    fn restore_clean_start(
-        &self,
-        session_id: &str,
-        host: LanCloneHost,
-    ) -> Result<(), PeerSyncError> {
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        source.host = Some(host);
-        source.phase = PeerDeltaSourcePhase::Prepared;
-        #[cfg(desktop)]
-        {
-            source.tunnel_metadata = None;
-        }
-        Ok(())
-    }
-
-    #[cfg(desktop)]
-    fn start_tunnel(
-        &self,
-        session_id: &str,
-        request: PeerDeltaTunnelStart,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        self.start_tunnel_inner(session_id, request)
-    }
-
-    #[cfg(desktop)]
-    fn start_tunnel_inner(
-        &self,
-        session_id: &str,
-        request: PeerDeltaTunnelStart,
-    ) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let metadata = match &request {
-            PeerDeltaTunnelStart::Quick => PeerDeltaTunnelMetadata::quick(),
-            PeerDeltaTunnelStart::Named { .. } => PeerDeltaTunnelMetadata::named(),
-        };
-        let mut host = self.take_prepared_host(session_id)?;
-        {
-            let mut runtime = self.lock()?;
-            require_source(&mut runtime, session_id)?.tunnel_metadata = Some(metadata);
-        }
-        let origin = match metadata.kind {
-            PeerDeltaTunnelKind::Quick => host.start_quick_tunnel_origin(),
-            PeerDeltaTunnelKind::Named => host.start_named_tunnel_origin(),
-        };
-        let pairing = match origin {
-            Ok(pairing) => pairing,
-            Err(error) => {
-                self.restore_clean_start(session_id, host)?;
-                return Err(
-                    if metadata.kind == PeerDeltaTunnelKind::Named
-                        && error
-                            == PeerSyncError::Transport(NAMED_TUNNEL_ORIGIN_UNAVAILABLE.to_owned())
-                    {
-                        error
-                    } else {
-                        tunnel_start_error()
-                    },
-                );
-            }
-        };
-        let tunnel = match self.tunnel_launcher.start(request, host) {
-            Ok(tunnel) => tunnel,
-            Err(mut failure) => {
-                match failure.recover_host() {
-                    Ok(Some(mut host)) => {
-                        if host.stop().is_ok() {
-                            self.restore_clean_start(session_id, host)?;
-                        } else {
-                            let mut runtime = self.lock()?;
-                            let source = require_source(&mut runtime, session_id)?;
-                            source.host = Some(host);
-                            source.phase = PeerDeltaSourcePhase::Stopping;
-                        }
-                    }
-                    Ok(None) | Err(_) => {
-                        let mut runtime = self.lock()?;
-                        let source = require_source(&mut runtime, session_id)?;
-                        source.failed_tunnel = Some(failure);
-                        source.phase = PeerDeltaSourcePhase::Stopping;
-                    }
-                }
-                return Err(tunnel_start_error());
-            }
-        };
-        let endpoint = match validate_lan_endpoint(tunnel.transport_url().as_str()) {
-            Ok(endpoint) if endpoint.starts_with("https://") => endpoint,
-            _ => return Err(self.abort_started_tunnel(session_id, tunnel)),
-        };
-        let pairing_uri = match build_pairing_uri(&endpoint, &pairing) {
-            Ok(uri) => uri,
-            Err(_) => return Err(self.abort_started_tunnel(session_id, tunnel)),
-        };
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        source.tunnel = Some(tunnel);
-        source.pairing_uri = Some(pairing_uri);
-        source.phase = PeerDeltaSourcePhase::Running;
-        source_status(&runtime)
-    }
-
-    #[cfg(desktop)]
-    fn abort_started_tunnel(
-        &self,
-        session_id: &str,
-        mut tunnel: Box<dyn DeltaTunnel>,
-    ) -> PeerSyncError {
-        let stopped = tunnel.stop().is_ok();
-        if let Ok(mut runtime) = self.lock() {
-            if let Ok(source) = require_source(&mut runtime, session_id) {
-                if stopped {
-                    source.phase = PeerDeltaSourcePhase::Stopped;
-                    runtime.source = None;
-                    runtime.stopped = true;
-                } else {
-                    source.tunnel = Some(tunnel);
-                    source.phase = PeerDeltaSourcePhase::Stopping;
-                }
-            }
-        }
-        tunnel_start_error()
-    }
-
-    #[cfg(desktop)]
-    fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        self.stop_source_inner(session_id)
-    }
-
-    #[cfg(desktop)]
-    fn stop_source_inner(&self, session_id: &str) -> Result<(), PeerSyncError> {
-        let (mut host, mut tunnel, mut failed_tunnel) = {
-            let mut runtime = self.lock()?;
-            let source = require_source(&mut runtime, session_id)?;
-            if source.stop_in_progress {
-                return Err(PeerSyncError::Protocol(
-                    "peer delta source stop is already in progress".to_owned(),
-                ));
-            }
-            source.stop_in_progress = true;
-            source.phase = PeerDeltaSourcePhase::Stopping;
-            source.pairing_uri = None;
-            (
-                source.host.take(),
-                source.tunnel.take(),
-                source.failed_tunnel.take(),
-            )
-        };
-        let mut error = None;
-        if let Some(active) = tunnel.as_mut() {
-            if active.stop().is_ok() {
-                tunnel = None;
-            } else {
-                error = Some(tunnel_stop_error());
-            }
-        }
-        if let Some(failure) = failed_tunnel.as_mut() {
-            if failure.stop().is_ok() {
-                failed_tunnel = None;
-            } else if error.is_none() {
-                error = Some(tunnel_stop_error());
-            }
-        }
-        if let Some(active) = host.as_mut() {
-            match active.stop() {
-                Ok(()) => host = None,
-                Err(failure) if error.is_none() => error = Some(failure),
-                Err(_) => {}
-            }
-        }
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        source.stop_in_progress = false;
-        source.host = host;
-        source.tunnel = tunnel;
-        source.failed_tunnel = failed_tunnel;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        runtime.source = None;
-        runtime.stopped = true;
-        Ok(())
-    }
-
-    fn revoke(&self, session_id: &str, device_id: &str) -> Result<(), PeerSyncError> {
-        let mut runtime = self.lock()?;
-        let source = require_source(&mut runtime, session_id)?;
-        if !source.control.revoke(device_id) {
-            return Err(PeerSyncError::Validation(
-                "peer delta source device is absent".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn revoke_registered_device(&self, device_id: &str) {
-        if let Ok(runtime) = self.lock() {
-            if let Some(source) = runtime.source.as_ref() {
-                let _ = source.control.revoke(device_id);
-            }
-        }
-    }
-
-    pub(crate) fn configure_v2_registry(
-        &self,
-        app_root: &Path,
-        name: &str,
-        permissions: super::device_registry::DevicePermissions,
-    ) -> Result<(), PeerSyncError> {
-        let mut runtime = self.lock()?;
-        let source = runtime.source.as_mut().ok_or_else(|| {
-            PeerSyncError::Protocol("peer delta source is not prepared".to_owned())
-        })?;
-        if source.phase != PeerDeltaSourcePhase::Prepared {
-            return Err(PeerSyncError::Protocol(
-                "peer delta source is not prepared".to_owned(),
-            ));
-        }
-        source
-            .host
-            .as_mut()
-            .ok_or_else(|| {
-                PeerSyncError::Protocol("peer delta source host is unavailable".to_owned())
-            })?
-            .enable_v2_registry(app_root, name, permissions)
-    }
-
-    fn status(&self) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        self.status_inner()
-    }
-
-    #[cfg(any(target_os = "android", test))]
-    fn attach_source_foreground(
-        &self,
-        session_id: &str,
-        key: AndroidForegroundKey,
-    ) -> Result<(), PeerSyncError> {
-        let mut runtime = self.lock()?;
-        require_source(&mut runtime, session_id)?.foreground = Some(key);
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "android", test))]
-    fn pause_source_exact(&self, key: &AndroidForegroundKey) {
-        let Ok(_operation) = self.lifecycle_operation.lock() else {
-            return;
-        };
-        let Ok(mut runtime) = self.lock() else {
-            return;
-        };
-        let Some(source) = runtime.source.as_mut() else {
-            return;
-        };
-        if source.foreground.as_ref() != Some(key) {
-            return;
-        }
-        let Some(mut host) = source.host.take() else {
-            return;
-        };
-        if host.stop().is_err() {
-            source.host = Some(host);
-            source.phase = PeerDeltaSourcePhase::Stopping;
-            return;
-        }
-        source.host = Some(host);
-        source.foreground = None;
-        source.pairing_uri = None;
-        source.phase = PeerDeltaSourcePhase::Prepared;
-    }
-
-    #[cfg(any(target_os = "android", test))]
-    fn release_source_android(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<AndroidForegroundKey>, PeerSyncError> {
-        let operation = self.lock_lifecycle_operation()?;
-        let (foreground, mut source) = {
-            let mut runtime = self.lock()?;
-            let source = runtime
-                .source
-                .as_ref()
-                .filter(|source| source.session_id == session_id)
-                .ok_or_else(|| {
-                    PeerSyncError::Validation("peer delta source session is absent".to_owned())
-                })?;
-            let foreground = source.foreground.clone();
-            let source = runtime.source.take().expect("checked source");
-            runtime.stopped = true;
-            (foreground, source)
-        };
-        if let Some(host) = source.host.as_mut() {
-            if let Err(error) = host.stop() {
-                let mut runtime = self.lock()?;
-                runtime.stopped = false;
-                runtime.source = Some(source);
-                return Err(error);
-            }
-        }
-        source.foreground = None;
-        drop(source);
-        drop(operation);
-        if let Some(key) = foreground.as_ref() {
-            let _ = registry().cancel_exact(key);
-            let _ = registry().detach_if_generation(key);
-        }
-        Ok(foreground)
-    }
-
-    fn status_inner(&self) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-        #[cfg(desktop)]
-        let tunnel_owner = {
-            let mut runtime = self.lock()?;
-            runtime.source.as_mut().and_then(|source| {
-                source
-                    .tunnel
-                    .take()
-                    .map(|tunnel| (source.session_id.clone(), tunnel))
-            })
-        };
-        #[cfg(desktop)]
-        if let Some((session_id, mut tunnel)) = tunnel_owner {
-            let lifecycle = tunnel.lifecycle();
-            let mut runtime = self.lock()?;
-            if let Ok(source) = require_source(&mut runtime, &session_id) {
-                match lifecycle {
-                    Ok(DeltaTunnelLifecycle::Running) => source.tunnel = Some(tunnel),
-                    Ok(DeltaTunnelLifecycle::CleanupPending) | Err(_) => {
-                        source.tunnel = Some(tunnel);
-                        source.phase = PeerDeltaSourcePhase::Stopping;
-                        source.pairing_uri = None;
-                    }
-                    Ok(DeltaTunnelLifecycle::Stopped) => {
-                        source.phase = PeerDeltaSourcePhase::Stopping;
-                        source.pairing_uri = None;
-                    }
-                }
-            }
-            drop(runtime);
-            if matches!(lifecycle, Ok(DeltaTunnelLifecycle::Stopped)) {
-                let _ = self.stop_source_inner(&session_id);
-            }
-        }
-        let runtime = self.lock()?;
-        if runtime.source.is_none() {
-            return Ok(PeerDeltaSourceStatus::idle(if runtime.stopped {
-                PeerDeltaSourcePhase::Stopped
-            } else {
-                PeerDeltaSourcePhase::Idle
-            }));
-        }
-        source_status(&runtime)
-    }
-
-    #[cfg(desktop)]
-    fn tunnel_status(&self) -> Result<PeerDeltaTunnelStatus, PeerSyncError> {
-        let _operation = self.lock_lifecycle_operation()?;
-        let _ = self.status_inner()?;
-        let runtime = self.lock()?;
-        Ok(tunnel_status(&runtime))
-    }
-
-    #[cfg(desktop)]
-    pub(crate) fn shutdown_for_exit(&self) {
-        let Ok(_operation) = self.lifecycle_operation.lock() else {
-            return;
-        };
-        let session_id = self.runtime.lock().ok().and_then(|runtime| {
-            runtime
-                .source
-                .as_ref()
-                .map(|source| source.session_id.clone())
-        });
-        if let Some(session_id) = session_id {
-            let _ = self.stop_source_inner(&session_id);
-        }
-    }
-
     fn begin_pull(&self) -> Result<PullGuard, PeerSyncError> {
         let mut runtime = self.lock()?;
         if runtime.pull_in_progress {
@@ -966,34 +331,6 @@ impl PeerDeltaCommandState {
 
 struct PullGuard {
     state: PeerDeltaCommandState,
-}
-
-// Clears source_preparing on drop (mirroring PullGuard) so a panic in the
-// prepare path cannot wedge every later prepare with "already prepared"
-// until app restart. Disarm once the flag has been consumed.
-struct SourcePrepareGuard<'a> {
-    runtime: &'a Mutex<PeerDeltaRuntime>,
-    armed: bool,
-}
-
-impl SourcePrepareGuard<'_> {
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for SourcePrepareGuard<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Recover a poisoned lock: resetting the plain bool is always safe,
-        // and skipping it would wedge the prepare lane permanently.
-        self.runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .source_preparing = false;
-    }
 }
 
 struct AbortUnsealedJobOnDrop<'a>(&'a RefCell<DurableCasJob>);
@@ -1013,81 +350,6 @@ impl Drop for PullGuard {
             runtime.pull_in_progress = false;
         }
     }
-}
-
-fn require_source<'a>(
-    runtime: &'a mut PeerDeltaRuntime,
-    session_id: &str,
-) -> Result<&'a mut DeltaSourceRuntime, PeerSyncError> {
-    runtime
-        .source
-        .as_mut()
-        .filter(|source| source.session_id == session_id)
-        .ok_or_else(|| PeerSyncError::Validation("peer delta source session is absent".to_owned()))
-}
-
-fn source_status(runtime: &PeerDeltaRuntime) -> Result<PeerDeltaSourceStatus, PeerSyncError> {
-    let Some(source) = &runtime.source else {
-        return Ok(PeerDeltaSourceStatus::idle(PeerDeltaSourcePhase::Idle));
-    };
-    Ok(PeerDeltaSourceStatus {
-        session_id: Some(source.session_id.clone()),
-        manifest_id: Some(source.manifest_id.clone()),
-        pairing_uri: source.pairing_uri.clone(),
-        phase: source.phase,
-        devices: source
-            .control
-            .devices()
-            .into_iter()
-            .map(|device| PeerDeltaSourceDevice {
-                device_id: device.device_id,
-                transferred_bytes: device.verified_bytes,
-                current_object: device.current_object,
-                last_seen_at: u64::try_from(device.last_seen_unix_ms).unwrap_or(u64::MAX),
-                revoked: device.revoked,
-            })
-            .collect(),
-        #[cfg(desktop)]
-        tunnel: source.tunnel_metadata,
-    })
-}
-
-#[cfg(desktop)]
-fn tunnel_status(runtime: &PeerDeltaRuntime) -> PeerDeltaTunnelStatus {
-    let Some(source) = runtime
-        .source
-        .as_ref()
-        .filter(|source| source.tunnel_metadata.is_some())
-    else {
-        return PeerDeltaTunnelStatus {
-            session_id: None,
-            phase: PeerDeltaTunnelPhase::Idle,
-            tunnel: None,
-        };
-    };
-    let phase = match source.phase {
-        PeerDeltaSourcePhase::Starting => PeerDeltaTunnelPhase::Starting,
-        PeerDeltaSourcePhase::Running => PeerDeltaTunnelPhase::Running,
-        PeerDeltaSourcePhase::Stopping => PeerDeltaTunnelPhase::Stopping,
-        PeerDeltaSourcePhase::Stopped => PeerDeltaTunnelPhase::Stopped,
-        PeerDeltaSourcePhase::Idle | PeerDeltaSourcePhase::Prepared => PeerDeltaTunnelPhase::Idle,
-    };
-    PeerDeltaTunnelStatus {
-        session_id: Some(source.session_id.clone()),
-        phase,
-        tunnel: source.tunnel_metadata,
-    }
-}
-
-// Desktop-only tunnel lifecycle errors.
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn tunnel_start_error() -> PeerSyncError {
-    PeerSyncError::Transport("peer delta tunnel failed to start".to_owned())
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn tunnel_stop_error() -> PeerSyncError {
-    PeerSyncError::Transport("peer delta tunnel failed to stop".to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1636,64 +898,6 @@ fn classify_activation_conflict(
 }
 
 #[tauri::command]
-pub async fn peer_delta_prepare(
-    app: AppHandle,
-    state: State<'_, PeerDeltaCommandState>,
-) -> Result<PeerDeltaSourceStatus, String> {
-    let state = state.inner().clone();
-    let app_root = app_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mut runtime = state.lock().map_err(|error| error.to_string())?;
-            if runtime.source_preparing || runtime.source.is_some() {
-                return Err("peer delta source is already prepared".to_owned());
-            }
-            runtime.source_preparing = true;
-        }
-        let guard = SourcePrepareGuard {
-            runtime: &state.runtime,
-            armed: true,
-        };
-        let prepared = (|| {
-            let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
-            let prepared = persistent_store::commands::with_store_mut(app.state(), |store| {
-                prepare_shared_delta_source(store, &cas, &app_root).map_err(|error| {
-                    StoreError::Store {
-                        message: error.to_string(),
-                    }
-                })
-            })
-            .map_err(|error| error.to_string())?;
-            state
-                .install_prepared_shared_source(prepared)
-                .map_err(|error| error.to_string())
-        })();
-        if prepared.is_ok() {
-            // install_source consumed the flag atomically with publishing the
-            // prepared source.
-            guard.disarm();
-        }
-        let status = prepared?;
-        state
-            .configure_v2_registry(
-                &app_root,
-                super::device_registry::platform_device_name(),
-                super::device_registry::DevicePermissions::read(),
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(status)
-    })
-    .await
-    .map_err(|error| format!("peer delta source preparation worker failed: {error}"))?
-}
-
-#[tauri::command]
-#[cfg(target_os = "android")]
-pub fn peer_delta_source_reserve() -> Result<AndroidForegroundKey, String> {
-    registry().reserve(AndroidForegroundLane::P4Source)
-}
-
-#[tauri::command]
 #[cfg(target_os = "android")]
 pub fn peer_delta_target_reserve(
     state: State<'_, PeerDeltaCommandState>,
@@ -1737,98 +941,6 @@ pub fn peer_delta_target_foreground_cancel(
         "peer delta target foreground cancellation",
         state.cancel_target_foreground_exact(&foreground),
     )
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-pub fn peer_delta_start(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-) -> Result<PeerDeltaSourceStatus, String> {
-    let address = discover_lan_ipv4().map_err(|error| error.to_string())?;
-    state
-        .start_source(&session_id, address)
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-pub async fn peer_delta_start(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-    foreground: AndroidForegroundKey,
-) -> Result<PeerDeltaSourceStatus, String> {
-    let cancellation = acquire_foreground(&foreground, AndroidForegroundLane::P4Source).await?;
-    let address = super::android_source_commands::discover_private_lan_address()?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if cancellation.is_cancelled() {
-            return Err("Android foreground service was cancelled".to_owned());
-        }
-        let status = state
-            .start_source(&session_id, address)
-            .map_err(|error| error.to_string())?;
-        state
-            .attach_source_foreground(&session_id, foreground.clone())
-            .map_err(|error| error.to_string())?;
-        let callback_state = state.clone();
-        let callback_key = foreground.clone();
-        if !registry().set_source_stop_callback_exact(&foreground, move || {
-            callback_state.pause_source_exact(&callback_key);
-        }) {
-            state.pause_source_exact(&foreground);
-            return Err("Android foreground service detached before source start".to_owned());
-        }
-        Ok(status)
-    })
-    .await
-    .map_err(|error| format!("peer delta source start worker failed: {error}"))?
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-pub async fn peer_delta_tunnel_start(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-    tunnel: PeerDeltaTunnelStart,
-) -> Result<PeerDeltaSourceStatus, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.start_tunnel(&session_id, tunnel))
-        .await
-        .map_err(|error| format!("peer delta tunnel start worker failed: {error}"))?
-        .map_err(|_| "peer delta tunnel failed to start".to_owned())
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-pub async fn peer_delta_tunnel_status(
-    state: State<'_, PeerDeltaCommandState>,
-) -> Result<PeerDeltaTunnelStatus, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.tunnel_status())
-        .await
-        .map_err(|error| format!("peer delta tunnel status worker failed: {error}"))?
-        .map_err(|_| "peer delta tunnel status is unavailable".to_owned())
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-pub async fn peer_delta_tunnel_stop(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-) -> Result<(), String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.stop_source(&session_id))
-        .await
-        .map_err(|error| format!("peer delta tunnel stop worker failed: {error}"))?
-        .map_err(|_| "peer delta tunnel failed to stop".to_owned())
-}
-
-#[tauri::command]
-pub fn peer_delta_status(
-    state: State<'_, PeerDeltaCommandState>,
-) -> Result<PeerDeltaSourceStatus, String> {
-    state.status().map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1934,43 +1046,6 @@ pub async fn peer_delta_target_abandon(
         })
         .await,
     )
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-pub async fn peer_delta_stop(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-) -> Result<(), String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.stop_source(&session_id))
-        .await
-        .map_err(|error| format!("peer delta source stop worker failed: {error}"))?
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-pub async fn peer_delta_stop(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-) -> Result<Option<AndroidForegroundKey>, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.release_source_android(&session_id))
-        .await
-        .map_err(|error| format!("peer delta source stop worker failed: {error}"))?
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn peer_delta_revoke(
-    state: State<'_, PeerDeltaCommandState>,
-    session_id: String,
-    device_id: String,
-) -> Result<(), String> {
-    state
-        .revoke(&session_id, &device_id)
-        .map_err(|error| error.to_string())
 }
 
 #[cfg(desktop)]
@@ -2206,10 +1281,6 @@ fn delta_app_data_root(app: &AppHandle) -> Result<PathBuf, PeerSyncError> {
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
-fn build_pairing_uri(endpoint: &str, pairing: &super::LanPairing) -> Result<String, PeerSyncError> {
-    super::tunnel_lifecycle::build_lane_pairing_uri("peer-delta", endpoint, pairing)
-}
-
 pub(crate) fn canonical_source_device_id(app_root: &Path) -> Result<String, PeerSyncError> {
     super::device_registry::load_or_create_device_id(app_root)
         .map_err(|error| PeerSyncError::Storage(error.to_string()))
@@ -2230,6 +1301,7 @@ fn store_error(error: StoreError) -> PeerSyncError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LanCloneHost;
     use super::*;
     use crate::{
         asset_repository::job_pins::{collect_durable_cas_job_roots, CasObjectRole},
@@ -2253,10 +1325,9 @@ mod tests {
     use serde_json::json;
     use std::{
         io::{Cursor, Read},
-        net::SocketAddr,
         sync::{
             atomic::{AtomicBool, Ordering},
-            mpsc, Arc, Barrier,
+            mpsc, Arc,
         },
         thread,
         time::Duration,
@@ -2377,204 +1448,17 @@ mod tests {
         }
     }
 
-    struct FakeDeltaTunnelLauncher(Arc<Mutex<FakeDeltaTunnelState>>);
-
-    struct FakeDeltaTunnelState {
-        endpoint: url::Url,
-        lifecycle: DeltaTunnelLifecycle,
-        stop_failures: usize,
-        stop_calls: usize,
-        seen_origin: Option<SocketAddr>,
-        seen_named_token: Option<String>,
-        stop_pause: Option<Arc<Barrier>>,
-        start_pause: Option<Arc<Barrier>>,
-        lifecycle_pause: Option<Arc<Barrier>>,
-    }
-
-    impl Default for FakeDeltaTunnelState {
-        fn default() -> Self {
-            Self {
-                endpoint: url::Url::parse("https://quick-id.trycloudflare.com").unwrap(),
-                lifecycle: DeltaTunnelLifecycle::Running,
-                stop_failures: 0,
-                stop_calls: 0,
-                seen_origin: None,
-                seen_named_token: None,
-                stop_pause: None,
-                start_pause: None,
-                lifecycle_pause: None,
-            }
-        }
-    }
-
-    struct FakeDeltaTunnel {
-        host: Option<LanCloneHost>,
-        state: Arc<Mutex<FakeDeltaTunnelState>>,
-    }
-
-    impl DeltaTunnel for FakeDeltaTunnel {
-        fn transport_url(&self) -> url::Url {
-            self.state.lock().unwrap().endpoint.clone()
-        }
-
-        fn lifecycle(&mut self) -> Result<DeltaTunnelLifecycle, String> {
-            let (lifecycle, pause) = {
-                let state = self.state.lock().unwrap();
-                (state.lifecycle, state.lifecycle_pause.clone())
-            };
-            if let Some(pause) = pause {
-                pause.wait();
-                pause.wait();
-            }
-            if lifecycle == DeltaTunnelLifecycle::Stopped {
-                if let Some(host) = self.host.as_mut() {
-                    host.stop().map_err(|error| error.to_string())?;
-                }
-                self.host = None;
-            }
-            Ok(lifecycle)
-        }
-
-        fn stop(&mut self) -> Result<(), String> {
-            let pause = {
-                let mut state = self.state.lock().unwrap();
-                state.stop_calls += 1;
-                if state.stop_failures != 0 {
-                    state.stop_failures -= 1;
-                    return Err("injected stop failure".to_owned());
-                }
-                state.stop_pause.clone()
-            };
-            if let Some(pause) = pause {
-                pause.wait();
-                pause.wait();
-            }
-            if let Some(host) = self.host.as_mut() {
-                host.stop().map_err(|error| error.to_string())?;
-            }
-            self.host = None;
-            self.state.lock().unwrap().lifecycle = DeltaTunnelLifecycle::Stopped;
-            Ok(())
-        }
-    }
-
-    impl DeltaTunnelLauncher for FakeDeltaTunnelLauncher {
-        fn start(
-            &self,
-            request: PeerDeltaTunnelStart,
-            host: LanCloneHost,
-        ) -> Result<Box<dyn DeltaTunnel>, Box<dyn FailedDeltaTunnel>> {
-            let pause = {
-                let mut state = self.0.lock().unwrap();
-                state.seen_origin = host.address();
-                if let PeerDeltaTunnelStart::Named { token, .. } = request {
-                    state.seen_named_token = Some(token);
-                }
-                state.start_pause.clone()
-            };
-            if let Some(pause) = pause {
-                pause.wait();
-                pause.wait();
-            }
-            Ok(Box::new(FakeDeltaTunnel {
-                host: Some(host),
-                state: Arc::clone(&self.0),
-            }))
-        }
-    }
-
-    fn prepared_delta_state(
-        root: &Path,
-        launcher: Arc<dyn DeltaTunnelLauncher>,
-    ) -> (PeerDeltaCommandState, String) {
-        let (session, manifest_bytes) = prepared_delta_source(root);
-        let state = PeerDeltaCommandState::with_tunnel_launcher(launcher);
-        let status = state
-            .install_source(
-                session,
-                "00000000-0000-4000-8000-000000000001",
-                manifest_bytes,
-            )
-            .unwrap();
-        (state, status.session_id.unwrap())
-    }
-
-    fn prepared_delta_source(root: &Path) -> (LogicalDeltaSourceSession, Vec<u8>) {
+    /// Hosts a real P4 source through the same engine calls the shared device
+    /// sync session makes, now that the per-lane source runtime is gone.
+    fn host_delta_source(root: &Path) -> (LanCloneHost, super::super::LanPairing) {
         let cas = PayloadCas::new(root).unwrap();
         let mut store = PersistentStore::open(root).unwrap();
-        let built = store
-            .seal_or_initialize_active_logical_generation(&cas)
+        let mut prepared = prepare_shared_delta_source(&mut store, &cas, root).unwrap();
+        let mut host = LanCloneHost::prepare_logical(prepared.take_session().unwrap());
+        host.enable_v2_registry(root, "Windows", DevicePermissions::read())
             .unwrap();
-        let session = LogicalDeltaSourceSession::open_owned(
-            store.open_native_job_store().unwrap(),
-            root,
-            &built.manifest.library_id,
-            &built.manifest.generation,
-            P4_SOURCE_PIN_PREFIX,
-        )
-        .unwrap();
-        (session, built.manifest_bytes)
-    }
-
-    #[test]
-    fn android_full_source_release_drops_lifecycle_gate_before_real_registry_callback() {
-        let _registry_guard = test_registry_guard();
-        let root = tempfile::tempdir().unwrap();
-        let (session, manifest_bytes) = prepared_delta_source(root.path());
-        let state = PeerDeltaCommandState::default();
-        let status = state
-            .install_source(
-                session,
-                "00000000-0000-4000-8000-000000000001",
-                manifest_bytes,
-            )
-            .unwrap();
-        let session_id = status.session_id.unwrap();
-        let foreground = registry().reserve(AndroidForegroundLane::P4Source).unwrap();
-        assert!(registry().attach_exact(&foreground));
-        state
-            .attach_source_foreground(&session_id, foreground.clone())
-            .unwrap();
-        let callback_state = state.clone();
-        let callback_key = foreground.clone();
-        assert!(
-            registry().set_source_stop_callback_exact(&foreground, move || {
-                callback_state.pause_source_exact(&callback_key);
-            })
-        );
-        let release_state = state.clone();
-        let (released_tx, released_rx) = mpsc::channel();
-
-        let release = thread::spawn(move || {
-            let result = release_state.release_source_android(&session_id);
-            released_tx.send(result).unwrap();
-        });
-
-        assert_eq!(
-            released_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("full release deadlocked in foreground callback")
-                .unwrap(),
-            Some(foreground.clone()),
-        );
-        release.join().unwrap();
-        assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
-        assert!(registry().acquire_exact(&foreground).is_none());
-        let next = registry().reserve(AndroidForegroundLane::P4Target).unwrap();
-        assert!(registry().detach_if_generation(&next));
-
-        let (fresh_session, fresh_manifest) = prepared_delta_source(root.path());
-        let prepared = state
-            .install_source(
-                fresh_session,
-                "00000000-0000-4000-8000-000000000001",
-                fresh_manifest,
-            )
-            .unwrap();
-        assert_eq!(prepared.phase, PeerDeltaSourcePhase::Prepared);
-        state
-            .release_source_android(prepared.session_id.as_deref().unwrap())
-            .unwrap();
+        let pairing = host.start().unwrap();
+        (host, pairing)
     }
 
     #[test]
@@ -2859,61 +1743,6 @@ mod tests {
     }
 
     #[test]
-    fn delta_prepare_stop_prepare_keeps_the_canonical_v2_source_identity() {
-        let source_root = tempfile::tempdir().unwrap();
-        let target_root = tempfile::tempdir().unwrap();
-        let canonical =
-            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
-
-        let state = PeerDeltaCommandState::default();
-        for _ in 0..2 {
-            let source_device_id = canonical_source_device_id(source_root.path()).unwrap();
-            assert_eq!(source_device_id, canonical);
-            let (session, manifest_bytes) = prepared_delta_source(source_root.path());
-            let prepared = state
-                .install_source(session, &source_device_id, manifest_bytes)
-                .unwrap();
-            state
-                .configure_v2_registry(
-                    source_root.path(),
-                    "Windows",
-                    super::super::device_registry::DevicePermissions::read(),
-                )
-                .unwrap();
-            let running = state
-                .start_source(prepared.session_id.as_deref().unwrap(), Ipv4Addr::LOCALHOST)
-                .unwrap();
-            let pairing = url::Url::parse(running.pairing_uri.as_deref().unwrap()).unwrap();
-            let endpoint = pairing
-                .query_pairs()
-                .find(|(key, _)| key == "endpoint")
-                .unwrap()
-                .1
-                .into_owned();
-            let manifest_id = pairing
-                .query_pairs()
-                .find(|(key, _)| key == "manifest")
-                .unwrap()
-                .1
-                .into_owned();
-            let claim = pairing.fragment().unwrap().strip_prefix("claim=").unwrap();
-            let client = super::super::lan::LanLogicalDeltaClient::claim_v2_and_register(
-                target_root.path(),
-                "Android",
-                &endpoint,
-                prepared.session_id.as_deref().unwrap(),
-                &manifest_id,
-                claim,
-            )
-            .unwrap();
-            assert_eq!(client.hello().unwrap().device_id, canonical);
-            state
-                .stop_source(prepared.session_id.as_deref().unwrap())
-                .unwrap();
-        }
-    }
-
-    #[test]
     fn invalid_persisted_source_device_identity_fails_closed() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("peer-sync").join("device-id");
@@ -2924,328 +1753,6 @@ mod tests {
             canonical_source_device_id(root.path()),
             Err(PeerSyncError::Storage(_))
         ));
-    }
-
-    #[test]
-    fn delta_pairing_uses_a_dedicated_scheme_without_changing_clone_links() {
-        let pairing = super::super::LanPairing {
-            session_id: "00000000-0000-4000-8000-000000000001".to_owned(),
-            manifest_id: "1".repeat(64),
-            claim: "2".repeat(64),
-            permissions: None,
-        };
-
-        let uri = build_pairing_uri("http://192.168.1.8:1234", &pairing).unwrap();
-
-        assert!(uri.starts_with("risuailocal://peer-delta/v1?"));
-        assert!(uri.ends_with(&format!("#claim={}", pairing.claim)));
-    }
-
-    #[test]
-    fn quick_and_named_tunnels_use_loopback_and_publish_canonical_https() {
-        for (request, expected_kind) in [
-            (PeerDeltaTunnelStart::Quick, PeerDeltaTunnelKind::Quick),
-            (
-                PeerDeltaTunnelStart::Named {
-                    token: "named-secret-token".to_owned(),
-                    expected_public_base_url: "https://sync.example.com".to_owned(),
-                },
-                PeerDeltaTunnelKind::Named,
-            ),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let fake = Arc::new(Mutex::new(FakeDeltaTunnelState {
-                endpoint: url::Url::parse("https://sync.example.com").unwrap(),
-                ..Default::default()
-            }));
-            let (state, session_id) = prepared_delta_state(
-                root.path(),
-                Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-            );
-
-            let status = state.start_tunnel(&session_id, request).unwrap();
-
-            assert_eq!(status.phase, PeerDeltaSourcePhase::Running);
-            assert_eq!(status.tunnel.unwrap().kind, expected_kind);
-            assert!(status
-                .pairing_uri
-                .unwrap()
-                .contains("endpoint=https%3A%2F%2Fsync.example.com"));
-            assert_eq!(
-                fake.lock().unwrap().seen_origin.unwrap().ip(),
-                Ipv4Addr::LOCALHOST
-            );
-            state.stop_source(&session_id).unwrap();
-        }
-    }
-
-    #[test]
-    fn malformed_tunnel_endpoint_is_stopped_without_publishing_a_pairing() {
-        let root = tempfile::tempdir().unwrap();
-        let fake = Arc::new(Mutex::new(FakeDeltaTunnelState {
-            endpoint: url::Url::parse("https://sync.example.com/not-bare").unwrap(),
-            ..Default::default()
-        }));
-        let (state, session_id) = prepared_delta_state(
-            root.path(),
-            Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-        );
-
-        assert!(state
-            .start_tunnel(&session_id, PeerDeltaTunnelStart::Quick)
-            .is_err());
-        assert_eq!(fake.lock().unwrap().stop_calls, 1);
-        assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
-    }
-
-    #[test]
-    fn natural_exit_and_failed_stop_keep_exact_cleanup_owner_for_retry() {
-        let root = tempfile::tempdir().unwrap();
-        let fake = Arc::new(Mutex::new(FakeDeltaTunnelState {
-            stop_failures: 1,
-            ..Default::default()
-        }));
-        let (state, session_id) = prepared_delta_state(
-            root.path(),
-            Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-        );
-        state
-            .start_tunnel(&session_id, PeerDeltaTunnelStart::Quick)
-            .unwrap();
-
-        assert!(state.stop_source(&session_id).is_err());
-        assert_eq!(
-            state.status().unwrap().phase,
-            PeerDeltaSourcePhase::Stopping
-        );
-        state.stop_source(&session_id).unwrap();
-        assert_eq!(fake.lock().unwrap().stop_calls, 2);
-        assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
-
-        let root = tempfile::tempdir().unwrap();
-        let fake = Arc::new(Mutex::new(FakeDeltaTunnelState::default()));
-        let (state, session_id) = prepared_delta_state(
-            root.path(),
-            Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-        );
-        state
-            .start_tunnel(&session_id, PeerDeltaTunnelStart::Quick)
-            .unwrap();
-        fake.lock().unwrap().lifecycle = DeltaTunnelLifecycle::Stopped;
-        assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
-        assert!(state.revoke(&session_id, "wrong-device").is_err());
-    }
-
-    #[test]
-    fn stop_and_final_exit_wait_for_tunnel_start_owner() {
-        for final_exit in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let pause = Arc::new(Barrier::new(2));
-            let fake = Arc::new(Mutex::new(FakeDeltaTunnelState {
-                start_pause: Some(Arc::clone(&pause)),
-                ..Default::default()
-            }));
-            let (state, session_id) = prepared_delta_state(
-                root.path(),
-                Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-            );
-            let start_state = state.clone();
-            let start_session = session_id.clone();
-            let start = thread::spawn(move || {
-                start_state.start_tunnel(&start_session, PeerDeltaTunnelStart::Quick)
-            });
-            pause.wait();
-
-            let (done_tx, done_rx) = mpsc::channel();
-            let cleanup_state = state.clone();
-            let cleanup_session = session_id.clone();
-            thread::spawn(move || {
-                let result = if final_exit {
-                    cleanup_state.shutdown_for_exit();
-                    Ok(())
-                } else {
-                    cleanup_state.stop_source(&cleanup_session)
-                };
-                done_tx.send(result).unwrap();
-            });
-            let early_cleanup = done_rx.recv_timeout(Duration::from_millis(100));
-            let cleanup_blocked = matches!(&early_cleanup, Err(mpsc::RecvTimeoutError::Timeout));
-            pause.wait();
-            let start_result = start.join().unwrap();
-            let cleanup_result = match early_cleanup {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    done_rx.recv_timeout(Duration::from_secs(2)).unwrap()
-                }
-                Err(error) => panic!("cleanup channel failed: {error}"),
-            };
-            assert!(cleanup_blocked);
-            start_result.unwrap();
-            cleanup_result.unwrap();
-            assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
-        }
-    }
-
-    #[test]
-    fn stop_waits_for_status_probe_to_restore_the_exact_tunnel_owner() {
-        let root = tempfile::tempdir().unwrap();
-        let pause = Arc::new(Barrier::new(2));
-        let fake = Arc::new(Mutex::new(FakeDeltaTunnelState {
-            lifecycle_pause: Some(Arc::clone(&pause)),
-            ..Default::default()
-        }));
-        let (state, session_id) = prepared_delta_state(
-            root.path(),
-            Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-        );
-        state
-            .start_tunnel(&session_id, PeerDeltaTunnelStart::Quick)
-            .unwrap();
-        let status_state = state.clone();
-        let status = thread::spawn(move || status_state.status());
-        pause.wait();
-
-        let (done_tx, done_rx) = mpsc::channel();
-        let stop_state = state.clone();
-        let stop_session = session_id.clone();
-        thread::spawn(move || done_tx.send(stop_state.stop_source(&stop_session)).unwrap());
-        let early_stop = done_rx.recv_timeout(Duration::from_millis(100));
-        let stop_blocked = matches!(&early_stop, Err(mpsc::RecvTimeoutError::Timeout));
-        pause.wait();
-        let status_result = status.join().unwrap();
-        let stop_result = match early_stop {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                done_rx.recv_timeout(Duration::from_secs(2)).unwrap()
-            }
-            Err(error) => panic!("stop channel failed: {error}"),
-        };
-        assert!(stop_blocked);
-        assert_eq!(status_result.unwrap().phase, PeerDeltaSourcePhase::Running);
-        stop_result.unwrap();
-        assert_eq!(fake.lock().unwrap().stop_calls, 1);
-        assert_eq!(state.status().unwrap().phase, PeerDeltaSourcePhase::Stopped);
-    }
-
-    #[test]
-    fn new_prepare_waits_for_status_probe_and_never_receives_the_old_tunnel() {
-        let root = tempfile::tempdir().unwrap();
-        let replacement_root = tempfile::tempdir().unwrap();
-        let (replacement_session, replacement_manifest) =
-            prepared_delta_source(replacement_root.path());
-        let pause = Arc::new(Barrier::new(2));
-        let fake = Arc::new(Mutex::new(FakeDeltaTunnelState {
-            lifecycle_pause: Some(Arc::clone(&pause)),
-            ..Default::default()
-        }));
-        let (state, session_id) = prepared_delta_state(
-            root.path(),
-            Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-        );
-        state
-            .start_tunnel(&session_id, PeerDeltaTunnelStart::Quick)
-            .unwrap();
-        let status_state = state.clone();
-        let status = thread::spawn(move || status_state.status());
-        pause.wait();
-
-        let (prepared_tx, prepared_rx) = mpsc::channel();
-        let prepare_state = state.clone();
-        thread::spawn(move || {
-            prepared_tx
-                .send(prepare_state.install_source(
-                    replacement_session,
-                    "00000000-0000-4000-8000-000000000002",
-                    replacement_manifest,
-                ))
-                .unwrap();
-        });
-        let early_prepare = prepared_rx.recv_timeout(Duration::from_millis(100));
-        let prepare_blocked = matches!(&early_prepare, Err(mpsc::RecvTimeoutError::Timeout));
-        pause.wait();
-        status.join().unwrap().unwrap();
-        let replacement = match early_prepare {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                prepared_rx.recv_timeout(Duration::from_secs(2)).unwrap()
-            }
-            Err(error) => panic!("prepare channel failed: {error}"),
-        };
-        assert!(prepare_blocked);
-        let replacement = replacement.unwrap();
-        let runtime = state.lock().unwrap();
-        let source = runtime.source.as_ref().unwrap();
-        assert_eq!(source.session_id, replacement.session_id.unwrap());
-        assert!(source.tunnel.is_none());
-        assert_eq!(source.phase, PeerDeltaSourcePhase::Prepared);
-    }
-
-    #[test]
-    fn stop_and_final_exit_release_the_owned_p4_source_pin() {
-        for final_exit in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let fake = Arc::new(Mutex::new(FakeDeltaTunnelState::default()));
-            let (state, session_id) = prepared_delta_state(
-                root.path(),
-                Arc::new(FakeDeltaTunnelLauncher(Arc::clone(&fake))),
-            );
-            state
-                .start_tunnel(&session_id, PeerDeltaTunnelStart::Quick)
-                .unwrap();
-
-            if final_exit {
-                state.shutdown_for_exit();
-            } else {
-                state.stop_source(&session_id).unwrap();
-            }
-
-            let mut reopened = PersistentStore::open(root.path()).unwrap();
-            assert_eq!(
-                reopened
-                    .reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)
-                    .unwrap(),
-                0
-            );
-        }
-    }
-
-    #[test]
-    fn revocation_is_scoped_to_the_exact_source_session_and_device() {
-        let root = tempfile::tempdir().unwrap();
-        let (state, session_id) = prepared_delta_state(
-            root.path(),
-            Arc::new(FakeDeltaTunnelLauncher(Arc::new(Mutex::new(
-                FakeDeltaTunnelState::default(),
-            )))),
-        );
-        let status = state
-            .start_source(&session_id, Ipv4Addr::LOCALHOST)
-            .unwrap();
-        let uri = url::Url::parse(status.pairing_uri.as_deref().unwrap()).unwrap();
-        let endpoint = uri
-            .query_pairs()
-            .find(|(key, _)| key == "endpoint")
-            .unwrap()
-            .1;
-        let claim = uri.fragment().unwrap().strip_prefix("claim=").unwrap();
-        let _client = LanLogicalDeltaClient::claim(
-            &endpoint,
-            &session_id,
-            status.manifest_id.as_deref().unwrap(),
-            claim,
-            "00000000-0000-4000-8000-000000000098",
-        )
-        .unwrap();
-        let device_id = state.status().unwrap().devices[0].device_id.clone();
-
-        assert!(state
-            .revoke("00000000-0000-4000-8000-000000000099", &device_id)
-            .is_err());
-        assert!(state
-            .revoke(&session_id, "00000000-0000-4000-8000-000000000099")
-            .is_err());
-        state.revoke(&session_id, &device_id).unwrap();
-        assert!(state.status().unwrap().devices[0].revoked);
     }
 
     #[test]
@@ -3966,32 +2473,15 @@ mod tests {
         let source_root = tempfile::tempdir().unwrap();
         let target_root = tempfile::tempdir().unwrap();
         let source_device_id = canonical_source_device_id(source_root.path()).unwrap();
-        let (session, manifest_bytes) = prepared_delta_source(source_root.path());
-        let state = PeerDeltaCommandState::default();
-        let prepared = state
-            .install_source(session, &source_device_id, manifest_bytes)
-            .unwrap();
-        state
-            .configure_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
-            .unwrap();
-        let running = state
-            .start_source(prepared.session_id.as_deref().unwrap(), Ipv4Addr::LOCALHOST)
-            .unwrap();
-        let pairing = url::Url::parse(running.pairing_uri.as_deref().unwrap()).unwrap();
-        let endpoint = pairing
-            .query_pairs()
-            .find(|(key, _)| key == "endpoint")
-            .unwrap()
-            .1
-            .into_owned();
-        let claim = pairing.fragment().unwrap().strip_prefix("claim=").unwrap();
+        let (mut host, pairing) = host_delta_source(source_root.path());
+        let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
         let mut client = LanLogicalDeltaClient::claim_v2_and_register(
             target_root.path(),
             "Android",
             &endpoint,
-            prepared.session_id.as_deref().unwrap(),
-            prepared.manifest_id.as_deref().unwrap(),
-            claim,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
         )
         .unwrap();
         let (remote_manifest, attempt) = fetch_delta_manifest_and_completion(&client).unwrap();
@@ -4039,9 +2529,7 @@ mod tests {
                 .unwrap();
         assert_eq!(outgoing.devices()[0].total_bytes, 0);
 
-        state
-            .stop_source(prepared.session_id.as_deref().unwrap())
-            .unwrap();
+        host.stop().unwrap();
     }
 
     #[test]
@@ -4118,32 +2606,15 @@ mod tests {
             })
             .unwrap();
         drop(source_store);
-        let (session, manifest_bytes) = prepared_delta_source(source_root.path());
-        let state = PeerDeltaCommandState::default();
-        let prepared = state
-            .install_source(session, &source_device_id, manifest_bytes)
-            .unwrap();
-        state
-            .configure_v2_registry(source_root.path(), "Windows", DevicePermissions::read())
-            .unwrap();
-        let running = state
-            .start_source(prepared.session_id.as_deref().unwrap(), Ipv4Addr::LOCALHOST)
-            .unwrap();
-        let pairing = url::Url::parse(running.pairing_uri.as_deref().unwrap()).unwrap();
-        let endpoint = pairing
-            .query_pairs()
-            .find(|(key, _)| key == "endpoint")
-            .unwrap()
-            .1
-            .into_owned();
-        let claim = pairing.fragment().unwrap().strip_prefix("claim=").unwrap();
+        let (mut host, pairing) = host_delta_source(source_root.path());
+        let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
         let mut client = LanLogicalDeltaClient::claim_v2_and_register(
             target_root.path(),
             "Android",
             &endpoint,
-            prepared.session_id.as_deref().unwrap(),
-            prepared.manifest_id.as_deref().unwrap(),
-            claim,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
         )
         .unwrap();
         let (remote_manifest, first_attempt) =
@@ -4215,7 +2686,7 @@ mod tests {
                 &outgoing.devices()[0].device_id,
                 super::super::device_registry::CompletionLane::Delta,
                 &first_attempt.operation_id,
-                prepared.manifest_id.as_deref().unwrap(),
+                &pairing.manifest_id,
                 completed.useful_bytes,
             )
             .unwrap());
@@ -4231,9 +2702,7 @@ mod tests {
             completed.useful_bytes
         );
 
-        state
-            .stop_source(prepared.session_id.as_deref().unwrap())
-            .unwrap();
+        host.stop().unwrap();
     }
 
     #[test]

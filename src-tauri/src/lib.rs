@@ -606,24 +606,6 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_target_foreground_release,
             #[cfg(target_os = "android")]
             peer_sync::delta_commands::peer_delta_target_foreground_cancel,
-            #[cfg(target_os = "android")]
-            peer_sync::delta_commands::peer_delta_source_reserve,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_prepare,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_start,
-            #[cfg(desktop)]
-            peer_sync::delta_commands::peer_delta_tunnel_start,
-            #[cfg(desktop)]
-            peer_sync::delta_commands::peer_delta_tunnel_status,
-            #[cfg(desktop)]
-            peer_sync::delta_commands::peer_delta_tunnel_stop,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_status,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_stop,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_revoke,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::delta_commands::peer_delta_target_retained,
             #[cfg(any(desktop, target_os = "android"))]
@@ -801,8 +783,6 @@ pub fn run() {
     app.run(|app, event| {
         #[cfg(desktop)]
         if run_event_requires_peer_clone_shutdown(&event) {
-            app.state::<peer_sync::delta_commands::PeerDeltaCommandState>()
-                .shutdown_for_exit();
             app.state::<peer_sync::bidirectional_commands::PeerBidirectionalCommandState>()
                 .shutdown_for_exit();
             if let Err(error) = app

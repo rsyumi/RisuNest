@@ -5,7 +5,6 @@ use super::shared_session::DeviceSyncSourceState;
 use super::{
     bidirectional_commands::PeerBidirectionalCommandState,
     command_codes::finish_peer_command,
-    delta_commands::PeerDeltaCommandState,
     device_registry::{
         incoming_source_by_id, incoming_source_summaries, outgoing_device_summaries,
         register_incoming_source, remove_incoming_source, revoke_outgoing_device, IncomingSource,
@@ -205,18 +204,15 @@ pub(crate) fn remove_incoming_source_if_inactive(
 #[tauri::command]
 pub fn peer_sync_revoke_outgoing_device(
     app: AppHandle,
-    delta: State<'_, PeerDeltaCommandState>,
     bidirectional: State<'_, PeerBidirectionalCommandState>,
     shared: State<'_, DeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
-    let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
     finish_peer_command(
         "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            delta.revoke_registered_device(id);
             bidirectional.revoke_registered_device(id);
             shared.revoke_registered_device(id);
         }),
@@ -468,18 +464,15 @@ mod tests {
 #[tauri::command]
 pub fn peer_sync_revoke_outgoing_device(
     app: AppHandle,
-    delta: State<'_, PeerDeltaCommandState>,
     bidirectional: State<'_, PeerBidirectionalCommandState>,
     shared: State<'_, AndroidDeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
-    let delta = delta.inner().clone();
     let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
     finish_peer_command(
         "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            delta.revoke_registered_device(id);
             bidirectional.revoke_registered_device(id);
             shared.revoke_registered_device(id);
         }),

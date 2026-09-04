@@ -977,6 +977,14 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
     assert!(!stale.exists());
     assert!(noncanonical.is_dir());
     assert!(canonical_file.is_file());
+    // The delta lane owns a P4 generation pin for as long as its prepared
+    // source lives, so stop has to leave nothing for a later reclaim to find.
+    assert_eq!(
+        store
+            .reclaim_logical_generation_pins(super::delta_commands::P4_SOURCE_PIN_PREFIX)
+            .unwrap(),
+        0
+    );
 }
 
 #[cfg(desktop)]
