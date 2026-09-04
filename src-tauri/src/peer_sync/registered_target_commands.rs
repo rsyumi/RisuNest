@@ -324,7 +324,7 @@ pub async fn peer_clone_claim_registered_client(
 
 #[tauri::command]
 #[cfg(target_os = "android")]
-pub async fn peer_clone_claim_client(
+pub async fn peer_clone_claim_v2_client(
     app: AppHandle,
     endpoint: String,
     session_id: String,
@@ -368,18 +368,6 @@ pub async fn peer_clone_claim_client(
     .await
     .map_err(|error| registered_operation_failure("Android clone registration worker", error))?
     .map_err(|code: PeerCommandCode| code.to_string())
-}
-
-#[tauri::command]
-#[cfg(target_os = "android")]
-pub async fn peer_clone_claim_v2_client(
-    app: AppHandle,
-    endpoint: String,
-    session_id: String,
-    manifest_id: String,
-    claim: String,
-) -> Result<AndroidPeerCloneClaimResult, String> {
-    peer_clone_claim_client(app, endpoint, session_id, manifest_id, claim).await
 }
 
 #[tauri::command]

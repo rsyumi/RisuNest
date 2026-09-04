@@ -1115,37 +1115,13 @@ impl PeerCloneCommandState {
             })
     }
 
-    pub fn claim_target(
+    pub(crate) fn claim_v2_target(
         &self,
         peer_root: &Path,
         endpoint: &str,
         session_id: &str,
         manifest_id: &str,
         claim: &str,
-    ) -> Result<PeerCloneClaimResult, PeerSyncError> {
-        self.claim_target_mode(peer_root, endpoint, session_id, manifest_id, claim, false)
-    }
-
-    pub(crate) fn claim_strict_v2_target(
-        &self,
-        peer_root: &Path,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-    ) -> Result<PeerCloneClaimResult, PeerSyncError> {
-        self.claim_target_mode(peer_root, endpoint, session_id, manifest_id, claim, true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn claim_target_mode(
-        &self,
-        peer_root: &Path,
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        strict_v2: bool,
     ) -> Result<PeerCloneClaimResult, PeerSyncError> {
         self.reap_finished_target_worker()?;
         let request = PeerCloneTargetRequest {
@@ -1181,48 +1157,20 @@ impl PeerCloneCommandState {
                         "peer clone target cannot rotate credentials during activation".to_owned(),
                     ));
                 }
-                if strict_v2 {
-                    if !matches!(
-                        target.status.phase,
-                        PeerCloneTargetPhase::Idle
-                            | PeerCloneTargetPhase::Failed
-                            | PeerCloneTargetPhase::Cancelled
-                    ) {
-                        return Err(PeerSyncError::Protocol(
-                            "peer clone target is not ready to repair its pairing".to_owned(),
-                        ));
-                    }
-                    if target.worker.is_some() {
-                        return Err(PeerSyncError::Protocol(
-                            "peer clone target worker is still active".to_owned(),
-                        ));
-                    }
-                } else {
-                    if !matches!(
-                        target.status.phase,
-                        PeerCloneTargetPhase::Failed | PeerCloneTargetPhase::Cancelled
-                    ) {
-                        return if target.request == request {
-                            target
-                                .client
-                                .as_ref()
-                                .map(|client| clone_claim_result(&target.request, client))
-                                .ok_or_else(|| {
-                                    PeerSyncError::Protocol(
-                                        "peer clone target client is unavailable".to_owned(),
-                                    )
-                                })
-                        } else {
-                            Err(PeerSyncError::Protocol(
-                                "peer clone target is not ready to repair its pairing".to_owned(),
-                            ))
-                        };
-                    }
-                    if target.worker.is_some() || target.client.is_none() {
-                        return Err(PeerSyncError::Protocol(
-                            "peer clone target worker is still active".to_owned(),
-                        ));
-                    }
+                if !matches!(
+                    target.status.phase,
+                    PeerCloneTargetPhase::Idle
+                        | PeerCloneTargetPhase::Failed
+                        | PeerCloneTargetPhase::Cancelled
+                ) {
+                    return Err(PeerSyncError::Protocol(
+                        "peer clone target is not ready to repair its pairing".to_owned(),
+                    ));
+                }
+                if target.worker.is_some() {
+                    return Err(PeerSyncError::Protocol(
+                        "peer clone target worker is still active".to_owned(),
+                    ));
                 }
             }
             if runtime.target_claiming {
@@ -1249,53 +1197,15 @@ impl PeerCloneCommandState {
             let pending_marker =
                 persisted_marker.unwrap_or_else(|| TargetOperationMarker::new(&request));
             let operation_id = pending_marker.operation_id.clone();
-            let claim_client = || {
-                if strict_v2 {
-                    return LanCloneClient::claim_strict_v2_and_persist_and_register(
-                        app_root,
-                        super::device_registry::platform_device_name(),
-                        &paths.credential,
-                        endpoint,
-                        session_id,
-                        manifest_id,
-                        claim,
-                    );
-                }
-                match LanCloneClient::claim_v2_and_persist_and_register(
-                    app_root,
-                    super::device_registry::platform_device_name(),
-                    &paths.credential,
-                    endpoint,
-                    session_id,
-                    manifest_id,
-                    claim,
-                ) {
-                    Ok(client) => Ok(client),
-                    Err(error) if super::lan::v2_claim_is_unsupported(&error) => {
-                        LanCloneClient::claim_and_persist(
-                            &paths.credential,
-                            endpoint,
-                            session_id,
-                            manifest_id,
-                            claim,
-                        )
-                    }
-                    Err(error) => Err(error),
-                }
-            };
-            let lan = if strict_v2 || rotate_credential {
-                claim_client()?
-            } else {
-                match fs::symlink_metadata(&paths.credential) {
-                    Ok(_) => {
-                        let lan = LanCloneClient::open_persisted(&paths.credential)?;
-                        let _ = lan.try_migrate_persisted_credential(app_root)?;
-                        lan
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => claim_client()?,
-                    Err(error) => return Err(error.into()),
-                }
-            };
+            let lan = LanCloneClient::claim_strict_v2_and_persist_and_register(
+                app_root,
+                super::device_registry::platform_device_name(),
+                &paths.credential,
+                endpoint,
+                session_id,
+                manifest_id,
+                claim,
+            )?;
             if !lan.matches_target(endpoint, session_id, manifest_id)? {
                 return Err(PeerSyncError::Protocol(
                     "persisted peer clone target identity does not match the request".to_owned(),
@@ -1391,10 +1301,12 @@ impl PeerCloneCommandState {
             })?;
             if !same_target_identity(&target.request, &request)
                 || target.job_root != paths.job_root
-                || !(matches!(
+                || !matches!(
                     target.status.phase,
-                    PeerCloneTargetPhase::Failed | PeerCloneTargetPhase::Cancelled
-                ) || strict_v2 && target.status.phase == PeerCloneTargetPhase::Idle)
+                    PeerCloneTargetPhase::Idle
+                        | PeerCloneTargetPhase::Failed
+                        | PeerCloneTargetPhase::Cancelled
+                )
                 || target.worker.is_some()
             {
                 return Err(PeerSyncError::Protocol(
@@ -3762,25 +3674,6 @@ pub fn peer_clone_revoke(
 }
 
 #[tauri::command]
-pub async fn peer_clone_claim_client(
-    app: AppHandle,
-    state: State<'_, PeerCloneCommandState>,
-    endpoint: String,
-    session_id: String,
-    manifest_id: String,
-    claim: String,
-) -> Result<PeerCloneClaimResult, String> {
-    let state = state.inner().clone();
-    let (_, peer_root) = app_peer_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        state.claim_target(&peer_root, &endpoint, &session_id, &manifest_id, &claim)
-    })
-    .await
-    .map_err(|error| format!("peer clone target claim worker failed: {error}"))?
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub async fn peer_clone_claim_v2_client(
     app: AppHandle,
     state: State<'_, PeerCloneCommandState>,
@@ -3796,7 +3689,7 @@ pub async fn peer_clone_claim_v2_client(
     let state = state.inner().clone();
     let (_, peer_root) = bounded_app_peer_root(&app)?;
     let claimed = tauri::async_runtime::spawn_blocking(move || {
-        state.claim_strict_v2_target(&peer_root, &endpoint, &session_id, &manifest_id, &claim)
+        state.claim_v2_target(&peer_root, &endpoint, &session_id, &manifest_id, &claim)
     })
     .await;
     finish_peer_worker("peer clone v2 target claim", claimed)
@@ -4586,7 +4479,7 @@ mod tests {
         });
 
         assert!(state
-            .claim_strict_v2_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -4620,7 +4513,7 @@ mod tests {
         let state = PeerCloneCommandState::default();
 
         assert!(state
-            .claim_strict_v2_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -4705,7 +4598,7 @@ mod tests {
         });
 
         let result = target
-            .claim_strict_v2_target(
+            .claim_v2_target(
                 &target_peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -4798,7 +4691,7 @@ mod tests {
         };
         let target = PeerCloneCommandState::default();
         let claim_result = target
-            .claim_target(
+            .claim_v2_target(
                 &target_root.path().join("peer-sync"),
                 &request.endpoint,
                 &request.session_id,
@@ -4824,18 +4717,14 @@ mod tests {
             incoming.sources()[0].device_id,
             super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap()
         );
-        PeerCloneCommandState::default()
-            .claim_target(
-                &target_root.path().join("peer-sync"),
-                &request.endpoint,
-                &request.session_id,
-                &request.manifest_id,
-                &pairing.claim,
-            )
-            .unwrap();
-        assert!(super::super::LanCloneClient::claim(
+        let verifier_root = tempfile::tempdir().unwrap();
+        assert!(LanCloneClient::claim_strict_v2_and_persist_and_register(
+            verifier_root.path(),
+            "Verifier",
+            &verifier_root.path().join("credential.json"),
             &request.endpoint,
             &request.session_id,
+            &request.manifest_id,
             &pairing.claim,
         )
         .is_err());
@@ -5075,7 +4964,7 @@ mod tests {
         let peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
         let claim_result = target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -5258,7 +5147,7 @@ mod tests {
         };
         assert_eq!(
             recovered
-                .claim_target(
+                .claim_v2_target(
                     &peer_root,
                     &blocked_request.endpoint,
                     &blocked_request.session_id,
@@ -5342,6 +5231,13 @@ mod tests {
                 &NeverCancelled,
             )
             .unwrap();
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let running = source
             .start_source(
                 prepared.session_id.as_deref().unwrap(),
@@ -5360,7 +5256,7 @@ mod tests {
         let peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
         target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -5420,17 +5316,19 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
+        assert_eq!(
             super::super::device_registry::OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
                 .devices()
-                .is_empty()
+                .len(),
+            1
         );
-        assert!(
+        assert_eq!(
             super::super::device_registry::IncomingSourceRegistry::load(target_root.path())
                 .unwrap()
                 .sources()
-                .is_empty()
+                .len(),
+            1
         );
         source.stop_source(&request.session_id).unwrap();
     }
@@ -5480,7 +5378,7 @@ mod tests {
         let peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
         let claim = target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -5688,6 +5586,13 @@ mod tests {
                 &NeverCancelled,
             )
             .unwrap();
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let running = source
             .start_source(
                 prepared.session_id.as_deref().unwrap(),
@@ -5706,7 +5611,7 @@ mod tests {
         let peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
         target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -5747,6 +5652,13 @@ mod tests {
                 &NeverCancelled,
             )
             .unwrap();
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let running = source
             .start_source(
                 prepared.session_id.as_deref().unwrap(),
@@ -5763,7 +5675,7 @@ mod tests {
         let target = PeerCloneCommandState::default();
         let peer_root = target_root.path().join("peer-sync");
         target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -5806,68 +5718,44 @@ mod tests {
             .join("ledger.jsonl");
         assert!(credential.is_file());
         let persisted_chunk = first_persisted_chunk_event(&ledger);
-        source.shutdown_for_exit();
-        drop(source);
-        let reopened = PeerCloneCommandState::initialize(&source_peer_root);
-        let restarted = reopened
-            .start_source(&request.session_id, Ipv4Addr::new(192, 168, 1, 4))
-            .unwrap();
-        let restarted_pairing = parse_product_pairing(restarted.pairing_uri.as_deref().unwrap());
-        let restarted_request = PeerCloneTargetRequest {
-            endpoint: format!(
-                "http://127.0.0.1:{}",
-                reopened.source_bind_address().unwrap().unwrap().port()
-            ),
-            session_id: restarted_pairing.session_id,
-            manifest_id: restarted_pairing.manifest_id,
-        };
         let different_session = PeerCloneTargetRequest {
             session_id: "223e4567-e89b-42d3-a456-426614174000".to_owned(),
-            ..restarted_request.clone()
+            ..request.clone()
         };
         let different_manifest = PeerCloneTargetRequest {
             manifest_id: "0".repeat(64),
-            ..restarted_request.clone()
+            ..request.clone()
         };
         assert!(target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &different_session.endpoint,
                 &different_session.session_id,
                 &different_session.manifest_id,
-                &restarted_pairing.claim,
+                &pairing.claim,
             )
             .is_err());
         assert!(target
-            .claim_target(
+            .claim_v2_target(
                 &peer_root,
                 &different_manifest.endpoint,
                 &different_manifest.session_id,
                 &different_manifest.manifest_id,
-                &restarted_pairing.claim,
+                &pairing.claim,
             )
             .is_err());
         target
-            .claim_target(
-                &peer_root,
-                &restarted_request.endpoint,
-                &restarted_request.session_id,
-                &restarted_request.manifest_id,
-                &restarted_pairing.claim,
-            )
-            .unwrap();
-        target
-            .start_target_download(&peer_root, restarted_request.clone())
+            .resume_target_download(&peer_root, request.clone())
             .unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
         assert_eq!(
             persisted_chunk_event_count(&ledger, &persisted_chunk),
             1,
-            "credential rotation must not redownload an already verified chunk"
+            "a cancelled transfer must not redownload an already verified chunk"
         );
 
-        assert_eq!(reopened.source_status().unwrap().devices.len(), 1);
-        reopened.stop_source(&restarted_request.session_id).unwrap();
+        assert_eq!(source.source_status().unwrap().devices.len(), 1);
+        source.stop_source(&request.session_id).unwrap();
     }
 
     #[test]
@@ -5893,6 +5781,13 @@ mod tests {
                     &NeverCancelled,
                 )
                 .unwrap();
+            source
+                .configure_v2_registry(
+                    source_root.path(),
+                    "Windows",
+                    super::super::device_registry::DevicePermissions::read(),
+                )
+                .unwrap();
             let running = source
                 .start_source(
                     prepared.session_id.as_deref().unwrap(),
@@ -5903,7 +5798,7 @@ mod tests {
             let target_peer_root = target_root.path().join("peer-sync");
             let target = PeerCloneCommandState::default();
             target
-                .claim_target(
+                .claim_v2_target(
                     &target_peer_root,
                     &format!(
                         "http://127.0.0.1:{}",
@@ -5926,6 +5821,13 @@ mod tests {
             source.shutdown_for_exit();
             drop(source);
             let reopened = PeerCloneCommandState::initialize(&source_peer_root);
+            reopened
+                .configure_v2_registry(
+                    source_root.path(),
+                    "Windows",
+                    super::super::device_registry::DevicePermissions::read(),
+                )
+                .unwrap();
             let restarted = reopened
                 .start_source(&pairing.session_id, Ipv4Addr::new(192, 168, 1, 4))
                 .unwrap();
@@ -5936,7 +5838,7 @@ mod tests {
             );
 
             assert!(target
-                .claim_target(
+                .claim_v2_target(
                     &target_peer_root,
                     &repaired_endpoint,
                     &repaired.session_id,
@@ -5945,7 +5847,7 @@ mod tests {
                 )
                 .is_err());
             PeerCloneCommandState::default()
-                .claim_target(
+                .claim_v2_target(
                     &verifier_root.path().join("peer-sync"),
                     &repaired_endpoint,
                     &repaired.session_id,
@@ -5958,7 +5860,7 @@ mod tests {
     }
 
     #[test]
-    fn product_target_repair_reservation_blocks_old_worker_until_credential_rotation_finishes() {
+    fn product_target_repair_reservation_blocks_old_worker_until_the_claim_finishes() {
         let source_root = tempfile::tempdir().unwrap();
         let target_root = tempfile::tempdir().unwrap();
         let source_cas = PayloadCas::new(source_root.path()).unwrap();
@@ -5972,6 +5874,13 @@ mod tests {
                 &source_cas,
                 &source_peer_root,
                 &NeverCancelled,
+            )
+            .unwrap();
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
             )
             .unwrap();
         let running = source
@@ -5992,7 +5901,7 @@ mod tests {
         let target_peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
         target
-            .claim_target(
+            .claim_v2_target(
                 &target_peer_root,
                 &first_request.endpoint,
                 &first_request.session_id,
@@ -6016,6 +5925,13 @@ mod tests {
         source.shutdown_for_exit();
         drop(source);
         let reopened = PeerCloneCommandState::initialize(&source_peer_root);
+        reopened
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let restarted = reopened
             .start_source(
                 prepared.session_id.as_deref().unwrap(),
@@ -6040,7 +5956,7 @@ mod tests {
         let claiming_request = repaired_request.clone();
         let repaired_claim = repaired_pairing.claim.clone();
         let claim = thread::spawn(move || {
-            claiming_target.claim_target(
+            claiming_target.claim_v2_target(
                 &claiming_root,
                 &claiming_request.endpoint,
                 &claiming_request.session_id,
@@ -6066,19 +5982,22 @@ mod tests {
 
         claim_pause.wait();
         let claim_result = claim.join().unwrap();
-        assert_eq!(devices_before_claim, 0);
+        assert_eq!(devices_before_claim, 1);
         assert_eq!(credential_before_claim, first_credential);
         assert!(resume_while_claiming.is_err());
         assert_eq!(phase_while_claiming, PeerCloneTargetPhase::Failed);
         assert!(!worker_started);
         assert_eq!(request_while_claiming, first_request);
-        claim_result.unwrap();
-        assert_ne!(fs::read(&credential_path).unwrap(), first_credential);
+        // A registered source refuses to rotate a bearer while this target still
+        // holds completion state for the job, so the repair claim fails and the
+        // reservation has to leave the persisted credential exactly as it was.
+        assert!(claim_result.is_err());
+        assert_eq!(fs::read(&credential_path).unwrap(), first_credential);
         assert_eq!(reopened.source_status().unwrap().devices.len(), 1);
-        target
-            .start_target_download(&target_peer_root, repaired_request.clone())
-            .unwrap();
-        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        assert_eq!(
+            target.target_status(&first_request).unwrap().phase,
+            PeerCloneTargetPhase::Failed
+        );
         reopened.stop_source(&repaired_request.session_id).unwrap();
     }
 
@@ -6912,6 +6831,13 @@ mod tests {
                 &NeverCancelled,
             )
             .unwrap();
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let running = source
             .start_source(
                 prepared.session_id.as_deref().unwrap(),
@@ -6930,7 +6856,7 @@ mod tests {
         let target_peer_root = target_root.path().join("peer-sync");
         let target = PeerCloneCommandState::default();
         target
-            .claim_target(
+            .claim_v2_target(
                 &target_peer_root,
                 &request.endpoint,
                 &request.session_id,
@@ -7015,6 +6941,13 @@ mod tests {
             })
         );
 
+        source
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let first_running = source
             .start_source(
                 prepared.session_id.as_deref().unwrap(),
@@ -7026,9 +6959,11 @@ mod tests {
             "http://127.0.0.1:{}",
             source.source_bind_address().unwrap().unwrap().port()
         );
-        let credential_root = source_root.path().join("first-credential");
-        let credential_path = credential_root.join("credential.json");
-        LanCloneClient::claim_and_persist(
+        let target_app_root = tempfile::tempdir().unwrap();
+        let credential_path = target_app_root.path().join("first-credential.json");
+        LanCloneClient::claim_strict_v2_and_persist_and_register(
+            target_app_root.path(),
+            "Registered target",
             &credential_path,
             &first_endpoint,
             &first_pairing.session_id,
@@ -7052,6 +6987,13 @@ mod tests {
         assert_eq!(recovered.manifest_id, prepared.manifest_id);
         assert!(reopened.source_bind_address().unwrap().is_none());
 
+        reopened
+            .configure_v2_registry(
+                source_root.path(),
+                "Windows",
+                super::super::device_registry::DevicePermissions::read(),
+            )
+            .unwrap();
         let second_running = reopened
             .start_source(
                 recovered.session_id.as_deref().unwrap(),
@@ -7063,8 +7005,10 @@ mod tests {
             "http://127.0.0.1:{}",
             reopened.source_bind_address().unwrap().unwrap().port()
         );
-        let second_credential_path = source_root.path().join("second-credential.json");
-        LanCloneClient::claim_and_persist(
+        let second_credential_path = target_app_root.path().join("second-credential.json");
+        LanCloneClient::claim_strict_v2_and_persist_and_register(
+            target_app_root.path(),
+            "Registered target",
             &second_credential_path,
             &second_endpoint,
             &second_pairing.session_id,
@@ -7078,7 +7022,7 @@ mod tests {
         assert_eq!(second_pairing.manifest_id, first_pairing.manifest_id);
         assert_ne!(second_pairing.claim, first_pairing.claim);
         assert_ne!(second_credential["bearer"], first_credential["bearer"]);
-        assert_ne!(second_credential["deviceId"], first_credential["deviceId"]);
+        assert_eq!(second_credential["deviceId"], first_credential["deviceId"]);
         let stale = reqwest::blocking::Client::new()
             .get(format!(
                 "{second_endpoint}/v1/sessions/{}/manifest",

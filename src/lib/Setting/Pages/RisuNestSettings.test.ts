@@ -129,13 +129,6 @@ describe('RisuNest native command integration', () => {
             peer_sync::shared_session::device_sync_source_reserve,`)
     })
 
-    it('uses target-exclusive staged clone claim handlers', () => {
-        expectExactRustBlock(handlerSource, `#[cfg(desktop)]
-            peer_sync::commands::peer_clone_claim_client,`)
-        expectExactRustBlock(handlerSource, `#[cfg(target_os = "android")]
-            peer_sync::registered_target_commands::peer_clone_claim_client,`)
-    })
-
     it('uses target-exclusive canonical v2 clone claim handlers', () => {
         expectExactRustBlock(handlerSource, `#[cfg(desktop)]
             peer_sync::commands::peer_clone_claim_v2_client,`)
