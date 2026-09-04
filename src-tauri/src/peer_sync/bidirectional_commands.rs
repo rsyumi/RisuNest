@@ -4497,6 +4497,7 @@ impl LanBidirectionalControl for ProductionLanBidirectionalControl {
             &request.source_session_id,
             &request.source_manifest_id,
             &request.source_claim,
+            &self.source_device_id,
         )?;
         if client.source_device_id() != session.target_device_id {
             return Err(PeerSyncError::Validation(

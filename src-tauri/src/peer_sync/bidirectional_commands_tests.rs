@@ -10731,9 +10731,14 @@ fn completed_acknowledgement_keeps_source_owned_until_explicit_stop() {
         .unwrap()
         .strip_prefix("claim=")
         .unwrap();
-    let _client =
-        super::super::lan::LanLogicalDeltaClient::claim(&endpoint, session_id, &manifest_id, claim)
-            .unwrap();
+    let _client = super::super::lan::LanLogicalDeltaClient::claim(
+        &endpoint,
+        session_id,
+        &manifest_id,
+        claim,
+        "00000000-0000-4000-8000-000000000098",
+    )
+    .unwrap();
     let claimed_device_id = state
         .status(directory.path(), &mut store)
         .unwrap()

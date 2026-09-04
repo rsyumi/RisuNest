@@ -71,6 +71,8 @@ fn recovered_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// text. The claim paths that produce it land with the peer version check.
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) const PEER_OUTDATED: &str = "peer-outdated";
+/// The only claim protocol the source serves and every client sends.
+const CLAIM_PROTOCOL_VERSION: u8 = 2;
 #[cfg(desktop)]
 pub(crate) const NAMED_TUNNEL_ORIGIN_PORT: u16 = 32145;
 #[cfg(desktop)]
@@ -345,7 +347,7 @@ impl LanCloneClient {
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
                 device_id: Some(device_id.to_owned()),
-                protocol_version: Some(2),
+                protocol_version: CLAIM_PROTOCOL_VERSION,
                 device_name: Some(device_name.to_owned()),
                 permissions: None,
             })
@@ -1037,7 +1039,9 @@ impl LanSession {
         }
     }
 
-    fn legacy_permissions(&self) -> DevicePermissions {
+    /// The grant a session hands out when its pairing link did not pin one, which
+    /// is the case only for the sessions a lane opens for a single operation.
+    fn lane_permissions(&self) -> DevicePermissions {
         match self {
             Self::BidirectionalLogical(_) => DevicePermissions::read_and_bidirectional(),
             Self::Clone(_) | Self::Logical(_) => DevicePermissions::read(),
@@ -2164,36 +2168,39 @@ fn claim(
     if secret.len() != 32 {
         return respond_empty(stream, 403);
     }
-    let has_v2_field = request_body.protocol_version.is_some()
-        || request_body.device_name.is_some()
-        || request_body.permissions.is_some();
-    let v2 = if has_v2_field {
-        if request_body.protocol_version != Some(2) || request_body.permissions.is_some() {
-            return respond_empty(stream, 400);
-        }
-        let Some(device_id) = request_body.device_id.as_deref() else {
-            return respond_empty(stream, 400);
-        };
-        let Some(device_name) = request_body.device_name.as_deref() else {
-            return respond_empty(stream, 400);
-        };
-        if !is_canonical_uuid(device_id) || validate_device_name(device_name).is_err() {
-            return respond_empty(stream, 400);
-        }
-        let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
-            return respond_empty(stream, 400);
-        };
-        Some((device_id.to_owned(), device_name.to_owned(), registration))
-    } else {
-        None
+    if request_body.protocol_version != CLAIM_PROTOCOL_VERSION || request_body.permissions.is_some()
+    {
+        return respond_empty(stream, 400);
+    }
+    let Some(device_id) = request_body.device_id.as_deref() else {
+        return respond_empty(stream, 400);
     };
-    let device_id = match (session, &v2) {
-        (_, Some((device_id, _, _))) => device_id.clone(),
-        (LanSession::BidirectionalLogical(_), None) => match request_body.device_id.as_deref() {
-            Some(device_id) if is_canonical_uuid(device_id) => device_id.to_owned(),
-            _ => return respond_empty(stream, 400),
-        },
-        (LanSession::Clone(_) | LanSession::Logical(_), None) => uuid::Uuid::new_v4().to_string(),
+    if !is_canonical_uuid(device_id) {
+        return respond_empty(stream, 400);
+    }
+    let device_id = device_id.to_owned();
+    let registration = recovered_lock(&shared.v2_registration).clone();
+    // A registering claim names the device it registers; a session a lane opens for
+    // a single operation registers nothing and answers with its own identity.
+    let registered_device_name = match &registration {
+        Some(_) => {
+            let Some(device_name) = request_body.device_name.as_deref() else {
+                return respond_empty(stream, 400);
+            };
+            if validate_device_name(device_name).is_err() {
+                return respond_empty(stream, 400);
+            }
+            Some(device_name.to_owned())
+        }
+        None => None,
+    };
+    let (source_device_id, source_device_name) = match (&registration, session.source_device_id()) {
+        (Some(registration), _) => (
+            registration.device_id.clone(),
+            Some(registration.name.clone()),
+        ),
+        (None, Some(source_device_id)) => (source_device_id.to_owned(), None),
+        (None, None) => return respond_empty(stream, 400),
     };
     let mut claim = recovered_lock(&shared.claim);
     let Some(claim) = claim.as_mut() else {
@@ -2206,14 +2213,14 @@ fn claim(
         return respond_empty(stream, 403);
     }
     let bearer = hex::encode(random_secret()?);
-    let permissions = v2
+    let permissions = claim
+        .v2_permissions
+        .clone()
+        .unwrap_or_else(|| session.lane_permissions());
+    let registered_app_root = registration
         .as_ref()
-        .and_then(|_| claim.v2_permissions.clone())
-        .unwrap_or_else(|| session.legacy_permissions());
-    let registered_app_root = v2
-        .as_ref()
-        .map(|(_, _, registration)| registration.app_root.clone());
-    if let Some((_, name, registration)) = &v2 {
+        .map(|registration| registration.app_root.clone());
+    if let (Some(registration), Some(name)) = (&registration, &registered_device_name) {
         if register_outgoing_claim(
             &registration.app_root,
             OutgoingDevice {
@@ -2236,17 +2243,13 @@ fn claim(
         }
     }
     claim.consumed = true;
-    let source_v2 = v2.as_ref().map(|(_, _, registration)| registration);
     let response = ClaimResponse {
         device_id: device_id.clone(),
         bearer,
         permission: session.permission(),
-        // Legacy logical clients retain their lane-specific source identity.
-        source_device_id: source_v2
-            .map(|registration| registration.device_id.as_str())
-            .or_else(|| session.source_device_id()),
-        source_device_name: source_v2.map(|registration| registration.name.as_str()),
-        permissions: source_v2.map(|_| permissions.values()),
+        source_device_id: &source_device_id,
+        source_device_name: source_device_name.as_deref(),
+        permissions: permissions.values(),
     };
     recovered_lock(&shared.devices).insert(
         device_id,
@@ -2707,8 +2710,7 @@ struct ClaimRequest {
     claim: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    protocol_version: Option<u8>,
+    protocol_version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3101,12 +3103,12 @@ struct ClaimResponse<'a> {
     device_id: String,
     bearer: String,
     permission: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_device_id: Option<&'a str>,
+    source_device_id: &'a str,
+    // A session a lane opens for a single operation answers the peer it was handed
+    // to and registers nothing, so it carries no source device name.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_device_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    permissions: Option<&'a [String]>,
+    permissions: &'a [String],
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4266,7 +4268,7 @@ mod timeout_tests {
             session_id,
             manifest_id,
             claim,
-            Some(device_id),
+            device_id,
             "logical-bidirectional",
             LogicalClientTimeouts {
                 control_request: TEST_P5_CONTROL_TIMEOUT,
@@ -6849,6 +6851,10 @@ mod timeout_tests {
         let raw = reqwest::blocking::Client::new();
 
         for body in [
+            // The shape a build that predates the registered claim sends.
+            serde_json::json!({"claim": pairing.claim}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceName": "Android"}),
+            serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": target_id}),
             serde_json::json!({"claim": pairing.claim, "version": 2, "deviceId": target_id, "deviceName": "Android"}),
             serde_json::json!({"claim": pairing.claim, "protocolVersion": 3, "deviceId": target_id, "deviceName": "Android"}),
             serde_json::json!({"claim": pairing.claim, "protocolVersion": 2, "deviceId": "bad", "deviceName": "Android"}),
@@ -7055,7 +7061,7 @@ mod timeout_tests {
                 &pairing.session_id,
                 &pairing.manifest_id,
                 &pairing.claim,
-                Some("00000000-0000-4000-8000-000000000076"),
+                "00000000-0000-4000-8000-000000000076",
                 "logical-read",
                 LogicalClientTimeouts {
                     control_request: CONTROL_REQUEST_TIMEOUT,
@@ -7123,6 +7129,7 @@ mod timeout_tests {
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
+            "00000000-0000-4000-8000-000000000078",
         )
         .unwrap();
         register_outgoing_claim(
@@ -7228,6 +7235,7 @@ mod timeout_tests {
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
+            "00000000-0000-4000-8000-000000000078",
         )
         .unwrap();
         let mut reader = client
@@ -7830,11 +7838,13 @@ mod timeout_tests {
         let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let endpoint = format!("http://{}", host.address().unwrap());
         let control_timeout = Duration::from_millis(1_000);
-        let mut client = LanLogicalDeltaClient::claim_with_timeouts(
+        let mut client = LanLogicalDeltaClient::claim_with_timeouts_and_device(
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
+            "00000000-0000-4000-8000-000000000077",
+            "logical-read",
             LogicalClientTimeouts {
                 control_request: control_timeout,
                 object_idle: Duration::from_secs(10),
@@ -8146,7 +8156,7 @@ impl LanLogicalDeltaClient {
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
                 device_id: Some(target_device_id.clone()),
-                protocol_version: Some(2),
+                protocol_version: CLAIM_PROTOCOL_VERSION,
                 device_name: Some(target_name.to_owned()),
                 permissions: None,
             })
@@ -8209,39 +8219,27 @@ impl LanLogicalDeltaClient {
         })
     }
 
+    /// Claims the session the peer opened for a single operation. That session
+    /// registers nothing on either side, so the answer carries the peer's own
+    /// identity instead of a registered source.
     pub fn claim(
         endpoint: &str,
         session_id: &str,
         manifest_id: &str,
         claim: &str,
-    ) -> Result<Self, PeerSyncError> {
-        Self::claim_with_timeouts(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            LogicalClientTimeouts {
-                control_request: CONTROL_REQUEST_TIMEOUT,
-                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
-            },
-        )
-    }
-
-    fn claim_with_timeouts(
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        timeouts: LogicalClientTimeouts,
+        device_id: &str,
     ) -> Result<Self, PeerSyncError> {
         Self::claim_with_timeouts_and_device(
             endpoint,
             session_id,
             manifest_id,
             claim,
-            None,
+            device_id,
             "logical-read",
-            timeouts,
+            LogicalClientTimeouts {
+                control_request: CONTROL_REQUEST_TIMEOUT,
+                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+            },
         )
     }
 
@@ -8250,7 +8248,7 @@ impl LanLogicalDeltaClient {
         session_id: &str,
         manifest_id: &str,
         claim: &str,
-        device_id: Option<&str>,
+        device_id: &str,
         permission: &str,
         timeouts: LogicalClientTimeouts,
     ) -> Result<Self, PeerSyncError> {
@@ -8258,7 +8256,7 @@ impl LanLogicalDeltaClient {
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
             || !is_lower_hex_256(claim)
-            || device_id.is_some_and(|value| !is_canonical_uuid(value))
+            || !is_canonical_uuid(device_id)
         {
             return Err(PeerSyncError::Protocol(
                 "invalid logical delta pairing data".to_owned(),
@@ -8278,14 +8276,18 @@ impl LanLogicalDeltaClient {
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
-                device_id: device_id.map(str::to_owned),
-                protocol_version: None,
+                device_id: Some(device_id.to_owned()),
+                protocol_version: CLAIM_PROTOCOL_VERSION,
                 device_name: None,
                 permissions: None,
             })
             .timeout(control_timeout)
             .send()
             .map_err(transport)?;
+        // A peer that predates the single-operation claim refuses it outright.
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
+        }
         if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
@@ -8307,8 +8309,7 @@ impl LanLogicalDeltaClient {
         let source_device_id = response.source_device_id.ok_or_else(|| {
             PeerSyncError::Protocol("logical delta source device identity is missing".to_owned())
         })?;
-        if !is_canonical_uuid(&response.device_id)
-            || device_id.is_some_and(|expected| response.device_id.as_str() != expected)
+        if response.device_id != device_id
             || !is_canonical_uuid(&source_device_id)
             || !is_lower_hex_256(&response.bearer)
             || response.permission != permission
@@ -8650,7 +8651,7 @@ impl LanBidirectionalLogicalClient {
             session_id,
             manifest_id,
             claim,
-            Some(device_id),
+            device_id,
             "logical-bidirectional",
             LogicalClientTimeouts {
                 control_request: CONTROL_REQUEST_TIMEOUT,

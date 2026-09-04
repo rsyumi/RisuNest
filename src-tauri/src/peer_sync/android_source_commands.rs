@@ -534,7 +534,13 @@ mod tests {
         let prepared = prepare_clone_session(&FixtureSource { database }, &source_root).unwrap();
         let session_id = prepared.manifest().session_id.clone();
         let manifest_id = prepared.manifest_id().to_owned();
-        let host = LanCloneHost::prepare(prepared);
+        let mut host = LanCloneHost::prepare(prepared);
+        host.enable_v2_registry(
+            fixture_root.path(),
+            "Android source",
+            DevicePermissions::read(),
+        )
+        .unwrap();
         let retained = host.control();
         let state = AndroidPeerCloneSourceState::default();
         *state.source.lock().unwrap() = Some(AndroidSource {
@@ -576,7 +582,12 @@ mod tests {
             .build()
             .unwrap()
             .post(format!("{endpoint}/v1/sessions/{session_id}/claim"))
-            .json(&json!({ "claim": claim }))
+            .json(&json!({
+                "claim": claim,
+                "protocolVersion": 2,
+                "deviceId": "00000000-0000-4000-8000-000000000135",
+                "deviceName": "Android target",
+            }))
             .send()
             .unwrap()
             .json()

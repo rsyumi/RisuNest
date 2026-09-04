@@ -3226,6 +3226,7 @@ mod tests {
             &session_id,
             status.manifest_id.as_deref().unwrap(),
             claim,
+            "00000000-0000-4000-8000-000000000098",
         )
         .unwrap();
         let device_id = state.status().unwrap().devices[0].device_id.clone();

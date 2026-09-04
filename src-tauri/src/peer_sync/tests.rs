@@ -429,6 +429,17 @@ fn prepare(source: &FixtureSource, root: &Path) -> PreparedCloneSession {
     prepare_clone_session(source, root).unwrap()
 }
 
+/// Every claim on the wire names the device it is for, so raw-HTTP fixtures build
+/// their request body here.
+fn claim_body(claim: &str, device_id: &str) -> Value {
+    json!({
+        "claim": claim,
+        "protocolVersion": 2,
+        "deviceId": device_id,
+        "deviceName": "Clone target",
+    })
+}
+
 /// Enables the v2 registry on a prepared clone host and starts it. Every clone
 /// target reaches a source through the registered claim, so clone fixtures start
 /// their host this way.
@@ -752,15 +763,15 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     let session_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, base) = start_registered_clone_source(&mut host, source_root.path());
+    let target_id = "00000000-0000-4000-8000-000000000131";
     let claim_url = format!("{base}/v1/sessions/{}/claim", pairing.session_id);
     let client = Client::new();
 
     assert_eq!(
         client
             .post(&claim_url)
-            .json(&json!({"claim": "wrong"}))
+            .json(&claim_body("wrong", target_id))
             .send()
             .unwrap()
             .status(),
@@ -770,7 +781,7 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     assert_eq!(
         client
             .post(&claim_url)
-            .json(&json!({"claim": pairing.claim}))
+            .json(&claim_body(&pairing.claim, target_id))
             .send()
             .unwrap()
             .status(),
@@ -780,12 +791,11 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
 
     let second_session_root = tempfile::tempdir().unwrap();
     let mut host = LanCloneHost::prepare(prepare(&source, second_session_root.path()));
-    let pairing = host.start().unwrap();
-    let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, base) = start_registered_clone_source(&mut host, source_root.path());
     let claim_url = format!("{base}/v1/sessions/{}/claim", pairing.session_id);
     let claim: Value = client
         .post(&claim_url)
-        .json(&json!({"claim": pairing.claim}))
+        .json(&claim_body(&pairing.claim, target_id))
         .send()
         .unwrap()
         .json()
@@ -794,7 +804,7 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     assert_eq!(
         client
             .post(&claim_url)
-            .json(&json!({"claim": pairing.claim}))
+            .json(&claim_body(&pairing.claim, target_id))
             .send()
             .unwrap()
             .status(),
@@ -856,6 +866,8 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     assert_eq!(host.devices()[0].verified_bytes, 42);
     let device_id = claim["deviceId"].as_str().unwrap();
     assert!(host.revoke(device_id));
+    // A registered source drops the revoked device outright, so its bearer is no
+    // longer a known authorization rather than a rejected one.
     assert_eq!(
         client
             .get(&manifest_url)
@@ -863,7 +875,7 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
             .send()
             .unwrap()
             .status(),
-        403
+        401
     );
     host.stop().unwrap();
 
@@ -891,12 +903,14 @@ fn lan_object_routes_only_serve_exact_manifest_chunk_boundaries() {
     let session_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[CLONE_CHUNK_SIZE as usize + 1]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, base) = start_registered_clone_source(&mut host, source_root.path());
     let client = Client::new();
     let claim: Value = client
         .post(format!("{base}/v1/sessions/{}/claim", pairing.session_id))
-        .json(&json!({"claim": pairing.claim}))
+        .json(&claim_body(
+            &pairing.claim,
+            "00000000-0000-4000-8000-000000000132",
+        ))
         .send()
         .unwrap()
         .json()
@@ -3821,14 +3835,16 @@ fn lan_stop_interrupts_a_range_receiver_that_does_not_read() {
     let session_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[CLONE_CHUNK_SIZE as usize]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
-    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let (pairing, endpoint) = start_registered_clone_source(&mut host, source_root.path());
     let claim: Value = Client::new()
         .post(format!(
             "{endpoint}/v1/sessions/{}/claim",
             pairing.session_id
         ))
-        .json(&json!({"claim": pairing.claim}))
+        .json(&claim_body(
+            &pairing.claim,
+            "00000000-0000-4000-8000-000000000133",
+        ))
         .send()
         .unwrap()
         .json()
@@ -3931,7 +3947,7 @@ fn lan_server_tolerates_read_poll_timeouts_within_the_overall_deadline() {
     let session_root = tempfile::tempdir().unwrap();
     let source = fixture_source(source_root.path(), &[64]);
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-    let pairing = host.start().unwrap();
+    let (pairing, _endpoint) = start_registered_clone_source(&mut host, source_root.path());
     let mut stream = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
 
     thread::sleep(Duration::from_millis(350));
@@ -3950,7 +3966,7 @@ fn lan_server_tolerates_read_poll_timeouts_within_the_overall_deadline() {
         "request inside the overall deadline was rejected: {response:?}"
     );
 
-    let body = json!({ "claim": pairing.claim }).to_string();
+    let body = claim_body(&pairing.claim, "00000000-0000-4000-8000-000000000134").to_string();
     let mut body_stream =
         TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
     write!(
