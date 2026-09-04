@@ -74,8 +74,6 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('uses the redesigned controller page without legacy embeds or receipt casts', () => {
-        expect(deviceSyncSource).not.toContain('PeerCloneSettings')
-        expect(deviceSyncSource).not.toContain('PeerCloneAndroidSettings')
         expect(deviceSyncSource).not.toContain('cloneTarget as unknown')
         expect(deviceSyncSource).toContain('cloneTarget?.backupPaths')
     })

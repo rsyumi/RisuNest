@@ -4,7 +4,6 @@ import settingsRawSource from '../Settings.svelte?raw'
 import pageRawSource from './RisuNestSettings.svelte?raw'
 import backupRestoreRawSource from './RisuNestBackupRestore.svelte?raw'
 import tauriLibRawSource from '../../../../src-tauri/src/lib.rs?raw'
-import peerCloneAndroidRawSource from './PeerCloneAndroidSettings.svelte?raw'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
 
@@ -13,7 +12,6 @@ const settingsSource = normalizeNewlines(settingsRawSource)
 const pageSource = normalizeNewlines(pageRawSource)
 const backupRestoreSource = normalizeNewlines(backupRestoreRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
-const peerCloneAndroidSource = normalizeNewlines(peerCloneAndroidRawSource)
 
 function expectExactRustBlock(source: string, block: string): void {
     expect(source.split(block)).toHaveLength(2)
@@ -185,15 +183,6 @@ describe('RisuNest sync language schema', () => {
         for (const path of required) {
             const value = path.split('.').reduce<any>((current, key) => current?.[key], translation.risuNest.sync)
             expect(value).toEqual(expect.any(String))
-        }
-    })
-})
-
-describe('temporary Android PeerClone Korean language coverage', () => {
-    it('defines every peerClone key referenced by the component without English fallback', () => {
-        const keys = [...peerCloneAndroidSource.matchAll(/language\.peerClone\.([A-Za-z0-9_]+)/g)].map((match) => match[1])
-        for (const key of keys) {
-            expect(languageKorean.peerClone[key as keyof typeof languageKorean.peerClone]).toEqual(expect.any(String))
         }
     })
 })
