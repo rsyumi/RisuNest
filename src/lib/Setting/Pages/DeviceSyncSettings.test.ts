@@ -49,8 +49,8 @@ import DeviceSyncSettings from './DeviceSyncSettings.svelte'
 
 const cloneBase = {
     platform: 'desktop' as const, resumeAvailable: false,
-    sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const }, sourcePairingUri: '', targetPhase: 'idle' as const, error: null, warning: null,
-    state: { source: { phase: 'idle' as const, revokedDeviceIds: [] }, target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
+    targetPhase: 'idle' as const, error: null, warning: null,
+    state: { target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
 }
 const deltaBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const }, sourcePairingUri: '', pullPhase: 'idle' as const, retained: null, error: null }
 const bidiBase = { sourceStatus: { phase: 'idle' as const, devices: [] }, sourcePairingUri: '', operationPhase: 'idle' as const, operationRetained: false, sourceBusy: false, sourceError: null, operationError: null }

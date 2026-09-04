@@ -3,82 +3,20 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     createPeerCloneFacade,
     initialPeerCloneState,
-    pairingUriForQr,
-    parsePeerCloneUri,
     reducePeerCloneState,
 } from './peerClone'
 import type { PeerCloneInvoke, PeerCloneReplacementRuntime } from './peerClone'
 
 const claim = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-const pairingUri = `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
-const quickTunnelPairingUri = `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fexample-id.trycloudflare.com&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
-const namedTunnelPairingUri = `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
-
-describe('parsePeerCloneUri', () => {
-    it('parses the strict v1 LAN pairing URI and preserves the fragment claim separately', () => {
-        expect(parsePeerCloneUri(pairingUri)).toEqual({
-            endpoint: 'http://192.168.1.4:43123/',
-            sessionId: '123e4567-e89b-12d3-a456-426614174000',
-            manifestId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-            claim,
-        })
-        expect(pairingUriForQr(pairingUri)).toBe(pairingUri)
-    })
-
-    it.each([
-        [quickTunnelPairingUri, 'https://example-id.trycloudflare.com/'],
-        [namedTunnelPairingUri, 'https://sync.example.com/'],
-    ])('accepts a bare public HTTPS tunnel endpoint', (uri, endpoint) => {
-        expect(parsePeerCloneUri(uri)).toEqual({
-            endpoint,
-            sessionId: '123e4567-e89b-12d3-a456-426614174000',
-            manifestId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-            claim,
-        })
-    })
-
-    it.each([
-        `https://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/nope?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2Fuser%3Apass%40192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123%23bad&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2Fexample.com%3A43123&session=invalid&manifest=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA#claim=',
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&endpoint=http%3A%2F%2F192.168.1.5%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&extra=x#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123%2Fv1%2Fsessions%2Fother&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123%2Fv1%2Fsessions%2F123e4567-e89b-12d3-a456-426614174000&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F999.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F127.0.0.1%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F224.0.0.1%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2Flocalhost%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F8.8.8.8%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2Fexample.com%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A0&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%3A8443&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%3A443&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%2Fclone&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%2F.&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%2Fa%2F..&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%2F%252e&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fuser%40sync.example.com&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Flocalhost&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2F127.0.0.1&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
-    ])('rejects malformed or unsafe pairing URI %s', (uri) => {
-        expect(() => parsePeerCloneUri(uri)).toThrow()
-    })
-
-    it('rejects overlong values and malformed fragment encoding with the standard parser error', () => {
-        expect(() => parsePeerCloneUri(`${pairingUri}${'x'.repeat(8192)}`)).toThrow('Invalid peer clone pairing URI')
-        expect(() => parsePeerCloneUri(pairingUri.replace(claim, '%E0%A4%A'))).toThrow('Invalid peer clone pairing URI')
-        expect(() => parsePeerCloneUri(pairingUri.replace(claim, 'A'.repeat(64)))).toThrow('Invalid peer clone pairing URI')
-    })
-})
 
 const claimedTarget = {
     endpoint: 'http://192.168.1.4:43123/',
     sessionId: '123e4567-e89b-12d3-a456-426614174000',
     manifestId: 'a'.repeat(64),
+}
+const otherClaimedTarget = {
+    ...claimedTarget,
+    sessionId: '223e4567-e89b-42d3-a456-426614174000',
 }
 
 describe('PeerClone facade', () => {
@@ -98,33 +36,6 @@ describe('PeerClone facade', () => {
 
         expect(invoke.mock.calls.map(([command]) => command)).not.toContain('peer_clone_claim_client')
         expect(invoke.mock.calls.map(([command]) => command)).toContain('peer_clone_download')
-    })
-
-    it('refuses to download a link-joined target that no registered source has claimed', async () => {
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string, ..._args: unknown[]): Promise<T> => (command === 'peer_clone_capabilities'
-            ? {
-                desktop: true,
-                sourceReady: true,
-                atomicActivationReady: true,
-                losslessBackupReady: true,
-                httpTransportReady: true,
-                largeFixturePassed: true,
-                productionEnabled: true,
-            }
-            : undefined) as T)
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: replacementRuntime(),
-        })
-
-        facade.join(pairingUri)
-        await expect(facade.download()).rejects.toThrow('confirmation')
-        facade.confirmDestructiveReplace()
-        await expect(facade.download()).rejects.toThrow('Peer clone target requires a registered source claim')
-
-        expect(invoke).not.toHaveBeenCalled()
-        expect(JSON.stringify(invoke.mock.calls)).not.toContain(claim)
     })
 
     it('sends the download request without the link claim once the source registration owns the target', async () => {
@@ -155,7 +66,7 @@ describe('PeerClone facade', () => {
         expect(JSON.stringify(invoke.mock.calls)).not.toContain(claim)
     })
 
-    it('keeps public source and target operations closed until native production gates pass', async () => {
+    it('keeps target operations closed until native production gates pass', async () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(): Promise<T> => ({
             desktop: true,
             sourceReady: false,
@@ -173,15 +84,11 @@ describe('PeerClone facade', () => {
 
         facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
-        await expect(facade.prepare()).rejects.toThrow('not enabled')
-        await expect(facade.start('source-session')).rejects.toThrow('not enabled')
         await expect(facade.download()).rejects.toThrow('not enabled')
         facade.confirmDestructiveReplace()
         await expect(facade.resume()).rejects.toThrow('not enabled')
 
         expect(invoke.mock.calls).toEqual([
-            ['peer_clone_capabilities'],
-            ['peer_clone_capabilities'],
             ['peer_clone_capabilities'],
             ['peer_clone_capabilities'],
         ])
@@ -203,10 +110,8 @@ describe('PeerClone facade', () => {
 
         facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
-        await expect(facade.prepare()).rejects.toThrow('not enabled')
         await expect(facade.download()).rejects.toThrow('not enabled')
         expect(invoke.mock.calls).toEqual([
-            ['peer_clone_capabilities'],
             ['peer_clone_capabilities'],
         ])
     })
@@ -222,9 +127,7 @@ describe('PeerClone facade', () => {
                 largeFixturePassed: false,
                 productionEnabled: true,
             }
-            : command === 'peer_clone_prepare'
-                ? { phase: 'prepared', sessionId: 'source-session', devices: [] }
-                : undefined) as T)
+            : undefined) as T)
         const facade = createPeerCloneFacade({
             platform: 'desktop',
             invoke: invoke as unknown as PeerCloneInvoke,
@@ -233,184 +136,7 @@ describe('PeerClone facade', () => {
 
         facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
-        await expect(facade.prepare()).resolves.toEqual({ phase: 'prepared', sessionId: 'source-session', devices: [] })
         await expect(facade.download()).resolves.toBeUndefined()
-    })
-
-    it('flushes source writes before native lossless preparation', async () => {
-        const events: string[] = []
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
-            if (command === 'peer_clone_prepare') {
-                events.push('prepare')
-                return { phase: 'prepared', sessionId: 'source-session', devices: [] } as T
-            }
-            return undefined as T
-        })
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: {
-                async flushPendingData(reason: string) {
-                    events.push(`flush:${reason}`)
-                },
-                capturePersistentMutationToken: vi.fn(),
-                acquireDestructiveReplacementFence: vi.fn(),
-            },
-        })
-
-        await facade.prepare()
-
-        expect(events).toEqual(['flush:peer-clone-source-prepare', 'prepare'])
-    })
-
-    it('returns the pairing claim only from start and keeps later source status claim-free', async () => {
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
-            if (command === 'peer_clone_start') {
-                return {
-                    phase: 'running',
-                    sessionId: 'source-session',
-                    manifestId: 'a'.repeat(64),
-                    pairingUri,
-                    devices: [],
-                } as T
-            }
-            if (command === 'peer_clone_status') {
-                return {
-                    phase: 'running',
-                    sessionId: 'source-session',
-                    manifestId: 'a'.repeat(64),
-                    devices: [],
-                } as T
-            }
-            return undefined as T
-        })
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: replacementRuntime(),
-        })
-
-        await expect(facade.start('source-session')).resolves.toMatchObject({ pairingUri })
-        const status = await facade.sourceStatus()
-
-        expect(status.pairingUri).toBeUndefined()
-        expect(JSON.stringify(status)).not.toContain(claim)
-    })
-
-    it('starts Quick Tunnel through the one-shot tunnel command and exposes no persistent endpoint metadata', async () => {
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
-            if (command === 'peer_clone_tunnel_start') {
-                return {
-                    phase: 'running',
-                    sessionId: 'source-session',
-                    manifestId: 'a'.repeat(64),
-                    pairingUri: quickTunnelPairingUri,
-                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
-                    devices: [],
-                } as T
-            }
-            if (command === 'peer_clone_tunnel_status') {
-                return {
-                    phase: 'running',
-                    sessionId: 'source-session',
-                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
-                } as T
-            }
-            return undefined as T
-        })
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: replacementRuntime(),
-        })
-
-        const started = await facade.startQuickTunnel('source-session')
-        const status = await facade.tunnelStatus()
-
-        expect(invoke).toHaveBeenCalledWith('peer_clone_tunnel_start', {
-            sessionId: 'source-session',
-            tunnel: { kind: 'quick' },
-        })
-        expect(started).toMatchObject({
-            pairingUri: quickTunnelPairingUri,
-            tunnel: { kind: 'quick', experimental: true, oneShot: true },
-        })
-        expect(status).toEqual({
-            phase: 'running',
-            sessionId: 'source-session',
-            tunnel: { kind: 'quick', experimental: true, oneShot: true },
-        })
-        expect(JSON.stringify(status)).not.toContain('trycloudflare.com')
-    })
-
-    it('submits a Named Tunnel token once without retaining or reflecting it in state and errors', async () => {
-        const token = 'named-tunnel-token-that-is-at-least-32-bytes'
-        const probeUrl = 'https://sync.example.com/v1/sessions/id/tunnel-check/probe-secret'
-        let fail = false
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
-            if (command === 'peer_clone_tunnel_start') {
-                if (fail) throw new Error(`${token} ${probeUrl}`)
-                return {
-                    phase: 'running',
-                    sessionId: 'source-session',
-                    manifestId: 'a'.repeat(64),
-                    pairingUri: namedTunnelPairingUri,
-                    tunnel: { kind: 'named', experimental: false, oneShot: false },
-                    devices: [],
-                } as T
-            }
-            return undefined as T
-        })
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: replacementRuntime(),
-        })
-
-        await facade.startNamedTunnel('source-session', token, 'https://sync.example.com')
-        expect(invoke).toHaveBeenCalledWith('peer_clone_tunnel_start', {
-            sessionId: 'source-session',
-            tunnel: {
-                kind: 'named',
-                token,
-                expectedPublicBaseUrl: 'https://sync.example.com',
-            },
-        })
-        expect(JSON.stringify(facade.getState())).not.toContain(token)
-        expect(JSON.stringify(facade.getState())).not.toContain(probeUrl)
-
-        fail = true
-        const failed = facade.startNamedTunnel('source-session', token, 'https://sync.example.com')
-        await expect(failed).rejects.toThrow('Named tunnel failed to start')
-        await expect(failed).rejects.not.toThrow(token)
-        await expect(failed).rejects.not.toThrow(probeUrl)
-        expect(JSON.stringify(facade.getState())).not.toContain(token)
-    })
-
-    it('preserves only the native fixed-port recovery guidance for Named Tunnel', async () => {
-        const message = 'Named Tunnel cannot bind loopback port 32145. Stop the app using that port, or use Quick Tunnel / Trusted LAN.'
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
-            if (command === 'peer_clone_tunnel_start') throw new Error(message)
-            return undefined as T
-        })
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: replacementRuntime(),
-        })
-
-        await expect(
-            facade.startNamedTunnel(
-                'source-session',
-                'named-tunnel-token-that-is-at-least-32-bytes',
-                'https://sync.example.com',
-            ),
-        ).rejects.toThrow(message)
     })
 
     it('finalizes only after native download reaches the activation barrier', async () => {
@@ -519,7 +245,7 @@ describe('PeerClone facade', () => {
             },
         })
 
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
 
         await expect(facade.targetStatus()).rejects.toThrow('revision conflict')
@@ -554,7 +280,7 @@ describe('PeerClone facade', () => {
                 },
             },
         })
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
 
         await expect(facade.targetStatus()).rejects.toThrow(`${failure} failed`)
@@ -604,7 +330,7 @@ describe('PeerClone facade', () => {
                 },
             },
         })
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
 
         await expect(facade.targetStatus()).rejects.toThrow('refresh failed')
@@ -646,7 +372,7 @@ describe('PeerClone facade', () => {
             invoke: invoke as unknown as PeerCloneInvoke,
             runtime: replacementRuntime(refresh, fenceRelease),
         })
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
 
         await expect(facade.targetStatus()).rejects.toThrow('native release failed')
@@ -670,7 +396,7 @@ describe('PeerClone facade', () => {
 
         const joined = reducePeerCloneState(completed, {
             type: 'target-joined',
-            pairing: parsePeerCloneUri(pairingUri),
+            pairing: { ...claimedTarget, claim },
         })
 
         expect(joined.target.backupPaths).toBeUndefined()
@@ -705,13 +431,11 @@ describe('PeerClone facade', () => {
                 },
             },
         })
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
         const finalizing = facade.targetStatus()
         await Promise.resolve()
-        expect(() => facade.join(
-            pairingUri.replace('123e4567-e89b-12d3-a456-426614174000', '223e4567-e89b-42d3-a456-426614174000'),
-        )).toThrow('finalization is still active')
+        expect(() => facade.joinClaimed(otherClaimedTarget)).toThrow('finalization is still active')
         releaseCapture?.()
 
         await finalizing
@@ -740,7 +464,7 @@ describe('PeerClone facade', () => {
             },
         })
 
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
         await facade.resume()
         await facade.targetStatus()
@@ -752,38 +476,6 @@ describe('PeerClone facade', () => {
         })
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_claim_client')).toBe(false)
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_finalize')).toBe(false)
-    })
-
-    it('locks one target identity across the first download await', async () => {
-        let releaseCapabilities: (() => void) | undefined
-        const capabilitiesBlocked = new Promise<void>((resolve) => {
-            releaseCapabilities = resolve
-        })
-        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-            if (command === 'peer_clone_capabilities') {
-                await capabilitiesBlocked
-                return productionCapabilities() as T
-            }
-            return undefined as T
-        })
-        const facade = createPeerCloneFacade({
-            platform: 'desktop',
-            invoke: invoke as unknown as PeerCloneInvoke,
-            runtime: replacementRuntime(),
-        })
-        facade.joinClaimed(claimedTarget)
-        facade.confirmDestructiveReplace()
-
-        const downloading = facade.download()
-        await Promise.resolve()
-        expect(() => facade.join(
-            pairingUri.replace('123e4567-e89b-12d3-a456-426614174000', '223e4567-e89b-42d3-a456-426614174000'),
-        )).toThrow('already owned')
-        releaseCapabilities?.()
-        await downloading
-
-        expect(invoke).toHaveBeenCalledWith('peer_clone_download', claimedTarget)
-        expect(invoke.mock.calls.map(([command]) => command)).not.toContain('peer_clone_claim_client')
     })
 
     it.each(['capabilities', 'download'] as const)(
@@ -810,10 +502,6 @@ describe('PeerClone facade', () => {
             facade.confirmDestructiveReplace()
 
             await expect(facade.download()).rejects.toThrow(`${failure} failed`)
-            expect(() => facade.join(pairingUri.replace(
-                '123e4567-e89b-12d3-a456-426614174000',
-                '223e4567-e89b-42d3-a456-426614174000',
-            ))).toThrow('already owned')
 
             expect(facade.getState().target.phase).toBe('failed')
             await facade.resume()
@@ -824,58 +512,6 @@ describe('PeerClone facade', () => {
             )
             expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_resume')).toHaveLength(1)
             expect(facade.getState().target.phase).toBe('downloading')
-        },
-    )
-
-    it.each(['failed', 'cancelled'] as const)(
-        'rotates a fresh pairing only for the same %s transfer identity, and still refuses a link-only download',
-        async (phase) => {
-            let failDownload = phase === 'failed'
-            const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
-                if (command === 'peer_clone_capabilities') return productionCapabilities() as T
-                if (command === 'peer_clone_download' && failDownload) {
-                    failDownload = false
-                    throw new Error('source restarted')
-                }
-                return undefined as T
-            })
-            const facade = createPeerCloneFacade({
-                platform: 'desktop',
-                invoke: invoke as unknown as PeerCloneInvoke,
-                runtime: replacementRuntime(),
-            })
-            facade.joinClaimed(claimedTarget)
-            facade.confirmDestructiveReplace()
-            if (phase === 'failed') {
-                await expect(facade.download()).rejects.toThrow('source restarted')
-            } else {
-                await facade.download()
-                await facade.cancel()
-            }
-
-            const repairedPairing = pairingUri
-                .replace('192.168.1.4%3A43123', '192.168.1.5%3A43124')
-                .replace(`#claim=${claim}`, `#claim=${'c'.repeat(64)}`)
-            expect(() => facade.join(repairedPairing.replace(
-                '123e4567-e89b-12d3-a456-426614174000',
-                '223e4567-e89b-42d3-a456-426614174000',
-            ))).toThrow('already owned')
-
-            expect(facade.join(repairedPairing).target).toMatchObject({
-                phase: 'joined',
-                pairing: {
-                    endpoint: 'http://192.168.1.5:43124/',
-                    sessionId: '123e4567-e89b-12d3-a456-426614174000',
-                    manifestId: 'a'.repeat(64),
-                    claim: 'c'.repeat(64),
-                },
-            })
-            facade.confirmDestructiveReplace()
-            await expect(facade.download())
-                .rejects.toThrow('Peer clone target requires a registered source claim')
-
-            expect(invoke.mock.calls.map(([command]) => command)).not.toContain('peer_clone_claim_client')
-            expect(invoke).toHaveBeenCalledWith('peer_clone_download', claimedTarget)
         },
     )
 
@@ -897,11 +533,7 @@ describe('PeerClone facade', () => {
                 () => { events.push('fence-release') },
             ),
         })
-        const other = pairingUri.replace(
-            '123e4567-e89b-12d3-a456-426614174000',
-            '223e4567-e89b-42d3-a456-426614174000',
-        )
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
 
         await facade.targetStatus()
@@ -910,13 +542,13 @@ describe('PeerClone facade', () => {
             'native-release:123e4567-e89b-12d3-a456-426614174000',
             'fence-release',
         ])
-        expect(facade.join(other).target).toMatchObject({
+        expect(facade.joinClaimed(otherClaimedTarget).target).toMatchObject({
             phase: 'joined',
             pairing: { sessionId: '223e4567-e89b-42d3-a456-426614174000' },
         })
     })
 
-    it('discards a stale target status response after a different unowned pairing joins', async () => {
+    it('discards a stale target status response after a different pairing joins', async () => {
         let resolveStatus: ((value: unknown) => void) | undefined
         const status = new Promise((resolve) => {
             resolveStatus = resolve
@@ -931,14 +563,10 @@ describe('PeerClone facade', () => {
             invoke: invoke as unknown as PeerCloneInvoke,
             runtime: replacementRuntime(),
         })
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
         const polling = facade.targetStatus()
-        const other = pairingUri.replace(
-            '123e4567-e89b-12d3-a456-426614174000',
-            '223e4567-e89b-42d3-a456-426614174000',
-        )
-        facade.join(other)
+        facade.joinClaimed(otherClaimedTarget)
         resolveStatus?.({ phase: 'awaitingActivation', completedBytes: 10, totalBytes: 10 })
         await polling
 
@@ -964,7 +592,7 @@ describe('PeerClone facade', () => {
             invoke: invoke as unknown as PeerCloneInvoke,
             runtime: replacementRuntime(),
         })
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
 
         await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
@@ -973,30 +601,27 @@ describe('PeerClone facade', () => {
 
     it('reports web and Android as explicitly unsupported without invoking native commands', async () => {
         const invoke = vi.fn()
-        expect(createPeerCloneFacade({ platform: 'web', invoke }).status()).toEqual({ kind: 'unsupported', platform: 'web' })
-        expect(createPeerCloneFacade({ platform: 'android', invoke }).status()).toEqual({ kind: 'unsupported', platform: 'android' })
+        await expect(createPeerCloneFacade({ platform: 'web', invoke }).capabilities())
+            .rejects.toThrow('Peer clone is unsupported on web')
+        await expect(createPeerCloneFacade({ platform: 'android', invoke }).capabilities())
+            .rejects.toThrow('Peer clone is unsupported on android')
         expect(invoke).not.toHaveBeenCalled()
     })
 
-    it('models source controls and resumable target progress as pure transitions', () => {
+    it('models resumable target progress as pure transitions', () => {
         let state = initialPeerCloneState
-        state = reducePeerCloneState(state, { type: 'source-prepared', sessionId: 'source-session' })
-        state = reducePeerCloneState(state, { type: 'source-started' })
-        state = reducePeerCloneState(state, { type: 'source-stopped' })
-        state = reducePeerCloneState(state, { type: 'source-revoked', deviceId: 'device-a' })
-        state = reducePeerCloneState(state, { type: 'target-joined', pairing: parsePeerCloneUri(pairingUri) })
+        state = reducePeerCloneState(state, { type: 'target-joined', pairing: { ...claimedTarget, claim } })
         state = reducePeerCloneState(state, { type: 'target-confirmed' })
         state = reducePeerCloneState(state, { type: 'target-progress', completedBytes: 8, totalBytes: 10 })
         state = reducePeerCloneState(state, { type: 'target-cancelled' })
         state = reducePeerCloneState(state, { type: 'target-resumed' })
 
         expect(state).toMatchObject({
-            source: { phase: 'stopped', sessionId: 'source-session', revokedDeviceIds: ['device-a'] },
             target: { phase: 'downloading', destructiveConfirmed: true, completedBytes: 8, totalBytes: 10 },
         })
     })
 
-    it('polls target progress without forwarding the one-time claim', async () => {
+    it('polls target progress for the claimed target', async () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => ({
             phase: command === 'peer_clone_target_status' ? 'downloading' : undefined,
             completedBytes: 8,
@@ -1004,7 +629,7 @@ describe('PeerClone facade', () => {
         } as T))
         const facade = createPeerCloneFacade({ platform: 'desktop', invoke: invoke as unknown as PeerCloneInvoke })
 
-        facade.join(pairingUri)
+        facade.joinClaimed(claimedTarget)
         facade.confirmDestructiveReplace()
         await facade.targetStatus()
 
@@ -1013,7 +638,7 @@ describe('PeerClone facade', () => {
             completedBytes: 8,
             totalBytes: 10,
         })
-        expect(JSON.stringify(invoke.mock.calls)).not.toContain(claim)
+        expect(invoke).toHaveBeenCalledWith('peer_clone_target_status', claimedTarget)
     })
 })
 

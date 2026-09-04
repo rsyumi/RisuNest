@@ -27,25 +27,6 @@ export interface PeerCloneFacadeOptions {
 
 export type PeerCloneReplacementRuntime = PeerSyncMutationRuntime
 
-export type PeerCloneCapability =
-    | { kind: 'supported'; platform: 'desktop' }
-    | { kind: 'unsupported'; platform: 'web' | 'android' }
-
-export interface PeerCloneSourceStatus {
-    sessionId?: string
-    manifestId?: string
-    pairingUri?: string
-    phase: 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'stopped'
-    tunnel?: PeerCloneTunnelMetadata
-    devices: readonly {
-        deviceId: string
-        verifiedBytes: number
-        currentObject?: string
-        lastSeenAt: number
-        revoked?: boolean
-    }[]
-}
-
 export interface PeerCloneTunnelMetadata {
     kind: 'quick' | 'named'
     experimental: boolean
@@ -76,11 +57,6 @@ export interface PeerCloneNativeCapabilities {
 }
 
 export interface PeerCloneState {
-    source: {
-        phase: 'idle' | 'prepared' | 'running' | 'stopped'
-        sessionId?: string
-        revokedDeviceIds: string[]
-    }
     target: {
         phase: 'idle' | 'joined' | 'confirmed' | 'downloading' | 'cancelled' | 'completed' | 'failed'
         pairing?: PeerClonePairing
@@ -92,10 +68,6 @@ export interface PeerCloneState {
 }
 
 export type PeerCloneEvent =
-    | { type: 'source-prepared'; sessionId: string }
-    | { type: 'source-started' }
-    | { type: 'source-stopped' }
-    | { type: 'source-revoked'; deviceId: string }
     | { type: 'target-joined'; pairing: PeerClonePairing }
     | { type: 'target-confirmed' }
     | { type: 'target-progress'; completedBytes: number; totalBytes?: number }
@@ -105,28 +77,11 @@ export type PeerCloneEvent =
     | { type: 'target-failed' }
 
 export const initialPeerCloneState: PeerCloneState = {
-    source: { phase: 'idle', revokedDeviceIds: [] },
     target: { phase: 'idle', destructiveConfirmed: false, completedBytes: 0 },
 }
 
 export function reducePeerCloneState(state: PeerCloneState, event: PeerCloneEvent): PeerCloneState {
     switch (event.type) {
-        case 'source-prepared':
-            return { ...state, source: { ...state.source, phase: 'prepared', sessionId: event.sessionId } }
-        case 'source-started':
-            return { ...state, source: { ...state.source, phase: 'running' } }
-        case 'source-stopped':
-            return { ...state, source: { ...state.source, phase: 'stopped' } }
-        case 'source-revoked':
-            return {
-                ...state,
-                source: {
-                    ...state.source,
-                    revokedDeviceIds: state.source.revokedDeviceIds.includes(event.deviceId)
-                        ? state.source.revokedDeviceIds
-                        : [...state.source.revokedDeviceIds, event.deviceId],
-                },
-            }
         case 'target-joined':
             return {
                 ...state,
@@ -173,7 +128,6 @@ const claimPattern = /^[0-9a-f]{64}$/
 const maximumPairingUriLength = 8192
 const maximumEndpointLength = 2048
 const maximumClaimLength = 512
-const namedTunnelOriginUnavailableMessage = 'Named Tunnel cannot bind loopback port 32145. Stop the app using that port, or use Quick Tunnel / Trusted LAN.'
 
 function invalidPairingUri(): never {
     throw new Error('Invalid peer clone pairing URI')
@@ -344,21 +298,6 @@ export function parsePeerPairingUri(value: string, rules: PeerPairingUriRules): 
     return { endpoint, sessionId, manifestId, claim }
 }
 
-export function parsePeerCloneUri(value: string): PeerClonePairing {
-    return parsePeerPairingUri(value, {
-        hostname: 'peer-clone',
-        pathname: '/v1',
-        invalid: invalidPairingUri,
-        claimRule: 'encodedHex64',
-        allowLanEndpoint: false,
-        trimTrailingSlash: false,
-    })
-}
-
-export function pairingUriForQr(pairingUri: string): string {
-    return pairingUri
-}
-
 function unsupported(platform: PeerClonePlatform): never {
     throw new Error(`Peer clone is unsupported on ${platform}`)
 }
@@ -372,13 +311,6 @@ function sameTargetRequest(
         && left.manifestId === right.manifestId
 }
 
-function sameTargetIdentity(
-    left: { sessionId: string; manifestId: string },
-    right: { sessionId: string; manifestId: string },
-): boolean {
-    return left.sessionId === right.sessionId && left.manifestId === right.manifestId
-}
-
 export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     const nativeInvoke = options.invoke ?? invoke
     let state = initialPeerCloneState
@@ -386,7 +318,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     let targetIdentityEpoch = 0
     let warning = ''
     let ownedTarget: { endpoint: string; sessionId: string; manifestId: string } | undefined
-    let claimOwned = false
     let pendingRefresh: {
         request: { endpoint: string; sessionId: string; manifestId: string }
         revision: number
@@ -467,7 +398,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 const completed = { ...awaiting, phase: 'completed' as const }
                 state = reducePeerCloneState(state, { type: 'target-completed', backupPaths })
                 ownedTarget = undefined
-                claimOwned = false
                 return completed
             } catch (error) {
                 if (nativeStarted && !pendingRefresh) {
@@ -480,17 +410,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             }
         })()
         return finalization
-    }
-    const requireSourceReady = async () => {
-        const current = await capabilities()
-        if (
-            !current.productionEnabled
-            || !current.sourceReady
-            || !current.losslessBackupReady
-            || !current.httpTransportReady
-        ) {
-            throw new Error('Peer clone source is not enabled by native production gates')
-        }
     }
     const requireTargetReady = async () => {
         const current = await capabilities()
@@ -505,45 +424,9 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     }
 
     return {
-        status(): PeerCloneCapability {
-            return options.platform === 'desktop'
-                ? { kind: 'supported', platform: 'desktop' }
-                : { kind: 'unsupported', platform: options.platform }
-        },
         getState: () => state,
         getWarning: () => warning,
         capabilities,
-        join(pairingUri: string): PeerCloneState {
-            if (finalization || pendingRefresh) {
-                throw new Error('Peer clone target finalization is still active')
-            }
-            const pairing = parsePeerCloneUri(pairingUri)
-            if (ownedTarget) {
-                const rotatable = state.target.phase === 'failed'
-                    || state.target.phase === 'cancelled'
-                    || (!claimOwned && (state.target.phase === 'joined' || state.target.phase === 'confirmed'))
-                if (rotatable && sameTargetIdentity(ownedTarget, pairing)) {
-                    warning = ''
-                    targetIdentityEpoch += 1
-                    ownedTarget = {
-                        endpoint: pairing.endpoint,
-                        sessionId: pairing.sessionId,
-                        manifestId: pairing.manifestId,
-                    }
-                    claimOwned = false
-                    state = reducePeerCloneState(state, { type: 'target-joined', pairing })
-                    return state
-                }
-                if (!sameTargetRequest(ownedTarget, pairing)) {
-                    throw new Error('Another peer clone target job is already owned')
-                }
-                return state
-            }
-            warning = ''
-            targetIdentityEpoch += 1
-            state = reducePeerCloneState(state, { type: 'target-joined', pairing })
-            return state
-        },
         joinClaimed(target: PeerCloneClaimedTarget): PeerCloneState {
             if (finalization || pendingRefresh) {
                 throw new Error('Peer clone target finalization is still active')
@@ -552,7 +435,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             warning = ''
             targetIdentityEpoch += 1
             ownedTarget = { ...target }
-            claimOwned = true
             state = reducePeerCloneState(state, { type: 'target-joined', pairing })
             return state
         },
@@ -561,85 +443,12 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             state = reducePeerCloneState(state, { type: 'target-confirmed' })
             return state
         },
-        async prepare(request: Record<string, unknown> = {}): Promise<PeerCloneSourceStatus> {
-            supported()
-            await requireSourceReady()
-            await replacementRuntime().flushPendingData('peer-clone-source-prepare')
-            const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_prepare', request)
-            if (result.sessionId) state = reducePeerCloneState(state, { type: 'source-prepared', sessionId: result.sessionId })
-            return result
-        },
-        async start(sessionId: string): Promise<PeerCloneSourceStatus> {
-            supported()
-            await requireSourceReady()
-            const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_start', { sessionId })
-            state = reducePeerCloneState(state, { type: 'source-started' })
-            return result
-        },
-        async startQuickTunnel(sessionId: string): Promise<PeerCloneSourceStatus> {
-            supported()
-            await requireSourceReady()
-            const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_tunnel_start', {
-                sessionId,
-                tunnel: { kind: 'quick' },
-            })
-            state = reducePeerCloneState(state, { type: 'source-started' })
-            return result
-        },
-        async startNamedTunnel(
-            sessionId: string,
-            token: string,
-            expectedPublicBaseUrl: string,
-        ): Promise<PeerCloneSourceStatus> {
-            supported()
-            await requireSourceReady()
-            try {
-                const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_tunnel_start', {
-                    sessionId,
-                    tunnel: { kind: 'named', token, expectedPublicBaseUrl },
-                })
-                state = reducePeerCloneState(state, { type: 'source-started' })
-                return result
-            } catch (cause) {
-                const message = cause instanceof Error
-                    ? cause.message
-                    : typeof cause === 'string' ? cause : ''
-                if (message === namedTunnelOriginUnavailableMessage) {
-                    throw new Error(namedTunnelOriginUnavailableMessage)
-                }
-                throw new Error('Named tunnel failed to start')
-            }
-        },
-        async sourceStatus(): Promise<PeerCloneSourceStatus> {
-            supported()
-            return nativeInvoke('peer_clone_status')
-        },
-        async tunnelStatus(): Promise<PeerCloneTunnelStatus> {
-            supported()
-            return nativeInvoke('peer_clone_tunnel_status')
-        },
-        async stop(sessionId: string): Promise<void> {
-            supported()
-            await nativeInvoke('peer_clone_stop', { sessionId })
-            state = reducePeerCloneState(state, { type: 'source-stopped' })
-        },
-        async stopTunnel(sessionId: string): Promise<void> {
-            supported()
-            await nativeInvoke('peer_clone_tunnel_stop', { sessionId })
-            state = reducePeerCloneState(state, { type: 'source-stopped' })
-        },
-        async revoke(sessionId: string, deviceId: string): Promise<void> {
-            supported()
-            await nativeInvoke('peer_clone_revoke', { sessionId, deviceId })
-            state = reducePeerCloneState(state, { type: 'source-revoked', deviceId })
-        },
         async download(): Promise<void> {
             supported()
             const pairing = state.target.pairing
             if (!state.target.destructiveConfirmed || !pairing) {
                 throw new Error('Peer clone target requires destructive replacement confirmation')
             }
-            if (!claimOwned) throw new Error('Peer clone target requires a registered source claim')
             const args = ownTarget({
                 endpoint: pairing.endpoint,
                 sessionId: pairing.sessionId,

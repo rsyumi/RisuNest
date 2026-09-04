@@ -82,12 +82,8 @@ describe('production device sync composition', () => {
         const initializeClone = vi.fn(async () => undefined)
         const clone = {
             snapshot: () => ({
-                sourceStatus: { phase: 'idle' as const, devices: [] }, tunnelStatus: { phase: 'idle' as const },
-                state: {
-                    source: { phase: 'idle' as const, revokedDeviceIds: [] },
-                    target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 },
-                },
-                sourcePairingUri: '', error: cloneError, warning: '',
+                state: { target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
+                error: cloneError, warning: '',
             }),
             subscribe: () => () => undefined,
             initialize: initializeClone,

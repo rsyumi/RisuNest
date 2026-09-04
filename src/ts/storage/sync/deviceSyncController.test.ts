@@ -5,13 +5,8 @@ import { createDeviceSyncController, startDeviceSyncAutoListen } from './deviceS
 import type { PeerCloneControllerSnapshot } from './peerCloneController'
 
 const cloneSnapshot = (error = '') => ({
-    sourceStatus: { phase: 'idle' as const, devices: [] },
-    tunnelStatus: { phase: 'idle' as const },
-    state: {
-        source: { phase: 'idle' as const, revokedDeviceIds: [] },
-        target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 },
-    },
-    sourcePairingUri: '', error, warning: '',
+    state: { target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
+    error, warning: '',
 })
 
 const deltaSnapshot = (error = '') => ({

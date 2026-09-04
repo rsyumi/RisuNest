@@ -74,10 +74,7 @@ export function createAndroidDeviceSyncCloneTarget(
                 : state.phase === 'cancelled' || state.phase === 'completed' || state.phase === 'failed'
                     ? state.phase
                     : 'idle',
-            sourceStatus: { phase: 'idle', devices: [] },
-            tunnelStatus: { phase: 'idle' },
             state: {
-                source: { phase: 'idle', revokedDeviceIds: [] },
                 target: {
                     phase: androidTargetPhase(state),
                     destructiveConfirmed: state.destructiveConfirmed,
@@ -86,7 +83,6 @@ export function createAndroidDeviceSyncCloneTarget(
                     ...(state.backupPaths === undefined ? {} : { backupPaths: state.backupPaths }),
                 },
             },
-            sourcePairingUri: '',
             error: error || state.error || '',
             warning: capabilities?.productionEnabled === false ? 'unavailable' : '',
         }
@@ -218,7 +214,7 @@ const defaultFactories: ProductionFactories = {
     sourceAndroid: (runtime) => createAndroidDeviceSyncFacade({
         flushPendingData: runtime.flushPendingData,
     }),
-    cloneDesktop: (runtime) => targetOnly(getDesktopPeerCloneController(runtime)),
+    cloneDesktop: (runtime) => getDesktopPeerCloneController(runtime),
     cloneAndroid: (runtime) => createAndroidDeviceSyncCloneTarget(getAndroidPeerCloneFacade({
         capturePersistentMutationToken: runtime.capturePersistentMutationToken,
         acquireDestructiveReplacementFence: runtime.acquireDestructiveReplacementFence,
