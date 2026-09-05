@@ -5188,7 +5188,7 @@ fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     )
 }
 
-fn open_command_store(app: &AppHandle) -> Result<PersistentStore, PeerSyncError> {
+pub(super) fn open_command_store(app: &AppHandle) -> Result<PersistentStore, PeerSyncError> {
     persistent_store::commands::with_store_mut(app.state(), |store| store.open_native_job_store())
         .map_err(store_error)
 }

@@ -3,6 +3,7 @@ use super::shared_session::AndroidDeviceSyncSourceState;
 #[cfg(desktop)]
 use super::shared_session::DeviceSyncSourceState;
 use super::{
+    bidirectional_commands::open_command_store,
     command_codes::finish_peer_command,
     device_registry::{
         incoming_source_by_id, incoming_source_summaries, outgoing_device_summaries,
@@ -11,6 +12,9 @@ use super::{
     },
     logical_completion::invalidate_outgoing_logical_completion_proofs,
     PeerSyncError,
+};
+use crate::persistent_store::{
+    PersistentStore, RegisteredSyncDeviceStatus, StoreError, PRODUCT_LOGICAL_LIBRARY_ID,
 };
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
@@ -74,6 +78,10 @@ fn app_root(app: &impl RegistryAppRootResolver) -> Result<PathBuf, String> {
     )
 }
 
+fn store_error(error: StoreError) -> PeerSyncError {
+    PeerSyncError::Storage(error.to_string())
+}
+
 fn revoke_outgoing_device_with_logical_cleanup(
     app_root: &Path,
     device_id: &str,
@@ -83,6 +91,53 @@ fn revoke_outgoing_device_with_logical_cleanup(
     // fails, the stale proof remains unusable and the caller still sees error.
     revoke_outgoing_device(app_root, device_id, revoke_live)?;
     invalidate_outgoing_logical_completion_proofs(app_root, device_id)
+}
+
+/// Marks the durable registration a bidirectional pairing left behind as
+/// revoked. A device that never reached the durable registry, or that is already
+/// revoked or forgotten, leaves nothing to revoke.
+fn revoke_durable_bidirectional_device(
+    store: &mut PersistentStore,
+    device_id: &str,
+) -> Result<(), PeerSyncError> {
+    let device = store
+        .list_sync_devices(PRODUCT_LOGICAL_LIBRARY_ID)
+        .map_err(store_error)?
+        .into_iter()
+        .find(|device| device.device_id == device_id);
+    match device.map(|device| device.status) {
+        Some(RegisteredSyncDeviceStatus::Active) => {
+            let acknowledgement = store
+                .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, device_id)
+                .map_err(store_error)?;
+            store
+                .revoke_sync_device(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    device_id,
+                    &acknowledgement.shared_identity,
+                )
+                .map(|_| ())
+                .map_err(store_error)
+        }
+        Some(RegisteredSyncDeviceStatus::Revoked | RegisteredSyncDeviceStatus::Forgotten)
+        | None => Ok(()),
+    }
+}
+
+/// Withdraws every trace of a registered device: the file registry with its live
+/// bearer and completion proofs, and the durable sync-device row. Both halves run
+/// even when the first one fails, and the first failure is the reported one. Each
+/// half is idempotent, so the retry the user makes finishes whatever is left.
+fn revoke_registered_device_everywhere(
+    app_root: &Path,
+    device_id: &str,
+    revoke_live: impl FnOnce(&str),
+    open_store: impl FnOnce() -> Result<PersistentStore, PeerSyncError>,
+) -> Result<(), PeerSyncError> {
+    let registry = revoke_outgoing_device_with_logical_cleanup(app_root, device_id, revoke_live);
+    let durable = open_store()
+        .and_then(|mut store| revoke_durable_bidirectional_device(&mut store, device_id));
+    registry.and(durable)
 }
 
 #[tauri::command]
@@ -207,24 +262,34 @@ pub fn peer_sync_revoke_outgoing_device(
     device_id: String,
 ) -> Result<(), String> {
     let shared = shared.inner().clone();
+    let app_root = app_root(&app)?;
     finish_peer_command(
         "peer sync registry outgoing device revocation",
-        revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            shared.revoke_registered_device(id);
-        }),
+        revoke_registered_device_everywhere(
+            &app_root,
+            &device_id,
+            move |id| shared.revoke_registered_device(id),
+            || open_command_store(&app),
+        ),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer_sync::{
-        device_registry::{
-            issue_outgoing_unmeasured_completion_offer, CompletionLane, DevicePermissions,
-            OutgoingDevice, OutgoingDeviceRegistry,
+    use crate::{
+        asset_repository::PayloadCas,
+        peer_sync::{
+            device_registry::{
+                issue_outgoing_unmeasured_completion_offer, CompletionLane, DevicePermissions,
+                OutgoingDevice, OutgoingDeviceRegistry,
+            },
+            logical_completion::{
+                prepare_outgoing_logical_completion_proof, LogicalCompletionManifest,
+            },
         },
-        logical_completion::{
-            prepare_outgoing_logical_completion_proof, LogicalCompletionManifest,
+        persistent_store::{
+            establish_logical_common_base, SyncGenerationIdentity, VerifiedSyncDeviceRegistration,
         },
     };
     use std::{collections::BTreeMap, fs};
@@ -266,6 +331,60 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    /// Adds the durable registration a bidirectional pairing leaves behind, on
+    /// top of the file-registry state `root_with_logical_proof` already wrote.
+    fn root_with_durable_registration() -> tempfile::TempDir {
+        let root = root_with_logical_proof();
+        let cas = PayloadCas::new(root.path()).unwrap();
+        let mut store = PersistentStore::open(root.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            DEVICE_ID,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    DEVICE_ID,
+                    SyncGenerationIdentity {
+                        generation_id: base.manifest.generation,
+                        manifest_hash: base.manifest_hash,
+                        generation_sequence: base.manifest.generation_sequence,
+                    },
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        root
+    }
+
+    fn durable_device_statuses(root: &Path) -> Vec<RegisteredSyncDeviceStatus> {
+        PersistentStore::open(root)
+            .unwrap()
+            .list_sync_devices(PRODUCT_LOGICAL_LIBRARY_ID)
+            .unwrap()
+            .into_iter()
+            .map(|device| device.status)
+            .collect()
+    }
+
+    fn revoke_everywhere(root: &Path, revoke_live: impl FnOnce(&str)) -> Result<(), PeerSyncError> {
+        revoke_registered_device_everywhere(root, DEVICE_ID, revoke_live, || {
+            PersistentStore::open(root).map_err(store_error)
+        })
     }
 
     fn latest_registry_log_containing(marker: &str) -> crate::native_log::LogEntry {
@@ -455,6 +574,43 @@ mod tests {
             .devices()
             .is_empty());
     }
+
+    #[test]
+    fn revoke_also_revokes_the_durable_registration_and_repeats_without_error() {
+        let root = root_with_durable_registration();
+        assert_eq!(
+            durable_device_statuses(root.path()),
+            vec![RegisteredSyncDeviceStatus::Active]
+        );
+        let mut revoked_live = false;
+
+        revoke_everywhere(root.path(), |_| revoked_live = true).unwrap();
+        revoke_everywhere(root.path(), |_| {}).unwrap();
+
+        assert!(revoked_live);
+        assert!(OutgoingDeviceRegistry::load(root.path())
+            .unwrap()
+            .devices()
+            .is_empty());
+        assert_eq!(
+            durable_device_statuses(root.path()),
+            vec![RegisteredSyncDeviceStatus::Revoked]
+        );
+    }
+
+    #[test]
+    fn revoke_succeeds_for_a_device_that_never_reached_the_durable_registry() {
+        let root = root_with_logical_proof();
+        PersistentStore::open(root.path()).unwrap();
+
+        revoke_everywhere(root.path(), |_| {}).unwrap();
+
+        assert!(OutgoingDeviceRegistry::load(root.path())
+            .unwrap()
+            .devices()
+            .is_empty());
+        assert!(durable_device_statuses(root.path()).is_empty());
+    }
 }
 #[cfg(target_os = "android")]
 #[tauri::command]
@@ -464,10 +620,14 @@ pub fn peer_sync_revoke_outgoing_device(
     device_id: String,
 ) -> Result<(), String> {
     let shared = shared.inner().clone();
+    let app_root = app_root(&app)?;
     finish_peer_command(
         "peer sync registry outgoing device revocation",
-        revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            shared.revoke_registered_device(id);
-        }),
+        revoke_registered_device_everywhere(
+            &app_root,
+            &device_id,
+            move |id| shared.revoke_registered_device(id),
+            || open_command_store(&app),
+        ),
     )
 }
