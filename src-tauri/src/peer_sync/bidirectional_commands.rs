@@ -29,6 +29,7 @@ use super::{
         execute_logical_delta_pull_with_pre_activation, select_missing_logical_delta_objects,
     },
     maintenance::ActiveTempGuard,
+    shared_session::SharedRemoteCommitSlot,
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
     LogicalDeltaStagedTarget, PeerSyncError,
 };
@@ -5217,6 +5218,7 @@ fn prepare_product_source_session(
     source: LogicalDeltaSourceSession,
     source_device_id: &str,
     manifest_bytes: Vec<u8>,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
 ) -> Result<(PreparedBidirectionalLogicalLanSession, String, String), PeerSyncError> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let manifest_id = source.manifest_hash().to_owned();
@@ -5235,6 +5237,7 @@ fn prepare_product_source_session(
         objects,
         Box::new(source),
         control,
+        remote_commit,
     )?;
     Ok((prepared, session_id, manifest_id))
 }
@@ -5244,6 +5247,7 @@ pub(crate) fn prepare_shared_bidirectional_source(
     cas: &PayloadCas,
     app_root: &Path,
     expected_revision: i64,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
 ) -> Result<PreparedSharedBidirectionalSource, PeerSyncError> {
     let retained = PeerBidirectionalOperationJournal::new(app_root).load()?;
     let source_device_id = super::delta_commands::canonical_source_device_id(app_root)?;
@@ -5283,6 +5287,7 @@ pub(crate) fn prepare_shared_bidirectional_source(
         source,
         &source_device_id,
         built.manifest_bytes,
+        remote_commit,
     )?;
     Ok(PreparedSharedBidirectionalSource {
         session: Some(session),

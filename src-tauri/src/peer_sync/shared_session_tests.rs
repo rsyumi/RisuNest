@@ -10,8 +10,8 @@ use super::{
     shared_session::{
         reserve_device_sync_source, AndroidDeviceSyncHost, AndroidDeviceSyncSourceState,
         DeviceSyncLinkPermissions, DeviceSyncListenMethod, DeviceSyncPrepareRequest,
-        DeviceSyncSourcePhase, SharedPairingData, SharedSessionLifecycle, SharedSessionPhase,
-        SharedSourceLane, SharedSourceOwnership, SharedSourcePreparation,
+        DeviceSyncSourcePhase, SharedPairingData, SharedRemoteCommit, SharedSessionLifecycle,
+        SharedSessionPhase, SharedSourceLane, SharedSourceOwnership, SharedSourcePreparation,
     },
     PeerSyncError,
 };
@@ -31,7 +31,7 @@ use super::{
     shared_session::{
         run_device_sync_rotate_link, DeviceSyncSourceState, SharedPeerTunnel,
         SharedPeerTunnelCleanup, SharedPeerTunnelLauncher, SharedPeerTunnelLifecycle,
-        SharedPublicOriginVerifier, SharedSessionHost, SharedSourceEngines,
+        SharedPublicOriginVerifier, SharedRemoteCommitSlot, SharedSessionHost, SharedSourceEngines,
         SharedSourcePreparationContext,
     },
     CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PinnedCloneRevision,
@@ -1150,6 +1150,7 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
             app_root: root.path(),
             cancellation: &NeverCancelled,
             expected_bidirectional_revision: expected_revision,
+            remote_commit: Arc::new(SharedRemoteCommitSlot::default()),
         };
         lifecycle.prepare(&mut context).unwrap();
     }
@@ -1245,6 +1246,7 @@ fn real_shared_clone_cleanup_preserves_session_owned_by_a_different_active_marke
         app_root: root.path(),
         cancellation: &NeverCancelled,
         expected_bidirectional_revision: expected_revision,
+        remote_commit: Arc::new(SharedRemoteCommitSlot::default()),
     };
     lifecycle.prepare(&mut context).unwrap();
     let marker_path = root.path().join("peer-clone").join("active-source.json");
@@ -1310,6 +1312,54 @@ fn seed_shared_source_store(store: &mut PersistentStore) {
         )
         .unwrap();
     store.replace_commit(&staging, Some(0)).unwrap();
+}
+
+/// The remote commit signal is process memory only: a recorded commit stays
+/// readable through `stop` so the controller's final status read can still act
+/// on it, and only a `prepare` that actually reseals clears it.
+const REMOTE_COMMIT_OPERATION: &str = "00000000-0000-4000-8000-0000000000a1";
+
+#[test]
+fn android_shared_source_remote_commit_follows_the_same_lifecycle() {
+    let _guard = test_registry_guard();
+    let events = Arc::new(Mutex::new(AndroidHostEvents::default()));
+    let state = android_state(events);
+    let root = tempfile::tempdir().unwrap();
+    state
+        .remote_commit_slot()
+        .record(REMOTE_COMMIT_OPERATION, 12);
+
+    let prepared = state
+        .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+        .unwrap();
+    assert_eq!(prepared.last_remote_commit, None);
+
+    state
+        .remote_commit_slot()
+        .record(REMOTE_COMMIT_OPERATION, 12);
+    let expected = Some(SharedRemoteCommit {
+        operation_id: REMOTE_COMMIT_OPERATION.to_owned(),
+        committed_revision: 12,
+    });
+    assert_eq!(state.status().unwrap().last_remote_commit, expected);
+    assert_eq!(
+        state
+            .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+            .unwrap()
+            .last_remote_commit,
+        expected,
+    );
+
+    assert_eq!(state.stop_for_test().unwrap(), None);
+
+    assert_eq!(state.status().unwrap().last_remote_commit, expected);
+    assert_eq!(
+        state
+            .prepare_for_test(&mut (), root.path(), android_lan_request(32145))
+            .unwrap()
+            .last_remote_commit,
+        None,
+    );
 }
 
 #[cfg(desktop)]
@@ -1429,6 +1479,7 @@ fn host() -> (tempfile::TempDir, SharedSessionHost) {
         objects,
         Box::new(Empty(bidi_objects)),
         Arc::new(Control),
+        Arc::new(SharedRemoteCommitSlot::default()),
     )
     .unwrap();
     let mut host = SharedSessionHost::new(clone, delta, bidi).unwrap();
@@ -2661,6 +2712,7 @@ fn device_sync_wire_names_match_the_settings_contract() {
         latest_error: Some(
             super::super::shared_session::DeviceSyncErrorCategory::TransportUnavailable,
         ),
+        last_remote_commit: None,
     };
     let serialized = serde_json::to_value(status).unwrap();
     assert_eq!(
@@ -2670,11 +2722,199 @@ fn device_sync_wire_names_match_the_settings_contract() {
             "endpoint": null,
             "pairingUri": null,
             "expiresAtMs": null,
-            "latestError": "transport-unavailable"
+            "latestError": "transport-unavailable",
+            "lastRemoteCommit": null
         })
     );
     assert!(!serialized.to_string().contains("raw"));
     assert!(!serialized.to_string().contains("bearer"));
+    let recorded = super::super::shared_session::DeviceSyncSourceStatus {
+        phase: DeviceSyncSourcePhase::Running,
+        endpoint: None,
+        pairing_uri: None,
+        expires_at_ms: None,
+        latest_error: None,
+        last_remote_commit: Some(SharedRemoteCommit {
+            operation_id: REMOTE_COMMIT_OPERATION.to_owned(),
+            committed_revision: 12,
+        }),
+    };
+    let recorded = serde_json::to_value(recorded).unwrap();
+    assert_eq!(
+        recorded["lastRemoteCommit"],
+        serde_json::json!({
+            "operationId": REMOTE_COMMIT_OPERATION,
+            "committedRevision": 12
+        })
+    );
+    assert!(!recorded.to_string().contains("raw"));
+    assert!(!recorded.to_string().contains("bearer"));
+}
+
+#[test]
+fn shared_source_status_reports_a_recorded_remote_commit() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(state.status().unwrap().last_remote_commit, None);
+
+    state
+        .remote_commit_slot()
+        .record(REMOTE_COMMIT_OPERATION, 12);
+
+    assert_eq!(
+        state.status().unwrap().last_remote_commit,
+        Some(SharedRemoteCommit {
+            operation_id: REMOTE_COMMIT_OPERATION.to_owned(),
+            committed_revision: 12,
+        })
+    );
+}
+
+#[test]
+fn shared_source_stop_keeps_the_recorded_remote_commit() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    state
+        .remote_commit_slot()
+        .record(REMOTE_COMMIT_OPERATION, 12);
+
+    let stopped = state.stop().unwrap();
+
+    assert_eq!(stopped.phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(
+        stopped.last_remote_commit,
+        Some(SharedRemoteCommit {
+            operation_id: REMOTE_COMMIT_OPERATION.to_owned(),
+            committed_revision: 12,
+        })
+    );
+    assert_eq!(
+        state.status().unwrap().last_remote_commit,
+        Some(SharedRemoteCommit {
+            operation_id: REMOTE_COMMIT_OPERATION.to_owned(),
+            committed_revision: 12,
+        })
+    );
+}
+
+#[test]
+fn shared_source_prepare_clears_the_recorded_remote_commit() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    state
+        .remote_commit_slot()
+        .record(REMOTE_COMMIT_OPERATION, 12);
+
+    let prepared = state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(prepared.phase, DeviceSyncSourcePhase::Prepared);
+    assert_eq!(prepared.last_remote_commit, None);
+    assert_eq!(state.status().unwrap().last_remote_commit, None);
+}
+
+#[test]
+fn shared_source_idempotent_prepare_keeps_the_recorded_remote_commit() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    let request = DeviceSyncPrepareRequest {
+        method: DeviceSyncListenMethod::Lan,
+        fixed_port: available_port(),
+        public_base_url: None,
+    };
+    state.prepare(&mut (), root.path(), request.clone()).unwrap();
+    state
+        .remote_commit_slot()
+        .record(REMOTE_COMMIT_OPERATION, 12);
+
+    let again = state.prepare(&mut (), root.path(), request).unwrap();
+
+    assert_eq!(again.phase, DeviceSyncSourcePhase::Prepared);
+    assert_eq!(
+        again.last_remote_commit,
+        Some(SharedRemoteCommit {
+            operation_id: REMOTE_COMMIT_OPERATION.to_owned(),
+            committed_revision: 12,
+        })
+    );
+}
+
+#[test]
+fn shared_bidirectional_prepare_hands_the_remote_commit_slot_to_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let cas = PayloadCas::new(root.path()).unwrap();
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    seed_shared_source_store(&mut store);
+    let expected_revision = store.revision().unwrap();
+    let slot = Arc::new(SharedRemoteCommitSlot::default());
+
+    let mut prepared = super::super::bidirectional_commands::prepare_shared_bidirectional_source(
+        &mut store,
+        &cas,
+        root.path(),
+        expected_revision,
+        Arc::clone(&slot),
+    )
+    .unwrap();
+
+    let session = prepared.take_session().unwrap();
+    assert!(Arc::ptr_eq(session.remote_commit_slot_for_test(), &slot));
+    prepared.cleanup();
 }
 fn claim(pairing: &SharedPairingData, id: &str) -> reqwest::blocking::Response {
     reqwest::blocking::Client::new().post(format!("{}/v1/sessions/{}/claim", pairing.endpoint, pairing.session_id)).json(&serde_json::json!({"claim": pairing.claim, "protocolVersion":2, "deviceId":id, "deviceName":"target"})).send().unwrap()

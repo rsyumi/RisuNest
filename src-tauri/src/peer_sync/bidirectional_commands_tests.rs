@@ -8438,6 +8438,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
         source,
         source_device_id,
         source_active.manifest_bytes,
+        Arc::new(SharedRemoteCommitSlot::default()),
     )
     .unwrap();
     let mut source_host = LanCloneHost::prepare_bidirectional_logical(prepared);

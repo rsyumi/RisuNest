@@ -24,7 +24,10 @@ use super::{
     PeerSyncError,
 };
 #[cfg(any(desktop, target_os = "android"))]
-use super::{LogicalDeltaObject, LogicalDeltaObjectSource, PreparedCloneSession};
+use super::{
+    shared_session::SharedRemoteCommitSlot, LogicalDeltaObject, LogicalDeltaObjectSource,
+    PreparedCloneSession,
+};
 #[cfg(any(desktop, target_os = "android"))]
 use crate::{
     asset_repository::PayloadCas,
@@ -985,6 +988,7 @@ pub struct PreparedLogicalLanSession {
 pub(crate) struct PreparedBidirectionalLogicalLanSession {
     logical: PreparedLogicalLanSession,
     control: Arc<dyn LanBidirectionalControl>,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -998,6 +1002,7 @@ impl PreparedBidirectionalLogicalLanSession {
         objects: Vec<LogicalDeltaObject>,
         source: Box<dyn LogicalDeltaObjectSource + Send>,
         control: Arc<dyn LanBidirectionalControl>,
+        remote_commit: Arc<SharedRemoteCommitSlot>,
     ) -> Result<Self, PeerSyncError> {
         Ok(Self {
             logical: PreparedLogicalLanSession::new(
@@ -1009,7 +1014,13 @@ impl PreparedBidirectionalLogicalLanSession {
                 source,
             )?,
             control,
+            remote_commit,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_commit_slot_for_test(&self) -> &Arc<SharedRemoteCommitSlot> {
+        &self.remote_commit
     }
 }
 
@@ -1140,6 +1151,13 @@ impl LanSession {
     fn bidirectional_control(&self) -> Option<&Arc<dyn LanBidirectionalControl>> {
         match self {
             Self::BidirectionalLogical(session) => Some(&session.control),
+            Self::Clone(_) | Self::Logical(_) => None,
+        }
+    }
+
+    fn remote_commit_slot(&self) -> Option<&Arc<SharedRemoteCommitSlot>> {
+        match self {
+            Self::BidirectionalLogical(session) => Some(&session.remote_commit),
             Self::Clone(_) | Self::Logical(_) => None,
         }
     }
@@ -2642,6 +2660,11 @@ fn bidirectional_remote_apply(
     let cancellation = AtomicCancellation::new(Arc::clone(stopped));
     match control.remote_apply(bidirectional_session, request, &cancellation) {
         Ok(receipt) if receipt.is_valid() => {
+            // The store commit is already durable here, so the renderer's
+            // working set is stale whatever the completion seal decides.
+            if let Some(slot) = session.remote_commit_slot() {
+                slot.record(&operation_id, receipt.committed_revision);
+            }
             if completion_deferred {
                 let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
                     return respond_empty(stream, 409);
@@ -4410,6 +4433,7 @@ mod timeout_tests {
             build_logical_manifest, LogicalManifestBuilderInput, LogicalRecordEnvelope,
             LogicalRecordLocator, ProjectedLogicalRecord,
         },
+        shared_session::SharedRemoteCommit,
         LogicalDeltaObject, LogicalDeltaObjectSource,
     };
     use std::{collections::BTreeMap, io::Cursor, sync::mpsc};
@@ -5431,6 +5455,223 @@ mod timeout_tests {
         assert!(requester.join().unwrap().is_err());
     }
 
+    /// Drives one remote apply against a running shared bidirectional host and
+    /// reports whether the peer accepted it, so the record assertions can look
+    /// only at the slot the source state would publish.
+    fn remote_apply_against_slot(
+        session_id: &str,
+        operation_id: &str,
+        expected_source_revision: i64,
+        control: Arc<BidirectionalControlFixture>,
+        slot: &Arc<SharedRemoteCommitSlot>,
+    ) -> bool {
+        let source_device_id = "00000000-0000-4000-8000-0000000000b1";
+        let target_device_id = "00000000-0000-4000-8000-0000000000b2";
+        let mut host = LanCloneHost::prepare_bidirectional_logical(
+            prepared_bidirectional_logical_session_with_slot(
+                session_id,
+                source_device_id,
+                control,
+                Arc::clone(slot),
+            ),
+        );
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanBidirectionalLogicalClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+            target_device_id,
+        )
+        .unwrap();
+        let accepted = client
+            .request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: operation_id.to_owned(),
+                source_endpoint: endpoint,
+                source_session_id: pairing.session_id,
+                source_manifest_id: pairing.manifest_id.clone(),
+                source_claim: pairing.claim,
+                expected_source_revision,
+                expected_source_generation: LanBidirectionalGeneration {
+                    generation_id: "generation-1".to_owned(),
+                    manifest_hash: pairing.manifest_id.clone(),
+                    generation_sequence: "1".to_owned(),
+                },
+                expected_common_base_manifest_hash: pairing.manifest_id,
+                backup_losing_side: false,
+                completion_deferred_v1: None,
+            })
+            .is_ok();
+        host.stop().unwrap();
+        accepted
+    }
+
+    #[test]
+    fn p5_remote_apply_records_the_commit_for_the_shared_source() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = Arc::new(SharedRemoteCommitSlot::default());
+        let control = Arc::new(BidirectionalControlFixture::default());
+
+        assert!(remote_apply_against_slot(
+            "00000000-0000-4000-8000-0000000000b3",
+            "00000000-0000-4000-8000-0000000000b4",
+            7,
+            control,
+            &slot,
+        ));
+
+        assert_eq!(
+            slot.latest(),
+            Some(SharedRemoteCommit {
+                operation_id: "00000000-0000-4000-8000-0000000000b4".to_owned(),
+                committed_revision: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn p5_failed_remote_apply_records_no_commit() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for error in [
+            PeerSyncError::Storage("injected remote apply failure".to_owned()),
+            PeerSyncError::ActivationConflict {
+                expected: None,
+                actual: None,
+            },
+        ] {
+            let slot = Arc::new(SharedRemoteCommitSlot::default());
+            let control = Arc::new(BidirectionalControlFixture::default());
+            *control.remote_apply_error.lock().unwrap() = Some(error);
+
+            assert!(!remote_apply_against_slot(
+                "00000000-0000-4000-8000-0000000000b5",
+                "00000000-0000-4000-8000-0000000000b6",
+                7,
+                control,
+                &slot,
+            ));
+
+            assert_eq!(slot.latest(), None);
+        }
+    }
+
+    #[test]
+    fn p5_remote_apply_keeps_only_the_latest_commit() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = Arc::new(SharedRemoteCommitSlot::default());
+
+        assert!(remote_apply_against_slot(
+            "00000000-0000-4000-8000-0000000000b7",
+            "00000000-0000-4000-8000-0000000000b8",
+            7,
+            Arc::new(BidirectionalControlFixture::default()),
+            &slot,
+        ));
+        assert!(remote_apply_against_slot(
+            "00000000-0000-4000-8000-0000000000b9",
+            "00000000-0000-4000-8000-0000000000ba",
+            9,
+            Arc::new(BidirectionalControlFixture::default()),
+            &slot,
+        ));
+
+        assert_eq!(
+            slot.latest(),
+            Some(SharedRemoteCommit {
+                operation_id: "00000000-0000-4000-8000-0000000000ba".to_owned(),
+                committed_revision: 9,
+            })
+        );
+    }
+
+    /// The record has to precede the completion seal: a seal that fails after a
+    /// valid receipt leaves the store committed, so the renderer still has to
+    /// refresh even though the peer sees the request as failed.
+    #[test]
+    fn p5_remote_apply_records_the_commit_when_the_completion_seal_fails() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
+        let slot = Arc::new(SharedRemoteCommitSlot::default());
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let mut host = LanCloneHost::prepare_bidirectional_logical(
+            prepared_bidirectional_logical_session_with_slot(
+                "00000000-0000-4000-8000-0000000000bb",
+                &source_device_id,
+                Arc::clone(&control),
+                Arc::clone(&slot),
+            ),
+        );
+        host.enable_v2_registry(
+            source_root.path(),
+            "Windows",
+            DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        fail_next_logical_completion_proof_write_for_test(
+            source_root.path(),
+            &client.inner.device_id,
+            CompletionLane::Bidirectional,
+        )
+        .unwrap();
+
+        assert!(client
+            .request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: lease.as_str().to_owned(),
+                source_endpoint: endpoint,
+                source_session_id: pairing.session_id,
+                source_manifest_id: pairing.manifest_id.clone(),
+                source_claim: pairing.claim,
+                expected_source_revision: 5,
+                expected_source_generation: LanBidirectionalGeneration {
+                    generation_id: "generation-1".to_owned(),
+                    manifest_hash: pairing.manifest_id.clone(),
+                    generation_sequence: "1".to_owned(),
+                },
+                expected_common_base_manifest_hash: pairing.manifest_id,
+                backup_losing_side: false,
+                completion_deferred_v1: Some(true),
+            })
+            .is_err());
+
+        assert_eq!(*control.remote_apply_commits.lock().unwrap(), 1);
+        assert_eq!(
+            slot.latest(),
+            Some(SharedRemoteCommit {
+                operation_id: lease.as_str().to_owned(),
+                committed_revision: 5,
+            })
+        );
+        host.stop().unwrap();
+    }
+
     fn prepared_bidirectional_logical_session(
         session_id: &str,
         source_device_id: &str,
@@ -5441,6 +5682,22 @@ mod timeout_tests {
             source_device_id,
             "generation-1",
             control,
+            Arc::new(SharedRemoteCommitSlot::default()),
+        )
+    }
+
+    fn prepared_bidirectional_logical_session_with_slot(
+        session_id: &str,
+        source_device_id: &str,
+        control: Arc<BidirectionalControlFixture>,
+        remote_commit: Arc<SharedRemoteCommitSlot>,
+    ) -> PreparedBidirectionalLogicalLanSession {
+        prepared_bidirectional_logical_session_with_generation(
+            session_id,
+            source_device_id,
+            "generation-1",
+            control,
+            remote_commit,
         )
     }
 
@@ -5449,6 +5706,7 @@ mod timeout_tests {
         source_device_id: &str,
         generation: &str,
         control: Arc<BidirectionalControlFixture>,
+        remote_commit: Arc<SharedRemoteCommitSlot>,
     ) -> PreparedBidirectionalLogicalLanSession {
         let built = build_logical_manifest(LogicalManifestBuilderInput {
             library_id: "library".to_owned(),
@@ -5482,6 +5740,7 @@ mod timeout_tests {
                 .collect(),
             Box::new(LogicalFixtureSource(BTreeMap::new())),
             control,
+            remote_commit,
         )
         .unwrap()
     }
@@ -5526,6 +5785,7 @@ mod timeout_tests {
                 object_bytes,
             )]))),
             control,
+            Arc::new(SharedRemoteCommitSlot::default()),
         )
         .unwrap();
         (session, object_hash)
@@ -6242,6 +6502,7 @@ mod timeout_tests {
                 &source_device_id,
                 "generation-2",
                 Arc::clone(&restarted_control),
+                Arc::new(SharedRemoteCommitSlot::default()),
             ),
         );
         restarted_host
@@ -6363,6 +6624,7 @@ mod timeout_tests {
                 &source_device_id,
                 "generation-2",
                 Arc::clone(&control),
+                Arc::new(SharedRemoteCommitSlot::default()),
             ),
         );
         restarted_host

@@ -296,6 +296,7 @@ pub(crate) struct SharedSourcePreparationContext<'a> {
     pub(crate) app_root: &'a std::path::Path,
     pub(crate) cancellation: &'a dyn CancellationProbe,
     pub(crate) expected_bidirectional_revision: i64,
+    pub(crate) remote_commit: Arc<SharedRemoteCommitSlot>,
 }
 
 #[cfg(any(desktop, target_os = "android", test))]
@@ -377,6 +378,7 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
                     context.cas,
                     context.app_root,
                     context.expected_bidirectional_revision,
+                    Arc::clone(&context.remote_commit),
                 )?);
             }
         }
@@ -436,6 +438,49 @@ pub enum DeviceSyncErrorCategory {
     StateUnavailable,
 }
 
+/// The last bidirectional commit a peer applied under this shared session.
+/// It says only that the store revision moved under the renderer, so the
+/// renderer can refresh its working set; it is not completion accounting.
+#[cfg(any(desktop, target_os = "android", test))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedRemoteCommit {
+    pub operation_id: String,
+    pub committed_revision: i64,
+}
+
+#[cfg(any(desktop, target_os = "android", test))]
+#[derive(Default)]
+pub(crate) struct SharedRemoteCommitSlot {
+    latest: Mutex<Option<SharedRemoteCommit>>,
+}
+
+#[cfg(any(desktop, target_os = "android", test))]
+impl SharedRemoteCommitSlot {
+    pub(crate) fn record(&self, operation_id: &str, committed_revision: i64) {
+        *self.recovered() = Some(SharedRemoteCommit {
+            operation_id: operation_id.to_owned(),
+            committed_revision,
+        });
+    }
+
+    pub(crate) fn latest(&self) -> Option<SharedRemoteCommit> {
+        self.recovered().clone()
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.recovered() = None;
+    }
+
+    /// A poisoned slot never fails a status read.  Losing every later poll is
+    /// worse than losing one recorded commit, and the value is advisory.
+    fn recovered(&self) -> std::sync::MutexGuard<'_, Option<SharedRemoteCommit>> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[cfg(any(desktop, target_os = "android", test))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -445,6 +490,7 @@ pub struct DeviceSyncSourceStatus {
     pub pairing_uri: Option<String>,
     pub expires_at_ms: Option<u64>,
     pub latest_error: Option<DeviceSyncErrorCategory>,
+    pub last_remote_commit: Option<SharedRemoteCommit>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -530,6 +576,7 @@ where
     runtime: Arc<Mutex<AndroidDeviceSyncRuntime>>,
     lifecycle: Arc<SharedSessionLifecycle<P>>,
     lan_address_override: Option<Ipv4Addr>,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -544,6 +591,7 @@ where
             runtime: Arc::clone(&self.runtime),
             lifecycle: Arc::clone(&self.lifecycle),
             lan_address_override: self.lan_address_override,
+            remote_commit: Arc::clone(&self.remote_commit),
         }
     }
 }
@@ -573,7 +621,12 @@ where
             })),
             lifecycle: Arc::new(SharedSessionLifecycle::new(preparation)),
             lan_address_override,
+            remote_commit: Arc::new(SharedRemoteCommitSlot::default()),
         }
+    }
+
+    pub(crate) fn remote_commit_slot(&self) -> Arc<SharedRemoteCommitSlot> {
+        Arc::clone(&self.remote_commit)
     }
 
     #[cfg(test)]
@@ -644,6 +697,9 @@ where
         if self.runtime()?.phase == DeviceSyncSourcePhase::Prepared {
             return self.status();
         }
+        // Only a preparation that actually reseals the source drops the
+        // recorded remote commit; every other path keeps it observable.
+        self.remote_commit.clear();
         self.set_phase(DeviceSyncSourcePhase::Preparing)?;
         if let Err(error) = self.lifecycle.prepare(context) {
             let mut runtime = self.runtime()?;
@@ -663,7 +719,10 @@ where
         runtime.foreground = None;
         runtime.latest_error = None;
         runtime.phase = DeviceSyncSourcePhase::Prepared;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn start_attached(
@@ -759,7 +818,10 @@ where
             runtime.pairing = Some(pairing);
             runtime.foreground = Some(foreground.clone());
             runtime.latest_error = None;
-            Ok(Self::status_from_runtime(&runtime))
+            Ok(Self::status_from_runtime(
+                &runtime,
+                self.remote_commit.latest(),
+            ))
         })();
         drop(_operation);
         let status = match start_result {
@@ -813,12 +875,18 @@ where
         let mut runtime = self.runtime()?;
         runtime.pairing = Some(pairing);
         runtime.latest_error = None;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn status(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
         let runtime = self.runtime()?;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn stop(
@@ -927,7 +995,10 @@ where
         Err(error)
     }
 
-    fn status_from_runtime(runtime: &AndroidDeviceSyncRuntime) -> DeviceSyncSourceStatus {
+    fn status_from_runtime(
+        runtime: &AndroidDeviceSyncRuntime,
+        last_remote_commit: Option<SharedRemoteCommit>,
+    ) -> DeviceSyncSourceStatus {
         DeviceSyncSourceStatus {
             phase: runtime.phase,
             endpoint: runtime
@@ -943,6 +1014,7 @@ where
                 .as_ref()
                 .and_then(|pairing| u64::try_from(pairing.expires_at_ms).ok()),
             latest_error: runtime.latest_error,
+            last_remote_commit,
         }
     }
 
@@ -1064,6 +1136,7 @@ where
     lan_address_override: Option<Ipv4Addr>,
     quick_tunnel_launcher: Arc<dyn SharedPeerTunnelLauncher>,
     public_origin_verifier: Arc<dyn SharedPublicOriginVerifier>,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
 }
 
 #[cfg(desktop)]
@@ -1079,6 +1152,7 @@ where
             lan_address_override: self.lan_address_override,
             quick_tunnel_launcher: Arc::clone(&self.quick_tunnel_launcher),
             public_origin_verifier: Arc::clone(&self.public_origin_verifier),
+            remote_commit: Arc::clone(&self.remote_commit),
         }
     }
 }
@@ -1120,7 +1194,12 @@ where
             lan_address_override,
             quick_tunnel_launcher,
             public_origin_verifier,
+            remote_commit: Arc::new(SharedRemoteCommitSlot::default()),
         }
+    }
+
+    pub(crate) fn remote_commit_slot(&self) -> Arc<SharedRemoteCommitSlot> {
+        Arc::clone(&self.remote_commit)
     }
 
     #[cfg(test)]
@@ -1195,9 +1274,15 @@ where
                 runtime.phase,
                 DeviceSyncSourcePhase::Prepared | DeviceSyncSourcePhase::Running
             ) {
-                return Ok(Self::status_from_runtime(&runtime));
+                return Ok(Self::status_from_runtime(
+                    &runtime,
+                    self.remote_commit.latest(),
+                ));
             }
         }
+        // Only a preparation that actually reseals the source drops the
+        // recorded remote commit; every other path keeps it observable.
+        self.remote_commit.clear();
         self.set_phase(DeviceSyncSourcePhase::Preparing)?;
         if let Err(error) = self.lifecycle.prepare(context) {
             return self.fail(DeviceSyncErrorCategory::PreparationFailed, error);
@@ -1212,7 +1297,10 @@ where
         runtime.pairing = None;
         runtime.latest_error = None;
         runtime.phase = DeviceSyncSourcePhase::Prepared;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn start(
@@ -1347,7 +1435,10 @@ where
         runtime.tunnel = tunnel;
         runtime.latest_error = None;
         runtime.phase = DeviceSyncSourcePhase::Running;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn status(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
@@ -1374,7 +1465,10 @@ where
                 }
             }
         }
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     fn rotate_link(
@@ -1462,7 +1556,10 @@ where
         runtime.pairing = Some(rotated);
         runtime.latest_error = None;
         runtime.phase = DeviceSyncSourcePhase::Running;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn stop(&self) -> Result<DeviceSyncSourceStatus, PeerSyncError> {
@@ -1512,7 +1609,10 @@ where
         runtime.tunnel = None;
         runtime.failed_tunnel = None;
         runtime.latest_error = None;
-        Ok(Self::status_from_runtime(&runtime))
+        Ok(Self::status_from_runtime(
+            &runtime,
+            self.remote_commit.latest(),
+        ))
     }
 
     pub(crate) fn revoke_registered_device(&self, device_id: &str) {
@@ -1559,7 +1659,10 @@ where
         }
     }
 
-    fn status_from_runtime(runtime: &DeviceSyncRuntime) -> DeviceSyncSourceStatus {
+    fn status_from_runtime(
+        runtime: &DeviceSyncRuntime,
+        last_remote_commit: Option<SharedRemoteCommit>,
+    ) -> DeviceSyncSourceStatus {
         DeviceSyncSourceStatus {
             phase: runtime.phase,
             endpoint: runtime
@@ -1575,6 +1678,7 @@ where
                 .as_ref()
                 .and_then(|pairing| u64::try_from(pairing.expires_at_ms).ok()),
             latest_error: runtime.latest_error,
+            last_remote_commit,
         }
     }
 
@@ -1688,6 +1792,7 @@ pub async fn device_sync_prepare(
                 app_root: &app_root,
                 cancellation: &NeverCancelled,
                 expected_bidirectional_revision,
+                remote_commit: worker_state.remote_commit_slot(),
             };
             worker_state
                 .prepare(&mut context, &app_root, request)
@@ -1874,6 +1979,7 @@ pub(crate) async fn device_sync_prepare(
                 app_root: &app_root,
                 cancellation: &crate::local_backup::NeverCancelled,
                 expected_bidirectional_revision,
+                remote_commit: worker_state.remote_commit_slot(),
             };
             worker_state
                 .prepare(&mut context, &app_root, request)
