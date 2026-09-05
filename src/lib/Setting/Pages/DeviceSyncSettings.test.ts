@@ -534,7 +534,7 @@ describe('DeviceSyncSettings', () => {
         ['running', undefined, 'Receiving 0%'],
         ['completed', { kind: 'noChanges', revision: 1, transferredObjects: 0, transferredBytes: 0 }, 'Already up to date.'],
         ['fullCloneRequired', { kind: 'fullCloneRequired', reason: 'noExactCommonBase' }, 'A full copy is required.'],
-        ['conflict', { kind: 'conflict', reason: 'localAndRemoteChanged' }, 'Both devices changed the same logical records.'],
+        ['conflict', { kind: 'conflict', reason: 'localAndRemoteChanged' }, 'The same items changed on both devices, so the changes could not be received.'],
         ['failed', undefined, 'Error'],
     ] as const)('maps delta %s safely', async (phase, pullResult, expected) => {
         const delta = { ...deltaBase, pullPhase: phase, pullResult, error: phase === 'failed' ? 'operation-failed' as const : null }
@@ -620,7 +620,7 @@ describe('DeviceSyncSettings', () => {
 
     it.each([
         ['source-in-use' as const, 'A sync task is still using this device. Finish or cancel it, then try again.'],
-        ['source-changed' as const, "This device's registration changed. Select the target device again and retry."],
+        ['source-changed' as const, "The target device's registration changed. Select the target device again and retry."],
         ['delta-completion-retained' as const, 'An unfinished earlier update is still pending. Continue or cancel it under Sync tasks.'],
         ['peer-outdated' as const, 'The other device runs an older RisuNest. Update both devices to the same version and try again.'],
     ])('renders the localized wording for the bounded work failure %s', async (code, wording) => {
