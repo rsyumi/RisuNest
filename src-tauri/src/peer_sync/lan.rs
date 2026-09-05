@@ -1069,21 +1069,24 @@ impl SharedSessionTable {
 
     /// Routes one request and records the contact the retirement policy reads.
     /// The owned handle lets the caller release this lock before it streams a
-    /// response body.
+    /// response body.  A request is also the other moment the table sees the
+    /// clock, so retired sessions past their grace are swept here as well as on
+    /// a reseal; otherwise a source whose hellos stopped would keep them until
+    /// it stops.
     fn touch_at(&mut self, session_id: &str, now_ms: u128) -> Option<Arc<LanSession>> {
-        for entry in self
+        let touched = self
             .clone
             .iter_mut()
             .chain(self.delta.iter_mut())
             .chain(self.bidirectional.iter_mut())
             .chain(self.retired.iter_mut())
-        {
-            if entry.session.session_id() == session_id {
+            .find(|entry| entry.session.session_id() == session_id)
+            .map(|entry| {
                 entry.last_touched_ms = now_ms;
-                return Some(Arc::clone(&entry.session));
-            }
-        }
-        None
+                Arc::clone(&entry.session)
+            });
+        self.retire_sweep_at(now_ms);
+        touched
     }
 
     /// Seats a freshly sealed session as the lane's newest, unless the lane is
@@ -8942,6 +8945,29 @@ mod timeout_tests {
 
         assert_eq!(retired_ids(&table), [busy]);
         assert!(table.touch_at(idle, recent + 2_000).is_none());
+    }
+
+    #[test]
+    fn shared_session_table_request_routing_sweeps_expired_retired_sessions() {
+        let idle = "00000000-0000-4000-8000-0000000000f1";
+        let live = "00000000-0000-4000-8000-0000000000f2";
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(idle), 1, 0);
+        table.install_at(
+            SharedSessionKind::Delta,
+            table_delta_session(live),
+            2,
+            1_000,
+        );
+        assert_eq!(retired_ids(&table), [idle]);
+
+        // No reseal follows, so a request for the live session is the only
+        // clock the table sees. The retired session past its grace goes then.
+        let expired = 1_000 + RETIRED_SESSION_GRACE_MS + 1;
+        assert!(table.touch_at(live, expired).is_some());
+
+        assert!(table.retired.is_empty());
+        assert!(table.touch_at(idle, expired + 1).is_none());
     }
 
     #[test]
