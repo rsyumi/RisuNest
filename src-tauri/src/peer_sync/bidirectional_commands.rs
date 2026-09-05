@@ -178,7 +178,7 @@ impl TargetPreparedConflictPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "phase", rename_all = "camelCase")]
+#[serde(tag = "phase", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum PeerBidirectionalDurableOperation {
     SourcePrepared {
         schema: String,

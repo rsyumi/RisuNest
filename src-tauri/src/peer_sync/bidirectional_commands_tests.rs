@@ -2413,9 +2413,10 @@ fn source_prepared_operation_survives_reopen_without_changing_older_journals() {
     assert!(journal.load().is_err());
     journal.store(&prepared).unwrap();
 
-    // The durable operation enum does not deny unknown fields, so a stale
-    // completion flag from a record this build no longer writes is ignored
-    // rather than reported. Every remote apply is lease-gated now.
+    // A stale completion flag belongs to a record this build no longer writes,
+    // so it is a shape only an older build could have produced: the journal
+    // refuses it instead of skipping the key. Every remote apply is lease-gated
+    // now.
     let mut deferred_source = serde_json::to_value(&prepared).unwrap();
     deferred_source
         .as_object_mut()
@@ -2426,10 +2427,8 @@ fn source_prepared_operation_survives_reopen_without_changing_older_journals() {
         serde_json::to_vec(&deferred_source).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        SourcePreparedEvidence::from_operation(&journal.load().unwrap().unwrap()),
-        SourcePreparedEvidence::from_operation(&prepared)
-    );
+    assert!(journal.load().is_err());
+    journal.store(&prepared).unwrap();
 
     let old_fixture = serde_json::to_vec(&PeerBidirectionalDurableOperation::LocalCommitted {
         schema: OPERATION_SCHEMA.to_owned(),
@@ -2954,6 +2953,26 @@ fn a_journal_without_a_remote_backup_flag_is_not_deserializable() {
 fn a_journal_with_a_stale_completion_mode_is_not_deserializable() {
     let mut journal = local_committed_journal_json();
     journal["context"]["completionMode"] = json!("v1");
+    let bytes = serde_json::to_vec(&journal).unwrap();
+    assert!(serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes).is_err());
+
+    let directory = tempfile::tempdir().unwrap();
+    let operation_root = directory.path().join("peer-bidirectional");
+    fs::create_dir_all(&operation_root).unwrap();
+    fs::write(operation_root.join(OPERATION_FILE), &bytes).unwrap();
+
+    assert!(matches!(
+        PeerBidirectionalOperationJournal::new(directory.path()).load(),
+        Err(PeerSyncError::Storage(_))
+    ));
+}
+
+#[test]
+fn a_journal_with_an_unknown_operation_field_is_not_deserializable() {
+    // The pre-release compatibility rule: a key only an older RisuNest build
+    // could have written is a deserialization error, not something to skip.
+    let mut journal = local_committed_journal_json();
+    journal["completionDeferredV1"] = json!(false);
     let bytes = serde_json::to_vec(&journal).unwrap();
     assert!(serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes).is_err());
 
