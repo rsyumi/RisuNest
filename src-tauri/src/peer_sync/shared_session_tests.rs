@@ -728,6 +728,7 @@ fn android_notification_stop_refuses_real_connections_and_release_removes_the_so
             app_root: root.path(),
             cancellation: &NeverCancelled,
             expected_bidirectional_revision: expected_revision,
+            remote_commit: Arc::new(SharedRemoteCommitSlot::default()),
         };
         state
             .prepare_for_test(&mut context, root.path(), android_lan_request(port))
