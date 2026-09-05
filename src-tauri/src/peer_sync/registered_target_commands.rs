@@ -161,11 +161,9 @@ fn resolve_registered_source(
             );
             return Err(PeerCommandCode::IdentityMismatch);
         }
-    }
-    // The full copy replaces this device's data wholesale, so the clone lane is
-    // refreshed once the source's identity is confirmed. The source reseals only
-    // when its store has moved past the package it already advertises.
-    if lane == RegisteredLane::Clone {
+        // The full copy replaces this device's data wholesale, so the clone lane is
+        // refreshed once the source's identity is confirmed. The source reseals only
+        // when its store has moved past the package it already advertises.
         refresh_clone_lane(&mut connection, authenticated_peer_clone_session)?;
     }
     Ok(connection)
