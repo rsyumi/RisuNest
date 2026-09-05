@@ -233,7 +233,7 @@ fn loopback_origin() -> SocketAddr {
 
 #[test]
 fn quick_tunnel_has_only_loopback_transport_and_no_token_sources() {
-    let launch = TunnelMode::Quick.launch(loopback_origin()).unwrap();
+    let launch = quick_launch(loopback_origin()).unwrap();
 
     assert_eq!(
         launch.args,
@@ -247,21 +247,20 @@ fn quick_tunnel_has_only_loopback_transport_and_no_token_sources() {
     assert_eq!(launch.origin, "http://127.0.0.1:32145");
     assert_eq!(launch.env_remove, ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"]);
     assert!(!launch.args.iter().any(|arg| arg == "--token"));
-    assert!(launch.token_env.is_none());
 }
 
 #[test]
 fn quick_tunnel_rejects_zero_or_non_loopback_origins() {
     assert!(matches!(
-        TunnelMode::Quick.launch(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        quick_launch(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
         Err(TunnelError::InvalidOrigin)
     ));
     assert!(matches!(
-        TunnelMode::Quick.launch(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 32145))),
+        quick_launch(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 32145))),
         Err(TunnelError::InvalidOrigin)
     ));
     assert!(matches!(
-        TunnelMode::Quick.launch("[::1]:32145".parse().unwrap()),
+        quick_launch("[::1]:32145".parse().unwrap()),
         Err(TunnelError::InvalidOrigin)
     ));
 }
@@ -411,8 +410,7 @@ fn discovery_failure_returns_peer_session_for_lan_fallback() {
         },
     );
 
-    let failure =
-        expect_failure(adapter.start(TunnelMode::Quick, loopback_origin(), peer(&state, 41)));
+    let failure = expect_failure(adapter.start(loopback_origin(), peer(&state, 41)));
     let returned = expect_peer(failure);
 
     assert_eq!(returned.id, 41);
@@ -436,11 +434,7 @@ fn dropping_discovery_failure_retries_owned_peer_revoke() {
     let mut owned_peer = peer(&state, 54);
     owned_peer.revoke_results = VecDeque::from([Err("first revoke failed".into()), Ok(())]);
 
-    drop(expect_failure(adapter.start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        owned_peer,
-    )));
+    drop(expect_failure(adapter.start(loopback_origin(), owned_peer)));
 
     assert_eq!(state.lock().unwrap().session_revokes, 2);
 }
@@ -462,8 +456,7 @@ fn launch_failure_returns_peer_session_without_exposing_a_token() {
         },
     );
 
-    let failure =
-        expect_failure(adapter.start(TunnelMode::Quick, loopback_origin(), peer(&state, 42)));
+    let failure = expect_failure(adapter.start(loopback_origin(), peer(&state, 42)));
     let returned = expect_peer(failure);
 
     assert_eq!(returned.id, 42);
@@ -496,11 +489,7 @@ fn dropping_launch_failure_bounds_owned_peer_revoke() {
         Err("must not be attempted".into()),
     ]);
 
-    drop(expect_failure(adapter.start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        owned_peer,
-    )));
+    drop(expect_failure(adapter.start(loopback_origin(), owned_peer)));
 
     assert_eq!(state.lock().unwrap().session_revokes, 3);
 }
@@ -517,8 +506,7 @@ fn readiness_failure_stops_process_then_returns_peer_session() {
     );
     let adapter = adapter(&state, process);
 
-    let failure =
-        expect_failure(adapter.start(TunnelMode::Quick, loopback_origin(), peer(&state, 43)));
+    let failure = expect_failure(adapter.start(loopback_origin(), peer(&state, 43)));
     let returned = expect_peer(failure);
 
     assert_eq!(returned.id, 43);
@@ -544,8 +532,7 @@ fn failed_start_cleanup_preserves_process_for_retry_before_returning_peer() {
     process.stop_results = VecDeque::from([Err("stop timeout".into()), Ok(())]);
     let adapter = adapter(&state, process);
 
-    let mut failure =
-        expect_failure(adapter.start(TunnelMode::Quick, loopback_origin(), peer(&state, 44)));
+    let mut failure = expect_failure(adapter.start(loopback_origin(), peer(&state, 44)));
 
     assert_eq!(
         failure.process_cleanup_error.as_deref(),
@@ -573,11 +560,9 @@ fn dropping_failed_start_retries_child_cleanup_automatically() {
     ]);
     let adapter = adapter(&state, process);
 
-    drop(expect_failure(adapter.start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 45),
-    )));
+    drop(expect_failure(
+        adapter.start(loopback_origin(), peer(&state, 45)),
+    ));
 
     let state = state.lock().unwrap();
     assert_eq!(state.stop_timeouts.len(), 3);
@@ -603,11 +588,9 @@ fn dropping_readiness_failure_cleans_process_and_peer_independently() {
     let mut owned_peer = peer(&state, 56);
     owned_peer.revoke_results = VecDeque::from([Err("first revoke failed".into()), Ok(())]);
 
-    drop(expect_failure(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        owned_peer,
-    )));
+    drop(expect_failure(
+        adapter(&state, process).start(loopback_origin(), owned_peer),
+    ));
 
     let state = state.lock().unwrap();
     assert_eq!(state.stop_timeouts.len(), 4);
@@ -620,11 +603,8 @@ fn dropping_readiness_failure_cleans_process_and_peer_independently() {
 fn successful_start_exposes_transport_url_separately_from_peer_session() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let process = fake_process(&state, Ok(ready()));
-    let mut running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 46),
-    ));
+    let mut running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 46)));
 
     assert_eq!(
         running.transport_url().as_str(),
@@ -638,11 +618,8 @@ fn natural_process_exit_revokes_peer_session() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let mut process = fake_process(&state, Ok(ready()));
     process.polls = VecDeque::from([Ok(Some(7))]);
-    let mut running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 47),
-    ));
+    let mut running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 47)));
 
     let terminal = running.wait_terminal(Duration::from_secs(1)).unwrap();
 
@@ -655,11 +632,8 @@ fn nonblocking_lifecycle_poll_reaps_a_natural_exit() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let mut process = fake_process(&state, Ok(ready()));
     process.polls = VecDeque::from([Ok(Some(7))]);
-    let mut running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 57),
-    ));
+    let mut running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 57)));
 
     let mut lifecycle = RunningTunnelLifecycle::Running;
     for _ in 0..100 {
@@ -679,11 +653,8 @@ fn process_stop_failure_keeps_supervisor_state_for_retry() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let mut process = fake_process(&state, Ok(ready()));
     process.stop_results = VecDeque::from([Err("stop timeout".into()), Ok(())]);
-    let mut running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 48),
-    ));
+    let mut running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 48)));
 
     assert!(matches!(
         running.stop(Duration::from_millis(20)),
@@ -705,8 +676,7 @@ fn peer_revoke_failure_keeps_supervisor_state_for_retry() {
     let process = fake_process(&state, Ok(ready()));
     let mut peer = peer(&state, 49);
     peer.revoke_results = VecDeque::from([Err("revoke failed".into()), Ok(())]);
-    let mut running =
-        expect_running(adapter(&state, process).start(TunnelMode::Quick, loopback_origin(), peer));
+    let mut running = expect_running(adapter(&state, process).start(loopback_origin(), peer));
 
     assert!(matches!(
         running.stop(Duration::from_millis(20)),
@@ -729,8 +699,7 @@ fn natural_exit_revoke_failure_can_be_retried_without_restarting_process() {
     process.polls = VecDeque::from([Ok(Some(9))]);
     let mut peer = peer(&state, 50);
     peer.revoke_results = VecDeque::from([Err("revoke failed".into()), Ok(())]);
-    let mut running =
-        expect_running(adapter(&state, process).start(TunnelMode::Quick, loopback_origin(), peer));
+    let mut running = expect_running(adapter(&state, process).start(loopback_origin(), peer));
 
     thread::sleep(Duration::from_millis(30));
     running.stop(Duration::from_millis(20)).unwrap();
@@ -747,8 +716,7 @@ fn natural_exit_revoke_failure_reports_cleanup_pending_until_stop_retry() {
     process.polls = VecDeque::from([Ok(Some(9))]);
     let mut peer = peer(&state, 59);
     peer.revoke_results = VecDeque::from([Err("revoke failed".into()), Ok(())]);
-    let mut running =
-        expect_running(adapter(&state, process).start(TunnelMode::Quick, loopback_origin(), peer));
+    let mut running = expect_running(adapter(&state, process).start(loopback_origin(), peer));
 
     let mut lifecycle = RunningTunnelLifecycle::Running;
     for _ in 0..100 {
@@ -830,11 +798,8 @@ fn drop_retries_cleanup_before_releasing_the_handle() {
         Err("stop timeout 2".into()),
         Ok(()),
     ]);
-    let running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 51),
-    ));
+    let running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 51)));
 
     drop(running);
 
@@ -860,8 +825,7 @@ fn drop_disconnects_and_rejoins_supervisor_after_bounded_retry_failure() {
         Err("revoke failed 3".into()),
         Err("disconnect cleanup failed".into()),
     ]);
-    let running =
-        expect_running(adapter(&state, process).start(TunnelMode::Quick, loopback_origin(), peer));
+    let running = expect_running(adapter(&state, process).start(loopback_origin(), peer));
 
     drop(running);
 
@@ -878,11 +842,8 @@ fn poll_error_stops_process_and_revokes_peer_before_reporting_terminal_reason() 
     let mut process = fake_process(&state, Ok(ready()));
     process.polls = VecDeque::from([Err("wait failed".into())]);
     process.stop_results = VecDeque::from([Err("monitor cleanup timed out".into()), Ok(())]);
-    let mut running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 53),
-    ));
+    let mut running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 53)));
 
     let terminal = running.wait_terminal(Duration::from_secs(1)).unwrap();
 
@@ -916,11 +877,8 @@ fn nonblocking_lifecycle_reports_cleanup_pending_until_stop_retry() {
     let mut process = fake_process(&state, Ok(ready()));
     process.polls = VecDeque::from([Err("wait failed".into())]);
     process.stop_results = VecDeque::from([Err("monitor cleanup timed out".into()), Ok(())]);
-    let mut running = expect_running(adapter(&state, process).start(
-        TunnelMode::Quick,
-        loopback_origin(),
-        peer(&state, 58),
-    ));
+    let mut running =
+        expect_running(adapter(&state, process).start(loopback_origin(), peer(&state, 58)));
 
     let mut lifecycle = RunningTunnelLifecycle::Running;
     for _ in 0..100 {

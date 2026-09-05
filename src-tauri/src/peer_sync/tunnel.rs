@@ -228,55 +228,35 @@ impl CloudflaredDiscovery for PathCloudflaredDiscovery {
     }
 }
 
-pub(crate) enum TunnelMode {
-    Quick,
-}
-
 struct LaunchSpec {
     args: Vec<OsString>,
     env_remove: [&'static str; 2],
-    token_env: Option<String>,
     // Asserted by the launch-spec tests.
     #[cfg_attr(not(test), allow(dead_code))]
     origin: String,
-    readiness: ProcessReadiness,
 }
 
-enum ProcessReadiness {
-    Quick,
-}
-
-impl TunnelMode {
-    fn launch(self, origin: SocketAddr) -> Result<LaunchSpec, TunnelError> {
-        let SocketAddr::V4(origin) = origin else {
-            return Err(TunnelError::InvalidOrigin);
-        };
-        if origin.ip() != &Ipv4Addr::LOCALHOST || origin.port() == 0 {
-            return Err(TunnelError::InvalidOrigin);
-        }
-        let origin = format!("http://{origin}");
-
-        let (args, token_env, readiness) = match self {
-            Self::Quick => (
-                vec![
-                    "tunnel".into(),
-                    "--no-autoupdate".into(),
-                    "--url".into(),
-                    origin.clone().into(),
-                ],
-                None,
-                ProcessReadiness::Quick,
-            ),
-        };
-
-        Ok(LaunchSpec {
-            args,
-            env_remove: ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"],
-            token_env,
-            origin,
-            readiness,
-        })
+/// The quick tunnel is the only cloudflared process this build launches. It
+/// takes no token: the two token sources are scrubbed from the environment and
+/// nothing here can put one back.
+fn quick_launch(origin: SocketAddr) -> Result<LaunchSpec, TunnelError> {
+    let SocketAddr::V4(origin) = origin else {
+        return Err(TunnelError::InvalidOrigin);
+    };
+    if origin.ip() != &Ipv4Addr::LOCALHOST || origin.port() == 0 {
+        return Err(TunnelError::InvalidOrigin);
     }
+    let origin = format!("http://{origin}");
+    Ok(LaunchSpec {
+        args: vec![
+            "tunnel".into(),
+            "--no-autoupdate".into(),
+            "--url".into(),
+            origin.clone().into(),
+        ],
+        env_remove: ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"],
+        origin,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,19 +359,12 @@ fn parse_quick_tunnel_url(output: &str) -> Option<Url> {
     None
 }
 
-fn safe_readiness_error_output(readiness: &ProcessReadiness, output: &BoundedOutput) -> String {
-    match readiness {
-        ProcessReadiness::Quick => output.text(),
-    }
-}
-
 pub(crate) struct SystemTunnelProcess {
     child: Child,
     #[cfg(windows)]
     _kill_on_close_job: KillOnCloseJob,
     output_rx: Receiver<Vec<u8>>,
     output: BoundedOutput,
-    readiness: ProcessReadiness,
 }
 
 #[cfg(windows)]
@@ -449,7 +422,7 @@ impl SystemTunnelProcess {
     }
 
     fn safe_error_output(&self) -> String {
-        safe_readiness_error_output(&self.readiness, &self.output)
+        self.output.text()
     }
 }
 
@@ -475,12 +448,8 @@ impl TunnelProcess for SystemTunnelProcess {
                 self.capture_output();
                 return Err(self.exited_error(status));
             }
-            match &self.readiness {
-                ProcessReadiness::Quick => {
-                    if let Some(transport_url) = parse_quick_tunnel_url(&self.output.text()) {
-                        return Ok(TunnelReady { transport_url });
-                    }
-                }
+            if let Some(transport_url) = parse_quick_tunnel_url(&self.output.text()) {
+                return Ok(TunnelReady { transport_url });
             }
             let now = Instant::now();
             if now >= deadline {
@@ -599,9 +568,7 @@ impl TunnelProcessLauncher for SystemTunnelProcessLauncher {
         let LaunchSpec {
             args,
             env_remove,
-            token_env,
             origin: _,
-            readiness,
         } = launch;
         let mut command = Command::new(executable.as_path());
         command
@@ -611,9 +578,6 @@ impl TunnelProcessLauncher for SystemTunnelProcessLauncher {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(token) = token_env {
-            command.env("TUNNEL_TOKEN", token);
-        }
         configure_no_window(&mut command);
 
         #[cfg(windows)]
@@ -646,7 +610,6 @@ impl TunnelProcessLauncher for SystemTunnelProcessLauncher {
             _kill_on_close_job: kill_on_close_job,
             output_rx,
             output: BoundedOutput::new(OUTPUT_LIMIT),
-            readiness,
         })
     }
 }
@@ -807,14 +770,13 @@ where
 {
     fn start<S>(
         &self,
-        mode: TunnelMode,
         origin: SocketAddr,
         peer_session: S,
     ) -> Result<RunningTunnel, TunnelStartFailure<L::Process, S>>
     where
         S: PeerSession,
     {
-        let launch = match mode.launch(origin) {
+        let launch = match quick_launch(origin) {
             Ok(launch) => launch,
             Err(error) => {
                 return Err(TunnelStartFailure {
@@ -1009,7 +971,7 @@ pub(crate) fn start_quick_desktop_tunnel_session<S>(
 where
     S: PeerSession,
 {
-    TunnelAdapter::system().start(TunnelMode::Quick, origin, peer_session)
+    TunnelAdapter::system().start(origin, peer_session)
 }
 
 enum SupervisorCommand {
