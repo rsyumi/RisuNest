@@ -6286,11 +6286,11 @@ pub async fn peer_bidirectional_resume(
         run_retained_remote_completion(&mut store, &root, &operation_id, expected_revision, None)
     })
     .await;
-    // A worker that never returned leaves no outcome to publish, so it reports
-    // the join failure on its own and skips the Android terminal publication
-    // below, the way it did before the bounded codes landed.
-    let resumed = finish_peer_worker("bidirectional resume worker", joined.map(Ok))?;
-    let outcome = finish_peer_command("bidirectional resume", resumed);
+    // A worker that never returned has no outcome of its own, so its join code
+    // becomes the outcome: the Android foreground notification has to leave the
+    // running state even when the worker panicked.
+    let outcome = finish_peer_worker("bidirectional resume worker", joined.map(Ok))
+        .and_then(|resumed| finish_peer_command("bidirectional resume", resumed));
     #[cfg(target_os = "android")]
     finish_peer_command(
         "bidirectional resume terminal state",
