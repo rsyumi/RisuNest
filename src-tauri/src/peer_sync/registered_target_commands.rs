@@ -142,7 +142,7 @@ fn resolve_registered_source(
     device_id: &str,
     lane: RegisteredLane,
 ) -> Result<RegisteredSourceConnection, PeerCommandCode> {
-    let connection =
+    let mut connection =
         resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello_status)?;
     if lane == RegisteredLane::Clone {
         // The clone lane re-reads the hello immediately before it connects, so a

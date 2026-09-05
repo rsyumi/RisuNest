@@ -4136,7 +4136,6 @@ fn retain_foreign_source_operation(app_root: &std::path::Path) {
             transferred_bytes: 0,
             backup_required: false,
             backup: None,
-            completion_deferred_v1: false,
             durable_job_id: "123e4567-e89b-42d3-a456-426614174303".to_owned(),
         })
         .unwrap();

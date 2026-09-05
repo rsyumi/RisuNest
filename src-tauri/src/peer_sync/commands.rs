@@ -4222,41 +4222,27 @@ mod tests {
     /// job belonging to another source device still refuses.
     #[test]
     fn a_registered_retry_supersedes_the_stale_persisted_job_of_the_same_source() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
-        let source_device_id = "00000000-0000-4000-8000-000000000221";
-        let bearer = "a".repeat(64);
+        let interrupted = source.request.clone();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
         let other_source_device_id = "00000000-0000-4000-8000-000000000222";
         let other_bearer = "b".repeat(64);
-        let interrupted = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000223".to_owned(),
-            manifest_id: "c".repeat(64),
-        };
-        let resealed = PeerCloneTargetRequest {
-            endpoint: interrupted.endpoint.clone(),
-            session_id: "00000000-0000-4000-8000-000000000224".to_owned(),
-            manifest_id: "d".repeat(64),
-        };
         let foreign = PeerCloneTargetRequest {
             endpoint: "http://127.0.0.1:32146".to_owned(),
             session_id: "00000000-0000-4000-8000-000000000225".to_owned(),
             manifest_id: "e".repeat(64),
-        };
-        let register_source = |device_id: &str, endpoint: &str, bearer: &str| {
-            super::super::device_registry::register_incoming_source(
-                root.path(),
-                super::super::device_registry::IncomingSource {
-                    device_id: device_id.to_owned(),
-                    name: format!("Source {device_id}"),
-                    endpoint: endpoint.to_owned(),
-                    bearer: bearer.to_owned(),
-                    permissions: super::super::device_registry::DevicePermissions::read(),
-                    last_seen_ms: 0,
-                    total_bytes: 0,
-                },
-            )
-            .unwrap();
         };
         let connect = |state: &PeerCloneCommandState,
                        request: &PeerCloneTargetRequest,
@@ -4269,21 +4255,25 @@ mod tests {
                 &request.manifest_id,
                 device_id,
                 bearer,
-                PeerCompletionCapability::Unsupported,
             )
         };
-        register_source(source_device_id, &interrupted.endpoint, &bearer);
-        connect(
-            &PeerCloneCommandState::default(),
-            &interrupted,
-            source_device_id,
-            &bearer,
-        )
-        .unwrap();
+        {
+            let first_run = PeerCloneCommandState::default();
+            connect(&first_run, &interrupted, &source_device_id, &bearer).unwrap();
+            // The app restart leaves the interrupted job on disk with no owner.
+        }
 
-        // The restart leaves the interrupted job on disk with nothing owning it.
-        let restarted = PeerCloneCommandState::default();
-        let result = connect(&restarted, &resealed, source_device_id, &bearer).unwrap();
+        // The source moved on: its clone lane now names a fresh session and
+        // manifest, and the retry resolves that descriptor.
+        let resealed = source.restart(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            "Restarted",
+        );
+        source.register_at(root.path(), &resealed.endpoint);
+        let retry = PeerCloneCommandState::default();
+        let result = connect(&retry, &resealed, &source_device_id, &bearer).unwrap();
 
         let interrupted_root = target_paths(&peer_root, &interrupted).unwrap().job_root;
         let resealed_root = target_paths(&peer_root, &resealed).unwrap().job_root;
@@ -4292,8 +4282,20 @@ mod tests {
         assert!(resealed_root.try_exists().unwrap());
 
         // The surviving job belongs to the first source, so a second source
-        // cannot supersede it.
-        register_source(other_source_device_id, &foreign.endpoint, &other_bearer);
+        // cannot supersede it; the refusal happens before any transport.
+        super::super::device_registry::register_incoming_source(
+            root.path(),
+            super::super::device_registry::IncomingSource {
+                device_id: other_source_device_id.to_owned(),
+                name: "Other source".to_owned(),
+                endpoint: foreign.endpoint.clone(),
+                bearer: other_bearer.clone(),
+                permissions: super::super::device_registry::DevicePermissions::read(),
+                last_seen_ms: 0,
+                total_bytes: 0,
+            },
+        )
+        .unwrap();
         assert_eq!(
             connect(
                 &PeerCloneCommandState::default(),
@@ -4312,8 +4314,8 @@ mod tests {
             .job_root
             .try_exists()
             .unwrap());
+        source.hosted.host.stop().unwrap();
     }
-
     #[test]
     fn registered_target_reconnect_cleanup_failure_preserves_terminal_ownership() {
         let source_root = tempfile::tempdir().unwrap();
