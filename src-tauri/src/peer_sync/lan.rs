@@ -156,6 +156,16 @@ pub(crate) const PEER_COMPLETION_LEASE_HEADER: &str = "RisuNest-Peer-Completion-
 pub(crate) const PEER_COMPLETION_RESUME_HEADER: &str = "RisuNest-Peer-Completion-Resume";
 #[cfg(any(desktop, target_os = "android"))]
 const LOGICAL_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a session that a newer seal replaced keeps answering.  A transfer
+/// in flight touches its own session for every object, so a retired session
+/// that nothing touched for this long has finished or been abandoned.
+#[cfg(any(desktop, target_os = "android"))]
+const RETIRED_SESSION_GRACE_MS: u128 = 10 * 60 * 1000;
+/// The retired sessions one lane keeps.  Each one holds a SQLite handle and a
+/// logical generation pin, so the count is bounded rather than left to the
+/// grace window alone.
+#[cfg(any(desktop, target_os = "android"))]
+const MAX_RETIRED_SESSIONS_PER_LANE: usize = 4;
 
 #[cfg(any(desktop, target_os = "android"))]
 pub struct LanPairing {
@@ -953,9 +963,173 @@ pub(crate) struct TunnelOriginProbe {
     pub(crate) expected_body: [u8; 32],
 }
 
+/// The lane a live session belongs to.  `shared_session::SharedSourceLane`
+/// orders preparation instead, and `lan` deliberately does not depend on that
+/// module.
+#[cfg(any(desktop, target_os = "android"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedSessionKind {
+    Clone,
+    Delta,
+    Bidirectional,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+impl SharedSessionKind {
+    const ALL: [Self; 3] = [Self::Clone, Self::Delta, Self::Bidirectional];
+}
+
+/// A prepared session together with the store revision it was sealed at.  The
+/// three preparation functions already know that revision, so the seal carries
+/// it rather than making the table recompute it.
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) struct SharedSessionSeal<T> {
+    pub(crate) session: T,
+    pub(crate) sealed_revision: i64,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+struct SharedSessionEntry {
+    session: Arc<LanSession>,
+    sealed_revision: i64,
+    last_touched_ms: u128,
+}
+
+/// The live session set of one host.  Each lane keeps its newest seal, and the
+/// sessions a newer seal replaced stay routable so a transfer already in
+/// flight finishes on the session it started with.
+#[cfg(any(desktop, target_os = "android"))]
+struct SharedSessionTable {
+    clone: Option<SharedSessionEntry>,
+    delta: Option<SharedSessionEntry>,
+    bidirectional: Option<SharedSessionEntry>,
+    retired: Vec<SharedSessionEntry>,
+    /// The lane the pairing link names.  A shared host pairs on its clone
+    /// lane; a host that opens one lane for a single operation pairs on that.
+    pairing: SharedSessionKind,
+}
+
+#[cfg(any(desktop, target_os = "android"))]
+impl SharedSessionTable {
+    fn new(pairing: SharedSessionKind) -> Self {
+        Self {
+            clone: None,
+            delta: None,
+            bidirectional: None,
+            retired: Vec::new(),
+            pairing,
+        }
+    }
+
+    fn lane_mut(&mut self, kind: SharedSessionKind) -> &mut Option<SharedSessionEntry> {
+        match kind {
+            SharedSessionKind::Clone => &mut self.clone,
+            SharedSessionKind::Delta => &mut self.delta,
+            SharedSessionKind::Bidirectional => &mut self.bidirectional,
+        }
+    }
+
+    fn latest(&self, kind: SharedSessionKind) -> Option<&SharedSessionEntry> {
+        match kind {
+            SharedSessionKind::Clone => self.clone.as_ref(),
+            SharedSessionKind::Delta => self.delta.as_ref(),
+            SharedSessionKind::Bidirectional => self.bidirectional.as_ref(),
+        }
+    }
+
+    fn descriptor(&self, kind: SharedSessionKind) -> Option<(String, String)> {
+        self.latest(kind).map(|entry| {
+            (
+                entry.session.session_id().to_owned(),
+                entry.session.manifest_id().to_owned(),
+            )
+        })
+    }
+
+    fn primary(&self) -> Option<Arc<LanSession>> {
+        self.latest(self.pairing)
+            .map(|entry| Arc::clone(&entry.session))
+    }
+
+    /// Routes one request and records the contact the retirement policy reads.
+    /// The owned handle lets the caller release this lock before it streams a
+    /// response body.
+    fn touch_at(&mut self, session_id: &str, now_ms: u128) -> Option<Arc<LanSession>> {
+        for entry in self
+            .clone
+            .iter_mut()
+            .chain(self.delta.iter_mut())
+            .chain(self.bidirectional.iter_mut())
+            .chain(self.retired.iter_mut())
+        {
+            if entry.session.session_id() == session_id {
+                entry.last_touched_ms = now_ms;
+                return Some(Arc::clone(&entry.session));
+            }
+        }
+        None
+    }
+
+    /// Seats a freshly sealed session as the lane's newest, unless the lane is
+    /// already at that revision or beyond.  Dropping the argument in that case
+    /// releases its generation pin, and it advertises the same values anyway.
+    fn install_at(
+        &mut self,
+        kind: SharedSessionKind,
+        session: LanSession,
+        sealed_revision: i64,
+        now_ms: u128,
+    ) {
+        if self
+            .latest(kind)
+            .is_some_and(|entry| entry.sealed_revision >= sealed_revision)
+        {
+            return;
+        }
+        let entry = SharedSessionEntry {
+            session: Arc::new(session),
+            sealed_revision,
+            last_touched_ms: now_ms,
+        };
+        if let Some(previous) = self.lane_mut(kind).replace(entry) {
+            self.retired.push(previous);
+        }
+        self.retire_sweep_at(now_ms);
+    }
+
+    fn retire_sweep_at(&mut self, now_ms: u128) {
+        self.retired.retain(|entry| {
+            now_ms.saturating_sub(entry.last_touched_ms) <= RETIRED_SESSION_GRACE_MS
+        });
+        for kind in SharedSessionKind::ALL {
+            let mut touched = self
+                .retired
+                .iter()
+                .filter(|entry| entry.session.kind() == kind)
+                .map(|entry| entry.last_touched_ms)
+                .collect::<Vec<_>>();
+            if touched.len() <= MAX_RETIRED_SESSIONS_PER_LANE {
+                continue;
+            }
+            touched.sort_unstable();
+            let mut excess = touched.len() - MAX_RETIRED_SESSIONS_PER_LANE;
+            let cutoff = touched[excess - 1];
+            // Ties at the cutoff drop in retirement order, so the session that
+            // was replaced first is the one that goes.
+            self.retired.retain(|entry| {
+                if excess == 0 || entry.session.kind() != kind || entry.last_touched_ms > cutoff {
+                    return true;
+                }
+                excess -= 1;
+                false
+            });
+        }
+    }
+}
+
 #[cfg(any(desktop, target_os = "android"))]
 struct LanShared {
-    sessions: Vec<LanSession>,
+    sessions: Mutex<SharedSessionTable>,
     claim: Mutex<Option<ClaimState>>,
     #[cfg(desktop)]
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
@@ -1105,6 +1279,14 @@ impl LanSession {
         }
     }
 
+    fn kind(&self) -> SharedSessionKind {
+        match self {
+            Self::Clone(_) => SharedSessionKind::Clone,
+            Self::Logical(_) => SharedSessionKind::Delta,
+            Self::BidirectionalLogical(_) => SharedSessionKind::Bidirectional,
+        }
+    }
+
     /// The grant a session hands out when its pairing link did not pin one, which
     /// is the case only for the sessions a lane opens for a single operation.
     fn lane_permissions(&self) -> DevicePermissions {
@@ -1156,18 +1338,17 @@ impl LanSession {
 }
 
 #[cfg(any(desktop, target_os = "android"))]
-fn session_by_id<'a>(shared: &'a LanShared, session_id: &str) -> Option<&'a LanSession> {
-    shared
-        .sessions
-        .iter()
-        .find(|session| session.session_id() == session_id)
+fn session_by_id(shared: &LanShared, session_id: &str) -> Option<Arc<LanSession>> {
+    recovered_lock(&shared.sessions).touch_at(session_id, now_ms())
 }
 
 #[cfg(any(desktop, target_os = "android"))]
-fn primary_session(shared: &LanShared) -> &LanSession {
-    // Every host is prepared with at least one session, and a shared host lists the
-    // clone session first, so the pairing link always names this session.
-    &shared.sessions[0]
+fn primary_session(shared: &LanShared) -> Result<Arc<LanSession>, PeerSyncError> {
+    // Every host is prepared with at least one session, and a shared host pairs
+    // on its clone lane, so the pairing link always names this session.
+    recovered_lock(&shared.sessions)
+        .primary()
+        .ok_or_else(|| PeerSyncError::Protocol("shared LAN host has no pairing session".to_owned()))
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -1238,13 +1419,10 @@ pub struct LanCloneHost {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHost {
-    // Physical clone hosting has no production caller left: the unified device
-    // sync source hosts logical sessions. The engine tests still cover it.
-    #[cfg(test)]
-    pub fn prepare(session: PreparedCloneSession) -> Self {
+    fn with_sessions(sessions: SharedSessionTable) -> Self {
         Self {
             shared: Arc::new(LanShared {
-                sessions: vec![LanSession::Clone(session)],
+                sessions: Mutex::new(sessions),
                 claim: Mutex::new(None),
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
@@ -1261,24 +1439,24 @@ impl LanCloneHost {
         }
     }
 
+    // A host that opens a single lane pairs on that lane and never reseals, so
+    // its one session is seated at revision zero and stays there.
+    fn with_single_session(session: LanSession) -> Self {
+        let kind = session.kind();
+        let mut sessions = SharedSessionTable::new(kind);
+        sessions.install_at(kind, session, 0, now_ms());
+        Self::with_sessions(sessions)
+    }
+
+    // Physical clone hosting has no production caller left: the unified device
+    // sync source hosts logical sessions. The engine tests still cover it.
+    #[cfg(test)]
+    pub fn prepare(session: PreparedCloneSession) -> Self {
+        Self::with_single_session(LanSession::Clone(session))
+    }
+
     pub fn prepare_logical(session: PreparedLogicalLanSession) -> Self {
-        Self {
-            shared: Arc::new(LanShared {
-                sessions: vec![LanSession::Logical(session)],
-                claim: Mutex::new(None),
-                #[cfg(desktop)]
-                tunnel_probe: Mutex::new(None),
-                devices: Mutex::new(BTreeMap::new()),
-                v2_registration: Mutex::new(None),
-                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
-                #[cfg(test)]
-                after_v2_registry_claim: Mutex::new(None),
-            }),
-            address: None,
-            stopped: None,
-            active_connection: None,
-            thread: None,
-        }
+        Self::with_single_session(LanSession::Logical(session))
     }
 
     // Production hosts bidirectional sessions through the shared session
@@ -1287,63 +1465,50 @@ impl LanCloneHost {
     pub(crate) fn prepare_bidirectional_logical(
         session: PreparedBidirectionalLogicalLanSession,
     ) -> Self {
-        Self {
-            shared: Arc::new(LanShared {
-                sessions: vec![LanSession::BidirectionalLogical(session)],
-                claim: Mutex::new(None),
-                #[cfg(desktop)]
-                tunnel_probe: Mutex::new(None),
-                devices: Mutex::new(BTreeMap::new()),
-                v2_registration: Mutex::new(None),
-                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
-                #[cfg(test)]
-                after_v2_registry_claim: Mutex::new(None),
-            }),
-            address: None,
-            stopped: None,
-            active_connection: None,
-            thread: None,
-        }
+        Self::with_single_session(LanSession::BidirectionalLogical(session))
     }
 
     // One raw listener can serve the existing three session types.  Their
     // transfer engines remain owned by the prepared sessions themselves.
     pub(crate) fn prepare_shared(
-        clone: PreparedCloneSession,
-        delta: PreparedLogicalLanSession,
-        bidirectional: PreparedBidirectionalLogicalLanSession,
+        clone: SharedSessionSeal<PreparedCloneSession>,
+        delta: SharedSessionSeal<PreparedLogicalLanSession>,
+        bidirectional: SharedSessionSeal<PreparedBidirectionalLogicalLanSession>,
     ) -> Result<Self, PeerSyncError> {
-        let sessions = vec![
-            LanSession::Clone(clone),
-            LanSession::Logical(delta),
-            LanSession::BidirectionalLogical(bidirectional),
+        let seals = [
+            (
+                SharedSessionKind::Clone,
+                LanSession::Clone(clone.session),
+                clone.sealed_revision,
+            ),
+            (
+                SharedSessionKind::Delta,
+                LanSession::Logical(delta.session),
+                delta.sealed_revision,
+            ),
+            (
+                SharedSessionKind::Bidirectional,
+                LanSession::BidirectionalLogical(bidirectional.session),
+                bidirectional.sealed_revision,
+            ),
         ];
-        let mut ids = std::collections::BTreeSet::new();
-        if sessions
-            .iter()
-            .any(|session| !ids.insert(session.session_id()))
         {
-            return Err(PeerSyncError::Validation(
-                "shared LAN sessions must have distinct IDs".to_owned(),
-            ));
+            let mut ids = std::collections::BTreeSet::new();
+            if seals
+                .iter()
+                .any(|(_, session, _)| !ids.insert(session.session_id()))
+            {
+                return Err(PeerSyncError::Validation(
+                    "shared LAN sessions must have distinct IDs".to_owned(),
+                ));
+            }
         }
-        Ok(Self {
-            shared: Arc::new(LanShared {
-                sessions,
-                claim: Mutex::new(None),
-                #[cfg(desktop)]
-                tunnel_probe: Mutex::new(None),
-                devices: Mutex::new(BTreeMap::new()),
-                v2_registration: Mutex::new(None),
-                issued_logical_objects: OutgoingLogicalIssuedObjects::default(),
-                #[cfg(test)]
-                after_v2_registry_claim: Mutex::new(None),
-            }),
-            address: None,
-            stopped: None,
-            active_connection: None,
-            thread: None,
-        })
+        let mut sessions = SharedSessionTable::new(SharedSessionKind::Clone);
+        let now = now_ms();
+        for (kind, session, sealed_revision) in seals {
+            sessions.install_at(kind, session, sealed_revision, now);
+        }
+        Ok(Self::with_sessions(sessions))
     }
 
     // Decides what a claim on this host does: a registered clone or shared host
@@ -1523,9 +1688,10 @@ impl LanCloneHost {
         self.address = Some(address);
         self.stopped = Some(stopped);
         self.active_connection = Some(active_connection);
+        let primary = primary_session(&self.shared)?;
         Ok(LanPairing {
-            session_id: primary_session(&self.shared).session_id().to_owned(),
-            manifest_id: primary_session(&self.shared).manifest_id().to_owned(),
+            session_id: primary.session_id().to_owned(),
+            manifest_id: primary.manifest_id().to_owned(),
             claim: hex::encode(claim),
             permissions: v2_permissions.map(|permissions| permissions.values().to_vec()),
         })
@@ -1559,18 +1725,23 @@ impl LanCloneHost {
             consumed: false,
             v2_permissions: permissions.clone(),
         });
+        let primary = primary_session(&self.shared)?;
         Ok(LanPairing {
-            session_id: primary_session(&self.shared).session_id().to_owned(),
-            manifest_id: primary_session(&self.shared).manifest_id().to_owned(),
+            session_id: primary.session_id().to_owned(),
+            manifest_id: primary.manifest_id().to_owned(),
             claim: hex::encode(claim),
             permissions: permissions.map(|value| value.values().to_vec()),
         })
     }
 
+    // The session table lives behind a lock, so this convenience accessor hands
+    // back an owned manifest instead of a borrow into the table.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn manifest(&self) -> &super::CloneManifest {
-        match primary_session(&self.shared) {
-            LanSession::Clone(session) => session.manifest(),
+    pub fn manifest(&self) -> super::CloneManifest {
+        let primary =
+            primary_session(&self.shared).expect("shared LAN host has no pairing session");
+        match primary.as_ref() {
+            LanSession::Clone(session) => session.manifest().clone(),
             LanSession::Logical(_) | LanSession::BidirectionalLogical(_) => {
                 panic!("logical LAN session has no clone manifest")
             }
@@ -1611,7 +1782,7 @@ impl LanCloneHost {
         });
         let path_prefix = format!(
             "/v1/sessions/{}/tunnel-check",
-            primary_session(&self.shared).session_id()
+            primary_session(&self.shared)?.session_id()
         );
         let path = format!("{path_prefix}/{}", hex::encode(secret));
         Ok(TunnelOriginProbe {
@@ -2014,13 +2185,13 @@ fn handle_request(
         }
     }
     if request.url == format!("{prefix}/claim") {
-        return claim(stream, request, shared, session);
+        return claim(stream, request, shared, &session);
     }
     let device = match authorize(&request, shared) {
         Ok(device) => device,
         Err(status) => return respond_empty(stream, status),
     };
-    if matches!(session, LanSession::BidirectionalLogical(_))
+    if matches!(&*session, LanSession::BidirectionalLogical(_))
         && !device.permissions.allows_bidirectional()
     {
         return respond_empty(stream, 403);
@@ -2037,7 +2208,7 @@ fn handle_request(
                 return respond_empty(stream, 400);
             }
             if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
-                let issued = match session {
+                let issued = match &*session {
                     LanSession::Clone(clone) => {
                         let transferred_bytes = clone
                             .manifest()
@@ -2099,7 +2270,7 @@ fn handle_request(
                         ),
                         (PEER_COMPLETION_LEASE_HEADER, lease.as_str()),
                     ],
-                    match session {
+                    match &*session {
                         LanSession::Clone(session) => session.manifest_bytes(),
                         LanSession::Logical(session) => &session.manifest_bytes,
                         LanSession::BidirectionalLogical(session) => {
@@ -2118,7 +2289,7 @@ fn handle_request(
                 ("Content-Type", "application/json"),
                 ("ETag", &quoted(session.manifest_id())),
             ],
-            match session {
+            match &*session {
                 LanSession::Clone(session) => session.manifest_bytes(),
                 LanSession::Logical(session) => &session.manifest_bytes,
                 LanSession::BidirectionalLogical(session) => &session.logical.manifest_bytes,
@@ -2129,13 +2300,13 @@ fn handle_request(
         if request.method != "POST" {
             return respond_empty(stream, 405);
         }
-        return progress(stream, request, shared, session, &device.device_id);
+        return progress(stream, request, shared, &session, &device.device_id);
     }
     if request.url == format!("{prefix}/registration") {
-        return bidirectional_registration(stream, request, session, &device);
+        return bidirectional_registration(stream, request, &session, &device);
     }
     if request.url == format!("{prefix}/remote-apply") {
-        return bidirectional_remote_apply(stream, request, shared, session, &device, stopped);
+        return bidirectional_remote_apply(stream, request, shared, &session, &device, stopped);
     }
     let object_prefix = format!("{prefix}/objects/");
     let Some(object) = request.url.strip_prefix(&object_prefix).map(str::to_owned) else {
@@ -2144,11 +2315,11 @@ fn handle_request(
     if object.contains('/') || session.object_size(&object).is_none() {
         return respond_empty(stream, 404);
     }
-    match (session, request.method.as_str()) {
-        (LanSession::Clone(_), "HEAD") => head(stream, session, &object),
-        (LanSession::Clone(_), "GET") => range(stream, &request, session, &object, stopped),
+    match (&*session, request.method.as_str()) {
+        (LanSession::Clone(_), "HEAD") => head(stream, &session, &object),
+        (LanSession::Clone(_), "GET") => range(stream, &request, &session, &object, stopped),
         (LanSession::Logical(_) | LanSession::BidirectionalLogical(_), "HEAD") => {
-            head(stream, session, &object)
+            head(stream, &session, &object)
         }
         (LanSession::Logical(_) | LanSession::BidirectionalLogical(_), "GET") => {
             if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
@@ -2187,7 +2358,7 @@ fn handle_request(
             logical_object(
                 stream,
                 shared,
-                session,
+                &session,
                 &device.device_id,
                 &object,
                 completion_issue_guard,
@@ -2982,17 +3153,17 @@ fn hello(
     let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
         return respond_empty(stream, 404);
     };
-    #[derive(Clone, Serialize)]
+    #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct LaneDescriptor<'a> {
-        session_id: &'a str,
-        manifest_id: &'a str,
+    struct LaneDescriptor {
+        session_id: String,
+        manifest_id: String,
     }
     #[derive(Serialize)]
-    struct Lanes<'a> {
-        clone: Option<LaneDescriptor<'a>>,
-        delta: Option<LaneDescriptor<'a>>,
-        bidirectional: Option<LaneDescriptor<'a>>,
+    struct Lanes {
+        clone: Option<LaneDescriptor>,
+        delta: Option<LaneDescriptor>,
+        bidirectional: Option<LaneDescriptor>,
     }
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -3000,33 +3171,25 @@ fn hello(
         device_id: &'a str,
         name: &'a str,
         permissions: &'a [String],
-        lanes: Lanes<'a>,
+        lanes: Lanes,
     }
-    let clone = shared
-        .sessions
-        .iter()
-        .find(|session| matches!(session, LanSession::Clone(_)));
-    let delta = shared
-        .sessions
-        .iter()
-        .find(|session| matches!(session, LanSession::Logical(_)));
-    let bidirectional = shared
-        .sessions
-        .iter()
-        .find(|session| matches!(session, LanSession::BidirectionalLogical(_)));
-    let lanes = Lanes {
-        clone: clone.map(|session| LaneDescriptor {
-            session_id: session.session_id(),
-            manifest_id: session.manifest_id(),
-        }),
-        delta: delta.map(|session| LaneDescriptor {
-            session_id: session.session_id(),
-            manifest_id: session.manifest_id(),
-        }),
-        bidirectional: bidirectional.map(|session| LaneDescriptor {
-            session_id: session.session_id(),
-            manifest_id: session.manifest_id(),
-        }),
+    // The three descriptors are copied out and the lock is released before the
+    // response goes on the wire.
+    let lanes = {
+        let table = recovered_lock(&shared.sessions);
+        let descriptor = |kind| {
+            table
+                .descriptor(kind)
+                .map(|(session_id, manifest_id)| LaneDescriptor {
+                    session_id,
+                    manifest_id,
+                })
+        };
+        Lanes {
+            clone: descriptor(SharedSessionKind::Clone),
+            delta: descriptor(SharedSessionKind::Delta),
+            bidirectional: descriptor(SharedSessionKind::Bidirectional),
+        }
     };
     respond_json_with_headers(
         stream,
@@ -8339,6 +8502,203 @@ mod timeout_tests {
             logical_request_timeout(LogicalRequestKind::Object, timeouts),
             Duration::from_secs(30),
         );
+    }
+    const TABLE_SOURCE_ID: &str = "00000000-0000-4000-8000-0000000000d0";
+
+    fn table_delta_session(session_id: &str) -> LanSession {
+        LanSession::Logical(prepared_logical_session(session_id, TABLE_SOURCE_ID))
+    }
+
+    fn table_bidirectional_session(session_id: &str) -> LanSession {
+        LanSession::BidirectionalLogical(prepared_bidirectional_logical_session(
+            session_id,
+            TABLE_SOURCE_ID,
+            Arc::new(BidirectionalControlFixture::default()),
+        ))
+    }
+
+    fn retired_ids(table: &SharedSessionTable) -> Vec<String> {
+        table
+            .retired
+            .iter()
+            .map(|entry| entry.session.session_id().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn shared_session_table_routes_every_live_session_by_id() {
+        let first = "00000000-0000-4000-8000-0000000000d1";
+        let second = "00000000-0000-4000-8000-0000000000d2";
+        let third = "00000000-0000-4000-8000-0000000000d3";
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(first), 1, 10);
+        table.install_at(
+            SharedSessionKind::Bidirectional,
+            table_bidirectional_session(second),
+            1,
+            10,
+        );
+        table.install_at(SharedSessionKind::Delta, table_delta_session(third), 2, 20);
+
+        assert_eq!(retired_ids(&table), [first]);
+        for id in [first, second, third] {
+            assert_eq!(table.touch_at(id, 30).unwrap().session_id(), id);
+        }
+        assert!(table
+            .touch_at("00000000-0000-4000-8000-0000000000d9", 30)
+            .is_none());
+    }
+
+    #[test]
+    fn shared_session_table_install_retires_the_previous_entry() {
+        let first = "00000000-0000-4000-8000-0000000000d4";
+        let second = "00000000-0000-4000-8000-0000000000d5";
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(first), 3, 10);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(second), 4, 20);
+
+        assert_eq!(
+            table.descriptor(SharedSessionKind::Delta).unwrap().0,
+            second
+        );
+        assert_eq!(
+            table
+                .latest(SharedSessionKind::Delta)
+                .unwrap()
+                .sealed_revision,
+            4
+        );
+        assert_eq!(retired_ids(&table), [first]);
+    }
+
+    #[test]
+    fn shared_session_table_install_drops_a_stale_seal() {
+        let first = "00000000-0000-4000-8000-0000000000d6";
+        let second = "00000000-0000-4000-8000-0000000000d7";
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(first), 5, 10);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(second), 5, 20);
+
+        assert_eq!(table.descriptor(SharedSessionKind::Delta).unwrap().0, first);
+        assert!(table.retired.is_empty());
+        assert!(table.touch_at(second, 30).is_none());
+    }
+
+    #[test]
+    fn shared_session_table_retires_idle_sessions_after_the_grace_window() {
+        let idle = "00000000-0000-4000-8000-0000000000e1";
+        let busy = "00000000-0000-4000-8000-0000000000e2";
+        let newest = "00000000-0000-4000-8000-0000000000e3";
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        table.install_at(SharedSessionKind::Delta, table_delta_session(idle), 1, 0);
+        table.install_at(
+            SharedSessionKind::Delta,
+            table_delta_session(busy),
+            2,
+            1_000,
+        );
+        let recent = RETIRED_SESSION_GRACE_MS + 1_000;
+        assert!(table.touch_at(busy, recent).is_some());
+        table.install_at(
+            SharedSessionKind::Delta,
+            table_delta_session(newest),
+            3,
+            recent + 1_000,
+        );
+
+        assert_eq!(retired_ids(&table), [busy]);
+        assert!(table.touch_at(idle, recent + 2_000).is_none());
+    }
+
+    #[test]
+    fn shared_session_table_caps_retired_sessions_per_lane() {
+        let ids = [
+            "00000000-0000-4000-8000-0000000000e4",
+            "00000000-0000-4000-8000-0000000000e5",
+            "00000000-0000-4000-8000-0000000000e6",
+            "00000000-0000-4000-8000-0000000000e7",
+            "00000000-0000-4000-8000-0000000000e8",
+            "00000000-0000-4000-8000-0000000000e9",
+        ];
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        for (index, id) in ids.iter().enumerate() {
+            table.install_at(
+                SharedSessionKind::Delta,
+                table_delta_session(id),
+                index as i64 + 1,
+                index as u128 + 1,
+            );
+        }
+
+        assert_eq!(table.retired.len(), MAX_RETIRED_SESSIONS_PER_LANE);
+        assert_eq!(retired_ids(&table), ids[1..5]);
+        assert!(table.touch_at(ids[0], 100).is_none());
+    }
+
+    #[test]
+    fn shared_session_table_keeps_the_most_recently_touched_retired_session() {
+        let ids = [
+            "00000000-0000-4000-8000-0000000000ea",
+            "00000000-0000-4000-8000-0000000000eb",
+            "00000000-0000-4000-8000-0000000000ec",
+            "00000000-0000-4000-8000-0000000000ed",
+            "00000000-0000-4000-8000-0000000000ee",
+            "00000000-0000-4000-8000-0000000000ef",
+        ];
+        let mut table = SharedSessionTable::new(SharedSessionKind::Delta);
+        for (index, id) in ids.iter().enumerate() {
+            table.install_at(
+                SharedSessionKind::Delta,
+                table_delta_session(id),
+                index as i64 + 1,
+                index as u128 + 1,
+            );
+            // The oldest retired session keeps answering an in-flight transfer,
+            // so the cap has to drop the untouched ones instead.
+            if index >= 1 {
+                assert!(table.touch_at(ids[0], index as u128 + 1).is_some());
+            }
+        }
+
+        assert_eq!(table.retired.len(), MAX_RETIRED_SESSIONS_PER_LANE);
+        assert!(table.touch_at(ids[0], 100).is_some());
+        assert!(table.touch_at(ids[1], 100).is_none());
+    }
+
+    #[test]
+    fn shared_session_table_primary_session_follows_the_pairing_lane() {
+        let delta = "00000000-0000-4000-8000-0000000000f1";
+        let bidirectional = "00000000-0000-4000-8000-0000000000f2";
+        let mut delta_paired = SharedSessionTable::new(SharedSessionKind::Delta);
+        delta_paired.install_at(SharedSessionKind::Delta, table_delta_session(delta), 1, 10);
+        delta_paired.install_at(
+            SharedSessionKind::Bidirectional,
+            table_bidirectional_session(bidirectional),
+            1,
+            10,
+        );
+        let mut bidirectional_paired = SharedSessionTable::new(SharedSessionKind::Bidirectional);
+        bidirectional_paired.install_at(
+            SharedSessionKind::Delta,
+            table_delta_session(delta),
+            1,
+            10,
+        );
+        bidirectional_paired.install_at(
+            SharedSessionKind::Bidirectional,
+            table_bidirectional_session(bidirectional),
+            1,
+            10,
+        );
+
+        assert_eq!(delta_paired.primary().unwrap().session_id(), delta);
+        assert_eq!(
+            bidirectional_paired.primary().unwrap().session_id(),
+            bidirectional
+        );
+        assert!(SharedSessionTable::new(SharedSessionKind::Clone)
+            .primary()
+            .is_none());
     }
 }
 

@@ -21,6 +21,7 @@ use super::{
         LanBidirectionalControl, LanBidirectionalRegistrationRequest,
         LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
         LanBidirectionalSession, PreparedBidirectionalLogicalLanSession, PreparedLogicalLanSession,
+        SharedSessionSeal,
     },
     logical_delta::{
         build_logical_manifest, LogicalManifestBuilderInput, LogicalManifestObject,
@@ -1483,7 +1484,21 @@ fn host() -> (tempfile::TempDir, SharedSessionHost) {
         Arc::new(SharedRemoteCommitSlot::default()),
     )
     .unwrap();
-    let mut host = SharedSessionHost::new(clone, delta, bidi).unwrap();
+    let mut host = SharedSessionHost::new(
+        SharedSessionSeal {
+            session: clone,
+            sealed_revision: 0,
+        },
+        SharedSessionSeal {
+            session: delta,
+            sealed_revision: 0,
+        },
+        SharedSessionSeal {
+            session: bidi,
+            sealed_revision: 0,
+        },
+    )
+    .unwrap();
     host.enable_v2_registry(root.path(), "test", DevicePermissions::read())
         .unwrap();
     (root, host)

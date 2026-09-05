@@ -94,6 +94,7 @@ struct PeerDeltaRuntime {
 /// source cleanup drops the transport.
 pub(crate) struct PreparedSharedDeltaSource {
     session: Option<PreparedLogicalLanSession>,
+    sealed_revision: i64,
 }
 
 impl PreparedSharedDeltaSource {
@@ -101,6 +102,10 @@ impl PreparedSharedDeltaSource {
         self.session.take().ok_or_else(|| {
             PeerSyncError::Protocol("shared delta source session is unavailable".to_owned())
         })
+    }
+
+    pub(crate) fn sealed_revision(&self) -> i64 {
+        self.sealed_revision
     }
 
     pub(crate) fn cleanup(&mut self) {
@@ -131,6 +136,9 @@ pub(crate) fn prepare_shared_delta_source(
     let transport_session_id = uuid::Uuid::new_v4().to_string();
     let manifest_id = session.manifest_hash().to_owned();
     let objects = session.objects().to_vec();
+    let sealed_revision = i64::try_from(built.manifest.source_revision).map_err(|_| {
+        PeerSyncError::Validation("logical source revision exceeds SQLite range".to_owned())
+    })?;
     let prepared = PreparedLogicalLanSession::new(
         &transport_session_id,
         &source_device_id,
@@ -141,6 +149,7 @@ pub(crate) fn prepare_shared_delta_source(
     )?;
     Ok(PreparedSharedDeltaSource {
         session: Some(prepared),
+        sealed_revision,
     })
 }
 

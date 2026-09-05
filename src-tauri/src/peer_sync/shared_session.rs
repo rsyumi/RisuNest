@@ -4,7 +4,8 @@
 use super::{
     device_registry::DevicePermissions,
     lan::{
-        LanCloneHost, LanPairing, PreparedBidirectionalLogicalLanSession, PreparedLogicalLanSession,
+        LanCloneHost, LanPairing, PreparedBidirectionalLogicalLanSession,
+        PreparedLogicalLanSession, SharedSessionSeal,
     },
     PeerSyncError, PreparedCloneSession,
 };
@@ -314,9 +315,18 @@ impl SharedSourceOwnership for SharedSourceEngines {
             PeerSyncError::Protocol("shared bidirectional source is not prepared".to_owned())
         })?;
         SharedSessionHost::new(
-            clone.take_session()?,
-            delta.take_session()?,
-            bidirectional.take_session()?,
+            SharedSessionSeal {
+                sealed_revision: clone.sealed_revision(),
+                session: clone.take_session()?,
+            },
+            SharedSessionSeal {
+                sealed_revision: delta.sealed_revision(),
+                session: delta.take_session()?,
+            },
+            SharedSessionSeal {
+                sealed_revision: bidirectional.sealed_revision(),
+                session: bidirectional.take_session()?,
+            },
         )
     }
 
@@ -2131,9 +2141,9 @@ pub(crate) struct SharedSessionHost {
 
 impl SharedSessionHost {
     pub(crate) fn new(
-        clone: PreparedCloneSession,
-        delta: PreparedLogicalLanSession,
-        bidirectional: PreparedBidirectionalLogicalLanSession,
+        clone: SharedSessionSeal<PreparedCloneSession>,
+        delta: SharedSessionSeal<PreparedLogicalLanSession>,
+        bidirectional: SharedSessionSeal<PreparedBidirectionalLogicalLanSession>,
     ) -> Result<Self, PeerSyncError> {
         Ok(Self {
             inner: Arc::new(Mutex::new(SharedSessionHostInner {

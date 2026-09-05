@@ -5084,6 +5084,7 @@ pub(super) fn open_command_store(app: &AppHandle) -> Result<PersistentStore, Pee
 
 pub(crate) struct PreparedSharedBidirectionalSource {
     session: Option<PreparedBidirectionalLogicalLanSession>,
+    sealed_revision: i64,
 }
 
 impl PreparedSharedBidirectionalSource {
@@ -5093,6 +5094,10 @@ impl PreparedSharedBidirectionalSource {
         self.session.take().ok_or_else(|| {
             PeerSyncError::Protocol("shared bidirectional source session is unavailable".to_owned())
         })
+    }
+
+    pub(crate) fn sealed_revision(&self) -> i64 {
+        self.sealed_revision
     }
 
     pub(crate) fn cleanup(&mut self) {
@@ -5179,6 +5184,7 @@ pub(crate) fn prepare_shared_bidirectional_source(
     )?;
     Ok(PreparedSharedBidirectionalSource {
         session: Some(session),
+        sealed_revision: expected_revision,
     })
 }
 

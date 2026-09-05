@@ -148,6 +148,7 @@ pub(crate) fn prepare_lossless_clone_session(
 /// exact generated directory for deterministic lane cleanup.
 pub(crate) struct PreparedUnifiedCloneSource {
     prepared: Option<PreparedCloneSession>,
+    sealed_revision: i64,
     session_root: PathBuf,
     marker_path: PathBuf,
     marker: UnifiedActiveSourceMarker,
@@ -158,6 +159,10 @@ impl PreparedUnifiedCloneSource {
         self.prepared.take().ok_or_else(|| {
             PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())
         })
+    }
+
+    pub(crate) fn sealed_revision(&self) -> i64 {
+        self.sealed_revision
     }
 
     pub(crate) fn cleanup(&mut self) -> Result<(), PeerSyncError> {
@@ -227,6 +232,7 @@ pub(crate) fn prepare_unified_clone_source(
     }
     Ok(PreparedUnifiedCloneSource {
         prepared: Some(prepared),
+        sealed_revision: expected_revision,
         session_root,
         marker_path,
         marker,
