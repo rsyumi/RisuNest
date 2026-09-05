@@ -301,8 +301,21 @@ describe('device sync facade', () => {
         await expect(facade.status()).resolves.toEqual({ phase: 'prepared', lastRemoteCommit })
     })
 
+    it('accepts any canonical lowercase operation id the native side accepts', async () => {
+        // Native validation is `is_canonical_uuid` (any version), so a nil UUID
+        // must not turn the status poll into a state failure.
+        const lastRemoteCommit = { operationId: '00000000-0000-0000-0000-000000000000', committedRevision: 3 }
+        const facade = createDeviceSyncFacade({
+            invoke: vi.fn(async () => ({ phase: 'prepared', lastRemoteCommit })),
+            runtime: runtimeStub(),
+        })
+
+        await expect(facade.status()).resolves.toEqual({ phase: 'prepared', lastRemoteCommit })
+    })
+
     it.each([
         ['an extra key', { operationId: canonicalOperationId, committedRevision: 12, extra: 'secret' }],
+        ['an uppercase operation id', { operationId: canonicalOperationId.toUpperCase(), committedRevision: 12 }],
         ['a missing revision', { operationId: canonicalOperationId }],
         ['a non-UUID operation', { operationId: 'not-a-uuid', committedRevision: 12 }],
         ['a negative revision', { operationId: canonicalOperationId, committedRevision: -1 }],

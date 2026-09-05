@@ -247,7 +247,10 @@ export function safeDeviceSyncStatus(value: unknown): DeviceSyncStatus {
     let lastRemoteCommit: DeviceSyncRemoteCommit | undefined
     if (source.lastRemoteCommit !== undefined && source.lastRemoteCommit !== null) {
         const commit = source.lastRemoteCommit as Record<string, unknown>
-        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        // Mirrors the native `is_canonical_uuid` rule (lowercase hyphenated form,
+        // any version): a stricter check here would turn a peer's accepted
+        // operation id into a status failure that stops the source poll.
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
         if (
             typeof commit !== 'object'
             || Array.isArray(commit)
