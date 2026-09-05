@@ -88,98 +88,6 @@ fn re_bounding_a_bidirectional_outcome_keeps_a_code_the_lane_already_produced() 
     );
 }
 
-#[test]
-fn android_p5_source_release_consumes_exact_full_stop_after_notification_callback() {
-    let _registry_guard = super::super::android_foreground::test_registry_guard();
-    let directory = tempfile::tempdir().unwrap();
-    let cas = PayloadCas::new(directory.path()).unwrap();
-    let mut store = PersistentStore::open(directory.path()).unwrap();
-    let active = store
-        .seal_or_initialize_active_logical_generation(&cas)
-        .unwrap();
-    let source = LogicalDeltaSourceSession::open_owned(
-        store.open_native_job_store().unwrap(),
-        directory.path(),
-        PRODUCT_LOGICAL_LIBRARY_ID,
-        &active.manifest.generation,
-        P5_SOURCE_PIN_PREFIX,
-    )
-    .unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174189";
-    let prepared = super::super::lan::PreparedLogicalLanSession::new(
-        session_id,
-        "123e4567-e89b-42d3-a456-426614174190",
-        active.manifest_hash.clone(),
-        active.manifest_bytes,
-        source.objects().to_vec(),
-        Box::new(source),
-    )
-    .unwrap();
-    let state = PeerBidirectionalCommandState::default();
-    state
-        .install_source(
-            LanCloneHost::prepare_logical(prepared),
-            session_id,
-            &active.manifest_hash,
-        )
-        .unwrap();
-    let foreground = registry().reserve(AndroidForegroundLane::P5Source).unwrap();
-    assert!(registry().attach_exact(&foreground));
-    state
-        .attach_source_foreground(session_id, foreground.clone())
-        .unwrap();
-    let lease_count = || {
-        let connection =
-            rusqlite::Connection::open(directory.path().join("persistent").join("persistent.db"))
-                .unwrap();
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM logical_generation_session_pins WHERE session_id LIKE 'logical-session-p5-source-%'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-    };
-
-    assert_eq!(lease_count(), 1);
-    assert_eq!(
-        state.source_stop_foreground(session_id).unwrap(),
-        Some(foreground.clone()),
-    );
-    assert!(state.source_is_active().unwrap());
-    assert_eq!(lease_count(), 1);
-    assert!(registry().reserve(AndroidForegroundLane::P4Source).is_err());
-
-    state.pause_source_exact(&foreground);
-    assert!(state.source_is_active().unwrap());
-    assert_eq!(lease_count(), 1);
-    assert!(registry().reserve(AndroidForegroundLane::P4Source).is_err());
-    assert_eq!(
-        state.source_stop_foreground(session_id).unwrap(),
-        Some(foreground.clone()),
-    );
-
-    let stale = AndroidForegroundKey {
-        generation: foreground.generation + 1,
-        ..foreground.clone()
-    };
-    assert!(!state
-        .release_source_android_exact(session_id, &stale)
-        .unwrap());
-    assert!(state.source_is_active().unwrap());
-    assert_eq!(lease_count(), 1);
-
-    assert!(state
-        .release_source_android_exact(session_id, &foreground)
-        .unwrap());
-    assert!(!state.source_is_active().unwrap());
-    assert_eq!(lease_count(), 0);
-    assert!(state
-        .release_source_android_exact(session_id, &foreground)
-        .unwrap());
-    let fresh = registry().reserve(AndroidForegroundLane::P4Source).unwrap();
-    assert!(registry().abandon_source_exact(&fresh));
-}
 use crate::{
     asset_repository::{
         job_pins::{collect_durable_cas_job_roots, CasObjectRole},
@@ -198,7 +106,7 @@ use crate::{
 };
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     io::Cursor,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -212,51 +120,6 @@ static REVERSE_CLEANUP_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex:
 struct FakeReverseProcess {
     attempts: Arc<AtomicUsize>,
     fail_through_attempt: usize,
-}
-
-struct FakeSourceTunnel {
-    lifecycles: VecDeque<RunningTunnelLifecycle>,
-    stop_attempts: Arc<AtomicUsize>,
-    fail_stop_through_attempt: usize,
-}
-
-impl SourceTunnelProcess for FakeSourceTunnel {
-    fn stop(&mut self) -> Result<(), PeerSyncError> {
-        let attempt = self.stop_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-        if attempt <= self.fail_stop_through_attempt {
-            Err(PeerSyncError::Transport(
-                "fixture source cleanup failed".to_owned(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn lifecycle(&mut self) -> Result<RunningTunnelLifecycle, PeerSyncError> {
-        Ok(self
-            .lifecycles
-            .pop_front()
-            .unwrap_or(RunningTunnelLifecycle::Running))
-    }
-}
-
-struct BlockingSourceTunnel {
-    lifecycle_started: mpsc::Sender<()>,
-    lifecycle_release: mpsc::Receiver<()>,
-    stop_attempts: Arc<AtomicUsize>,
-}
-
-impl SourceTunnelProcess for BlockingSourceTunnel {
-    fn stop(&mut self) -> Result<(), PeerSyncError> {
-        self.stop_attempts.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn lifecycle(&mut self) -> Result<RunningTunnelLifecycle, PeerSyncError> {
-        self.lifecycle_started.send(()).unwrap();
-        self.lifecycle_release.recv().unwrap();
-        Ok(RunningTunnelLifecycle::Running)
-    }
 }
 
 impl ReverseTunnelProcess for FakeReverseProcess {
@@ -280,52 +143,6 @@ fn fake_reverse_owner(
         attempts: Arc::clone(attempts),
         fail_through_attempt,
     }))
-}
-
-fn state_with_source_tunnel(
-    root: &Path,
-    session_id: &str,
-    tunnel: Box<dyn SourceTunnelProcess>,
-) -> (PeerBidirectionalCommandState, PersistentStore) {
-    let cas = PayloadCas::new(root).unwrap();
-    let mut store = PersistentStore::open(root).unwrap();
-    let active = store
-        .seal_or_initialize_active_logical_generation(&cas)
-        .unwrap();
-    let source = LogicalDeltaSourceSession::open(
-        store.open_native_job_store().unwrap(),
-        root,
-        PRODUCT_LOGICAL_LIBRARY_ID,
-        &active.manifest.generation,
-    )
-    .unwrap();
-    let prepared = super::super::lan::PreparedLogicalLanSession::new(
-        session_id,
-        "123e4567-e89b-42d3-a456-426614174190",
-        active.manifest_hash.clone(),
-        active.manifest_bytes,
-        source.objects().to_vec(),
-        Box::new(source),
-    )
-    .unwrap();
-    let state = PeerBidirectionalCommandState::default();
-    state
-        .install_source(
-            LanCloneHost::prepare_logical(prepared),
-            session_id,
-            &active.manifest_hash,
-        )
-        .unwrap();
-    {
-        let mut runtime = state.lock().unwrap();
-        let source = runtime.source.as_mut().unwrap();
-        source.host = None;
-        source.tunnel = Some(tunnel);
-        source.phase = PeerBidirectionalSourcePhase::Running;
-        source.pairing_uri = Some("risuailocal://peer-sync/v1".to_owned());
-        source.tunnel_metadata = Some(PeerBidirectionalTunnelMetadata::quick());
-    }
-    (state, store)
 }
 
 struct FixtureSource {
@@ -2626,20 +2443,22 @@ fn source_prepared_operation_survives_reopen_without_changing_older_journals() {
             if retained == operation_id
     ));
 
-    let mut legacy_source = serde_json::to_value(&prepared).unwrap();
-    legacy_source
+    // The journal renames variants, not their fields, so the flag is stored as
+    // `backup_required`. Every source-prepared record this build writes carries
+    // it, so a record without it is not a shape this build can read.
+    let mut without_backup_flag = serde_json::to_value(&prepared).unwrap();
+    assert!(without_backup_flag
         .as_object_mut()
         .unwrap()
-        .remove("backupRequired");
+        .remove("backup_required")
+        .is_some());
     fs::write(
         journal.root.join(OPERATION_FILE),
-        serde_json::to_vec(&legacy_source).unwrap(),
+        serde_json::to_vec(&without_backup_flag).unwrap(),
     )
     .unwrap();
-    let legacy_source = journal.load().unwrap().unwrap();
-    let legacy_evidence = SourcePreparedEvidence::from_operation(&legacy_source).unwrap();
-    assert!(legacy_evidence.requires_backup());
-    assert!(!legacy_evidence.completion_deferred_v1);
+    assert!(journal.load().is_err());
+    journal.store(&prepared).unwrap();
 
     let mut deferred_source = serde_json::to_value(&prepared).unwrap();
     deferred_source
@@ -8919,24 +8738,17 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
 }
 
 #[test]
-fn command_state_excludes_source_preparation_and_target_work() {
+fn command_state_serializes_target_work() {
     let state = PeerBidirectionalCommandState::default();
-
-    let source = state.begin_source_prepare().unwrap();
-    assert!(matches!(
-        state.begin_target(),
-        Err(PeerSyncError::Protocol(message)) if message.contains("source")
-    ));
-    drop(source);
 
     let target = state.begin_target().unwrap();
     assert!(matches!(
-        state.begin_source_prepare(),
+        state.begin_target(),
         Err(PeerSyncError::Protocol(message)) if message.contains("target")
     ));
     drop(target);
 
-    assert!(state.begin_source_prepare().is_ok());
+    assert!(state.begin_target().is_ok());
 }
 
 #[test]
@@ -9890,65 +9702,6 @@ fn acknowledge_does_not_promote_source_postcommit_with_a_corrupt_physical_backup
 }
 
 #[test]
-fn status_projects_source_prepared_while_source_runtime_is_active() {
-    let directory = tempfile::tempdir().unwrap();
-    let operation_id = "123e4567-e89b-42d3-a456-426614174164";
-    let durable_job_id = "123e4567-e89b-42d3-a456-426614174165";
-    let (mut store, _cas, evidence, _receipt) = retain_source_postcommit_fixture(
-        directory.path(),
-        operation_id,
-        "123e4567-e89b-42d3-a456-426614174166",
-        "123e4567-e89b-42d3-a456-426614174167",
-        durable_job_id,
-    );
-    let active = store
-        .seal_or_initialize_active_logical_generation(&PayloadCas::new(directory.path()).unwrap())
-        .unwrap();
-    let source = LogicalDeltaSourceSession::open(
-        PersistentStore::open(directory.path()).unwrap(),
-        directory.path(),
-        PRODUCT_LOGICAL_LIBRARY_ID,
-        &active.manifest.generation,
-    )
-    .unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174168";
-    let prepared = super::super::lan::PreparedLogicalLanSession::new(
-        session_id,
-        "123e4567-e89b-42d3-a456-426614174169",
-        active.manifest_hash.clone(),
-        active.manifest_bytes,
-        source.objects().to_vec(),
-        Box::new(source),
-    )
-    .unwrap();
-    let state = PeerBidirectionalCommandState::default();
-    state
-        .install_source(
-            LanCloneHost::prepare_logical(prepared),
-            session_id,
-            &active.manifest_hash,
-        )
-        .unwrap();
-
-    let status = state.status(directory.path(), &mut store).unwrap();
-
-    assert!(matches!(
-        status.operation,
-        Some(PeerBidirectionalStatusOperation::SourcePrepared { ref operation_id })
-            if operation_id == &evidence.operation_id
-    ));
-    assert!(matches!(
-        PeerBidirectionalOperationJournal::new(directory.path())
-            .load()
-            .unwrap(),
-        Some(PeerBidirectionalDurableOperation::SourcePrepared { .. })
-    ));
-    let job = DurableCasJob::open(directory.path(), durable_job_id).unwrap();
-    assert!(job.is_sealed());
-    assert!(!job.is_released());
-}
-
-#[test]
 fn status_projects_source_prepared_while_target_guard_is_active_then_promotes_once_idle() {
     let directory = tempfile::tempdir().unwrap();
     let operation_id = "123e4567-e89b-42d3-a456-426614174170";
@@ -10619,7 +10372,6 @@ fn lane_three_capabilities_and_status_dtos_are_exact() {
         )
         .unwrap(),
         json!({
-            "source": { "phase": "idle", "devices": [] },
             "operation": {
                 "phase": "completed",
                 "result": {
@@ -10696,316 +10448,6 @@ fn source_completed_status_projects_its_backup_as_local_without_mutating_the_jou
     };
     assert_eq!(result.backups[0].side, PeerBidirectionalBackupSide::Local);
     assert_eq!(journal.load().unwrap(), Some(completed));
-}
-
-#[test]
-fn completed_acknowledgement_keeps_source_owned_until_explicit_stop() {
-    let directory = tempfile::tempdir().unwrap();
-    let cas = PayloadCas::new(directory.path()).unwrap();
-    let mut store = PersistentStore::open(directory.path()).unwrap();
-    let built = store
-        .seal_or_initialize_active_logical_generation(&cas)
-        .unwrap();
-    let source = LogicalDeltaSourceSession::open(
-        PersistentStore::open(directory.path()).unwrap(),
-        directory.path(),
-        PRODUCT_LOGICAL_LIBRARY_ID,
-        &built.manifest.generation,
-    )
-    .unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174085";
-    let prepared = super::super::lan::PreparedLogicalLanSession::new(
-        session_id,
-        "123e4567-e89b-42d3-a456-426614174086",
-        built.manifest_hash.clone(),
-        built.manifest_bytes,
-        source.objects().to_vec(),
-        Box::new(source),
-    )
-    .unwrap();
-    let host = LanCloneHost::prepare_logical(prepared);
-    let state = PeerBidirectionalCommandState::default();
-    state
-        .install_source(host, session_id, &built.manifest_hash)
-        .unwrap();
-    let started = state.start_source(session_id, Ipv4Addr::LOCALHOST).unwrap();
-    assert_eq!(started.phase, PeerBidirectionalSourcePhase::Running);
-    assert!(matches!(
-        state.begin_target(),
-        Err(PeerSyncError::Protocol(message)) if message.contains("source")
-    ));
-    let pairing_uri = url::Url::parse(started.pairing_uri.as_deref().unwrap()).unwrap();
-    assert_eq!(pairing_uri.host_str(), Some("peer-sync"));
-    let endpoint = pairing_uri
-        .query_pairs()
-        .find(|(key, _)| key == "endpoint")
-        .unwrap()
-        .1
-        .into_owned();
-    let manifest_id = pairing_uri
-        .query_pairs()
-        .find(|(key, _)| key == "manifest")
-        .unwrap()
-        .1
-        .into_owned();
-    let claim = pairing_uri
-        .fragment()
-        .unwrap()
-        .strip_prefix("claim=")
-        .unwrap();
-    let _client = super::super::lan::LanLogicalDeltaClient::claim(
-        &endpoint,
-        session_id,
-        &manifest_id,
-        claim,
-        "00000000-0000-4000-8000-000000000098",
-    )
-    .unwrap();
-    let claimed_device_id = state
-        .status(directory.path(), &mut store)
-        .unwrap()
-        .source
-        .devices[0]
-        .device_id
-        .clone();
-    state
-        .revoke_source_device(session_id, &claimed_device_id)
-        .unwrap();
-    assert!(
-        state
-            .status(directory.path(), &mut store)
-            .unwrap()
-            .source
-            .devices[0]
-            .revoked
-    );
-    let operation_id = "123e4567-e89b-42d3-a456-426614174087";
-    let journal = PeerBidirectionalOperationJournal::new(directory.path());
-    journal
-        .store(&PeerBidirectionalDurableOperation::Completed {
-            schema: OPERATION_SCHEMA.to_owned(),
-            remote_apply_receipt: None,
-            source_binding: None,
-            result: PeerBidirectionalCompletedResult {
-                kind: "noChanges".to_owned(),
-                operation_id: operation_id.to_owned(),
-                revision: 0,
-                remote_revision: 0,
-                transferred_objects: 0,
-                transferred_bytes: 0,
-                backups: vec![],
-            },
-        })
-        .unwrap();
-
-    assert!(matches!(
-        state.acknowledge(directory.path(), &mut store, operation_id),
-        Err(PeerSyncError::Protocol(message)) if message.contains("source")
-    ));
-    assert!(journal.load().unwrap().is_some());
-    assert_eq!(
-        state
-            .status(directory.path(), &mut store)
-            .unwrap()
-            .source
-            .phase,
-        PeerBidirectionalSourcePhase::Running
-    );
-    state.stop_source(session_id).unwrap();
-    assert_eq!(
-        state
-            .status(directory.path(), &mut store)
-            .unwrap()
-            .source
-            .phase,
-        PeerBidirectionalSourcePhase::Stopped
-    );
-    assert!(state.begin_target().is_ok());
-    state
-        .acknowledge(directory.path(), &mut store, operation_id)
-        .unwrap();
-    assert!(journal.load().unwrap().is_none());
-}
-
-#[test]
-fn clean_natural_tunnel_exit_finalizes_the_exact_source() {
-    let directory = tempfile::tempdir().unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174191";
-    let stop_attempts = Arc::new(AtomicUsize::new(0));
-    let (state, mut store) = state_with_source_tunnel(
-        directory.path(),
-        session_id,
-        Box::new(FakeSourceTunnel {
-            lifecycles: VecDeque::from([RunningTunnelLifecycle::Stopped]),
-            stop_attempts: Arc::clone(&stop_attempts),
-            fail_stop_through_attempt: 0,
-        }),
-    );
-
-    let status = state.status(directory.path(), &mut store).unwrap();
-
-    assert_eq!(status.source.phase, PeerBidirectionalSourcePhase::Stopped);
-    assert!(status.source.session_id.is_none());
-    assert!(status.source.devices.is_empty());
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
-    assert!(!state.source_is_active().unwrap());
-}
-
-#[test]
-fn cleanup_pending_natural_exit_retains_owner_for_exact_stop_retry() {
-    let directory = tempfile::tempdir().unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174192";
-    let stop_attempts = Arc::new(AtomicUsize::new(0));
-    let (state, mut store) = state_with_source_tunnel(
-        directory.path(),
-        session_id,
-        Box::new(FakeSourceTunnel {
-            lifecycles: VecDeque::from([RunningTunnelLifecycle::CleanupPending]),
-            stop_attempts: Arc::clone(&stop_attempts),
-            fail_stop_through_attempt: 0,
-        }),
-    );
-
-    let status = state.status(directory.path(), &mut store).unwrap();
-    assert_eq!(status.source.phase, PeerBidirectionalSourcePhase::Stopping);
-    assert_eq!(status.source.session_id.as_deref(), Some(session_id));
-    assert!(state.source_is_active().unwrap());
-
-    state.stop_source(session_id).unwrap();
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        state
-            .status(directory.path(), &mut store)
-            .unwrap()
-            .source
-            .phase,
-        PeerBidirectionalSourcePhase::Stopped
-    );
-}
-
-#[test]
-fn source_status_probe_serializes_with_exact_stop() {
-    let directory = tempfile::tempdir().unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174193";
-    let stop_attempts = Arc::new(AtomicUsize::new(0));
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let (state, _store) = state_with_source_tunnel(
-        directory.path(),
-        session_id,
-        Box::new(BlockingSourceTunnel {
-            lifecycle_started: started_tx,
-            lifecycle_release: release_rx,
-            stop_attempts: Arc::clone(&stop_attempts),
-        }),
-    );
-    let status_state = state.clone();
-    let root = directory.path().to_path_buf();
-    let status = thread::spawn(move || {
-        let mut store = PersistentStore::open(&root).unwrap();
-        status_state.status(&root, &mut store)
-    });
-    started_rx.recv().unwrap();
-    let stop_state = state.clone();
-    let session = session_id.to_owned();
-    let (stopped_tx, stopped_rx) = mpsc::channel();
-    let stop = thread::spawn(move || {
-        let result = stop_state.stop_source(&session);
-        stopped_tx.send(()).unwrap();
-        result
-    });
-
-    assert!(stopped_rx.try_recv().is_err());
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 0);
-    release_tx.send(()).unwrap();
-    status.join().unwrap().unwrap();
-    stop.join().unwrap().unwrap();
-    stopped_rx.recv().unwrap();
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
-    assert!(!state.source_is_active().unwrap());
-}
-
-#[test]
-fn final_exit_uses_the_same_exact_source_cleanup_owner() {
-    let directory = tempfile::tempdir().unwrap();
-    let session_id = "123e4567-e89b-42d3-a456-426614174194";
-    let stop_attempts = Arc::new(AtomicUsize::new(0));
-    let (state, _store) = state_with_source_tunnel(
-        directory.path(),
-        session_id,
-        Box::new(FakeSourceTunnel {
-            lifecycles: VecDeque::new(),
-            stop_attempts: Arc::clone(&stop_attempts),
-            fail_stop_through_attempt: 0,
-        }),
-    );
-
-    state.shutdown_for_exit();
-
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
-    assert!(!state.source_is_active().unwrap());
-}
-
-#[test]
-fn offline_status_projects_and_idempotently_revokes_a_durable_registered_device() {
-    let directory = tempfile::tempdir().unwrap();
-    let cas = PayloadCas::new(directory.path()).unwrap();
-    let mut store = PersistentStore::open(directory.path()).unwrap();
-    let base = store
-        .seal_or_initialize_active_logical_generation(&cas)
-        .unwrap();
-    let peer_id = "123e4567-e89b-42d3-a456-426614174099";
-    establish_logical_common_base(
-        &mut store,
-        &cas,
-        peer_id,
-        PRODUCT_LOGICAL_LIBRARY_ID,
-        &base.manifest.generation,
-        0,
-        &base.manifest_bytes,
-    )
-    .unwrap();
-    let common = SyncGenerationIdentity {
-        generation_id: base.manifest.generation,
-        manifest_hash: base.manifest_hash,
-        generation_sequence: base.manifest.generation_sequence,
-    };
-    store
-        .attach_verified_sync_device_at_common_base(
-            VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
-                PRODUCT_LOGICAL_LIBRARY_ID,
-                peer_id,
-                common,
-                17,
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-    let state = PeerBidirectionalCommandState::default();
-
-    let status = state.status(directory.path(), &mut store).unwrap();
-    assert_eq!(status.source.phase, PeerBidirectionalSourcePhase::Idle);
-    assert_eq!(
-        status.source.devices,
-        vec![PeerBidirectionalSourceDevice {
-            device_id: peer_id.to_owned(),
-            transferred_bytes: 0,
-            current_object: None,
-            last_seen_at: 17,
-            revoked: false,
-        }]
-    );
-
-    state
-        .revoke_source_device("stopped-session", peer_id)
-        .unwrap();
-    revoke_durable_bidirectional_device(&mut store, peer_id).unwrap();
-    revoke_durable_bidirectional_device(&mut store, peer_id).unwrap();
-
-    let status = state.status(directory.path(), &mut store).unwrap();
-    assert_eq!(status.source.devices.len(), 1);
-    assert!(status.source.devices[0].revoked);
 }
 
 #[test]

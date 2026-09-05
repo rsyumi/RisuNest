@@ -737,21 +737,15 @@ impl<P: TunnelProcess, S: PeerSession> TunnelStartFailure<P, S> {
         self.error.to_string()
     }
 
+    // Recovering the peer session from a failed start is asserted by the tunnel
+    // seam tests; production start failures are surfaced, not unwound.
+    #[cfg(test)]
     pub(crate) fn into_peer_session(mut self) -> Result<S, Self> {
         if self.process.is_none() {
             Ok(self.peer_session.take().expect("peer session is owned"))
         } else {
             Err(self)
         }
-    }
-
-    pub(crate) fn retry_into_peer_session(mut self) -> Result<S, Self> {
-        for _ in 0..DROP_CLEANUP_ATTEMPTS {
-            if self.retry_process_stop(DEFAULT_STOP_TIMEOUT).is_ok() {
-                break;
-            }
-        }
-        self.into_peer_session()
     }
 }
 

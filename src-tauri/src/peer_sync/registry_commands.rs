@@ -3,7 +3,6 @@ use super::shared_session::AndroidDeviceSyncSourceState;
 #[cfg(desktop)]
 use super::shared_session::DeviceSyncSourceState;
 use super::{
-    bidirectional_commands::PeerBidirectionalCommandState,
     command_codes::finish_peer_command,
     device_registry::{
         incoming_source_by_id, incoming_source_summaries, outgoing_device_summaries,
@@ -204,16 +203,13 @@ pub(crate) fn remove_incoming_source_if_inactive(
 #[tauri::command]
 pub fn peer_sync_revoke_outgoing_device(
     app: AppHandle,
-    bidirectional: State<'_, PeerBidirectionalCommandState>,
     shared: State<'_, DeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
-    let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
     finish_peer_command(
         "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            bidirectional.revoke_registered_device(id);
             shared.revoke_registered_device(id);
         }),
     )
@@ -464,16 +460,13 @@ mod tests {
 #[tauri::command]
 pub fn peer_sync_revoke_outgoing_device(
     app: AppHandle,
-    bidirectional: State<'_, PeerBidirectionalCommandState>,
     shared: State<'_, AndroidDeviceSyncSourceState>,
     device_id: String,
 ) -> Result<(), String> {
-    let bidirectional = bidirectional.inner().clone();
     let shared = shared.inner().clone();
     finish_peer_command(
         "peer sync registry outgoing device revocation",
         revoke_outgoing_device_with_logical_cleanup(&app_root(&app)?, &device_id, move |id| {
-            bidirectional.revoke_registered_device(id);
             shared.revoke_registered_device(id);
         }),
     )

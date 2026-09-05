@@ -612,10 +612,6 @@ pub fn run() {
             peer_sync::delta_commands::peer_delta_target_abandon,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_capabilities,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_prepare,
-            #[cfg(target_os = "android")]
-            peer_sync::bidirectional_commands::peer_bidirectional_source_reserve,
             #[cfg(target_os = "android")]
             peer_sync::bidirectional_commands::peer_bidirectional_target_reserve,
             #[cfg(target_os = "android")]
@@ -625,19 +621,7 @@ pub fn run() {
             #[cfg(target_os = "android")]
             peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_release,
             #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_start,
-            #[cfg(desktop)]
-            peer_sync::bidirectional_commands::peer_bidirectional_tunnel_start,
-            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_status,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_stop,
-            #[cfg(target_os = "android")]
-            peer_sync::bidirectional_commands::peer_bidirectional_source_release,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_revoke,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_resolve,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::bidirectional_commands::peer_bidirectional_resume,
             #[cfg(any(desktop, target_os = "android"))]
@@ -783,8 +767,7 @@ pub fn run() {
     app.run(|app, event| {
         #[cfg(desktop)]
         if run_event_requires_peer_clone_shutdown(&event) {
-            app.state::<peer_sync::bidirectional_commands::PeerBidirectionalCommandState>()
-                .shutdown_for_exit();
+            peer_sync::bidirectional_commands::cleanup_reverse_tunnels_for_exit();
             if let Err(error) = app
                 .state::<peer_sync::shared_session::DeviceSyncSourceState>()
                 .stop()
