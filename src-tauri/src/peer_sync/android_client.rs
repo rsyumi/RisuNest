@@ -1,8 +1,7 @@
 use super::{
-    activate_downloaded_clone,
-    lan::{validate_lan_endpoint, PeerCompletionCapability},
-    CloneTargetAdapter, CloneValidator, DownloadReport, LanCloneClient, LoopbackCloneClient,
-    LosslessCloneTargetAdapter, PeerSyncError, TransferCancellation,
+    activate_downloaded_clone, lan::validate_lan_endpoint, CloneTargetAdapter, CloneValidator,
+    DownloadReport, LanCloneClient, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
+    TransferCancellation,
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -113,8 +112,6 @@ struct AndroidCloneJobDescriptor {
     schema: String,
     job_id: String,
     manifest_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completion_capability: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,12 +149,11 @@ struct AndroidClonePersistedStatus {
     backup_path: Option<PathBuf>,
     #[serde(default)]
     completion_acknowledged: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completion_lease_id: Option<String>,
+    completion_lease_id: String,
 }
 
 impl AndroidClonePersistedStatus {
-    fn ready(completion_lease_id: Option<String>) -> Self {
+    fn ready(completion_lease_id: String) -> Self {
         Self {
             schema: JOB_STATUS_SCHEMA.to_owned(),
             phase: AndroidCloneJobPhase::Ready,
@@ -188,10 +184,7 @@ impl AndroidClonePersistedStatus {
             || invalid_error
             || invalid_commit
             || invalid_acknowledgement
-            || self
-                .completion_lease_id
-                .as_deref()
-                .is_some_and(|lease_id| !is_canonical_v4_uuid(lease_id))
+            || !is_canonical_v4_uuid(&self.completion_lease_id)
         {
             return Err(PeerSyncError::Storage(
                 "Android clone job status is invalid".to_owned(),
@@ -294,7 +287,6 @@ impl AndroidResumableCloneJob {
         target_device_id: &str,
         source_device_id: &str,
         bearer: &str,
-        completion_capability: PeerCompletionCapability,
     ) -> Result<Self, PeerSyncError> {
         let job_root = job_root.as_ref();
         let job_id = validate_job_id_from_path(job_root)?;
@@ -312,8 +304,6 @@ impl AndroidResumableCloneJob {
                 schema: JOB_SCHEMA.to_owned(),
                 job_id: job_id.clone(),
                 manifest_id: manifest_id.to_owned(),
-                completion_capability: (completion_capability == PeerCompletionCapability::V1)
-                    .then(|| super::lan::PEER_COMPLETION_CAPABILITY_V1.to_owned()),
             };
             write_new_json(&root.join("job.json"), &descriptor)?;
             let lan = LanCloneClient::from_registered_and_persist(
@@ -325,19 +315,12 @@ impl AndroidResumableCloneJob {
                 source_device_id,
                 bearer,
             )?;
-            let mut client = LoopbackCloneClient::from_lan_with_completion(
-                &root,
-                lan,
-                manifest_id,
-                completion_capability,
-                None,
-            )?;
+            let mut client =
+                LoopbackCloneClient::from_lan_with_completion(&root, lan, manifest_id, None)?;
+            // The lease the source issues is part of the published job, so the
+            // status file is written once the manifest fetch has produced it.
+            let completion_lease_id = require_completion_lease(&mut client)?;
             write_new_json(
-                &root.join("status.json"),
-                &AndroidClonePersistedStatus::ready(None),
-            )?;
-            let completion_lease_id = client.prepare_completion_manifest()?;
-            write_json_atomic(
                 &root.join("status.json"),
                 &AndroidClonePersistedStatus::ready(completion_lease_id),
             )?;
@@ -387,15 +370,13 @@ impl AndroidResumableCloneJob {
         } else {
             None
         };
-        let completion_capability = descriptor_completion_capability(&descriptor)?;
         let resume_lease_id = persisted_status
             .as_ref()
-            .and_then(|status| status.completion_lease_id.as_deref());
+            .map(|status| status.completion_lease_id.as_str());
         let client = LoopbackCloneClient::from_lan_with_completion(
             &root,
             lan,
             &descriptor.manifest_id,
-            completion_capability,
             resume_lease_id,
         )?;
         let mut job = Self {
@@ -407,7 +388,7 @@ impl AndroidResumableCloneJob {
             client,
         };
         if persisted_status.is_none() {
-            let completion_lease_id = job.client.prepare_completion_manifest()?;
+            let completion_lease_id = require_completion_lease(&mut job.client)?;
             let mut status = AndroidClonePersistedStatus::ready(completion_lease_id);
             if job.root.join("verified.json").is_file() {
                 let (completed_bytes, total_bytes) = job.client.transfer_progress()?;
@@ -845,7 +826,6 @@ impl AndroidCloneJobRegistry {
         target_device_id: &str,
         source_device_id: &str,
         bearer: &str,
-        completion_capability: PeerCompletionCapability,
     ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
         let endpoint = validate_lan_endpoint(endpoint)?;
         validate_session_id(session_id)?;
@@ -884,7 +864,6 @@ impl AndroidCloneJobRegistry {
             target_device_id,
             source_device_id,
             bearer,
-            completion_capability,
         )?;
         let published = (|| {
             let _source_lifecycle = super::registry_commands::lock_registered_source_lifecycle()?;
@@ -1104,7 +1083,6 @@ impl AndroidCloneJobRegistry {
                 "Android clone completion is not committed".to_owned(),
             ));
         }
-        let completion_capability = descriptor_completion_capability(&job.descriptor)?;
         if !backup_receipt_owns_activation(
             persisted.backup_path.as_deref(),
             activation_root,
@@ -1128,78 +1106,40 @@ impl AndroidCloneJobRegistry {
         let app_root = self.jobs_root.parent().ok_or_else(|| {
             PeerSyncError::Storage("Android clone jobs root has no app root".to_owned())
         })?;
-        match completion_capability {
-            PeerCompletionCapability::Unsupported => {
-                let receipt_id = super::device_registry::completion_receipt_id(
-                    "clone",
-                    job_id,
-                    &job.descriptor.manifest_id,
-                );
-                if persisted.completion_acknowledged {
-                    if !super::device_registry::incoming_completed_operation_recorded(
-                        app_root,
-                        source_device_id,
-                        &receipt_id,
-                    )? {
-                        return Err(PeerSyncError::Validation(
-                            "Android clone completion receipt is missing".to_owned(),
-                        ));
-                    }
-                } else {
-                    super::device_registry::record_incoming_completed_operation_once(
-                        app_root,
-                        source_device_id,
-                        &receipt_id,
-                        ledger_total,
-                    )?;
-                }
+        let completion_lease_id = &persisted.completion_lease_id;
+        let delivery = super::device_registry::PendingCompletionDelivery {
+            source_device_id: source_device_id.to_owned(),
+            lane: super::device_registry::CompletionLane::Clone
+                .as_str()
+                .to_owned(),
+            completion_lease_id: completion_lease_id.to_owned(),
+            manifest_id: job.descriptor.manifest_id.clone(),
+            useful_bytes: ledger_total,
+            receipt_id: super::device_registry::completion_receipt_id(
+                "clone",
+                completion_lease_id,
+                &job.descriptor.manifest_id,
+            ),
+        };
+        if persisted.completion_acknowledged {
+            if !super::device_registry::incoming_completion_is_durable(app_root, &delivery)? {
+                return Err(PeerSyncError::Validation(
+                    "Android clone completion receipt is missing".to_owned(),
+                ));
             }
-            PeerCompletionCapability::V1 => {
-                let completion_lease_id =
-                    persisted.completion_lease_id.as_deref().ok_or_else(|| {
-                        PeerSyncError::Validation(
-                            "Android clone completion lease is missing".to_owned(),
-                        )
-                    })?;
-                let delivery = super::device_registry::PendingCompletionDelivery {
-                    source_device_id: source_device_id.to_owned(),
-                    lane: super::device_registry::CompletionLane::Clone
-                        .as_str()
-                        .to_owned(),
-                    completion_lease_id: completion_lease_id.to_owned(),
-                    manifest_id: job.descriptor.manifest_id.clone(),
-                    useful_bytes: ledger_total,
-                    receipt_id: super::device_registry::completion_receipt_id(
-                        "clone",
-                        completion_lease_id,
-                        &job.descriptor.manifest_id,
-                    ),
-                };
-                if persisted.completion_acknowledged {
-                    if !super::device_registry::incoming_completion_is_durable(app_root, &delivery)?
-                    {
-                        return Err(PeerSyncError::Validation(
-                            "Android clone completion receipt is missing".to_owned(),
-                        ));
-                    }
-                } else {
-                    let delivered = super::client::prepare_and_deliver_registered_clone_completion(
-                        app_root,
-                        &root.join("credential.json"),
-                        &delivery,
-                    )?;
-                    if delivered {
-                        super::device_registry::finalize_incoming_completion_delivery(
-                            app_root, &delivery,
-                        )?;
-                    }
-                    if !super::device_registry::incoming_completion_is_durable(app_root, &delivery)?
-                    {
-                        return Err(PeerSyncError::Validation(
-                            "Android clone completion is not durable".to_owned(),
-                        ));
-                    }
-                }
+        } else {
+            let delivered = super::client::prepare_and_deliver_registered_clone_completion(
+                app_root,
+                &root.join("credential.json"),
+                &delivery,
+            )?;
+            if delivered {
+                super::device_registry::finalize_incoming_completion_delivery(app_root, &delivery)?;
+            }
+            if !super::device_registry::incoming_completion_is_durable(app_root, &delivery)? {
+                return Err(PeerSyncError::Validation(
+                    "Android clone completion is not durable".to_owned(),
+                ));
             }
         }
         job.acknowledge_completion()
@@ -1636,10 +1576,6 @@ fn validate_job(job_root: &Path) -> Result<(PathBuf, AndroidCloneJobDescriptor),
     if descriptor.schema != JOB_SCHEMA
         || descriptor.job_id != job_id
         || !is_sha256(&descriptor.manifest_id)
-        || !matches!(
-            descriptor.completion_capability.as_deref(),
-            None | Some(super::lan::PEER_COMPLETION_CAPABILITY_V1)
-        )
     {
         return Err(PeerSyncError::Storage(
             "Android clone job descriptor is invalid".to_owned(),
@@ -1648,16 +1584,13 @@ fn validate_job(job_root: &Path) -> Result<(PathBuf, AndroidCloneJobDescriptor),
     Ok((root, descriptor))
 }
 
-fn descriptor_completion_capability(
-    descriptor: &AndroidCloneJobDescriptor,
-) -> Result<PeerCompletionCapability, PeerSyncError> {
-    match descriptor.completion_capability.as_deref() {
-        None => Ok(PeerCompletionCapability::Unsupported),
-        Some(super::lan::PEER_COMPLETION_CAPABILITY_V1) => Ok(PeerCompletionCapability::V1),
-        Some(_) => Err(PeerSyncError::Storage(
-            "Android clone completion capability is invalid".to_owned(),
-        )),
-    }
+/// The manifest fetch is what mints the completion lease a registered Android
+/// job is accounted against, so a source that answers without one leaves
+/// nothing to publish.
+fn require_completion_lease(client: &mut LoopbackCloneClient) -> Result<String, PeerSyncError> {
+    client.prepare_completion_manifest()?.ok_or_else(|| {
+        PeerSyncError::Protocol("Android clone completion lease is missing".to_owned())
+    })
 }
 
 fn validate_android_completion_state(
@@ -1665,17 +1598,7 @@ fn validate_android_completion_state(
     status: &AndroidClonePersistedStatus,
 ) -> Result<(), PeerSyncError> {
     status.validate()?;
-    let valid = match (
-        descriptor.completion_capability.as_deref(),
-        status.completion_lease_id.as_deref(),
-    ) {
-        (None, None) => true,
-        (Some(super::lan::PEER_COMPLETION_CAPABILITY_V1), Some(lease_id)) => {
-            is_canonical_v4_uuid(lease_id) && lease_id != descriptor.job_id
-        }
-        _ => false,
-    };
-    if !valid {
+    if status.completion_lease_id == descriptor.job_id {
         return Err(PeerSyncError::Storage(
             "Android clone completion lease is inconsistent".to_owned(),
         ));

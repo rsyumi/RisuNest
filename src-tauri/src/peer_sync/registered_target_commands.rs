@@ -4,8 +4,8 @@ use super::{
     command_codes::{code_for, PeerCommandCode},
     device_registry::{incoming_source_by_id, IncomingSource},
     lan::{
-        authenticated_peer_hello_status, authenticated_peer_hello_with_capabilities,
-        AuthenticatedPeerHelloOutcome, PeerCompletionCapability, PeerHello, PeerHelloLane,
+        authenticated_peer_hello, authenticated_peer_hello_status, AuthenticatedPeerHelloOutcome,
+        PeerHello, PeerHelloLane,
     },
     PeerSyncError,
 };
@@ -45,7 +45,6 @@ struct RegisteredSourceConnection {
     source: IncomingSource,
     lane: PeerHelloLane,
     hello: PeerHello,
-    completion: PeerCompletionCapability,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -143,22 +142,25 @@ fn resolve_registered_source(
     device_id: &str,
     lane: RegisteredLane,
 ) -> Result<RegisteredSourceConnection, PeerCommandCode> {
-    let mut connection =
+    let connection =
         resolve_registered_source_with(app_root, device_id, lane, authenticated_peer_hello_status)?;
     if lane == RegisteredLane::Clone {
-        let observed = authenticated_peer_hello_with_capabilities(
-            &connection.source.endpoint,
-            &connection.source.bearer,
-        )
-        .map_err(|error| safe_failure("registered clone capabilities", error))?;
-        if observed.hello != connection.hello {
+        // The clone lane re-reads the hello immediately before it connects, so a
+        // source that answers as a different device, or that no longer advertises
+        // completion accounting, is refused before any target job is published.
+        // The refusal keeps its own code, so an outdated peer reads as one.
+        let observed =
+            authenticated_peer_hello(&connection.source.endpoint, &connection.source.bearer)
+                .map_err(|error| {
+                    registered_target_operation_failure("registered clone capabilities", error)
+                })?;
+        if observed != connection.hello {
             crate::nlog!(
                 "warn",
                 "registered clone capability hello changed its authenticated identity"
             );
             return Err(PeerCommandCode::IdentityMismatch);
         }
-        connection.completion = observed.completion;
     }
     Ok(connection)
 }
@@ -207,7 +209,6 @@ pub async fn peer_clone_claim_registered_client(
                 &connection.lane.manifest_id,
                 &connection.source.device_id,
                 &connection.source.bearer,
-                connection.completion,
             )
             .map_err(|error| {
                 registered_target_operation_failure("registered clone target", error)
@@ -287,7 +288,6 @@ pub async fn peer_clone_claim_registered_client(
                 &local_device_id,
                 &connection.source.device_id,
                 &connection.source.bearer,
-                connection.completion,
             )
             .map_err(|error| {
                 registered_target_operation_failure("registered Android clone target", error)
@@ -481,7 +481,6 @@ fn resolve_registered_source_with(
         source,
         lane: descriptor,
         hello: current,
-        completion: PeerCompletionCapability::Unsupported,
     })
 }
 
@@ -500,7 +499,10 @@ fn registered_hello_outcome(
             crate::nlog!("warn", "{context} failed: HTTP 401 Unauthorized");
             Err(PeerCommandCode::AuthorizationExpired)
         }
-        Err(error) => Err(safe_failure(context, error)),
+        // The hello is where an outdated peer is recognised, so its refusal goes
+        // through the same mapping table the delta and bidirectional lanes use
+        // instead of collapsing to a generic connection failure.
+        Err(error) => Err(registered_target_operation_failure(context, error)),
     }
 }
 
@@ -707,6 +709,36 @@ mod tests {
     }
 
     #[test]
+    fn registered_clone_reports_a_peer_without_completion_accounting_as_outdated() {
+        let root = tempfile::tempdir().unwrap();
+        register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
+
+        let outdated = resolve_registered_source_with(
+            root.path(),
+            SOURCE_ID,
+            RegisteredLane::Clone,
+            |_, _| {
+                Err(PeerSyncError::Validation(
+                    crate::peer_sync::lan::PEER_OUTDATED.to_owned(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(outdated.code(), "peerOutdated");
+
+        // The clone lane re-reads the hello before it connects, and that refusal
+        // keeps its own code too.
+        assert_eq!(
+            registered_target_operation_failure(
+                "registered clone capabilities",
+                PeerSyncError::Validation(crate::peer_sync::lan::PEER_OUTDATED.to_owned()),
+            )
+            .code(),
+            "peerOutdated"
+        );
+    }
+
+    #[test]
     fn registered_local_failures_are_not_reported_as_connection_failures() {
         let target = registered_target_operation_failure(
             "registered clone target",
@@ -881,31 +913,5 @@ mod tests {
         .unwrap();
         assert_eq!(bidirectional.source_device_id(), SOURCE_ID);
         assert_eq!(bidirectional.credential().bearer, BEARER);
-    }
-
-    #[test]
-    #[cfg(desktop)]
-    fn registered_clone_primes_the_existing_target_runtime() {
-        let root = tempfile::tempdir().unwrap();
-        register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
-        let state = crate::peer_sync::commands::PeerCloneCommandState::default();
-        let target = state
-            .connect_registered_target(
-                &root.path().join("peer-clone"),
-                "http://127.0.0.1:32145",
-                SESSION_ID,
-                MANIFEST_ID,
-                SOURCE_ID,
-                BEARER,
-                PeerCompletionCapability::Unsupported,
-            )
-            .unwrap();
-        assert_eq!(target.source_device_id, SOURCE_ID);
-        assert!(
-            serde_json::to_string(&state.target_status_current().unwrap())
-                .unwrap()
-                .contains("\"phase\":\"idle\"")
-        );
-        assert!(root.path().join("peer-clone/targets").try_exists().unwrap());
     }
 }

@@ -932,6 +932,7 @@ impl IncomingSourceRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn record_completed_operation_once(
         &mut self,
         source_id: &str,
@@ -948,6 +949,7 @@ impl IncomingSourceRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn record_completed_operation_once_for_lane(
         &mut self,
         source_id: &str,
@@ -1017,6 +1019,7 @@ impl IncomingSourceRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn has_completed_operation(
         &self,
         source_id: &str,
@@ -1025,6 +1028,7 @@ impl IncomingSourceRegistry {
         self.has_completed_operation_for_lane(source_id, CompletionLane::Clone, receipt_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_completed_operation_for_lane(
         &self,
         source_id: &str,
@@ -1640,6 +1644,9 @@ pub(crate) fn record_incoming_completed_operation_best_effort(
     }
 }
 
+// Only the engine tests still record a completion without a source-issued
+// lease; every product path goes through the prepared delivery outbox.
+#[cfg(test)]
 pub(crate) fn record_incoming_completed_operation_once(
     app_root: &Path,
     source_id: &str,
@@ -1655,6 +1662,7 @@ pub(crate) fn record_incoming_completed_operation_once(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn record_incoming_completed_operation_once_for_lane(
     app_root: &Path,
     source_id: &str,
@@ -1671,6 +1679,7 @@ pub(crate) fn record_incoming_completed_operation_once_for_lane(
         .record_completed_operation_once_for_lane(source_id, lane, receipt_id, bytes, seen_at_ms)
 }
 
+#[cfg(test)]
 pub(crate) fn incoming_completed_operation_recorded(
     app_root: &Path,
     source_id: &str,
@@ -1682,6 +1691,7 @@ pub(crate) fn incoming_completed_operation_recorded(
     IncomingSourceRegistry::load(app_root)?.has_completed_operation(source_id, receipt_id)
 }
 
+#[cfg(test)]
 pub(crate) fn incoming_completed_operation_recorded_for_lane(
     app_root: &Path,
     source_id: &str,

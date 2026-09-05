@@ -546,6 +546,7 @@ fn current_android_clone_backup_remains_protected_after_cas_release() {
             "committedRevision": 2,
             "backupPath": backup,
             "completionAcknowledged": false,
+            "completionLeaseId": "00000000-0000-4000-8000-0000000000a1",
         }),
     );
 
@@ -588,6 +589,7 @@ fn desktop_clone_backup_remains_protected_until_its_exact_receipt_and_ack() {
                     "activation/backups/pre-clone-{operation_id}.lossless"
                 ),
                 "completionAcknowledged": completion_acknowledged,
+                "completionLeaseId": "00000000-0000-4000-8000-0000000000a2",
             }))
             .expect("serialize operation marker"),
         )
@@ -659,6 +661,7 @@ fn android_clone_backup_remains_protected_until_its_current_job_is_released() {
             "error": null,
             "committedRevision": 2,
             "backupPath": backup,
+            "completionLeaseId": "00000000-0000-4000-8000-0000000000a4",
         }),
     );
 
@@ -683,6 +686,7 @@ fn android_clone_backup_remains_protected_until_its_current_job_is_released() {
             "error": null,
             "committedRevision": 2,
             "backupPath": mismatched_receipt,
+            "completionLeaseId": "00000000-0000-4000-8000-0000000000a5",
         }),
     );
     assert!(delete_backup(root, &backup).is_err());
@@ -774,6 +778,7 @@ fn final_locked_recheck_rejects_a_desktop_reference_published_after_validation()
                     "activation/backups/pre-clone-{operation_id}.lossless"
                 ),
                 "completionAcknowledged": false,
+                "completionLeaseId": "00000000-0000-4000-8000-0000000000a3",
             }))
             .expect("serialize target marker"),
         )

@@ -523,7 +523,6 @@ fn registered_android_clone_job(
         &source.target_device_id,
         &source.source_device_id,
         &source.bearer,
-        super::lan::PeerCompletionCapability::V1,
     )
 }
 
@@ -1024,7 +1023,6 @@ fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
         client_root.path(),
         claimed,
         &pairing.manifest_id,
-        super::lan::PeerCompletionCapability::Unsupported,
         None,
     )
     .unwrap();
@@ -1045,7 +1043,6 @@ fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
         client_root.path(),
         persisted,
         &pairing.manifest_id,
-        super::lan::PeerCompletionCapability::Unsupported,
         None,
     )
     .unwrap();
@@ -1454,7 +1451,6 @@ fn android_clone_registry_recovers_one_persisted_job_without_exposing_the_bearer
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
 
@@ -1472,7 +1468,12 @@ fn android_clone_registry_recovers_one_persisted_job_without_exposing_the_bearer
     let status: Value =
         serde_json::from_slice(&fs::read(job_root.join("status.json")).unwrap()).unwrap();
     assert!(descriptor.get("completionCapability").is_none());
-    assert!(status.get("completionLeaseId").is_none());
+    assert_eq!(
+        uuid::Uuid::parse_str(status["completionLeaseId"].as_str().unwrap())
+            .unwrap()
+            .get_version(),
+        Some(uuid::Version::Random)
+    );
     drop(registry);
 
     let reopened =
@@ -1526,7 +1527,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
     let job_root = target_root
@@ -1537,7 +1537,7 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
         serde_json::from_slice(&fs::read(job_root.join("job.json")).unwrap()).unwrap();
     let persisted_status: Value =
         serde_json::from_slice(&fs::read(job_root.join("status.json")).unwrap()).unwrap();
-    assert_eq!(descriptor["completionCapability"], "v1");
+    assert!(descriptor.get("completionCapability").is_none());
     let completion_lease_id = persisted_status["completionLeaseId"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(completion_lease_id)
@@ -1554,7 +1554,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
 
@@ -1571,7 +1570,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             &target_device_id,
             "00000000-0000-4000-8000-000000000299",
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .is_err());
     assert!(registry
@@ -1582,7 +1580,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             "00000000-0000-4000-8000-000000000298",
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .is_err());
     let sources_path = target_root.path().join("peer-sync/sources.json");
@@ -1610,7 +1607,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             &target_device_id,
             &source_device_id,
             &rotated_bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .is_err());
 
@@ -1625,7 +1621,6 @@ fn android_clone_registry_starts_and_idempotently_resumes_a_registered_source() 
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
     assert_eq!(recovered, started);
@@ -1729,7 +1724,6 @@ fn android_registered_clone_publication_serializes_source_removal_after_revalida
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
     });
 
@@ -1821,7 +1815,6 @@ fn bearer_rotation_wins_before_registered_android_publication() {
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap_err();
 
@@ -1937,7 +1930,6 @@ fn new_registration_is_refused_while_a_clone_target_uses_a_registered_source() {
             &peers.manifest_id,
             &peers.source_device_id,
             &peers.registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     let outgoing_before = peers.outgoing_bytes();
@@ -1959,6 +1951,12 @@ fn new_registration_is_refused_while_a_clone_target_uses_a_registered_source() {
     // Finishing the target releases the refusal, and the same link still works,
     // which is only possible because the refused attempt never consumed it.
     fs::remove_dir_all(peers.target_root.path().join("peer-clone").join("targets")).unwrap();
+    // The discarded job leaves the completion lease this connect issued behind,
+    // and a device that still owes one cannot rotate its credential, so the
+    // source forgets the abandoned registration first.
+    let abandoned_target_device_id =
+        super::device_registry::load_or_create_device_id(peers.target_root.path()).unwrap();
+    assert!(peers.host.revoke(&abandoned_target_device_id));
     peers.claim(&credential, &rotated).unwrap();
 
     assert!(credential.try_exists().unwrap());
@@ -2010,7 +2008,6 @@ fn new_registration_is_refused_while_an_android_clone_job_uses_a_registered_sour
             &target_device_id,
             &peers.source_device_id,
             &peers.registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     let outgoing_before = peers.outgoing_bytes();
@@ -2052,7 +2049,6 @@ fn source_removal_is_refused_while_an_android_clone_job_uses_the_source() {
             &target_device_id,
             &peers.source_device_id,
             &peers.registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     let incoming_before = peers.incoming_bytes();
@@ -2073,49 +2069,33 @@ fn source_removal_is_refused_while_an_android_clone_job_uses_the_source() {
 
 #[test]
 fn android_clone_recovery_discards_an_unpublished_registered_source_orphan() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
-    let source_device_id = "00000000-0000-4000-8000-000000000291";
-    let target_device_id = super::device_registry::load_or_create_device_id(root.path()).unwrap();
-    let endpoint = "http://127.0.0.1:32145";
-    let session_id = "00000000-0000-4000-8000-000000000292";
-    let manifest_id = "e".repeat(64);
-    let bearer = "f".repeat(64);
-    super::device_registry::register_incoming_source(
-        root.path(),
-        super::device_registry::IncomingSource {
-            device_id: source_device_id.to_owned(),
-            name: "Android source".to_owned(),
-            endpoint: endpoint.to_owned(),
-            bearer: bearer.clone(),
-            permissions: super::device_registry::DevicePermissions::read(),
-            last_seen_ms: 0,
-            total_bytes: 0,
-        },
-    )
-    .unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let registered = register_android_clone_source(&mut host, source_root.path(), root.path());
     let registry = super::android_client::AndroidCloneJobRegistry::initialize(root.path()).unwrap();
     let started = registry
         .connect_registered(
-            endpoint,
-            session_id,
-            &manifest_id,
-            &target_device_id,
-            source_device_id,
-            &bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
         )
         .unwrap();
     let job_root = root.path().join("peer-clone-jobs").join(&started.job_id);
     assert!(job_root.exists());
     let resumed = registry
         .connect_registered(
-            endpoint,
-            session_id,
-            &manifest_id,
-            &target_device_id,
-            source_device_id,
-            &bearer,
-            super::lan::PeerCompletionCapability::V1,
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
         )
         .unwrap();
     assert_eq!(resumed, started);
@@ -2124,7 +2104,12 @@ fn android_clone_recovery_discards_an_unpublished_registered_source_orphan() {
     let status: Value =
         serde_json::from_slice(&fs::read(job_root.join("status.json")).unwrap()).unwrap();
     assert!(descriptor.get("completionCapability").is_none());
-    assert!(status.get("completionLeaseId").is_none());
+    assert_eq!(
+        uuid::Uuid::parse_str(status["completionLeaseId"].as_str().unwrap())
+            .unwrap()
+            .get_version(),
+        Some(uuid::Version::Random)
+    );
     drop(registry);
 
     let sources_path = root.path().join("peer-sync/sources.json");
@@ -2136,6 +2121,7 @@ fn android_clone_recovery_discards_an_unpublished_registered_source_orphan() {
         super::android_client::AndroidCloneJobRegistry::initialize(root.path()).unwrap();
     assert!(recovered.current().unwrap().is_none());
     assert!(!job_root.exists());
+    host.stop().unwrap();
 }
 
 #[test]
@@ -2156,7 +2142,6 @@ fn android_clone_recovery_discards_a_job_whose_credential_lost_its_source_identi
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     drop(registry);
@@ -2205,7 +2190,6 @@ fn android_clone_recovery_keeps_a_job_whose_credential_only_fails_to_be_read() {
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     drop(registry);
@@ -2283,15 +2267,17 @@ fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery(
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
+    let status_path = app_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id)
+        .join("status.json");
+    let persisted_lease: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    let persisted_lease = persisted_lease["completionLeaseId"].clone();
     fs::write(
-        app_root
-            .path()
-            .join("peer-clone-jobs")
-            .join(&claimed.job_id)
-            .join("status.json"),
+        &status_path,
         serde_json::to_vec(&json!({
             "schema": "risunest.android-peer-clone-status/v1",
             "phase": "downloading",
@@ -2299,6 +2285,7 @@ fn android_clone_registry_pauses_downloading_state_only_during_initial_recovery(
             "totalBytes": 64,
             "error": null,
             "committedRevision": null,
+            "completionLeaseId": persisted_lease,
         }))
         .unwrap(),
     )
@@ -2376,7 +2363,6 @@ fn android_clone_recovery_discards_a_valid_registered_job_without_published_owne
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     let jobs_root = target_root.path().join("peer-clone-jobs");
@@ -2415,7 +2401,6 @@ fn android_clone_registry_recovers_a_renamed_deletion_tombstone() {
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     drop(registry);
@@ -2453,7 +2438,6 @@ fn android_clone_registry_rejects_a_second_target_until_the_owned_job_is_resolve
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
 
@@ -2465,7 +2449,6 @@ fn android_clone_registry_rejects_a_second_target_until_the_owned_job_is_resolve
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap_err();
 
@@ -2491,7 +2474,6 @@ fn android_clone_registry_marks_a_transport_interruption_paused_for_foreground_r
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     host.stop().unwrap();
@@ -2524,7 +2506,6 @@ fn android_clone_registry_reclaims_a_durable_cancel_marker_during_restart() {
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry.request_cancel(&claimed.job_id).unwrap();
@@ -2560,7 +2541,6 @@ fn android_clone_registry_retains_live_cancelled_ownership_until_native_cleanup(
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
 
@@ -2684,7 +2664,6 @@ fn android_registered_clone_accounts_once_and_releases_only_with_exact_durable_e
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
 
@@ -3071,7 +3050,6 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
     registry
@@ -3190,7 +3168,7 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
 }
 
 #[test]
-fn android_clone_registry_rebuilds_verified_missing_status_from_transfer_ledger() {
+fn android_clone_registry_reconciles_a_verified_job_status_after_restart() {
     let source_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
     let source_cas = crate::asset_repository::PayloadCas::new(source_root.path()).unwrap();
@@ -3223,7 +3201,6 @@ fn android_clone_registry_rebuilds_verified_missing_status_from_transfer_ledger(
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry
@@ -3235,7 +3212,24 @@ fn android_clone_registry_rebuilds_verified_missing_status_from_transfer_ledger(
         .join("peer-clone-jobs")
         .join(&claimed.job_id)
         .join("status.json");
-    fs::remove_file(&status_path).unwrap();
+    // The status file also carries the lease the source issued, so a job whose
+    // progress was lost keeps that lease and has its verified phase reconciled
+    // from the verified marker instead of asking for a second lease.
+    let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    fs::write(
+        &status_path,
+        serde_json::to_vec(&json!({
+            "schema": "risunest.android-peer-clone-status/v1",
+            "phase": "downloading",
+            "completedBytes": 0,
+            "totalBytes": verified.total_bytes,
+            "error": null,
+            "committedRevision": null,
+            "completionLeaseId": persisted["completionLeaseId"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     drop(registry);
 
     let restarted =
@@ -3323,7 +3317,6 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
     registry
@@ -3393,7 +3386,6 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry
@@ -3418,7 +3410,7 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .unwrap()
             .devices()[0]
             .total_bytes,
-        0
+        legacy_total
     );
     assert_eq!(
         super::device_registry::IncomingSourceRegistry::load(target_root.path())
@@ -3471,7 +3463,6 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
     assert_ne!(second.job_id, first.job_id);
@@ -3553,7 +3544,7 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .unwrap()
             .devices()[0]
             .total_bytes,
-        second_total
+        legacy_total + second_total
     );
     assert!(first_backup.is_file());
     assert_eq!(
@@ -3572,7 +3563,6 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             &target_device_id,
             &source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::V1,
         )
         .unwrap();
     registry
@@ -3593,7 +3583,7 @@ fn android_registered_clone_new_job_for_same_manifest_counts_as_a_distinct_opera
             .unwrap()
             .devices()[0]
             .total_bytes,
-        second_total
+        legacy_total + second_total
     );
     assert_eq!(
         super::device_registry::IncomingSourceRegistry::load(target_root.path())
@@ -3653,7 +3643,6 @@ fn android_clone_registry_retries_after_backup_receipt_persistence_fails() {
             &registered.target_device_id,
             &registered.source_device_id,
             &registered.bearer,
-            super::lan::PeerCompletionCapability::Unsupported,
         )
         .unwrap();
     registry

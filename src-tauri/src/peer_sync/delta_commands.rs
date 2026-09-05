@@ -19,11 +19,10 @@ use super::{
     command_codes::{code_for, finish_peer_worker, PeerCommandCode},
     delta_completion::{
         abandon_retained_delta_completion, recover_delta_completion, retained_delta_completion,
-        DeltaCompletionContext, DeltaCompletionMode, LanDeltaCompletionTransport,
-        PeerDeltaCompletionJournal, RecoveredDeltaCompletion, RetainedDeltaCompletion,
-        RetainedDeltaWitness,
+        DeltaCompletionContext, LanDeltaCompletionTransport, PeerDeltaCompletionJournal,
+        RecoveredDeltaCompletion, RetainedDeltaCompletion, RetainedDeltaWitness,
     },
-    lan::{LanLogicalDeltaClient, PeerCompletionCapability, PreparedLogicalLanSession},
+    lan::{LanLogicalDeltaClient, PreparedLogicalLanSession},
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
     LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError,
     ReadyLogicalDeltaPlan,
@@ -373,7 +372,6 @@ pub enum PeerDeltaPullResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeltaCompletionAttempt {
     operation_id: String,
-    mode: DeltaCompletionMode,
     source_bearer: String,
 }
 
@@ -393,7 +391,6 @@ fn delta_completion_context(
         operation_id: attempt.operation_id.clone(),
         source_device_id: source_device_id.to_owned(),
         manifest_id: manifest_id.to_owned(),
-        mode: attempt.mode,
         pre_revision,
         pre_common_base,
         post_revision,
@@ -1076,32 +1073,22 @@ fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T
 fn fetch_delta_manifest_and_completion(
     client: &LanLogicalDeltaClient,
 ) -> Result<(Vec<u8>, DeltaCompletionAttempt), PeerSyncError> {
-    let observed = client.hello_with_capabilities()?;
-    if observed.hello.device_id != client.source_device_id()
-        || !observed.hello.permissions.allows_read()
-    {
+    let observed = client.hello()?;
+    if observed.device_id != client.source_device_id() || !observed.permissions.allows_read() {
         return Err(PeerSyncError::Protocol(
             "registered delta source identity or permission changed".to_owned(),
         ));
     }
     let source_bearer = client.registered_source_bearer();
     let manifest = client.fetch_manifest_with_completion_lease(None)?;
-    let attempt = match (observed.completion, manifest.completion_lease_id) {
-        (PeerCompletionCapability::V1, Some(lease)) => DeltaCompletionAttempt {
-            operation_id: lease.as_str().to_owned(),
-            mode: DeltaCompletionMode::CompletionV1,
-            source_bearer: source_bearer.to_owned(),
-        },
-        (PeerCompletionCapability::Unsupported, None) => DeltaCompletionAttempt {
-            operation_id: uuid::Uuid::new_v4().to_string(),
-            mode: DeltaCompletionMode::UnsupportedV2,
-            source_bearer: source_bearer.to_owned(),
-        },
-        _ => {
-            return Err(PeerSyncError::Protocol(
-                "registered delta completion capability changed during manifest fetch".to_owned(),
-            ))
-        }
+    let Some(lease) = manifest.completion_lease_id else {
+        return Err(PeerSyncError::Protocol(
+            "registered delta completion capability changed during manifest fetch".to_owned(),
+        ));
+    };
+    let attempt = DeltaCompletionAttempt {
+        operation_id: lease.as_str().to_owned(),
+        source_bearer: source_bearer.to_owned(),
     };
     Ok((manifest.bytes, attempt))
 }
@@ -1287,7 +1274,7 @@ mod tests {
             _source: &IncomingSource,
             _context: &DeltaCompletionContext,
         ) -> Result<u64, PeerSyncError> {
-            panic!("unsupported completion must not prepare the source")
+            panic!("an uncommitted completion must not prepare the source")
         }
 
         fn deliver(
@@ -1295,7 +1282,31 @@ mod tests {
             _source: &IncomingSource,
             _delivery: &super::super::device_registry::PendingCompletionDelivery,
         ) -> Result<(), PeerSyncError> {
-            panic!("unsupported completion must not deliver to the source")
+            panic!("an uncommitted completion must not deliver to the source")
+        }
+    }
+
+    /// Stands in for the source a committed delta settles against. The engine
+    /// tests never speak HTTP, so the prepared byte count mirrors what the
+    /// transfer actually moved.
+    #[derive(Default)]
+    struct LocalCompletionTransport;
+
+    impl DeltaCompletionTransport for LocalCompletionTransport {
+        fn prepare(
+            &mut self,
+            _source: &IncomingSource,
+            context: &DeltaCompletionContext,
+        ) -> Result<u64, PeerSyncError> {
+            Ok(context.transferred_bytes)
+        }
+
+        fn deliver(
+            &mut self,
+            _source: &IncomingSource,
+            _delivery: &super::super::device_registry::PendingCompletionDelivery,
+        ) -> Result<(), PeerSyncError> {
+            Ok(())
         }
     }
 
@@ -1405,7 +1416,6 @@ mod tests {
         };
         DeltaCompletionAttempt {
             operation_id: uuid::Uuid::new_v4().to_string(),
-            mode: DeltaCompletionMode::UnsupportedV2,
             source_bearer: registered.bearer,
         }
     }
@@ -1459,7 +1469,7 @@ mod tests {
             cancellation,
             &attempt,
         );
-        let completed = recover_delta_completion(store, app_root, &mut NoCompletionTransport)
+        let completed = recover_delta_completion(store, app_root, &mut LocalCompletionTransport)
             .unwrap()
             .is_some();
         assert_eq!(
@@ -2003,7 +2013,6 @@ mod tests {
         register_accounting_source(directory.path(), 40, 7);
         let attempt = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000027".to_owned(),
-            mode: DeltaCompletionMode::UnsupportedV2,
             source_bearer: "b".repeat(64),
         };
         let context = delta_completion_context(
@@ -2250,7 +2259,6 @@ mod tests {
         let mut source = empty_source();
         let conflict = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000023".to_owned(),
-            mode: DeltaCompletionMode::UnsupportedV2,
             source_bearer: "a".repeat(64),
         };
 
@@ -2276,7 +2284,6 @@ mod tests {
             remote_root_manifest(&local.manifest, "remote-other", json!({"side":"remote"}));
         let full_clone = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000024".to_owned(),
-            mode: DeltaCompletionMode::UnsupportedV2,
             source_bearer: "a".repeat(64),
         };
         assert_eq!(
@@ -2365,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_unsupported_activation_releases_the_job_before_durable_accounting_recovery() {
+    fn registered_activation_releases_the_job_before_durable_accounting_recovery() {
         let directory = tempfile::tempdir().unwrap();
         register_accounting_source(directory.path(), 40, 7);
         let mut store = PersistentStore::open(directory.path()).unwrap();
@@ -2398,7 +2405,6 @@ mod tests {
         };
         let attempt = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000025".to_owned(),
-            mode: DeltaCompletionMode::UnsupportedV2,
             source_bearer: "a".repeat(64),
         };
 
@@ -2435,7 +2441,7 @@ mod tests {
         .is_err());
 
         let completed =
-            recover_delta_completion(&mut store, directory.path(), &mut NoCompletionTransport)
+            recover_delta_completion(&mut store, directory.path(), &mut LocalCompletionTransport)
                 .unwrap()
                 .unwrap();
         assert_eq!(completed.useful_bytes, remote.record_objects[0].object.size);
@@ -2483,7 +2489,6 @@ mod tests {
         };
         let attempt = DeltaCompletionAttempt {
             operation_id: "00000000-0000-4000-8000-000000000026".to_owned(),
-            mode: DeltaCompletionMode::UnsupportedV2,
             source_bearer: "a".repeat(64),
         };
         fail_next_delta_completion_store_after_replace(directory.path());
@@ -2553,7 +2558,9 @@ mod tests {
         )
         .unwrap();
         let (remote_manifest, attempt) = fetch_delta_manifest_and_completion(&client).unwrap();
-        assert_eq!(attempt.mode, DeltaCompletionMode::CompletionV1);
+        assert!(
+            super::super::device_registry::CompletionLeaseId::parse(&attempt.operation_id).is_ok()
+        );
 
         let mut target_store = PersistentStore::open(target_root.path()).unwrap();
         let target_cas = PayloadCas::new(target_root.path()).unwrap();

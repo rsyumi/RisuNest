@@ -4,12 +4,11 @@ use super::device_registry::{
     completion_receipt_id, finalize_incoming_completion_delivery,
     incoming_completed_operation_bytes_for_lane, incoming_completion_is_durable,
     incoming_source_by_id, prepare_incoming_completion_delivery,
-    record_incoming_completed_operation_once_for_lane, snapshot_incoming_completion_delivery,
-    CompletionDeliveryPrepareStatus, CompletionLane, IncomingSource, PendingCompletionDelivery,
+    snapshot_incoming_completion_delivery, CompletionDeliveryPrepareStatus, CompletionLane,
+    IncomingSource, PendingCompletionDelivery,
 };
 use super::lan::{
-    authenticated_peer_hello_with_capabilities, deliver_peer_completion,
-    prepare_peer_logical_completion, PeerCompletionCapability, PeerCompletionDelivery,
+    authenticated_peer_hello, deliver_peer_completion, prepare_peer_logical_completion,
 };
 use super::PeerSyncError;
 use crate::{
@@ -74,20 +73,12 @@ fn fail_store_after_replace_if_requested(path: &Path) -> Result<(), PeerSyncErro
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum DeltaCompletionMode {
-    CompletionV1,
-    UnsupportedV2,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DeltaCompletionContext {
     pub(crate) operation_id: String,
     pub(crate) source_device_id: String,
     pub(crate) manifest_id: String,
-    pub(crate) mode: DeltaCompletionMode,
     pub(crate) pre_revision: i64,
     pub(crate) pre_common_base: Option<SyncGenerationIdentity>,
     pub(crate) post_revision: i64,
@@ -153,29 +144,20 @@ impl DeltaCompletionTransport for LanDeltaCompletionTransport {
         delivery: &PendingCompletionDelivery,
     ) -> Result<(), PeerSyncError> {
         validate_v1_source(source)?;
-        match deliver_peer_completion(
+        deliver_peer_completion(
             &source.endpoint,
             &source.bearer,
-            PeerCompletionCapability::V1,
             CompletionLane::Delta,
             &delivery.completion_lease_id,
             &delivery.manifest_id,
             delivery.useful_bytes,
-        )? {
-            PeerCompletionDelivery::Delivered => Ok(()),
-            PeerCompletionDelivery::Unsupported => {
-                invalid("delta completion capability changed during delivery")
-            }
-        }
+        )
     }
 }
 
 fn validate_v1_source(source: &IncomingSource) -> Result<(), PeerSyncError> {
-    let observed = authenticated_peer_hello_with_capabilities(&source.endpoint, &source.bearer)?;
-    if observed.hello.device_id != source.device_id
-        || !observed.hello.permissions.allows_read()
-        || observed.completion != PeerCompletionCapability::V1
-    {
+    let observed = authenticated_peer_hello(&source.endpoint, &source.bearer)?;
+    if observed.device_id != source.device_id || !observed.permissions.allows_read() {
         return invalid("delta completion source identity or capability changed");
     }
     Ok(())
@@ -494,94 +476,61 @@ pub(crate) fn complete_delta_accounting(
         &receipt_id,
     )?;
 
-    match context.mode {
-        DeltaCompletionMode::CompletionV1 => {
-            if let Some(useful_bytes) = completed_bytes {
-                return Ok(useful_bytes);
-            }
-            let delivery = match snapshot_incoming_completion_delivery(
-                app_root,
-                &context.source_device_id,
-                CompletionLane::Delta,
-            )? {
-                Some(snapshot) => {
-                    validate_delta_delivery(&snapshot.delivery, &context, &receipt_id)?;
-                    snapshot.delivery
-                }
-                None => {
-                    let source = incoming_source_by_id(app_root, &context.source_device_id)?
-                        .ok_or_else(|| {
-                            PeerSyncError::Validation(
-                                "registered incoming source is missing".to_owned(),
-                            )
-                        })?;
-                    let useful_bytes = transport.prepare(&source, &context)?;
-                    let delivery = delta_delivery(&context, receipt_id.clone(), useful_bytes);
-                    match prepare_incoming_completion_delivery(app_root, delivery.clone())? {
-                        CompletionDeliveryPrepareStatus::Pending => delivery,
-                        CompletionDeliveryPrepareStatus::AlreadyDurable => {
-                            return incoming_completed_operation_bytes_for_lane(
-                                app_root,
-                                &context.source_device_id,
-                                CompletionLane::Delta,
-                                &receipt_id,
-                            )?
-                            .filter(|completed| *completed == useful_bytes)
-                            .ok_or_else(|| {
-                                PeerSyncError::Validation(
-                                    "delta completion receipt is not exact".to_owned(),
-                                )
-                            });
-                        }
-                    }
-                }
-            };
-            let snapshot = snapshot_incoming_completion_delivery(
-                app_root,
-                &context.source_device_id,
-                CompletionLane::Delta,
-            )?
-            .ok_or_else(|| {
-                PeerSyncError::Validation("pending delta completion delivery is missing".to_owned())
-            })?;
-            if snapshot.delivery != delivery {
-                return invalid("pending delta completion delivery does not match");
-            }
-            transport.deliver(&snapshot.source, &snapshot.delivery)?;
-            finalize_incoming_completion_delivery(app_root, &delivery)?;
-            if !incoming_completion_is_durable(app_root, &delivery)? {
-                return invalid("delta completion delivery is not durable");
-            }
-            Ok(delivery.useful_bytes)
-        }
-        DeltaCompletionMode::UnsupportedV2 => {
-            let useful_bytes = context.transferred_bytes;
-            if let Some(completed_bytes) = completed_bytes {
-                return if completed_bytes == useful_bytes {
-                    Ok(useful_bytes)
-                } else {
-                    invalid("delta completion receipt byte count conflicts")
-                };
-            }
-            record_incoming_completed_operation_once_for_lane(
-                app_root,
-                &context.source_device_id,
-                CompletionLane::Delta,
-                &receipt_id,
-                useful_bytes,
-            )?;
-            if incoming_completed_operation_bytes_for_lane(
-                app_root,
-                &context.source_device_id,
-                CompletionLane::Delta,
-                &receipt_id,
-            )? != Some(useful_bytes)
-            {
-                return invalid("delta completion receipt is not durable");
-            }
-            Ok(useful_bytes)
-        }
+    if let Some(useful_bytes) = completed_bytes {
+        return Ok(useful_bytes);
     }
+    let delivery = match snapshot_incoming_completion_delivery(
+        app_root,
+        &context.source_device_id,
+        CompletionLane::Delta,
+    )? {
+        Some(snapshot) => {
+            validate_delta_delivery(&snapshot.delivery, &context, &receipt_id)?;
+            snapshot.delivery
+        }
+        None => {
+            let source =
+                incoming_source_by_id(app_root, &context.source_device_id)?.ok_or_else(|| {
+                    PeerSyncError::Validation("registered incoming source is missing".to_owned())
+                })?;
+            let useful_bytes = transport.prepare(&source, &context)?;
+            let delivery = delta_delivery(&context, receipt_id.clone(), useful_bytes);
+            match prepare_incoming_completion_delivery(app_root, delivery.clone())? {
+                CompletionDeliveryPrepareStatus::Pending => delivery,
+                CompletionDeliveryPrepareStatus::AlreadyDurable => {
+                    return incoming_completed_operation_bytes_for_lane(
+                        app_root,
+                        &context.source_device_id,
+                        CompletionLane::Delta,
+                        &receipt_id,
+                    )?
+                    .filter(|completed| *completed == useful_bytes)
+                    .ok_or_else(|| {
+                        PeerSyncError::Validation(
+                            "delta completion receipt is not exact".to_owned(),
+                        )
+                    });
+                }
+            }
+        }
+    };
+    let snapshot = snapshot_incoming_completion_delivery(
+        app_root,
+        &context.source_device_id,
+        CompletionLane::Delta,
+    )?
+    .ok_or_else(|| {
+        PeerSyncError::Validation("pending delta completion delivery is missing".to_owned())
+    })?;
+    if snapshot.delivery != delivery {
+        return invalid("pending delta completion delivery does not match");
+    }
+    transport.deliver(&snapshot.source, &snapshot.delivery)?;
+    finalize_incoming_completion_delivery(app_root, &delivery)?;
+    if !incoming_completion_is_durable(app_root, &delivery)? {
+        return invalid("delta completion delivery is not durable");
+    }
+    Ok(delivery.useful_bytes)
 }
 
 pub(crate) fn recover_delta_completion(

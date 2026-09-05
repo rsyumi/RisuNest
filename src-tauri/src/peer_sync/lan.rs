@@ -474,25 +474,17 @@ impl LanCloneClient {
         authenticated_peer_hello(&self.endpoint, &self.bearer)
     }
 
-    pub(crate) fn hello_with_capabilities(
-        &self,
-    ) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
-        authenticated_peer_hello_with_capabilities(&self.endpoint, &self.bearer)
-    }
-
     pub(crate) fn deliver_completion(
         &self,
-        capability: PeerCompletionCapability,
         operation_id: &str,
         transferred_bytes: u64,
-    ) -> Result<PeerCompletionDelivery, PeerSyncError> {
+    ) -> Result<(), PeerSyncError> {
         let manifest_id = self.manifest_id.as_deref().ok_or_else(|| {
             PeerSyncError::Protocol("LAN clone manifest identity is missing".to_owned())
         })?;
         deliver_peer_completion(
             &self.endpoint,
             &self.bearer,
-            capability,
             CompletionLane::Clone,
             operation_id,
             manifest_id,
@@ -2626,33 +2618,23 @@ fn bidirectional_remote_apply(
     }
     let operation_id = request.operation_id.clone();
     let completion_manifest_id = request.expected_source_generation.manifest_hash.clone();
-    let completion_deferred = request.completion_deferred_v1 == Some(true);
-    if let Some(registration) = recovered_lock(&shared.v2_registration).clone() {
-        let valid_completion_mode = if completion_deferred {
-            outgoing_bidirectional_completion_lease_allows_remote_apply(
-                &registration.app_root,
-                &device.device_id,
-                &operation_id,
-                &completion_manifest_id,
-            )
-        } else {
-            outgoing_completion_offer_active(
-                &registration.app_root,
-                &device.device_id,
-                CompletionLane::Bidirectional,
-            )
-            .map(|active| !active)
-        };
-        match valid_completion_mode {
-            Ok(true) => {}
-            Ok(false) => return respond_empty(stream, 409),
-            Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
-                return respond_empty(stream, 409);
-            }
-            Err(_) => return respond_empty(stream, 500),
-        }
-    } else if completion_deferred {
+    // Every remote apply is accounted against a completion lease this source
+    // issued, so a source without the v2 registry has nothing to gate it with.
+    let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
         return respond_empty(stream, 409);
+    };
+    match outgoing_bidirectional_completion_lease_allows_remote_apply(
+        &registration.app_root,
+        &device.device_id,
+        &operation_id,
+        &completion_manifest_id,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return respond_empty(stream, 409),
+        Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
+            return respond_empty(stream, 409);
+        }
+        Err(_) => return respond_empty(stream, 500),
     }
     let control = session
         .bidirectional_control()
@@ -2665,25 +2647,20 @@ fn bidirectional_remote_apply(
             if let Some(slot) = session.remote_commit_slot() {
                 slot.record(&operation_id, receipt.committed_revision);
             }
-            if completion_deferred {
-                let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
+            match seal_outgoing_bidirectional_logical_completion(
+                &registration.app_root,
+                &device.device_id,
+                &operation_id,
+                &completion_manifest_id,
+                receipt.transferred_bytes,
+                &shared.issued_logical_objects,
+            ) {
+                Ok(CompletionSealStatus::Sealed | CompletionSealStatus::AlreadyCompleted) => {}
+                Ok(CompletionSealStatus::Conflict)
+                | Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
                     return respond_empty(stream, 409);
-                };
-                match seal_outgoing_bidirectional_logical_completion(
-                    &registration.app_root,
-                    &device.device_id,
-                    &operation_id,
-                    &completion_manifest_id,
-                    receipt.transferred_bytes,
-                    &shared.issued_logical_objects,
-                ) {
-                    Ok(CompletionSealStatus::Sealed | CompletionSealStatus::AlreadyCompleted) => {}
-                    Ok(CompletionSealStatus::Conflict)
-                    | Err(PeerSyncError::Validation(_) | PeerSyncError::Protocol(_)) => {
-                        return respond_empty(stream, 409);
-                    }
-                    Err(_) => return respond_empty(stream, 500),
                 }
+                Err(_) => return respond_empty(stream, 500),
             }
             respond_json(stream, 200, &receipt)
         }
@@ -3142,8 +3119,6 @@ pub(crate) struct LanBidirectionalRemoteApplyRequest {
     pub(crate) expected_source_generation: LanBidirectionalGeneration,
     pub(crate) expected_common_base_manifest_hash: String,
     pub(crate) backup_losing_side: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) completion_deferred_v1: Option<bool>,
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -3272,29 +3247,6 @@ pub(crate) enum AuthenticatedPeerHelloOutcome {
     AuthorizationExpired,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PeerCompletionCapability {
-    Unsupported,
-    V1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PeerHelloWithCapabilities {
-    pub(crate) hello: PeerHello,
-    pub(crate) completion: PeerCompletionCapability,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PeerCompletionDelivery {
-    Unsupported,
-    Delivered,
-}
-
-enum AuthenticatedPeerHelloCapabilitiesOutcome {
-    Hello(PeerHelloWithCapabilities),
-    AuthorizationExpired,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerHelloLane {
@@ -3335,32 +3287,6 @@ pub(crate) fn authenticated_peer_hello_status(
     endpoint: &str,
     bearer: &str,
 ) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError> {
-    match authenticated_peer_hello_capabilities_status(endpoint, bearer)? {
-        AuthenticatedPeerHelloCapabilitiesOutcome::Hello(observed) => {
-            Ok(AuthenticatedPeerHelloOutcome::Hello(observed.hello))
-        }
-        AuthenticatedPeerHelloCapabilitiesOutcome::AuthorizationExpired => {
-            Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired)
-        }
-    }
-}
-
-pub(crate) fn authenticated_peer_hello_with_capabilities(
-    endpoint: &str,
-    bearer: &str,
-) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
-    match authenticated_peer_hello_capabilities_status(endpoint, bearer)? {
-        AuthenticatedPeerHelloCapabilitiesOutcome::Hello(observed) => Ok(observed),
-        AuthenticatedPeerHelloCapabilitiesOutcome::AuthorizationExpired => {
-            Err(PeerSyncError::Transport("HTTP 401 Unauthorized".to_owned()))
-        }
-    }
-}
-
-fn authenticated_peer_hello_capabilities_status(
-    endpoint: &str,
-    bearer: &str,
-) -> Result<AuthenticatedPeerHelloCapabilitiesOutcome, PeerSyncError> {
     let endpoint = validate_lan_endpoint(endpoint)?;
     if !is_lower_hex_256(bearer) {
         return Err(PeerSyncError::Protocol(
@@ -3373,7 +3299,7 @@ fn authenticated_peer_hello_capabilities_status(
         .send()
         .map_err(transport)?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Ok(AuthenticatedPeerHelloCapabilitiesOutcome::AuthorizationExpired);
+        return Ok(AuthenticatedPeerHelloOutcome::AuthorizationExpired);
     }
     if response.status() != reqwest::StatusCode::OK {
         return Err(PeerSyncError::Transport(format!(
@@ -3381,17 +3307,17 @@ fn authenticated_peer_hello_capabilities_status(
             response.status()
         )));
     }
-    let completion = match response.headers().get(PEER_COMPLETION_CAPABILITY_HEADER) {
-        None => PeerCompletionCapability::Unsupported,
-        Some(value) if value.as_bytes() == PEER_COMPLETION_CAPABILITY_V1.as_bytes() => {
-            PeerCompletionCapability::V1
-        }
+    // Every RisuNest source advertises completion accounting, so a peer that
+    // omits the header is an older build rather than a peer with less to offer.
+    match response.headers().get(PEER_COMPLETION_CAPABILITY_HEADER) {
+        None => return Err(PeerSyncError::Validation(PEER_OUTDATED.to_owned())),
+        Some(value) if value.as_bytes() == PEER_COMPLETION_CAPABILITY_V1.as_bytes() => {}
         Some(_) => {
             return Err(PeerSyncError::Protocol(
                 "invalid peer completion capability".to_owned(),
             ));
         }
-    };
+    }
     let mut body = Vec::new();
     response
         .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
@@ -3413,28 +3339,22 @@ fn authenticated_peer_hello_capabilities_status(
             "invalid peer hello response".to_owned(),
         ));
     }
-    Ok(AuthenticatedPeerHelloCapabilitiesOutcome::Hello(
-        PeerHelloWithCapabilities {
-            hello: PeerHello {
-                device_id: response.device_id,
-                name: response.name,
-                permissions,
-                lanes: response.lanes,
-            },
-            completion,
-        },
-    ))
+    Ok(AuthenticatedPeerHelloOutcome::Hello(PeerHello {
+        device_id: response.device_id,
+        name: response.name,
+        permissions,
+        lanes: response.lanes,
+    }))
 }
 
 pub(crate) fn deliver_peer_completion(
     endpoint: &str,
     bearer: &str,
-    capability: PeerCompletionCapability,
     lane: CompletionLane,
     operation_id: &str,
     manifest_id: &str,
     transferred_bytes: u64,
-) -> Result<PeerCompletionDelivery, PeerSyncError> {
+) -> Result<(), PeerSyncError> {
     let endpoint = validate_lan_endpoint(endpoint)?;
     if !is_lower_hex_256(bearer)
         || !is_canonical_v4_uuid(operation_id)
@@ -3443,9 +3363,6 @@ pub(crate) fn deliver_peer_completion(
         return Err(PeerSyncError::Protocol(
             "invalid peer completion request".to_owned(),
         ));
-    }
-    if capability == PeerCompletionCapability::Unsupported {
-        return Ok(PeerCompletionDelivery::Unsupported);
     }
     let request = PeerCompletionRequest {
         schema: PEER_COMPLETION_SCHEMA.to_owned(),
@@ -3476,7 +3393,7 @@ pub(crate) fn deliver_peer_completion(
             "peer completion response must be empty".to_owned(),
         ));
     }
-    Ok(PeerCompletionDelivery::Delivered)
+    Ok(())
 }
 
 pub(crate) fn prepare_peer_logical_completion(
@@ -4049,7 +3966,6 @@ mod endpoint_tests {
             },
             expected_common_base_manifest_hash: "f".repeat(64),
             backup_losing_side: false,
-            completion_deferred_v1: None,
         };
         assert!(request.is_valid());
     }
@@ -4646,7 +4562,7 @@ mod timeout_tests {
             .unwrap();
             write!(
                 hello,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{PEER_COMPLETION_CAPABILITY_HEADER}: {PEER_COMPLETION_CAPABILITY_V1}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -5402,35 +5318,61 @@ mod timeout_tests {
         }
     }
 
+    /// The remote apply gate accounts every apply against a lease this source
+    /// issued, so a bidirectional peer test needs a registered v2 source rather
+    /// than a bare pairing claim.
+    fn registered_bidirectional_peer(
+        session_id: &str,
+        control: Arc<BidirectionalControlFixture>,
+        source_root: &Path,
+    ) -> (LanCloneHost, String, LanPairing) {
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root).unwrap();
+        let mut host = LanCloneHost::prepare_bidirectional_logical(
+            prepared_bidirectional_logical_session(session_id, &source_device_id, control),
+        );
+        host.enable_v2_registry(
+            source_root,
+            "Windows",
+            DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        (host, endpoint, pairing)
+    }
+
     #[test]
     fn p5_source_stop_cancels_remote_apply_and_joins_the_host() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
         let control = Arc::new(BidirectionalControlFixture::default());
         let (started_tx, started_rx) = mpsc::channel();
         *control.remote_apply_started.lock().unwrap() = Some(started_tx);
-        let session_id = "00000000-0000-4000-8000-000000000082";
-        let source_device_id = "00000000-0000-4000-8000-000000000083";
-        let target_device_id = "00000000-0000-4000-8000-000000000084";
-        let mut host =
-            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
-                session_id,
-                source_device_id,
-                Arc::clone(&control),
-            ));
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
-        let client = LanBidirectionalLogicalClient::claim(
+        let (mut host, endpoint, pairing) = registered_bidirectional_peer(
+            "00000000-0000-4000-8000-000000000082",
+            Arc::clone(&control),
+            source_root.path(),
+        );
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
-            target_device_id,
         )
         .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
         let request = LanBidirectionalRemoteApplyRequest {
-            operation_id: "00000000-0000-4000-8000-000000000085".to_owned(),
+            operation_id: lease.as_str().to_owned(),
             source_endpoint: endpoint,
             source_session_id: pairing.session_id,
             source_manifest_id: pairing.manifest_id.clone(),
@@ -5443,7 +5385,6 @@ mod timeout_tests {
             },
             expected_common_base_manifest_hash: pairing.manifest_id,
             backup_losing_side: false,
-            completion_deferred_v1: None,
         };
         let requester = thread::spawn(move || client.request_remote_apply(request));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -5835,27 +5776,40 @@ mod timeout_tests {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
         let control = Arc::new(BidirectionalControlFixture::default());
         *control.remote_apply_delay.lock().unwrap() = Some(Duration::from_millis(1_500));
-        let session_id = "00000000-0000-4000-8000-000000000078";
-        let source_device_id = "00000000-0000-4000-8000-000000000079";
-        let target_device_id = "00000000-0000-4000-8000-000000000080";
-        let mut host =
-            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
-                session_id,
-                source_device_id,
-                Arc::clone(&control),
-            ));
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
-        let client = direct_bidirectional_client(
+        let (mut host, endpoint, pairing) = registered_bidirectional_peer(
+            "00000000-0000-4000-8000-000000000078",
+            Arc::clone(&control),
+            source_root.path(),
+        );
+        let mut client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
-            target_device_id,
         )
         .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        // The control channel keeps the short test budget; only the dedicated
+        // remote apply client may outlive it.
+        let timeouts = LogicalClientTimeouts {
+            control_request: TEST_P5_CONTROL_TIMEOUT,
+            object_idle: TEST_P5_OBJECT_IDLE_TIMEOUT,
+        };
+        client.inner.control_timeout = TEST_P5_CONTROL_TIMEOUT;
+        client.inner.control_client =
+            build_logical_http_client(LogicalRequestKind::Control, timeouts).unwrap();
+        client.inner.object_client =
+            build_logical_http_client(LogicalRequestKind::Object, timeouts).unwrap();
         let generation = LanBidirectionalGeneration {
             generation_id: "generation-1".to_owned(),
             manifest_hash: pairing.manifest_id.clone(),
@@ -5865,7 +5819,7 @@ mod timeout_tests {
         let started = Instant::now();
         let receipt = client
             .request_remote_apply(LanBidirectionalRemoteApplyRequest {
-                operation_id: "00000000-0000-4000-8000-000000000081".to_owned(),
+                operation_id: lease.as_str().to_owned(),
                 source_endpoint: endpoint,
                 source_session_id: pairing.session_id,
                 source_manifest_id: pairing.manifest_id,
@@ -5874,7 +5828,6 @@ mod timeout_tests {
                 expected_source_generation: generation.clone(),
                 expected_common_base_manifest_hash: generation.manifest_hash.clone(),
                 backup_losing_side: false,
-                completion_deferred_v1: None,
             })
             .unwrap();
 
@@ -5884,84 +5837,22 @@ mod timeout_tests {
     }
 
     #[test]
-    fn v2_bidirectional_legacy_remote_apply_preserves_http_compatibility_without_early_accounting()
-    {
+    fn p5_claim_binds_the_stable_target_and_authenticates_control_callbacks() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let source_root = tempfile::tempdir().unwrap();
         let target_root = tempfile::tempdir().unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
         let source_device_id =
             super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
-        let control = Arc::new(BidirectionalControlFixture::default());
-        *control.remote_apply_bytes.lock().unwrap() = 17;
-        let mut host =
-            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
-                "00000000-0000-4000-8000-000000000086",
-                &source_device_id,
-                Arc::clone(&control),
-            ));
-        host.enable_v2_registry(
+        let target_device_id =
+            super::super::device_registry::load_or_create_device_id(target_root.path()).unwrap();
+        let (mut host, endpoint, pairing) = registered_bidirectional_peer(
+            "00000000-0000-4000-8000-000000000070",
+            Arc::clone(&control),
             source_root.path(),
-            "Windows",
-            DevicePermissions::read_and_bidirectional(),
-        )
-        .unwrap();
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
-        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
-            target_root.path(),
-            "Android",
-            &endpoint,
-            &pairing.session_id,
-            &pairing.manifest_id,
-            &pairing.claim,
-        )
-        .unwrap();
-        let request = LanBidirectionalRemoteApplyRequest {
-            operation_id: "00000000-0000-4000-8000-000000000087".to_owned(),
-            source_endpoint: endpoint,
-            source_session_id: pairing.session_id,
-            source_manifest_id: pairing.manifest_id.clone(),
-            source_claim: pairing.claim,
-            expected_source_revision: 0,
-            expected_source_generation: LanBidirectionalGeneration {
-                generation_id: "generation-1".to_owned(),
-                manifest_hash: pairing.manifest_id.clone(),
-                generation_sequence: "1".to_owned(),
-            },
-            expected_common_base_manifest_hash: pairing.manifest_id,
-            backup_losing_side: false,
-            completion_deferred_v1: None,
-        };
-
-        client.request_remote_apply(request.clone()).unwrap();
-        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
-        client.request_remote_apply(request).unwrap();
-
-        let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
-        assert_eq!(registry.devices()[0].total_bytes, 0);
-        assert!(registry.devices()[0].last_seen_ms > 0);
-        host.stop().unwrap();
-    }
-
-    #[test]
-    fn p5_claim_binds_the_stable_target_and_authenticates_control_callbacks() {
-        let _guard = LOGICAL_LAN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let control = Arc::new(BidirectionalControlFixture::default());
-        let session_id = "00000000-0000-4000-8000-000000000070";
-        let source_device_id = "00000000-0000-4000-8000-000000000071";
-        let target_device_id = "00000000-0000-4000-8000-000000000072";
-        let mut host =
-            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
-                session_id,
-                source_device_id,
-                Arc::clone(&control),
-            ));
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
+        );
         assert_eq!(
             reqwest::blocking::Client::new()
                 .post(format!(
@@ -5974,12 +5865,13 @@ mod timeout_tests {
                 .status(),
             reqwest::StatusCode::UNAUTHORIZED
         );
-        let client = LanBidirectionalLogicalClient::claim(
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
-            target_device_id,
         )
         .unwrap();
         let generation = LanBidirectionalGeneration {
@@ -6007,65 +5899,50 @@ mod timeout_tests {
             target_device_id
         );
 
-        let accepted = client
-            .request_remote_apply(LanBidirectionalRemoteApplyRequest {
-                operation_id: "00000000-0000-4000-8000-000000000075".to_owned(),
-                source_endpoint: endpoint.clone(),
-                source_session_id: pairing.session_id.clone(),
-                source_manifest_id: pairing.manifest_id.clone(),
-                source_claim: pairing.claim.clone(),
-                expected_source_revision: 0,
-                expected_source_generation: generation.clone(),
-                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
-                backup_losing_side: false,
-                completion_deferred_v1: None,
-            })
+        // One issued lease covers the whole exchange: a refused apply leaves it
+        // open, and only the accepted apply seals it.
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
             .unwrap();
-        assert_eq!(accepted.committed_generation, generation);
+        let apply_request = || LanBidirectionalRemoteApplyRequest {
+            operation_id: lease.as_str().to_owned(),
+            source_endpoint: endpoint.clone(),
+            source_session_id: pairing.session_id.clone(),
+            source_manifest_id: pairing.manifest_id.clone(),
+            source_claim: pairing.claim.clone(),
+            expected_source_revision: 0,
+            expected_source_generation: generation.clone(),
+            expected_common_base_manifest_hash: pairing.manifest_id.clone(),
+            backup_losing_side: false,
+        };
 
         *control.remote_apply_error.lock().unwrap() = Some(PeerSyncError::ActivationConflict {
             expected: Some("before".to_owned()),
             actual: Some("after".to_owned()),
         });
         assert!(matches!(
-            client.request_remote_apply(LanBidirectionalRemoteApplyRequest {
-                operation_id: "00000000-0000-4000-8000-000000000076".to_owned(),
-                source_endpoint: endpoint.clone(),
-                source_session_id: pairing.session_id.clone(),
-                source_manifest_id: pairing.manifest_id.clone(),
-                source_claim: pairing.claim.clone(),
-                expected_source_revision: 0,
-                expected_source_generation: generation.clone(),
-                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
-                backup_losing_side: false,
-                completion_deferred_v1: None,
-            }),
+            client.request_remote_apply(apply_request()),
             Err(PeerSyncError::ActivationConflict { .. })
         ));
 
         *control.remote_apply_error.lock().unwrap() =
             Some(PeerSyncError::Storage("fixture failure".to_owned()));
         assert!(matches!(
-            client.request_remote_apply(LanBidirectionalRemoteApplyRequest {
-                operation_id: "00000000-0000-4000-8000-000000000077".to_owned(),
-                source_endpoint: endpoint.clone(),
-                source_session_id: pairing.session_id.clone(),
-                source_manifest_id: pairing.manifest_id.clone(),
-                source_claim: pairing.claim.clone(),
-                expected_source_revision: 0,
-                expected_source_generation: generation.clone(),
-                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
-                backup_losing_side: false,
-                completion_deferred_v1: None,
-            }),
+            client.request_remote_apply(apply_request()),
             Err(PeerSyncError::Transport(message)) if message.contains("500")
         ));
+
+        *control.remote_apply_error.lock().unwrap() = None;
+        let accepted = client.request_remote_apply(apply_request()).unwrap();
+        assert_eq!(accepted.committed_generation, generation);
 
         let resumed = LanBidirectionalLogicalClient::resume(client.credential()).unwrap();
         assert_eq!(resumed.device_id(), target_device_id);
         assert_eq!(resumed.source_device_id(), source_device_id);
 
-        assert!(host.revoke(target_device_id));
+        assert!(host.revoke(&target_device_id));
         assert!(matches!(
             client.register(LanBidirectionalRegistrationRequest {
                 library_id: "library".to_owned(),
@@ -6191,19 +6068,15 @@ mod timeout_tests {
                 .status(),
             reqwest::StatusCode::OK
         );
-        assert_eq!(
-            deliver_peer_completion(
-                &restarted_endpoint,
-                &bearer,
-                PeerCompletionCapability::V1,
-                CompletionLane::Delta,
-                completion_lease.as_str(),
-                &pending_manifest,
-                0,
-            )
-            .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        deliver_peer_completion(
+            &restarted_endpoint,
+            &bearer,
+            CompletionLane::Delta,
+            completion_lease.as_str(),
+            &pending_manifest,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
@@ -6258,15 +6131,13 @@ mod timeout_tests {
         for key in ["deviceId", "name", "permissions", "lanes"] {
             assert!(json.contains_key(key));
         }
-        let observed = client.hello_with_capabilities().unwrap();
-        assert_eq!(observed.hello.device_id, source_id);
-        assert_eq!(observed.completion, PeerCompletionCapability::V1);
-        assert_eq!(client.hello().unwrap(), observed.hello);
+        let observed = client.hello().unwrap();
+        assert_eq!(observed.device_id, source_id);
         host.stop().unwrap();
     }
 
     #[test]
-    fn v2_bidirectional_completion_deferred_flag_prevents_legacy_early_accounting() {
+    fn v2_bidirectional_remote_apply_seals_its_lease_and_refuses_an_unleased_operation() {
         let _guard = LOGICAL_LAN_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6318,7 +6189,6 @@ mod timeout_tests {
             },
             expected_common_base_manifest_hash: pairing.manifest_id,
             backup_losing_side: false,
-            completion_deferred_v1: Some(true),
         };
 
         assert!(client
@@ -6339,19 +6209,14 @@ mod timeout_tests {
                 .unwrap(),
             17
         );
-        let capability = client.hello_with_capabilities().unwrap().completion;
-        assert_eq!(
-            client
-                .deliver_completion(capability, completion_lease.as_str(), 17)
-                .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        client
+            .deliver_completion(completion_lease.as_str(), 17)
+            .unwrap();
         assert!(client.request_remote_apply(request.clone()).is_err());
         assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
-        let mut legacy = request;
-        legacy.operation_id = "00000000-0000-4000-8000-000000000111".to_owned();
-        legacy.completion_deferred_v1 = None;
-        assert!(client.request_remote_apply(legacy).is_err());
+        let mut unleased = request;
+        unleased.operation_id = "00000000-0000-4000-8000-000000000111".to_owned();
+        assert!(client.request_remote_apply(unleased).is_err());
         assert_eq!(*control.remote_apply_calls.lock().unwrap(), 1);
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
@@ -6416,7 +6281,6 @@ mod timeout_tests {
                 },
                 expected_common_base_manifest_hash: pairing.manifest_id.clone(),
                 backup_losing_side: false,
-                completion_deferred_v1: Some(true),
             })
             .unwrap();
         assert_eq!(
@@ -6425,10 +6289,7 @@ mod timeout_tests {
                 .unwrap(),
             0
         );
-        let capability = client.hello_with_capabilities().unwrap().completion;
-        client
-            .deliver_completion(capability, lease.as_str(), 0)
-            .unwrap();
+        client.deliver_completion(lease.as_str(), 0).unwrap();
 
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
@@ -6539,7 +6400,6 @@ mod timeout_tests {
             expected_source_generation: generation.clone(),
             expected_common_base_manifest_hash: generation.manifest_hash,
             backup_losing_side: false,
-            completion_deferred_v1: Some(true),
         };
 
         assert!(restarted_client.request_remote_apply(request).is_err());
@@ -6605,7 +6465,6 @@ mod timeout_tests {
             expected_source_generation: old_generation.clone(),
             expected_common_base_manifest_hash: old_manifest_id.clone(),
             backup_losing_side: false,
-            completion_deferred_v1: Some(true),
         };
         fail_next_logical_completion_proof_write_for_test(
             source_root.path(),
@@ -6852,20 +6711,15 @@ mod timeout_tests {
                 .status(),
             reqwest::StatusCode::NO_CONTENT
         );
-        let capability = client.hello_with_capabilities().unwrap().completion;
-        assert_eq!(
-            deliver_peer_completion(
-                &endpoint,
-                &client.bearer,
-                capability,
-                CompletionLane::Clone,
-                operation_id,
-                &pairing.manifest_id,
-                23,
-            )
-            .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        deliver_peer_completion(
+            &endpoint,
+            &client.bearer,
+            CompletionLane::Clone,
+            operation_id,
+            &pairing.manifest_id,
+            23,
+        )
+        .unwrap();
         let mismatched_retry = serde_json::json!({
             "schema": PEER_COMPLETION_SCHEMA,
             "lane": "delta",
@@ -6991,7 +6845,6 @@ mod timeout_tests {
         let result = deliver_peer_completion(
             &endpoint,
             &client.bearer,
-            PeerCompletionCapability::V1,
             CompletionLane::Clone,
             completion_lease.as_str(),
             &pairing.manifest_id,
@@ -7004,19 +6857,15 @@ mod timeout_tests {
         device.total_bytes = 0;
         registry.upsert(device).unwrap();
         registry.save().unwrap();
-        assert_eq!(
-            deliver_peer_completion(
-                &endpoint,
-                &client.bearer,
-                PeerCompletionCapability::V1,
-                CompletionLane::Clone,
-                completion_lease.as_str(),
-                &pairing.manifest_id,
-                1,
-            )
-            .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        deliver_peer_completion(
+            &endpoint,
+            &client.bearer,
+            CompletionLane::Clone,
+            completion_lease.as_str(),
+            &pairing.manifest_id,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
@@ -7028,7 +6877,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn completion_client_skips_legacy_servers_and_retries_the_same_request_after_response_loss() {
+    fn hello_without_the_completion_header_reports_an_outdated_peer() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -7046,23 +6895,17 @@ mod timeout_tests {
             hello.flush().unwrap();
             finish_response(&mut hello);
         });
-        let observed = authenticated_peer_hello_with_capabilities(&endpoint, TEST_BEARER).unwrap();
+        let error = authenticated_peer_hello(&endpoint, TEST_BEARER).unwrap_err();
         server.join().unwrap();
-        assert_eq!(observed.completion, PeerCompletionCapability::Unsupported);
+        assert_eq!(error, PeerSyncError::Validation(PEER_OUTDATED.to_owned()));
         assert_eq!(
-            deliver_peer_completion(
-                &endpoint,
-                TEST_BEARER,
-                observed.completion,
-                CompletionLane::Clone,
-                "00000000-0000-4000-8000-000000000107",
-                &"a".repeat(64),
-                9,
-            )
-            .unwrap(),
-            PeerCompletionDelivery::Unsupported
+            super::super::command_codes::code_for(&error).code(),
+            "peerOutdated"
         );
+    }
 
+    #[test]
+    fn completion_client_retries_the_same_request_after_response_loss() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -7100,7 +6943,6 @@ mod timeout_tests {
             deliver_peer_completion(
                 &endpoint,
                 TEST_BEARER,
-                PeerCompletionCapability::V1,
                 CompletionLane::Clone,
                 "00000000-0000-4000-8000-000000000108",
                 &"b".repeat(64),
@@ -7108,7 +6950,7 @@ mod timeout_tests {
             )
         };
         assert!(deliver().is_err());
-        assert_eq!(deliver().unwrap(), PeerCompletionDelivery::Delivered);
+        deliver().unwrap();
         server.join().unwrap();
     }
 
@@ -7189,7 +7031,6 @@ mod timeout_tests {
             operation_id: uuid::Uuid::new_v4().to_string(),
             source_device_id: source_device_id.to_owned(),
             manifest_id: manifest_id.to_owned(),
-            mode: super::super::delta_completion::DeltaCompletionMode::CompletionV1,
             pre_revision: 4,
             pre_common_base: Some(base("1")),
             post_revision: 5,
@@ -7293,7 +7134,11 @@ mod timeout_tests {
         .unwrap();
 
         assert_eq!(client.source_device_id(), source_id);
-        assert!(!client.fetch_manifest().unwrap().is_empty());
+        assert!(!client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .bytes
+            .is_empty());
         let hello = client.hello().unwrap();
         assert_eq!(hello.device_id, source_id);
         assert!(hello.permissions.allows_bidirectional());
@@ -7511,22 +7356,12 @@ mod timeout_tests {
         );
         assert_eq!(client.hello().unwrap().device_id, source_id);
         assert_eq!(client.prepare_delta_completion(lease.as_str()).unwrap(), 0);
-        assert_eq!(
-            client
-                .deliver_completion(PeerCompletionCapability::V1, lease.as_str(), 0)
-                .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        client.deliver_completion(lease.as_str(), 0).unwrap();
         assert_eq!(
             raw.post(&claim_url).json(&body).send().unwrap().status(),
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(
-            client
-                .deliver_completion(PeerCompletionCapability::V1, lease.as_str(), 0)
-                .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        client.deliver_completion(lease.as_str(), 0).unwrap();
         assert!(host.revoke(&target_id));
         let response = raw.post(&claim_url).json(&body).send().unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -7970,16 +7805,12 @@ mod timeout_tests {
                 .total_bytes,
             0
         );
-        let capability = client.hello_with_capabilities().unwrap().completion;
         assert!(client
-            .deliver_completion(capability, lease.as_str(), object.size + 1)
+            .deliver_completion(lease.as_str(), object.size + 1)
             .is_err());
-        assert_eq!(
-            client
-                .deliver_completion(capability, lease.as_str(), object.size)
-                .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        client
+            .deliver_completion(lease.as_str(), object.size)
+            .unwrap();
         assert_eq!(
             OutgoingDeviceRegistry::load(source_root.path())
                 .unwrap()
@@ -8126,19 +7957,15 @@ mod timeout_tests {
                 object.size
             );
         }
-        assert_eq!(
-            deliver_peer_completion(
-                &restarted_endpoint,
-                &bearer,
-                PeerCompletionCapability::V1,
-                CompletionLane::Delta,
-                lease.as_str(),
-                &old_manifest_id,
-                object.size,
-            )
-            .unwrap(),
-            PeerCompletionDelivery::Delivered
-        );
+        deliver_peer_completion(
+            &restarted_endpoint,
+            &bearer,
+            CompletionLane::Delta,
+            lease.as_str(),
+            &old_manifest_id,
+            object.size,
+        )
+        .unwrap();
         let registry = OutgoingDeviceRegistry::load(source_root.path()).unwrap();
         let device = registry
             .devices()
@@ -8645,23 +8472,11 @@ impl LanLogicalDeltaClient {
         authenticated_peer_hello(endpoint, &self.bearer)
     }
 
-    pub(crate) fn hello_with_capabilities(
-        &self,
-    ) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
-        let endpoint = self
-            .session_url
-            .split("/v1/sessions/")
-            .next()
-            .ok_or_else(|| PeerSyncError::Protocol("invalid logical session URL".to_owned()))?;
-        authenticated_peer_hello_with_capabilities(endpoint, &self.bearer)
-    }
-
     pub(crate) fn deliver_completion(
         &self,
-        capability: PeerCompletionCapability,
         operation_id: &str,
         transferred_bytes: u64,
-    ) -> Result<PeerCompletionDelivery, PeerSyncError> {
+    ) -> Result<(), PeerSyncError> {
         let endpoint = self
             .session_url
             .split("/v1/sessions/")
@@ -8670,7 +8485,6 @@ impl LanLogicalDeltaClient {
         deliver_peer_completion(
             endpoint,
             &self.bearer,
-            capability,
             CompletionLane::Delta,
             operation_id,
             &self.manifest_id,
@@ -9201,22 +9015,14 @@ impl LanBidirectionalLogicalClient {
         authenticated_peer_hello(&self.endpoint, &self.inner.bearer)
     }
 
-    pub(crate) fn hello_with_capabilities(
-        &self,
-    ) -> Result<PeerHelloWithCapabilities, PeerSyncError> {
-        authenticated_peer_hello_with_capabilities(&self.endpoint, &self.inner.bearer)
-    }
-
     pub(crate) fn deliver_completion(
         &self,
-        capability: PeerCompletionCapability,
         operation_id: &str,
         transferred_bytes: u64,
-    ) -> Result<PeerCompletionDelivery, PeerSyncError> {
+    ) -> Result<(), PeerSyncError> {
         deliver_peer_completion(
             &self.endpoint,
             &self.inner.bearer,
-            capability,
             CompletionLane::Bidirectional,
             operation_id,
             &self.inner.manifest_id,
@@ -9320,10 +9126,6 @@ impl LanBidirectionalLogicalClient {
 
     pub(crate) fn source_device_id(&self) -> &str {
         self.inner.source_device_id()
-    }
-
-    pub(crate) fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
-        self.inner.fetch_manifest()
     }
 
     pub(crate) fn fetch_manifest_with_completion_lease(

@@ -1,7 +1,7 @@
 use super::delta_completion::{
     abandon_retained_delta_completion, complete_delta_accounting, recover_delta_completion,
     registered_delta_source_is_active, retained_delta_completion, unlink_canonical_with_sync,
-    DeltaCommitWitness, DeltaCompletionContext, DeltaCompletionMode, DeltaCompletionTransport,
+    DeltaCommitWitness, DeltaCompletionContext, DeltaCompletionTransport,
     PeerDeltaCompletionJournal, PeerDeltaDurableCompletion, RetainedDeltaCompletion,
     RetainedDeltaWitness, DELTA_COMPLETION_AMBIGUOUS,
 };
@@ -44,7 +44,6 @@ fn context(operation_id: &str) -> DeltaCompletionContext {
         operation_id: operation_id.to_owned(),
         source_device_id: SOURCE_ID.to_owned(),
         manifest_id: "b".repeat(64),
-        mode: DeltaCompletionMode::CompletionV1,
         pre_revision: 4,
         pre_common_base: Some(identity("base", 'a', "1")),
         post_revision: 5,
@@ -510,83 +509,6 @@ fn v1_completion_overflow_retains_activation_intent_and_pending_outbox() {
 }
 
 #[test]
-fn unsupported_completion_records_target_only_once_including_zero_bytes() {
-    let root = tempfile::tempdir().unwrap();
-    register_source(root.path(), 5);
-    let mut operation = context(OPERATION_ID);
-    operation.mode = DeltaCompletionMode::UnsupportedV2;
-    operation.transferred_bytes = 0;
-    PeerDeltaCompletionJournal::new(root.path())
-        .store_activation_intent(&operation)
-        .unwrap();
-    let mut transport = fixture_transport(root.path(), 99, 5);
-
-    assert_eq!(
-        complete_delta_accounting(root.path(), &mut transport).unwrap(),
-        0
-    );
-    assert_eq!(
-        complete_delta_accounting(root.path(), &mut transport).unwrap(),
-        0
-    );
-    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
-    let registry = IncomingSourceRegistry::load(root.path()).unwrap();
-    assert_eq!(registry.sources()[0].total_bytes, 5);
-    assert!(registry
-        .has_completed_operation_for_lane(
-            SOURCE_ID,
-            CompletionLane::Delta,
-            &super::device_registry::completion_receipt_id(
-                "delta",
-                OPERATION_ID,
-                &operation.manifest_id,
-            ),
-        )
-        .unwrap());
-}
-
-#[test]
-fn unsupported_completion_rejects_a_same_receipt_with_different_bytes() {
-    let root = tempfile::tempdir().unwrap();
-    register_source(root.path(), 5);
-    let mut operation = context(OPERATION_ID);
-    operation.mode = DeltaCompletionMode::UnsupportedV2;
-    operation.transferred_bytes = 9;
-    let receipt_id = completion_receipt_id(
-        CompletionLane::Delta.as_str(),
-        &operation.operation_id,
-        &operation.manifest_id,
-    );
-    record_incoming_completed_operation_once_for_lane(
-        root.path(),
-        SOURCE_ID,
-        CompletionLane::Delta,
-        &receipt_id,
-        10,
-    )
-    .unwrap();
-    PeerDeltaCompletionJournal::new(root.path())
-        .store_activation_intent(&operation)
-        .unwrap();
-    let before = std::fs::read(root.path().join("peer-sync/sources.json")).unwrap();
-    let mut transport = fixture_transport(root.path(), 99, 15);
-
-    assert!(complete_delta_accounting(root.path(), &mut transport).is_err());
-    assert_eq!(
-        std::fs::read(root.path().join("peer-sync/sources.json")).unwrap(),
-        before
-    );
-    assert_eq!(
-        IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
-        15
-    );
-    assert!(PeerDeltaCompletionJournal::new(root.path())
-        .load()
-        .unwrap()
-        .is_some());
-}
-
-#[test]
 fn recovery_clears_uncommitted_intent_without_counting() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), 5);
@@ -742,7 +664,6 @@ fn committed_context(root: &Path) -> (PersistentStore, PayloadCas, DeltaCompleti
         .unwrap()
         .unwrap();
     let mut operation = context(OPERATION_ID);
-    operation.mode = DeltaCompletionMode::UnsupportedV2;
     operation.pre_revision = 0;
     operation.pre_common_base = Some(common.clone());
     operation.post_revision = 0;
@@ -759,13 +680,14 @@ fn committed_recovery_without_job_counts_and_removes_the_journal_once() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = fixture_transport(root.path(), 99, 5);
+    let mut transport = fixture_transport(root.path(), 17, 5);
 
     let completed = recover_delta_completion(&mut store, root.path(), &mut transport)
         .unwrap()
         .unwrap();
     assert_eq!(completed.context, operation);
     assert_eq!(completed.useful_bytes, 17);
+    assert_eq!((transport.prepares, transport.deliveries), (1, 1));
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
         22
@@ -800,14 +722,14 @@ fn committed_recovery_with_a_released_job_completes_exact_accounting() {
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
-    let mut transport = fixture_transport(root.path(), 99, 5);
+    let mut transport = fixture_transport(root.path(), 17, 5);
 
     assert!(
         recover_delta_completion(&mut store, root.path(), &mut transport)
             .unwrap()
             .is_some()
     );
-    assert_eq!((transport.prepares, transport.deliveries), (0, 0));
+    assert_eq!((transport.prepares, transport.deliveries), (1, 1));
     assert_eq!(
         IncomingSourceRegistry::load(root.path()).unwrap().sources()[0].total_bytes,
         22
@@ -826,7 +748,6 @@ fn committed_recovery_overflow_reuses_pending_bytes_and_retains_recovery_state()
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), u64::MAX);
     let (mut store, _cas, mut operation) = committed_context(root.path());
-    operation.mode = DeltaCompletionMode::CompletionV1;
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();
@@ -855,7 +776,6 @@ fn committed_recovery_without_job_uses_existing_v1_receipt_while_source_is_offli
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), 5);
     let (mut store, _cas, mut operation) = committed_context(root.path());
-    operation.mode = DeltaCompletionMode::CompletionV1;
     operation.transferred_bytes = 0;
     let receipt_id = completion_receipt_id(
         CompletionLane::Delta.as_str(),

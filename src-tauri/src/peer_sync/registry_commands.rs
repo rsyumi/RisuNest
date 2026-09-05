@@ -479,7 +479,6 @@ mod tests {
                     operation_id: "00000000-0000-4000-8000-000000000207".to_owned(),
                     source_device_id: source_device_id.to_owned(),
                     manifest_id: MANIFEST_ID.to_owned(),
-                    mode: crate::peer_sync::delta_completion::DeltaCompletionMode::CompletionV1,
                     pre_revision: 1,
                     pre_common_base: None,
                     post_revision: 2,

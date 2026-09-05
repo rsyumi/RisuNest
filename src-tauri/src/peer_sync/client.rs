@@ -4,9 +4,8 @@ use super::device_registry::{
     CompletionLeaseId, PendingCompletionDelivery,
 };
 use super::lan::{
-    parse_completion_lease_headers, LanCloneClient, PeerCompletionCapability,
-    PeerCompletionDelivery, PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1,
-    PEER_COMPLETION_RESUME_HEADER,
+    parse_completion_lease_headers, LanCloneClient, PEER_COMPLETION_CAPABILITY_HEADER,
+    PEER_COMPLETION_CAPABILITY_V1, PEER_COMPLETION_RESUME_HEADER,
 };
 use super::{
     http_stream::HttpRangeStream,
@@ -83,25 +82,13 @@ pub(crate) fn prepare_and_deliver_registered_clone_completion(
             "registered clone completion credential changed".to_owned(),
         ));
     }
-    let hello = lan.hello_with_capabilities()?;
-    if hello.hello.device_id != delivery.source_device_id
-        || !hello.hello.permissions.allows_read()
-        || hello.completion != PeerCompletionCapability::V1
-    {
+    let hello = lan.hello()?;
+    if hello.device_id != delivery.source_device_id || !hello.permissions.allows_read() {
         return Err(PeerSyncError::Protocol(
             "registered clone completion capability changed".to_owned(),
         ));
     }
-    if lan.deliver_completion(
-        PeerCompletionCapability::V1,
-        &delivery.completion_lease_id,
-        delivery.useful_bytes,
-    )? != PeerCompletionDelivery::Delivered
-    {
-        return Err(PeerSyncError::Protocol(
-            "registered clone completion is unsupported".to_owned(),
-        ));
-    }
+    lan.deliver_completion(&delivery.completion_lease_id, delivery.useful_bytes)?;
     Ok(true)
 }
 
@@ -325,21 +312,10 @@ impl LoopbackCloneClient {
         staging_root: impl AsRef<Path>,
         lan: LanCloneClient,
         expected_manifest_id: &str,
-        capability: PeerCompletionCapability,
         resume_lease_id: Option<&str>,
     ) -> Result<Self, PeerSyncError> {
         super::protocol::validate_hash(expected_manifest_id)?;
-        let completion_lease_id = match (capability, resume_lease_id) {
-            (PeerCompletionCapability::Unsupported, None) => None,
-            (PeerCompletionCapability::V1, lease_id) => {
-                lease_id.map(CompletionLeaseId::parse).transpose()?
-            }
-            (PeerCompletionCapability::Unsupported, Some(_)) => {
-                return Err(PeerSyncError::Protocol(
-                    "unsupported peer completion cannot resume a lease".to_owned(),
-                ))
-            }
-        };
+        let completion_lease_id = resume_lease_id.map(CompletionLeaseId::parse).transpose()?;
         let (http, ranges, session_url, bearer, persisted_manifest_id) =
             lan.into_resumable_parts()?;
         if persisted_manifest_id
@@ -366,7 +342,7 @@ impl LoopbackCloneClient {
             manifest: None,
             manifest_id: None,
             ledger,
-            completion_v1: capability == PeerCompletionCapability::V1,
+            completion_v1: true,
             completion_lease_id,
             #[cfg(test)]
             fail_after_cas_promotion: false,
