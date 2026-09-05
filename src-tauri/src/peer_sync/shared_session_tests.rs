@@ -600,6 +600,206 @@ fn android_explicit_stop_returns_exact_foreground_when_native_cleanup_needs_retr
     assert!(android_foreground_registry().detach_if_generation(&next));
 }
 
+/// The production shared host, reachable over IPv4 loopback.
+///
+/// `SharedSessionHost::start_private_lan` insists on a private or link-local
+/// interface, and no test machine can be relied on to own one, so the bind
+/// entry point is the single substitution this fixture makes.  Every other
+/// call, socket, thread, and cleanup below is the production host's.
+#[cfg(desktop)]
+struct LoopbackAndroidHost(SharedSessionHost);
+
+#[cfg(desktop)]
+impl AndroidDeviceSyncHost for LoopbackAndroidHost {
+    fn enable_registry(
+        &mut self,
+        app_root: &std::path::Path,
+        source_name: &str,
+        permissions: DevicePermissions,
+    ) -> Result<(), PeerSyncError> {
+        AndroidDeviceSyncHost::enable_registry(&mut self.0, app_root, source_name, permissions)
+    }
+
+    fn start_private_lan(
+        &mut self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Result<SharedPairingData, PeerSyncError> {
+        assert!(
+            address.is_loopback(),
+            "the loopback source fixture never binds a routable interface"
+        );
+        self.0.start_fixed_loopback(port)
+    }
+
+    fn stop_listener(&mut self) -> Result<(), PeerSyncError> {
+        AndroidDeviceSyncHost::stop_listener(&mut self.0)
+    }
+
+    fn rotate_link(
+        &mut self,
+        permissions: DevicePermissions,
+    ) -> Result<SharedPairingData, PeerSyncError> {
+        AndroidDeviceSyncHost::rotate_link(&mut self.0, permissions)
+    }
+
+    fn revoke_registered_device(&mut self, device_id: &str) {
+        AndroidDeviceSyncHost::revoke_registered_device(&mut self.0, device_id);
+    }
+}
+
+/// The real preparation engines, rewrapped so the Android state receives the
+/// loopback host.  Lane preparation and cleanup stay the production ones, so
+/// the prepared clone session on disk is created and removed for real.
+#[cfg(desktop)]
+struct LoopbackAndroidSourcePreparation {
+    engines: SharedSourceEngines,
+}
+
+#[cfg(desktop)]
+impl SharedSourceOwnership for LoopbackAndroidSourcePreparation {
+    type Host = LoopbackAndroidHost;
+
+    fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        self.engines.build_host().map(LoopbackAndroidHost)
+    }
+
+    fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
+        self.engines.cleanup(lane)
+    }
+
+    fn stop_host(&mut self, host: &mut Self::Host) -> Result<(), PeerSyncError> {
+        self.engines.stop_host(&mut host.0)
+    }
+}
+
+#[cfg(desktop)]
+impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>>
+    for LoopbackAndroidSourcePreparation
+{
+    fn prepare(
+        &mut self,
+        lane: SharedSourceLane,
+        context: &mut SharedSourcePreparationContext<'a>,
+    ) -> Result<(), PeerSyncError> {
+        self.engines.prepare(lane, context)
+    }
+}
+
+/// Resolves the prepared clone session directory from the source marker the
+/// clone lane writes, so the release assertion names the real owned root.
+#[cfg(desktop)]
+fn prepared_source_root(app_root: &std::path::Path) -> PathBuf {
+    let marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(app_root.join("peer-clone").join("active-source.json")).unwrap(),
+    )
+    .unwrap();
+    app_root
+        .join("peer-clone")
+        .join("source-sessions")
+        .join(marker["directoryId"].as_str().unwrap())
+}
+
+#[cfg(desktop)]
+#[test]
+fn android_notification_stop_refuses_real_connections_and_release_removes_the_source_root() {
+    let _guard = test_registry_guard();
+    let root = tempfile::tempdir().unwrap();
+    let cas = PayloadCas::new(root.path()).unwrap();
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    seed_shared_source_store(&mut store);
+    let expected_revision = store.revision().unwrap();
+    let state = AndroidDeviceSyncSourceState::new_for_test(
+        LoopbackAndroidSourcePreparation {
+            engines: SharedSourceEngines::new(),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    // A port the kernel just handed back is free without hard-coding one.
+    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    {
+        let mut context = SharedSourcePreparationContext {
+            store: &mut store,
+            cas: &cas,
+            app_root: root.path(),
+            cancellation: &NeverCancelled,
+            expected_bidirectional_revision: expected_revision,
+        };
+        state
+            .prepare_for_test(&mut context, root.path(), android_lan_request(port))
+            .unwrap();
+    }
+    let source_root = prepared_source_root(root.path());
+    let marker = root.path().join("peer-clone").join("active-source.json");
+    assert!(source_root.is_dir());
+    let foreground = android_foreground_registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
+    assert!(android_foreground_registry().attach_exact(&foreground));
+    let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let connect_timeout = std::time::Duration::from_secs(5);
+
+    let running = state
+        .start_attached_for_test(
+            DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            },
+            foreground.clone(),
+        )
+        .unwrap();
+
+    assert_eq!(running.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(
+        running.endpoint.as_deref(),
+        Some(format!("http://127.0.0.1:{port}").as_str())
+    );
+    // Positive control for the refusal below: the running source answers a
+    // real TCP connect on the advertised endpoint.
+    drop(
+        std::net::TcpStream::connect_timeout(&address, connect_timeout)
+            .expect("running source listener accepts a loopback connection"),
+    );
+
+    assert!(android_foreground_registry().cancel_exact(&foreground));
+
+    let stopped = state.status().unwrap();
+    assert_eq!(stopped.phase, DeviceSyncSourcePhase::Prepared);
+    assert_eq!(stopped.endpoint, None);
+    assert_eq!(stopped.pairing_uri, None);
+    assert_eq!(stopped.latest_error, None);
+    let refusal = std::net::TcpStream::connect_timeout(&address, connect_timeout)
+        .expect_err("stopped source listener still accepted a loopback connection");
+    #[cfg(windows)]
+    assert_eq!(refusal.kind(), std::io::ErrorKind::ConnectionRefused);
+    // Loopback RST is not guaranteed everywhere, so a bounded connect that
+    // never completes counts as refused off Windows.
+    #[cfg(not(windows))]
+    assert!(
+        matches!(
+            refusal.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "unexpected connect failure after the notification Stop: {refusal:?}"
+    );
+    // The notification Stop only drops the listener; the prepared lanes and
+    // their owned source root stay for a restart.
+    assert!(source_root.is_dir());
+    assert!(marker.is_file());
+    assert!(android_foreground_registry().detach_if_generation(&foreground));
+
+    assert_eq!(state.stop_for_test().unwrap(), None);
+
+    assert_eq!(state.status().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(state.status().unwrap().latest_error, None);
+    assert!(!source_root.exists());
+    assert!(!marker.exists());
+}
+
 #[derive(Default)]
 struct LifecycleFixture {
     events: Vec<&'static str>,
