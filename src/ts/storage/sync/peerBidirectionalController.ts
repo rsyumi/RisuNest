@@ -18,7 +18,6 @@ export type PeerBidirectionalOperationPhase =
     | 'sourceUnavailable'
     | 'refreshPending'
     | 'completed'
-    | 'stale'
     | 'failed'
 
 export interface PeerBidirectionalControllerSnapshot {
@@ -65,7 +64,6 @@ function resultPhase(result: PeerBidirectionalSyncResult): PeerBidirectionalOper
         case 'conflict': return 'awaitingConflict'
         case 'resumeRequired': return result.phase
         case 'sourceUnavailable': return 'sourceUnavailable'
-        case 'stale': return 'stale'
         default: return 'completed'
     }
 }

@@ -57,11 +57,6 @@ export type PeerBidirectionalSyncResult =
           remoteManifestHash: string
       }
     | {
-          kind: 'stale'
-          operationId: string
-          reason: 'localRevision' | 'remoteGeneration' | 'commonBase' | 'deviceAcknowledgement'
-      }
-    | {
           kind: 'resumeRequired'
           operationId: string
           phase: 'localCommitted'

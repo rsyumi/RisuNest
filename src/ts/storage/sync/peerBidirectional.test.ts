@@ -827,23 +827,6 @@ describe('peer bidirectional facade', () => {
         expect(events.at(-1)).toBe('release')
     })
 
-    it('does not refresh the renderer for a stale generation result', async () => {
-        const events: string[] = []
-        const facade = createPeerBidirectionalFacade({
-            platform: 'desktop',
-            runtime: runtime(events),
-            invoke: (async () => ({
-                kind: 'stale',
-                operationId: 'operation-stale',
-                reason: 'remoteGeneration',
-            })) as unknown as PeerBidirectionalInvoke,
-        })
-
-        await expect(facade.syncRegistered('device-stale')).resolves.toMatchObject({ kind: 'stale' })
-        expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
-        expect(events.at(-1)).toBe('release')
-    })
-
     it('retries only renderer refresh after native completion was committed', async () => {
         const events: string[] = []
         let failRefresh = true

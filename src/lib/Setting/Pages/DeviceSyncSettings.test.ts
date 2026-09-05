@@ -488,10 +488,10 @@ describe('DeviceSyncSettings', () => {
         await render(snapshot({ targets: {
             clone: { ...cloneBase, state: { ...cloneBase.state, target: { ...cloneBase.state.target, phase: 'completed' } } },
             delta: { ...deltaBase, pullPhase: 'running' },
-            bidirectional: { ...bidiBase, operationPhase: 'stale' },
+            bidirectional: { ...bidiBase, operationPhase: 'completed' },
         } }))
         expect(target.querySelector('[data-work-status]')?.textContent).toContain('Receiving')
-        expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('changed after sync started')
+        expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('Already up to date')
     })
 
     it('maps terminal results with human-readable totals and backup receipts', async () => {
@@ -582,12 +582,11 @@ describe('DeviceSyncSettings', () => {
     })
 
     it.each([
-        ['sourceUnavailable', true, true], ['refreshPending', true, false], ['localCommitted', true, true], ['targetPrepared', true, true], ['sourcePrepared', true, true], ['failed', false, false], ['stale', false, false],
+        ['sourceUnavailable', true, true], ['refreshPending', true, false], ['localCommitted', true, true], ['targetPrepared', true, true], ['sourcePrepared', true, true], ['failed', false, false],
     ] as const)('renders guarded bidirectional actions for %s', async (phase, resume, abandon) => {
-        await render(snapshot({ targets: { clone: cloneBase, delta: deltaBase, bidirectional: { ...bidiBase, operationPhase: phase, operationRetained: !['failed', 'stale'].includes(phase), operationError: phase === 'failed' ? 'operation-failed' : null } } }))
+        await render(snapshot({ targets: { clone: cloneBase, delta: deltaBase, bidirectional: { ...bidiBase, operationPhase: phase, operationRetained: phase !== 'failed', operationError: phase === 'failed' ? 'operation-failed' : null } } }))
         expect(Boolean(button('Continue'))).toBe(resume); expect(Boolean(button('Abandon task'))).toBe(abandon)
         if (phase === 'sourcePrepared') expect(target.querySelector('[data-work-status]')?.textContent).toContain('Start sharing')
-        if (phase === 'stale') expect(target.querySelector('[data-work-status]')?.textContent).toContain('changed after sync started')
     })
 
     it.each(['idle', 'prepared'] as const)('delegates sourcePrepared rehosting from a %s sharing phase', async (sourcePhase) => {

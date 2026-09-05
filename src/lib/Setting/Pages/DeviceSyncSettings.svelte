@@ -519,7 +519,6 @@
                     {:else if ['sourceUnavailable', 'localCommitted', 'targetPrepared'].includes(bidiPhase)}<p class="text-sm text-textcolor2">{bidiPhase === 'sourceUnavailable' ? sync.work.bidirectionalSourceUnavailable : sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" onclick={resumeBidi}>{sync.work.resume}</Button><Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button></div>
                     {:else if bidiPhase === 'refreshPending'}<p class="text-sm text-textcolor2">{sync.work.bidirectionalRefreshPending}</p><Button className="mt-2" size="sm" onclick={resumeBidi}>{sync.work.resume}</Button>
                     {:else if bidiPhase === 'failed'}<Button size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
-                    {:else if bidiPhase === 'stale'}<p class="text-sm">{sync.work.bidirectionalStale}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if bidiPhase === 'completed' && bidi?.operationResult?.kind !== 'conflict'}
                         {@const result = bidi.operationResult}
                         <p class="text-sm">{result?.kind === 'noChanges' ? sync.work.doneUpToDate : result?.kind === 'updated' ? format(sync.work.doneUpdated, result.transferredObjects, formatRisuNestStorageBytes(result.transferredBytes)) : sync.work.doneUpToDate}</p>

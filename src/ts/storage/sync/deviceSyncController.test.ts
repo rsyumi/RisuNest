@@ -647,13 +647,12 @@ describe('device sync controller', () => {
         ['sourceUnavailable', false],
         ['refreshPending', false],
         ['completed', true],
-        ['stale', true],
     ] as const)('applies the source rehost rule to durable bidirectional phase %s', async (operationPhase, allowed) => {
         const prepare = vi.fn(async () => ({ phase: 'prepared' as const }))
         const bidirectional = {
             snapshot: () => ({
                 ...bidirectionalSnapshot(), operationPhase,
-                operationRetained: !['stale'].includes(operationPhase),
+                operationRetained: true,
             }),
             subscribe: () => () => undefined, initialize: async () => undefined,
             syncRegistered: vi.fn(), resolveRegistered: vi.fn(), resume: vi.fn(), acknowledge: vi.fn(), abandon: vi.fn(),
