@@ -11,7 +11,11 @@ import {
     type DeviceSyncStatus,
 } from './deviceSync'
 import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground'
-import type { PeerSyncForegroundBridge, PeerSyncInvoke } from './peerSyncShared'
+import type {
+    PeerSyncForegroundBridge,
+    PeerSyncInvoke,
+    PeerSyncMutationRuntime,
+} from './peerSyncShared'
 
 export interface AndroidDeviceSyncForegroundIdentity {
     lane: 'device-sync-source'
@@ -22,7 +26,7 @@ export interface AndroidDeviceSyncForegroundIdentity {
 export interface AndroidDeviceSyncFacadeOptions {
     invoke?: DeviceSyncInvoke
     bridge?: PeerSyncForegroundBridge
-    flushPendingData(reason: string): Promise<void>
+    runtime: PeerSyncMutationRuntime
 }
 
 function nativeBridge(): PeerSyncForegroundBridge {
@@ -57,7 +61,7 @@ function safeForegroundIdentity(value: unknown): AndroidDeviceSyncForegroundIden
 export function createAndroidDeviceSyncFacade(options: AndroidDeviceSyncFacadeOptions) {
     const nativeInvoke = options.invoke ?? invoke
     const bridge = options.bridge ?? nativeBridge()
-    const desktopShape = createDeviceSyncFacade({ invoke: nativeInvoke })
+    const desktopShape = createDeviceSyncFacade({ invoke: nativeInvoke, runtime: options.runtime })
     let pendingBridgeStop: AndroidDeviceSyncForegroundIdentity | undefined
 
     const stopPendingBridge = (): void => {
@@ -80,7 +84,6 @@ export function createAndroidDeviceSyncFacade(options: AndroidDeviceSyncFacadeOp
             if (settings.method !== 'lan') {
                 throw new DeviceSyncError('invalid-configuration')
             }
-            await options.flushPendingData('device-sync-source-prepare')
             return desktopShape.prepare({ ...settings, publicBaseUrl: '' })
         },
         async start(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {

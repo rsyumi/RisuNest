@@ -43,6 +43,36 @@ describe('production device sync composition', () => {
         expect(createController.mock.calls[0]?.[0]).toMatchObject({ facade: androidFacade })
     })
 
+    it('hands the desktop source facade the same production mutation runtime', () => {
+        const runtime = {
+            flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),
+            acquireDestructiveReplacementFence: vi.fn(),
+        }
+        const desktopFacade = { platform: 'desktop-source' }
+        const sourceDesktop = vi.fn(() => desktopFacade)
+        const sourceAndroid = vi.fn(() => ({ platform: 'android-source' }))
+        const createController = vi.fn((_options: unknown) => ({ kind: 'controller' }))
+
+        createProductionDeviceSyncController({
+            platform: 'desktop', runtime,
+            factories: {
+                sourceAndroid: sourceAndroid as never,
+                sourceDesktop: sourceDesktop as never,
+                cloneDesktop: vi.fn(() => ({ kind: 'clone' }) as never),
+                deltaDesktop: vi.fn(() => ({ kind: 'delta' }) as never),
+                cloneAndroid: vi.fn(),
+                deltaAndroid: vi.fn(),
+                bidirectional: vi.fn(() => ({ kind: 'bidirectional' }) as never),
+                controller: createController as never,
+            },
+        })
+
+        expect(sourceDesktop).toHaveBeenCalledOnce()
+        expect(sourceDesktop).toHaveBeenCalledWith(runtime)
+        expect(sourceAndroid).not.toHaveBeenCalled()
+        expect(createController.mock.calls[0]?.[0]).toMatchObject({ facade: desktopFacade })
+    })
+
     it('composes every desktop target before returning the controller', () => {
         const runtime = {
             flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),

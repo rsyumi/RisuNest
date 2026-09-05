@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { parsePeerCloneEndpoint, parsePeerPairingUri } from './peerClone'
+import type { PeerSyncMutationRuntime } from './peerSyncShared'
 
 export type DeviceSyncInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
@@ -83,12 +84,27 @@ export interface DeviceSyncLinkPermissions {
     bidirectional: boolean
 }
 
+/** The last bidirectional commit a peer applied while this device shared. */
+export interface DeviceSyncRemoteCommit {
+    operationId: string
+    committedRevision: number
+}
+
+export interface DeviceSyncRemoteCommitRefresh {
+    /**
+     * True when unsaved local edits could not be committed before the refresh.
+     * The store is authoritative at that point, so the edits are gone.
+     */
+    discardedPendingEdits: boolean
+}
+
 export interface DeviceSyncStatus {
     phase: DeviceSyncPhase
     endpoint?: string
     pairingUri?: string
     expiresAtMs?: number
     latestError?: DeviceSyncErrorCode
+    lastRemoteCommit?: DeviceSyncRemoteCommit
 }
 
 export interface RegisteredDevice {
@@ -228,11 +244,31 @@ export function safeDeviceSyncStatus(value: unknown): DeviceSyncStatus {
         ) throw new DeviceSyncError('state-unavailable')
         expiresAtMs = source.expiresAtMs
     }
+    let lastRemoteCommit: DeviceSyncRemoteCommit | undefined
+    if (source.lastRemoteCommit !== undefined && source.lastRemoteCommit !== null) {
+        const commit = source.lastRemoteCommit as Record<string, unknown>
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        if (
+            typeof commit !== 'object'
+            || Array.isArray(commit)
+            || Object.keys(commit).sort().join(',') !== 'committedRevision,operationId'
+            || typeof commit.operationId !== 'string'
+            || !uuid.test(commit.operationId)
+            || typeof commit.committedRevision !== 'number'
+            || !Number.isSafeInteger(commit.committedRevision)
+            || commit.committedRevision < 0
+        ) throw new DeviceSyncError('state-unavailable')
+        lastRemoteCommit = {
+            operationId: commit.operationId,
+            committedRevision: commit.committedRevision,
+        }
+    }
     return {
         phase,
         ...(endpoint ? { endpoint } : {}),
         ...(pairingUri ? { pairingUri } : {}),
         ...(expiresAtMs === undefined ? {} : { expiresAtMs }),
+        ...(lastRemoteCommit ? { lastRemoteCommit } : {}),
         ...(typeof source.latestError === 'string'
             && (SHARED_SESSION_CODES as readonly string[]).includes(source.latestError)
             ? { latestError: source.latestError as DeviceSyncErrorCode }
@@ -263,7 +299,10 @@ function safeDevices(value: unknown): RegisteredDevice[] {
     })
 }
 
-export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = {}) {
+export function createDeviceSyncFacade(options: {
+    invoke?: DeviceSyncInvoke
+    runtime: PeerSyncMutationRuntime
+}) {
     const nativeInvoke = options.invoke ?? invoke
     const validate = (settings: DeviceSyncSettingsInput): void => {
         if (!Number.isInteger(settings.fixedPort) || settings.fixedPort < 1 || settings.fixedPort > 65535) {
@@ -271,12 +310,16 @@ export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = 
         }
     }
     const status = async (): Promise<DeviceSyncStatus> => safeDeviceSyncStatus(await safeInvoke(nativeInvoke, 'device_sync_status'))
-    const source = async (command: string, settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> => {
-        validate(settings)
-        return safeDeviceSyncStatus(await safeInvoke(nativeInvoke, command, { request: { ...settings } }))
-    }
     return {
-        prepare: (settings: DeviceSyncSettingsInput) => source('device_sync_prepare', settings),
+        // The seal pins the store revision, so unsaved edits have to reach the
+        // store first or the shared generation would leave them behind.
+        prepare: async (settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> => {
+            validate(settings)
+            await options.runtime.flushPendingData('device-sync-source-prepare')
+            return safeDeviceSyncStatus(
+                await safeInvoke(nativeInvoke, 'device_sync_prepare', { request: { ...settings } }),
+            )
+        },
         start: async (permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> =>
             safeDeviceSyncStatus(await safeInvoke(nativeInvoke, 'device_sync_start', { permissions })),
         status,
@@ -285,6 +328,32 @@ export function createDeviceSyncFacade(options: { invoke?: DeviceSyncInvoke } = 
         },
         async rotateLink(permissions: DeviceSyncLinkPermissions): Promise<DeviceSyncStatus> {
             return safeDeviceSyncStatus(await safeInvoke(nativeInvoke, 'device_sync_rotate_link', { permissions }))
+        },
+        /**
+         * Pulls the renderer working set up to a revision a peer committed
+         * underneath it. A refused flush is not fatal: the store is already
+         * ahead, so nothing pending could have been committed at that revision
+         * and the only recovery left is to reproject from the store.
+         */
+        async refreshAfterRemoteCommit(commit: DeviceSyncRemoteCommit): Promise<DeviceSyncRemoteCommitRefresh> {
+            let discardedPendingEdits = false
+            try {
+                await options.runtime.flushPendingData('device-sync-remote-commit')
+            } catch {
+                discardedPendingEdits = true
+            }
+            try {
+                const token = await options.runtime.capturePersistentMutationToken('device-sync-remote-commit')
+                const fence = await options.runtime.acquireDestructiveReplacementFence(token)
+                try {
+                    await fence.refreshCommittedWorkingSet(commit.committedRevision)
+                } finally {
+                    fence.release()
+                }
+            } catch (error) {
+                throw classifyDeviceSyncFailure(error)
+            }
+            return { discardedPendingEdits }
         },
         async outgoingDevices(): Promise<RegisteredDevice[]> {
             return safeDevices(await safeInvoke(nativeInvoke, 'peer_sync_outgoing_devices'))

@@ -176,7 +176,7 @@ const productionRuntime = {
 }
 
 type ProductionFactories = {
-    sourceDesktop?(): ReturnType<typeof createDeviceSyncFacade>
+    sourceDesktop?(runtime: typeof productionRuntime): ReturnType<typeof createDeviceSyncFacade>
     sourceAndroid?(runtime: typeof productionRuntime): ReturnType<typeof createAndroidDeviceSyncFacade>
     cloneDesktop(runtime: typeof productionRuntime): DeviceSyncCloneTarget
     cloneAndroid(runtime: typeof productionRuntime): DeviceSyncCloneTarget
@@ -206,10 +206,8 @@ function failClosedTarget<T extends { initialize(): Promise<void>; snapshot(): u
 }
 
 const defaultFactories: ProductionFactories = {
-    sourceDesktop: () => createDeviceSyncFacade(),
-    sourceAndroid: (runtime) => createAndroidDeviceSyncFacade({
-        flushPendingData: runtime.flushPendingData,
-    }),
+    sourceDesktop: (runtime) => createDeviceSyncFacade({ runtime }),
+    sourceAndroid: (runtime) => createAndroidDeviceSyncFacade({ runtime }),
     cloneDesktop: (runtime) => getDesktopPeerCloneController(runtime),
     cloneAndroid: (runtime) => createAndroidDeviceSyncCloneTarget(getAndroidPeerCloneFacade({
         capturePersistentMutationToken: runtime.capturePersistentMutationToken,
@@ -249,10 +247,8 @@ export function createProductionDeviceSyncController(options: {
     )
     return factories.controller({
         facade: options.facade ?? (platform === 'android'
-            ? factories.sourceAndroid?.(runtime) ?? createAndroidDeviceSyncFacade({
-                flushPendingData: runtime.flushPendingData,
-            })
-            : factories.sourceDesktop?.() ?? createDeviceSyncFacade()),
+            ? factories.sourceAndroid?.(runtime) ?? createAndroidDeviceSyncFacade({ runtime })
+            : factories.sourceDesktop?.(runtime) ?? createDeviceSyncFacade({ runtime })),
         targets: { clone, delta, bidirectional },
     })
 }

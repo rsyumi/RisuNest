@@ -9,6 +9,22 @@ const foreground = {
     generation: 7,
 }
 
+const runtimeStub = (flushPendingData?: (reason: string) => Promise<void>) => {
+    const fence = {
+        refreshCommittedWorkingSet: vi.fn(async (_revision: number) => undefined),
+        release: vi.fn(),
+    }
+    return {
+        fence,
+        flushPendingData: vi.fn(flushPendingData ?? (async (_reason: string) => undefined)),
+        capturePersistentMutationToken: vi.fn(async (_reason: string) => ({ revision: 1, mutationGeneration: 1 })),
+        acquireDestructiveReplacementFence: vi.fn(async (_token: {
+            revision: number
+            mutationGeneration: number
+        }) => fence),
+    }
+}
+
 function fixture(options: {
     startSource?: () => boolean
     stopSource?: () => boolean
@@ -29,13 +45,13 @@ function fixture(options: {
         startSource: vi.fn(options.startSource ?? (() => true)),
         stopSource: vi.fn(options.stopSource ?? (() => true)),
     }
-    const flushPendingData = vi.fn(options.flushPendingData ?? (async () => undefined))
+    const runtime = runtimeStub(options.flushPendingData)
     return {
         calls,
         invoke,
         bridge,
-        flushPendingData,
-        facade: createAndroidDeviceSyncFacade({ invoke, bridge, flushPendingData }),
+        runtime,
+        facade: createAndroidDeviceSyncFacade({ invoke, bridge, runtime }),
     }
 }
 
@@ -58,7 +74,7 @@ describe('Android unified device sync source facade', () => {
     it('awaits the persistent-data flush before native LAN preparation', async () => {
         const events: string[] = []
         let finishFlush: (() => void) | undefined
-        const { facade, invoke, flushPendingData } = fixture({
+        const { facade, invoke, runtime } = fixture({
             flushPendingData: async () => {
                 events.push('flush-start')
                 await new Promise<void>((resolve) => { finishFlush = resolve })
@@ -77,7 +93,8 @@ describe('Android unified device sync source facade', () => {
         finishFlush?.()
         await preparing
 
-        expect(flushPendingData).toHaveBeenCalledWith('device-sync-source-prepare')
+        expect(runtime.flushPendingData).toHaveBeenCalledWith('device-sync-source-prepare')
+        expect(runtime.flushPendingData).toHaveBeenCalledOnce()
         expect(events).toEqual(['flush-start', 'flush-finish', 'device_sync_prepare'])
     })
 
@@ -91,6 +108,18 @@ describe('Android unified device sync source facade', () => {
             .rejects.toBe(flushFailure)
 
         expect(invoke).not.toHaveBeenCalled()
+    })
+
+    it('exposes the shared remote commit refresh on the same mutation runtime', async () => {
+        const { facade, runtime } = fixture()
+
+        await expect(facade.refreshAfterRemoteCommit({
+            operationId: '00000000-0000-4000-8000-0000000000a1', committedRevision: 12,
+        })).resolves.toEqual({ discardedPendingEdits: false })
+
+        expect(runtime.flushPendingData).toHaveBeenCalledWith('device-sync-remote-commit')
+        expect(runtime.fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(12)
+        expect(runtime.fence.release).toHaveBeenCalledOnce()
     })
 
     it('recovers once, reserves once, and attaches the exact foreground identity without secrets', async () => {

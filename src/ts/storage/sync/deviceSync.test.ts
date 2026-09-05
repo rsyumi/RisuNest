@@ -2,10 +2,28 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { createDeviceSyncFacade, parseDeviceSyncUri } from './deviceSync'
 
+const runtimeStub = () => {
+    const fence = {
+        refreshCommittedWorkingSet: vi.fn(async (_revision: number) => undefined),
+        release: vi.fn(),
+    }
+    return {
+        fence,
+        flushPendingData: vi.fn(async (_reason: string) => undefined),
+        capturePersistentMutationToken: vi.fn(async (_reason: string) => ({ revision: 1, mutationGeneration: 1 })),
+        acquireDestructiveReplacementFence: vi.fn(async (_token: {
+            revision: number
+            mutationGeneration: number
+        }) => fence),
+    }
+}
+
+const canonicalOperationId = '00000000-0000-4000-8000-0000000000a1'
+
 describe('device sync facade', () => {
     it('forwards saved sharing settings and rejects a fixed port of zero', async () => {
         const invoke = vi.fn(async () => ({ phase: 'prepared' }))
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         await facade.prepare({ method: 'fixed-url', fixedPort: 32145, publicBaseUrl: 'https://sync.example' })
         await expect(facade.prepare({ method: 'lan', fixedPort: 0, publicBaseUrl: '' }))
@@ -25,7 +43,7 @@ describe('device sync facade', () => {
             }
             return { phase: 'running', endpoint, bearer: 'secret', pairingUri }
         })
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         const sources = await facade.incomingSources()
         const status = await facade.status()
@@ -43,7 +61,7 @@ describe('device sync facade', () => {
             sessionId: '123e4567-e89b-12d3-a456-426614174000',
             manifestId: 'a'.repeat(64),
         }))
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         await facade.claimStagedClone({
             endpoint: 'http://192.168.1.2:32145/', sessionId: 'session', manifestId: 'manifest', claim: 'claim',
@@ -116,7 +134,7 @@ describe('device sync facade', () => {
             },
         ]
         const invoke = vi.fn(async () => values.shift())
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
         const link = { endpoint: 'http://source/', sessionId: 'session', manifestId: 'manifest', claim: 'claim' }
 
         await expect(facade.claimStagedClone(link)).rejects.toMatchObject({ code: 'unavailable' })
@@ -127,13 +145,13 @@ describe('device sync facade', () => {
 
     it('rejects non-finite source expiration values', async () => {
         const invoke = vi.fn(async () => ({ phase: 'running', expiresAtMs: Number.NaN }))
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
     })
 
     it.each([undefined, 'unknown'])('rejects missing or unknown source phase %s', async (phase) => {
-        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase })) })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase })), runtime: runtimeStub() })
 
         await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
     })
@@ -145,7 +163,7 @@ describe('device sync facade', () => {
         'https://192.168.1.2/',
         'https://public.example:8443/',
     ])('rejects unsafe source endpoint %s', async (endpoint) => {
-        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase: 'running', endpoint })) })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase: 'running', endpoint })), runtime: runtimeStub() })
 
         await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
     })
@@ -171,7 +189,7 @@ describe('device sync facade', () => {
                     `session=123e4567-e89b-12d3-a456-426614174000&endpoint=${encodeURIComponent(endpoint)}`,
                 ),
             })
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
         await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
@@ -182,7 +200,7 @@ describe('device sync facade', () => {
     })
 
     it('preserves the transient native preparing source phase', async () => {
-        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase: 'preparing' })) })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => ({ phase: 'preparing' })), runtime: runtimeStub() })
 
         await expect(facade.status()).resolves.toEqual({ phase: 'preparing' })
     })
@@ -192,6 +210,7 @@ describe('device sync facade', () => {
             invoke: vi.fn(async () => ({
                 phase: 'idle', endpoint: null, pairingUri: null, expiresAtMs: null, latestError: null,
             })),
+            runtime: runtimeStub(),
         })
 
         await expect(facade.status()).resolves.toEqual({ phase: 'idle' })
@@ -201,7 +220,7 @@ describe('device sync facade', () => {
         const invoke = vi.fn()
             .mockResolvedValueOnce({ phase: 'error', latestError: 'cleanup-failed' })
             .mockResolvedValueOnce({ phase: 'error', latestError: 'private native details' })
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         await expect(facade.status()).resolves.toEqual({ phase: 'error', latestError: 'cleanup-failed' })
         await expect(facade.status()).resolves.toEqual({ phase: 'error' })
@@ -228,7 +247,7 @@ describe('device sync facade', () => {
         ['state-unavailable', 'state-unavailable'],
         ['private native detail', 'operation-failed'],
     ])('maps bounded native code %s to safe category %s', async (nativeError, category) => {
-        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }) })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }), runtime: runtimeStub() })
 
         await expect(facade.reconnectRegisteredClone('source')).rejects.toMatchObject({ code: category })
     })
@@ -241,7 +260,7 @@ describe('device sync facade', () => {
         'toString',
         'constructor',
     ])('no longer gives the unbounded native string %s a category of its own', async (nativeError) => {
-        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }) })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error(nativeError) }), runtime: runtimeStub() })
 
         await expect(facade.claimStagedClone({
             endpoint: 'http://10.1.2.3:32145',
@@ -252,7 +271,7 @@ describe('device sync facade', () => {
     })
 
     it('keeps the refusal category for the bounded registration code', async () => {
-        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error('registrationBlockedByActiveWork') }) })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(async () => { throw new Error('registrationBlockedByActiveWork') }), runtime: runtimeStub() })
 
         await expect(facade.claimStagedClone({
             endpoint: 'http://10.1.2.3:32145',
@@ -262,9 +281,148 @@ describe('device sync facade', () => {
         })).rejects.toMatchObject({ code: 'registration-blocked-by-active-work' })
     })
 
+    it('treats an absent last remote commit as an unset field', async () => {
+        const invoke = vi.fn()
+            .mockResolvedValueOnce({ phase: 'idle' })
+            .mockResolvedValueOnce({ phase: 'idle', lastRemoteCommit: null })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
+
+        await expect(facade.status()).resolves.toEqual({ phase: 'idle' })
+        await expect(facade.status()).resolves.toEqual({ phase: 'idle' })
+    })
+
+    it('keeps a well-formed last remote commit', async () => {
+        const lastRemoteCommit = { operationId: canonicalOperationId, committedRevision: 12 }
+        const facade = createDeviceSyncFacade({
+            invoke: vi.fn(async () => ({ phase: 'prepared', lastRemoteCommit })),
+            runtime: runtimeStub(),
+        })
+
+        await expect(facade.status()).resolves.toEqual({ phase: 'prepared', lastRemoteCommit })
+    })
+
+    it.each([
+        ['an extra key', { operationId: canonicalOperationId, committedRevision: 12, extra: 'secret' }],
+        ['a missing revision', { operationId: canonicalOperationId }],
+        ['a non-UUID operation', { operationId: 'not-a-uuid', committedRevision: 12 }],
+        ['a negative revision', { operationId: canonicalOperationId, committedRevision: -1 }],
+        ['a fractional revision', { operationId: canonicalOperationId, committedRevision: 1.5 }],
+        ['a string revision', { operationId: canonicalOperationId, committedRevision: '12' }],
+        ['an array', [canonicalOperationId, 12]],
+    ])('rejects a last remote commit with %s', async (_label, lastRemoteCommit) => {
+        const facade = createDeviceSyncFacade({
+            invoke: vi.fn(async () => ({ phase: 'prepared', lastRemoteCommit })),
+            runtime: runtimeStub(),
+        })
+
+        await expect(facade.status()).rejects.toMatchObject({ code: 'state-unavailable' })
+    })
+
+    it('awaits the persistent-data flush before native preparation', async () => {
+        const events: string[] = []
+        let finishFlush: (() => void) | undefined
+        const runtime = runtimeStub()
+        runtime.flushPendingData.mockImplementation(async () => {
+            events.push('flush-start')
+            await new Promise<void>((resolve) => { finishFlush = resolve })
+            events.push('flush-finish')
+        })
+        const invoke = vi.fn(async (command: string) => {
+            events.push(command)
+            return { phase: 'prepared' }
+        })
+        const facade = createDeviceSyncFacade({ invoke, runtime })
+
+        const preparing = facade.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
+        await vi.waitFor(() => expect(events).toEqual(['flush-start']))
+        expect(invoke).not.toHaveBeenCalled()
+
+        finishFlush?.()
+        await preparing
+
+        expect(runtime.flushPendingData).toHaveBeenCalledWith('device-sync-source-prepare')
+        expect(runtime.flushPendingData).toHaveBeenCalledOnce()
+        expect(events).toEqual(['flush-start', 'flush-finish', 'device_sync_prepare'])
+    })
+
+    it('does not invoke native preparation when the flush is refused', async () => {
+        const failure = new Error('flush failed')
+        const runtime = runtimeStub()
+        runtime.flushPendingData.mockRejectedValue(failure)
+        const invoke = vi.fn(async () => ({ phase: 'prepared' }))
+        const facade = createDeviceSyncFacade({ invoke, runtime })
+
+        await expect(facade.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' }))
+            .rejects.toBe(failure)
+        expect(invoke).not.toHaveBeenCalled()
+    })
+
+    it('validates the settings before spending a flush', async () => {
+        const runtime = runtimeStub()
+        const invoke = vi.fn(async () => ({ phase: 'prepared' }))
+        const facade = createDeviceSyncFacade({ invoke, runtime })
+
+        await expect(facade.prepare({ method: 'lan', fixedPort: 0, publicBaseUrl: '' }))
+            .rejects.toThrow('valid port')
+        expect(runtime.flushPendingData).not.toHaveBeenCalled()
+        expect(invoke).not.toHaveBeenCalled()
+    })
+
+    it('refreshes the working set to the committed revision after a remote commit', async () => {
+        const order: string[] = []
+        const runtime = runtimeStub()
+        runtime.flushPendingData.mockImplementation(async () => { order.push('flush') })
+        runtime.capturePersistentMutationToken.mockImplementation(async () => {
+            order.push('token')
+            return { revision: 4, mutationGeneration: 2 }
+        })
+        runtime.acquireDestructiveReplacementFence.mockImplementation(async () => {
+            order.push('fence')
+            return runtime.fence
+        })
+        runtime.fence.refreshCommittedWorkingSet.mockImplementation(async () => { order.push('refresh') })
+        runtime.fence.release.mockImplementation(() => { order.push('release') })
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(), runtime })
+
+        await expect(facade.refreshAfterRemoteCommit({
+            operationId: canonicalOperationId, committedRevision: 12,
+        })).resolves.toEqual({ discardedPendingEdits: false })
+
+        expect(order).toEqual(['flush', 'token', 'fence', 'refresh', 'release'])
+        expect(runtime.flushPendingData).toHaveBeenCalledWith('device-sync-remote-commit')
+        expect(runtime.capturePersistentMutationToken).toHaveBeenCalledWith('device-sync-remote-commit')
+        expect(runtime.acquireDestructiveReplacementFence).toHaveBeenCalledWith({ revision: 4, mutationGeneration: 2 })
+        expect(runtime.fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(12)
+    })
+
+    it('still refreshes when the flush conflicts with the peer commit', async () => {
+        const runtime = runtimeStub()
+        runtime.flushPendingData.mockRejectedValue(new Error('revision conflict'))
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(), runtime })
+
+        await expect(facade.refreshAfterRemoteCommit({
+            operationId: canonicalOperationId, committedRevision: 12,
+        })).resolves.toEqual({ discardedPendingEdits: true })
+
+        expect(runtime.fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(12)
+        expect(runtime.fence.release).toHaveBeenCalledOnce()
+    })
+
+    it('releases the fence and reports a bounded code when the refresh fails', async () => {
+        const runtime = runtimeStub()
+        runtime.fence.refreshCommittedWorkingSet.mockRejectedValue(new Error('operationFailed'))
+        const facade = createDeviceSyncFacade({ invoke: vi.fn(), runtime })
+
+        await expect(facade.refreshAfterRemoteCommit({
+            operationId: canonicalOperationId, committedRevision: 12,
+        })).rejects.toMatchObject({ code: 'operation-failed' })
+
+        expect(runtime.fence.release).toHaveBeenCalledOnce()
+    })
+
     it('keeps directional registry revoke commands separate', async () => {
         const invoke = vi.fn(async () => undefined)
-        const facade = createDeviceSyncFacade({ invoke })
+        const facade = createDeviceSyncFacade({ invoke, runtime: runtimeStub() })
 
         await facade.revokeOutgoing('device')
         await facade.revokeIncoming('source')
