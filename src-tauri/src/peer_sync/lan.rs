@@ -3582,6 +3582,33 @@ pub(crate) fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
     }
 }
 
+/// Picks this device's private (or, failing that, link-local) IPv4 from the
+/// interface list. Android sources bind an explicitly selected interface, so
+/// they enumerate instead of asking the routing table like `discover_lan_ipv4`.
+#[cfg(any(target_os = "android", test))]
+fn private_lan_address(candidates: impl IntoIterator<Item = std::net::IpAddr>) -> Option<Ipv4Addr> {
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find_map(|candidate| match candidate {
+            std::net::IpAddr::V4(address) if address.is_private() => Some(*address),
+            _ => None,
+        })
+        .or_else(|| {
+            candidates.iter().find_map(|candidate| match candidate {
+                std::net::IpAddr::V4(address) if address.is_link_local() => Some(*address),
+                _ => None,
+            })
+        })
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn discover_private_lan_address() -> Result<Ipv4Addr, String> {
+    let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
+    private_lan_address(interfaces.into_iter().map(|interface| interface.ip()))
+        .ok_or_else(|| "No private IPv4 LAN address is available".to_owned())
+}
+
 pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
     let url = reqwest::Url::parse(value)
         .map_err(|_| PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))?;
@@ -3700,6 +3727,43 @@ fn has_bare_authority_path(value: &str) -> bool {
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
+
+    #[test]
+    fn address_selection_accepts_only_private_or_link_local_ipv4() {
+        assert_eq!(
+            private_lan_address([
+                "8.8.8.8".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+                "192.168.1.4".parse().unwrap(),
+            ]),
+            Some(Ipv4Addr::new(192, 168, 1, 4)),
+        );
+        assert_eq!(private_lan_address(["8.8.8.8".parse().unwrap()]), None);
+        assert_eq!(
+            private_lan_address([
+                "127.0.0.1".parse().unwrap(),
+                "0.0.0.0".parse().unwrap(),
+                "203.0.113.5".parse().unwrap(),
+            ]),
+            None,
+        );
+        assert_eq!(
+            private_lan_address([
+                "10.2.3.4".parse().unwrap(),
+                "192.168.1.4".parse().unwrap(),
+                "169.254.7.8".parse().unwrap(),
+            ]),
+            Some(Ipv4Addr::new(10, 2, 3, 4)),
+        );
+        assert_eq!(
+            private_lan_address([
+                "169.254.7.8".parse().unwrap(),
+                "203.0.113.5".parse().unwrap(),
+                "192.168.9.4".parse().unwrap(),
+            ]),
+            Some(Ipv4Addr::new(192, 168, 9, 4)),
+        );
+    }
 
     #[test]
     fn clone_endpoint_accepts_private_http_and_bare_public_https() {

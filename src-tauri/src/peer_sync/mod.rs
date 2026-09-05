@@ -11,9 +11,6 @@ pub(crate) mod android_foreground;
 #[cfg(any(target_os = "android", test))]
 #[cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports))]
 mod android_jni;
-#[cfg(any(target_os = "android", test))]
-#[cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports))]
-pub(crate) mod android_source_commands;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod bidirectional_commands;
 mod client;

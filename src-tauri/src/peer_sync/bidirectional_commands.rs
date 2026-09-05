@@ -5443,8 +5443,7 @@ fn request_remote_apply_from_shared(
         Box::new(source),
     )?;
     let mut host = LanCloneHost::prepare_logical(prepared);
-    let address = super::android_source_commands::discover_private_lan_address()
-        .map_err(PeerSyncError::Transport)?;
+    let address = super::lan::discover_private_lan_address().map_err(PeerSyncError::Transport)?;
     let pairing = host.start_private_lan(address)?;
     let port = host
         .address()

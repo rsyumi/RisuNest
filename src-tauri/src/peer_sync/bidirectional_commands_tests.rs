@@ -20,7 +20,9 @@ fn android_p5_target_foreground_retains_running_until_durable_terminal_projectio
     assert!(state.cancel_target_foreground_exact(&foreground).unwrap());
     assert!(cancellation.is_cancelled());
     assert!(!state.release_target_foreground_exact(&foreground).unwrap());
-    assert!(registry().reserve(AndroidForegroundLane::P5Source).is_err());
+    assert!(registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .is_err());
 
     let result = PeerBidirectionalSyncResult::ResumeRequired {
         operation_id: "123e4567-e89b-42d3-a456-426614174188".to_owned(),
@@ -35,7 +37,9 @@ fn android_p5_target_foreground_retains_running_until_durable_terminal_projectio
     assert_eq!(terminal.result, Some(result));
     assert!(terminal.error.is_none());
     assert!(state.release_target_foreground_exact(&foreground).unwrap());
-    let source = registry().reserve(AndroidForegroundLane::P5Source).unwrap();
+    let source = registry()
+        .reserve(AndroidForegroundLane::DeviceSyncSource)
+        .unwrap();
     assert!(registry().abandon_source_exact(&source));
 }
 

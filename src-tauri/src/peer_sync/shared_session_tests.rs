@@ -78,7 +78,7 @@ struct AndroidHostFixture {
 fn android_source_reserve_logs_the_underlying_failure_and_preserves_its_string_contract() {
     let _guard = test_registry_guard();
     let occupied = android_foreground_registry()
-        .reserve(AndroidForegroundLane::P1Source)
+        .reserve(AndroidForegroundLane::P4Target)
         .unwrap();
 
     let error = reserve_device_sync_source().unwrap_err();

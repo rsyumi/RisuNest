@@ -9,10 +9,7 @@ use std::sync::{
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum AndroidForegroundLane {
     DeviceSyncSource,
-    P1Source,
-    P4Source,
     P4Target,
-    P5Source,
     P5Target,
 }
 
@@ -23,10 +20,7 @@ impl AndroidForegroundLane {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "device-sync-source" => Some(Self::DeviceSyncSource),
-            "p1-source" => Some(Self::P1Source),
-            "p4-source" => Some(Self::P4Source),
             "p4-target" => Some(Self::P4Target),
-            "p5-source" => Some(Self::P5Source),
             "p5-target" => Some(Self::P5Target),
             _ => None,
         }
@@ -140,13 +134,7 @@ impl AndroidForegroundRegistry {
         // paths hold command-state locks that those callbacks re-acquire.
         // Rejecting target-lane registrations keeps that re-entrancy
         // impossible.
-        if !matches!(
-            key.lane,
-            AndroidForegroundLane::DeviceSyncSource
-                | AndroidForegroundLane::P1Source
-                | AndroidForegroundLane::P4Source
-                | AndroidForegroundLane::P5Source
-        ) {
+        if !matches!(key.lane, AndroidForegroundLane::DeviceSyncSource) {
             return false;
         }
         let Ok(mut entry) = self.entry.lock() else {
@@ -183,13 +171,7 @@ impl AndroidForegroundRegistry {
     }
 
     pub(crate) fn abandon_source_exact(&self, key: &AndroidForegroundKey) -> bool {
-        if !matches!(
-            key.lane,
-            AndroidForegroundLane::DeviceSyncSource
-                | AndroidForegroundLane::P1Source
-                | AndroidForegroundLane::P4Source
-                | AndroidForegroundLane::P5Source
-        ) {
+        if !matches!(key.lane, AndroidForegroundLane::DeviceSyncSource) {
             return false;
         }
         let callback = {
@@ -217,13 +199,7 @@ impl AndroidForegroundRegistry {
         &self,
         lane: AndroidForegroundLane,
     ) -> Option<AndroidForegroundKey> {
-        if !matches!(
-            lane,
-            AndroidForegroundLane::DeviceSyncSource
-                | AndroidForegroundLane::P1Source
-                | AndroidForegroundLane::P4Source
-                | AndroidForegroundLane::P5Source
-        ) {
+        if !matches!(lane, AndroidForegroundLane::DeviceSyncSource) {
             return None;
         }
         self.entry
@@ -341,13 +317,7 @@ pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) fn peer_sync_foreground_source_abandon(
     foreground: AndroidForegroundKey,
 ) -> Result<bool, String> {
-    if !matches!(
-        foreground.lane,
-        AndroidForegroundLane::DeviceSyncSource
-            | AndroidForegroundLane::P1Source
-            | AndroidForegroundLane::P4Source
-            | AndroidForegroundLane::P5Source
-    ) {
+    if !matches!(foreground.lane, AndroidForegroundLane::DeviceSyncSource) {
         return Err("Android foreground identity is not a source lane".to_owned());
     }
     Ok(registry().abandon_source_exact(&foreground))
@@ -358,13 +328,7 @@ pub(crate) fn peer_sync_foreground_source_abandon(
 pub(crate) fn peer_sync_foreground_source_status(
     lane: AndroidForegroundLane,
 ) -> Result<Option<AndroidForegroundKey>, String> {
-    if !matches!(
-        lane,
-        AndroidForegroundLane::DeviceSyncSource
-            | AndroidForegroundLane::P1Source
-            | AndroidForegroundLane::P4Source
-            | AndroidForegroundLane::P5Source
-    ) {
+    if !matches!(lane, AndroidForegroundLane::DeviceSyncSource) {
         return Err("Android foreground lane is not a source lane".to_owned());
     }
     Ok(registry().source_status(lane))
@@ -385,25 +349,16 @@ mod tests {
             Some(AndroidForegroundLane::DeviceSyncSource)
         );
         assert_eq!(
-            AndroidForegroundLane::parse("p1-source"),
-            Some(AndroidForegroundLane::P1Source)
-        );
-        assert_eq!(
-            AndroidForegroundLane::parse("p4-source"),
-            Some(AndroidForegroundLane::P4Source)
-        );
-        assert_eq!(
             AndroidForegroundLane::parse("p4-target"),
             Some(AndroidForegroundLane::P4Target)
-        );
-        assert_eq!(
-            AndroidForegroundLane::parse("p5-source"),
-            Some(AndroidForegroundLane::P5Source)
         );
         assert_eq!(
             AndroidForegroundLane::parse("p5-target"),
             Some(AndroidForegroundLane::P5Target)
         );
+        assert_eq!(AndroidForegroundLane::parse("p1-source"), None);
+        assert_eq!(AndroidForegroundLane::parse("p4-source"), None);
+        assert_eq!(AndroidForegroundLane::parse("p5-source"), None);
         assert_eq!(AndroidForegroundLane::parse("p3-target"), None);
         assert_eq!(AndroidForegroundLane::parse("quick-tunnel"), None);
     }
@@ -411,9 +366,13 @@ mod tests {
     #[test]
     fn attach_acquire_cancel_and_detach_are_generation_exact() {
         let registry = AndroidForegroundRegistry::default();
-        let old = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        let old = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
         assert!(registry.detach_if_generation(&old));
-        let current = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        let current = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
         assert!(current.generation > old.generation);
         assert!(!registry.attach_exact(&old));
         assert!(registry.attach_exact(&current));
@@ -430,7 +389,9 @@ mod tests {
     #[test]
     fn source_stop_callback_runs_outside_registry_mutex_once() {
         let registry = Arc::new(AndroidForegroundRegistry::default());
-        let key = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        let key = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
         assert!(registry.attach_exact(&key));
         let called = Arc::new(AtomicBool::new(false));
         let callback_registry = Arc::clone(&registry);
@@ -458,8 +419,10 @@ mod tests {
     #[test]
     fn foreground_owner_is_globally_exclusive_across_reserved_and_attached_lanes() {
         let registry = AndroidForegroundRegistry::default();
-        let source = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
-        assert!(registry.reserve(AndroidForegroundLane::P4Source).is_err());
+        let source = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
+        assert!(registry.reserve(AndroidForegroundLane::P4Target).is_err());
         assert!(registry.attach_exact(&source));
         assert!(registry.reserve(AndroidForegroundLane::P4Target).is_err());
         assert!(registry.cancel_exact(&source));
@@ -476,22 +439,20 @@ mod tests {
     #[test]
     fn source_abandon_is_exact_idempotent_and_allows_a_different_lane() {
         let registry = AndroidForegroundRegistry::default();
-        for lane in [
-            AndroidForegroundLane::DeviceSyncSource,
-            AndroidForegroundLane::P1Source,
-            AndroidForegroundLane::P4Source,
-            AndroidForegroundLane::P5Source,
-        ] {
-            let source = registry.reserve(lane).unwrap();
-            let mut stale = source.clone();
-            stale.generation += 1;
-            assert!(!registry.abandon_source_exact(&stale));
-            assert!(registry.abandon_source_exact(&source));
-            assert!(registry.abandon_source_exact(&source));
-            let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
-            assert!(!registry.abandon_source_exact(&source));
-            assert!(registry.detach_if_generation(&target));
-        }
+        let source = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
+        let mut stale = source.clone();
+        stale.generation += 1;
+        assert!(!registry.abandon_source_exact(&stale));
+        assert!(registry.abandon_source_exact(&source));
+        assert!(registry.abandon_source_exact(&source));
+        let target = registry.reserve(AndroidForegroundLane::P4Target).unwrap();
+        // Target lanes are released through release_target_exact, never through
+        // the source abandon path.
+        assert!(!registry.abandon_source_exact(&target));
+        assert!(!registry.abandon_source_exact(&source));
+        assert!(registry.detach_if_generation(&target));
     }
 
     #[test]
@@ -505,11 +466,11 @@ mod tests {
             Some(source.clone())
         );
         assert_eq!(
-            registry.source_status(AndroidForegroundLane::P1Source),
+            registry.source_status(AndroidForegroundLane::P4Target),
             None
         );
         assert_eq!(
-            registry.source_status(AndroidForegroundLane::P4Target),
+            registry.source_status(AndroidForegroundLane::P5Target),
             None
         );
         assert!(registry.abandon_source_exact(&source));
@@ -527,9 +488,13 @@ mod tests {
         assert!(registry.retain_target_exact(&target));
         assert!(registry.cancel_exact(&target));
         assert!(!registry.detach_if_generation(&target));
-        assert!(registry.reserve(AndroidForegroundLane::P1Source).is_err());
+        assert!(registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .is_err());
         assert!(registry.release_target_exact(&target));
-        let source = registry.reserve(AndroidForegroundLane::P1Source).unwrap();
+        let source = registry
+            .reserve(AndroidForegroundLane::DeviceSyncSource)
+            .unwrap();
         assert!(!registry.release_target_exact(&target));
         assert!(registry.detach_if_generation(&source));
     }

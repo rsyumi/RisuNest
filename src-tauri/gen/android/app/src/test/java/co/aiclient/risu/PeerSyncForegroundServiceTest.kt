@@ -12,11 +12,11 @@ class PeerSyncForegroundServiceTest {
   @Test
   fun `only user started peer sync lanes are accepted`() {
     assertTrue(isAllowedPeerSyncForegroundLane("device-sync-source"))
-    assertTrue(isAllowedPeerSyncForegroundLane("p1-source"))
-    assertTrue(isAllowedPeerSyncForegroundLane("p4-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p4-target"))
-    assertTrue(isAllowedPeerSyncForegroundLane("p5-source"))
     assertTrue(isAllowedPeerSyncForegroundLane("p5-target"))
+    assertFalse(isAllowedPeerSyncForegroundLane("p1-source"))
+    assertFalse(isAllowedPeerSyncForegroundLane("p4-source"))
+    assertFalse(isAllowedPeerSyncForegroundLane("p5-source"))
     assertFalse(isAllowedPeerSyncForegroundLane("p3-target"))
     assertFalse(isAllowedPeerSyncForegroundLane("quick-tunnel"))
   }
@@ -33,24 +33,24 @@ class PeerSyncForegroundServiceTest {
 
   @Test
   fun `service extras contain identity only and no pairing secrets`() {
-    val extras = peerSyncForegroundIdentityExtras("p1-source", operationId, 7L)
+    val extras = peerSyncForegroundIdentityExtras("p4-target", operationId, 7L)
     assertEquals(setOf("lane", "operationId", "generation"), extras.keys)
     assertFalse(extras.keys.any { it.contains("token", true) || it.contains("bearer", true) || it.contains("claim", true) })
   }
 
   @Test
   fun `notification stop is immutable and generation exact`() {
-    val current = PeerSyncForegroundIdentity("p1-source", operationId, 7L)
-    assertEquals(current, peerSyncForegroundIdentity("p1-source", operationId, 7L))
-    assertEquals(null, peerSyncForegroundIdentity("p1-source", operationId, 0L))
+    val current = PeerSyncForegroundIdentity("device-sync-source", operationId, 7L)
+    assertEquals(current, peerSyncForegroundIdentity("device-sync-source", operationId, 7L))
+    assertEquals(null, peerSyncForegroundIdentity("device-sync-source", operationId, 0L))
     assertEquals(null, peerSyncForegroundIdentity("p3-target", operationId, 7L))
     assertTrue(isExactAttachedPeerSyncStop(current, current))
     assertFalse(isExactAttachedPeerSyncStop(current, current.copy(generation = 6L)))
-    val p4Source = PeerSyncForegroundIdentity("p4-source", operationId, 8L)
+    val unifiedSource = PeerSyncForegroundIdentity("device-sync-source", operationId, 8L)
     val p4Target = PeerSyncForegroundIdentity("p4-target", operationId, 9L)
-    assertEquals(p4Source, peerSyncForegroundIdentity("p4-source", operationId, 8L))
+    assertEquals(unifiedSource, peerSyncForegroundIdentity("device-sync-source", operationId, 8L))
     assertEquals(p4Target, peerSyncForegroundIdentity("p4-target", operationId, 9L))
-    assertFalse(isExactAttachedPeerSyncStop(p4Source, p4Target))
+    assertFalse(isExactAttachedPeerSyncStop(unifiedSource, p4Target))
   }
 
   @Test
@@ -66,21 +66,21 @@ class PeerSyncForegroundServiceTest {
 
   @Test
   fun `single service accepts only an idempotent sequential START until exact destruction`() {
-    val p1 = PeerSyncForegroundIdentity("p1-source", operationId, 7L)
+    val source = PeerSyncForegroundIdentity("device-sync-source", operationId, 7L)
     val p4 = PeerSyncForegroundIdentity("p4-target", "22222222-2222-4222-8222-222222222222", 8L)
-    assertTrue(canStartPeerSyncForeground(null, p1))
-    assertTrue(canStartPeerSyncForeground(p1, p1))
-    assertFalse(canStartPeerSyncForeground(p1, p4))
-    assertEquals(p4, rejectedPeerSyncForegroundStart(p1, p4))
-    assertEquals(null, rejectedPeerSyncForegroundStart(p1, p1))
+    assertTrue(canStartPeerSyncForeground(null, source))
+    assertTrue(canStartPeerSyncForeground(source, source))
+    assertFalse(canStartPeerSyncForeground(source, p4))
+    assertEquals(p4, rejectedPeerSyncForegroundStart(source, p4))
+    assertEquals(null, rejectedPeerSyncForegroundStart(source, source))
   }
 
   @Test
   fun `accepted exact Stop clears the attached identity and admits a cross lane START`() {
-    val p1 = PeerSyncForegroundIdentity("p1-source", operationId, 7L)
-    val p4 = PeerSyncForegroundIdentity("p4-source", "22222222-2222-4222-8222-222222222222", 8L)
+    val source = PeerSyncForegroundIdentity("device-sync-source", operationId, 7L)
+    val p4 = PeerSyncForegroundIdentity("p4-target", "22222222-2222-4222-8222-222222222222", 8L)
 
-    val attached = peerSyncForegroundIdentityAfterStop(p1, p1)
+    val attached = peerSyncForegroundIdentityAfterStop(source, source)
 
     assertNull(attached)
     assertTrue(canStartPeerSyncForeground(attached, p4))
@@ -88,7 +88,7 @@ class PeerSyncForegroundServiceTest {
 
   @Test
   fun `stale P5 Stop retains Kotlin identity and blocks a fresh cross lane START`() {
-    val p5 = PeerSyncForegroundIdentity("p5-source", operationId, 9L)
+    val p5 = PeerSyncForegroundIdentity("p5-target", operationId, 9L)
     val stale = p5.copy(generation = 8L)
     val fresh = PeerSyncForegroundIdentity(
       "p4-target",
@@ -112,16 +112,4 @@ class PeerSyncForegroundServiceTest {
     assertFalse(canStartPeerSyncForeground(current, current.copy(generation = 13L)))
   }
 
-  @Test
-  fun `unified and legacy source identities remain mutually exclusive`() {
-    val unified = PeerSyncForegroundIdentity("device-sync-source", operationId, 12L)
-    val legacy = PeerSyncForegroundIdentity(
-      "p1-source",
-      "22222222-2222-4222-8222-222222222222",
-      13L,
-    )
-
-    assertFalse(canStartPeerSyncForeground(unified, legacy))
-    assertFalse(canStartPeerSyncForeground(legacy, unified))
-  }
 }
