@@ -170,12 +170,18 @@ describe('RisuNest native command integration', () => {
 })
 
 describe('RisuNest sync language schema', () => {
-    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'lanWarning', 'androidLanOnly']
+    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'work.progressLabel', 'work.deltaConflictBothChanged', 'work.deltaConflictLocalChanged', 'work.bidirectionalSyncing', 'work.bidirectionalResumeRequired', 'work.bidirectionalSourceUnavailable', 'work.bidirectionalRefreshPending', 'work.bidirectionalStale', 'lanWarning', 'androidLanOnly', 'notificationsDisabledWarning']
 
     it.each([languageEnglish, languageKorean])('contains every required nested sync branch', (translation) => {
         for (const path of required) {
             const value = path.split('.').reduce<any>((current, key) => current?.[key], translation.risuNest.sync)
             expect(value).toEqual(expect.any(String))
         }
+    })
+
+    it.each([languageEnglish, languageKorean])('no longer carries the per-lane blocks', (translation) => {
+        expect('peerClone' in translation).toBe(false)
+        expect('peerDelta' in translation).toBe(false)
+        expect('peerBidirectional' in translation).toBe(false)
     })
 })

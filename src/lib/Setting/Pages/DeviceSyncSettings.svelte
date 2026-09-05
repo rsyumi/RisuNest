@@ -385,7 +385,7 @@
     <h3 class="text-xl font-bold">{sync.menuTitle}</h3>
     <p data-sync-intro class="mt-1 text-sm text-textcolor2">{sync.intro}</p>
     {#if isTauriAndroid && notificationsEnabled === false}
-        <p data-notification-warning class="mt-3 rounded-md border border-draculared bg-darkbg p-3 text-sm text-draculared">{language.peerClone.notificationsDisabledWarning}</p>
+        <p data-notification-warning class="mt-3 rounded-md border border-draculared bg-darkbg p-3 text-sm text-draculared">{sync.notificationsDisabledWarning}</p>
     {/if}
     <div data-sync-card="sharing" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
         <div class="flex items-center justify-between gap-3">
@@ -481,7 +481,7 @@
                         {#if cloneTarget.totalBytes !== undefined}
                             {@const percent = Math.round((cloneTarget.completedBytes / Math.max(1, cloneTarget.totalBytes)) * 100)}
                             <progress class="w-full" aria-label={format(sync.work.progress, percent)} value={cloneTarget.completedBytes} max={Math.max(1, cloneTarget.totalBytes)}></progress><p class="mt-1 text-sm">{format(sync.work.progress, percent)}</p>
-                        {:else}<progress class="w-full" aria-label={language.peerClone.progress}></progress><p class="mt-1 text-sm">{language.peerClone.progress}</p>{/if}
+                        {:else}<progress class="w-full" aria-label={sync.work.progressLabel}></progress><p class="mt-1 text-sm">{sync.work.progressLabel}</p>{/if}
                         <Button className="mt-2" size="sm" styled="danger" disabled={workActionPending} onclick={() => runWorkAction(() => controller.cancelClone())}>{sync.work.cancel}</Button>
                     {:else if cloneRetryable}
                         <Button size="sm" disabled={workActionPending} onclick={() => runWorkAction(() => controller.resumeClone())}>{sync.work.resume}</Button>
@@ -507,18 +507,18 @@
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'noChanges'}<p class="text-sm">{sync.work.doneUpToDate}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'updated'}<p class="text-sm">{format(sync.work.doneUpdated, delta.pullResult.transferredObjects, formatRisuNestStorageBytes(delta.pullResult.transferredBytes))}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'fullCloneRequired'}<p class="text-sm">{sync.work.needClone}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
-                    {:else if delta?.pullPhase === 'conflict'}<p class="text-sm text-draculared">{delta.pullResult?.kind === 'conflict' && delta.pullResult.reason === 'staleRevision' ? language.peerDelta.conflictStaleRevision : language.peerDelta.conflictLocalRemote}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
+                    {:else if delta?.pullPhase === 'conflict'}<p class="text-sm text-draculared">{delta.pullResult?.kind === 'conflict' && delta.pullResult.reason === 'staleRevision' ? sync.work.deltaConflictLocalChanged : sync.work.deltaConflictBothChanged}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'failed'}<Button size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>{/if}
                 {:else}
-                    {#if workActionPending || bidiPhase === 'running'}<p class="text-sm">{language.peerBidirectional.syncing}</p>
+                    {#if workActionPending || bidiPhase === 'running'}<p class="text-sm">{sync.work.bidirectionalSyncing}</p>
                     {:else if bidiPhase === 'awaitingConflict'}
                         {@const conflict = conflictNames()}
                         <div class="rounded-md border border-draculared p-3"><p class="font-bold text-draculared">{sync.work.conflictTitle}</p><p class="mt-1 text-sm text-textcolor2">{sync.work.conflictBody}</p><ul class="mt-2 list-inside list-disc text-sm">{#each conflict.names as name}<li>{name}</li>{/each}{#if conflict.otherCount > 0}<li>{format(sync.work.conflictOthers, conflict.otherCount)}</li>{/if}</ul><div class="mt-2 flex flex-wrap gap-2"><Button size="sm" onclick={() => resolve('local')}>{sync.work.keepThis}</Button><Button size="sm" onclick={() => resolve('remote')}>{sync.work.keepOther}</Button></div></div>
-                    {:else if bidiPhase === 'sourcePrepared'}<p class="text-sm text-textcolor2">{sync.share.start}: {language.peerBidirectional.resumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={!['idle', 'error', 'prepared'].includes(snapshot.source.phase)} onclick={resumeBidi}>{sync.work.resume}</Button>{#if snapshot.source.phase === 'idle'}<Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button>{/if}</div>
-                    {:else if ['sourceUnavailable', 'localCommitted', 'targetPrepared'].includes(bidiPhase)}<p class="text-sm text-textcolor2">{bidiPhase === 'sourceUnavailable' ? language.peerBidirectional.sourceUnavailable : language.peerBidirectional.resumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" onclick={resumeBidi}>{sync.work.resume}</Button><Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button></div>
-                    {:else if bidiPhase === 'refreshPending'}<p class="text-sm text-textcolor2">{language.peerBidirectional.refreshPending}</p><Button className="mt-2" size="sm" onclick={resumeBidi}>{sync.work.resume}</Button>
+                    {:else if bidiPhase === 'sourcePrepared'}<p class="text-sm text-textcolor2">{sync.share.start}: {sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={!['idle', 'error', 'prepared'].includes(snapshot.source.phase)} onclick={resumeBidi}>{sync.work.resume}</Button>{#if snapshot.source.phase === 'idle'}<Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button>{/if}</div>
+                    {:else if ['sourceUnavailable', 'localCommitted', 'targetPrepared'].includes(bidiPhase)}<p class="text-sm text-textcolor2">{bidiPhase === 'sourceUnavailable' ? sync.work.bidirectionalSourceUnavailable : sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" onclick={resumeBidi}>{sync.work.resume}</Button><Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button></div>
+                    {:else if bidiPhase === 'refreshPending'}<p class="text-sm text-textcolor2">{sync.work.bidirectionalRefreshPending}</p><Button className="mt-2" size="sm" onclick={resumeBidi}>{sync.work.resume}</Button>
                     {:else if bidiPhase === 'failed'}<Button size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
-                    {:else if bidiPhase === 'stale'}<p class="text-sm">{language.peerBidirectional.stale}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
+                    {:else if bidiPhase === 'stale'}<p class="text-sm">{sync.work.bidirectionalStale}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if bidiPhase === 'completed' && bidi?.operationResult?.kind !== 'conflict'}
                         {@const result = bidi.operationResult}
                         <p class="text-sm">{result?.kind === 'noChanges' ? sync.work.doneUpToDate : result?.kind === 'updated' ? format(sync.work.doneUpdated, result.transferredObjects, formatRisuNestStorageBytes(result.transferredBytes)) : sync.work.doneUpToDate}</p>
