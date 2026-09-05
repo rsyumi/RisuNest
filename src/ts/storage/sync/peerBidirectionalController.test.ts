@@ -868,7 +868,6 @@ describe('peer bidirectional controller', () => {
             expect(controller.snapshot().operationPhase).toBe('completed')
         },
     )
-
 })
 
 describe('peer bidirectional controller surface', () => {

@@ -89,6 +89,20 @@ describe('device sync facade', () => {
         expect(parseDeviceSyncUri(pairingUri).endpoint).toBe(canonical)
     })
 
+    const session = 'session=123e4567-e89b-12d3-a456-426614174000'
+    const canonicalQuery = `endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&${session}&manifest=${'a'.repeat(64)}`
+
+    it.each([
+        ['a non-hex claim fragment', `risuailocal://peer-clone/v2?${canonicalQuery}#claim=${'g'.repeat(64)}`],
+        ['a short claim fragment', `risuailocal://peer-clone/v2?${canonicalQuery}#claim=${'b'.repeat(63)}`],
+        ['a duplicated session key', `risuailocal://peer-clone/v2?${canonicalQuery}&${session}#claim=${'b'.repeat(64)}`],
+        ['an extra unknown key', `risuailocal://peer-clone/v2?${canonicalQuery}&bearer=secret#claim=${'b'.repeat(64)}`],
+        ['a missing manifest key', `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&${session}#claim=${'b'.repeat(64)}`],
+        ['a body past the 8192 character pairing URI ceiling', `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(`http://10.1.2.3:32145/${'a'.repeat(8192)}`)}&${session}&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`],
+    ])('rejects a canonical v2 link carrying %s', (_reason, uri) => {
+        expect(() => parseDeviceSyncUri(uri)).toThrow('Invalid device sync link')
+    })
+
     it('rejects malformed or secret-bearing native claim descriptors', async () => {
         const values = [
             { sourceDeviceId: 'source', endpoint: 'http://current/', sessionId: 'session' },

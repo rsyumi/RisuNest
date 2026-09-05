@@ -134,6 +134,52 @@ describe('production device sync composition', () => {
         expect(prepare).toHaveBeenCalledOnce()
     })
 
+    it('rejects a swallowed desktop bidirectional initialization failure until recovery succeeds', async () => {
+        let operationError = 'private bidirectional initialization failure'
+        const initializeBidirectional = vi.fn(async () => undefined)
+        const clone = {
+            snapshot: () => ({
+                state: { target: { phase: 'idle' as const, destructiveConfirmed: false, completedBytes: 0 } },
+                error: '', warning: '',
+            }),
+            subscribe: () => () => undefined,
+            initialize: vi.fn(async () => undefined),
+        }
+        const delta = {
+            snapshot: () => ({ pullPhase: 'idle' as const, retained: null, error: '' }),
+            subscribe: () => () => undefined,
+            initialize: vi.fn(async () => undefined),
+        }
+        const bidirectional = {
+            snapshot: () => ({
+                operationPhase: 'idle' as const, operationRetained: false, operationError,
+            }),
+            subscribe: () => () => undefined,
+            initialize: initializeBidirectional,
+        }
+        const facade = {
+            status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
+            prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
+            stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
+            revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+        }
+        const controller = createProductionDeviceSyncController({
+            platform: 'desktop', facade: facade as never,
+            factories: {
+                cloneDesktop: () => clone as never, cloneAndroid: vi.fn(),
+                deltaDesktop: () => delta as never, deltaAndroid: vi.fn(),
+                bidirectional: () => bidirectional as never,
+                controller: createDeviceSyncController,
+            },
+        })
+
+        await expect(controller.initialize()).rejects.toMatchObject({ code: 'state-unavailable' })
+
+        operationError = ''
+        await expect(controller.initialize()).resolves.toBeUndefined()
+        expect(initializeBidirectional).toHaveBeenCalledTimes(2)
+    })
+
     it('adapts the Android registered clone job to the unified target API', async () => {
         const listeners: Array<() => void> = []
         let state: {

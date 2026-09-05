@@ -31,37 +31,22 @@ function runtime(log: string[]): PeerBidirectionalMutationRuntime {
 }
 
 describe('peer bidirectional facade', () => {
-    it('preserves a durable source-prepared operation in status', async () => {
-        const status = {
-            operation: { phase: 'sourcePrepared' as const, operationId: 'operation-source-prepared' },
-        }
-        const nativeInvoke = vi.fn(async (command: string) => {
-            if (command === 'peer_bidirectional_status') return status
-            throw new Error(`Unexpected command: ${command}`)
-        })
-        const peer = createPeerBidirectionalFacade({
-            platform: 'desktop',
-            invoke: nativeInvoke as unknown as PeerBidirectionalInvoke,
-        })
+    it.each(['sourcePrepared', 'targetPrepared'] as const)(
+        'preserves a durable %s operation in status',
+        async (phase) => {
+            const status = { operation: { phase, operationId: `operation-${phase}` } }
+            const nativeInvoke = vi.fn(async (command: string) => {
+                if (command === 'peer_bidirectional_status') return status
+                throw new Error(`Unexpected command: ${command}`)
+            })
+            const peer = createPeerBidirectionalFacade({
+                platform: 'desktop',
+                invoke: nativeInvoke as unknown as PeerBidirectionalInvoke,
+            })
 
-        await expect(peer.status()).resolves.toEqual(status)
-    })
-
-    it('preserves a durable target-prepared operation in status', async () => {
-        const status = {
-            operation: { phase: 'targetPrepared' as const, operationId: 'operation-target-prepared' },
-        }
-        const nativeInvoke = vi.fn(async (command: string) => {
-            if (command === 'peer_bidirectional_status') return status
-            throw new Error(`Unexpected command: ${command}`)
-        })
-        const peer = createPeerBidirectionalFacade({
-            platform: 'desktop',
-            invoke: nativeInvoke as unknown as PeerBidirectionalInvoke,
-        })
-
-        await expect(peer.status()).resolves.toEqual(status)
-    })
+            await expect(peer.status()).resolves.toEqual(status)
+        },
+    )
 
     it('does not create a fallback authority on web', async () => {
         const platform = 'web' as const
@@ -498,6 +483,48 @@ describe('peer bidirectional facade', () => {
             kind: 'updated',
             revision: 8,
         })
+        expect(events).toEqual([
+            'flush:peer-bidirectional-sync',
+            'capture:peer-bidirectional-sync',
+            'acquire:7:11',
+            'invoke:peer_bidirectional_sync_registered:7',
+            'refresh:8',
+            'release',
+        ])
+    })
+
+    it('refuses a second registered mutation while the first native call is pending', async () => {
+        const events: string[] = []
+        let releaseNative: () => void = () => undefined
+        const nativePending = new Promise<void>((resolve) => { releaseNative = resolve })
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            events.push(`invoke:${command}:${String(args?.expectedRevision ?? '')}`)
+            await nativePending
+            return {
+                kind: 'updated',
+                operationId: 'operation-exclusive',
+                revision: 8,
+                remoteRevision: 4,
+                transferredObjects: 2,
+                transferredBytes: 19,
+                backups: [],
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+        })
+
+        const first = facade.syncRegistered('device-first')
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce())
+
+        await expect(facade.syncRegistered('device-second'))
+            .rejects.toThrow('A peer sync target is active')
+
+        releaseNative()
+        await expect(first).resolves.toMatchObject({ kind: 'updated', revision: 8 })
+        expect(invoke).toHaveBeenCalledOnce()
         expect(events).toEqual([
             'flush:peer-bidirectional-sync',
             'capture:peer-bidirectional-sync',
