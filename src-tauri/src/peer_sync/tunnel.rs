@@ -28,9 +28,6 @@ const DROP_CLEANUP_ATTEMPTS: usize = 3;
 const NAMED_ORIGIN_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 const NAMED_ORIGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const NAMED_ORIGIN_RETRY: Duration = Duration::from_millis(100);
-const NAMED_TUNNEL_REGISTERED: &str = "Registered tunnel connection";
-const MIN_TUNNEL_TOKEN_BYTES: usize = 32;
-const MAX_TUNNEL_TOKEN_BYTES: usize = 8 * 1024;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -40,7 +37,6 @@ pub(crate) enum TunnelError {
     CloudflaredNotInstalled,
     UntrustedCloudflared,
     InvalidOrigin,
-    InvalidNamedConfiguration,
     Launch(String),
     Readiness {
         reason: String,
@@ -63,9 +59,6 @@ impl fmt::Display for TunnelError {
             }
             Self::InvalidOrigin => {
                 formatter.write_str("tunnel origin must be 127.0.0.1 with a nonzero port")
-            }
-            Self::InvalidNamedConfiguration => {
-                formatter.write_str("invalid named tunnel configuration")
             }
             Self::Launch(error) => write!(formatter, "failed to launch cloudflared: {error}"),
             Self::Readiness { reason, .. } => {
@@ -237,10 +230,6 @@ impl CloudflaredDiscovery for PathCloudflaredDiscovery {
 
 pub(crate) enum TunnelMode {
     Quick,
-    Named {
-        token: String,
-        expected_public_base_url: Url,
-    },
 }
 
 struct LaunchSpec {
@@ -255,28 +244,9 @@ struct LaunchSpec {
 
 enum ProcessReadiness {
     Quick,
-    Named(Url),
 }
 
 impl TunnelMode {
-    pub(crate) fn named(
-        token: String,
-        expected_public_base_url: &str,
-    ) -> Result<Self, TunnelError> {
-        if token.len() < MIN_TUNNEL_TOKEN_BYTES
-            || token.len() > MAX_TUNNEL_TOKEN_BYTES
-            || !token.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(TunnelError::InvalidNamedConfiguration);
-        }
-        let expected_public_base_url = validate_public_base_url(expected_public_base_url)
-            .ok_or(TunnelError::InvalidNamedConfiguration)?;
-        Ok(Self::Named {
-            token,
-            expected_public_base_url,
-        })
-    }
-
     fn launch(self, origin: SocketAddr) -> Result<LaunchSpec, TunnelError> {
         let SocketAddr::V4(origin) = origin else {
             return Err(TunnelError::InvalidOrigin);
@@ -297,14 +267,6 @@ impl TunnelMode {
                 None,
                 ProcessReadiness::Quick,
             ),
-            Self::Named {
-                token,
-                expected_public_base_url,
-            } => (
-                vec!["tunnel".into(), "--no-autoupdate".into(), "run".into()],
-                Some(token),
-                ProcessReadiness::Named(expected_public_base_url),
-            ),
         };
 
         Ok(LaunchSpec {
@@ -320,16 +282,6 @@ impl TunnelMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TunnelReady {
     transport_url: Url,
-    verify_named_origin: bool,
-}
-
-impl TunnelReady {
-    fn named(transport_url: Url) -> Self {
-        Self {
-            transport_url,
-            verify_named_origin: true,
-        }
-    }
 }
 
 pub(crate) trait TunnelProcess: Send + 'static {
@@ -430,12 +382,7 @@ fn parse_quick_tunnel_url(output: &str) -> Option<Url> {
 fn safe_readiness_error_output(readiness: &ProcessReadiness, output: &BoundedOutput) -> String {
     match readiness {
         ProcessReadiness::Quick => output.text(),
-        ProcessReadiness::Named(_) => String::new(),
     }
-}
-
-fn named_tunnel_registered(output: &str) -> bool {
-    output.contains(NAMED_TUNNEL_REGISTERED)
 }
 
 pub(crate) struct SystemTunnelProcess {
@@ -531,18 +478,9 @@ impl TunnelProcess for SystemTunnelProcess {
             match &self.readiness {
                 ProcessReadiness::Quick => {
                     if let Some(transport_url) = parse_quick_tunnel_url(&self.output.text()) {
-                        return Ok(TunnelReady {
-                            transport_url,
-                            verify_named_origin: false,
-                        });
+                        return Ok(TunnelReady { transport_url });
                     }
                 }
-                ProcessReadiness::Named(expected_public_base_url)
-                    if named_tunnel_registered(&self.output.text()) =>
-                {
-                    return Ok(TunnelReady::named(expected_public_base_url.clone()));
-                }
-                ProcessReadiness::Named(_) => {}
             }
             let now = Instant::now();
             if now >= deadline {
@@ -871,7 +809,7 @@ where
         &self,
         mode: TunnelMode,
         origin: SocketAddr,
-        mut peer_session: S,
+        peer_session: S,
     ) -> Result<RunningTunnel, TunnelStartFailure<L::Process, S>>
     where
         S: PeerSession,
@@ -921,23 +859,6 @@ where
                 });
             }
         };
-
-        if ready.verify_named_origin
-            && peer_session
-                .verify_named_origin(&ready.transport_url, NAMED_ORIGIN_VERIFY_TIMEOUT)
-                .is_err()
-        {
-            let process_cleanup_error = process.stop(self.startup_cleanup_timeout).err();
-            return Err(TunnelStartFailure {
-                error: TunnelError::Readiness {
-                    reason: "named tunnel origin verification failed".into(),
-                    output: String::new(),
-                },
-                process: process_cleanup_error.as_ref().map(|_| process),
-                peer_session: Some(peer_session),
-                process_cleanup_error,
-            });
-        }
 
         Ok(RunningTunnel::spawn(process, peer_session, ready))
     }
@@ -1065,33 +986,6 @@ impl PeerSession for super::shared_session::SharedSessionHost {
         self.clear_tunnel_probe();
         result
     }
-}
-
-pub(crate) fn start_named_desktop_tunnel(
-    peer_session: super::LanCloneHost,
-    token: String,
-    expected_public_base_url: &str,
-) -> Result<RunningTunnel, TunnelStartFailure<SystemTunnelProcess, super::LanCloneHost>> {
-    let mode = match TunnelMode::named(token, expected_public_base_url) {
-        Ok(mode) => mode,
-        Err(error) => {
-            return Err(TunnelStartFailure {
-                error,
-                process: None,
-                peer_session: Some(peer_session),
-                process_cleanup_error: None,
-            });
-        }
-    };
-    let Some(origin) = peer_session.address() else {
-        return Err(TunnelStartFailure {
-            error: TunnelError::InvalidOrigin,
-            process: None,
-            peer_session: Some(peer_session),
-            process_cleanup_error: None,
-        });
-    };
-    TunnelAdapter::system().start(mode, origin, peer_session)
 }
 
 pub(crate) fn start_quick_desktop_tunnel(

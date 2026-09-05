@@ -148,7 +148,6 @@ fn exit_status(code: i32) -> ExitStatus {
 fn ready() -> TunnelReady {
     TunnelReady {
         transport_url: Url::parse("https://example-id.trycloudflare.com").unwrap(),
-        verify_named_origin: false,
     }
 }
 
@@ -252,123 +251,6 @@ fn quick_tunnel_has_only_loopback_transport_and_no_token_sources() {
 }
 
 #[test]
-fn named_tunnel_uses_only_child_environment_for_the_token() {
-    let secret = "eyJ-remotely-managed-tunnel-token";
-    let mode = TunnelMode::named(secret.to_owned(), "https://sync.example.com").unwrap();
-    let launch = mode.launch(loopback_origin()).unwrap();
-
-    assert_eq!(launch.args, ["tunnel", "--no-autoupdate", "run"]);
-    assert_eq!(launch.origin, "http://127.0.0.1:32145");
-    assert_eq!(launch.env_remove, ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"]);
-    assert!(launch.token_env.is_some());
-    assert!(!launch
-        .args
-        .iter()
-        .any(|argument| argument.to_string_lossy().contains(secret)));
-}
-
-#[test]
-fn named_tunnel_accepts_only_bounded_tokens_and_bare_public_https_urls() {
-    for (token, url) in [
-        ("short", "https://sync.example.com"),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "http://sync.example.com",
-        ),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "https://user@sync.example.com",
-        ),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "https://sync.example.com/path",
-        ),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "https://sync.example.com/.",
-        ),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "https://sync.example.com/a/..",
-        ),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "https://sync.example.com/%2e",
-        ),
-        (
-            "eyJ-remotely-managed-tunnel-token",
-            "https://sync.example.com:443",
-        ),
-        ("eyJ-remotely-managed-tunnel-token", "https://127.0.0.1"),
-    ] {
-        assert!(matches!(
-            TunnelMode::named(token.to_owned(), url),
-            Err(TunnelError::InvalidNamedConfiguration)
-        ));
-    }
-}
-
-#[test]
-fn named_tunnel_verifies_the_remote_route_before_becoming_ready() {
-    let state = Arc::new(Mutex::new(FakeState::default()));
-    let process = fake_process(
-        &state,
-        Ok(TunnelReady::named(
-            Url::parse("https://sync.example.com").unwrap(),
-        )),
-    );
-    let mut running = expect_running(
-        adapter(&state, process).start(
-            TunnelMode::named(
-                "eyJ-remotely-managed-tunnel-token".to_owned(),
-                "https://sync.example.com",
-            )
-            .unwrap(),
-            loopback_origin(),
-            peer(&state, 60),
-        ),
-    );
-
-    assert_eq!(state.lock().unwrap().named_origin_verifications, 1);
-    running.stop(DEFAULT_STOP_TIMEOUT).unwrap();
-}
-
-#[test]
-fn named_origin_mismatch_stops_the_process_without_exposing_probe_details() {
-    let state = Arc::new(Mutex::new(FakeState::default()));
-    let process = fake_process(
-        &state,
-        Ok(TunnelReady::named(
-            Url::parse("https://sync.example.com").unwrap(),
-        )),
-    );
-    let mut owned_peer = peer(&state, 61);
-    owned_peer.named_origin_verification =
-        Err("https://sync.example.com/v1/sessions/secret/tunnel-check/probe-secret".into());
-
-    let failure = expect_failure(
-        adapter(&state, process).start(
-            TunnelMode::named(
-                "eyJ-remotely-managed-tunnel-token".to_owned(),
-                "https://sync.example.com",
-            )
-            .unwrap(),
-            loopback_origin(),
-            owned_peer,
-        ),
-    );
-
-    assert_eq!(
-        failure.error.to_string(),
-        "cloudflared did not become ready: named tunnel origin verification failed"
-    );
-    assert!(!format!("{:?}", failure.error).contains("probe-secret"));
-    assert_eq!(state.lock().unwrap().stop_timeouts, [DEFAULT_STOP_TIMEOUT]);
-    drop(failure);
-    assert_eq!(state.lock().unwrap().session_revokes, 1);
-}
-
-#[test]
 fn quick_tunnel_rejects_zero_or_non_loopback_origins() {
     assert!(matches!(
         TunnelMode::Quick.launch(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
@@ -411,30 +293,6 @@ fn readiness_output_is_bounded_to_the_configured_tail() {
     output.push(b"6789abcdef");
 
     assert_eq!(output.text(), "89abcdef");
-}
-
-#[test]
-fn named_readiness_errors_never_return_process_output() {
-    let mut output = BoundedOutput::new(OUTPUT_LIMIT);
-    output.push(
-        b"token=eyJ-secret https://sync.example.com/v1/sessions/id/tunnel-check/probe-secret",
-    );
-
-    assert_eq!(
-        safe_readiness_error_output(
-            &ProcessReadiness::Named(Url::parse("https://sync.example.com").unwrap()),
-            &output,
-        ),
-        ""
-    );
-}
-
-#[test]
-fn named_readiness_requires_a_registered_connector_marker() {
-    assert!(!named_tunnel_registered("INF Starting tunnel"));
-    assert!(named_tunnel_registered(
-        "INF Registered tunnel connection connIndex=0 protocol=quic"
-    ));
 }
 
 #[test]

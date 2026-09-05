@@ -662,32 +662,6 @@ fn named_tunnel_probe_requires_a_started_loopback_host_and_is_one_time() {
 }
 
 #[test]
-fn named_tunnel_public_seam_refuses_to_launch_before_loopback_source_start() {
-    let source_root = tempfile::tempdir().unwrap();
-    let session_root = tempfile::tempdir().unwrap();
-    let source = fixture_source(source_root.path(), &[64]);
-    let host = LanCloneHost::prepare(prepare(&source, session_root.path()));
-
-    let failure = match super::tunnel::start_named_desktop_tunnel(
-        host,
-        "eyJ-remotely-managed-tunnel-token".to_owned(),
-        "https://sync.example.com",
-    ) {
-        Ok(_) => panic!("named tunnel started before its source host"),
-        Err(failure) => failure,
-    };
-    assert_eq!(
-        failure.error_message(),
-        "tunnel origin must be 127.0.0.1 with a nonzero port"
-    );
-    let host = match failure.into_peer_session() {
-        Ok(host) => host,
-        Err(_) => panic!("source ownership was not recoverable"),
-    };
-    assert_eq!(host.address(), None);
-}
-
-#[test]
 fn quick_tunnel_public_seam_refuses_to_launch_before_loopback_source_start() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
