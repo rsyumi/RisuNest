@@ -523,7 +523,7 @@ fn registered_android_clone_job(
         &source.target_device_id,
         &source.source_device_id,
         &source.bearer,
-        super::lan::PeerCompletionCapability::Unsupported,
+        super::lan::PeerCompletionCapability::V1,
     )
 }
 

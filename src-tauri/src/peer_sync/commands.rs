@@ -4204,37 +4204,22 @@ mod tests {
 
     #[test]
     fn registered_target_reconnect_replaces_only_a_terminal_owner_after_source_restart() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
         let state = PeerCloneCommandState::default();
-        let first = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000201".to_owned(),
-            manifest_id: "a".repeat(64),
-        };
-        let restarted = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32146".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000202".to_owned(),
-            manifest_id: "c".repeat(64),
-        };
-        let source_device_id = "00000000-0000-4000-8000-000000000203";
-        let bearer = "b".repeat(64);
-        let register_source = |endpoint: &str| {
-            super::super::device_registry::register_incoming_source(
-                root.path(),
-                super::super::device_registry::IncomingSource {
-                    device_id: source_device_id.to_owned(),
-                    name: "Desktop source".to_owned(),
-                    endpoint: endpoint.to_owned(),
-                    bearer: bearer.clone(),
-                    permissions: super::super::device_registry::DevicePermissions::read(),
-                    last_seen_ms: 0,
-                    total_bytes: 0,
-                },
-            )
-            .unwrap();
-        };
-        register_source(&first.endpoint);
+        let first = source.request.clone();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
 
         state
             .connect_registered_target(
@@ -4242,18 +4227,24 @@ mod tests {
                 &first.endpoint,
                 &first.session_id,
                 &first.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
-        assert!(registered_clone_source_is_active(root.path(), Some(source_device_id)).unwrap());
+        assert!(registered_clone_source_is_active(root.path(), Some(&source_device_id)).unwrap());
         assert!(
             super::super::registry_commands::remove_incoming_source_if_inactive(
                 root.path(),
-                source_device_id,
+                &source_device_id,
             )
             .is_err()
+        );
+        let restarted = source.restart(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            "Restarted",
         );
         assert!(state
             .connect_registered_target(
@@ -4261,9 +4252,9 @@ mod tests {
                 &restarted.endpoint,
                 &restarted.session_id,
                 &restarted.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
             .is_err());
         let first_root = target_paths(&peer_root, &first).unwrap().job_root;
@@ -4282,9 +4273,9 @@ mod tests {
                 &restarted.endpoint,
                 &restarted.session_id,
                 &restarted.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
             .is_err());
         state
@@ -4295,7 +4286,7 @@ mod tests {
             .unwrap()
             .status
             .phase = PeerCloneTargetPhase::Failed;
-        register_source(&restarted.endpoint);
+        source.register_at(root.path(), &restarted.endpoint);
 
         let result = state
             .connect_registered_target(
@@ -4303,65 +4294,60 @@ mod tests {
                 &restarted.endpoint,
                 &restarted.session_id,
                 &restarted.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
 
         assert_eq!(result.source_device_id, source_device_id);
         assert!(!first_root.try_exists().unwrap());
         assert!(restarted_root.try_exists().unwrap());
-        let runtime = state.lock_runtime().unwrap();
-        let target = runtime.target.as_ref().unwrap();
-        assert_eq!(target.request, restarted);
-        assert_eq!(target.status.phase, PeerCloneTargetPhase::Idle);
+        {
+            let runtime = state.lock_runtime().unwrap();
+            let target = runtime.target.as_ref().unwrap();
+            assert_eq!(target.request, restarted);
+            assert_eq!(target.status.phase, PeerCloneTargetPhase::Idle);
+        }
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn registered_target_reconnect_cleanup_failure_preserves_terminal_ownership() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
         let state = PeerCloneCommandState::default();
-        let first = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000211".to_owned(),
-            manifest_id: "d".repeat(64),
-        };
-        let restarted = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32146".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000212".to_owned(),
-            manifest_id: "e".repeat(64),
-        };
-        let source_device_id = "00000000-0000-4000-8000-000000000213";
-        let bearer = "f".repeat(64);
-        let register_source = |endpoint: &str| {
-            super::super::device_registry::register_incoming_source(
-                root.path(),
-                super::super::device_registry::IncomingSource {
-                    device_id: source_device_id.to_owned(),
-                    name: "Desktop source".to_owned(),
-                    endpoint: endpoint.to_owned(),
-                    bearer: bearer.clone(),
-                    permissions: super::super::device_registry::DevicePermissions::read(),
-                    last_seen_ms: 0,
-                    total_bytes: 0,
-                },
-            )
-            .unwrap();
-        };
-        register_source(&first.endpoint);
+        let first = source.request.clone();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
+
         state
             .connect_registered_target(
                 &peer_root,
                 &first.endpoint,
                 &first.session_id,
                 &first.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
+        let restarted = source.restart(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            "Restarted",
+        );
         state
             .lock_runtime()
             .unwrap()
@@ -4380,9 +4366,9 @@ mod tests {
                 &restarted.endpoint,
                 &restarted.session_id,
                 &restarted.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             ),
             Err(PeerSyncError::Storage(message))
                 if message == "injected peer clone target release cleanup failure"
@@ -4397,47 +4383,41 @@ mod tests {
             assert!(!runtime.target_claiming);
         }
 
-        register_source(&restarted.endpoint);
+        source.register_at(root.path(), &restarted.endpoint);
         state
             .connect_registered_target(
                 &peer_root,
                 &restarted.endpoint,
                 &restarted.session_id,
                 &restarted.manifest_id,
-                source_device_id,
+                &source_device_id,
                 &bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
         assert!(!first_root.try_exists().unwrap());
         assert!(restarted_root.try_exists().unwrap());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn registered_target_publish_revalidates_a_concurrently_removed_source() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
         let state = PeerCloneCommandState::default();
-        let source_device_id = "00000000-0000-4000-8000-000000000223";
-        let bearer = "a".repeat(64);
-        let request = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000224".to_owned(),
-            manifest_id: "b".repeat(64),
-        };
-        super::super::device_registry::register_incoming_source(
-            root.path(),
-            super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
-                name: "Desktop source".to_owned(),
-                endpoint: request.endpoint.clone(),
-                bearer: bearer.clone(),
-                permissions: super::super::device_registry::DevicePermissions::read(),
-                last_seen_ms: 0,
-                total_bytes: 0,
-            },
-        )
-        .unwrap();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
+        let request = source.request.clone();
         let pause = Arc::new(Barrier::new(2));
         state
             .pause_target_claim_before_network_for_test(Arc::clone(&pause))
@@ -4446,22 +4426,23 @@ mod tests {
         let worker_root = peer_root.clone();
         let worker_request = request.clone();
         let worker_bearer = bearer.clone();
+        let worker_source_device_id = source_device_id.clone();
         let worker = thread::spawn(move || {
             worker_state.connect_registered_target(
                 &worker_root,
                 &worker_request.endpoint,
                 &worker_request.session_id,
                 &worker_request.manifest_id,
-                source_device_id,
+                &worker_source_device_id,
                 &worker_bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
         });
 
         pause.wait();
         super::super::registry_commands::remove_incoming_source_if_inactive(
             root.path(),
-            source_device_id,
+            &source_device_id,
         )
         .unwrap();
         pause.wait();
@@ -4476,33 +4457,27 @@ mod tests {
             .job_root
             .try_exists()
             .unwrap());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn registered_target_publication_serializes_source_removal_after_revalidation() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
         let state = PeerCloneCommandState::default();
-        let source_device_id = "00000000-0000-4000-8000-000000000229";
-        let bearer = "5".repeat(64);
-        let request = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000230".to_owned(),
-            manifest_id: "6".repeat(64),
-        };
-        super::super::device_registry::register_incoming_source(
-            root.path(),
-            super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
-                name: "Desktop source".to_owned(),
-                endpoint: request.endpoint.clone(),
-                bearer: bearer.clone(),
-                permissions: super::super::device_registry::DevicePermissions::read(),
-                last_seen_ms: 0,
-                total_bytes: 0,
-            },
-        )
-        .unwrap();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
+        let request = source.request.clone();
         let reached_publish = Arc::new(Barrier::new(2));
         let resume_publish = Arc::new(Barrier::new(2));
         state
@@ -4515,15 +4490,16 @@ mod tests {
         let worker_root = peer_root.clone();
         let worker_request = request.clone();
         let worker_bearer = bearer.clone();
+        let worker_source_device_id = source_device_id.clone();
         let worker = thread::spawn(move || {
             worker_state.connect_registered_target(
                 &worker_root,
                 &worker_request.endpoint,
                 &worker_request.session_id,
                 &worker_request.manifest_id,
-                source_device_id,
+                &worker_source_device_id,
                 &worker_bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
         });
 
@@ -4535,12 +4511,13 @@ mod tests {
         assert!(!marker_path.try_exists().unwrap());
         let (removal_tx, removal_rx) = mpsc::channel();
         let removal_root = root.path().to_owned();
+        let removal_source_device_id = source_device_id.clone();
         let removal = thread::spawn(move || {
             removal_tx
                 .send(
                     super::super::registry_commands::remove_incoming_source_if_inactive(
                         &removal_root,
-                        source_device_id,
+                        &removal_source_device_id,
                     ),
                 )
                 .unwrap();
@@ -4556,34 +4533,28 @@ mod tests {
         ));
         removal.join().unwrap();
         assert!(marker_path.try_exists().unwrap());
-        assert!(registered_clone_source_is_active(root.path(), Some(source_device_id)).unwrap());
+        assert!(registered_clone_source_is_active(root.path(), Some(&source_device_id)).unwrap());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn registered_target_publication_wins_before_bearer_rotation() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
         let state = PeerCloneCommandState::default();
-        let source_device_id = "00000000-0000-4000-8000-000000000233";
-        let bearer = "7".repeat(64);
-        let request = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000234".to_owned(),
-            manifest_id: "8".repeat(64),
-        };
-        super::super::device_registry::register_incoming_source(
-            root.path(),
-            super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
-                name: "Desktop source".to_owned(),
-                endpoint: request.endpoint.clone(),
-                bearer: bearer.clone(),
-                permissions: super::super::device_registry::DevicePermissions::read(),
-                last_seen_ms: 0,
-                total_bytes: 0,
-            },
-        )
-        .unwrap();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
+        let request = source.request.clone();
         let reached_publish = Arc::new(Barrier::new(2));
         let resume_publish = Arc::new(Barrier::new(2));
         state
@@ -4596,15 +4567,16 @@ mod tests {
         let worker_root = peer_root.clone();
         let worker_request = request.clone();
         let worker_bearer = bearer.clone();
+        let worker_source_device_id = source_device_id.clone();
         let worker = thread::spawn(move || {
             worker_state.connect_registered_target(
                 &worker_root,
                 &worker_request.endpoint,
                 &worker_request.session_id,
                 &worker_request.manifest_id,
-                source_device_id,
+                &worker_source_device_id,
                 &worker_bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
         });
 
@@ -4613,13 +4585,14 @@ mod tests {
         let before = fs::read(&sources_path).unwrap();
         let (rotation_tx, rotation_rx) = mpsc::channel();
         let rotation_root = root.path().to_owned();
+        let rotation_source_device_id = source_device_id.clone();
         let rotation = thread::spawn(move || {
             rotation_tx
                 .send(
                     super::super::registry_commands::register_incoming_source_if_compatible(
                         &rotation_root,
                         super::super::device_registry::IncomingSource {
-                            device_id: source_device_id.to_owned(),
+                            device_id: rotation_source_device_id,
                             name: "Rotated source".to_owned(),
                             endpoint: "http://127.0.0.1:32146".to_owned(),
                             bearer: "9".repeat(64),
@@ -4644,34 +4617,28 @@ mod tests {
         ));
         rotation.join().unwrap();
         assert_eq!(fs::read(&sources_path).unwrap(), before);
-        assert!(registered_clone_source_is_active(root.path(), Some(source_device_id)).unwrap());
+        assert!(registered_clone_source_is_active(root.path(), Some(&source_device_id)).unwrap());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn bearer_rotation_wins_before_registered_target_publication() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
+            root.path(),
+        );
         let peer_root = root.path().join("peer-clone");
         let state = PeerCloneCommandState::default();
-        let source_device_id = "00000000-0000-4000-8000-000000000235";
-        let bearer = "a".repeat(64);
-        let request = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000236".to_owned(),
-            manifest_id: "b".repeat(64),
-        };
-        super::super::device_registry::register_incoming_source(
-            root.path(),
-            super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
-                name: "Desktop source".to_owned(),
-                endpoint: request.endpoint.clone(),
-                bearer: bearer.clone(),
-                permissions: super::super::device_registry::DevicePermissions::read(),
-                last_seen_ms: 0,
-                total_bytes: 0,
-            },
-        )
-        .unwrap();
+        let source_device_id = source.source_device_id.clone();
+        let bearer = source.bearer.clone();
+        let request = source.request.clone();
         let pause = Arc::new(Barrier::new(2));
         state
             .pause_target_claim_before_network_for_test(Arc::clone(&pause))
@@ -4680,15 +4647,16 @@ mod tests {
         let worker_root = peer_root.clone();
         let worker_request = request.clone();
         let worker_bearer = bearer.clone();
+        let worker_source_device_id = source_device_id.clone();
         let worker = thread::spawn(move || {
             worker_state.connect_registered_target(
                 &worker_root,
                 &worker_request.endpoint,
                 &worker_request.session_id,
                 &worker_request.manifest_id,
-                source_device_id,
+                &worker_source_device_id,
                 &worker_bearer,
-                PeerCompletionCapability::Unsupported,
+                PeerCompletionCapability::V1,
             )
         });
 
@@ -4696,7 +4664,7 @@ mod tests {
         super::super::registry_commands::register_incoming_source_if_compatible(
             root.path(),
             super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
+                device_id: source_device_id.clone(),
                 name: "Rotated source".to_owned(),
                 endpoint: request.endpoint.clone(),
                 bearer: "c".repeat(64),
@@ -4722,32 +4690,24 @@ mod tests {
             .job_root
             .join(TARGET_OPERATION_MARKER_FILE);
         assert!(!marker_path.try_exists().unwrap());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn initialize_discards_an_unpublished_registered_target_orphan() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let peer_root = root.path().join("peer-clone");
-        let source_device_id = "00000000-0000-4000-8000-000000000225";
-        let bearer = "c".repeat(64);
-        let request = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000226".to_owned(),
-            manifest_id: "d".repeat(64),
-        };
-        super::super::device_registry::register_incoming_source(
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
             root.path(),
-            super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
-                name: "Desktop source".to_owned(),
-                endpoint: request.endpoint.clone(),
-                bearer: bearer.clone(),
-                permissions: super::super::device_registry::DevicePermissions::read(),
-                last_seen_ms: 0,
-                total_bytes: 0,
-            },
-        )
-        .unwrap();
+        );
+        let peer_root = root.path().join("peer-clone");
+        let request = source.request.clone();
         let state = PeerCloneCommandState::default();
         state
             .connect_registered_target(
@@ -4755,9 +4715,9 @@ mod tests {
                 &request.endpoint,
                 &request.session_id,
                 &request.manifest_id,
-                source_device_id,
-                &bearer,
-                PeerCompletionCapability::Unsupported,
+                &source.source_device_id,
+                &source.bearer,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
         let job_root = target_paths(&peer_root, &request).unwrap().job_root;
@@ -4772,32 +4732,24 @@ mod tests {
 
         let _recovered = PeerCloneCommandState::initialize(&peer_root);
         assert!(!job_root.exists());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
     fn initialize_discards_a_registered_target_crashed_before_marker_publication() {
+        let source_root = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let peer_root = root.path().join("peer-clone");
-        let source_device_id = "00000000-0000-4000-8000-000000000231";
-        let bearer = "7".repeat(64);
-        let request = PeerCloneTargetRequest {
-            endpoint: "http://127.0.0.1:32145".to_owned(),
-            session_id: "00000000-0000-4000-8000-000000000232".to_owned(),
-            manifest_id: "8".repeat(64),
-        };
-        super::super::device_registry::register_incoming_source(
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let mut source = register_product_source(
+            source_root.path(),
+            &mut source_store,
+            &source_cas,
             root.path(),
-            super::super::device_registry::IncomingSource {
-                device_id: source_device_id.to_owned(),
-                name: "Desktop source".to_owned(),
-                endpoint: request.endpoint.clone(),
-                bearer: bearer.clone(),
-                permissions: super::super::device_registry::DevicePermissions::read(),
-                last_seen_ms: 0,
-                total_bytes: 0,
-            },
-        )
-        .unwrap();
+        );
+        let peer_root = root.path().join("peer-clone");
+        let request = source.request.clone();
         let state = PeerCloneCommandState::default();
         state
             .connect_registered_target(
@@ -4805,9 +4757,9 @@ mod tests {
                 &request.endpoint,
                 &request.session_id,
                 &request.manifest_id,
-                source_device_id,
-                &bearer,
-                PeerCompletionCapability::Unsupported,
+                &source.source_device_id,
+                &source.bearer,
+                PeerCompletionCapability::V1,
             )
             .unwrap();
         let job_root = target_paths(&peer_root, &request).unwrap().job_root;
@@ -4819,10 +4771,11 @@ mod tests {
         assert!(!job_root.exists());
         assert!(super::super::device_registry::incoming_source_by_id(
             root.path(),
-            source_device_id
+            &source.source_device_id
         )
         .unwrap()
         .is_some());
+        source.hosted.host.stop().unwrap();
     }
 
     #[test]
@@ -5012,6 +4965,94 @@ mod tests {
         }
     }
 
+    /// A live product source this device is already registered with. The
+    /// registered target commands fetch a completion manifest from the source
+    /// whenever it advertises completion v1, so the tests around ownership and
+    /// publication need a real listener rather than an unreachable endpoint.
+    struct RegisteredProductSource {
+        hosted: HostedProductSource,
+        request: PeerCloneTargetRequest,
+        source_device_id: String,
+        bearer: String,
+    }
+
+    impl RegisteredProductSource {
+        /// Restarts the source on a fresh session the way a source process
+        /// restart does. The v2 registry rehydrates the already registered
+        /// device from the source registry, so this device keeps its bearer.
+        fn restart(
+            &mut self,
+            source_root: &Path,
+            store: &mut PersistentStore,
+            cas: &PayloadCas,
+            username: &str,
+        ) -> PeerCloneTargetRequest {
+            self.hosted.host.stop().unwrap();
+            rename_product_store_owner(store, username);
+            self.hosted = host_product_source(source_root, store, cas);
+            PeerCloneTargetRequest {
+                endpoint: self.hosted.pairing.advertised_endpoint.clone(),
+                session_id: self.hosted.pairing.session_id.clone(),
+                manifest_id: self.hosted.pairing.manifest_id.clone(),
+            }
+        }
+
+        /// Re-points the registered source at `endpoint` without rotating the
+        /// bearer, which is what a target observes after the source moved.
+        fn register_at(&self, app_root: &Path, endpoint: &str) {
+            super::super::device_registry::register_incoming_source(
+                app_root,
+                super::super::device_registry::IncomingSource {
+                    device_id: self.source_device_id.clone(),
+                    name: "Windows".to_owned(),
+                    endpoint: endpoint.to_owned(),
+                    bearer: self.bearer.clone(),
+                    permissions: super::super::device_registry::DevicePermissions::read(),
+                    last_seen_ms: 0,
+                    total_bytes: 0,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    fn register_product_source(
+        source_root: &Path,
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        app_root: &Path,
+    ) -> RegisteredProductSource {
+        let hosted = host_product_source(source_root, store, cas);
+        LanCloneClient::claim_v2_and_persist_and_register(
+            app_root,
+            "Registered target",
+            &app_root.join("registration-credential.json"),
+            &hosted.pairing.advertised_endpoint,
+            &hosted.pairing.session_id,
+            &hosted.pairing.manifest_id,
+            &hosted.pairing.claim,
+        )
+        .unwrap();
+        let source_device_id =
+            super::super::device_registry::load_or_create_device_id(source_root).unwrap();
+        let bearer =
+            super::super::device_registry::incoming_source_by_id(app_root, &source_device_id)
+                .unwrap()
+                .unwrap()
+                .bearer;
+        let request = PeerCloneTargetRequest {
+            endpoint: hosted.pairing.advertised_endpoint.clone(),
+            session_id: hosted.pairing.session_id.clone(),
+            manifest_id: hosted.pairing.manifest_id.clone(),
+        };
+        RegisteredProductSource {
+            hosted,
+            request,
+            source_device_id,
+            bearer,
+        }
+    }
+
     fn wait_for_target_phase(
         state: &PeerCloneCommandState,
         expected: PeerCloneTargetPhase,
@@ -5078,6 +5119,29 @@ mod tests {
             )
             .unwrap();
         store.replace_commit(&staging, Some(0)).unwrap();
+    }
+
+    /// Edits a seeded store in place so the next preparation publishes a
+    /// different manifest, the way a restarted source that kept working does.
+    fn rename_product_store_owner(store: &mut PersistentStore, username: &str) {
+        let mut root = store.read_root(None).unwrap().value;
+        root["username"] = Value::String(username.to_owned());
+        let expected_revision = store.revision().unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision,
+                root: Some(root),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
     }
 
     fn product_filler(bytes: usize) -> String {
