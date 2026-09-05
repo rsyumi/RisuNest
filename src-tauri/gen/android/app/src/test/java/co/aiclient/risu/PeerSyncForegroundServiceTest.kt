@@ -111,5 +111,4 @@ class PeerSyncForegroundServiceTest {
     assertTrue(canStartPeerSyncForeground(current, current))
     assertFalse(canStartPeerSyncForeground(current, current.copy(generation = 13L)))
   }
-
 }

@@ -4,7 +4,7 @@ import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground
 import type { PeerSyncInvoke } from './peerSyncShared'
 
 const foreground = {
-    lane: 'p4-source' as const,
+    lane: 'device-sync-source' as const,
     operationId: '44444444-4444-4444-8444-444444444444',
     generation: 9,
 }
@@ -23,7 +23,7 @@ function fixture(startSource: () => boolean) {
     const lifecycle = createPeerAndroidSourceForeground({
         invoke: invoke as PeerSyncInvoke,
         bridge,
-        lane: 'p4-source',
+        lane: 'device-sync-source',
         reserveCommand: 'lane_reserve',
         startCommand: 'lane_start',
         startArgs: (sessionId, identity) => ({ sessionId, foreground: identity }),
@@ -64,7 +64,7 @@ describe('Android peer source foreground lifecycle', () => {
 
         const error = await lifecycle.start('session').catch((cause: unknown) => cause)
 
-        expect(bridge.stopSource).toHaveBeenCalledWith('p4-source', foreground.operationId, 9)
+        expect(bridge.stopSource).toHaveBeenCalledWith('device-sync-source', foreground.operationId, 9)
         expect(calls).toEqual([
             'peer_sync_foreground_source_status',
             'lane_reserve',
@@ -88,7 +88,7 @@ describe('Android peer source foreground lifecycle', () => {
 
         await expect(lifecycle.start('session')).resolves.toMatchObject({ foreground })
 
-        expect(bridge.stopSource).toHaveBeenCalledWith('p4-source', foreground.operationId, 9)
+        expect(bridge.stopSource).toHaveBeenCalledWith('device-sync-source', foreground.operationId, 9)
         expect(calls).toEqual([
             'peer_sync_foreground_source_status',
             'peer_sync_foreground_source_abandon',

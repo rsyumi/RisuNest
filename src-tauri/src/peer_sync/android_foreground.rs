@@ -25,6 +25,10 @@ impl AndroidForegroundLane {
             _ => None,
         }
     }
+
+    pub(crate) fn is_source(self) -> bool {
+        matches!(self, Self::DeviceSyncSource)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -134,7 +138,7 @@ impl AndroidForegroundRegistry {
         // paths hold command-state locks that those callbacks re-acquire.
         // Rejecting target-lane registrations keeps that re-entrancy
         // impossible.
-        if !matches!(key.lane, AndroidForegroundLane::DeviceSyncSource) {
+        if !key.lane.is_source() {
             return false;
         }
         let Ok(mut entry) = self.entry.lock() else {
@@ -171,7 +175,7 @@ impl AndroidForegroundRegistry {
     }
 
     pub(crate) fn abandon_source_exact(&self, key: &AndroidForegroundKey) -> bool {
-        if !matches!(key.lane, AndroidForegroundLane::DeviceSyncSource) {
+        if !key.lane.is_source() {
             return false;
         }
         let callback = {
@@ -199,7 +203,7 @@ impl AndroidForegroundRegistry {
         &self,
         lane: AndroidForegroundLane,
     ) -> Option<AndroidForegroundKey> {
-        if !matches!(lane, AndroidForegroundLane::DeviceSyncSource) {
+        if !lane.is_source() {
             return None;
         }
         self.entry
@@ -317,7 +321,7 @@ pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) fn peer_sync_foreground_source_abandon(
     foreground: AndroidForegroundKey,
 ) -> Result<bool, String> {
-    if !matches!(foreground.lane, AndroidForegroundLane::DeviceSyncSource) {
+    if !foreground.lane.is_source() {
         return Err("Android foreground identity is not a source lane".to_owned());
     }
     Ok(registry().abandon_source_exact(&foreground))
@@ -328,7 +332,7 @@ pub(crate) fn peer_sync_foreground_source_abandon(
 pub(crate) fn peer_sync_foreground_source_status(
     lane: AndroidForegroundLane,
 ) -> Result<Option<AndroidForegroundKey>, String> {
-    if !matches!(lane, AndroidForegroundLane::DeviceSyncSource) {
+    if !lane.is_source() {
         return Err("Android foreground lane is not a source lane".to_owned());
     }
     Ok(registry().source_status(lane))

@@ -257,17 +257,9 @@ struct PeerCloneRuntime {
     target: Option<TargetRuntime>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PeerCloneCommandState {
     runtime: Arc<Mutex<PeerCloneRuntime>>,
-}
-
-impl Default for PeerCloneCommandState {
-    fn default() -> Self {
-        Self {
-            runtime: Arc::new(Mutex::new(PeerCloneRuntime::default())),
-        }
-    }
 }
 
 impl PeerCloneCommandState {
@@ -2464,19 +2456,21 @@ fn as_store_error(error: PeerSyncError) -> StoreError {
     }
 }
 
-/// The application data directory and the peer clone root inside it, reported
-/// through the same bounded code every other clone target command uses.
-fn app_peer_root(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
+/// The application data directory, reported through the same bounded code
+/// every other clone target command uses.
+fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     finish_peer_command(
         "peer clone application data directory",
         app.path()
             .app_data_dir()
-            .map(|app_root| {
-                let peer_root = app_root.join("peer-clone");
-                (app_root, peer_root)
-            })
             .map_err(|error| PeerSyncError::Storage(error.to_string())),
     )
+}
+
+/// The peer clone root inside that directory, for the callers that need only
+/// the peer root.
+fn app_peer_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app_root(app).map(|app_root| app_root.join("peer-clone"))
 }
 
 fn target_request(
@@ -2505,7 +2499,7 @@ pub async fn peer_clone_claim_v2_client(
         validate_device_sync_endpoint(&endpoint),
     )?;
     let state = state.inner().clone();
-    let (_, peer_root) = app_peer_root(&app)?;
+    let peer_root = app_peer_root(&app)?;
     let claimed = tauri::async_runtime::spawn_blocking(move || {
         state.claim_v2_target(&peer_root, &endpoint, &session_id, &manifest_id, &claim)
     })
@@ -2521,7 +2515,7 @@ pub fn peer_clone_download(
     session_id: String,
     manifest_id: String,
 ) -> Result<(), String> {
-    let (_, peer_root) = app_peer_root(&app)?;
+    let peer_root = app_peer_root(&app)?;
     finish_peer_command(
         "peer clone target download",
         state.start_target_download(
@@ -2539,7 +2533,7 @@ pub async fn peer_clone_resume(
     session_id: String,
     manifest_id: String,
 ) -> Result<(), String> {
-    let (_, peer_root) = app_peer_root(&app)?;
+    let peer_root = app_peer_root(&app)?;
     let state = state.inner().clone();
     let request = target_request(endpoint, session_id, manifest_id);
     let resumed = tauri::async_runtime::spawn_blocking(move || {
@@ -2600,7 +2594,8 @@ pub async fn peer_clone_finalize(
 ) -> Result<PeerCloneFinalizeResult, String> {
     let state = state.inner().clone();
     let request = target_request(endpoint, session_id, manifest_id);
-    let (app_root, peer_root) = app_peer_root(&app)?;
+    let app_root = app_root(&app)?;
+    let peer_root = app_root.join("peer-clone");
     let finalized = tauri::async_runtime::spawn_blocking(move || {
         let cas = PayloadCas::new(&app_root)
             .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
@@ -4982,10 +4977,10 @@ mod tests {
         hosted.host.stop().unwrap();
     }
 
-    /// Hosts a real clone source through the same engine calls the shared
-    /// device sync session makes, so the target tests keep a live listener now
-    /// that the per-lane source runtime is gone. Keep the returned value alive
-    /// for as long as the test needs the listener.
+    /// Hosts a real clone source through the same preparation engine functions
+    /// the shared device sync session uses, so the target tests keep a live
+    /// listener now that the per-lane source runtime is gone. Keep the returned
+    /// value alive for as long as the test needs the listener.
     struct HostedProductSource {
         host: LanCloneHost,
         pairing: ProductPairing,

@@ -748,7 +748,7 @@ pub fn run() {
     native_log_state.configure_file_path(&app_data_dir);
     app.run(|app, event| {
         #[cfg(desktop)]
-        if run_event_requires_peer_clone_shutdown(&event) {
+        if run_event_requires_peer_sync_shutdown(&event) {
             peer_sync::bidirectional_commands::cleanup_reverse_tunnels_for_exit();
             if let Err(error) = app
                 .state::<peer_sync::shared_session::DeviceSyncSourceState>()
@@ -763,7 +763,7 @@ pub fn run() {
 }
 
 #[cfg(desktop)]
-fn run_event_requires_peer_clone_shutdown(event: &tauri::RunEvent) -> bool {
+fn run_event_requires_peer_sync_shutdown(event: &tauri::RunEvent) -> bool {
     matches!(event, tauri::RunEvent::Exit)
 }
 
@@ -807,11 +807,11 @@ mod header_map_tests {
 #[cfg(all(test, desktop))]
 mod tests {
     #[test]
-    fn peer_clone_shutdown_is_requested_only_for_the_final_exit_event() {
-        assert!(super::run_event_requires_peer_clone_shutdown(
+    fn peer_sync_shutdown_is_requested_only_for_the_final_exit_event() {
+        assert!(super::run_event_requires_peer_sync_shutdown(
             &tauri::RunEvent::Exit
         ));
-        assert!(!super::run_event_requires_peer_clone_shutdown(
+        assert!(!super::run_event_requires_peer_sync_shutdown(
             &tauri::RunEvent::Ready
         ));
     }

@@ -6,6 +6,8 @@ use super::android_foreground::{
 };
 #[cfg(target_os = "android")]
 use super::command_codes::finish_peer_command;
+#[cfg(any(target_os = "android", test))]
+use super::command_codes::is_bounded_code;
 use super::logical_delta_transfer::execute_logical_delta_pull_with_commit_intent;
 #[cfg(test)]
 use super::target_foreground_transition::AndroidTargetForegroundTransitionPhase as AndroidTargetForegroundPhase;
@@ -1128,7 +1130,7 @@ fn peer_operation_failure(context: &str, error: PeerSyncError) -> String {
 #[cfg(any(target_os = "android", test))]
 fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T, String> {
     outcome.map_err(|error| {
-        if super::command_codes::is_bounded_code(&error) {
+        if is_bounded_code(&error) {
             error
         } else {
             registered_local_operation_failure("registered delta operation", error)
@@ -1449,8 +1451,9 @@ mod tests {
         }
     }
 
-    /// Hosts a real P4 source through the same engine calls the shared device
-    /// sync session makes, now that the per-lane source runtime is gone.
+    /// Hosts a real P4 source through the same preparation engine functions the
+    /// shared device sync session uses, now that the per-lane source runtime is
+    /// gone.
     fn host_delta_source(root: &Path) -> (LanCloneHost, super::super::LanPairing) {
         let cas = PayloadCas::new(root).unwrap();
         let mut store = PersistentStore::open(root).unwrap();

@@ -1168,7 +1168,8 @@ pub(crate) struct LanCloneHostControl {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHostControl {
-    // Engine fixtures inspect the live device list; production only revokes.
+    // Test-only accessor for the live device list. Production only revokes
+    // through this control and never reads the list back.
     #[cfg(test)]
     pub(crate) fn devices(&self) -> Vec<LanDevice> {
         let Some(shared) = self.shared.upgrade() else {
@@ -1615,8 +1616,8 @@ impl LanCloneHost {
         *recovered_lock(&self.shared.tunnel_probe) = None;
     }
 
-    // Engine fixtures surface the live device list; production reads it through
-    // LanCloneHostControl.
+    // Test-only accessor for the live device list. Production never reads it,
+    // here or through LanCloneHostControl.
     #[cfg(test)]
     pub fn devices(&self) -> Vec<LanDevice> {
         self.control().devices()
