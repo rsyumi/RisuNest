@@ -1,3 +1,5 @@
+#[cfg(desktop)]
+use super::lan::authenticated_peer_clone_session;
 use super::lan::{
     validate_lan_endpoint, PEER_COMPLETION_CAPABILITY_HEADER, PEER_COMPLETION_CAPABILITY_V1,
     PEER_COMPLETION_LEASE_HEADER, PEER_COMPLETION_RESUME_HEADER, PEER_COMPLETION_SCHEMA,
@@ -44,7 +46,7 @@ use super::{
         SharedSourcePreparationContext,
     },
     CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PinnedCloneRevision,
-    PinnedSourceObject,
+    PinnedSourceObject, PreparedCloneSession,
 };
 #[cfg(desktop)]
 use crate::persistent_store::SyncGenerationIdentity;
@@ -1419,6 +1421,9 @@ impl SharedSessionResealer for NoReseal {
     fn reseal_bidirectional(
         &self,
     ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+        Err(PeerSyncError::Protocol("fixture".to_owned()))
+    }
+    fn reseal_clone(&self) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
         Err(PeerSyncError::Protocol("fixture".to_owned()))
     }
 }
@@ -4173,4 +4178,79 @@ fn shared_reseal_hands_the_same_remote_commit_slot_to_the_new_session() {
     );
     assert!(Arc::ptr_eq(&slot, &source.remote_commit));
     source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+impl RealSharedSource {
+    fn clone_session(&self) -> super::lan::PeerHelloLane {
+        authenticated_peer_clone_session(&self.endpoint, &self.bearer).unwrap()
+    }
+
+    fn active_clone_marker(&self) -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(
+                self.root
+                    .path()
+                    .join("peer-clone")
+                    .join("active-source.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+}
+
+/// The full copy replaces the target's data wholesale, so a source that has
+/// moved on rebuilds its package before it hands out a descriptor.
+#[cfg(desktop)]
+#[test]
+fn clone_session_request_rebuilds_the_package_after_a_local_commit() {
+    let mut source = started_real_shared_source();
+    let prepared = source.hello_lanes();
+    let prepared_directory = prepared_source_root(source.root.path());
+
+    let unchanged = source.clone_session();
+    source.commit_local_change("before-the-full-copy");
+    let refreshed = source.clone_session();
+
+    assert_eq!(
+        unchanged.session_id,
+        lane_session_id(&prepared, "clone"),
+        "an unchanged store answers with the package it already sealed"
+    );
+    assert_ne!(refreshed.session_id, unchanged.session_id);
+    assert_eq!(
+        source.active_clone_marker()["sessionId"].as_str().unwrap(),
+        refreshed.session_id
+    );
+    // Hello follows the refreshed lane, and the superseded package is gone so a
+    // full lossless copy of the data cannot pile up per reseal.
+    assert_eq!(
+        lane_session_id(&source.hello_lanes(), "clone"),
+        refreshed.session_id
+    );
+    assert!(!prepared_directory.exists());
+    assert!(prepared_source_root(source.root.path()).is_dir());
+    source.lifecycle.stop().unwrap();
+}
+
+/// Stop still owns every artifact the reseal produced, including the clone
+/// package the reseal replaced the prepared one with.
+#[cfg(desktop)]
+#[test]
+fn shared_stop_removes_the_resealed_clone_package_and_marker() {
+    let mut source = started_real_shared_source();
+    source.commit_local_change("before-stop-after-reseal");
+    source.clone_session();
+    let resealed = prepared_source_root(source.root.path());
+
+    source.lifecycle.stop().unwrap();
+
+    assert!(!resealed.exists());
+    assert!(!source
+        .root
+        .path()
+        .join("peer-clone")
+        .join("active-source.json")
+        .exists());
 }

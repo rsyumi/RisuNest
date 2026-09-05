@@ -23,9 +23,11 @@ use super::{
     delta_commands::{
         prepare_shared_delta_source, seal_shared_delta_session, PreparedSharedDeltaSource,
     },
-    production::{prepare_unified_clone_source, PreparedUnifiedCloneSource},
+    production::{
+        prepare_unified_clone_source, reseal_unified_clone_source, PreparedUnifiedCloneSource,
+    },
 };
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 use crate::local_backup::NeverCancelled;
 #[cfg(any(desktop, target_os = "android", test))]
 use crate::{
@@ -281,6 +283,23 @@ pub(crate) struct SharedSourceResealEngine {
     store: Mutex<PersistentStore>,
     app_root: PathBuf,
     remote_commit: Arc<SharedRemoteCommitSlot>,
+    /// Shared with `SharedSourceEngines`, because a clone reseal replaces the
+    /// owner that shared source cleanup later has to release.
+    clone: SharedCloneSourceOwner,
+}
+
+/// The one prepared clone source of a shared host. Both the preparation
+/// engines and the reseal engine reach it, so it lives behind one lock.
+#[cfg(any(desktop, target_os = "android", test))]
+type SharedCloneSourceOwner = Arc<Mutex<Option<PreparedUnifiedCloneSource>>>;
+
+#[cfg(any(desktop, target_os = "android", test))]
+fn lock_clone_source(
+    owner: &SharedCloneSourceOwner,
+) -> Result<std::sync::MutexGuard<'_, Option<PreparedUnifiedCloneSource>>, PeerSyncError> {
+    owner.lock().map_err(|error| {
+        PeerSyncError::Storage(format!("shared clone source mutex poisoned: {error}"))
+    })
 }
 
 #[cfg(any(desktop, target_os = "android", test))]
@@ -324,6 +343,30 @@ impl SharedSessionResealer for SharedSourceResealEngine {
         )
         .map(|sealed| sealed.session)
     }
+
+    fn reseal_clone(&self) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
+        let cas = PayloadCas::new(&self.app_root)?;
+        let mut store = self.lock_store()?;
+        let mut owner = lock_clone_source(&self.clone)?;
+        let current = owner.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
+        })?;
+        // A clone reseal has no operation to cancel it: the request that asked
+        // for it is the full copy about to start, and it waits for the package.
+        let mut prepared = reseal_unified_clone_source(
+            current,
+            &mut store,
+            &cas,
+            &self.app_root.join("peer-clone"),
+            &NeverCancelled,
+        )?;
+        let sealed = SharedSessionSeal {
+            sealed_revision: prepared.sealed_revision(),
+            session: prepared.take_session()?,
+        };
+        *owner = Some(prepared);
+        Ok(sealed)
+    }
 }
 
 #[cfg(any(desktop, target_os = "android", test))]
@@ -336,7 +379,7 @@ fn reseal_store_error(error: StoreError) -> PeerSyncError {
 /// command responsibility.  Those are layered above this preparation slice.
 #[cfg(any(desktop, target_os = "android", test))]
 pub(crate) struct SharedSourceEngines {
-    clone: Option<PreparedUnifiedCloneSource>,
+    clone: SharedCloneSourceOwner,
     delta: Option<PreparedSharedDeltaSource>,
     bidirectional: Option<PreparedSharedBidirectionalSource>,
     reseal: Option<Arc<SharedSourceResealEngine>>,
@@ -346,7 +389,7 @@ pub(crate) struct SharedSourceEngines {
 impl SharedSourceEngines {
     pub(crate) fn new() -> Self {
         Self {
-            clone: None,
+            clone: Arc::new(Mutex::new(None)),
             delta: None,
             bidirectional: None,
             reseal: None,
@@ -372,9 +415,16 @@ impl SharedSourceOwnership for SharedSourceEngines {
         let resealer = self.reseal.clone().ok_or_else(|| {
             PeerSyncError::Protocol("shared source reseal engine is not prepared".to_owned())
         })?;
-        let clone = self.clone.as_mut().ok_or_else(|| {
-            PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
-        })?;
+        let clone = {
+            let mut owner = lock_clone_source(&self.clone)?;
+            let clone = owner.as_mut().ok_or_else(|| {
+                PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
+            })?;
+            SharedSessionSeal {
+                sealed_revision: clone.sealed_revision(),
+                session: clone.take_session()?,
+            }
+        };
         let delta = self.delta.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("shared delta source is not prepared".to_owned())
         })?;
@@ -382,10 +432,7 @@ impl SharedSourceOwnership for SharedSourceEngines {
             PeerSyncError::Protocol("shared bidirectional source is not prepared".to_owned())
         })?;
         SharedSessionHost::new(
-            SharedSessionSeal {
-                sealed_revision: clone.sealed_revision(),
-                session: clone.take_session()?,
-            },
+            clone,
             SharedSessionSeal {
                 sealed_revision: delta.sealed_revision(),
                 session: delta.take_session()?,
@@ -401,13 +448,16 @@ impl SharedSourceOwnership for SharedSourceEngines {
     fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
         match lane {
             SharedSourceLane::Clone => {
-                // Cleanup runs in reverse preparation order, so releasing the
-                // reseal engine here outlives every session it could reseal.
-                self.reseal = None;
-                if let Some(clone) = self.clone.as_mut() {
+                let mut owner = lock_clone_source(&self.clone)?;
+                if let Some(clone) = owner.as_mut() {
                     clone.cleanup()?;
-                    self.clone = None;
+                    *owner = None;
                 }
+                drop(owner);
+                // Cleanup runs in reverse preparation order, so the reseal
+                // engine outlives every session it could have resealed, and a
+                // failed cleanup above keeps it for the retry.
+                self.reseal = None;
             }
             SharedSourceLane::Delta => {
                 if let Some(delta) = self.delta.as_mut() {
@@ -439,7 +489,7 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
     ) -> Result<(), PeerSyncError> {
         match lane {
             SharedSourceLane::Clone => {
-                self.clone = Some(prepare_unified_clone_source(
+                *lock_clone_source(&self.clone)? = Some(prepare_unified_clone_source(
                     context.store,
                     context.cas,
                     &context.app_root.join("peer-clone"),
@@ -456,6 +506,7 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
                     ),
                     app_root: context.app_root.to_path_buf(),
                     remote_commit: Arc::clone(&context.remote_commit),
+                    clone: Arc::clone(&self.clone),
                 }));
             }
             SharedSourceLane::Delta => {

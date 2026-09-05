@@ -4,8 +4,8 @@ use super::{
     command_codes::{code_for, PeerCommandCode},
     device_registry::{incoming_source_by_id, IncomingSource},
     lan::{
-        authenticated_peer_hello, authenticated_peer_hello_status, AuthenticatedPeerHelloOutcome,
-        PeerHello, PeerHelloLane,
+        authenticated_peer_clone_session, authenticated_peer_hello,
+        authenticated_peer_hello_status, AuthenticatedPeerHelloOutcome, PeerHello, PeerHelloLane,
     },
     PeerSyncError,
 };
@@ -162,7 +162,26 @@ fn resolve_registered_source(
             return Err(PeerCommandCode::IdentityMismatch);
         }
     }
+    // The full copy replaces this device's data wholesale, so the clone lane is
+    // refreshed once the source's identity is confirmed. The source reseals only
+    // when its store has moved past the package it already advertises.
+    if lane == RegisteredLane::Clone {
+        refresh_clone_lane(&mut connection, authenticated_peer_clone_session)?;
+    }
     Ok(connection)
+}
+
+/// Substitutes the clone lane with the descriptor the source hands back from its
+/// clone session endpoint. Nothing else about the connection changes, so the
+/// work directory, the credential URL and the pinned manifest all follow the
+/// refreshed session.
+fn refresh_clone_lane(
+    connection: &mut RegisteredSourceConnection,
+    refresh: impl FnOnce(&str, &str) -> Result<PeerHelloLane, PeerSyncError>,
+) -> Result<(), PeerCommandCode> {
+    connection.lane = refresh(&connection.source.endpoint, &connection.source.bearer)
+        .map_err(|error| safe_failure("registered clone session refresh", error))?;
+    Ok(())
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -913,5 +932,111 @@ mod tests {
         .unwrap();
         assert_eq!(bidirectional.source_device_id(), SOURCE_ID);
         assert_eq!(bidirectional.credential().bearer, BEARER);
+    }
+    const REFRESHED_SESSION_ID: &str = "00000000-0000-4000-8000-000000000104";
+    const REFRESHED_MANIFEST_ID: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// The clone lane the target works from is the one the source hands back
+    /// from its clone session endpoint, not the one hello advertised, so a full
+    /// copy carries data sealed after the request rather than at share time.
+    #[test]
+    fn registered_clone_takes_its_lane_from_the_clone_session_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
+        let mut connection = resolve_registered_source_with(
+            root.path(),
+            SOURCE_ID,
+            RegisteredLane::Clone,
+            |_, _| {
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
+            },
+        )
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+
+        refresh_clone_lane(&mut connection, |endpoint, bearer| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(endpoint, "http://127.0.0.1:32145");
+            assert_eq!(bearer, BEARER);
+            Ok(PeerHelloLane {
+                session_id: REFRESHED_SESSION_ID.to_owned(),
+                manifest_id: REFRESHED_MANIFEST_ID.to_owned(),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(connection.lane.session_id, REFRESHED_SESSION_ID);
+        assert_eq!(connection.lane.manifest_id, REFRESHED_MANIFEST_ID);
+        // Everything else the clone target pins stays what the hello resolved.
+        assert_eq!(connection.hello.device_id, SOURCE_ID);
+        assert_eq!(connection.source.endpoint, "http://127.0.0.1:32145");
+    }
+
+    /// A source whose refresh fails keeps the same bounded classification the
+    /// rest of the registered path uses, and a source too old to answer the
+    /// endpoint at all lands there through the same 404.
+    #[test]
+    fn registered_clone_refresh_failure_stays_transport_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
+        let mut connection = resolve_registered_source_with(
+            root.path(),
+            SOURCE_ID,
+            RegisteredLane::Clone,
+            |_, _| {
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
+            },
+        )
+        .unwrap();
+
+        let failure = refresh_clone_lane(&mut connection, |_, _| {
+            Err(PeerSyncError::Transport("HTTP 404 Not Found".to_owned()))
+        })
+        .unwrap_err();
+
+        assert_eq!(failure.code(), "transportUnavailable");
+        assert_eq!(connection.lane.session_id, SESSION_ID);
+    }
+
+    /// Resolution stops at a source whose identity changed, so the refresh
+    /// never runs against a source this device did not authenticate.
+    #[test]
+    fn registered_clone_keeps_the_hello_identity_check_before_the_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
+        let refreshes = AtomicUsize::new(0);
+
+        let mismatch = resolve_registered_source_with(
+            root.path(),
+            SOURCE_ID,
+            RegisteredLane::Clone,
+            |_, _| {
+                Ok(AuthenticatedPeerHelloOutcome::Hello(hello(
+                    OTHER_SOURCE_ID,
+                    DevicePermissions::read(),
+                )))
+            },
+        )
+        .map(|mut connection| {
+            refresh_clone_lane(&mut connection, |_, _| {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(PeerHelloLane {
+                    session_id: REFRESHED_SESSION_ID.to_owned(),
+                    manifest_id: REFRESHED_MANIFEST_ID.to_owned(),
+                })
+            })
+        })
+        .unwrap_err();
+
+        assert_eq!(mismatch.code(), "identityMismatch");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
     }
 }

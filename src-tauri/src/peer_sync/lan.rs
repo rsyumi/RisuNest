@@ -147,6 +147,10 @@ const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 pub(crate) const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// The clone session request waits for the source to rebuild its whole lossless
+/// package, which the five second control budget cannot cover. It matches the
+/// source's own response write budget instead.
+const CLONE_SESSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const PEER_COMPLETION_SCHEMA: &str = "risunest.peer-completion/v1";
 const PEER_COMPLETION_PREPARED_SCHEMA: &str = "risunest.peer-completion-prepared/v1";
 const MAX_COMPLETION_PREPARED_RESPONSE_BYTES: usize = 256;
@@ -1149,6 +1153,10 @@ pub(crate) trait SharedSessionResealer: Send + Sync {
     fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError>;
     fn reseal_bidirectional(&self)
         -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError>;
+    /// Rebuilds the whole lossless package, so this one carries its own sealed
+    /// revision: the package is sealed at whatever the store held while it was
+    /// built rather than at the revision the caller compared against.
+    fn reseal_clone(&self) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError>;
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -1376,6 +1384,37 @@ fn primary_session(shared: &LanShared) -> Result<Arc<LanSession>, PeerSyncError>
     recovered_lock(&shared.sessions)
         .primary()
         .ok_or_else(|| PeerSyncError::Protocol("shared LAN host has no pairing session".to_owned()))
+}
+
+/// Reseals the clone lane at the current store revision.  Unlike the logical
+/// lanes this is never done from `hello`: rebuilding the lossless package is
+/// proportional to the user's data, and `hello` answers inside a five second
+/// client budget that every registered peer depends on.
+#[cfg(any(desktop, target_os = "android"))]
+fn refresh_shared_clone_session(shared: &LanShared) {
+    let Some(resealer) = shared.resealer.as_ref() else {
+        return;
+    };
+    let revision = match resealer.store_revision() {
+        Ok(revision) => revision,
+        Err(error) => {
+            crate::nlog!("warn", "shared clone session reseal skipped: {error}");
+            return;
+        }
+    };
+    if recovered_lock(&shared.sessions).sealed_revision(SharedSessionKind::Clone) == Some(revision)
+    {
+        return;
+    }
+    match resealer.reseal_clone() {
+        Ok(sealed) => recovered_lock(&shared.sessions).install_at(
+            SharedSessionKind::Clone,
+            LanSession::Clone(sealed.session),
+            sealed.sealed_revision,
+            now_ms(),
+        ),
+        Err(error) => crate::nlog!("warn", "shared clone session reseal failed: {error}"),
+    }
 }
 
 /// Reseals the two logical lanes at the current store revision.  `hello` calls
@@ -2286,6 +2325,9 @@ fn handle_request(
     // across source restarts, unlike the per-session endpoints below.
     if request.url == "/v1/peer/hello" {
         return hello(stream, request, shared);
+    }
+    if request.url == "/v1/peer/clone-session" {
+        return clone_session(stream, request, shared);
     }
     if request.url == "/v1/peer/completion" {
         return completion(stream, request, shared);
@@ -3261,6 +3303,53 @@ fn completion(
     }
 }
 
+/// Hands back the clone lane descriptor, resealed first when this device's
+/// data has moved past the sealed package.  The full copy replaces the target's
+/// data wholesale, so it must not silently receive the package this device
+/// sealed when sharing started; that is why the refresh has its own endpoint
+/// rather than riding on `hello`'s budget.
+#[cfg(any(desktop, target_os = "android"))]
+fn clone_session(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+) -> Result<(), PeerSyncError> {
+    if request.method != "POST"
+        || request.range.is_some()
+        || request.range_count != 0
+        || !request.body.is_empty()
+    {
+        return respond_empty(stream, 404);
+    }
+    let device = match authorize(&request, shared) {
+        Ok(device) => device,
+        Err(status) => return respond_empty(stream, status),
+    };
+    if !device.permissions.allows_read() {
+        return respond_empty(stream, 403);
+    }
+    refresh_shared_clone_session(shared);
+    let Some((session_id, manifest_id)) =
+        recovered_lock(&shared.sessions).descriptor(SharedSessionKind::Clone)
+    else {
+        return respond_empty(stream, 404);
+    };
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CloneSessionDescriptor {
+        session_id: String,
+        manifest_id: String,
+    }
+    respond_json(
+        stream,
+        200,
+        &CloneSessionDescriptor {
+            session_id,
+            manifest_id,
+        },
+    )
+}
+
 #[cfg(any(desktop, target_os = "android"))]
 fn hello(
     stream: &mut TcpStream,
@@ -3637,6 +3726,50 @@ pub(crate) fn authenticated_peer_hello_status(
         permissions,
         lanes: response.lanes,
     }))
+}
+
+/// Asks a registered source to refresh its clone lane and hand back the
+/// descriptor the full copy should use.  A source that has not moved past its
+/// sealed revision answers with the descriptor it already advertises.
+pub(crate) fn authenticated_peer_clone_session(
+    endpoint: &str,
+    bearer: &str,
+) -> Result<PeerHelloLane, PeerSyncError> {
+    let endpoint = validate_lan_endpoint(endpoint)?;
+    if !is_lower_hex_256(bearer) {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer clone session credential".to_owned(),
+        ));
+    }
+    let response = build_clone_http_client(CLONE_SESSION_REQUEST_TIMEOUT)?
+        .post(format!("{endpoint}/v1/peer/clone-session"))
+        .bearer_auth(bearer)
+        .send()
+        .map_err(transport)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(PeerSyncError::Transport(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(transport)?;
+    if body.len() > MAX_CLAIM_RESPONSE_BYTES {
+        return Err(PeerSyncError::Protocol(
+            "peer clone session response is too large".to_owned(),
+        ));
+    }
+    let lane: PeerHelloLane = serde_json::from_slice(&body)
+        .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+    if !is_canonical_uuid(&lane.session_id) || !is_lower_hex_256(&lane.manifest_id) {
+        return Err(PeerSyncError::Protocol(
+            "invalid peer clone session response".to_owned(),
+        ));
+    }
+    Ok(lane)
 }
 
 pub(crate) fn deliver_peer_completion(
@@ -8633,6 +8766,7 @@ mod timeout_tests {
         );
     }
     const TABLE_SOURCE_ID: &str = "00000000-0000-4000-8000-0000000000d0";
+    const RESEAL_CLAIM_DEVICE_ID: &str = "00000000-0000-4000-8000-0000000002ff";
 
     fn table_delta_session(session_id: &str) -> LanSession {
         LanSession::Logical(prepared_logical_session(session_id, TABLE_SOURCE_ID))
@@ -8835,10 +8969,13 @@ mod timeout_tests {
         revision_error: Mutex<bool>,
         delta: Mutex<Vec<PreparedLogicalLanSession>>,
         bidirectional: Mutex<Vec<PreparedBidirectionalLogicalLanSession>>,
+        clone: Mutex<Vec<SharedSessionSeal<PreparedCloneSession>>>,
         delta_calls: Mutex<usize>,
         bidirectional_calls: Mutex<usize>,
+        clone_calls: Mutex<usize>,
         delta_error: Mutex<bool>,
         bidirectional_error: Mutex<bool>,
+        clone_error: Mutex<bool>,
     }
 
     impl ResealerFixture {
@@ -8864,11 +9001,29 @@ mod timeout_tests {
             *self.revision.lock().unwrap() = revision;
         }
 
+        fn queue_clone(&self, root: &Path, directory: &str, sealed_revision: i64) {
+            let database = root.join(format!("{directory}.db"));
+            fs::write(&database, b"{}").unwrap();
+            let session = super::super::prepare_clone_session(
+                &ResealCloneFixture(database),
+                root.join(directory),
+            )
+            .unwrap();
+            self.clone.lock().unwrap().push(SharedSessionSeal {
+                session,
+                sealed_revision,
+            });
+        }
+
         fn calls(&self) -> (usize, usize) {
             (
                 *self.delta_calls.lock().unwrap(),
                 *self.bidirectional_calls.lock().unwrap(),
             )
+        }
+
+        fn clone_calls(&self) -> usize {
+            *self.clone_calls.lock().unwrap()
         }
     }
 
@@ -8907,6 +9062,20 @@ mod timeout_tests {
             if queued.is_empty() {
                 return Err(PeerSyncError::Protocol(
                     "fixture bidirectional exhausted".to_owned(),
+                ));
+            }
+            Ok(queued.remove(0))
+        }
+
+        fn reseal_clone(&self) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
+            *self.clone_calls.lock().unwrap() += 1;
+            if *self.clone_error.lock().unwrap() {
+                return Err(PeerSyncError::Storage("fixture clone seal".to_owned()));
+            }
+            let mut queued = self.clone.lock().unwrap();
+            if queued.is_empty() {
+                return Err(PeerSyncError::Protocol(
+                    "fixture clone exhausted".to_owned(),
                 ));
             }
             Ok(queued.remove(0))
@@ -8990,7 +9159,7 @@ mod timeout_tests {
             ))
             .json(&ClaimRequest {
                 claim: pairing.claim.clone(),
-                device_id: Some("00000000-0000-4000-8000-0000000002ff".to_owned()),
+                device_id: Some(RESEAL_CLAIM_DEVICE_ID.to_owned()),
                 protocol_version: CLAIM_PROTOCOL_VERSION,
                 device_name: Some("Android".to_owned()),
                 permissions: None,
@@ -9222,6 +9391,210 @@ mod timeout_tests {
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        host.stop().unwrap();
+    }
+    fn clone_session_descriptor(endpoint: &str, bearer: &str) -> serde_json::Value {
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{endpoint}/v1/peer/clone-session"))
+            .bearer_auth(bearer)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json().unwrap()
+    }
+
+    #[test]
+    fn clone_session_endpoint_returns_the_current_descriptor_when_the_revision_is_unchanged() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.set_revision(4);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000301",
+            "00000000-0000-4000-8000-000000000302",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+        let advertised = hello_lanes(&endpoint, &bearer);
+
+        let descriptor = clone_session_descriptor(&endpoint, &bearer);
+
+        assert_eq!(descriptor["sessionId"], advertised["clone"]["sessionId"]);
+        assert_eq!(descriptor["manifestId"], advertised["clone"]["manifestId"]);
+        assert_eq!(resealer.clone_calls(), 0);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn clone_session_endpoint_issues_a_new_descriptor_after_a_local_commit() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.queue_clone(source_root.path(), "resealed-clone", 9);
+        resealer.set_revision(9);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000303",
+            "00000000-0000-4000-8000-000000000304",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+        let advertised = hello_lanes(&endpoint, &bearer);
+
+        let descriptor = clone_session_descriptor(&endpoint, &bearer);
+
+        assert_ne!(descriptor["sessionId"], advertised["clone"]["sessionId"]);
+        assert_eq!(resealer.clone_calls(), 1);
+        // A second request at the same revision reuses the freshly sealed lane.
+        assert_eq!(clone_session_descriptor(&endpoint, &bearer), descriptor);
+        assert_eq!(resealer.clone_calls(), 1);
+        // The lane the refreshed descriptor names is the one hello now reports.
+        assert_eq!(
+            hello_lanes(&endpoint, &bearer)["clone"]["sessionId"],
+            descriptor["sessionId"]
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn clone_session_endpoint_keeps_the_previous_descriptor_when_the_reseal_fails() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        *resealer.clone_error.lock().unwrap() = true;
+        resealer.set_revision(9);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000305",
+            "00000000-0000-4000-8000-000000000306",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+        let advertised = hello_lanes(&endpoint, &bearer);
+
+        let descriptor = clone_session_descriptor(&endpoint, &bearer);
+
+        assert_eq!(descriptor["sessionId"], advertised["clone"]["sessionId"]);
+        assert_eq!(descriptor["manifestId"], advertised["clone"]["manifestId"]);
+        assert_eq!(resealer.clone_calls(), 1);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn clone_session_endpoint_requires_an_authorized_read_device() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.set_revision(4);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000307",
+            "00000000-0000-4000-8000-000000000308",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let unauthorized = reqwest::blocking::Client::new()
+            .post(format!("{endpoint}/v1/peer/clone-session"))
+            .send()
+            .unwrap();
+        let wrong_bearer = reqwest::blocking::Client::new()
+            .post(format!("{endpoint}/v1/peer/clone-session"))
+            .bearer_auth("f".repeat(64))
+            .send()
+            .unwrap();
+        // Every registered grant carries read, so a device that reaches this
+        // route either holds it or is no longer registered at all.
+        assert!(host.revoke(RESEAL_CLAIM_DEVICE_ID));
+        let revoked = reqwest::blocking::Client::new()
+            .post(format!("{endpoint}/v1/peer/clone-session"))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap();
+
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong_bearer.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(revoked.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(resealer.clone_calls(), 0);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn clone_session_endpoint_rejects_a_body_or_the_wrong_method() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.set_revision(4);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000309",
+            "00000000-0000-4000-8000-00000000030a",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let wrong_method = reqwest::blocking::Client::new()
+            .get(format!("{endpoint}/v1/peer/clone-session"))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap();
+        let with_body = reqwest::blocking::Client::new()
+            .post(format!("{endpoint}/v1/peer/clone-session"))
+            .bearer_auth(&bearer)
+            .body("{}")
+            .send()
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(with_body.status(), reqwest::StatusCode::NOT_FOUND);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn the_clone_session_client_reads_the_refreshed_descriptor() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.queue_clone(source_root.path(), "client-clone", 12);
+        resealer.set_revision(12);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-00000000030b",
+            "00000000-0000-4000-8000-00000000030c",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+        let advertised = hello_lanes(&endpoint, &bearer);
+
+        let lane = authenticated_peer_clone_session(&endpoint, &bearer).unwrap();
+
+        assert_ne!(
+            serde_json::Value::from(lane.session_id.clone()),
+            advertised["clone"]["sessionId"]
+        );
+        assert_eq!(
+            hello_lanes(&endpoint, &bearer)["clone"]["sessionId"],
+            serde_json::Value::from(lane.session_id)
+        );
         host.stop().unwrap();
     }
 }

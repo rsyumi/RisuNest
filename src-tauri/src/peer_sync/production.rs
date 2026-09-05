@@ -182,6 +182,44 @@ impl PreparedUnifiedCloneSource {
             PeerSyncError::Storage("shared clone source session has no owned parent".to_owned())
         })?)
     }
+
+    /// Drops only the session directory of a source a newer preparation has
+    /// already superseded. The marker check `cleanup` makes cannot apply here:
+    /// the newer preparation owns the marker by the time this runs, and it is
+    /// exactly that newer marker which makes this directory unreachable.
+    fn release_superseded_directory(&mut self) -> Result<(), PeerSyncError> {
+        self.prepared.take();
+        remove_unified_directory(&self.session_root)
+    }
+}
+
+/// Replaces a prepared clone source with one sealed at the store's revision now.
+///
+/// The order is deliberate. The new package is built and its marker written
+/// first, so a failure at any point leaves the current source exactly as it was
+/// and the clone lane keeps answering from a package that still exists on disk.
+/// Only once the new marker owns the source does the superseded directory go,
+/// which keeps at most two packages on disk. Both steps run under one hold of
+/// the source file lock, because the single active-source marker admits exactly
+/// one owner and a reader must never see the gap between them.
+pub(crate) fn reseal_unified_clone_source(
+    current: &mut PreparedUnifiedCloneSource,
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    peer_root: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<PreparedUnifiedCloneSource, PeerSyncError> {
+    let _files = lock_unified_source_files()?;
+    let prepared = prepare_unified_clone_source_locked(store, cas, peer_root, cancellation)?;
+    // The swap already succeeded, so a directory that refuses to go is left for
+    // the sweep that shared source cleanup runs rather than failing the reseal.
+    if let Err(error) = current.release_superseded_directory() {
+        crate::nlog!(
+            "warn",
+            "superseded clone source directory removal failed: {error}"
+        );
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn prepare_unified_clone_source(
@@ -191,6 +229,15 @@ pub(crate) fn prepare_unified_clone_source(
     cancellation: &dyn CancellationProbe,
 ) -> Result<PreparedUnifiedCloneSource, PeerSyncError> {
     let _files = lock_unified_source_files()?;
+    prepare_unified_clone_source_locked(store, cas, peer_root, cancellation)
+}
+
+fn prepare_unified_clone_source_locked(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    peer_root: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<PreparedUnifiedCloneSource, PeerSyncError> {
     let operation_id = uuid::Uuid::new_v4().to_string();
     let preparation_parent = peer_root.join("source-preparation");
     let sessions_parent = peer_root.join("source-sessions");
