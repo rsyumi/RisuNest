@@ -493,8 +493,11 @@ export function createDeviceSyncController(options: {
                     source = await options.facade.start(permissions)
                     if (epoch !== sourceEpoch) throw new DeviceSyncError('state-unavailable')
                     rehostPrepared = false
-                    update({ source, sourceError: null, workError: null, error: null })
+                    // The same start transition the sharing card runs, so the
+                    // remote commit notice is settled the same way.
+                    update({ source, sourceError: null, workError: null, error: null, remoteCommitNotice: null })
                     observeSource(source)
+                    void observeRemoteCommit(source)
                     return source
                 } catch (error) {
                     if (epoch === sourceEpoch) observeSource(snapshot.source)

@@ -1085,6 +1085,35 @@ describe('device sync controller', () => {
         expect(start).toHaveBeenCalledTimes(2)
     })
 
+    it('clears the remote commit notice when the source is rehosted', async () => {
+        const status = vi.fn()
+            .mockResolvedValueOnce({ phase: 'idle' as const })
+            .mockResolvedValue({ phase: 'idle' as const, lastRemoteCommit: remoteCommit(12) })
+        const bidirectional = {
+            snapshot: () => ({ ...bidirectionalSnapshot(), operationPhase: 'sourcePrepared' as const, operationRetained: true }),
+            subscribe: () => () => undefined, initialize: async () => undefined,
+            syncRegistered: vi.fn(), resolveRegistered: vi.fn(), resume: vi.fn(),
+            acknowledge: vi.fn(), abandon: vi.fn(),
+        }
+        const controller = createDeviceSyncController({
+            facade: {
+                ...sourceFacade(), status,
+                refreshAfterRemoteCommit: vi.fn(async () => ({ discardedPendingEdits: true })),
+            },
+            targets: { bidirectional },
+        })
+        await controller.initialize()
+        await controller.stop()
+        await vi.waitFor(() => expect(controller.snapshot().remoteCommitNotice).toBe('editsDiscarded'))
+
+        await controller.rehostBidirectionalSource(
+            { method: 'lan', fixedPort: 32145, publicBaseUrl: '' },
+            { read: true, bidirectional: false },
+        )
+
+        expect(controller.snapshot().remoteCommitNotice).toBeNull()
+    })
+
     const remoteCommit = (committedRevision: number, operationId = '00000000-0000-4000-8000-0000000000a1') => ({
         operationId, committedRevision,
     })
