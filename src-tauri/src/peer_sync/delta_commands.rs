@@ -1463,6 +1463,36 @@ mod tests {
     }
 
     #[test]
+    fn delta_prepare_stop_prepare_keeps_the_canonical_v2_source_identity() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let canonical = canonical_source_device_id(source_root.path()).unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                canonical_source_device_id(source_root.path()).unwrap(),
+                canonical
+            );
+            let (mut host, pairing) = host_delta_source(source_root.path());
+            let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+            let client = LanLogicalDeltaClient::claim_v2_and_register(
+                target_root.path(),
+                "Android",
+                &endpoint,
+                &pairing.session_id,
+                &pairing.manifest_id,
+                &pairing.claim,
+            )
+            .unwrap();
+
+            // A restarted source keeps the persisted identity on the wire, so a
+            // registered target never sees it as a different peer.
+            assert_eq!(client.hello().unwrap().device_id, canonical);
+            host.stop().unwrap();
+        }
+    }
+
+    #[test]
     fn android_target_foreground_release_is_native_owned_and_generation_exact() {
         let _registry_guard = test_registry_guard();
         let state = PeerDeltaCommandState::default();

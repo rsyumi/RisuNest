@@ -676,6 +676,23 @@ impl PersistentStore {
             .map_err(Into::into)
     }
 
+    // Read-only counterpart of the reclaim above, so a test can prove a pin
+    // exists without deleting the very pin it is asserting on.
+    #[cfg(test)]
+    pub(crate) fn count_logical_generation_pins(
+        &self,
+        session_id_prefix: &str,
+    ) -> StoreResult<usize> {
+        validate_logical_session_pin_prefix(session_id_prefix)?;
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM logical_generation_session_pins
+             WHERE substr(session_id, 1, length(?1)) = ?1",
+            [session_id_prefix],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     // Exercised by the session-resume tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resume_logical_generation_pin(

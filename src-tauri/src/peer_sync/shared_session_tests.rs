@@ -958,6 +958,14 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
         .join("peer-clone")
         .join("active-source.json")
         .exists());
+    // Positive control for the reclaim assertion below: the delta lane holds a
+    // P4 generation pin for as long as its prepared source lives.
+    assert_eq!(
+        store
+            .count_logical_generation_pins(super::delta_commands::P4_SOURCE_PIN_PREFIX)
+            .unwrap(),
+        1
+    );
     let sessions = root.path().join("peer-clone").join("source-sessions");
     let stale = sessions.join("323e4567-e89b-42d3-a456-426614174000");
     let noncanonical = sessions.join("423E4567-E89B-42D3-A456-426614174000");
@@ -965,6 +973,12 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
     std::fs::create_dir_all(&stale).unwrap();
     std::fs::create_dir_all(&noncanonical).unwrap();
     std::fs::write(&canonical_file, b"preserve file").unwrap();
+    // A canonically named symlink is the escape the sweep must never follow.
+    let escaped = root.path().join("escaped-source-session");
+    std::fs::create_dir_all(&escaped).unwrap();
+    std::fs::write(escaped.join("sentinel"), b"preserve link target").unwrap();
+    let canonical_link = sessions.join("723e4567-e89b-42d3-a456-426614174000");
+    let linked = create_test_directory_symlink(&canonical_link, &escaped);
 
     lifecycle.stop().unwrap();
 
@@ -977,14 +991,43 @@ fn real_shared_source_engines_accept_a_short_lived_store_and_remove_clone_marker
     assert!(!stale.exists());
     assert!(noncanonical.is_dir());
     assert!(canonical_file.is_file());
-    // The delta lane owns a P4 generation pin for as long as its prepared
-    // source lives, so stop has to leave nothing for a later reclaim to find.
+    if linked {
+        // The sweep skips every link instead of deleting through it, so both
+        // the link and everything behind it survive an owned-root cleanup.
+        assert!(std::fs::symlink_metadata(&canonical_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(escaped.join("sentinel").is_file());
+    }
+    // Stop has to leave nothing for a later reclaim to find, and the release
+    // has to be durable rather than only visible to the open handle.
+    drop(store);
+    let mut reopened = PersistentStore::open(root.path()).unwrap();
     assert_eq!(
-        store
+        reopened
             .reclaim_logical_generation_pins(super::delta_commands::P4_SOURCE_PIN_PREFIX)
             .unwrap(),
         0
     );
+}
+
+/// Creates a directory symlink, reporting whether the platform allowed it.
+/// Windows refuses without Developer Mode or elevation, so callers skip the
+/// link-specific assertions instead of failing on an environment limit.
+#[cfg(desktop)]
+fn create_test_directory_symlink(link: &std::path::Path, target: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_dir(target, link);
+    #[cfg(not(windows))]
+    let created = std::os::unix::fs::symlink(target, link);
+    match created {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipping the source sweep symlink defence: {error}");
+            false
+        }
+    }
 }
 
 #[cfg(desktop)]
@@ -1968,6 +2011,112 @@ impl SharedPeerTunnelCleanup for RetryableStartCleanup {
     }
 }
 
+/// Holds the start inside the launcher until the test releases it twice, so a
+/// competing observer can look at the source while the start is in flight.
+struct PausedSharedTunnelLauncher {
+    pause: Arc<std::sync::Barrier>,
+}
+
+impl SharedPeerTunnelLauncher for PausedSharedTunnelLauncher {
+    fn start(&self, host: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        self.pause.wait();
+        self.pause.wait();
+        Ok(Box::new(FakeSharedTunnel {
+            _host: host,
+            public_url: url::Url::parse("https://paused-id.trycloudflare.com/").unwrap(),
+        }))
+    }
+}
+
+#[test]
+fn status_reports_starting_while_a_start_is_blocked_inside_the_launcher() {
+    let (root, host) = host();
+    let pause = Arc::new(std::sync::Barrier::new(2));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(PausedSharedTunnelLauncher {
+            pause: Arc::clone(&pause),
+        }),
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    let starting = {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            state.start(DeviceSyncLinkPermissions {
+                read: true,
+                bidirectional: false,
+            })
+        })
+    };
+    pause.wait();
+
+    // Status must not queue behind the operation the start owns.
+    let status = state.status().unwrap();
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Starting);
+    assert_eq!(status.endpoint, None);
+    assert_eq!(status.pairing_uri, None);
+
+    pause.wait();
+    assert_eq!(
+        starting.join().unwrap().unwrap().phase,
+        DeviceSyncSourcePhase::Running
+    );
+    state.stop().unwrap();
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+}
+
+/// Mirrors the system launcher when the tunnel process is already running but
+/// the start still fails: the spawned process is handed over as the cleanup
+/// owner instead of being leaked.
+struct SpawnedStartCleanupLauncher {
+    cleanup_available: std::sync::atomic::AtomicBool,
+    stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SharedPeerTunnelLauncher for SpawnedStartCleanupLauncher {
+    fn start(&self, _: SharedSessionHost) -> Result<Box<dyn SharedPeerTunnel>, PeerSyncError> {
+        Err(PeerSyncError::Transport(
+            "raw quick start failure after the process spawned".to_owned(),
+        ))
+    }
+
+    fn take_failed_cleanup(&self) -> Option<Box<dyn SharedPeerTunnelCleanup>> {
+        self.cleanup_available
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| {
+                Box::new(SpawnedStartCleanup {
+                    stop_calls: Arc::clone(&self.stop_calls),
+                }) as Box<dyn SharedPeerTunnelCleanup>
+            })
+    }
+}
+
+struct SpawnedStartCleanup {
+    stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SharedPeerTunnelCleanup for SpawnedStartCleanup {
+    fn stop(&mut self) -> Result<(), PeerSyncError> {
+        self.stop_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 struct FailingPublicOriginVerifier;
 
 impl SharedPublicOriginVerifier for FailingPublicOriginVerifier {
@@ -2036,6 +2185,53 @@ fn transport_failures_are_not_misreported_as_port_conflicts() {
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
         state.stop().unwrap();
     }
+}
+
+#[test]
+fn failed_quick_start_stops_the_spawned_tunnel_once_without_publishing_a_pairing() {
+    let (root, host) = host();
+    let stop_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = DeviceSyncSourceState::new_for_test_with_quick_tunnel(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Arc::new(SpawnedStartCleanupLauncher {
+            cleanup_available: std::sync::atomic::AtomicBool::new(true),
+            stop_calls: Arc::clone(&stop_calls),
+        }),
+    );
+    let port = available_port();
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Quick,
+                fixed_port: port,
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+
+    assert!(state
+        .start(DeviceSyncLinkPermissions {
+            read: true,
+            bidirectional: false,
+        })
+        .is_err());
+
+    // The already-spawned process is stopped by the failing start itself.
+    assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let status = state.status().unwrap();
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Error);
+    assert_eq!(status.endpoint, None);
+    assert_eq!(status.pairing_uri, None);
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+
+    // A cleanup that succeeded is not retained, so stop must not stop it twice.
+    assert_eq!(state.stop().unwrap().phase, DeviceSyncSourcePhase::Idle);
+    assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -2345,6 +2541,67 @@ fn unified_source_revoke_hook_invalidates_an_established_live_bearer() {
         reqwest::StatusCode::UNAUTHORIZED
     );
     fs::remove_dir(registry).unwrap();
+    state.stop().unwrap();
+}
+
+#[test]
+fn unified_source_revocation_is_scoped_to_the_revoked_device() {
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        Ipv4Addr::LOCALHOST,
+    );
+    let permissions = DeviceSyncLinkPermissions {
+        read: true,
+        bidirectional: false,
+    };
+    state
+        .prepare(
+            &mut (),
+            root.path(),
+            DeviceSyncPrepareRequest {
+                method: DeviceSyncListenMethod::Lan,
+                fixed_port: available_port(),
+                public_base_url: None,
+            },
+        )
+        .unwrap();
+    let endpoint = state.start(permissions).unwrap().endpoint.unwrap();
+    let established = |device_id: &str| {
+        let pairing = state.pairing_for_test().unwrap();
+        let response = claim(&pairing, device_id);
+        assert!(response.status().is_success());
+        response.json::<serde_json::Value>().unwrap()["bearer"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let kept_device = "00000000-0000-4000-8000-000000000034";
+    let revoked_device = "00000000-0000-4000-8000-000000000035";
+    let kept = established(kept_device);
+    // A pairing link carries a single claim, so the second device registers
+    // against a rotated link on the very same running source.
+    tauri::async_runtime::block_on(run_device_sync_rotate_link(state.clone(), permissions)).unwrap();
+    let revoked = established(revoked_device);
+    let client = reqwest::blocking::Client::new();
+    let hello = |bearer: &str| {
+        client
+            .get(format!("{endpoint}/v1/peer/hello"))
+            .bearer_auth(bearer)
+            .send()
+            .unwrap()
+            .status()
+    };
+    assert_eq!(hello(&kept), reqwest::StatusCode::OK);
+    assert_eq!(hello(&revoked), reqwest::StatusCode::OK);
+
+    state.revoke_registered_device(revoked_device);
+
+    assert_eq!(hello(&revoked), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(hello(&kept), reqwest::StatusCode::OK);
     state.stop().unwrap();
 }
 
