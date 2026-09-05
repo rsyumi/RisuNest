@@ -501,6 +501,13 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
     ) -> Result<(), PeerSyncError> {
         match lane {
             SharedSourceLane::Clone => {
+                // The lifecycle only cleans lanes that reported success, so the
+                // engine's store handle is opened before the package exists: a
+                // handle failure then leaves nothing behind to account for.
+                let store = context
+                    .store
+                    .open_native_job_store()
+                    .map_err(reseal_store_error)?;
                 *lock_clone_source(&self.clone)? = Some(prepare_unified_clone_source(
                     context.store,
                     context.cas,
@@ -510,12 +517,7 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
                 // Clone runs first, so the engine exists before any lane the
                 // host will later reseal.
                 self.reseal = Some(Arc::new(SharedSourceResealEngine {
-                    store: Mutex::new(
-                        context
-                            .store
-                            .open_native_job_store()
-                            .map_err(reseal_store_error)?,
-                    ),
+                    store: Mutex::new(store),
                     app_root: context.app_root.to_path_buf(),
                     remote_commit: Arc::clone(&context.remote_commit),
                     clone: Arc::clone(&self.clone),
