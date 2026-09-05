@@ -14,7 +14,7 @@ use super::target_foreground_transition::{
     AndroidTargetForegroundTransition, AndroidTargetForegroundTransitionError,
 };
 use super::{
-    command_codes::{code_for, finish_peer_worker, is_bounded_code, PeerCommandCode},
+    command_codes::{code_for, finish_peer_worker, PeerCommandCode},
     delta_completion::{
         abandon_retained_delta_completion, recover_delta_completion, retained_delta_completion,
         DeltaCompletionContext, DeltaCompletionMode, LanDeltaCompletionTransport,
@@ -1125,9 +1125,10 @@ fn peer_operation_failure(context: &str, error: PeerSyncError) -> String {
     code_for(&error).code().to_owned()
 }
 
+#[cfg(any(target_os = "android", test))]
 fn bound_registered_operation_outcome<T>(outcome: Result<T, String>) -> Result<T, String> {
     outcome.map_err(|error| {
-        if is_bounded_code(&error) {
+        if super::command_codes::is_bounded_code(&error) {
             error
         } else {
             registered_local_operation_failure("registered delta operation", error)

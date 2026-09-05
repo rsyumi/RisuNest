@@ -1,8 +1,7 @@
 use super::{
     protocol::{
         sha256_hex, CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor,
-        VerifiedChunk, CLONE_CHUNK_SIZE, CLONE_DATABASE_FORMAT, CLONE_LOSSLESS_DATABASE_FORMAT,
-        CLONE_MANIFEST_SCHEMA, MAX_MANIFEST_BYTES,
+        VerifiedChunk, CLONE_CHUNK_SIZE, CLONE_DATABASE_FORMAT, CLONE_MANIFEST_SCHEMA,
     },
     PeerSyncError,
 };
@@ -86,107 +85,6 @@ pub struct PreparedCloneSession {
 }
 
 impl PreparedCloneSession {
-    // Desktop source restart recovers a persisted lossless session.
-    #[cfg_attr(target_os = "android", allow(dead_code))]
-    pub(crate) fn reopen_lossless(
-        session_root: impl AsRef<Path>,
-        expected_session_id: &str,
-        expected_manifest_id: &str,
-    ) -> Result<Self, PeerSyncError> {
-        if uuid::Uuid::parse_str(expected_session_id)
-            .map(|value| value.to_string() != expected_session_id)
-            .unwrap_or(true)
-            || super::protocol::validate_hash(expected_manifest_id).is_err()
-        {
-            return recovery_validation("invalid prepared clone recovery identity");
-        }
-        let session_root = session_root.as_ref();
-        let root_metadata = match fs::symlink_metadata(session_root) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return recovery_validation("prepared clone session directory is missing")
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-            return recovery_validation("prepared clone session root is not a real directory");
-        }
-        let root = fs::canonicalize(session_root)?;
-        let manifest_path = root.join("manifest.json");
-        let manifest_metadata = match fs::symlink_metadata(&manifest_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return recovery_validation("prepared clone manifest is missing")
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if !manifest_metadata.is_file()
-            || manifest_metadata.file_type().is_symlink()
-            || manifest_metadata.len() > MAX_MANIFEST_BYTES as u64
-        {
-            return recovery_validation("prepared clone manifest file is invalid");
-        }
-        let mut manifest_bytes = Vec::with_capacity(manifest_metadata.len() as usize);
-        File::open(&manifest_path)?
-            .take(MAX_MANIFEST_BYTES as u64 + 1)
-            .read_to_end(&mut manifest_bytes)?;
-        if manifest_bytes.len() > MAX_MANIFEST_BYTES {
-            return recovery_validation("prepared clone manifest exceeds its bound");
-        }
-        let manifest: CloneManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
-        manifest.validate().map_err(recovery_contract_error)?;
-        let canonical = manifest
-            .canonical_bytes()
-            .map_err(recovery_contract_error)?;
-        if canonical != manifest_bytes {
-            return recovery_validation("prepared clone manifest is not canonical JSON");
-        }
-        let manifest_id = sha256_hex(&manifest_bytes);
-        if manifest.session_id != expected_session_id || manifest_id != expected_manifest_id {
-            return recovery_validation(
-                "prepared clone manifest identity does not match its marker",
-            );
-        }
-        if manifest.database.format != CLONE_LOSSLESS_DATABASE_FORMAT
-            || !manifest.payloads.is_empty()
-            || manifest.objects.len() != 1
-        {
-            return recovery_validation(
-                "prepared clone recovery requires exactly one lossless package",
-            );
-        }
-        let descriptor = manifest
-            .objects
-            .get(&manifest.database.object)
-            .ok_or_else(|| {
-                PeerSyncError::Validation(
-                    "prepared clone lossless package is absent from its manifest".to_owned(),
-                )
-            })?;
-        let cas = PayloadCas::new(&root).map_err(recovery_io_error)?;
-        let object_path = cas
-            .object_path(&manifest.database.object)
-            .map_err(recovery_io_error)?
-            .ok_or_else(|| {
-                PeerSyncError::Validation("prepared clone lossless package is missing".to_owned())
-            })?;
-        let object_size = fs::symlink_metadata(object_path)
-            .map_err(recovery_io_error)?
-            .len();
-        if object_size != descriptor.size {
-            return recovery_validation("prepared clone lossless package size changed");
-        }
-        let object_hash = descriptor.sha256.clone();
-        Ok(Self {
-            root,
-            manifest,
-            manifest_bytes,
-            manifest_id,
-            served_objects: BTreeMap::from([(object_hash.clone(), object_hash)]),
-        })
-    }
-
     pub fn manifest(&self) -> &CloneManifest {
         &self.manifest
     }
@@ -251,28 +149,6 @@ impl PreparedCloneSession {
         self.manifest_id = sha256_hex(&self.manifest_bytes);
         fs::write(self.root.join("manifest.json"), &self.manifest_bytes)?;
         Ok(())
-    }
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn recovery_validation<T>(message: &str) -> Result<T, PeerSyncError> {
-    Err(PeerSyncError::Validation(message.to_owned()))
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn recovery_contract_error(error: PeerSyncError) -> PeerSyncError {
-    PeerSyncError::Validation(error.to_string())
-}
-
-#[cfg_attr(target_os = "android", allow(dead_code))]
-fn recovery_io_error(error: std::io::Error) -> PeerSyncError {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
-    ) {
-        PeerSyncError::Validation(error.to_string())
-    } else {
-        PeerSyncError::Storage(error.to_string())
     }
 }
 

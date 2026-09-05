@@ -2048,6 +2048,9 @@ impl SharedSessionHost {
             .enable_v2_registry(app_root, source_name, permissions)
     }
 
+    // Desktop advertises on every interface; Android binds its selected
+    // private interface through start_private_lan.
+    #[cfg(any(desktop, test))]
     pub(crate) fn start_fixed_lan(
         &mut self,
         advertised_address: Ipv4Addr,
@@ -2071,6 +2074,9 @@ impl SharedSessionHost {
         Ok(data)
     }
 
+    // Only the Android device sync host binds an explicitly selected private
+    // interface; desktop advertises through start_fixed_lan.
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn start_private_lan(
         &mut self,
         address: Ipv4Addr,

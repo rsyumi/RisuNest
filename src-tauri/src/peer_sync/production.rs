@@ -154,39 +154,6 @@ pub(crate) struct PreparedUnifiedCloneSource {
 }
 
 impl PreparedUnifiedCloneSource {
-    pub(crate) fn directory_id(&self) -> Result<&str, PeerSyncError> {
-        self.session_root
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                PeerSyncError::Storage(
-                    "shared clone source directory identity is unavailable".to_owned(),
-                )
-            })
-    }
-
-    pub(crate) fn session_root(&self) -> &Path {
-        &self.session_root
-    }
-
-    pub(crate) fn session_id(&self) -> Result<&str, PeerSyncError> {
-        self.prepared
-            .as_ref()
-            .map(|prepared| prepared.manifest().session_id.as_str())
-            .ok_or_else(|| {
-                PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())
-            })
-    }
-
-    pub(crate) fn manifest_id(&self) -> Result<&str, PeerSyncError> {
-        self.prepared
-            .as_ref()
-            .map(PreparedCloneSession::manifest_id)
-            .ok_or_else(|| {
-                PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())
-            })
-    }
-
     pub(crate) fn take_session(&mut self) -> Result<PreparedCloneSession, PeerSyncError> {
         self.prepared.take().ok_or_else(|| {
             PeerSyncError::Protocol("shared clone source session is unavailable".to_owned())

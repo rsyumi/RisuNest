@@ -1168,6 +1168,8 @@ pub(crate) struct LanCloneHostControl {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHostControl {
+    // Engine fixtures inspect the live device list; production only revokes.
+    #[cfg(test)]
     pub(crate) fn devices(&self) -> Vec<LanDevice> {
         let Some(shared) = self.shared.upgrade() else {
             return Vec::new();
@@ -1225,6 +1227,9 @@ pub struct LanCloneHost {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHost {
+    // Physical clone hosting has no production caller left: the unified device
+    // sync source hosts logical sessions. The engine tests still cover it.
+    #[cfg(test)]
     pub fn prepare(session: PreparedCloneSession) -> Self {
         Self {
             shared: Arc::new(LanShared {
@@ -1265,6 +1270,9 @@ impl LanCloneHost {
         }
     }
 
+    // Production hosts bidirectional sessions through the shared session
+    // facade; the direct entry point stays for the engine tests.
+    #[cfg(test)]
     pub(crate) fn prepare_bidirectional_logical(
         session: PreparedBidirectionalLogicalLanSession,
     ) -> Self {
@@ -1394,6 +1402,8 @@ impl LanCloneHost {
         self.start_on(Ipv4Addr::UNSPECIFIED, 0)
     }
 
+    // Android sources bind an explicit interface through start_fixed_on.
+    #[cfg(any(desktop, test))]
     pub(crate) fn start_fixed_lan(&mut self, port: u16) -> Result<LanPairing, PeerSyncError> {
         if port == 0 {
             return Err(PeerSyncError::Validation(
@@ -1403,6 +1413,8 @@ impl LanCloneHost {
         self.start_on(Ipv4Addr::UNSPECIFIED, port)
     }
 
+    // The Android shared source binds its selected private interface here.
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn start_fixed_on(
         &mut self,
         address: Ipv4Addr,
@@ -1445,7 +1457,9 @@ impl LanCloneHost {
         self.start_on(Ipv4Addr::LOCALHOST, port)
     }
 
-    #[cfg(desktop)]
+    // Named tunnels have no production caller left (see the named tunnel engine
+    // cleanup item); the origin binding stays for the tunnel seam tests.
+    #[cfg(all(desktop, test))]
     pub(crate) fn start_named_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
         self.start_on(Ipv4Addr::LOCALHOST, named_tunnel_origin_port())
     }
@@ -1601,8 +1615,9 @@ impl LanCloneHost {
         *recovered_lock(&self.shared.tunnel_probe) = None;
     }
 
-    // Android source status surfaces the device list and revocation.
-    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
+    // Engine fixtures surface the live device list; production reads it through
+    // LanCloneHostControl.
+    #[cfg(test)]
     pub fn devices(&self) -> Vec<LanDevice> {
         self.control().devices()
     }

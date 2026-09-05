@@ -5184,23 +5184,15 @@ pub fn peer_bidirectional_target_foreground_release(
     )
 }
 
-/// The application data directory both finishers below project. The failure
-/// stays unwrapped so each of them keeps the wording its own callers report.
-fn resolve_app_root(app: &AppHandle) -> Result<PathBuf, tauri::Error> {
-    app.path().app_data_dir()
-}
-
+/// The application data directory every bidirectional command projects. Only
+/// the device sync page reaches these commands, so the failure detail stays in
+/// the native log and the caller sees the bounded code.
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
-    resolve_app_root(app)
-        .map_err(|error| format!("failed to resolve application data directory: {error}"))
-}
-
-/// The bounded-code twin of `app_root`, for the target commands the device sync
-/// page reaches. Source lane commands keep their own diagnostic text.
-fn bounded_app_root(app: &AppHandle) -> Result<PathBuf, String> {
     finish_peer_command(
         "bidirectional application data directory",
-        resolve_app_root(app).map_err(|error| PeerSyncError::Storage(error.to_string())),
+        app.path()
+            .app_data_dir()
+            .map_err(|error| PeerSyncError::Storage(error.to_string())),
     )
 }
 
@@ -5708,7 +5700,7 @@ pub fn peer_bidirectional_status(
     let mut store = finish_peer_command("bidirectional status store", open_command_store(&app))?;
     finish_peer_command(
         "bidirectional status",
-        state.status(&bounded_app_root(&app)?, &mut store),
+        state.status(&app_root(&app)?, &mut store),
     )
 }
 
@@ -5785,10 +5777,7 @@ async fn peer_bidirectional_sync_with_factory<
         NeverCancelled
     };
     let worker_state = state.clone();
-    let root = app_root(&app).map_err(|error| {
-        crate::nlog!("warn", "registered bidirectional app root failed: {error}");
-        PeerCommandCode::OperationFailed.code().to_owned()
-    })?;
+    let root = app_root(&app)?;
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let _guard = worker_state.begin_target().map_err(|error| {
             bidirectional_peer_operation_failure("bidirectional target state", error)
@@ -6135,10 +6124,7 @@ async fn peer_bidirectional_resolve_with_factory<
         NeverCancelled
     };
     let worker_state = state.clone();
-    let root = app_root(&app).map_err(|error| {
-        crate::nlog!("warn", "registered bidirectional app root failed: {error}");
-        PeerCommandCode::OperationFailed.code().to_owned()
-    })?;
+    let root = app_root(&app)?;
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let _guard = worker_state.begin_target().map_err(|error| {
             bidirectional_peer_operation_failure("bidirectional target state", error)
@@ -6264,7 +6250,7 @@ pub async fn peer_bidirectional_resume(
         NeverCancelled
     };
     let worker_state = state.clone();
-    let root = bounded_app_root(&app)?;
+    let root = app_root(&app)?;
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let _guard = worker_state.begin_target()?;
         #[cfg(target_os = "android")]
@@ -6321,7 +6307,7 @@ pub fn peer_bidirectional_acknowledge(
     state: State<'_, PeerBidirectionalCommandState>,
     operation_id: String,
 ) -> Result<(), String> {
-    let root = bounded_app_root(&app)?;
+    let root = app_root(&app)?;
     let mut store = finish_peer_command(
         "bidirectional acknowledgement store",
         open_command_store(&app),

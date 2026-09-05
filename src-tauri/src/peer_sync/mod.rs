@@ -77,7 +77,11 @@ pub use client::{
 pub use host::LoopbackCloneHost;
 pub use lan::LanCloneClient;
 #[cfg(any(desktop, target_os = "android"))]
-pub use lan::{LanCloneHost, LanPairing};
+pub use lan::LanCloneHost;
+// The pairing record only leaves `lan` for the engine fixtures that host a
+// source directly; production paths read it through the shared session.
+#[cfg(all(test, any(desktop, target_os = "android")))]
+pub use lan::LanPairing;
 #[cfg(test)]
 pub use logical_delta_transfer::execute_logical_delta_pull;
 pub use logical_delta_transfer::{
@@ -85,7 +89,7 @@ pub use logical_delta_transfer::{
     LogicalDeltaObjectSource, LogicalDeltaStagedTarget, LogicalDeltaTransferSelection,
     ReadyLogicalDeltaPlan,
 };
-#[cfg(any(target_os = "android", test))]
+#[cfg(test)]
 pub(crate) use production::prepare_lossless_clone_session;
 #[cfg(any(desktop, target_os = "android", test))]
 pub(crate) use production::LosslessCloneTargetAdapter;
