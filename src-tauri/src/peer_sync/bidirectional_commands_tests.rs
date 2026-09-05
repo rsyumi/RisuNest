@@ -10326,7 +10326,6 @@ fn lane_three_capabilities_and_status_dtos_are_exact() {
         serde_json::to_value(peer_bidirectional_capabilities()).unwrap(),
         json!({
             "desktop": true,
-            "sourceReady": true,
             "atomicActivationReady": true,
             "authenticatedTransportReady": true,
             "losslessBackupReady": true,

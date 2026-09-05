@@ -447,7 +447,6 @@ describe('peer bidirectional facade', () => {
             platform: 'desktop',
             invoke: (async () => ({
                 desktop: true,
-                sourceReady: true,
                 atomicActivationReady: true,
                 authenticatedTransportReady: false,
                 losslessBackupReady: true,

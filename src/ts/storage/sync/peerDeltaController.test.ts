@@ -10,7 +10,6 @@ function facadeFixture(overrides: Partial<Facade> = {}): Facade {
         recoverTargetForeground: vi.fn(async () => undefined),
         capabilities: vi.fn(async () => ({
             desktop: true,
-            sourceReady: true,
             atomicActivationReady: true,
             authenticatedTransportReady: true,
             productionEnabled: true,
@@ -53,11 +52,9 @@ describe('peer delta controller', () => {
                     events.push('capabilities')
                     return {
                         desktop: false,
-                        sourceReady: true,
                         atomicActivationReady: true,
                         authenticatedTransportReady: true,
                         productionEnabled: true,
-                        tunnelReady: false,
                     }
                 }),
                 retained: vi.fn(async () => {
@@ -151,7 +148,6 @@ describe('peer delta controller', () => {
             .mockRejectedValueOnce(new Error('capabilities unavailable'))
             .mockResolvedValueOnce({
                 desktop: true,
-                sourceReady: true,
                 atomicActivationReady: true,
                 authenticatedTransportReady: true,
                 productionEnabled: true,

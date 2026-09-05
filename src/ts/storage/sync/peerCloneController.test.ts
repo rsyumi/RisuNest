@@ -169,7 +169,6 @@ describe('peer clone controller surface', () => {
 function capabilities() {
     return {
         desktop: true,
-        sourceReady: true,
         atomicActivationReady: true,
         losslessBackupReady: true,
         httpTransportReady: true,

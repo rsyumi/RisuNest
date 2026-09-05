@@ -69,22 +69,18 @@ pub(crate) const P4_SOURCE_PIN_PREFIX: &str = "logical-session-p4-source-";
 #[serde(rename_all = "camelCase")]
 pub struct PeerDeltaCapabilities {
     desktop: bool,
-    source_ready: bool,
     atomic_activation_ready: bool,
     authenticated_transport_ready: bool,
     production_enabled: bool,
-    tunnel_ready: bool,
 }
 
 #[tauri::command]
 pub fn peer_delta_capabilities() -> PeerDeltaCapabilities {
     PeerDeltaCapabilities {
         desktop: cfg!(desktop),
-        source_ready: true,
         atomic_activation_ready: true,
         authenticated_transport_ready: true,
         production_enabled: true,
-        tunnel_ready: cfg!(desktop),
     }
 }
 

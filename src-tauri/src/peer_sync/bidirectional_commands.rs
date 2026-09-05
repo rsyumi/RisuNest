@@ -5117,7 +5117,6 @@ impl PeerBidirectionalCommandState {
 #[serde(rename_all = "camelCase")]
 pub struct PeerBidirectionalCapabilities {
     desktop: bool,
-    source_ready: bool,
     atomic_activation_ready: bool,
     authenticated_transport_ready: bool,
     lossless_backup_ready: bool,
@@ -5129,7 +5128,6 @@ pub struct PeerBidirectionalCapabilities {
 pub fn peer_bidirectional_capabilities() -> PeerBidirectionalCapabilities {
     PeerBidirectionalCapabilities {
         desktop: cfg!(desktop),
-        source_ready: true,
         atomic_activation_ready: true,
         authenticated_transport_ready: true,
         lossless_backup_ready: true,

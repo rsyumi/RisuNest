@@ -25,7 +25,6 @@ use tauri::{AppHandle, Manager, State};
 #[serde(rename_all = "camelCase")]
 pub struct PeerCloneCapabilities {
     desktop: bool,
-    source_ready: bool,
     atomic_activation_ready: bool,
     lossless_backup_ready: bool,
     http_transport_ready: bool,
@@ -36,7 +35,6 @@ pub struct PeerCloneCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerCloneGateState {
     desktop: bool,
-    source_ready: bool,
     atomic_activation_ready: bool,
     lossless_backup_ready: bool,
     http_transport_ready: bool,
@@ -47,7 +45,6 @@ impl PeerCloneCapabilities {
     fn current() -> Self {
         Self::from_gates(PeerCloneGateState {
             desktop: true,
-            source_ready: true,
             atomic_activation_ready: true,
             lossless_backup_ready: true,
             http_transport_ready: true,
@@ -58,13 +55,11 @@ impl PeerCloneCapabilities {
     fn from_gates(gates: PeerCloneGateState) -> Self {
         Self {
             desktop: gates.desktop,
-            source_ready: gates.source_ready,
             atomic_activation_ready: gates.atomic_activation_ready,
             lossless_backup_ready: gates.lossless_backup_ready,
             http_transport_ready: gates.http_transport_ready,
             large_fixture_passed: gates.large_fixture_passed,
             production_enabled: gates.desktop
-                && gates.source_ready
                 && gates.atomic_activation_ready
                 && gates.lossless_backup_ready
                 && gates.http_transport_ready,
@@ -2751,7 +2746,6 @@ mod tests {
             peer_clone_capabilities(),
             PeerCloneCapabilities {
                 desktop: true,
-                source_ready: true,
                 atomic_activation_ready: true,
                 lossless_backup_ready: true,
                 http_transport_ready: true,
@@ -2765,7 +2759,6 @@ mod tests {
     fn production_gate_requires_lossless_backup_and_qualified_http_transport() {
         let otherwise_ready = PeerCloneGateState {
             desktop: true,
-            source_ready: true,
             atomic_activation_ready: true,
             lossless_backup_ready: true,
             http_transport_ready: true,
@@ -2793,7 +2786,6 @@ mod tests {
     fn large_fixture_is_release_evidence_not_a_runtime_gate() {
         let capabilities = PeerCloneCapabilities::from_gates(PeerCloneGateState {
             desktop: true,
-            source_ready: true,
             atomic_activation_ready: true,
             lossless_backup_ready: true,
             http_transport_ready: true,

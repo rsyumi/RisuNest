@@ -25,11 +25,9 @@ export type PeerDeltaMutationRuntime = PeerSyncMutationRuntime
 
 export interface PeerDeltaCapabilities {
     desktop: boolean
-    sourceReady: boolean
     atomicActivationReady: boolean
     authenticatedTransportReady: boolean
     productionEnabled: boolean
-    tunnelReady: boolean
 }
 
 export type PeerDeltaPullResult =

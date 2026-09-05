@@ -17,7 +17,6 @@ function facade(overrides: Partial<PeerBidirectionalFacade> = {}): PeerBidirecti
     return {
         capabilities: async () => ({
             desktop: true,
-            sourceReady: true,
             atomicActivationReady: true,
             authenticatedTransportReady: true,
             losslessBackupReady: true,

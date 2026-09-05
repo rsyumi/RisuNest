@@ -36,7 +36,6 @@ export interface PeerCloneTargetStatus {
 
 export interface PeerCloneNativeCapabilities {
     desktop: true
-    sourceReady: boolean
     atomicActivationReady: boolean
     losslessBackupReady: boolean
     httpTransportReady: boolean

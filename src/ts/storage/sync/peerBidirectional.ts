@@ -7,7 +7,6 @@ export type PeerBidirectionalMutationRuntime = PeerSyncMutationRuntime
 
 export interface PeerBidirectionalCapabilities {
     desktop: boolean
-    sourceReady: boolean
     atomicActivationReady: boolean
     authenticatedTransportReady: boolean
     losslessBackupReady: boolean
@@ -438,7 +437,6 @@ export function createPeerBidirectionalFacade(options: {
             return {
                 ...capabilities,
                 productionEnabled: capabilities.productionEnabled
-                    && capabilities.sourceReady
                     && capabilities.atomicActivationReady
                     && capabilities.authenticatedTransportReady
                     && capabilities.losslessBackupReady

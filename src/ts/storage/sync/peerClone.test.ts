@@ -23,7 +23,7 @@ describe('PeerClone facade', () => {
     it('reuses an already claimed target without claiming again', async () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => (command === 'peer_clone_capabilities'
             ? {
-                desktop: true, sourceReady: true, atomicActivationReady: true, losslessBackupReady: true,
+                desktop: true, atomicActivationReady: true, losslessBackupReady: true,
                 httpTransportReady: true, largeFixturePassed: true, productionEnabled: true,
             }
             : undefined) as T)
@@ -42,7 +42,6 @@ describe('PeerClone facade', () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string, ..._args: unknown[]): Promise<T> => (command === 'peer_clone_capabilities'
             ? {
                 desktop: true,
-                sourceReady: true,
                 atomicActivationReady: true,
                 losslessBackupReady: true,
                 httpTransportReady: true,
@@ -69,7 +68,6 @@ describe('PeerClone facade', () => {
     it('keeps target operations closed until native production gates pass', async () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(): Promise<T> => ({
             desktop: true,
-            sourceReady: false,
             atomicActivationReady: false,
             losslessBackupReady: false,
             httpTransportReady: false,
@@ -100,7 +98,6 @@ describe('PeerClone facade', () => {
     ])('does not trust productionEnabled when the $name gate is closed', async ({ name: _name, ...gate }) => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(): Promise<T> => ({
             desktop: true,
-            sourceReady: true,
             atomicActivationReady: true,
             largeFixturePassed: true,
             productionEnabled: true,
@@ -120,7 +117,6 @@ describe('PeerClone facade', () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => (command === 'peer_clone_capabilities'
             ? {
                 desktop: true,
-                sourceReady: true,
                 atomicActivationReady: true,
                 losslessBackupReady: true,
                 httpTransportReady: true,
@@ -645,7 +641,6 @@ describe('PeerClone facade', () => {
 function productionCapabilities() {
     return {
         desktop: true,
-        sourceReady: true,
         atomicActivationReady: true,
         losslessBackupReady: true,
         httpTransportReady: true,
