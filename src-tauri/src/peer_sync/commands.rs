@@ -292,7 +292,7 @@ impl PeerCloneCommandState {
         })?;
         let paths = target_paths(peer_root, &request)?;
         if self.lock_runtime()?.target.is_none() {
-            ensure_no_other_persisted_target_job(peer_root, &paths.job_root)?;
+            ensure_no_other_persisted_target_job(peer_root, &paths.job_root, None)?;
         }
         let new_job = !paths.job_root.try_exists()?;
         let rotate_credential = {
@@ -503,7 +503,11 @@ impl PeerCloneCommandState {
         })?;
         let paths = target_paths(peer_root, &request)?;
         if self.lock_runtime()?.target.is_none() {
-            ensure_no_other_persisted_target_job(peer_root, &paths.job_root)?;
+            ensure_no_other_persisted_target_job(
+                peer_root,
+                &paths.job_root,
+                Some(source_device_id),
+            )?;
         }
         let new_job = !paths.job_root.try_exists()?;
         {
@@ -1590,15 +1594,27 @@ fn target_backup_path(peer_root: &Path, operation_id: &str) -> PathBuf {
     peer_root.join(target_backup_relative_path(operation_id))
 }
 
+/// Refuses a second persisted target job, except the one this same registered
+/// source superseded.
+///
+/// The source reseals its clone package whenever its own data moves, so an
+/// interrupted registered copy that is retried after a restart names a new
+/// session id while its old package no longer exists on disk. That job can
+/// never resume, so it is deleted and the retry proceeds. A job that already
+/// took its pre-clone backup is not superseded: that backup is the rollback for
+/// data this device has begun replacing, and the refusal keeps it referenced.
+/// A job from any other source device keeps refusing outright.
 fn ensure_no_other_persisted_target_job(
     peer_root: &Path,
     candidate_job_root: &Path,
+    superseding_source_device_id: Option<&str>,
 ) -> Result<(), PeerSyncError> {
     super::maintenance::with_backup_reference_lifecycle(|| {
         let targets_root = peer_root.join("targets");
         if !ordinary_directory(peer_root)? || !ordinary_directory(&targets_root)? {
             return Ok(());
         }
+        let mut superseded = Vec::new();
         for entry in fs::read_dir(&targets_root)? {
             let entry = entry?;
             if entry.path() == candidate_job_root {
@@ -1623,9 +1639,23 @@ fn ensure_no_other_persisted_target_job(
                 session_id,
                 manifest_id: marker.manifest_id.clone(),
             })?;
+            if marker.backup_path.is_none()
+                && superseding_source_device_id.is_some_and(|wanted| {
+                    LanCloneClient::open_persisted(&entry.path().join("credential.json"))
+                        .is_ok_and(|credential| credential.registered_source_device_id() == wanted)
+                })
+            {
+                superseded.push(entry.path());
+                continue;
+            }
             return Err(PeerSyncError::Protocol(
                 "another persisted peer clone target job is unresolved".to_owned(),
             ));
+        }
+        // Deleted after the walk, so a refusal later in the directory leaves
+        // every persisted job exactly as it was.
+        for job_root in superseded {
+            remove_directory_if_exists(&job_root)?;
         }
         Ok(())
     })
@@ -4183,6 +4213,105 @@ mod tests {
             assert_eq!(target.status.phase, PeerCloneTargetPhase::Idle);
         }
         source.hosted.host.stop().unwrap();
+    }
+
+    /// A registered source reseals its clone package whenever its own data
+    /// moves, so a copy interrupted before activation and retried after an app
+    /// restart names a new session while the package the old job needs is
+    /// already gone. That job is superseded rather than blocking the retry; a
+    /// job belonging to another source device still refuses.
+    #[test]
+    fn a_registered_retry_supersedes_the_stale_persisted_job_of_the_same_source() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_root = root.path().join("peer-clone");
+        let source_device_id = "00000000-0000-4000-8000-000000000221";
+        let bearer = "a".repeat(64);
+        let other_source_device_id = "00000000-0000-4000-8000-000000000222";
+        let other_bearer = "b".repeat(64);
+        let interrupted = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32145".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000223".to_owned(),
+            manifest_id: "c".repeat(64),
+        };
+        let resealed = PeerCloneTargetRequest {
+            endpoint: interrupted.endpoint.clone(),
+            session_id: "00000000-0000-4000-8000-000000000224".to_owned(),
+            manifest_id: "d".repeat(64),
+        };
+        let foreign = PeerCloneTargetRequest {
+            endpoint: "http://127.0.0.1:32146".to_owned(),
+            session_id: "00000000-0000-4000-8000-000000000225".to_owned(),
+            manifest_id: "e".repeat(64),
+        };
+        let register_source = |device_id: &str, endpoint: &str, bearer: &str| {
+            super::super::device_registry::register_incoming_source(
+                root.path(),
+                super::super::device_registry::IncomingSource {
+                    device_id: device_id.to_owned(),
+                    name: format!("Source {device_id}"),
+                    endpoint: endpoint.to_owned(),
+                    bearer: bearer.to_owned(),
+                    permissions: super::super::device_registry::DevicePermissions::read(),
+                    last_seen_ms: 0,
+                    total_bytes: 0,
+                },
+            )
+            .unwrap();
+        };
+        let connect = |state: &PeerCloneCommandState,
+                       request: &PeerCloneTargetRequest,
+                       device_id: &str,
+                       bearer: &str| {
+            state.connect_registered_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                device_id,
+                bearer,
+                PeerCompletionCapability::Unsupported,
+            )
+        };
+        register_source(source_device_id, &interrupted.endpoint, &bearer);
+        connect(
+            &PeerCloneCommandState::default(),
+            &interrupted,
+            source_device_id,
+            &bearer,
+        )
+        .unwrap();
+
+        // The restart leaves the interrupted job on disk with nothing owning it.
+        let restarted = PeerCloneCommandState::default();
+        let result = connect(&restarted, &resealed, source_device_id, &bearer).unwrap();
+
+        let interrupted_root = target_paths(&peer_root, &interrupted).unwrap().job_root;
+        let resealed_root = target_paths(&peer_root, &resealed).unwrap().job_root;
+        assert_eq!(result.source_device_id, source_device_id);
+        assert!(!interrupted_root.try_exists().unwrap());
+        assert!(resealed_root.try_exists().unwrap());
+
+        // The surviving job belongs to the first source, so a second source
+        // cannot supersede it.
+        register_source(other_source_device_id, &foreign.endpoint, &other_bearer);
+        assert_eq!(
+            connect(
+                &PeerCloneCommandState::default(),
+                &foreign,
+                other_source_device_id,
+                &other_bearer,
+            )
+            .unwrap_err(),
+            PeerSyncError::Protocol(
+                "another persisted peer clone target job is unresolved".to_owned()
+            )
+        );
+        assert!(resealed_root.try_exists().unwrap());
+        assert!(!target_paths(&peer_root, &foreign)
+            .unwrap()
+            .job_root
+            .try_exists()
+            .unwrap());
     }
 
     #[test]

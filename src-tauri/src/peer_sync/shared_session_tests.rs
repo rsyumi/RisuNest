@@ -53,11 +53,13 @@ use crate::persistent_store::SyncGenerationIdentity;
 #[cfg(desktop)]
 use crate::{
     asset_repository::PayloadCas,
-    local_backup::{CancellationProbe, NeverCancelled},
+    local_backup::{AtomicCancellation, CancellationProbe, NeverCancelled},
     persistent_store::PersistentStore,
 };
 #[cfg(desktop)]
 use sha2::{Digest, Sha256};
+#[cfg(desktop)]
+use std::sync::atomic::AtomicBool;
 #[cfg(desktop)]
 use std::{
     collections::BTreeMap,
@@ -1415,15 +1417,20 @@ impl SharedSessionResealer for NoReseal {
     fn store_revision(&self) -> Result<i64, PeerSyncError> {
         Ok(0)
     }
-    fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
+    fn reseal_delta(
+        &self,
+    ) -> Result<SharedSessionSeal<PreparedLogicalLanSession>, PeerSyncError> {
         Err(PeerSyncError::Protocol("fixture".to_owned()))
     }
     fn reseal_bidirectional(
         &self,
-    ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+    ) -> Result<SharedSessionSeal<PreparedBidirectionalLogicalLanSession>, PeerSyncError> {
         Err(PeerSyncError::Protocol("fixture".to_owned()))
     }
-    fn reseal_clone(&self) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
+    fn reseal_clone(
+        &self,
+        _: &dyn CancellationProbe,
+    ) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
         Err(PeerSyncError::Protocol("fixture".to_owned()))
     }
 }
@@ -4253,4 +4260,85 @@ fn shared_stop_removes_the_resealed_clone_package_and_marker() {
         .join("peer-clone")
         .join("active-source.json")
         .exists());
+}
+
+/// Every owned clone source directory, so a cancelled build is visible as an
+/// extra one rather than only as a missing marker.
+#[cfg(desktop)]
+fn source_session_directories(app_root: &std::path::Path) -> Vec<PathBuf> {
+    let sessions = app_root.join("peer-clone").join("source-sessions");
+    let Ok(entries) = fs::read_dir(&sessions) else {
+        return Vec::new();
+    };
+    let mut directories = entries
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories
+}
+
+/// The pairing link names the clone lane, so a device that opens the link has
+/// to find the session it names.  A registered device asking for a full copy in
+/// that window clones the package this host already sealed.
+#[cfg(desktop)]
+#[test]
+fn a_clone_session_request_holds_the_lane_while_a_pairing_link_is_claimable() {
+    let mut source = started_real_shared_source();
+    let prepared = source.hello_lanes();
+    let prepared_directory = prepared_source_root(source.root.path());
+    let link = source
+        .lifecycle
+        .with_host_mut(|host| host.rotate_link())
+        .unwrap()
+        .unwrap();
+
+    source.commit_local_change("while-the-pairing-link-is-claimable");
+    let deferred = source.clone_session();
+    // The sealed package the deferred descriptor names is still on disk, so the
+    // device that opens the link can still take it.
+    let held_directories = source_session_directories(source.root.path());
+    source
+        .lifecycle
+        .with_host_mut(|host| host.expire_link_for_test())
+        .unwrap();
+    let refreshed = source.clone_session();
+
+    assert_eq!(link.session_id, lane_session_id(&prepared, "clone"));
+    assert_eq!(deferred.session_id, link.session_id);
+    assert_eq!(held_directories, [prepared_directory.clone()]);
+    // The expired link no longer binds the lane, so the same request reseals.
+    assert_ne!(refreshed.session_id, deferred.session_id);
+    assert!(!prepared_directory.exists());
+    source.lifecycle.stop().unwrap();
+}
+
+/// "Stop sharing" cancels the package build, and a cancelled build leaves the
+/// lane, the marker and the owned directories exactly as they were.
+#[cfg(desktop)]
+#[test]
+fn a_cancelled_clone_reseal_leaves_no_package_behind() {
+    let mut source = started_real_shared_source();
+    let sealed = lane_session_id(&source.hello_lanes(), "clone");
+    let prepared_directory = prepared_source_root(source.root.path());
+    let resealer = source
+        .lifecycle
+        .with_preparation(|engines| engines.reseal_engine_for_test())
+        .unwrap()
+        .unwrap();
+
+    source.commit_local_change("before-the-cancelled-reseal");
+    let cancelled =
+        resealer.reseal_clone(&AtomicCancellation::new(Arc::new(AtomicBool::new(true))));
+
+    assert!(cancelled.is_err());
+    assert_eq!(lane_session_id(&source.hello_lanes(), "clone"), sealed);
+    assert_eq!(
+        source.active_clone_marker()["sessionId"].as_str().unwrap(),
+        sealed
+    );
+    assert_eq!(
+        source_session_directories(source.root.path()),
+        [prepared_directory]
+    );
+    source.lifecycle.stop().unwrap();
 }

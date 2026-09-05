@@ -27,7 +27,7 @@ use super::{
         prepare_unified_clone_source, reseal_unified_clone_source, PreparedUnifiedCloneSource,
     },
 };
-#[cfg(any(desktop, target_os = "android", test))]
+#[cfg(desktop)]
 use crate::local_backup::NeverCancelled;
 #[cfg(any(desktop, target_os = "android", test))]
 use crate::{
@@ -319,15 +319,17 @@ impl SharedSessionResealer for SharedSourceResealEngine {
         self.lock_store()?.revision().map_err(reseal_store_error)
     }
 
-    fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
+    fn reseal_delta(&self) -> Result<SharedSessionSeal<PreparedLogicalLanSession>, PeerSyncError> {
         let cas = PayloadCas::new(&self.app_root)?;
         let mut store = self.lock_store()?;
-        seal_shared_delta_session(&mut store, &cas, &self.app_root).map(|sealed| sealed.session)
+        // The seal carries the manifest's own `source_revision`, which is the
+        // revision the store held while the generation was sealed.
+        seal_shared_delta_session(&mut store, &cas, &self.app_root)
     }
 
     fn reseal_bidirectional(
         &self,
-    ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+    ) -> Result<SharedSessionSeal<PreparedBidirectionalLogicalLanSession>, PeerSyncError> {
         let cas = PayloadCas::new(&self.app_root)?;
         let mut store = self.lock_store()?;
         // The reseal expects the revision it just read, so the match only fails
@@ -341,24 +343,27 @@ impl SharedSessionResealer for SharedSourceResealEngine {
             revision,
             Arc::clone(&self.remote_commit),
         )
-        .map(|sealed| sealed.session)
     }
 
-    fn reseal_clone(&self) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
+    fn reseal_clone(
+        &self,
+        cancellation: &dyn CancellationProbe,
+    ) -> Result<SharedSessionSeal<PreparedCloneSession>, PeerSyncError> {
         let cas = PayloadCas::new(&self.app_root)?;
         let mut store = self.lock_store()?;
         let mut owner = lock_clone_source(&self.clone)?;
         let current = owner.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
         })?;
-        // A clone reseal has no operation to cancel it: the request that asked
-        // for it is the full copy about to start, and it waits for the package.
+        // The full package build is the one reseal long enough to outlast a
+        // stop, so the host's stop flag cancels it.  A cancelled build removes
+        // its own directories and leaves the current source untouched.
         let mut prepared = reseal_unified_clone_source(
             current,
             &mut store,
             &cas,
             &self.app_root.join("peer-clone"),
-            &NeverCancelled,
+            cancellation,
         )?;
         let sealed = SharedSessionSeal {
             sealed_revision: prepared.sealed_revision(),
@@ -394,6 +399,13 @@ impl SharedSourceEngines {
             bidirectional: None,
             reseal: None,
         }
+    }
+
+    /// The seam `hello` and the clone session endpoint reseal through.  Only
+    /// the tests reach it directly; production always goes through the host.
+    #[cfg(test)]
+    pub(crate) fn reseal_engine_for_test(&self) -> Option<Arc<SharedSourceResealEngine>> {
+        self.reseal.clone()
     }
 }
 
