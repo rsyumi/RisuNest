@@ -74,6 +74,10 @@ internal fun rejectedPeerSyncForegroundStart(
   requested: PeerSyncForegroundIdentity,
 ): PeerSyncForegroundIdentity? = requested.takeUnless { canStartPeerSyncForeground(attached, it) }
 
+internal fun shouldStopPeerSyncForegroundWithoutIdentity(
+  attached: PeerSyncForegroundIdentity?,
+): Boolean = attached == null
+
 internal object PeerSyncForegroundNativeBridge {
   init {
     System.loadLibrary("risuai_lib")
@@ -91,7 +95,7 @@ class PeerSyncForegroundService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val identity = intent?.peerSyncForegroundIdentity() ?: run {
-      stopSelfResult(startId)
+      if (shouldStopPeerSyncForegroundWithoutIdentity(attached)) stopSelfResult(startId)
       return PEER_SYNC_FOREGROUND_START_MODE
     }
     if (intent.action == PEER_SYNC_FOREGROUND_STOP_ACTION) {

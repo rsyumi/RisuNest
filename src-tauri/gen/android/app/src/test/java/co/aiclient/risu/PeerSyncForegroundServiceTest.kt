@@ -111,4 +111,24 @@ class PeerSyncForegroundServiceTest {
     assertTrue(canStartPeerSyncForeground(current, current))
     assertFalse(canStartPeerSyncForeground(current, current.copy(generation = 13L)))
   }
+
+  @Test
+  fun `a rejected lane START keeps the attached lane instead of stopping the service`() {
+    val target = PeerSyncForegroundIdentity("p4-target", operationId, 7L)
+    var attached = peerSyncForegroundIdentity(target.lane, target.operationId, target.generation)
+    var stops = 0
+
+    assertEquals(target, attached)
+
+    val rejected = peerSyncForegroundIdentity("p4-source", operationId, 8L)
+    assertNull(rejected)
+    if (shouldStopPeerSyncForegroundWithoutIdentity(attached)) {
+      stops += 1
+      attached = null
+    }
+
+    assertEquals(target, attached)
+    assertEquals(0, stops)
+    assertTrue(shouldStopPeerSyncForegroundWithoutIdentity(null))
+  }
 }
