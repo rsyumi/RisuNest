@@ -42,8 +42,7 @@ use crate::{
         PersistentStore, StoreError, SyncGenerationIdentity, PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
-// The delta pull without completion accounting is test-only, and the registered
-// desktop pull is the one product caller that never cancels.
+// The registered desktop pull is the one product caller that never cancels.
 #[cfg(any(desktop, test))]
 use crate::local_backup::NeverCancelled;
 use serde::Serialize;
@@ -506,8 +505,9 @@ impl Read for MeasuredLogicalDeltaReader {
     }
 }
 
-// Test-facing wrapper around the cancellation-aware pull entry point.
-#[cfg(test)]
+/// Every logical delta pull is a registered pull: it carries the completion
+/// attempt whose activation intent the completion journal retains until the
+/// recovery pass settles it.
 #[allow(clippy::too_many_arguments)]
 fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
@@ -517,57 +517,8 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
     expected_revision: i64,
     remote_manifest_bytes: &[u8],
     remote_source: &mut S,
-) -> Result<PeerDeltaPullResult, PeerSyncError> {
-    pull_logical_delta_with_cancellation(
-        store,
-        cas,
-        app_root,
-        source_device_id,
-        expected_revision,
-        remote_manifest_bytes,
-        remote_source,
-        &NeverCancelled,
-    )
-}
-
-// The engine tests drive a pull without completion accounting; every product
-// caller reaches the pull through `pull_logical_delta_with_completion`.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn pull_logical_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
-    store: &mut PersistentStore,
-    cas: &PayloadCas,
-    app_root: &Path,
-    source_device_id: &str,
-    expected_revision: i64,
-    remote_manifest_bytes: &[u8],
-    remote_source: &mut S,
     cancellation: &dyn CancellationProbe,
-) -> Result<PeerDeltaPullResult, PeerSyncError> {
-    pull_logical_delta_with_completion(
-        store,
-        cas,
-        app_root,
-        source_device_id,
-        expected_revision,
-        remote_manifest_bytes,
-        remote_source,
-        cancellation,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
-    store: &mut PersistentStore,
-    cas: &PayloadCas,
-    app_root: &Path,
-    source_device_id: &str,
-    expected_revision: i64,
-    remote_manifest_bytes: &[u8],
-    remote_source: &mut S,
-    cancellation: &dyn CancellationProbe,
-    completion: Option<&DeltaCompletionAttempt>,
+    completion: &DeltaCompletionAttempt,
 ) -> Result<PeerDeltaPullResult, PeerSyncError> {
     if cancellation.is_cancelled() {
         return Err(PeerSyncError::Cancelled);
@@ -595,23 +546,19 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
     }
     let manifest_id = hash_logical_manifest(&remote_manifest)
         .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
-    let pre_common_base = if completion.is_some() {
-        store
-            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, source_device_id)
-            .map_err(store_error)?
-    } else {
-        None
-    };
+    let pre_common_base = store
+        .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, source_device_id)
+        .map_err(store_error)?;
     let post_common_base = SyncGenerationIdentity {
         generation_id: remote_manifest.generation.clone(),
         manifest_hash: manifest_id.clone(),
         generation_sequence: remote_manifest.generation_sequence.clone(),
     };
 
-    let operation_id = completion
-        .map(|attempt| attempt.operation_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let job_id = format!("{P4_DELTA_TARGET_JOB_PREFIX}{operation_id}");
+    let job_id = format!(
+        "{P4_DELTA_TARGET_JOB_PREFIX}{}",
+        completion.operation_id.as_str()
+    );
     let job = RefCell::new(DurableCasJob::begin(
         app_root,
         &job_id,
@@ -639,19 +586,17 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
             return Err(PeerSyncError::Cancelled);
         }
         let intent_written = Cell::new(false);
-        let bootstrap_context = completion.map(|attempt| {
-            delta_completion_context(
-                attempt,
-                source_device_id,
-                &manifest_id,
-                expected_revision,
-                pre_common_base.clone(),
-                expected_revision,
-                post_common_base.clone(),
-                0,
-                0,
-            )
-        });
+        let bootstrap_context = delta_completion_context(
+            completion,
+            source_device_id,
+            &manifest_id,
+            expected_revision,
+            pre_common_base.clone(),
+            expected_revision,
+            post_common_base.clone(),
+            0,
+            0,
+        );
         let bootstrap = establish_logical_common_base_with_commit_intent(
             store,
             cas,
@@ -664,15 +609,12 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
                 if cancellation.is_cancelled() {
                     return Err(PeerSyncError::Cancelled);
                 }
-                if let (Some(context), Some(attempt)) = (bootstrap_context.as_ref(), completion) {
-                    publish_delta_activation_intent(
-                        app_root,
-                        context,
-                        &attempt.source_bearer,
-                        &intent_written,
-                    )?;
-                }
-                Ok(())
+                publish_delta_activation_intent(
+                    app_root,
+                    &bootstrap_context,
+                    &completion.source_bearer,
+                    &intent_written,
+                )
             },
         );
         return finish_bootstrap(&job, expected_revision, bootstrap, intent_written.get());
@@ -714,27 +656,24 @@ fn pull_logical_delta_with_completion<S: LogicalDeltaObjectSource + ?Sized>(
         &mut target,
         |_| Ok(()),
         |selection| {
-            if let Some(attempt) = completion {
-                let (transferred_objects, transferred_bytes) = selection_totals(selection)?;
-                let context = delta_completion_context(
-                    attempt,
-                    source_device_id,
-                    &manifest_id,
-                    expected_revision,
-                    pre_common_base.clone(),
-                    post_revision,
-                    post_common_base.clone(),
-                    transferred_objects,
-                    transferred_bytes,
-                );
-                publish_delta_activation_intent(
-                    app_root,
-                    &context,
-                    &attempt.source_bearer,
-                    &intent_written,
-                )?;
-            }
-            Ok(())
+            let (transferred_objects, transferred_bytes) = selection_totals(selection)?;
+            let context = delta_completion_context(
+                completion,
+                source_device_id,
+                &manifest_id,
+                expected_revision,
+                pre_common_base.clone(),
+                post_revision,
+                post_common_base.clone(),
+                transferred_objects,
+                transferred_bytes,
+            );
+            publish_delta_activation_intent(
+                app_root,
+                &context,
+                &completion.source_bearer,
+                &intent_written,
+            )
         },
         cancellation,
     );
@@ -1229,7 +1168,7 @@ async fn peer_delta_pull_with_client_factory<
         let source_device_id = client.source_device_id().to_owned();
         let cas = PayloadCas::new(&app_root)
             .map_err(|error| registered_local_operation_failure("peer delta CAS", error))?;
-        let pulled = pull_logical_delta_with_completion(
+        let pulled = pull_logical_delta(
             &mut store,
             &cas,
             &app_root,
@@ -1238,7 +1177,7 @@ async fn peer_delta_pull_with_client_factory<
             &manifest,
             &mut client,
             &cancellation,
-            Some(&completion),
+            &completion,
         );
         let recovered = recover_delta_completion(&mut store, &app_root, &mut completion_transport)
             .map_err(|error| peer_operation_failure("peer delta completion", error))?;
@@ -1311,7 +1250,9 @@ mod tests {
                 DeltaCompletionContext, DeltaCompletionTransport, PeerDeltaCompletionJournal,
                 PeerDeltaDurableCompletion,
             },
-            device_registry::{DevicePermissions, IncomingSource, IncomingSourceRegistry},
+            device_registry::{
+                incoming_source_by_id, DevicePermissions, IncomingSource, IncomingSourceRegistry,
+            },
             logical_delta::{
                 build_logical_manifest, BuiltLogicalManifest, LogicalManifest,
                 LogicalManifestBuilderInput, LogicalRecordEnvelope, LogicalRecordLocator,
@@ -1434,6 +1375,103 @@ mod tests {
 
     fn accounting_source(root: &Path) -> IncomingSource {
         IncomingSourceRegistry::load(root).unwrap().sources()[0].clone()
+    }
+
+    /// The completion attempt a pull carries, against the registered incoming
+    /// source the activation intent revalidates. An engine test that never
+    /// claims a v2 source registers one here instead, exactly as the claim
+    /// would have left it.
+    fn registered_delta_attempt(root: &Path, source_device_id: &str) -> DeltaCompletionAttempt {
+        let registered = match incoming_source_by_id(root, source_device_id).unwrap() {
+            Some(source) => source,
+            None => {
+                let mut registry = IncomingSourceRegistry::load(root).unwrap();
+                registry
+                    .upsert(IncomingSource {
+                        device_id: source_device_id.to_owned(),
+                        name: "delta source".to_owned(),
+                        endpoint: "http://192.168.0.24:32145".to_owned(),
+                        bearer: "b".repeat(64),
+                        permissions: DevicePermissions::read(),
+                        last_seen_ms: 0,
+                        total_bytes: 0,
+                    })
+                    .unwrap();
+                registry.save().unwrap();
+                incoming_source_by_id(root, source_device_id)
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        DeltaCompletionAttempt {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            mode: DeltaCompletionMode::UnsupportedV2,
+            source_bearer: registered.bearer,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pull_registered_delta<S: LogicalDeltaObjectSource + ?Sized>(
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        app_root: &Path,
+        source_device_id: &str,
+        expected_revision: i64,
+        remote_manifest_bytes: &[u8],
+        remote_source: &mut S,
+    ) -> Result<PeerDeltaPullResult, PeerSyncError> {
+        pull_registered_delta_with_cancellation(
+            store,
+            cas,
+            app_root,
+            source_device_id,
+            expected_revision,
+            remote_manifest_bytes,
+            remote_source,
+            &NeverCancelled,
+        )
+    }
+
+    /// Drives the engine the way the registered command does: a pull under a
+    /// completion attempt, then the recovery pass that settles the journal
+    /// entry it left behind. A pull that reports success without one is the
+    /// failure the command itself reports.
+    #[allow(clippy::too_many_arguments)]
+    fn pull_registered_delta_with_cancellation<S: LogicalDeltaObjectSource + ?Sized>(
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        app_root: &Path,
+        source_device_id: &str,
+        expected_revision: i64,
+        remote_manifest_bytes: &[u8],
+        remote_source: &mut S,
+        cancellation: &dyn CancellationProbe,
+    ) -> Result<PeerDeltaPullResult, PeerSyncError> {
+        let attempt = registered_delta_attempt(app_root, source_device_id);
+        let pulled = pull_logical_delta(
+            store,
+            cas,
+            app_root,
+            source_device_id,
+            expected_revision,
+            remote_manifest_bytes,
+            remote_source,
+            cancellation,
+            &attempt,
+        );
+        let completed = recover_delta_completion(store, app_root, &mut NoCompletionTransport)
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            completed,
+            pulled.as_ref().is_ok_and(is_successful_delta_result),
+            "a successful pull settles exactly one completion journal entry"
+        );
+        assert!(PeerDeltaCompletionJournal::new(app_root)
+            .load()
+            .unwrap()
+            .is_none());
+        pulled
     }
 
     impl Read for CancelAfterFirstReadCursor {
@@ -2105,7 +2143,7 @@ mod tests {
         let mut source = empty_source();
 
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2125,7 +2163,7 @@ mod tests {
         assert_eq!(store.revision().unwrap(), 0);
 
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2145,7 +2183,7 @@ mod tests {
         assert_eq!(store.revision().unwrap(), 0);
 
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2164,7 +2202,7 @@ mod tests {
 
         let other = remote_root_manifest(&local.manifest, "remote-other", json!({"side":"remote"}));
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2182,7 +2220,7 @@ mod tests {
         assert_eq!(source.reads, 0);
 
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2217,7 +2255,7 @@ mod tests {
         };
 
         assert_eq!(
-            pull_logical_delta_with_completion(
+            pull_logical_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2226,7 +2264,7 @@ mod tests {
                 &local.manifest_bytes,
                 &mut source,
                 &NeverCancelled,
-                Some(&conflict),
+                &conflict,
             )
             .unwrap(),
             PeerDeltaPullResult::Conflict {
@@ -2242,7 +2280,7 @@ mod tests {
             source_bearer: "a".repeat(64),
         };
         assert_eq!(
-            pull_logical_delta_with_completion(
+            pull_logical_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2251,7 +2289,7 @@ mod tests {
                 &divergent.manifest_bytes,
                 &mut source,
                 &NeverCancelled,
-                Some(&full_clone),
+                &full_clone,
             )
             .unwrap(),
             PeerDeltaPullResult::FullCloneRequired {
@@ -2283,7 +2321,7 @@ mod tests {
             .unwrap();
         let peer = "00000000-0000-4000-8000-000000000003";
         let mut source = empty_source();
-        pull_logical_delta(
+        pull_registered_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2302,7 +2340,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2335,7 +2373,7 @@ mod tests {
         let local = store
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
-        pull_logical_delta(
+        pull_registered_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2364,7 +2402,7 @@ mod tests {
             source_bearer: "a".repeat(64),
         };
 
-        let result = pull_logical_delta_with_completion(
+        let result = pull_logical_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2373,7 +2411,7 @@ mod tests {
             &remote.manifest_bytes,
             &mut source,
             &NeverCancelled,
-            Some(&attempt),
+            &attempt,
         )
         .unwrap();
 
@@ -2420,7 +2458,7 @@ mod tests {
         let local = store
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
-        pull_logical_delta(
+        pull_registered_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2450,7 +2488,7 @@ mod tests {
         };
         fail_next_delta_completion_store_after_replace(directory.path());
 
-        let error = pull_logical_delta_with_completion(
+        let error = pull_logical_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2459,7 +2497,7 @@ mod tests {
             &remote.manifest_bytes,
             &mut source,
             &NeverCancelled,
-            Some(&attempt),
+            &attempt,
         )
         .unwrap_err();
 
@@ -2519,7 +2557,7 @@ mod tests {
 
         let mut target_store = PersistentStore::open(target_root.path()).unwrap();
         let target_cas = PayloadCas::new(target_root.path()).unwrap();
-        let staged = pull_logical_delta_with_completion(
+        let staged = pull_logical_delta(
             &mut target_store,
             &target_cas,
             target_root.path(),
@@ -2528,7 +2566,7 @@ mod tests {
             &remote_manifest,
             &mut client,
             &NeverCancelled,
-            Some(&attempt),
+            &attempt,
         )
         .unwrap();
         assert_eq!(
@@ -2657,7 +2695,7 @@ mod tests {
         };
 
         assert_eq!(
-            pull_logical_delta_with_completion(
+            pull_logical_delta(
                 &mut target_store,
                 &target_cas,
                 target_root.path(),
@@ -2666,7 +2704,7 @@ mod tests {
                 &remote_manifest,
                 &mut cancelling_source,
                 &cancellation,
-                Some(&first_attempt),
+                &first_attempt,
             )
             .unwrap_err(),
             PeerSyncError::Cancelled
@@ -2680,7 +2718,7 @@ mod tests {
         let (retry_manifest, retry_attempt) = fetch_delta_manifest_and_completion(&client).unwrap();
         assert_eq!(retry_attempt.operation_id, first_attempt.operation_id);
         assert!(matches!(
-            pull_logical_delta_with_completion(
+            pull_logical_delta(
                 &mut target_store,
                 &target_cas,
                 target_root.path(),
@@ -2689,7 +2727,7 @@ mod tests {
                 &retry_manifest,
                 &mut client,
                 &NeverCancelled,
-                Some(&retry_attempt),
+                &retry_attempt,
             )
             .unwrap(),
             PeerDeltaPullResult::Updated { .. }
@@ -2745,7 +2783,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let peer = "00000000-0000-4000-8000-000000000023";
-        pull_logical_delta(
+        pull_registered_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2777,7 +2815,7 @@ mod tests {
             reads: 0,
         };
 
-        let error = pull_logical_delta_with_cancellation(
+        let error = pull_registered_delta_with_cancellation(
             &mut store,
             &cas,
             directory.path(),
@@ -2802,7 +2840,7 @@ mod tests {
 
         let mut retry = FixtureSource { objects, reads: 0 };
         assert!(matches!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2819,7 +2857,7 @@ mod tests {
         assert!(unowned.join("keep").is_file());
 
         assert!(matches!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2842,7 +2880,7 @@ mod tests {
             .seal_or_initialize_active_logical_generation(&cas)
             .unwrap();
         let peer = "00000000-0000-4000-8000-000000000013";
-        pull_logical_delta(
+        pull_registered_delta(
             &mut setup,
             &cas,
             directory.path(),
@@ -2880,7 +2918,7 @@ mod tests {
         let pull = thread::spawn(move || {
             let mut source = source;
             let cas = PayloadCas::new(&root).unwrap();
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut pull_store,
                 &cas,
                 &root,
@@ -2924,7 +2962,7 @@ mod tests {
             .unwrap();
         let peer = "00000000-0000-4000-8000-000000000004";
         let mut source = empty_source();
-        pull_logical_delta(
+        pull_registered_delta(
             &mut store,
             &cas,
             directory.path(),
@@ -2953,7 +2991,7 @@ mod tests {
             remote_root_manifest(&base.manifest, "remote-conflict", json!({"side":"remote"}));
 
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
@@ -2974,7 +3012,7 @@ mod tests {
             json!({"side":"local"})
         );
         assert_eq!(
-            pull_logical_delta(
+            pull_registered_delta(
                 &mut store,
                 &cas,
                 directory.path(),
