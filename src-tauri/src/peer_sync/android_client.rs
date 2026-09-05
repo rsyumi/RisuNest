@@ -362,51 +362,31 @@ impl AndroidResumableCloneJob {
         let session_id = session_id.to_owned();
         let source_device_id = lan.registered_source_device_id().to_owned();
         let status_path = root.join("status.json");
-        let persisted_status = if status_path.exists() {
-            Some(read_bounded_json::<AndroidClonePersistedStatus>(
-                &status_path,
-                MAX_JOB_RECORD_BYTES,
-            )?)
-        } else {
-            None
-        };
-        let resume_lease_id = persisted_status
-            .as_ref()
-            .map(|status| status.completion_lease_id.as_str());
+        // The status file is written atomically before the job is published,
+        // so a published job without one is local corruption and is refused
+        // the way a corrupt status file is. Nothing here asks the source.
+        if !status_path.is_file() {
+            return Err(PeerSyncError::Storage(
+                "Android clone job status is missing".to_owned(),
+            ));
+        }
+        let persisted_status: AndroidClonePersistedStatus =
+            read_bounded_json(&status_path, MAX_JOB_RECORD_BYTES)?;
+        validate_android_completion_state(&descriptor, &persisted_status)?;
         let client = LoopbackCloneClient::from_lan_with_completion(
             &root,
             lan,
             &descriptor.manifest_id,
-            resume_lease_id,
+            Some(persisted_status.completion_lease_id.as_str()),
         )?;
-        let mut job = Self {
+        Ok(Self {
             root,
             descriptor,
             endpoint,
             session_id,
             source_device_id,
             client,
-        };
-        if persisted_status.is_none() {
-            let completion_lease_id = require_completion_lease(&mut job.client)?;
-            let mut status = AndroidClonePersistedStatus::ready(completion_lease_id);
-            if job.root.join("verified.json").is_file() {
-                let (completed_bytes, total_bytes) = job.client.transfer_progress()?;
-                if completed_bytes != total_bytes {
-                    return Err(PeerSyncError::Storage(
-                        "Android verified clone transfer ledger is incomplete".to_owned(),
-                    ));
-                }
-                status.phase = AndroidCloneJobPhase::VerifiedAwaitingActivation;
-                status.completed_bytes = completed_bytes;
-                status.total_bytes = Some(total_bytes);
-            }
-            write_new_json(&job.root.join("status.json"), &status)?;
-        } else {
-            let status = job.read_status()?;
-            validate_android_completion_state(&job.descriptor, &status)?;
-        }
-        Ok(job)
+        })
     }
 
     pub fn phase(&self) -> Result<AndroidCloneJobPhase, PeerSyncError> {

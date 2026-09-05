@@ -3168,6 +3168,60 @@ fn android_registered_clone_accounting_failure_survives_restart_without_ack_or_r
 }
 
 #[test]
+fn android_clone_registry_refuses_a_published_job_without_its_status_file() {
+    let source_root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let source_cas = crate::asset_repository::PayloadCas::new(source_root.path()).unwrap();
+    let mut source_store =
+        crate::persistent_store::PersistentStore::open(source_root.path()).unwrap();
+    let mut target_store =
+        crate::persistent_store::PersistentStore::open(target_root.path()).unwrap();
+    seed_android_product_store(&mut source_store, "Source");
+    seed_android_product_store(&mut target_store, "Target");
+    let prepared = prepare_lossless_clone_session(
+        &mut source_store,
+        &source_cas,
+        1,
+        &source_root.path().join("preparation"),
+        &source_root.path().join("session"),
+        &crate::local_backup::NeverCancelled,
+    )
+    .unwrap();
+    let mut host = LanCloneHost::prepare(prepared);
+    let registered =
+        register_android_clone_source(&mut host, source_root.path(), target_root.path());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    let claimed = registry
+        .connect_registered(
+            &registered.endpoint,
+            &registered.session_id,
+            &registered.manifest_id,
+            &registered.target_device_id,
+            &registered.source_device_id,
+            &registered.bearer,
+        )
+        .unwrap();
+    let status_path = target_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id)
+        .join("status.json");
+    drop(registry);
+
+    // The status file is written atomically before the job is published, so a
+    // published job without one is local corruption. It is refused like a
+    // corrupt status file, without asking the source for anything.
+    fs::remove_file(&status_path).unwrap();
+    host.stop().unwrap();
+
+    assert!(matches!(
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()),
+        Err(PeerSyncError::Storage(message)) if message == "Android clone job status is missing"
+    ));
+}
+
+#[test]
 fn android_clone_registry_reconciles_a_verified_job_status_after_restart() {
     let source_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
@@ -3209,23 +3263,6 @@ fn android_clone_registry_reconciles_a_verified_job_status_after_restart() {
         .join(&claimed.job_id)
         .join("status.json");
     let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
-    // A job that lost its status file before transferring anything asks the
-    // running source for a completion lease again, and the same manifest and
-    // byte count hand the already issued lease back rather than a second one.
-    fs::remove_file(&status_path).unwrap();
-    drop(registry);
-
-    let registry =
-        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
-    assert_eq!(
-        registry.current().unwrap().unwrap().phase,
-        AndroidCloneJobPhase::Ready
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&fs::read(&status_path).unwrap()).unwrap()
-            ["completionLeaseId"],
-        persisted["completionLeaseId"]
-    );
     registry
         .download(&claimed.job_id, &TransferCancellation::new())
         .unwrap();
