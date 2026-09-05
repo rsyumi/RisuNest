@@ -5299,10 +5299,31 @@ mod timeout_tests {
         control: Arc<BidirectionalControlFixture>,
         source_root: &Path,
     ) -> (LanCloneHost, String, LanPairing) {
+        registered_bidirectional_peer_with_slot(
+            session_id,
+            control,
+            source_root,
+            Arc::new(SharedRemoteCommitSlot::default()),
+        )
+    }
+
+    /// The same registered peer, sharing the commit slot the source state would
+    /// publish so a test can read back what an apply recorded.
+    fn registered_bidirectional_peer_with_slot(
+        session_id: &str,
+        control: Arc<BidirectionalControlFixture>,
+        source_root: &Path,
+        remote_commit: Arc<SharedRemoteCommitSlot>,
+    ) -> (LanCloneHost, String, LanPairing) {
         let source_device_id =
             super::super::device_registry::load_or_create_device_id(source_root).unwrap();
         let mut host = LanCloneHost::prepare_bidirectional_logical(
-            prepared_bidirectional_logical_session(session_id, &source_device_id, control),
+            prepared_bidirectional_logical_session_with_slot(
+                session_id,
+                &source_device_id,
+                control,
+                remote_commit,
+            ),
         );
         host.enable_v2_registry(
             source_root,
@@ -5370,38 +5391,46 @@ mod timeout_tests {
     }
 
     /// Drives one remote apply against a running shared bidirectional host and
-    /// reports whether the peer accepted it, so the record assertions can look
-    /// only at the slot the source state would publish.
+    /// reports the operation it was accounted against together with whether the
+    /// peer accepted it, so the record assertions can look only at the slot the
+    /// source state would publish. Every apply is gated on a lease this source
+    /// issued; `unleased_operation_id` sends an operation the source never
+    /// leased instead, which is the shape the gate has to refuse.
     fn remote_apply_against_slot(
         session_id: &str,
-        operation_id: &str,
         expected_source_revision: i64,
         control: Arc<BidirectionalControlFixture>,
         slot: &Arc<SharedRemoteCommitSlot>,
-    ) -> bool {
-        let source_device_id = "00000000-0000-4000-8000-0000000000b1";
-        let target_device_id = "00000000-0000-4000-8000-0000000000b2";
-        let mut host = LanCloneHost::prepare_bidirectional_logical(
-            prepared_bidirectional_logical_session_with_slot(
-                session_id,
-                source_device_id,
-                control,
-                Arc::clone(slot),
-            ),
+        unleased_operation_id: Option<&str>,
+    ) -> (String, bool) {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let (mut host, endpoint, pairing) = registered_bidirectional_peer_with_slot(
+            session_id,
+            control,
+            source_root.path(),
+            Arc::clone(slot),
         );
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
-        let client = LanBidirectionalLogicalClient::claim(
+        let client = LanBidirectionalLogicalClient::claim_v2_and_register(
+            target_root.path(),
+            "Android",
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
-            target_device_id,
         )
         .unwrap();
+        let lease = client
+            .fetch_manifest_with_completion_lease(None)
+            .unwrap()
+            .completion_lease_id
+            .unwrap();
+        let operation_id = unleased_operation_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| lease.as_str().to_owned());
         let accepted = client
             .request_remote_apply(LanBidirectionalRemoteApplyRequest {
-                operation_id: operation_id.to_owned(),
+                operation_id: operation_id.clone(),
                 source_endpoint: endpoint,
                 source_session_id: pairing.session_id,
                 source_manifest_id: pairing.manifest_id.clone(),
@@ -5414,11 +5443,10 @@ mod timeout_tests {
                 },
                 expected_common_base_manifest_hash: pairing.manifest_id,
                 backup_losing_side: false,
-                completion_deferred_v1: None,
             })
             .is_ok();
         host.stop().unwrap();
-        accepted
+        (operation_id, accepted)
     }
 
     #[test]
@@ -5429,18 +5457,19 @@ mod timeout_tests {
         let slot = Arc::new(SharedRemoteCommitSlot::default());
         let control = Arc::new(BidirectionalControlFixture::default());
 
-        assert!(remote_apply_against_slot(
+        let (operation_id, accepted) = remote_apply_against_slot(
             "00000000-0000-4000-8000-0000000000b3",
-            "00000000-0000-4000-8000-0000000000b4",
             7,
             control,
             &slot,
-        ));
+            None,
+        );
 
+        assert!(accepted);
         assert_eq!(
             slot.latest(),
             Some(SharedRemoteCommit {
-                operation_id: "00000000-0000-4000-8000-0000000000b4".to_owned(),
+                operation_id,
                 committed_revision: 7,
             })
         );
@@ -5462,16 +5491,34 @@ mod timeout_tests {
             let control = Arc::new(BidirectionalControlFixture::default());
             *control.remote_apply_error.lock().unwrap() = Some(error);
 
-            assert!(!remote_apply_against_slot(
+            let (_operation_id, accepted) = remote_apply_against_slot(
                 "00000000-0000-4000-8000-0000000000b5",
-                "00000000-0000-4000-8000-0000000000b6",
                 7,
                 control,
                 &slot,
-            ));
+                None,
+            );
 
+            assert!(!accepted);
             assert_eq!(slot.latest(), None);
         }
+
+        // An operation the source never leased is refused before the control
+        // ever applies it, so it reaches neither the store nor the slot.
+        let slot = Arc::new(SharedRemoteCommitSlot::default());
+        let control = Arc::new(BidirectionalControlFixture::default());
+
+        let (_operation_id, accepted) = remote_apply_against_slot(
+            "00000000-0000-4000-8000-0000000000b6",
+            7,
+            Arc::clone(&control),
+            &slot,
+            Some("00000000-0000-4000-8000-0000000000bc"),
+        );
+
+        assert!(!accepted);
+        assert_eq!(*control.remote_apply_calls.lock().unwrap(), 0);
+        assert_eq!(slot.latest(), None);
     }
 
     #[test]
@@ -5481,25 +5528,28 @@ mod timeout_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let slot = Arc::new(SharedRemoteCommitSlot::default());
 
-        assert!(remote_apply_against_slot(
+        let (first_operation, accepted) = remote_apply_against_slot(
             "00000000-0000-4000-8000-0000000000b7",
-            "00000000-0000-4000-8000-0000000000b8",
             7,
             Arc::new(BidirectionalControlFixture::default()),
             &slot,
-        ));
-        assert!(remote_apply_against_slot(
+            None,
+        );
+        assert!(accepted);
+        let (second_operation, accepted) = remote_apply_against_slot(
             "00000000-0000-4000-8000-0000000000b9",
-            "00000000-0000-4000-8000-0000000000ba",
             9,
             Arc::new(BidirectionalControlFixture::default()),
             &slot,
-        ));
+            None,
+        );
+        assert!(accepted);
 
+        assert_ne!(first_operation, second_operation);
         assert_eq!(
             slot.latest(),
             Some(SharedRemoteCommit {
-                operation_id: "00000000-0000-4000-8000-0000000000ba".to_owned(),
+                operation_id: second_operation,
                 committed_revision: 9,
             })
         );
@@ -5515,26 +5565,14 @@ mod timeout_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let source_root = tempfile::tempdir().unwrap();
         let target_root = tempfile::tempdir().unwrap();
-        let source_device_id =
-            super::super::device_registry::load_or_create_device_id(source_root.path()).unwrap();
         let slot = Arc::new(SharedRemoteCommitSlot::default());
         let control = Arc::new(BidirectionalControlFixture::default());
-        let mut host = LanCloneHost::prepare_bidirectional_logical(
-            prepared_bidirectional_logical_session_with_slot(
-                "00000000-0000-4000-8000-0000000000bb",
-                &source_device_id,
-                Arc::clone(&control),
-                Arc::clone(&slot),
-            ),
-        );
-        host.enable_v2_registry(
+        let (mut host, endpoint, pairing) = registered_bidirectional_peer_with_slot(
+            "00000000-0000-4000-8000-0000000000bb",
+            Arc::clone(&control),
             source_root.path(),
-            "Windows",
-            DevicePermissions::read_and_bidirectional(),
-        )
-        .unwrap();
-        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
-        let endpoint = format!("http://{}", host.address().unwrap());
+            Arc::clone(&slot),
+        );
         let client = LanBidirectionalLogicalClient::claim_v2_and_register(
             target_root.path(),
             "Android",
@@ -5571,7 +5609,6 @@ mod timeout_tests {
                 },
                 expected_common_base_manifest_hash: pairing.manifest_id,
                 backup_losing_side: false,
-                completion_deferred_v1: Some(true),
             })
             .is_err());
 

@@ -8793,6 +8793,7 @@ fn retained_bidirectional_completion_completes_against_a_restarted_registered_so
         source_session,
         &source_device_id,
         source_active.manifest_bytes.clone(),
+        Arc::new(SharedRemoteCommitSlot::default()),
     )
     .unwrap();
     let mut source_host = LanCloneHost::prepare_bidirectional_logical(prepared);
@@ -8914,6 +8915,7 @@ fn retained_bidirectional_completion_completes_against_a_restarted_registered_so
             restarted_session,
             &source_device_id,
             source_active.manifest_bytes.clone(),
+            Arc::new(SharedRemoteCommitSlot::default()),
         )
         .unwrap();
     assert_ne!(restarted_session_id, session_id);
