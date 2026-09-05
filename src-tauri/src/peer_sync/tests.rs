@@ -3203,19 +3203,38 @@ fn android_clone_registry_reconciles_a_verified_job_status_after_restart() {
             &registered.bearer,
         )
         .unwrap();
-    registry
-        .download(&claimed.job_id, &TransferCancellation::new())
-        .unwrap();
-    let verified = registry.current().unwrap().unwrap();
     let status_path = target_root
         .path()
         .join("peer-clone-jobs")
         .join(&claimed.job_id)
         .join("status.json");
+    let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    // A job that lost its status file before transferring anything asks the
+    // running source for a completion lease again, and the same manifest and
+    // byte count hand the already issued lease back rather than a second one.
+    fs::remove_file(&status_path).unwrap();
+    drop(registry);
+
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();
+    assert_eq!(
+        registry.current().unwrap().unwrap().phase,
+        AndroidCloneJobPhase::Ready
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&status_path).unwrap()).unwrap()
+            ["completionLeaseId"],
+        persisted["completionLeaseId"]
+    );
+    registry
+        .download(&claimed.job_id, &TransferCancellation::new())
+        .unwrap();
+    let verified = registry.current().unwrap().unwrap();
+    drop(registry);
+
     // The status file also carries the lease the source issued, so a job whose
     // progress was lost keeps that lease and has its verified phase reconciled
     // from the verified marker instead of asking for a second lease.
-    let persisted: Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
     fs::write(
         &status_path,
         serde_json::to_vec(&json!({
@@ -3230,7 +3249,6 @@ fn android_clone_registry_reconciles_a_verified_job_status_after_restart() {
         .unwrap(),
     )
     .unwrap();
-    drop(registry);
 
     let restarted =
         super::android_client::AndroidCloneJobRegistry::initialize(target_root.path()).unwrap();

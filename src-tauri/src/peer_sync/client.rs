@@ -85,7 +85,7 @@ pub(crate) fn prepare_and_deliver_registered_clone_completion(
     let hello = lan.hello()?;
     if hello.device_id != delivery.source_device_id || !hello.permissions.allows_read() {
         return Err(PeerSyncError::Protocol(
-            "registered clone completion capability changed".to_owned(),
+            "registered clone completion identity or permission changed".to_owned(),
         ));
     }
     lan.deliver_completion(&delivery.completion_lease_id, delivery.useful_bytes)?;

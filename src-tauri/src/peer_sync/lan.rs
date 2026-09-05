@@ -4426,33 +4426,6 @@ mod timeout_tests {
         }
     }
 
-    fn direct_bidirectional_client(
-        endpoint: &str,
-        session_id: &str,
-        manifest_id: &str,
-        claim: &str,
-        device_id: &str,
-    ) -> Result<LanBidirectionalLogicalClient, PeerSyncError> {
-        let inner = LanLogicalDeltaClient::claim_with_timeouts_and_device(
-            endpoint,
-            session_id,
-            manifest_id,
-            claim,
-            device_id,
-            "logical-bidirectional",
-            LogicalClientTimeouts {
-                control_request: TEST_P5_CONTROL_TIMEOUT,
-                object_idle: TEST_P5_OBJECT_IDLE_TIMEOUT,
-            },
-        )?;
-        Ok(LanBidirectionalLogicalClient {
-            remote_apply_client: build_bidirectional_remote_apply_client()?,
-            endpoint: validate_private_lan_endpoint(endpoint)?,
-            session_id: session_id.to_owned(),
-            inner,
-        })
-    }
-
     /// Answers one claim request with a fixed body, so a client can be pointed at a
     /// response shape the source itself would never produce.
     fn canned_claim_response_server(

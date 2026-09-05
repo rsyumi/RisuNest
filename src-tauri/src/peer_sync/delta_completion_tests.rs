@@ -747,7 +747,7 @@ fn committed_recovery_with_a_released_job_completes_exact_accounting() {
 fn committed_recovery_overflow_reuses_pending_bytes_and_retains_recovery_state() {
     let root = tempfile::tempdir().unwrap();
     register_source(root.path(), u64::MAX);
-    let (mut store, _cas, mut operation) = committed_context(root.path());
+    let (mut store, _cas, operation) = committed_context(root.path());
     PeerDeltaCompletionJournal::new(root.path())
         .store_activation_intent(&operation)
         .unwrap();

@@ -407,7 +407,7 @@ impl PeerCloneCommandState {
                         completion_lease_id.as_deref(),
                     )?;
                 } else {
-                    persist_target_completion_lease(
+                    require_matching_target_completion_lease(
                         &paths.job_root,
                         &request,
                         &operation_id,
@@ -620,7 +620,7 @@ impl PeerCloneCommandState {
                         completion_lease_id.as_deref(),
                     )?;
                 } else {
-                    persist_target_completion_lease(
+                    require_matching_target_completion_lease(
                         &paths.job_root,
                         &request,
                         &operation_id,
@@ -1399,7 +1399,7 @@ fn publish_new_target_completion_marker(
     write_target_operation_marker(&marker_path, &marker, request)
 }
 
-fn persist_target_completion_lease(
+fn require_matching_target_completion_lease(
     job_root: &Path,
     request: &PeerCloneTargetRequest,
     operation_id: &str,

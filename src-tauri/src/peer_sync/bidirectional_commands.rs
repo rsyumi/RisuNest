@@ -3595,7 +3595,7 @@ fn complete_v1_bidirectional_accounting(
         let hello = super::lan::authenticated_peer_hello(&source.endpoint, &source.bearer)?;
         if hello.device_id != source.device_id || !hello.permissions.allows_bidirectional() {
             return Err(PeerSyncError::Validation(
-                "registered bidirectional source no longer advertises completion V1".to_owned(),
+                "registered bidirectional source identity or permission changed".to_owned(),
             ));
         }
         let useful_bytes = prepare_peer_logical_completion(
@@ -3661,7 +3661,7 @@ fn complete_v1_bidirectional_accounting(
         if hello.device_id != snapshot.source.device_id || !hello.permissions.allows_bidirectional()
         {
             return Err(PeerSyncError::Validation(
-                "registered bidirectional source no longer advertises completion V1".to_owned(),
+                "registered bidirectional source identity or permission changed".to_owned(),
             ));
         }
         deliver_peer_completion(
@@ -5542,7 +5542,7 @@ fn require_retained_v1_source(
         || !observed.permissions.allows_bidirectional()
     {
         return Err(PeerSyncError::Validation(
-            "registered bidirectional source no longer advertises completion V1".to_owned(),
+            "registered bidirectional source identity or permission changed".to_owned(),
         ));
     }
     Ok(())

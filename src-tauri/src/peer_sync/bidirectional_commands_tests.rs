@@ -4224,7 +4224,7 @@ fn explicit_v1_target_abandon_removes_a_source_unavailable_local_commit() {
     let directory = tempfile::tempdir().unwrap();
     let mut store = PersistentStore::open(directory.path()).unwrap();
     let operation_id = "123e4567-e89b-42d3-a456-426614174096";
-    let mut retained_context = context(operation_id);
+    let retained_context = context(operation_id);
     let retained = PeerBidirectionalDurableOperation::LocalCommitted {
         schema: OPERATION_SCHEMA.to_owned(),
         context: retained_context,
@@ -4250,7 +4250,7 @@ fn explicit_v1_target_abandon_removes_a_source_unavailable_local_commit() {
 fn v1_remote_receipt_without_a_delivery_retries_completion_instead_of_abandoning() {
     let directory = tempfile::tempdir().unwrap();
     let operation_id = "123e4567-e89b-42d3-a456-426614174096";
-    let mut retained_context = context(operation_id);
+    let retained_context = context(operation_id);
     let retained = PeerBidirectionalDurableOperation::LocalCommitted {
         schema: OPERATION_SCHEMA.to_owned(),
         context: retained_context,
@@ -8651,6 +8651,398 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
         .unwrap();
 }
 
+/// The registered incoming source a target reports its completion to when the
+/// source is a live host rather than a fixture endpoint.
+fn register_live_bidirectional_source(
+    root: &Path,
+    credential: &LanBidirectionalLogicalCredential,
+    endpoint: &str,
+) {
+    let mut registry = super::super::device_registry::IncomingSourceRegistry::load(root).unwrap();
+    registry
+        .upsert(super::super::device_registry::IncomingSource {
+            device_id: credential.source_device_id.clone(),
+            name: "bidirectional source".to_owned(),
+            endpoint: endpoint.to_owned(),
+            bearer: credential.bearer.clone(),
+            permissions: super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+            last_seen_ms: 0,
+            total_bytes: 0,
+        })
+        .unwrap();
+    registry.save().unwrap();
+}
+
+/// End to end proof that a retained local commit still finishes against a real
+/// source: the target commits under the completion lease that source issued,
+/// the source restarts before the remote apply, and the resume completes
+/// through the registered session the restarted source hosts. Every step is
+/// lease gated, so this is the coverage the completion accounting rules need.
+#[test]
+fn retained_bidirectional_completion_completes_against_a_restarted_registered_source() {
+    let bootstrap = tempfile::tempdir().unwrap();
+    let bootstrap_cas = PayloadCas::new(bootstrap.path()).unwrap();
+    let mut bootstrap_store = PersistentStore::open(bootstrap.path()).unwrap();
+    seed_lossless_backup_fixture(&mut bootstrap_store, &bootstrap_cas);
+    let base = bootstrap_store
+        .seal_or_initialize_active_logical_generation(&bootstrap_cas)
+        .unwrap();
+    drop(bootstrap_store);
+    let source_directory = tempfile::tempdir().unwrap();
+    let target_directory = tempfile::tempdir().unwrap();
+    copy_tree(bootstrap.path(), source_directory.path());
+    copy_tree(bootstrap.path(), target_directory.path());
+    let source_device_id =
+        super::super::device_registry::load_or_create_device_id(source_directory.path()).unwrap();
+    let target_device_id =
+        super::super::device_registry::load_or_create_device_id(target_directory.path()).unwrap();
+    let common = SyncGenerationIdentity {
+        generation_id: base.manifest.generation.clone(),
+        manifest_hash: base.manifest_hash.clone(),
+        generation_sequence: base.manifest.generation_sequence.clone(),
+    };
+
+    let source_cas = PayloadCas::new(source_directory.path()).unwrap();
+    let target_cas = PayloadCas::new(target_directory.path()).unwrap();
+    let mut source_store = PersistentStore::open(source_directory.path()).unwrap();
+    let mut target_store = PersistentStore::open(target_directory.path()).unwrap();
+    for (store, cas, peer_device_id) in [
+        (&mut source_store, &source_cas, target_device_id.as_str()),
+        (&mut target_store, &target_cas, source_device_id.as_str()),
+    ] {
+        let revision = store.revision().unwrap();
+        establish_logical_common_base(
+            store,
+            cas,
+            peer_device_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            revision,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        let revision = store.revision().unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_device_id,
+                    common.clone(),
+                    0,
+                )
+                .unwrap(),
+                revision,
+            )
+            .unwrap();
+    }
+
+    let revision = source_store.revision().unwrap();
+    source_store
+        .commit(&WorkingSetCommit {
+            expected_revision: revision,
+            root: None,
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![crate::persistent_store::PluginStorageMutation::Set {
+                key: "source-key".to_owned(),
+                value: json!({"side": "source"}),
+            }]),
+            asset_owner_heads: None,
+        })
+        .unwrap();
+    let source_active = source_store
+        .seal_or_initialize_active_logical_generation(&source_cas)
+        .unwrap();
+    let source_revision = source_store.revision().unwrap();
+    drop(source_store);
+    let revision = target_store.revision().unwrap();
+    target_store
+        .commit(&WorkingSetCommit {
+            expected_revision: revision,
+            root: None,
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![crate::persistent_store::PluginStorageMutation::Set {
+                key: "target-key".to_owned(),
+                value: json!({"side": "target"}),
+            }]),
+            asset_owner_heads: None,
+        })
+        .unwrap();
+
+    let source_session = LogicalDeltaSourceSession::open(
+        PersistentStore::open(source_directory.path()).unwrap(),
+        source_directory.path(),
+        PRODUCT_LOGICAL_LIBRARY_ID,
+        &source_active.manifest.generation,
+    )
+    .unwrap();
+    let (prepared, session_id, manifest_id) = prepare_product_source_session(
+        source_directory.path(),
+        PersistentStore::open(source_directory.path()).unwrap(),
+        source_session,
+        &source_device_id,
+        source_active.manifest_bytes.clone(),
+    )
+    .unwrap();
+    let mut source_host = LanCloneHost::prepare_bidirectional_logical(prepared);
+    source_host
+        .enable_v2_registry(
+            source_directory.path(),
+            "Windows source",
+            super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+    let pairing = source_host.start().unwrap();
+    assert_eq!(pairing.session_id, session_id);
+    assert_eq!(pairing.manifest_id, manifest_id);
+    let endpoint = format!("http://127.0.0.1:{}", source_host.address().unwrap().port());
+
+    let mut client = LanBidirectionalLogicalClient::claim_v2_and_register(
+        target_directory.path(),
+        "Windows target",
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    assert_eq!(client.source_device_id(), source_device_id);
+    assert_eq!(client.device_id(), target_device_id);
+    let credential = client.credential();
+    let completion = client.fetch_manifest_with_completion_lease(None).unwrap();
+    let operation_id = completion
+        .completion_lease_id
+        .clone()
+        .expect("a registered source issues a bidirectional completion lease")
+        .as_str()
+        .to_owned();
+    let remote_manifest_bytes = completion.bytes;
+    register_live_bidirectional_source(target_directory.path(), &credential, &endpoint);
+
+    let revision = target_store.revision().unwrap();
+    let attached = attach_local_device_at_existing_base(
+        &mut target_store,
+        client.source_device_id(),
+        revision,
+    )
+    .unwrap();
+    assert_eq!(attached, common);
+    let remote_revision = i64::try_from(
+        decode_logical_manifest(&remote_manifest_bytes)
+            .unwrap()
+            .source_revision,
+    )
+    .unwrap();
+    client
+        .register(LanBidirectionalRegistrationRequest {
+            library_id: PRODUCT_LOGICAL_LIBRARY_ID.to_owned(),
+            generation: LanBidirectionalGeneration {
+                generation_id: attached.generation_id.clone(),
+                manifest_hash: attached.manifest_hash.clone(),
+                generation_sequence: attached.generation_sequence.clone(),
+            },
+            expected_revision: remote_revision,
+        })
+        .unwrap();
+    let revision = target_store.revision().unwrap();
+    assert_eq!(
+        begin_bidirectional_local_merge_with_cancellation(
+            &mut target_store,
+            &target_cas,
+            target_directory.path(),
+            credential.clone(),
+            revision,
+            &remote_manifest_bytes,
+            &mut client,
+            &NeverCancelled,
+            Some(operation_id.clone()),
+        )
+        .unwrap(),
+        LocalMergeOutcome::LocalCommitted
+    );
+
+    let journal = PeerBidirectionalOperationJournal::new(target_directory.path());
+    let mut retained = journal.load().unwrap().unwrap();
+    let PeerBidirectionalDurableOperation::LocalCommitted {
+        context,
+        shared_generation,
+        remote_backup_required,
+        transferred_objects,
+        transferred_bytes,
+        ..
+    } = &mut retained
+    else {
+        panic!("expected a retained local commit");
+    };
+    assert_eq!(context.operation_id, operation_id);
+    assert_eq!(context.expected_remote_revision, remote_revision);
+    let shared_generation = shared_generation.clone();
+    let local_transferred_objects = *transferred_objects;
+    let local_transferred_bytes = *transferred_bytes;
+    // The source is the losing side of the replacement, so its apply has to
+    // publish a backup the completed result reports.
+    *remote_backup_required = true;
+    journal.store(&retained).unwrap();
+
+    // The source restarts before the target ever asks for the remote apply. Its
+    // registration and the lease it issued outlive the session, so the target
+    // reconnects with its stored bearer instead of claiming the fresh pairing.
+    source_host.stop().unwrap();
+    drop(client);
+    let restarted_session = LogicalDeltaSourceSession::open(
+        PersistentStore::open(source_directory.path()).unwrap(),
+        source_directory.path(),
+        PRODUCT_LOGICAL_LIBRARY_ID,
+        &source_active.manifest.generation,
+    )
+    .unwrap();
+    let (restarted_prepared, restarted_session_id, restarted_manifest_id) =
+        prepare_product_source_session(
+            source_directory.path(),
+            PersistentStore::open(source_directory.path()).unwrap(),
+            restarted_session,
+            &source_device_id,
+            source_active.manifest_bytes.clone(),
+        )
+        .unwrap();
+    assert_ne!(restarted_session_id, session_id);
+    assert_eq!(restarted_manifest_id, manifest_id);
+    let mut restarted_host = LanCloneHost::prepare_bidirectional_logical(restarted_prepared);
+    restarted_host
+        .enable_v2_registry(
+            source_directory.path(),
+            "Windows source",
+            super::super::device_registry::DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+    let restarted_pairing = restarted_host.start().unwrap();
+    let restarted_endpoint = format!(
+        "http://127.0.0.1:{}",
+        restarted_host.address().unwrap().port()
+    );
+    let restarted_client = LanBidirectionalLogicalClient::from_registered(
+        &restarted_endpoint,
+        &restarted_pairing.session_id,
+        &restarted_manifest_id,
+        &target_device_id,
+        &source_device_id,
+        &credential.bearer,
+    )
+    .unwrap();
+    register_live_bidirectional_source(target_directory.path(), &credential, &restarted_endpoint);
+
+    DISCOVER_LAN_IPV4_OVERRIDE.with(|address| address.set(Some(Ipv4Addr::LOCALHOST)));
+    let revision = target_store.revision().unwrap();
+    let result = run_retained_remote_completion(
+        &mut target_store,
+        target_directory.path(),
+        &operation_id,
+        revision,
+        Some(&restarted_client),
+    )
+    .unwrap();
+    let PeerBidirectionalSyncResult::Updated {
+        operation_id: completed_operation_id,
+        revision: completed_revision,
+        remote_revision: completed_remote_revision,
+        transferred_objects,
+        transferred_bytes,
+        backups,
+    } = result.clone()
+    else {
+        panic!("expected an updated retained completion, got {result:?}");
+    };
+    assert_eq!(completed_operation_id, operation_id);
+    assert_eq!(completed_revision, target_store.revision().unwrap());
+    assert_eq!(completed_remote_revision, source_revision + 1);
+    assert!(transferred_objects >= local_transferred_objects);
+    assert!(transferred_bytes >= local_transferred_bytes);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(backups[0].side, PeerBidirectionalBackupSide::Remote);
+    assert!(PathBuf::from(&backups[0].path).is_file());
+    assert_eq!(
+        target_store
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, &source_device_id)
+            .unwrap(),
+        Some(shared_generation.clone())
+    );
+    assert_eq!(
+        target_store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, &source_device_id)
+            .unwrap()
+            .shared_identity,
+        shared_generation
+    );
+    assert!(matches!(
+        journal.load().unwrap(),
+        Some(PeerBidirectionalDurableOperation::Completed {
+            remote_apply_receipt: None,
+            source_binding: None,
+            result: ref completed,
+            ..
+        }) if completed.kind == "updated"
+            && completed.operation_id == operation_id
+            && completed.revision == completed_revision
+            && completed.remote_revision == completed_remote_revision
+            && completed.backups == backups
+    ));
+    // The completion was accounted against that lease on both sides.
+    assert!(
+        super::super::device_registry::incoming_completed_operation_recorded_for_lane(
+            target_directory.path(),
+            &source_device_id,
+            super::super::device_registry::CompletionLane::Bidirectional,
+            &super::super::device_registry::completion_receipt_id(
+                "bidirectional",
+                &operation_id,
+                &credential.manifest_id,
+            ),
+        )
+        .unwrap()
+    );
+    assert!(
+        super::super::device_registry::outgoing_completion_receipt_bytes(
+            source_directory.path(),
+            &target_device_id,
+            super::super::device_registry::CompletionLane::Bidirectional,
+            &operation_id,
+            &manifest_id,
+        )
+        .unwrap()
+        .is_some()
+    );
+
+    let source_inspector = PersistentStore::open(source_directory.path()).unwrap();
+    assert_eq!(source_inspector.revision().unwrap(), source_revision + 1);
+    assert_eq!(
+        source_inspector
+            .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, &target_device_id)
+            .unwrap(),
+        Some(shared_generation)
+    );
+    assert_eq!(
+        source_inspector
+            .read_plugin_storage("target-key", None)
+            .unwrap()
+            .unwrap()
+            .value,
+        json!({"side": "target"})
+    );
+    journal.acknowledge_completed(&operation_id).unwrap();
+    restarted_host.stop().unwrap();
+}
+
 #[test]
 fn command_state_serializes_target_work() {
     let state = PeerBidirectionalCommandState::default();
@@ -9945,7 +10337,7 @@ fn deferred_v1_source_precommit_descendant_requires_explicit_revoke_to_abandon()
         let target_device_id = "123e4567-e89b-42d3-a456-426614174211";
         let operation_id = issue_deferred_bidirectional_offer(directory.path(), target_device_id);
         let durable_job_id = uuid::Uuid::new_v4().to_string();
-        let (mut store, cas, mut evidence, previous) = retain_source_prepared_fixture(
+        let (mut store, cas, evidence, previous) = retain_source_prepared_fixture(
             directory.path(),
             &operation_id,
             source_device_id,
@@ -10037,7 +10429,7 @@ fn deferred_v1_source_completed_ack_requires_exact_receipt_or_explicit_revoke() 
         let target_device_id = "123e4567-e89b-42d3-a456-426614174215";
         let operation_id = issue_deferred_bidirectional_offer(directory.path(), target_device_id);
         let durable_job_id = uuid::Uuid::new_v4().to_string();
-        let (mut store, _cas, mut evidence, remote_receipt) = retain_source_postcommit_fixture(
+        let (mut store, _cas, evidence, remote_receipt) = retain_source_postcommit_fixture(
             directory.path(),
             &operation_id,
             source_device_id,
