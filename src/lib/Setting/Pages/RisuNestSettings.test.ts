@@ -168,7 +168,7 @@ describe('RisuNest native command integration', () => {
 })
 
 describe('RisuNest sync language schema', () => {
-    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'work.progressLabel', 'work.deltaConflictBothChanged', 'work.deltaConflictLocalChanged', 'work.bidirectionalSyncing', 'work.bidirectionalResumeRequired', 'work.bidirectionalSourceUnavailable', 'work.bidirectionalRefreshPending', 'lanWarning', 'androidLanOnly', 'notificationsDisabledWarning']
+    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'work.progressLabel', 'work.deltaConflictBothChanged', 'work.deltaConflictLocalChanged', 'work.bidirectionalSyncing', 'work.bidirectionalResumeRequired', 'work.bidirectionalSourceUnavailable', 'work.bidirectionalRefreshPending', 'work.bidirectionalEditsDiscarded', 'lanWarning', 'androidLanOnly', 'notificationsDisabledWarning']
 
     it.each([languageEnglish, languageKorean])('contains every required nested sync branch', (translation) => {
         for (const path of required) {

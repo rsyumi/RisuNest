@@ -57,7 +57,7 @@ const bidiBase = { operationPhase: 'idle' as const, operationRetained: false, op
 const validRegistrationUri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F10.1.2.3%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
 
 function snapshot(partial: Partial<DeviceSyncControllerSnapshot> = {}): DeviceSyncControllerSnapshot {
-    return { source: { phase: 'idle' }, sources: [], devices: [], error: null, sourceError: null, workError: null, remoteCommitRefreshPending: false, stagedLink: null, stagedUri: null, stagedSourceDeviceId: null, activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null, expiredSourceIds: [], targets: { clone: cloneBase, delta: deltaBase, bidirectional: bidiBase }, ...partial }
+    return { source: { phase: 'idle' }, sources: [], devices: [], error: null, sourceError: null, workError: null, remoteCommitNotice: null, stagedLink: null, stagedUri: null, stagedSourceDeviceId: null, activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null, expiredSourceIds: [], targets: { clone: cloneBase, delta: deltaBase, bidirectional: bidiBase }, ...partial }
 }
 
 describe('DeviceSyncSettings', () => {
@@ -154,16 +154,24 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('reports a pending remote commit refresh inside the sharing card', async () => {
-        await render(snapshot({ source: { phase: 'running' }, remoteCommitRefreshPending: true }))
+        await render(snapshot({ source: { phase: 'running' }, remoteCommitNotice: 'refreshFailed' }))
 
         const notice = target.querySelector('[data-share-refresh]')!
         expect(notice.textContent).toBe('Both devices are committed, but the local screen could not refresh.')
         expect(target.querySelector('[data-sync-card="sharing"]')?.contains(notice)).toBe(true)
     })
 
+    it('reports discarded edits inside the sharing card', async () => {
+        await render(snapshot({ source: { phase: 'running' }, remoteCommitNotice: 'editsDiscarded' }))
+
+        const notice = target.querySelector('[data-share-refresh]')!
+        expect(notice.textContent).toBe("The other device's changes were applied, and recent unsaved edits on this device were lost. The screen may differ from what you last saw.")
+        expect(target.querySelector('[data-sync-card="sharing"]')?.contains(notice)).toBe(true)
+    })
+
     it('lets a source error win over the pending remote commit refresh notice', async () => {
         await render(snapshot({
-            source: { phase: 'running' }, sourceError: 'port-unavailable', remoteCommitRefreshPending: true,
+            source: { phase: 'running' }, sourceError: 'port-unavailable', remoteCommitNotice: 'refreshFailed',
         }))
 
         expect(target.querySelector('[data-share-refresh]')).toBeNull()
@@ -173,7 +181,7 @@ describe('DeviceSyncSettings', () => {
 
     it('lets a sharing action error win over the pending remote commit refresh notice', async () => {
         controllerState.controller.stop.mockRejectedValueOnce('port-unavailable')
-        await render(snapshot({ source: { phase: 'running' }, remoteCommitRefreshPending: true }))
+        await render(snapshot({ source: { phase: 'running' }, remoteCommitNotice: 'refreshFailed' }))
 
         button('Stop sharing')!.click()
 

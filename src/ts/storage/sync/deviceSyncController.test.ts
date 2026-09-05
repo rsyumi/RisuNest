@@ -1119,7 +1119,7 @@ describe('device sync controller', () => {
 
         expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
         expect(refreshAfterRemoteCommit).toHaveBeenCalledWith(remoteCommit(12))
-        expect(controller.snapshot().remoteCommitRefreshPending).toBe(false)
+        expect(controller.snapshot().remoteCommitNotice).toBeNull()
     })
 
     it('retries the remote commit refresh after a failure', async () => {
@@ -1134,16 +1134,16 @@ describe('device sync controller', () => {
         commit = remoteCommit(12)
 
         await vi.advanceTimersByTimeAsync(10)
-        expect(controller.snapshot().remoteCommitRefreshPending).toBe(true)
+        expect(controller.snapshot().remoteCommitNotice).toBe('refreshFailed')
         expect(JSON.stringify(controller.snapshot())).not.toContain('private')
 
         await vi.advanceTimersByTimeAsync(10)
 
         expect(refreshAfterRemoteCommit).toHaveBeenCalledTimes(2)
-        expect(controller.snapshot().remoteCommitRefreshPending).toBe(false)
+        expect(controller.snapshot().remoteCommitNotice).toBeNull()
     })
 
-    it('keeps the notice when the flush conflicted', async () => {
+    it('reports discarded edits when the flush conflicted', async () => {
         vi.useFakeTimers()
         const refreshAfterRemoteCommit = vi.fn(async () => ({ discardedPendingEdits: true }))
         let commit: ReturnType<typeof remoteCommit> | undefined
@@ -1155,7 +1155,7 @@ describe('device sync controller', () => {
         await vi.advanceTimersByTimeAsync(30)
 
         expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
-        expect(controller.snapshot().remoteCommitRefreshPending).toBe(true)
+        expect(controller.snapshot().remoteCommitNotice).toBe('editsDiscarded')
     })
 
     it('treats an equal revision with a different operation id as new', async () => {
@@ -1220,11 +1220,11 @@ describe('device sync controller', () => {
         await controller.start({ read: true, bidirectional: false })
         commit = remoteCommit(12)
         await vi.advanceTimersByTimeAsync(10)
-        expect(controller.snapshot().remoteCommitRefreshPending).toBe(true)
+        expect(controller.snapshot().remoteCommitNotice).toBe('editsDiscarded')
 
         await controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
 
-        expect(controller.snapshot().remoteCommitRefreshPending).toBe(false)
+        expect(controller.snapshot().remoteCommitNotice).toBeNull()
     })
 
     it('keeps source and receive errors in distinct snapshot scopes', async () => {

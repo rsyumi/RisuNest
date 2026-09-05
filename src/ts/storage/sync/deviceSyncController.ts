@@ -78,6 +78,8 @@ export type DeviceSyncBidirectionalTarget = {
     abandon(): Promise<void>
 }
 
+export type DeviceSyncRemoteCommitNotice = 'refreshFailed' | 'editsDiscarded'
+
 export interface DeviceSyncControllerSnapshot {
     source: DeviceSyncStatus
     sources: RegisteredDevice[]
@@ -87,10 +89,11 @@ export interface DeviceSyncControllerSnapshot {
     workError: DeviceSyncErrorCode | null
     /**
      * A peer commit reached this device but its working set could not be
-     * brought fully into line: either the refresh failed, or unsaved edits
-     * were lost to the peer's revision.
+     * brought fully into line. `refreshFailed` retries on the next poll;
+     * `editsDiscarded` means the refresh went through and unsaved edits were
+     * lost to the peer's revision.
      */
-    remoteCommitRefreshPending: boolean
+    remoteCommitNotice: DeviceSyncRemoteCommitNotice | null
     stagedLink: StagedDeviceSyncLink | null
     stagedUri: string | null
     stagedSourceDeviceId: string | null
@@ -107,7 +110,7 @@ export interface DeviceSyncControllerSnapshot {
 function createInitialSnapshot(): DeviceSyncControllerSnapshot {
     return {
         source: { phase: 'idle' }, sources: [], devices: [], error: null,
-        sourceError: null, workError: null, remoteCommitRefreshPending: false,
+        sourceError: null, workError: null, remoteCommitNotice: null,
         stagedLink: null, stagedUri: null, stagedSourceDeviceId: null,
         activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null,
         expiredSourceIds: [], targets: {},
@@ -241,11 +244,11 @@ export function createDeviceSyncController(options: {
         if (remoteCommitInFlight) return remoteCommitInFlight
         const work = options.facade.refreshAfterRemoteCommit(commit).then((result) => {
             handledRemoteCommit = commit
-            update({ remoteCommitRefreshPending: result.discardedPendingEdits })
+            update({ remoteCommitNotice: result.discardedPendingEdits ? 'editsDiscarded' : null })
         }).catch(() => {
             // The mark stays behind on purpose: the next poll retries the
             // same record rather than leaving the working set stale.
-            update({ remoteCommitRefreshPending: true })
+            update({ remoteCommitNotice: 'refreshFailed' })
         }).finally(() => {
             if (remoteCommitInFlight === work) remoteCommitInFlight = undefined
         })
@@ -268,7 +271,7 @@ export function createDeviceSyncController(options: {
                 source,
                 sourceError: source.latestError ?? null,
                 error: source.latestError ?? snapshot.workError,
-                remoteCommitRefreshPending: false,
+                remoteCommitNotice: null,
             })
             observeSource(source)
             // Not awaited: a refresh must never hold up a source operation.
