@@ -1,15 +1,15 @@
 use super::*;
 
 #[test]
-fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
-    let directory = tempfile::tempdir().expect("create v12 schema directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v12 store");
+fn fresh_schema_adds_only_the_global_empty_asset_object_catalog() {
+    let directory = tempfile::tempdir().expect("create asset catalog schema directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh store");
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read current version"),
-        17
+        1
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -40,96 +40,8 @@ fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
 }
 
 #[test]
-fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
-    let directory = tempfile::tempdir().expect("create v11 migration directory");
-    let store = PersistentStore::open(directory.path()).expect("create current store");
-    store
-        .connection
-        .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
-             DROP TABLE logical_sync_device_ack_proofs;
-             DROP INDEX logical_sync_devices_status;
-             DROP TABLE logical_sync_devices;
-             DROP TABLE asset_gc_maintenance_state;
-             DROP TABLE asset_alias_replacement_candidates;
-             DROP TABLE asset_object_deletions;
-             DROP TABLE asset_objects;
-             PRAGMA user_version = 11;",
-        )
-        .expect("create v11 fixture");
-    drop(store);
-    let sentinel = directory
-        .path()
-        .join("assets-v2/objects/aa/untracked-v11-object");
-    fs::create_dir_all(sentinel.parent().expect("read sentinel parent"))
-        .expect("create sentinel shard");
-    fs::write(&sentinel, b"not a catalog candidate").expect("write sentinel object");
-
-    let migrated = PersistentStore::open(directory.path()).expect("migrate v11 store");
-    assert_eq!(
-        migrated
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .expect("read migrated version"),
-        17
-    );
-    assert_eq!(
-        migrated
-            .connection
-            .query_row("SELECT COUNT(*) FROM asset_objects", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("count empty migrated catalog"),
-        0
-    );
-    assert_eq!(
-        fs::read(sentinel).expect("read untracked sentinel"),
-        b"not a catalog candidate"
-    );
-}
-
-#[test]
-fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
-    let directory = tempfile::tempdir().expect("create v12 collision directory");
-    let store = PersistentStore::open(directory.path()).expect("create current store");
-    store
-        .connection
-        .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
-             DROP TABLE logical_sync_device_ack_proofs;
-             DROP INDEX logical_sync_devices_status;
-             DROP TABLE logical_sync_devices;
-             DROP TABLE asset_gc_maintenance_state;
-             DROP TABLE asset_alias_replacement_candidates;
-             DROP TABLE asset_object_deletions;
-             DROP TABLE asset_objects;
-             CREATE TABLE asset_objects (collision_marker TEXT NOT NULL);
-             PRAGMA user_version = 11;",
-        )
-        .expect("create colliding v11 fixture");
-    drop(store);
-
-    assert!(PersistentStore::open(directory.path()).is_err());
-    let connection = Connection::open(directory.path().join("persistent/persistent.db"))
-        .expect("reopen colliding v11 fixture");
-    assert_eq!(
-        connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .expect("read rolled-back version"),
-        11
-    );
-    assert_eq!(
-        table_columns(&connection, "asset_objects")
-            .into_iter()
-            .map(|column| column.0)
-            .collect::<Vec<_>>(),
-        ["collision_marker"]
-    );
-}
-
-#[test]
-fn schema_v15_adds_exact_durable_asset_deletion_tombstones() {
-    let directory = tempfile::tempdir().expect("create v15 schema directory");
+fn fresh_schema_adds_exact_durable_asset_deletion_tombstones() {
+    let directory = tempfile::tempdir().expect("create deletion tombstone schema directory");
     let store = PersistentStore::open(directory.path()).expect("open current store");
 
     assert_eq!(
@@ -160,8 +72,8 @@ fn schema_v15_adds_exact_durable_asset_deletion_tombstones() {
 }
 
 #[test]
-fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
-    let directory = tempfile::tempdir().expect("create v16 schema directory");
+fn fresh_schema_adds_generation_scoped_exact_replacement_alias_provenance() {
+    let directory = tempfile::tempdir().expect("create replacement provenance schema directory");
     let store = PersistentStore::open(directory.path()).expect("open current store");
 
     assert_eq!(
@@ -169,7 +81,7 @@ fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        17
+        1
     );
     assert_eq!(
         table_columns(&store.connection, "asset_alias_replacement_candidates")
@@ -187,59 +99,11 @@ fn schema_v16_adds_generation_scoped_exact_replacement_alias_provenance() {
     assert!(super::GENERATION_TABLES
         .iter()
         .any(|(table, _)| *table == "asset_alias_replacement_candidates"));
-
-    store
-        .connection
-        .execute(
-            "INSERT INTO app_kv (key, value) VALUES ('v15-sentinel', 'true')",
-            [],
-        )
-        .expect("seed v15 migration sentinel");
-    store
-        .connection
-        .execute_batch(
-            "DROP TABLE asset_gc_maintenance_state;
-             DROP TABLE asset_alias_replacement_candidates;
-             PRAGMA user_version = 15;",
-        )
-        .expect("create v15 schema fixture");
-    drop(store);
-
-    let migrated = PersistentStore::open(directory.path()).expect("migrate v15 schema");
-    assert_eq!(
-        migrated
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            .unwrap(),
-        17
-    );
-    assert_eq!(
-        migrated
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM asset_alias_replacement_candidates",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count migrated replacement candidates"),
-        0
-    );
-    assert_eq!(
-        migrated
-            .connection
-            .query_row(
-                "SELECT value FROM app_kv WHERE key = 'v15-sentinel'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("read preserved v15 migration sentinel"),
-        "true"
-    );
 }
 
 #[test]
-fn schema_v17_adds_one_validated_asset_gc_maintenance_cursor_row() {
-    let directory = tempfile::tempdir().expect("create v17 schema directory");
+fn fresh_schema_adds_one_validated_asset_gc_maintenance_cursor_row() {
+    let directory = tempfile::tempdir().expect("create asset GC maintenance schema directory");
     let store = PersistentStore::open(directory.path()).expect("open current store");
 
     assert_eq!(
@@ -247,7 +111,7 @@ fn schema_v17_adds_one_validated_asset_gc_maintenance_cursor_row() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        17
+        1
     );
     assert_eq!(
         table_columns(&store.connection, "asset_gc_maintenance_state")
@@ -270,143 +134,6 @@ fn schema_v17_adds_one_validated_asset_gc_maintenance_cursor_row() {
     assert!(super::GENERATION_TABLES
         .iter()
         .all(|(table, _)| *table != "asset_gc_maintenance_state"));
-
-    store
-        .connection
-        .execute(
-            "INSERT INTO app_kv (key, value) VALUES ('v16-sentinel', 'true')",
-            [],
-        )
-        .expect("seed v16 migration sentinel");
-    store
-        .connection
-        .execute_batch(
-            "DROP TABLE asset_gc_maintenance_state;
-             PRAGMA user_version = 16;",
-        )
-        .expect("create exact v16 schema fixture");
-    drop(store);
-
-    let migrated = PersistentStore::open(directory.path()).expect("migrate v16 schema");
-    assert_eq!(
-        migrated
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            .unwrap(),
-        17
-    );
-    assert_eq!(
-        migrated
-            .connection
-            .query_row(
-                "SELECT singleton, catalog_cursor FROM asset_gc_maintenance_state",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .unwrap(),
-        (1, None)
-    );
-    assert_eq!(
-        migrated
-            .connection
-            .query_row(
-                "SELECT value FROM app_kv WHERE key = 'v16-sentinel'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        "true"
-    );
-}
-
-#[test]
-fn schema_v15_migrates_v14_without_scanning_cas_objects() {
-    let directory = tempfile::tempdir().expect("create v14 migration directory");
-    let store = PersistentStore::open(directory.path()).expect("create current store");
-    store
-        .connection
-        .execute_batch(
-            "DROP TABLE asset_gc_maintenance_state;
-             DROP TABLE asset_alias_replacement_candidates;
-             DROP TABLE asset_object_deletions;
-             PRAGMA user_version = 14;",
-        )
-        .expect("create v14 fixture");
-    drop(store);
-    let sentinel = directory
-        .path()
-        .join("assets-v2/objects/aa/untracked-v14-object");
-    fs::create_dir_all(sentinel.parent().expect("read sentinel parent"))
-        .expect("create sentinel shard");
-    fs::write(&sentinel, b"not a deletion tombstone").expect("write sentinel object");
-
-    let migrated = PersistentStore::open(directory.path()).expect("migrate v14 store");
-    assert_eq!(
-        migrated
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .expect("read migrated version"),
-        17
-    );
-    assert_eq!(
-        migrated
-            .connection
-            .query_row("SELECT COUNT(*) FROM asset_object_deletions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("count empty migrated tombstones"),
-        0
-    );
-    assert_eq!(
-        fs::read(sentinel).expect("read untracked sentinel"),
-        b"not a deletion tombstone"
-    );
-}
-
-#[test]
-fn schema_v13_to_v14_commit_is_a_resumable_boundary_before_v15() {
-    let directory = tempfile::tempdir().expect("create resumable v13 migration directory");
-    let store = PersistentStore::open(directory.path()).expect("create current store");
-    store
-        .connection
-        .execute_batch(
-            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
-             DROP TABLE logical_sync_device_ack_proofs;
-             DROP TABLE asset_gc_maintenance_state;
-             DROP TABLE asset_alias_replacement_candidates;
-             DROP TABLE asset_object_deletions;
-             PRAGMA user_version = 13;",
-        )
-        .expect("create exact v13 fixture");
-    drop(store);
-
-    let database_path = directory.path().join("persistent/persistent.db");
-    let mut interrupted = Connection::open(&database_path).expect("open v13 database");
-    super::schema::migrate_v13_to_v14_for_test(&mut interrupted)
-        .expect("commit exact v14 boundary");
-    assert_eq!(
-        interrupted
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
-        14
-    );
-    assert!(
-        table_columns(&interrupted, "logical_sync_device_ack_proofs")
-            .iter()
-            .any(|column| column.0 == "local_generation_id")
-    );
-    assert!(table_columns(&interrupted, "asset_object_deletions").is_empty());
-    drop(interrupted);
-
-    let resumed = PersistentStore::open(directory.path()).expect("resume v14 to v15 migration");
-    assert_eq!(
-        resumed
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
-        17
-    );
-    assert!(!table_columns(&resumed.connection, "asset_object_deletions").is_empty());
 }
 
 #[test]
