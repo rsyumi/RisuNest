@@ -6038,10 +6038,13 @@ async fn peer_bidirectional_sync_with_factory<
         }
     })
     .await
-    .map_err(|error| {
+    // A worker that never returned has no outcome of its own, so its join
+    // failure becomes the outcome and the Android terminal publication below
+    // still runs.
+    .unwrap_or_else(|error| {
         crate::nlog!("warn", "registered bidirectional worker failed: {error}");
-        PeerCommandCode::OperationFailed.code().to_owned()
-    })?;
+        Err(PeerCommandCode::OperationFailed.code().to_owned())
+    });
     let outcome = bound_registered_bidirectional_outcome(outcome);
     #[cfg(target_os = "android")]
     state
@@ -6196,13 +6199,14 @@ async fn peer_bidirectional_resolve_with_factory<
         }
     })
     .await
-    .map_err(|error| {
+    // Same as the sync worker above: the join failure is the outcome.
+    .unwrap_or_else(|error| {
         crate::nlog!(
             "warn",
             "registered bidirectional resolution worker failed: {error}"
         );
-        PeerCommandCode::OperationFailed.code().to_owned()
-    })?;
+        Err(PeerCommandCode::OperationFailed.code().to_owned())
+    });
     let outcome = bound_registered_bidirectional_outcome(outcome);
     #[cfg(target_os = "android")]
     state
