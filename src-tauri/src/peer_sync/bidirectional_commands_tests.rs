@@ -2974,6 +2974,7 @@ fn local_committed_journal_json(completion_mode: Option<&str>) -> serde_json::Va
             "generationSequence": "3",
         },
         "changed": true,
+        "remote_backup_required": true,
         "transferred_objects": 2,
         "transferred_bytes": 19,
         "backups": [],
@@ -2981,25 +2982,24 @@ fn local_committed_journal_json(completion_mode: Option<&str>) -> serde_json::Va
 }
 
 #[test]
-fn local_committed_journal_without_a_backup_flag_requires_remote_backup_conservatively() {
+fn a_journal_without_a_remote_backup_flag_is_not_deserializable() {
+    let mut journal = local_committed_journal_json(Some("unsupported"));
+    assert!(journal
+        .as_object_mut()
+        .unwrap()
+        .remove("remote_backup_required")
+        .is_some());
+    let bytes = serde_json::to_vec(&journal).unwrap();
+    assert!(serde_json::from_slice::<PeerBidirectionalDurableOperation>(&bytes).is_err());
+
     let directory = tempfile::tempdir().unwrap();
     let operation_root = directory.path().join("peer-bidirectional");
     fs::create_dir_all(&operation_root).unwrap();
-    fs::write(
-        operation_root.join(OPERATION_FILE),
-        serde_json::to_vec(&local_committed_journal_json(Some("unsupported"))).unwrap(),
-    )
-    .unwrap();
+    fs::write(operation_root.join(OPERATION_FILE), &bytes).unwrap();
 
     assert!(matches!(
-        PeerBidirectionalOperationJournal::new(directory.path())
-            .load()
-            .unwrap()
-            .unwrap(),
-        PeerBidirectionalDurableOperation::LocalCommitted {
-            remote_backup_required: true,
-            ..
-        }
+        PeerBidirectionalOperationJournal::new(directory.path()).load(),
+        Err(PeerSyncError::Storage(_))
     ));
 }
 

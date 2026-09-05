@@ -166,10 +166,6 @@ pub(crate) struct PeerBidirectionalOperationContext {
     pub(crate) completion_delivery: Option<super::device_registry::PendingCompletionDelivery>,
 }
 
-fn conservative_remote_backup_required() -> bool {
-    true
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TargetPreparedConflictPolicy {
@@ -206,7 +202,7 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         backup_required: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backup: Option<LanBidirectionalBackupReceipt>,
-        #[serde(default, rename = "completionDeferredV1")]
+        #[serde(rename = "completionDeferredV1")]
         completion_deferred_v1: bool,
         durable_job_id: String,
     },
@@ -236,7 +232,6 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         committed_revision: i64,
         shared_generation: SyncGenerationIdentity,
         changed: bool,
-        #[serde(default = "conservative_remote_backup_required")]
         remote_backup_required: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote_apply_receipt: Option<LanBidirectionalRemoteApplyReceipt>,
@@ -588,7 +583,6 @@ pub(crate) struct SourcePreparedEvidence {
     transferred_bytes: u64,
     backup_required: bool,
     backup: Option<LanBidirectionalBackupReceipt>,
-    #[serde(default)]
     completion_deferred_v1: bool,
 }
 
