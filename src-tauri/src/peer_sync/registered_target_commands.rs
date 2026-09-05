@@ -2,7 +2,7 @@
 use super::android_client::{AndroidCloneJobPhase, AndroidCloneJobStatus};
 use super::{
     command_codes::{code_for, PeerCommandCode},
-    device_registry::{incoming_source_by_id, DevicePermissions, IncomingSource},
+    device_registry::{incoming_source_by_id, IncomingSource},
     lan::{
         authenticated_peer_hello_status, authenticated_peer_hello_with_capabilities,
         AuthenticatedPeerHelloOutcome, PeerCompletionCapability, PeerHello, PeerHelloLane,
@@ -48,39 +48,6 @@ struct RegisteredSourceConnection {
     completion: PeerCompletionCapability,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisteredLaneDescriptor {
-    session_id: String,
-    manifest_id: String,
-}
-
-impl From<&PeerHelloLane> for RegisteredLaneDescriptor {
-    fn from(value: &PeerHelloLane) -> Self {
-        Self {
-            session_id: value.session_id.clone(),
-            manifest_id: value.manifest_id.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisteredHelloLanes {
-    clone: Option<RegisteredLaneDescriptor>,
-    delta: Option<RegisteredLaneDescriptor>,
-    bidirectional: Option<RegisteredLaneDescriptor>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisteredSourceHello {
-    source_device_id: String,
-    name: String,
-    permissions: DevicePermissions,
-    lanes: RegisteredHelloLanes,
-}
-
 #[cfg(any(target_os = "android", test))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,6 +87,7 @@ pub(crate) fn safe_android_clone_status(
     }
 }
 
+#[cfg(any(target_os = "android", test))]
 fn validate_android_registered_source_endpoint(endpoint: &str) -> Result<String, PeerSyncError> {
     let endpoint = super::lan::validate_lan_endpoint(endpoint)?;
     let parsed =
@@ -159,10 +127,6 @@ pub struct AndroidPeerCloneClaimResult {
 }
 
 impl RegisteredSourceConnection {
-    fn safe_hello(&self) -> RegisteredSourceHello {
-        safe_hello(&self.hello)
-    }
-
     #[cfg(desktop)]
     fn clone_target(&self) -> RegisteredCloneTarget {
         RegisteredCloneTarget {
@@ -171,19 +135,6 @@ impl RegisteredSourceConnection {
             session_id: self.lane.session_id.clone(),
             manifest_id: self.lane.manifest_id.clone(),
         }
-    }
-}
-
-fn safe_hello(hello: &PeerHello) -> RegisteredSourceHello {
-    RegisteredSourceHello {
-        source_device_id: hello.device_id.clone(),
-        name: hello.name.clone(),
-        permissions: hello.permissions.clone(),
-        lanes: RegisteredHelloLanes {
-            clone: hello.lanes.clone.as_ref().map(Into::into),
-            delta: hello.lanes.delta.as_ref().map(Into::into),
-            bidirectional: hello.lanes.bidirectional.as_ref().map(Into::into),
-        },
     }
 }
 
@@ -235,60 +186,6 @@ fn registered_operation_failure(context: &str, error: impl fmt::Display) -> Stri
 fn registered_target_operation_failure(context: &str, error: PeerSyncError) -> PeerCommandCode {
     crate::nlog!("warn", "{context} failed: {error}");
     code_for(&error)
-}
-
-fn registered_hello(
-    app_root: &Path,
-    device_id: &str,
-) -> Result<RegisteredSourceHello, PeerCommandCode> {
-    registered_hello_with(
-        app_root,
-        device_id,
-        cfg!(target_os = "android"),
-        authenticated_peer_hello_status,
-    )
-}
-
-fn registered_hello_with<F>(
-    app_root: &Path,
-    device_id: &str,
-    require_android_lan: bool,
-    transport: F,
-) -> Result<RegisteredSourceHello, PeerCommandCode>
-where
-    F: FnOnce(&str, &str) -> Result<AuthenticatedPeerHelloOutcome, PeerSyncError>,
-{
-    let source = incoming_source_by_id(app_root, device_id)
-        .map_err(|error| safe_failure("registered source lookup", error))?
-        .ok_or(PeerCommandCode::SourceMissing)?;
-    if require_android_lan {
-        validate_android_registered_source_endpoint(&source.endpoint)
-            .map_err(|error| safe_failure("registered Android hello endpoint", error))?;
-    }
-    let current = registered_hello_outcome(
-        "registered source hello",
-        transport(&source.endpoint, &source.bearer),
-    )?;
-    if current.device_id != source.device_id {
-        crate::nlog!(
-            "warn",
-            "registered source hello returned a different device identity"
-        );
-        return Err(PeerCommandCode::IdentityMismatch);
-    }
-    Ok(safe_hello(&current))
-}
-
-#[tauri::command]
-pub async fn peer_sync_registered_hello(
-    app: AppHandle,
-    device_id: String,
-) -> Result<RegisteredSourceHello, String> {
-    let root = app_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || registered_hello(&root, &device_id))
-        .await
-        .map_err(|error| safe_command_failure("registered source hello worker", error))?
-        .map_err(|code: PeerCommandCode| code.to_string())
 }
 
 #[tauri::command]
@@ -880,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_hello_and_clone_target_never_serialize_the_bearer() {
+    fn the_clone_target_never_serializes_the_bearer() {
         let root = tempfile::tempdir().unwrap();
         register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();
         let connection = resolve_registered_source_with(
@@ -895,11 +792,8 @@ mod tests {
             },
         )
         .unwrap();
-        let hello_json = serde_json::to_string(&connection.safe_hello()).unwrap();
         let target_json = serde_json::to_string(&connection.clone_target()).unwrap();
-        assert!(!hello_json.contains(BEARER));
         assert!(!target_json.contains(BEARER));
-        assert!(!hello_json.contains("endpoint"));
         assert!(target_json.contains("http://127.0.0.1:32145"));
     }
 
@@ -910,24 +804,6 @@ mod tests {
         assert!(validate_android_registered_source_endpoint("https://sync.example.com").is_err());
         assert!(validate_android_registered_source_endpoint("http://8.8.8.8:32145").is_err());
         assert!(validate_android_registered_source_endpoint("http://127.0.0.1:32145").is_err());
-    }
-
-    #[test]
-    fn android_registered_hello_rejects_public_endpoint_before_transport() {
-        let root = tempfile::tempdir().unwrap();
-        let mut public = source(DevicePermissions::read());
-        public.endpoint = "https://sync.example.com".to_owned();
-        register_incoming_source(root.path(), public).unwrap();
-        let transport_called = std::cell::Cell::new(false);
-
-        let error = registered_hello_with(root.path(), SOURCE_ID, true, |_, _| {
-            transport_called.set(true);
-            unreachable!("public Android endpoints must be rejected before transport")
-        })
-        .unwrap_err();
-
-        assert_eq!(error.code(), "transportUnavailable");
-        assert!(!transport_called.get());
     }
 
     #[test]

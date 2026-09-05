@@ -93,7 +93,6 @@ describe('RisuNest native command integration', () => {
         'device_sync_stop',
         'device_sync_rotate_link',
         'device_sync_source_reserve',
-        'peer_sync_registered_hello',
         'peer_clone_claim_registered_client',
         'peer_delta_pull_registered',
         'peer_delta_target_retained',
@@ -138,7 +137,6 @@ describe('RisuNest native command integration', () => {
 
     it('exposes registered reconnect commands on both supported native targets', () => {
         for (const command of [
-            'peer_sync_registered_hello',
             'peer_clone_claim_registered_client',
             'peer_delta_pull_registered',
             'peer_bidirectional_sync_registered',

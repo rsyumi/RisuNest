@@ -640,8 +640,6 @@ pub fn run() {
             #[cfg(target_os = "android")]
             peer_sync::shared_session::device_sync_source_reserve,
             #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registered_target_commands::peer_sync_registered_hello,
-            #[cfg(any(desktop, target_os = "android"))]
             peer_sync::registered_target_commands::peer_clone_claim_registered_client,
             #[cfg(any(desktop, target_os = "android"))]
             peer_sync::registered_target_commands::peer_delta_pull_registered,
