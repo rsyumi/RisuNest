@@ -435,7 +435,8 @@
             </div>
         {/if}
         {#if shareActionError}<p data-share-error role="alert" class="mt-3 text-sm text-draculared">{shareActionError}</p>
-        {:else if sourceError}<p role="alert" class="mt-3 text-sm text-draculared">{safeError(sourceError)}</p>{/if}
+        {:else if sourceError}<p role="alert" class="mt-3 text-sm text-draculared">{safeError(sourceError)}</p>
+        {:else if snapshot.remoteCommitRefreshPending}<p data-share-refresh role="alert" class="mt-3 text-sm text-draculared">{sync.work.bidirectionalRefreshPending}</p>{/if}
     </div>
 
     <div data-sync-card="devices" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">

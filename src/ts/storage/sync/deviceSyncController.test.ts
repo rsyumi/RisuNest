@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+type SourceRefresh = (commit: DeviceSyncRemoteCommit) => Promise<DeviceSyncRemoteCommitRefresh>
+
+const refreshStub = () => vi.fn(async () => ({ discardedPendingEdits: false }))
+
 import { DeviceSyncError } from './deviceSync'
+import type { DeviceSyncRemoteCommit, DeviceSyncRemoteCommitRefresh } from './deviceSync'
 import { createDeviceSyncController, startDeviceSyncAutoListen } from './deviceSyncController'
 import type { PeerCloneControllerSnapshot } from './peerCloneController'
 
@@ -21,7 +26,7 @@ const sourceFacade = (prepare = vi.fn(async () => ({ phase: 'prepared' as const 
     status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
     prepare, start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
     rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-    revokeOutgoing: async () => undefined,
+    revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
 })
 
 afterEach(() => {
@@ -66,7 +71,7 @@ describe('device sync controller', () => {
                 status: async () => ({ phase: 'idle' as const }), incomingSources, outgoingDevices,
                 prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
                 stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
         })
 
@@ -84,7 +89,7 @@ describe('device sync controller', () => {
                 status: async () => ({ phase: 'prepared' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
                 prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
                 stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
         })
 
@@ -100,7 +105,7 @@ describe('device sync controller', () => {
                 prepare: async () => await new Promise((resolve) => { release = () => resolve({ phase: 'prepared' as const }) }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => { throw new Error('http://private.example bearer secret') },
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
         })
         await controller.initialize()
@@ -246,7 +251,7 @@ describe('device sync controller', () => {
                 status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [{ deviceId: 'source', name: 'Source', permissions: ['read'] as const }], outgoingDevices: async () => [],
                 prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
                 stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, claimStagedClone, reconnectRegisteredClone,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(), claimStagedClone, reconnectRegisteredClone,
             },
             targets: {
                 clone: {
@@ -275,7 +280,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined, claimStagedClone,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(), claimStagedClone,
             },
             targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() } },
         })
@@ -463,7 +468,7 @@ describe('device sync controller', () => {
                 incomingSources: async () => [], outgoingDevices: async () => [],
                 prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
                 stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
             targets: { clone, delta, bidirectional },
         })
@@ -482,7 +487,7 @@ describe('device sync controller', () => {
                 status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
                 prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
                 stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
             targets: {
                 clone: { snapshot: () => cloneSnapshot('bearer secret'), subscribe: (listener) => { listener(cloneSnapshot('bearer secret')); return () => undefined }, initialize: async () => undefined, joinClaimed: vi.fn(), confirmDestructiveReplace: vi.fn(), download: vi.fn(), resume: vi.fn(), cancel: vi.fn() },
@@ -510,7 +515,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined, claimStagedClone,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(), claimStagedClone,
             },
             targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() } },
         })
@@ -535,7 +540,7 @@ describe('device sync controller', () => {
                 prepare: async () => await new Promise((resolve) => { release = () => resolve({ phase: 'prepared' as const }) }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
             targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered: vi.fn(), abandonRetained: vi.fn() } },
         })
@@ -696,7 +701,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
             targets: {
                 delta: {
@@ -726,7 +731,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined, claimStagedClone, reconnectRegisteredClone,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(), claimStagedClone, reconnectRegisteredClone,
             },
             targets: {
                 clone,
@@ -810,7 +815,7 @@ describe('device sync controller', () => {
                     outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                     start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                     rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                    revokeOutgoing: async () => undefined,
+                    revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
                     claimStagedClone: async () => ({
                         sourceDeviceId: 'staged-source', endpoint: 'http://source/',
                         sessionId: 'session', manifestId: 'a'.repeat(64),
@@ -853,7 +858,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
                 claimStagedClone: async () => ({
                     sourceDeviceId: 'staged-source', endpoint: 'http://source/',
                     sessionId: 'session', manifestId: 'a'.repeat(64),
@@ -888,7 +893,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
                 reconnectRegisteredClone: async () => {
                     if (reconnectFails) throw new DeviceSyncError('registration-expired')
                     return { sourceDeviceId: 'source', endpoint: 'http://source/', sessionId: 'session', manifestId: 'a'.repeat(64) }
@@ -929,7 +934,7 @@ describe('device sync controller', () => {
                 outgoingDevices: async () => [], prepare: async () => ({ phase: 'prepared' as const }),
                 start: async () => ({ phase: 'running' as const }), stop: async () => undefined,
                 rotateLink: async () => ({ phase: 'running' as const }), revokeIncoming: async () => undefined,
-                revokeOutgoing: async () => undefined, reconnectRegisteredClone,
+                revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(), reconnectRegisteredClone,
             },
             targets: { clone, delta, bidirectional },
         })
@@ -970,7 +975,7 @@ describe('device sync controller', () => {
                 status: async () => ({ phase: 'idle' as const }), incomingSources: async () => [], outgoingDevices: async () => [],
                 prepare: async () => ({ phase: 'prepared' as const }), start: async () => ({ phase: 'running' as const }),
                 stop: async () => undefined, rotateLink: async () => ({ phase: 'running' as const }),
-                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined,
+                revokeIncoming: async () => undefined, revokeOutgoing: async () => undefined, refreshAfterRemoteCommit: refreshStub(),
             },
             deepLinks: { consumePending: () => null, subscribe },
         })
@@ -1079,6 +1084,148 @@ describe('device sync controller', () => {
 
         expect(prepare).toHaveBeenCalledOnce()
         expect(start).toHaveBeenCalledTimes(2)
+    })
+
+    const remoteCommit = (committedRevision: number, operationId = '00000000-0000-4000-8000-0000000000a1') => ({
+        operationId, committedRevision,
+    })
+
+    /**
+     * A shared source that is already listening, with the peer commit arriving
+     * only after the controller has settled, which is the case this refresh
+     * exists for.
+     */
+    const sharingController = (
+        refreshAfterRemoteCommit: SourceRefresh,
+        commit: () => ReturnType<typeof remoteCommit> | undefined,
+    ) => createDeviceSyncController({
+        facade: {
+            ...sourceFacade(), refreshAfterRemoteCommit,
+            status: async () => ({ phase: 'running' as const, ...(commit() ? { lastRemoteCommit: commit()! } : {}) }),
+            start: async () => ({ phase: 'running' as const }),
+        },
+        sourcePollMilliseconds: 10,
+    })
+
+    it('processes a new remote commit exactly once', async () => {
+        vi.useFakeTimers()
+        const refreshAfterRemoteCommit = refreshStub()
+        let commit: ReturnType<typeof remoteCommit> | undefined
+        const controller = sharingController(refreshAfterRemoteCommit, () => commit)
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        commit = remoteCommit(12)
+
+        await vi.advanceTimersByTimeAsync(30)
+
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledWith(remoteCommit(12))
+        expect(controller.snapshot().remoteCommitRefreshPending).toBe(false)
+    })
+
+    it('retries the remote commit refresh after a failure', async () => {
+        vi.useFakeTimers()
+        const refreshAfterRemoteCommit = vi.fn()
+            .mockRejectedValueOnce(new Error('private refresh failure'))
+            .mockResolvedValueOnce({ discardedPendingEdits: false })
+        let commit: ReturnType<typeof remoteCommit> | undefined
+        const controller = sharingController(refreshAfterRemoteCommit, () => commit)
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        commit = remoteCommit(12)
+
+        await vi.advanceTimersByTimeAsync(10)
+        expect(controller.snapshot().remoteCommitRefreshPending).toBe(true)
+        expect(JSON.stringify(controller.snapshot())).not.toContain('private')
+
+        await vi.advanceTimersByTimeAsync(10)
+
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledTimes(2)
+        expect(controller.snapshot().remoteCommitRefreshPending).toBe(false)
+    })
+
+    it('keeps the notice when the flush conflicted', async () => {
+        vi.useFakeTimers()
+        const refreshAfterRemoteCommit = vi.fn(async () => ({ discardedPendingEdits: true }))
+        let commit: ReturnType<typeof remoteCommit> | undefined
+        const controller = sharingController(refreshAfterRemoteCommit, () => commit)
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        commit = remoteCommit(12)
+
+        await vi.advanceTimersByTimeAsync(30)
+
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
+        expect(controller.snapshot().remoteCommitRefreshPending).toBe(true)
+    })
+
+    it('treats an equal revision with a different operation id as new', async () => {
+        vi.useFakeTimers()
+        const refreshAfterRemoteCommit = refreshStub()
+        let commit: ReturnType<typeof remoteCommit> | undefined
+        const controller = sharingController(refreshAfterRemoteCommit, () => commit)
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        commit = remoteCommit(12)
+
+        await vi.advanceTimersByTimeAsync(10)
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
+
+        commit = remoteCommit(12, '00000000-0000-4000-8000-0000000000a2')
+        await vi.advanceTimersByTimeAsync(10)
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledTimes(2)
+
+        await vi.advanceTimersByTimeAsync(10)
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledTimes(2)
+    })
+
+    it('processes a remote commit observed during initialize', async () => {
+        vi.useFakeTimers()
+        const refreshAfterRemoteCommit = refreshStub()
+        const controller = sharingController(refreshAfterRemoteCommit, () => remoteCommit(12))
+
+        await controller.initialize()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledWith(remoteCommit(12))
+
+        await vi.advanceTimersByTimeAsync(30)
+
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
+    })
+
+    it('processes a remote commit observed by the stop status read', async () => {
+        const refreshAfterRemoteCommit = refreshStub()
+        const status = vi.fn()
+            .mockResolvedValueOnce({ phase: 'idle' as const })
+            .mockResolvedValue({ phase: 'idle' as const, lastRemoteCommit: remoteCommit(12) })
+        const controller = createDeviceSyncController({
+            facade: { ...sourceFacade(), refreshAfterRemoteCommit, status },
+        })
+        await controller.initialize()
+        expect(refreshAfterRemoteCommit).not.toHaveBeenCalled()
+
+        await controller.stop()
+        await Promise.resolve()
+
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledOnce()
+        expect(refreshAfterRemoteCommit).toHaveBeenCalledWith(remoteCommit(12))
+    })
+
+    it('clears the notice after a successful source operation', async () => {
+        vi.useFakeTimers()
+        const refreshAfterRemoteCommit = vi.fn(async () => ({ discardedPendingEdits: true }))
+        let commit: ReturnType<typeof remoteCommit> | undefined
+        const controller = sharingController(refreshAfterRemoteCommit, () => commit)
+        await controller.initialize()
+        await controller.start({ read: true, bidirectional: false })
+        commit = remoteCommit(12)
+        await vi.advanceTimersByTimeAsync(10)
+        expect(controller.snapshot().remoteCommitRefreshPending).toBe(true)
+
+        await controller.prepare({ method: 'lan', fixedPort: 32145, publicBaseUrl: '' })
+
+        expect(controller.snapshot().remoteCommitRefreshPending).toBe(false)
     })
 
     it('keeps source and receive errors in distinct snapshot scopes', async () => {

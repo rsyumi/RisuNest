@@ -1,6 +1,8 @@
 import type {
     DeviceSyncSettingsInput,
     DeviceSyncLinkPermissions,
+    DeviceSyncRemoteCommit,
+    DeviceSyncRemoteCommitRefresh,
     DeviceSyncStatus,
     RegisteredCloneSession,
     RegisteredDevice,
@@ -38,6 +40,7 @@ type SourceFacade = {
     outgoingDevices(): Promise<RegisteredDevice[]>
     revokeIncoming(deviceId: string): Promise<void>
     revokeOutgoing(deviceId: string): Promise<void>
+    refreshAfterRemoteCommit(commit: DeviceSyncRemoteCommit): Promise<DeviceSyncRemoteCommitRefresh>
     claimStagedClone?(link: StagedDeviceSyncLink): Promise<RegisteredCloneSession>
     reconnectRegisteredClone?(deviceId: string): Promise<RegisteredCloneSession>
 }
@@ -82,6 +85,12 @@ export interface DeviceSyncControllerSnapshot {
     error: DeviceSyncErrorCode | null
     sourceError: DeviceSyncErrorCode | null
     workError: DeviceSyncErrorCode | null
+    /**
+     * A peer commit reached this device but its working set could not be
+     * brought fully into line: either the refresh failed, or unsaved edits
+     * were lost to the peer's revision.
+     */
+    remoteCommitRefreshPending: boolean
     stagedLink: StagedDeviceSyncLink | null
     stagedUri: string | null
     stagedSourceDeviceId: string | null
@@ -98,7 +107,7 @@ export interface DeviceSyncControllerSnapshot {
 function createInitialSnapshot(): DeviceSyncControllerSnapshot {
     return {
         source: { phase: 'idle' }, sources: [], devices: [], error: null,
-        sourceError: null, workError: null,
+        sourceError: null, workError: null, remoteCommitRefreshPending: false,
         stagedLink: null, stagedUri: null, stagedSourceDeviceId: null,
         activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null,
         expiredSourceIds: [], targets: {},
@@ -141,6 +150,10 @@ export function createDeviceSyncController(options: {
     let stagedLinkEpoch = 0
     let rehostPrepared = false
     let disposed = false
+    // The native slot lives in process memory, so this high-water mark shares
+    // the controller's lifetime and needs no persistence of its own.
+    let handledRemoteCommit: DeviceSyncRemoteCommit | null = null
+    let remoteCommitInFlight: Promise<void> | undefined
 
     const publish = (): void => {
         snapshot = { ...snapshot, targets: { ...snapshot.targets } }
@@ -200,6 +213,7 @@ export function createDeviceSyncController(options: {
                     sourceError: source.latestError ?? null,
                     error: source.latestError ?? snapshot.workError,
                 })
+                await observeRemoteCommit(source)
                 if (!['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.stop()
             } catch (error) {
                 if (pollEpoch !== sourceEpoch) return
@@ -211,6 +225,32 @@ export function createDeviceSyncController(options: {
     const observeSource = (source: DeviceSyncStatus): void => {
         if (['preparing', 'prepared', 'starting', 'running', 'stopping'].includes(source.phase)) polling.start()
         else polling.stop()
+    }
+    // Store revisions rise monotonically, so the revision alone filters the
+    // normal duplicates; the operation id only settles a tie, which is what a
+    // replayed remote apply produces.
+    const isNewRemoteCommit = (commit: DeviceSyncRemoteCommit): boolean => {
+        if (!handledRemoteCommit) return true
+        if (commit.committedRevision > handledRemoteCommit.committedRevision) return true
+        return commit.committedRevision === handledRemoteCommit.committedRevision
+            && commit.operationId !== handledRemoteCommit.operationId
+    }
+    const observeRemoteCommit = async (source: DeviceSyncStatus): Promise<void> => {
+        const commit = source.lastRemoteCommit
+        if (!commit || !isNewRemoteCommit(commit)) return
+        if (remoteCommitInFlight) return remoteCommitInFlight
+        const work = options.facade.refreshAfterRemoteCommit(commit).then((result) => {
+            handledRemoteCommit = commit
+            update({ remoteCommitRefreshPending: result.discardedPendingEdits })
+        }).catch(() => {
+            // The mark stays behind on purpose: the next poll retries the
+            // same record rather than leaving the working set stale.
+            update({ remoteCommitRefreshPending: true })
+        }).finally(() => {
+            if (remoteCommitInFlight === work) remoteCommitInFlight = undefined
+        })
+        remoteCommitInFlight = work
+        return work
     }
     const beginSourceLifecycle = (): number => {
         sourceEpoch += 1
@@ -228,8 +268,11 @@ export function createDeviceSyncController(options: {
                 source,
                 sourceError: source.latestError ?? null,
                 error: source.latestError ?? snapshot.workError,
+                remoteCommitRefreshPending: false,
             })
             observeSource(source)
+            // Not awaited: a refresh must never hold up a source operation.
+            void observeRemoteCommit(source)
             return source
         } catch (error) {
             if (epoch === sourceEpoch) observeSource(snapshot.source)
@@ -384,6 +427,7 @@ export function createDeviceSyncController(options: {
                     error: source.latestError ?? snapshot.workError,
                 })
                 observeSource(source)
+                void observeRemoteCommit(source)
             }).catch((error) => {
                 initialized = false
                 initialization = undefined
@@ -606,6 +650,7 @@ export function createDeviceSyncController(options: {
             if (disposed) return
             disposed = true
             sourceEpoch += 1
+            remoteCommitInFlight = undefined
             polling.stop()
             unsubscribeDeepLink()
             for (const unsubscribe of targetUnsubscribers) unsubscribe?.()
