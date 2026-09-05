@@ -45,9 +45,7 @@ export function createPeerAndroidSourceForeground<
         throw primary
     }
     const recover = async (): Promise<void> => {
-        const pending = await options.invoke<Identity | null>('peer_sync_foreground_source_status', {
-            lane: options.lane,
-        })
+        const pending = await options.invoke<Identity | null>('peer_sync_foreground_source_status')
         if (pending?.lane === options.lane) await stopAndAbandon(pending)
     }
 

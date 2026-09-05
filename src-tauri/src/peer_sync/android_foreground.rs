@@ -329,13 +329,8 @@ pub(crate) fn peer_sync_foreground_source_abandon(
 
 #[tauri::command]
 #[cfg(target_os = "android")]
-pub(crate) fn peer_sync_foreground_source_status(
-    lane: AndroidForegroundLane,
-) -> Result<Option<AndroidForegroundKey>, String> {
-    if !lane.is_source() {
-        return Err("Android foreground lane is not a source lane".to_owned());
-    }
-    Ok(registry().source_status(lane))
+pub(crate) fn peer_sync_foreground_source_status() -> Option<AndroidForegroundKey> {
+    registry().source_status(AndroidForegroundLane::DeviceSyncSource)
 }
 
 #[cfg(test)]

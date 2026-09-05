@@ -100,7 +100,7 @@ describe('Android unified device sync source facade', () => {
         await expect(facade.start(permissions)).resolves.toEqual({ phase: 'running' })
 
         expect(calls).toEqual([
-            ['peer_sync_foreground_source_status', { lane: 'device-sync-source' }],
+            ['peer_sync_foreground_source_status', undefined],
             ['device_sync_source_reserve', undefined],
             ['device_sync_start', { permissions, foreground }],
         ])
