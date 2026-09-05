@@ -22,7 +22,7 @@ use super::{
         LanBidirectionalLogicalClient, LanBidirectionalLogicalCredential,
         LanBidirectionalRegistrationRequest, LanBidirectionalRemoteApplyReceipt,
         LanBidirectionalRemoteApplyRequest, LanBidirectionalSession, LanLogicalDeltaClient,
-        PreparedBidirectionalLogicalLanSession,
+        PreparedBidirectionalLogicalLanSession, SharedSessionSeal,
     },
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
     logical_delta_transfer::{
@@ -72,11 +72,11 @@ use tauri::{AppHandle, Manager, State};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-const OPERATION_SCHEMA: &str = "risunest.peer-bidirectional-operation/v1";
+pub(crate) const OPERATION_SCHEMA: &str = "risunest.peer-bidirectional-operation/v1";
 const OPERATION_FILE: &str = "operation.json";
 const ABANDON_CLAIM_FILE: &str = ".operation-abandon.claim";
 const MAX_OPERATION_BYTES: u64 = 1_048_576;
-const P5_SOURCE_PIN_PREFIX: &str = "logical-session-p5-source-";
+pub(crate) const P5_SOURCE_PIN_PREFIX: &str = "logical-session-p5-source-";
 
 #[cfg(test)]
 thread_local! {
@@ -5142,6 +5142,29 @@ pub(crate) fn prepare_shared_bidirectional_source(
     expected_revision: i64,
     remote_commit: Arc<SharedRemoteCommitSlot>,
 ) -> Result<PreparedSharedBidirectionalSource, PeerSyncError> {
+    store
+        .reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)
+        .map_err(store_error)?;
+    let sealed =
+        seal_shared_bidirectional_session(store, cas, app_root, expected_revision, remote_commit)?;
+    Ok(PreparedSharedBidirectionalSource {
+        session: Some(sealed.session),
+        sealed_revision: sealed.sealed_revision,
+    })
+}
+
+/// The bidirectional seal without the bulk pin reclaim, for the same reason as
+/// the delta lane: a hello reseal must leave the pins of retired sessions
+/// alone.  The retained-work refusal and the revision match both stay here, so
+/// a reseal defers while this device holds another device's operation and never
+/// advertises a manifest whose revision the store has already moved past.
+pub(crate) fn seal_shared_bidirectional_session(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    expected_revision: i64,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
+) -> Result<SharedSessionSeal<PreparedBidirectionalLogicalLanSession>, PeerSyncError> {
     let retained = PeerBidirectionalOperationJournal::new(app_root).load()?;
     let source_device_id = super::delta_commands::canonical_source_device_id(app_root)?;
     if retained
@@ -5152,9 +5175,6 @@ pub(crate) fn prepare_shared_bidirectional_source(
             "a target-owned bidirectional operation is retained".to_owned(),
         ));
     }
-    store
-        .reclaim_logical_generation_pins(P5_SOURCE_PIN_PREFIX)
-        .map_err(store_error)?;
     let actual = store.revision().map_err(store_error)?;
     if actual != expected_revision {
         return Err(store_error(StoreError::RevisionConflict {
@@ -5182,8 +5202,8 @@ pub(crate) fn prepare_shared_bidirectional_source(
         built.manifest_bytes,
         remote_commit,
     )?;
-    Ok(PreparedSharedBidirectionalSource {
-        session: Some(session),
+    Ok(SharedSessionSeal {
+        session,
         sealed_revision: expected_revision,
     })
 }

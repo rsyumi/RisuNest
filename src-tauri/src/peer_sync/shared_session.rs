@@ -5,7 +5,7 @@ use super::{
     device_registry::DevicePermissions,
     lan::{
         LanCloneHost, LanPairing, PreparedBidirectionalLogicalLanSession,
-        PreparedLogicalLanSession, SharedSessionSeal,
+        PreparedLogicalLanSession, SharedSessionResealer, SharedSessionSeal,
     },
     PeerSyncError, PreparedCloneSession,
 };
@@ -17,9 +17,12 @@ use std::sync::{Arc, Mutex};
 #[cfg(any(desktop, target_os = "android", test))]
 use super::{
     bidirectional_commands::{
-        prepare_shared_bidirectional_source, PreparedSharedBidirectionalSource,
+        prepare_shared_bidirectional_source, seal_shared_bidirectional_session,
+        PreparedSharedBidirectionalSource,
     },
-    delta_commands::{prepare_shared_delta_source, PreparedSharedDeltaSource},
+    delta_commands::{
+        prepare_shared_delta_source, seal_shared_delta_session, PreparedSharedDeltaSource,
+    },
     production::{prepare_unified_clone_source, PreparedUnifiedCloneSource},
 };
 #[cfg(desktop)]
@@ -269,6 +272,65 @@ impl<P: SharedSourceOwnership> SharedSessionLifecycle<P> {
     }
 }
 
+/// Owns the store handle the LAN thread reseals on.  It is the pattern the
+/// bidirectional control already uses: a second SQLite connection to the same
+/// WAL database, so a hello reseal never takes the live store lock the
+/// renderer commits through.
+#[cfg(any(desktop, target_os = "android", test))]
+pub(crate) struct SharedSourceResealEngine {
+    store: Mutex<PersistentStore>,
+    app_root: PathBuf,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
+}
+
+#[cfg(any(desktop, target_os = "android", test))]
+impl SharedSourceResealEngine {
+    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, PersistentStore>, PeerSyncError> {
+        self.store.lock().map_err(|error| {
+            PeerSyncError::Storage(format!(
+                "shared source reseal store mutex poisoned: {error}"
+            ))
+        })
+    }
+}
+
+#[cfg(any(desktop, target_os = "android", test))]
+impl SharedSessionResealer for SharedSourceResealEngine {
+    fn store_revision(&self) -> Result<i64, PeerSyncError> {
+        self.lock_store()?.revision().map_err(reseal_store_error)
+    }
+
+    fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
+        let cas = PayloadCas::new(&self.app_root)?;
+        let mut store = self.lock_store()?;
+        seal_shared_delta_session(&mut store, &cas, &self.app_root).map(|sealed| sealed.session)
+    }
+
+    fn reseal_bidirectional(
+        &self,
+    ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+        let cas = PayloadCas::new(&self.app_root)?;
+        let mut store = self.lock_store()?;
+        // The reseal expects the revision it just read, so the match only fails
+        // when the renderer committed between the read and the seal.  That lane
+        // then waits for the next hello.
+        let revision = store.revision().map_err(reseal_store_error)?;
+        seal_shared_bidirectional_session(
+            &mut store,
+            &cas,
+            &self.app_root,
+            revision,
+            Arc::clone(&self.remote_commit),
+        )
+        .map(|sealed| sealed.session)
+    }
+}
+
+#[cfg(any(desktop, target_os = "android", test))]
+fn reseal_store_error(error: StoreError) -> PeerSyncError {
+    PeerSyncError::Storage(error.to_string())
+}
+
 /// Concrete desktop adapter around the existing source preparation engines.
 /// It deliberately has no listener, tunnel, foreground-service, or Tauri
 /// command responsibility.  Those are layered above this preparation slice.
@@ -277,6 +339,7 @@ pub(crate) struct SharedSourceEngines {
     clone: Option<PreparedUnifiedCloneSource>,
     delta: Option<PreparedSharedDeltaSource>,
     bidirectional: Option<PreparedSharedBidirectionalSource>,
+    reseal: Option<Arc<SharedSourceResealEngine>>,
 }
 
 #[cfg(any(desktop, target_os = "android", test))]
@@ -286,6 +349,7 @@ impl SharedSourceEngines {
             clone: None,
             delta: None,
             bidirectional: None,
+            reseal: None,
         }
     }
 }
@@ -305,6 +369,9 @@ impl SharedSourceOwnership for SharedSourceEngines {
     type Host = SharedSessionHost;
 
     fn build_host(&mut self) -> Result<Self::Host, PeerSyncError> {
+        let resealer = self.reseal.clone().ok_or_else(|| {
+            PeerSyncError::Protocol("shared source reseal engine is not prepared".to_owned())
+        })?;
         let clone = self.clone.as_mut().ok_or_else(|| {
             PeerSyncError::Protocol("shared clone source is not prepared".to_owned())
         })?;
@@ -327,12 +394,16 @@ impl SharedSourceOwnership for SharedSourceEngines {
                 sealed_revision: bidirectional.sealed_revision(),
                 session: bidirectional.take_session()?,
             },
+            resealer,
         )
     }
 
     fn cleanup(&mut self, lane: SharedSourceLane) -> Result<(), PeerSyncError> {
         match lane {
             SharedSourceLane::Clone => {
+                // Cleanup runs in reverse preparation order, so releasing the
+                // reseal engine here outlives every session it could reseal.
+                self.reseal = None;
                 if let Some(clone) = self.clone.as_mut() {
                     clone.cleanup()?;
                     self.clone = None;
@@ -374,6 +445,18 @@ impl<'a> SharedSourcePreparation<SharedSourcePreparationContext<'a>> for SharedS
                     &context.app_root.join("peer-clone"),
                     context.cancellation,
                 )?);
+                // Clone runs first, so the engine exists before any lane the
+                // host will later reseal.
+                self.reseal = Some(Arc::new(SharedSourceResealEngine {
+                    store: Mutex::new(
+                        context
+                            .store
+                            .open_native_job_store()
+                            .map_err(reseal_store_error)?,
+                    ),
+                    app_root: context.app_root.to_path_buf(),
+                    remote_commit: Arc::clone(&context.remote_commit),
+                }));
             }
             SharedSourceLane::Delta => {
                 self.delta = Some(prepare_shared_delta_source(
@@ -2144,10 +2227,11 @@ impl SharedSessionHost {
         clone: SharedSessionSeal<PreparedCloneSession>,
         delta: SharedSessionSeal<PreparedLogicalLanSession>,
         bidirectional: SharedSessionSeal<PreparedBidirectionalLogicalLanSession>,
+        resealer: Arc<dyn SharedSessionResealer>,
     ) -> Result<Self, PeerSyncError> {
         Ok(Self {
             inner: Arc::new(Mutex::new(SharedSessionHostInner {
-                host: LanCloneHost::prepare_shared(clone, delta, bidirectional)?,
+                host: LanCloneHost::prepare_shared(clone, delta, bidirectional, resealer)?,
                 advertised_endpoint: None,
             })),
         })
@@ -2264,6 +2348,13 @@ impl SharedSessionHost {
         let result = inner.host.stop();
         inner.advertised_endpoint = None;
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control_for_test(
+        &self,
+    ) -> Result<super::lan::LanCloneHostControl, PeerSyncError> {
+        Ok(self.inner()?.host.control())
     }
 
     #[cfg(test)]

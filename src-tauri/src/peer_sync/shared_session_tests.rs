@@ -17,11 +17,19 @@ use super::{
 };
 #[cfg(desktop)]
 use super::{
+    bidirectional_commands::{
+        PeerBidirectionalDurableOperation, PeerBidirectionalOperationJournal,
+        OPERATION_SCHEMA as PEER_BIDIRECTIONAL_OPERATION_SCHEMA,
+    },
+    lan::{LanBidirectionalGeneration, SharedSessionKind, MAX_RETIRED_SESSIONS_PER_LANE},
+};
+#[cfg(desktop)]
+use super::{
     lan::{
         LanBidirectionalControl, LanBidirectionalRegistrationRequest,
         LanBidirectionalRemoteApplyReceipt, LanBidirectionalRemoteApplyRequest,
         LanBidirectionalSession, PreparedBidirectionalLogicalLanSession, PreparedLogicalLanSession,
-        SharedSessionSeal,
+        SharedSessionResealer, SharedSessionSeal,
     },
     logical_delta::{
         build_logical_manifest, LogicalManifestBuilderInput, LogicalManifestObject,
@@ -38,6 +46,8 @@ use super::{
     CloneSource, LogicalDeltaObject, LogicalDeltaObjectSource, PinnedCloneRevision,
     PinnedSourceObject,
 };
+#[cfg(desktop)]
+use crate::persistent_store::SyncGenerationIdentity;
 #[cfg(desktop)]
 use crate::{
     asset_repository::PayloadCas,
@@ -1396,6 +1406,22 @@ impl LogicalDeltaObjectSource for Empty {
         )))
     }
 }
+/// The transport fixtures seal every lane at revision zero and this reports
+/// the same, so hello never reseals inside them.
+struct NoReseal;
+impl SharedSessionResealer for NoReseal {
+    fn store_revision(&self) -> Result<i64, PeerSyncError> {
+        Ok(0)
+    }
+    fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
+        Err(PeerSyncError::Protocol("fixture".to_owned()))
+    }
+    fn reseal_bidirectional(
+        &self,
+    ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+        Err(PeerSyncError::Protocol("fixture".to_owned()))
+    }
+}
 struct Control;
 impl LanBidirectionalControl for Control {
     fn register(
@@ -1497,6 +1523,7 @@ fn host() -> (tempfile::TempDir, SharedSessionHost) {
             session: bidi,
             sealed_revision: 0,
         },
+        Arc::new(NoReseal),
     )
     .unwrap();
     host.enable_v2_registry(root.path(), "test", DevicePermissions::read())
@@ -3734,4 +3761,416 @@ fn stop_clears_runtime_and_restart_rehydrates_persisted_bearer() {
     );
     host.stop().unwrap();
 }
+}
+
+/// A prepared, running shared source over a real store, a real listener and the
+/// real preparation engines.  The lifecycle owns the host, so the store handle
+/// stays available for the local commits these scenarios make.
+#[cfg(desktop)]
+struct RealSharedSource {
+    root: tempfile::TempDir,
+    store: PersistentStore,
+    remote_commit: Arc<SharedRemoteCommitSlot>,
+    lifecycle: SharedSessionLifecycle<SharedSourceEngines>,
+    endpoint: String,
+    bearer: String,
+}
+
+#[cfg(desktop)]
+const RESEAL_TARGET_DEVICE_ID: &str = "00000000-0000-4000-8000-0000000004a1";
+
+#[cfg(desktop)]
+fn started_real_shared_source() -> RealSharedSource {
+    let root = tempfile::tempdir().unwrap();
+    let cas = PayloadCas::new(root.path()).unwrap();
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    seed_shared_source_store(&mut store);
+    let expected_revision = store.revision().unwrap();
+    let remote_commit = Arc::new(SharedRemoteCommitSlot::default());
+    let lifecycle = SharedSessionLifecycle::new(SharedSourceEngines::new());
+    {
+        let mut context = SharedSourcePreparationContext {
+            store: &mut store,
+            cas: &cas,
+            app_root: root.path(),
+            cancellation: &NeverCancelled,
+            expected_bidirectional_revision: expected_revision,
+            remote_commit: Arc::clone(&remote_commit),
+        };
+        lifecycle.prepare(&mut context).unwrap();
+    }
+    // A port the kernel just handed back is free without hard-coding one.
+    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let pairing = lifecycle
+        .with_host_mut(|host| {
+            host.enable_v2_registry(
+                root.path(),
+                "Windows",
+                DevicePermissions::read_and_bidirectional(),
+            )?;
+            host.start_fixed_loopback(port)
+        })
+        .unwrap()
+        .unwrap();
+    // The pairing link names the clone lane, so the claim goes through the raw
+    // endpoint instead of one lane's client.
+    let claimed = reqwest::blocking::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{}/claim",
+            pairing.endpoint, pairing.session_id
+        ))
+        .json(&serde_json::json!({
+            "claim": pairing.claim,
+            "deviceId": RESEAL_TARGET_DEVICE_ID,
+            "protocolVersion": 2,
+            "deviceName": "Android",
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(claimed.status(), reqwest::StatusCode::OK);
+    let bearer = claimed.json::<serde_json::Value>().unwrap()["bearer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    RealSharedSource {
+        root,
+        store,
+        remote_commit,
+        lifecycle,
+        endpoint: pairing.endpoint,
+        bearer,
+    }
+}
+
+#[cfg(desktop)]
+impl RealSharedSource {
+    fn hello_lanes(&self) -> serde_json::Value {
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{}/v1/peer/hello", self.endpoint))
+            .bearer_auth(&self.bearer)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json::<serde_json::Value>().unwrap()["lanes"].clone()
+    }
+
+    fn commit_local_change(&mut self, username: &str) {
+        let revision = self.store.revision().unwrap();
+        let staging = self.store.replace_begin().unwrap().staging_id;
+        self.store
+            .replace_put_root(
+                &staging,
+                &serde_json::json!({
+                    "username": username,
+                    "botPresetsId": 0,
+                    "personas": [{ "id": "persona" }],
+                    "selectedPersona": 0,
+                    "enabledModules": [],
+                    "characterOrder": [],
+                    "modules": [],
+                    "loadouts": [],
+                    "plugins": [],
+                    "pluginCustomStorage": {},
+                }),
+            )
+            .unwrap();
+        self.store
+            .replace_put_presets(&staging, &[serde_json::json!({ "name": "preset" })])
+            .unwrap();
+        self.store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &crate::persistent_store::AssetRepositoryAuthorityState::V2 {
+                    migration_id: "shared-source-assets".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        self.store
+            .replace_put_cold_payload_authority(
+                &staging,
+                &crate::persistent_store::ColdPayloadAuthorityState::V2 {
+                    migration_id: "shared-source-cold".to_owned(),
+                    compatibility_hash: "cd".repeat(32),
+                },
+            )
+            .unwrap();
+        self.store.replace_commit(&staging, Some(revision)).unwrap();
+    }
+
+    fn lane_sessions(&self) -> Vec<(SharedSessionKind, String, String, i64)> {
+        self.lifecycle
+            .with_host_mut(|host| host.control_for_test().unwrap().lane_sessions_for_test())
+            .unwrap()
+    }
+
+    fn retired_session_ids(&self) -> Vec<String> {
+        self.lifecycle
+            .with_host_mut(|host| {
+                host.control_for_test()
+                    .unwrap()
+                    .retired_session_ids_for_test()
+            })
+            .unwrap()
+    }
+}
+
+#[cfg(desktop)]
+fn lane_session_id(lanes: &serde_json::Value, lane: &str) -> String {
+    lanes[lane]["sessionId"].as_str().unwrap().to_owned()
+}
+
+#[cfg(desktop)]
+fn lane_manifest_id(lanes: &serde_json::Value, lane: &str) -> String {
+    lanes[lane]["manifestId"].as_str().unwrap().to_owned()
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_hello_reseals_the_logical_lanes_after_a_local_commit() {
+    let mut source = started_real_shared_source();
+    let before = source.hello_lanes();
+
+    source.commit_local_change("after-the-first-hello");
+    let after = source.hello_lanes();
+
+    for lane in ["delta", "bidirectional"] {
+        assert_ne!(
+            lane_session_id(&before, lane),
+            lane_session_id(&after, lane)
+        );
+        assert_ne!(
+            lane_manifest_id(&before, lane),
+            lane_manifest_id(&after, lane)
+        );
+    }
+    source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_hello_keeps_the_same_sessions_when_nothing_changed() {
+    let source = started_real_shared_source();
+
+    let first = source.hello_lanes();
+    let second = source.hello_lanes();
+    let third = source.hello_lanes();
+
+    assert_eq!(first, second);
+    assert_eq!(second, third);
+    assert!(source.retired_session_ids().is_empty());
+    source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_hello_leaves_the_clone_lane_at_its_prepared_seal() {
+    let mut source = started_real_shared_source();
+    let before = source.hello_lanes();
+    let prepared_clone = source
+        .lane_sessions()
+        .into_iter()
+        .find(|(kind, ..)| *kind == SharedSessionKind::Clone)
+        .unwrap();
+
+    source.commit_local_change("after-the-clone-seal");
+    let after = source.hello_lanes();
+
+    assert_eq!(
+        lane_session_id(&before, "clone"),
+        lane_session_id(&after, "clone")
+    );
+    assert_eq!(
+        lane_manifest_id(&before, "clone"),
+        lane_manifest_id(&after, "clone")
+    );
+    assert_eq!(prepared_clone.1, lane_session_id(&after, "clone"));
+    source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn a_retired_shared_delta_session_still_serves_its_manifest() {
+    let mut source = started_real_shared_source();
+    let before = source.hello_lanes();
+    let retired = lane_session_id(&before, "delta");
+
+    source.commit_local_change("after-the-retired-session");
+    let after = source.hello_lanes();
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{retired}/manifest",
+            source.endpoint
+        ))
+        .bearer_auth(&source.bearer)
+        .send()
+        .unwrap();
+
+    assert_ne!(lane_session_id(&after, "delta"), retired);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(reqwest::header::ETAG).unwrap(),
+        format!("\"{}\"", lane_manifest_id(&before, "delta")).as_str()
+    );
+    assert!(source.retired_session_ids().contains(&retired));
+    source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_reseal_keeps_the_generation_pin_count_bounded() {
+    let mut source = started_real_shared_source();
+
+    for round in 0..8 {
+        source.commit_local_change(&format!("pin-bound-{round}"));
+        source.hello_lanes();
+    }
+
+    // One live session plus the retirement cap, for both logical prefixes.
+    let bound = MAX_RETIRED_SESSIONS_PER_LANE + 1;
+    assert!(
+        source
+            .store
+            .count_logical_generation_pins(super::delta_commands::P4_SOURCE_PIN_PREFIX)
+            .unwrap()
+            <= bound
+    );
+    assert!(
+        source
+            .store
+            .count_logical_generation_pins(super::bidirectional_commands::P5_SOURCE_PIN_PREFIX)
+            .unwrap()
+            <= bound
+    );
+    source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_stop_releases_every_session_and_pin() {
+    let mut source = started_real_shared_source();
+    source.commit_local_change("before-stop");
+    source.hello_lanes();
+
+    source.lifecycle.stop().unwrap();
+
+    let root = source.root.path().to_path_buf();
+    drop(source);
+    let mut reopened = PersistentStore::open(&root).unwrap();
+    assert_eq!(
+        reopened
+            .reclaim_logical_generation_pins(super::delta_commands::P4_SOURCE_PIN_PREFIX)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        reopened
+            .reclaim_logical_generation_pins(super::bidirectional_commands::P5_SOURCE_PIN_PREFIX)
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_hello_defers_the_bidirectional_lane_while_a_target_operation_is_retained() {
+    let mut source = started_real_shared_source();
+    let before = source.hello_lanes();
+    retain_foreign_source_operation(source.root.path());
+
+    source.commit_local_change("while-a-target-operation-is-retained");
+    let after = source.hello_lanes();
+
+    assert_ne!(
+        lane_session_id(&before, "delta"),
+        lane_session_id(&after, "delta")
+    );
+    assert_eq!(
+        lane_session_id(&before, "bidirectional"),
+        lane_session_id(&after, "bidirectional")
+    );
+    source.lifecycle.stop().unwrap();
+}
+
+/// Writes a retained operation prepared for a different source device, which is
+/// exactly what `retained_allows_source_prepare` refuses.
+#[cfg(desktop)]
+fn retain_foreign_source_operation(app_root: &std::path::Path) {
+    let generation = |id: &str, fill: char| SyncGenerationIdentity {
+        generation_id: id.to_owned(),
+        manifest_hash: fill.to_string().repeat(64),
+        generation_sequence: "0".to_owned(),
+    };
+    PeerBidirectionalOperationJournal::new(app_root)
+        .store(&PeerBidirectionalDurableOperation::SourcePrepared {
+            schema: PEER_BIDIRECTIONAL_OPERATION_SCHEMA.to_owned(),
+            operation_id: "123e4567-e89b-42d3-a456-426614174300".to_owned(),
+            source_device_id: "123e4567-e89b-42d3-a456-426614174301".to_owned(),
+            target_device_id: "123e4567-e89b-42d3-a456-426614174302".to_owned(),
+            expected_source_revision: 0,
+            previous_shared: generation("previous", 'a'),
+            expected_source_generation: generation("source", 'b'),
+            shared_generation: LanBidirectionalGeneration {
+                generation_id: "shared".to_owned(),
+                manifest_hash: "c".repeat(64),
+                generation_sequence: "1".to_owned(),
+            },
+            incoming_revision: 1,
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            backup_required: false,
+            backup: None,
+            completion_deferred_v1: false,
+            durable_job_id: "123e4567-e89b-42d3-a456-426614174303".to_owned(),
+        })
+        .unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_hello_reseal_keeps_the_recorded_remote_commit() {
+    let mut source = started_real_shared_source();
+    source
+        .remote_commit
+        .record("00000000-0000-4000-8000-0000000004b1", 12);
+    let expected = Some(SharedRemoteCommit {
+        operation_id: "00000000-0000-4000-8000-0000000004b1".to_owned(),
+        committed_revision: 12,
+    });
+
+    source.commit_local_change("keeps-the-remote-commit");
+    source.hello_lanes();
+
+    assert_eq!(source.remote_commit.latest(), expected);
+    source.lifecycle.stop().unwrap();
+}
+
+#[cfg(desktop)]
+#[test]
+fn shared_reseal_hands_the_same_remote_commit_slot_to_the_new_session() {
+    let mut source = started_real_shared_source();
+    let before = source.hello_lanes();
+
+    source.commit_local_change("keeps-the-slot");
+    let after = source.hello_lanes();
+    let slot = source
+        .lifecycle
+        .with_host_mut(|host| {
+            host.control_for_test()
+                .unwrap()
+                .bidirectional_remote_commit_slot_for_test()
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_ne!(
+        lane_session_id(&before, "bidirectional"),
+        lane_session_id(&after, "bidirectional")
+    );
+    assert!(Arc::ptr_eq(&slot, &source.remote_commit));
+    source.lifecycle.stop().unwrap();
 }

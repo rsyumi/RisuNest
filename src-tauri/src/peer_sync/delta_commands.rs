@@ -22,7 +22,7 @@ use super::{
         DeltaCompletionContext, LanDeltaCompletionTransport, PeerDeltaCompletionJournal,
         RecoveredDeltaCompletion, RetainedDeltaCompletion, RetainedDeltaWitness,
     },
-    lan::{LanLogicalDeltaClient, PreparedLogicalLanSession},
+    lan::{LanLogicalDeltaClient, PreparedLogicalLanSession, SharedSessionSeal},
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
     LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError,
     ReadyLogicalDeltaPlan,
@@ -121,6 +121,22 @@ pub(crate) fn prepare_shared_delta_source(
     store
         .reclaim_logical_generation_pins(P4_SOURCE_PIN_PREFIX)
         .map_err(store_error)?;
+    let sealed = seal_shared_delta_session(store, cas, app_root)?;
+    Ok(PreparedSharedDeltaSource {
+        session: Some(sealed.session),
+        sealed_revision: sealed.sealed_revision,
+    })
+}
+
+/// The delta seal without the bulk pin reclaim.  A hello reseal must not
+/// reclaim: `reclaim_logical_generation_pins` clears every pin under the
+/// prefix, which would take the pins of retired sessions that are still
+/// serving a transfer.
+pub(crate) fn seal_shared_delta_session(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+) -> Result<SharedSessionSeal<PreparedLogicalLanSession>, PeerSyncError> {
     let built = store
         .seal_or_initialize_active_logical_generation(cas)
         .map_err(store_error)?;
@@ -147,8 +163,8 @@ pub(crate) fn prepare_shared_delta_source(
         objects,
         Box::new(session),
     )?;
-    Ok(PreparedSharedDeltaSource {
-        session: Some(prepared),
+    Ok(SharedSessionSeal {
+        session: prepared,
         sealed_revision,
     })
 }

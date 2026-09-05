@@ -165,7 +165,7 @@ const RETIRED_SESSION_GRACE_MS: u128 = 10 * 60 * 1000;
 /// logical generation pin, so the count is bounded rather than left to the
 /// grace window alone.
 #[cfg(any(desktop, target_os = "android"))]
-const MAX_RETIRED_SESSIONS_PER_LANE: usize = 4;
+pub(crate) const MAX_RETIRED_SESSIONS_PER_LANE: usize = 4;
 
 #[cfg(any(desktop, target_os = "android"))]
 pub struct LanPairing {
@@ -977,6 +977,14 @@ pub(crate) enum SharedSessionKind {
 #[cfg(any(desktop, target_os = "android"))]
 impl SharedSessionKind {
     const ALL: [Self; 3] = [Self::Clone, Self::Delta, Self::Bidirectional];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clone => "clone",
+            Self::Delta => "delta",
+            Self::Bidirectional => "bidirectional",
+        }
+    }
 }
 
 /// A prepared session together with the store revision it was sealed at.  The
@@ -1035,6 +1043,10 @@ impl SharedSessionTable {
             SharedSessionKind::Delta => self.delta.as_ref(),
             SharedSessionKind::Bidirectional => self.bidirectional.as_ref(),
         }
+    }
+
+    fn sealed_revision(&self, kind: SharedSessionKind) -> Option<i64> {
+        self.latest(kind).map(|entry| entry.sealed_revision)
     }
 
     fn descriptor(&self, kind: SharedSessionKind) -> Option<(String, String)> {
@@ -1127,9 +1139,24 @@ impl SharedSessionTable {
     }
 }
 
+/// Seam the shared source hands to its host so `hello` can reseal the two
+/// logical lanes at the current store revision.  It keeps `lan` free of a
+/// `PersistentStore` dependency, exactly as `LanBidirectionalControl` does,
+/// and lets the LAN tests drive a reseal without a real store.
+#[cfg(any(desktop, target_os = "android"))]
+pub(crate) trait SharedSessionResealer: Send + Sync {
+    fn store_revision(&self) -> Result<i64, PeerSyncError>;
+    fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError>;
+    fn reseal_bidirectional(&self)
+        -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError>;
+}
+
 #[cfg(any(desktop, target_os = "android"))]
 struct LanShared {
     sessions: Mutex<SharedSessionTable>,
+    /// Present only on a shared host.  A host that opens one lane for a single
+    /// operation never reseals.
+    resealer: Option<Arc<dyn SharedSessionResealer>>,
     claim: Mutex<Option<ClaimState>>,
     #[cfg(desktop)]
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
@@ -1351,6 +1378,54 @@ fn primary_session(shared: &LanShared) -> Result<Arc<LanSession>, PeerSyncError>
         .ok_or_else(|| PeerSyncError::Protocol("shared LAN host has no pairing session".to_owned()))
 }
 
+/// Reseals the two logical lanes at the current store revision.  `hello` calls
+/// it before it reads the descriptors, so a registered peer always resolves the
+/// lane that matches this device's data right now.
+///
+/// Two orderings matter.  The seal runs outside the table lock, because it does
+/// store I/O and the preparation thread reads the same table.  And the table is
+/// replaced before the response goes out, so a client that gives up on its five
+/// second hello budget still finds the new session on its retry.
+///
+/// Every failure keeps the lane exactly as it was and shows up in the native
+/// log only: the worst outcome of a failed reseal is the behaviour that existed
+/// before this refresh.
+#[cfg(any(desktop, target_os = "android"))]
+fn refresh_shared_sessions(shared: &LanShared) {
+    let Some(resealer) = shared.resealer.as_ref() else {
+        return;
+    };
+    let revision = match resealer.store_revision() {
+        Ok(revision) => revision,
+        Err(error) => {
+            crate::nlog!("warn", "shared session reseal skipped: {error}");
+            return;
+        }
+    };
+    for kind in [SharedSessionKind::Delta, SharedSessionKind::Bidirectional] {
+        if recovered_lock(&shared.sessions).sealed_revision(kind) == Some(revision) {
+            continue;
+        }
+        let sealed = match kind {
+            SharedSessionKind::Delta => resealer.reseal_delta().map(LanSession::Logical),
+            SharedSessionKind::Bidirectional => resealer
+                .reseal_bidirectional()
+                .map(LanSession::BidirectionalLogical),
+            SharedSessionKind::Clone => continue,
+        };
+        match sealed {
+            Ok(session) => {
+                recovered_lock(&shared.sessions).install_at(kind, session, revision, now_ms());
+            }
+            Err(error) => crate::nlog!(
+                "warn",
+                "shared {} session reseal failed: {error}",
+                kind.as_str()
+            ),
+        }
+    }
+}
+
 #[cfg(any(desktop, target_os = "android"))]
 #[derive(Clone)]
 pub(crate) struct LanCloneHostControl {
@@ -1406,6 +1481,54 @@ impl LanCloneHostControl {
     pub(crate) fn is_attached_for_test(&self) -> bool {
         self.shared.strong_count() != 0
     }
+
+    /// The newest session of every lane as `(kind, session id, manifest id,
+    /// sealed revision)`. Production never reads the table back; a reseal is
+    /// invisible above the transport, so only the tests observe it.
+    #[cfg(test)]
+    pub(crate) fn lane_sessions_for_test(&self) -> Vec<(SharedSessionKind, String, String, i64)> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let table = recovered_lock(&shared.sessions);
+        SharedSessionKind::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                table.latest(kind).map(|entry| {
+                    (
+                        kind,
+                        entry.session.session_id().to_owned(),
+                        entry.session.manifest_id().to_owned(),
+                        entry.sealed_revision,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_session_ids_for_test(&self) -> Vec<String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let table = recovered_lock(&shared.sessions);
+        table
+            .retired
+            .iter()
+            .map(|entry| entry.session.session_id().to_owned())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bidirectional_remote_commit_slot_for_test(
+        &self,
+    ) -> Option<Arc<SharedRemoteCommitSlot>> {
+        let shared = self.shared.upgrade()?;
+        let table = recovered_lock(&shared.sessions);
+        table
+            .latest(SharedSessionKind::Bidirectional)
+            .and_then(|entry| entry.session.remote_commit_slot().cloned())
+    }
 }
 
 #[cfg(any(desktop, target_os = "android"))]
@@ -1419,10 +1542,14 @@ pub struct LanCloneHost {
 
 #[cfg(any(desktop, target_os = "android"))]
 impl LanCloneHost {
-    fn with_sessions(sessions: SharedSessionTable) -> Self {
+    fn with_sessions(
+        sessions: SharedSessionTable,
+        resealer: Option<Arc<dyn SharedSessionResealer>>,
+    ) -> Self {
         Self {
             shared: Arc::new(LanShared {
                 sessions: Mutex::new(sessions),
+                resealer,
                 claim: Mutex::new(None),
                 #[cfg(desktop)]
                 tunnel_probe: Mutex::new(None),
@@ -1445,7 +1572,7 @@ impl LanCloneHost {
         let kind = session.kind();
         let mut sessions = SharedSessionTable::new(kind);
         sessions.install_at(kind, session, 0, now_ms());
-        Self::with_sessions(sessions)
+        Self::with_sessions(sessions, None)
     }
 
     // Physical clone hosting has no production caller left: the unified device
@@ -1474,6 +1601,7 @@ impl LanCloneHost {
         clone: SharedSessionSeal<PreparedCloneSession>,
         delta: SharedSessionSeal<PreparedLogicalLanSession>,
         bidirectional: SharedSessionSeal<PreparedBidirectionalLogicalLanSession>,
+        resealer: Arc<dyn SharedSessionResealer>,
     ) -> Result<Self, PeerSyncError> {
         let seals = [
             (
@@ -1508,7 +1636,7 @@ impl LanCloneHost {
         for (kind, session, sealed_revision) in seals {
             sessions.install_at(kind, session, sealed_revision, now);
         }
-        Ok(Self::with_sessions(sessions))
+        Ok(Self::with_sessions(sessions, Some(resealer)))
     }
 
     // Decides what a claim on this host does: a registered clone or shared host
@@ -3153,6 +3281,7 @@ fn hello(
     let Some(registration) = recovered_lock(&shared.v2_registration).clone() else {
         return respond_empty(stream, 404);
     };
+    refresh_shared_sessions(shared);
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct LaneDescriptor {
@@ -8699,6 +8828,401 @@ mod timeout_tests {
         assert!(SharedSessionTable::new(SharedSessionKind::Clone)
             .primary()
             .is_none());
+    }
+    #[derive(Default)]
+    struct ResealerFixture {
+        revision: Mutex<i64>,
+        revision_error: Mutex<bool>,
+        delta: Mutex<Vec<PreparedLogicalLanSession>>,
+        bidirectional: Mutex<Vec<PreparedBidirectionalLogicalLanSession>>,
+        delta_calls: Mutex<usize>,
+        bidirectional_calls: Mutex<usize>,
+        delta_error: Mutex<bool>,
+        bidirectional_error: Mutex<bool>,
+    }
+
+    impl ResealerFixture {
+        fn queue_delta(&self, session_id: &str) {
+            self.delta
+                .lock()
+                .unwrap()
+                .push(prepared_logical_session(session_id, TABLE_SOURCE_ID));
+        }
+
+        fn queue_bidirectional(&self, session_id: &str) {
+            self.bidirectional
+                .lock()
+                .unwrap()
+                .push(prepared_bidirectional_logical_session(
+                    session_id,
+                    TABLE_SOURCE_ID,
+                    Arc::new(BidirectionalControlFixture::default()),
+                ));
+        }
+
+        fn set_revision(&self, revision: i64) {
+            *self.revision.lock().unwrap() = revision;
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            (
+                *self.delta_calls.lock().unwrap(),
+                *self.bidirectional_calls.lock().unwrap(),
+            )
+        }
+    }
+
+    impl SharedSessionResealer for ResealerFixture {
+        fn store_revision(&self) -> Result<i64, PeerSyncError> {
+            if *self.revision_error.lock().unwrap() {
+                return Err(PeerSyncError::Storage("fixture revision".to_owned()));
+            }
+            Ok(*self.revision.lock().unwrap())
+        }
+
+        fn reseal_delta(&self) -> Result<PreparedLogicalLanSession, PeerSyncError> {
+            *self.delta_calls.lock().unwrap() += 1;
+            if *self.delta_error.lock().unwrap() {
+                return Err(PeerSyncError::Storage("fixture delta seal".to_owned()));
+            }
+            let mut queued = self.delta.lock().unwrap();
+            if queued.is_empty() {
+                return Err(PeerSyncError::Protocol(
+                    "fixture delta exhausted".to_owned(),
+                ));
+            }
+            Ok(queued.remove(0))
+        }
+
+        fn reseal_bidirectional(
+            &self,
+        ) -> Result<PreparedBidirectionalLogicalLanSession, PeerSyncError> {
+            *self.bidirectional_calls.lock().unwrap() += 1;
+            if *self.bidirectional_error.lock().unwrap() {
+                return Err(PeerSyncError::Storage(
+                    "fixture bidirectional seal".to_owned(),
+                ));
+            }
+            let mut queued = self.bidirectional.lock().unwrap();
+            if queued.is_empty() {
+                return Err(PeerSyncError::Protocol(
+                    "fixture bidirectional exhausted".to_owned(),
+                ));
+            }
+            Ok(queued.remove(0))
+        }
+    }
+
+    struct ResealCloneFixture(PathBuf);
+    struct ResealCloneLease(PathBuf);
+
+    impl super::super::CloneSource for ResealCloneFixture {
+        type Lease = ResealCloneLease;
+
+        fn pin(&self) -> Result<Self::Lease, PeerSyncError> {
+            Ok(ResealCloneLease(self.0.clone()))
+        }
+    }
+
+    impl super::super::PinnedCloneRevision for ResealCloneLease {
+        fn source_revision(&self) -> u64 {
+            1
+        }
+
+        fn objects(&self) -> Result<Vec<super::super::PinnedSourceObject>, PeerSyncError> {
+            Ok(vec![super::super::PinnedSourceObject::database(&self.0)])
+        }
+    }
+
+    /// A shared host with the three prepared lanes and a reseal seam under the
+    /// test's control, which is what `hello` reads before it answers.
+    fn shared_reseal_host(
+        root: &Path,
+        delta_id: &str,
+        bidirectional_id: &str,
+        sealed_revision: i64,
+        resealer: Arc<ResealerFixture>,
+    ) -> LanCloneHost {
+        let database = root.join("clone-source.db");
+        fs::write(&database, b"{}").unwrap();
+        let clone = super::super::prepare_clone_session(
+            &ResealCloneFixture(database),
+            root.join("clone-session"),
+        )
+        .unwrap();
+        LanCloneHost::prepare_shared(
+            SharedSessionSeal {
+                session: clone,
+                sealed_revision,
+            },
+            SharedSessionSeal {
+                session: prepared_logical_session(delta_id, TABLE_SOURCE_ID),
+                sealed_revision,
+            },
+            SharedSessionSeal {
+                session: prepared_bidirectional_logical_session(
+                    bidirectional_id,
+                    TABLE_SOURCE_ID,
+                    Arc::new(BidirectionalControlFixture::default()),
+                ),
+                sealed_revision,
+            },
+            resealer,
+        )
+        .unwrap()
+    }
+
+    fn started_reseal_host(source_root: &Path, host: &mut LanCloneHost) -> (String, String) {
+        host.enable_v2_registry(
+            source_root,
+            "Windows",
+            DevicePermissions::read_and_bidirectional(),
+        )
+        .unwrap();
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        // The pairing link names the clone lane, so the claim goes through the
+        // raw endpoint rather than one lane client.
+        let claimed = reqwest::blocking::Client::new()
+            .post(format!(
+                "{endpoint}/v1/sessions/{}/claim",
+                pairing.session_id
+            ))
+            .json(&ClaimRequest {
+                claim: pairing.claim.clone(),
+                device_id: Some("00000000-0000-4000-8000-0000000002ff".to_owned()),
+                protocol_version: CLAIM_PROTOCOL_VERSION,
+                device_name: Some("Android".to_owned()),
+                permissions: None,
+            })
+            .send()
+            .unwrap();
+        assert_eq!(claimed.status(), reqwest::StatusCode::OK);
+        let bearer = claimed.json::<serde_json::Value>().unwrap()["bearer"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (endpoint, bearer)
+    }
+
+    fn hello_lanes(endpoint: &str, bearer: &str) -> serde_json::Value {
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{endpoint}/v1/peer/hello"))
+            .bearer_auth(bearer)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json::<serde_json::Value>().unwrap()["lanes"].clone()
+    }
+
+    fn lane_session_id(lanes: &serde_json::Value, lane: &str) -> String {
+        lanes[lane]["sessionId"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn hello_reseals_both_logical_lanes_when_the_revision_moved() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.queue_delta("00000000-0000-4000-8000-000000000201");
+        resealer.queue_bidirectional("00000000-0000-4000-8000-000000000202");
+        resealer.set_revision(7);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000203",
+            "00000000-0000-4000-8000-000000000204",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let before = hello_lanes(&endpoint, &bearer);
+        let clone_before = lane_session_id(&before, "clone");
+
+        assert_eq!(
+            lane_session_id(&before, "delta"),
+            "00000000-0000-4000-8000-000000000201"
+        );
+        assert_eq!(
+            lane_session_id(&before, "bidirectional"),
+            "00000000-0000-4000-8000-000000000202"
+        );
+        // The clone lane keeps its prepared seal: only the two logical lanes
+        // reseal at hello time.
+        assert_eq!(lane_session_id(&before, "clone"), clone_before);
+        assert_eq!(resealer.calls(), (1, 1));
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn hello_does_not_reseal_when_the_revision_is_unchanged() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.set_revision(4);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000205",
+            "00000000-0000-4000-8000-000000000206",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let first = hello_lanes(&endpoint, &bearer);
+        let second = hello_lanes(&endpoint, &bearer);
+        let third = hello_lanes(&endpoint, &bearer);
+
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert_eq!(
+            lane_session_id(&first, "delta"),
+            "00000000-0000-4000-8000-000000000205"
+        );
+        assert_eq!(resealer.calls(), (0, 0));
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn hello_keeps_the_previous_session_when_a_reseal_fails() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        *resealer.delta_error.lock().unwrap() = true;
+        *resealer.bidirectional_error.lock().unwrap() = true;
+        resealer.set_revision(9);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-000000000207",
+            "00000000-0000-4000-8000-000000000208",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let lanes = hello_lanes(&endpoint, &bearer);
+
+        assert_eq!(
+            lane_session_id(&lanes, "delta"),
+            "00000000-0000-4000-8000-000000000207"
+        );
+        assert_eq!(
+            lane_session_id(&lanes, "bidirectional"),
+            "00000000-0000-4000-8000-000000000208"
+        );
+        assert_eq!(resealer.calls(), (1, 1));
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn hello_reseals_the_other_lane_when_one_lane_fails() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let resealer = Arc::new(ResealerFixture::default());
+        *resealer.delta_error.lock().unwrap() = true;
+        resealer.queue_bidirectional("00000000-0000-4000-8000-000000000209");
+        resealer.set_revision(9);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            "00000000-0000-4000-8000-00000000020a",
+            "00000000-0000-4000-8000-00000000020b",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let lanes = hello_lanes(&endpoint, &bearer);
+
+        assert_eq!(
+            lane_session_id(&lanes, "delta"),
+            "00000000-0000-4000-8000-00000000020a"
+        );
+        assert_eq!(
+            lane_session_id(&lanes, "bidirectional"),
+            "00000000-0000-4000-8000-000000000209"
+        );
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn a_retired_session_id_still_serves_its_manifest() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let retired = "00000000-0000-4000-8000-00000000020c";
+        let resealer = Arc::new(ResealerFixture::default());
+        resealer.queue_delta("00000000-0000-4000-8000-00000000020d");
+        resealer.queue_bidirectional("00000000-0000-4000-8000-00000000020e");
+        resealer.set_revision(11);
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            retired,
+            "00000000-0000-4000-8000-00000000020f",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+
+        let lanes = hello_lanes(&endpoint, &bearer);
+        assert_ne!(lane_session_id(&lanes, "delta"), retired);
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{endpoint}/v1/sessions/{retired}/manifest"))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn a_retired_session_dropped_by_the_cap_answers_404() {
+        let _guard = LOGICAL_LAN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_root = tempfile::tempdir().unwrap();
+        let dropped = "00000000-0000-4000-8000-000000000210";
+        let resealer = Arc::new(ResealerFixture::default());
+        for id in [
+            "00000000-0000-4000-8000-000000000211",
+            "00000000-0000-4000-8000-000000000212",
+            "00000000-0000-4000-8000-000000000213",
+            "00000000-0000-4000-8000-000000000214",
+            "00000000-0000-4000-8000-000000000215",
+            "00000000-0000-4000-8000-000000000216",
+        ] {
+            resealer.queue_delta(id);
+        }
+        let mut host = shared_reseal_host(
+            source_root.path(),
+            dropped,
+            "00000000-0000-4000-8000-000000000217",
+            4,
+            Arc::clone(&resealer),
+        );
+        let (endpoint, bearer) = started_reseal_host(source_root.path(), &mut host);
+        for revision in 5..11 {
+            resealer.set_revision(revision);
+            hello_lanes(&endpoint, &bearer);
+        }
+
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{endpoint}/v1/sessions/{dropped}/manifest"))
+            .bearer_auth(&bearer)
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        host.stop().unwrap();
     }
 }
 
