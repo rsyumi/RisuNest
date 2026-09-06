@@ -168,7 +168,7 @@
             <div class="w-full justify-center flex mt-8 logo-animation" onanimationend={() => {
                 start = true
             }}>
-                <img src="/logo_typo_trans.png" alt="logo" class="w-full max-w-(--breakpoint-sm)  mb-0">
+                <img src="/wordmark-transparent.svg" alt="RisuNest" class="w-full max-w-(--breakpoint-sm) mb-0">
             </div>
         {:else}
             <div class="relative w-full flex-col bg-darkbg grow mt-5 max-w-full p-5 rounded-t-lg overflow-x-hidden flex border-gray-800 border chat-animation overflow-y-auto">

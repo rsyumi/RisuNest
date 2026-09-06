@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="9 9 492 492"><defs>
+        <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="510" y2="510">
+            <stop offset="0.186" stop-color="#05AAB5"></stop>
+            <stop offset="0.294" stop-color="#13A4C4"></stop>
+            <stop offset="0.392" stop-color="#2799D6"></stop>
+            <stop offset="0.588" stop-color="#4687F1"></stop>
+            <stop offset="0.716" stop-color="#5878FD"></stop>
+        </linearGradient>
+        <linearGradient id="inner" gradientUnits="userSpaceOnUse" x1="0" y1="234" x2="0" y2="296">
+            <stop offset="0" stop-color="#CEE1FD"></stop>
+            <stop offset="1" stop-color="#B3CFFC"></stop>
+        </linearGradient>
+        <linearGradient id="bowl" gradientUnits="userSpaceOnUse" x1="0" y1="290" x2="0" y2="392">
+            <stop offset="0" stop-color="#FEFEFE"></stop>
+            <stop offset="1" stop-color="#DCEAFD"></stop>
+        </linearGradient>
+    </defs><rect x="9" y="9" width="492" height="492" fill="url(#bg)"/></svg>
