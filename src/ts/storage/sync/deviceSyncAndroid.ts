@@ -62,6 +62,13 @@ export function createAndroidDeviceSyncFacade(options: AndroidDeviceSyncFacadeOp
     const nativeInvoke = options.invoke ?? invoke
     const bridge = options.bridge ?? nativeBridge()
     const desktopShape = createDeviceSyncFacade({ invoke: nativeInvoke, runtime: options.runtime })
+    // `peer_clone_claim_registered_client` answers with the Android registered clone status
+    // instead of the desktop registered clone session, so the Android facade never advertises
+    // the desktop reconnect entry point. The clone target's `joinRegistered` covers this lane.
+    const {
+        reconnectRegisteredClone: _desktopReconnectRegisteredClone,
+        ...androidShape
+    } = desktopShape
     let pendingBridgeStop: AndroidDeviceSyncForegroundIdentity | undefined
 
     const stopPendingBridge = (): void => {
@@ -79,7 +86,7 @@ export function createAndroidDeviceSyncFacade(options: AndroidDeviceSyncFacadeOp
     }
 
     return {
-        ...desktopShape,
+        ...androidShape,
         async prepare(settings: DeviceSyncSettingsInput): Promise<DeviceSyncStatus> {
             if (settings.method !== 'lan') {
                 throw new DeviceSyncError('invalid-configuration')

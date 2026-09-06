@@ -110,6 +110,13 @@ describe('Android unified device sync source facade', () => {
         expect(invoke).not.toHaveBeenCalled()
     })
 
+    it('omits the desktop registered clone reconnect that Android answers with another shape', () => {
+        const { facade } = fixture()
+
+        expect('reconnectRegisteredClone' in facade).toBe(false)
+        expect(createDeviceSyncController({ facade }).snapshot().error).toBeNull()
+    })
+
     it('exposes the shared remote commit refresh on the same mutation runtime', async () => {
         const { facade, runtime } = fixture()
 

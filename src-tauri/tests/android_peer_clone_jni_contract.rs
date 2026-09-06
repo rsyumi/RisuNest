@@ -6,6 +6,8 @@ static FORCE_RISUAI_LIBRARY_LINK: fn() = risuai_lib::run;
 unsafe extern "system" {
     fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume();
     fn Java_co_aiclient_risu_PeerCloneNativeBridge_pause();
+    fn Java_co_aiclient_risu_PeerCloneNativeBridge_setForegroundAllowed();
+    fn Java_co_aiclient_risu_PeerCloneNativeBridge_requestCancel();
     fn Java_co_aiclient_risu_PeerCloneNativeBridge_cancelAndCleanup();
     fn Java_co_aiclient_risu_PeerCloneNativeBridge_cleanupCompleted();
     fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_attach();
@@ -23,6 +25,8 @@ fn android_peer_clone_jni_symbols_are_linked() {
     let symbols = [
         Java_co_aiclient_risu_PeerCloneNativeBridge_resume as *const (),
         Java_co_aiclient_risu_PeerCloneNativeBridge_pause as *const (),
+        Java_co_aiclient_risu_PeerCloneNativeBridge_setForegroundAllowed as *const (),
+        Java_co_aiclient_risu_PeerCloneNativeBridge_requestCancel as *const (),
         Java_co_aiclient_risu_PeerCloneNativeBridge_cancelAndCleanup as *const (),
         Java_co_aiclient_risu_PeerCloneNativeBridge_cleanupCompleted as *const (),
         Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_attach as *const (),

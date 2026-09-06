@@ -556,6 +556,69 @@ describe('SqlitePersistentDataStore', () => {
         expect(mocks.invoke).toHaveBeenCalledTimes(19)
     })
 
+    it('retains the native open report and warns when a snapshot restore was skipped', async () => {
+        const openResult = {
+            revision: 12,
+            assetGcMaintenance: {
+                report: {
+                    markedHashes: ['aa'.repeat(32)],
+                    graceRetainedHashes: [],
+                    potentialDeleteHashes: ['bb'.repeat(32)],
+                    potentialDeleteBytes: 64,
+                    deletedHashes: [],
+                    deletedBytes: 0,
+                    blockers: ['cold-payload-unscanned'],
+                    deletionEnabled: false,
+                },
+                nextCursor: null,
+            },
+            restoreFailure: 'persistent snapshot restore skipped: integrity check failed',
+        }
+        mocks.invoke.mockResolvedValue(openResult)
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        const store = new SqlitePersistentDataStore()
+
+        expect(store.lastOpenResult).toBeNull()
+        await store.open()
+
+        expect(store.lastOpenResult).toEqual(openResult)
+        expect(store.lastOpenResult?.assetGcMaintenance.report.blockers)
+            .toEqual(['cold-payload-unscanned'])
+        expect(warn).toHaveBeenCalledOnce()
+        expect(warn.mock.calls[0][0]).toContain(openResult.restoreFailure)
+        warn.mockRestore()
+    })
+
+    it('keeps the open report without warning when no snapshot restore was skipped', async () => {
+        const openResult = {
+            revision: 3,
+            assetGcMaintenance: {
+                report: {
+                    markedHashes: [],
+                    graceRetainedHashes: [],
+                    potentialDeleteHashes: [],
+                    potentialDeleteBytes: 0,
+                    deletedHashes: [],
+                    deletedBytes: 0,
+                    blockers: [],
+                    deletionEnabled: true,
+                },
+                nextCursor: 'asset-gc-cursor',
+            },
+        }
+        mocks.invoke.mockResolvedValue(openResult)
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        const store = new SqlitePersistentDataStore()
+
+        await store.open()
+
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_open')
+        expect(store.lastOpenResult).toEqual(openResult)
+        expect(store.lastOpenResult?.restoreFailure).toBeUndefined()
+        expect(warn).not.toHaveBeenCalled()
+        warn.mockRestore()
+    })
+
     it('keeps a lease active and retries native cleanup after release fails', async () => {
         const releaseError = new Error('native release failed')
         let releaseCalls = 0

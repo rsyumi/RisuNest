@@ -43,6 +43,32 @@ const MAX_STAGED_CHARACTER_BYTES = 4 * 1024 * 1024
 const MAX_STAGED_ASSET_RECORDS = 512
 const textEncoder = new TextEncoder()
 
+/** Mirrors the Rust `AssetGcDryRunReport` that `pds_open` reports for the asset repository. */
+export interface PersistentAssetGcReport {
+    markedHashes: string[]
+    graceRetainedHashes: string[]
+    potentialDeleteHashes: string[]
+    potentialDeleteBytes: number
+    deletedHashes: string[]
+    deletedBytes: number
+    blockers: string[]
+    deletionEnabled: boolean
+}
+
+/** Mirrors the Rust `AssetGcDryRunPage`: one report page plus its continuation cursor. */
+export interface PersistentAssetGcMaintenance {
+    report: PersistentAssetGcReport
+    nextCursor: string | null
+}
+
+/** Mirrors the Rust `PersistentStoreOpenResult` returned by the `pds_open` command. */
+export interface PersistentStoreOpenResult {
+    revision: DataRevision
+    assetGcMaintenance: PersistentAssetGcMaintenance
+    /** Present when a requested snapshot restore was skipped and the old database stayed active. */
+    restoreFailure?: string
+}
+
 interface NativeStoreError {
     code?: string
     message?: string
@@ -118,8 +144,19 @@ function batches<T>(values: T[], limit: number): T[][] {
 }
 
 export class SqlitePersistentDataStore implements PersistentDataStore {
+    /** The payload of the most recent `pds_open`, so callers can inspect the open-time report. */
+    lastOpenResult: PersistentStoreOpenResult | null = null
+
     async open(): Promise<void> {
-        await invokeStore<{ revision: DataRevision }>('pds_open')
+        const result = await invokeStore<PersistentStoreOpenResult>('pds_open')
+        this.lastOpenResult = result
+        if (result?.restoreFailure) {
+            // The native side already wrote this to the native log, but the web layer keeps its
+            // own console breadcrumb so a skipped restore is not silent in the frontend.
+            console.warn(
+                `Persistent store opened without the requested snapshot restore: ${result.restoreFailure}`,
+            )
+        }
     }
 
     readRoot(): Promise<Versioned<PersistentRoot>> {
