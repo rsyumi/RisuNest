@@ -9,14 +9,14 @@ import {
 
 test('benchmark config isolates the profile and standalone frontend', () => {
     const original = {
-        identifier: 'co.aiclient.risu',
+        identifier: 'RisuNest',
         build: { frontendDist: '../dist' },
         bundle: { active: true },
         app: { windows: [{}] },
     }
     const config = buildBenchmarkConfig(original, 9333, 'run-123')
 
-    assert.equal(config.identifier, 'co.aiclient.risu.regexnativepilot.run123')
+    assert.equal(config.identifier, 'RisuNest.regexnativepilot.run123')
     assert.equal(config.bundle.active, false)
     assert.equal(config.build.frontendDist, '../node_modules/.cache/regex-native-pilot')
     assert.match(config.app.windows[0].additionalBrowserArgs, /--remote-debugging-port=9333/)

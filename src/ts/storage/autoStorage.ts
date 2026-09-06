@@ -50,7 +50,7 @@ export class AutoStorage{
                 console.log("using opfs storage")
 
                 const forage = localforage.createInstance({
-                    name: "risuai"
+                    name: "risunest"
                 })
 
                 const i = await forage.getItem("database/database.bin")
@@ -83,7 +83,7 @@ export class AutoStorage{
             }
             console.log("using forage storage")
             this.realStorage = localforage.createInstance({
-                name: "risuai"
+                name: "risunest"
             })
         }
     }

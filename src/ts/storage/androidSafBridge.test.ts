@@ -312,7 +312,7 @@ describe('Android SAF bridge', () => {
         })
 
         const result = await copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/files/persistent/exports/risusave-a.risudat',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/files/persistent/exports/risusave-a.risudat',
             suggestedName: 'backup.risudat',
         }, {
             createRequestId: () => 'request-1',
@@ -323,7 +323,7 @@ describe('Android SAF bridge', () => {
 
         expect(copyExport).toHaveBeenCalledExactlyOnceWith(
             'request-1',
-            '/data/user/0/co.aiclient.risu/files/persistent/exports/risusave-a.risudat',
+            '/data/user/0/io.github.rsyumi.risunest/files/persistent/exports/risusave-a.risudat',
             'backup.risudat',
         )
         expect(result).toEqual({
@@ -356,7 +356,7 @@ describe('Android SAF bridge', () => {
         })
 
         await expect(copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/files/persistent/exports/risusave-a.risudat',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/files/persistent/exports/risusave-a.risudat',
             suggestedName: 'backup.risudat',
         }, {
             createRequestId: () => 'request-2',
@@ -379,7 +379,7 @@ describe('Android SAF bridge', () => {
         const controller = new AbortController()
         const cancelExport = vi.fn()
         const promise = copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/persistent/exports/risusave-a.risudat',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/persistent/exports/risusave-a.risudat',
             suggestedName: 'backup.risudat',
             signal: controller.signal,
         }, {
@@ -424,7 +424,7 @@ describe('Android SAF bridge', () => {
         }))
 
         const result = await copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
             suggestedName: 'chat.zip',
             deferAcknowledgement: true,
         }, {
@@ -442,7 +442,7 @@ describe('Android SAF bridge', () => {
         const listeners = new Set<(event: Event) => void>()
         const controller = new AbortController()
         const promise = copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/persistent/exports/risusave-a.risudat',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/persistent/exports/risusave-a.risudat',
             suggestedName: 'backup.risudat',
             signal: controller.signal,
         }, {
@@ -472,7 +472,7 @@ describe('Android SAF bridge', () => {
         const listeners = new Set<(event: Event) => void>()
         const controller = new AbortController()
         const promise = copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/persistent/exports/risusave-a.risudat',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/persistent/exports/risusave-a.risudat',
             suggestedName: 'backup.risudat',
             signal: controller.signal,
         }, {
@@ -537,7 +537,7 @@ describe('Android SAF bridge', () => {
         })
 
         await copyNativeExportToAndroidSaf({
-            sourcePath: '/data/user/0/co.aiclient.risu/files/persistent/exports/source.risudat',
+            sourcePath: '/data/user/0/io.github.rsyumi.risunest/files/persistent/exports/source.risudat',
             suggestedName: 'backup.risudat',
             onProgress,
         }, {

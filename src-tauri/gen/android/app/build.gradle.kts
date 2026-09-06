@@ -45,12 +45,12 @@ val releaseSigningReady = keystorePropertiesFile.exists() &&
 android {
     compileSdk = 36
     ndkVersion = "28.2.13676358"
-    namespace = "co.aiclient.risu"
+    namespace = "io.github.rsyumi.risunest"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         manifestPlaceholders["enableExperimentalPeerCloneClient"] =
             enableExperimentalPeerCloneClient.get().toString()
-        applicationId = "co.aiclient.risu"
+        applicationId = "io.github.rsyumi.risunest"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -83,7 +83,7 @@ android {
             isJniDebuggable = true
             isMinifyEnabled = false
             // The Tauri template kept the full DWARF debug info of the Rust
-            // cdylib in the APK. The dev-profile librisuai_lib.so is ~470 MB,
+            // cdylib in the APK. The dev-profile librisunest_lib.so is ~470 MB,
             // of which ~285 MB is debug info, and `useLegacyPackaging = false`
             // stores it uncompressed, so the debug APK was ~476 MB. Letting AGP
             // strip the packaged copy leaves the unstripped library in
@@ -152,7 +152,7 @@ afterEvaluate {
     tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {
         if (name.endsWith("UnitTest")) {
             filter {
-                excludeTestsMatching("co.aiclient.risu.SafFileBridgeLowMemoryTest")
+                excludeTestsMatching("io.github.rsyumi.risunest.SafFileBridgeLowMemoryTest")
             }
         }
     }
@@ -167,7 +167,7 @@ afterEvaluate {
         minHeapSize = "16m"
         maxHeapSize = "32m"
         filter {
-            includeTestsMatching("co.aiclient.risu.SafFileBridgeLowMemoryTest")
+            includeTestsMatching("io.github.rsyumi.risunest.SafFileBridgeLowMemoryTest")
         }
     }
 }

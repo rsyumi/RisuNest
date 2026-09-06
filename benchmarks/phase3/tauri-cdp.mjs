@@ -105,7 +105,7 @@ export function buildBenchmarkConfig(original, port, runId, sourceRevision) {
 
     return {
         ...structuredClone(original),
-        identifier: `co.aiclient.risu.phase3benchmark.${revisionSegment}.${safeRunId}`,
+        identifier: `RisuNest.phase3benchmark.${revisionSegment}.${safeRunId}`,
         bundle: {
             ...original.bundle,
             active: false,
@@ -173,7 +173,7 @@ export function benchmarkAppDataDirectory(snapshotPath, identifier) {
     const persistentDirectory = path.dirname(snapshotDirectory)
     const appDataDirectory = path.dirname(persistentDirectory)
     if (
-        !identifier.startsWith('co.aiclient.risu.phase3benchmark.') ||
+        !identifier.startsWith('RisuNest.phase3benchmark.') ||
         path.basename(snapshotDirectory) !== 'snapshots' ||
         path.basename(persistentDirectory) !== 'persistent' ||
         path.basename(appDataDirectory) !== identifier

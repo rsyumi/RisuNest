@@ -39,9 +39,9 @@ test('short segment fixtures preserve the requested batch size and order', () =>
 })
 
 test('benchmark config isolates the Windows profile and disables bundling', () => {
-    const original = { identifier: 'co.aiclient.risu', bundle: { active: true }, app: { windows: [{}] } }
+    const original = { identifier: 'RisuNest', bundle: { active: true }, app: { windows: [{}] } }
     const config = buildBenchmarkConfig(original, 9333, 'run-123')
-    assert.equal(config.identifier, 'co.aiclient.risu.tokenizerbenchmark.run123')
+    assert.equal(config.identifier, 'RisuNest.tokenizerbenchmark.run123')
     assert.equal(config.bundle.active, false)
     assert.match(config.app.windows[0].additionalBrowserArgs, /--remote-debugging-port=9333/)
     assert.equal(original.app.windows[0].additionalBrowserArgs, undefined)

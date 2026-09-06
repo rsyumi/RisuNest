@@ -36,7 +36,7 @@ describe('device sync facade', () => {
 
     it('keeps registry DTOs free of endpoint and bearer secrets while preserving a valid source endpoint', async () => {
         const endpoint = 'http://192.168.1.2:32145/'
-        const pairingUri = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const pairingUri = `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
         const invoke = vi.fn(async (command: string) => {
             if (command === 'peer_sync_incoming_sources') {
                 return [{ deviceId: 'source', name: 'Source', permissions: ['read'], endpoint: 'http://private', bearer: 'secret' }]
@@ -79,7 +79,7 @@ describe('device sync facade', () => {
         ['peer-sync', '/v1'],
         ['peer-clone', '/v3'],
     ])('rejects the %s lane link at %s instead of a device sync v2 link', (host, path) => {
-        const uri = `risuailocal://${host}${path}?endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const uri = `risunestlocal://${host}${path}?endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
 
         expect(() => parseDeviceSyncUri(uri)).toThrow('Invalid device sync link')
     })
@@ -90,7 +90,7 @@ describe('device sync facade', () => {
         'http://127.255.255.254:32145',
         'http://[::1]:32145',
     ])('rejects canonical v2 loopback endpoint %s', (endpoint) => {
-        const pairingUri = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const pairingUri = `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
 
         expect(() => parseDeviceSyncUri(pairingUri)).toThrow('Invalid device sync link')
     })
@@ -102,7 +102,7 @@ describe('device sync facade', () => {
         ['http://[fe80::1234]:32145', 'http://[fe80::1234]:32145/'],
         ['https://sync.example.com', 'https://sync.example.com/'],
     ])('accepts canonical v2 endpoint %s under the LAN/public HTTPS policy', (endpoint, canonical) => {
-        const pairingUri = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const pairingUri = `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
 
         expect(parseDeviceSyncUri(pairingUri).endpoint).toBe(canonical)
     })
@@ -111,12 +111,12 @@ describe('device sync facade', () => {
     const canonicalQuery = `endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&${session}&manifest=${'a'.repeat(64)}`
 
     it.each([
-        ['a non-hex claim fragment', `risuailocal://peer-clone/v2?${canonicalQuery}#claim=${'g'.repeat(64)}`],
-        ['a short claim fragment', `risuailocal://peer-clone/v2?${canonicalQuery}#claim=${'b'.repeat(63)}`],
-        ['a duplicated session key', `risuailocal://peer-clone/v2?${canonicalQuery}&${session}#claim=${'b'.repeat(64)}`],
-        ['an extra unknown key', `risuailocal://peer-clone/v2?${canonicalQuery}&bearer=secret#claim=${'b'.repeat(64)}`],
-        ['a missing manifest key', `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&${session}#claim=${'b'.repeat(64)}`],
-        ['a body past the 8192 character pairing URI ceiling', `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(`http://10.1.2.3:32145/${'a'.repeat(8192)}`)}&${session}&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`],
+        ['a non-hex claim fragment', `risunestlocal://peer-clone/v2?${canonicalQuery}#claim=${'g'.repeat(64)}`],
+        ['a short claim fragment', `risunestlocal://peer-clone/v2?${canonicalQuery}#claim=${'b'.repeat(63)}`],
+        ['a duplicated session key', `risunestlocal://peer-clone/v2?${canonicalQuery}&${session}#claim=${'b'.repeat(64)}`],
+        ['an extra unknown key', `risunestlocal://peer-clone/v2?${canonicalQuery}&bearer=secret#claim=${'b'.repeat(64)}`],
+        ['a missing manifest key', `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent('http://10.1.2.3:32145')}&${session}#claim=${'b'.repeat(64)}`],
+        ['a body past the 8192 character pairing URI ceiling', `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent(`http://10.1.2.3:32145/${'a'.repeat(8192)}`)}&${session}&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`],
     ])('rejects a canonical v2 link carrying %s', (_reason, uri) => {
         expect(() => parseDeviceSyncUri(uri)).toThrow('Invalid device sync link')
     })
@@ -171,15 +171,15 @@ describe('device sync facade', () => {
     it('rejects malformed or endpoint-mismatched source pairing state', async () => {
         const endpoint = 'http://192.168.1.2:32145/'
         const otherEndpoint = 'http://192.168.1.3:32145/'
-        const validPairing = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(otherEndpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
-        const matchingPairing = `risuailocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const validPairing = `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent(otherEndpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const matchingPairing = `risunestlocal://peer-clone/v2?endpoint=${encodeURIComponent(endpoint)}&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
         const invoke = vi.fn()
             .mockResolvedValueOnce({ phase: 'running', pairingUri: validPairing })
-            .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: 'risuailocal://peer-clone/v2' })
+            .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: 'risunestlocal://peer-clone/v2' })
             .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: validPairing })
             .mockResolvedValueOnce({
                 phase: 'running', endpoint,
-                pairingUri: matchingPairing.replace('risuailocal://', 'risuailocal://user:secret@'),
+                pairingUri: matchingPairing.replace('risunestlocal://', 'risunestlocal://user:secret@'),
             })
             .mockResolvedValueOnce({ phase: 'running', endpoint, pairingUri: `\n${matchingPairing}\t` })
             .mockResolvedValueOnce({

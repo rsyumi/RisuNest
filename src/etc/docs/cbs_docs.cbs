@@ -135,7 +135,7 @@ metadata,"Get metadata value. argument can be:
 - mobile (is mobile)
 - local (is local)
 - node (is node)
-- version (version of Risuai)
+- version (version of RisuNest)
 - major (Major version of risuai)
 - lang (current language code)
 - browserlang (same as navigator.language in js)

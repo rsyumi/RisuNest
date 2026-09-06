@@ -1632,7 +1632,7 @@ fn unified_lan_transport_uses_the_requested_fixed_port_and_releases_it_on_stop()
         .pairing_uri
         .as_deref()
         .unwrap()
-        .starts_with("risuailocal://peer-clone/v2?"));
+        .starts_with("risunestlocal://peer-clone/v2?"));
     assert!(status.expires_at_ms.unwrap() > 0);
     assert_eq!(status.latest_error, None);
     state.stop().unwrap();
@@ -3496,7 +3496,7 @@ fn canonical_registration_uri_has_exact_clone_fields_and_no_bearer() {
 
     let uri = pairing.canonical_uri();
 
-    assert!(uri.starts_with("risuailocal://peer-clone/v2?"));
+    assert!(uri.starts_with("risunestlocal://peer-clone/v2?"));
     assert!(uri.contains(&format!("endpoint=http%3A%2F%2F127.0.0.1%3A{port}")));
     assert!(uri.contains("session=00000000-0000-4000-8000-000000000001"));
     assert!(uri.contains(&format!("manifest={}", "a".repeat(64))));

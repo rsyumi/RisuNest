@@ -1327,7 +1327,7 @@ app.get('/api/oauth_login', async (req, res) => {
                 grant_types: ['authorization_code'],
                 scope: 'risuai',
                 token_endpoint_auth_method: 'client_secret_basic',
-                client_name: 'Risuai Node Server',
+                client_name: 'RisuNest Node Server',
             })
         });
 

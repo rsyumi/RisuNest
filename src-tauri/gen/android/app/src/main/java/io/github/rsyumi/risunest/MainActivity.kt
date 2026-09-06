@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import android.content.ComponentCallbacks2
 import android.content.ContentResolver
@@ -58,7 +58,7 @@ private const val MINIMUM_WEBVIEW_MAJOR = 111
 private const val NATIVE_RESILIENCE_PREFERENCES = "risu-native-resilience"
 private const val RENDERER_RECOVERY_MARKER = "renderer-recovery-warning"
 private const val SAF_PROGRESS_INTERVAL_MILLIS = 100L
-private const val OPENED_FILE_INTENT_CONSUMED = "co.aiclient.risu.OPENED_FILE_INTENT_CONSUMED"
+private const val OPENED_FILE_INTENT_CONSUMED = "io.github.rsyumi.risunest.OPENED_FILE_INTENT_CONSUMED"
 private const val OPENED_FILE_FINGERPRINT_STATE = "risu.opened-file-fingerprint"
 private const val LOSSLESS_SOURCE_REQUEST_STATE = "risu.lossless-source-request"
 private const val LOSSLESS_SOURCE_CANCELLED_STATE = "risu.lossless-source-cancelled"

@@ -1,8 +1,8 @@
 import { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'co.aiclient.risu',
-  appName: 'Risuai',
+  appId: 'io.github.rsyumi.risunest',
+  appName: 'RisuNest',
   webDir: 'dist',
   server: {
     androidScheme: 'https'

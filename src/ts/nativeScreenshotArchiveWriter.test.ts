@@ -189,7 +189,7 @@ describe('Android screenshot archive writer', () => {
                 if (command === 'native_file_job_screenshot_output_publish') {
                     return {
                         bytes: 7,
-                        sourcePath: '/data/user/0/co.aiclient.risu/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
+                        sourcePath: '/data/user/0/io.github.rsyumi.risunest/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
                         warningCodes: [],
                     }
                 }
@@ -239,7 +239,7 @@ describe('Android screenshot archive writer', () => {
             if (command === 'native_file_job_screenshot_output_publish') {
                 return {
                     bytes: 7,
-                    sourcePath: '/data/user/0/co.aiclient.risu/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
+                    sourcePath: '/data/user/0/io.github.rsyumi.risunest/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
                     warningCodes: [],
                 }
             }
@@ -372,7 +372,7 @@ describe('Android screenshot archive writer', () => {
             if (command === 'native_file_job_screenshot_output_publish') {
                 return {
                     bytes: 7,
-                    sourcePath: '/data/user/0/co.aiclient.risu/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
+                    sourcePath: '/data/user/0/io.github.rsyumi.risunest/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
                     warningCodes: [],
                 }
             }

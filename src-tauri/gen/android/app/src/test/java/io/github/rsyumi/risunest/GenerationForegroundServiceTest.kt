@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import android.app.Service
 import java.io.File

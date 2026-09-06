@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import android.annotation.SuppressLint
 import android.app.Notification
@@ -27,7 +27,7 @@ import kotlinx.coroutines.launch
 
 internal const val PEER_CLONE_JOB_ID_EXTRA = "nativePeerCloneJobId"
 private const val PEER_CLONE_NOTIFICATION_CHANNEL = "risunest-peer-clone"
-private const val PEER_CLONE_CANCEL_ACTION = "co.aiclient.risu.CANCEL_PEER_CLONE"
+private const val PEER_CLONE_CANCEL_ACTION = "io.github.rsyumi.risunest.CANCEL_PEER_CLONE"
 
 internal enum class PeerCloneTransferMode {
   DISABLED,
@@ -177,7 +177,7 @@ internal inline fun peerCloneNativeResult(
 
 internal object PeerCloneNativeBridge {
   init {
-    System.loadLibrary("risuai_lib")
+    System.loadLibrary("risunest_lib")
   }
 
   @JvmStatic external fun resume(

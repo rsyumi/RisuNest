@@ -1,5 +1,5 @@
 use crc32fast::hash as crc32;
-use risuai_lib::native_file_jobs::charx::{
+use risunest_lib::native_file_jobs::charx::{
     inspect_charx_file, write_charx_file, CharXContainerKind, CharXInspection, CharXLimits,
     CharXParseErrorCode, CharXWriteErrorCode,
 };
@@ -242,7 +242,7 @@ fn parse_card(
     source_name: &str,
     bytes: &[u8],
     limits: CharXLimits,
-) -> Result<(TempDir, CharXInspection), risuai_lib::native_file_jobs::charx::CharXParseError> {
+) -> Result<(TempDir, CharXInspection), risunest_lib::native_file_jobs::charx::CharXParseError> {
     let directory = TempDir::new().expect("source directory");
     let staging = directory.path().join("jobs");
     fs::create_dir(&staging).expect("staging root");
@@ -439,7 +439,7 @@ fn native_export_cancellation_removes_only_its_owned_output() {
 }
 
 fn payload_graph(
-    card: &risuai_lib::native_file_jobs::charx::ParsedCharXDescriptor,
+    card: &risunest_lib::native_file_jobs::charx::ParsedCharXDescriptor,
 ) -> Vec<(
     String,
     Option<String>,

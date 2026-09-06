@@ -377,7 +377,7 @@ export async function exportChat(page:number){
                     </tr>
                     ${chatContentHTML}
                 </table>
-                <p>Chat from Risuai</p>
+                <p>Chat from RisuNest</p>
             `
 
             //copy to clipboard

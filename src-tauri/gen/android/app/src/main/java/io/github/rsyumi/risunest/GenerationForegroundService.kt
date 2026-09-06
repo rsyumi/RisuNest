@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -12,8 +12,8 @@ import androidx.core.content.ContextCompat
 internal const val GENERATION_FOREGROUND_START_MODE = Service.START_NOT_STICKY
 private const val GENERATION_FOREGROUND_CHANNEL = "risunest-generation"
 private const val GENERATION_FOREGROUND_NOTIFICATION_ID = 0x52474e31
-private const val GENERATION_FOREGROUND_BEGIN = "co.aiclient.risu.GENERATION_FOREGROUND_BEGIN"
-private const val GENERATION_FOREGROUND_TOKEN = "co.aiclient.risu.GENERATION_FOREGROUND_TOKEN"
+private const val GENERATION_FOREGROUND_BEGIN = "io.github.rsyumi.risunest.GENERATION_FOREGROUND_BEGIN"
+private const val GENERATION_FOREGROUND_TOKEN = "io.github.rsyumi.risunest.GENERATION_FOREGROUND_TOKEN"
 private const val INVALID_GENERATION_FOREGROUND_TOKEN = -1L
 
 internal class GenerationForegroundLifecycle {

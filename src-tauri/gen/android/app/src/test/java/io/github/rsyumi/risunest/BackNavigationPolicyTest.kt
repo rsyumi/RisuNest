@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

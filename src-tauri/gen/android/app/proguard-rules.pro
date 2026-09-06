@@ -28,7 +28,7 @@
 # The JNI entry points themselves (the `external fun` declarations on
 # PeerCloneNativeBridge and PeerSyncForegroundNativeBridge) are already kept by
 # the generated proguard-wry.pro `native <methods>` rule.
--keep interface co.aiclient.risu.PeerCloneNativeProgress { *; }
--keepclassmembers class * implements co.aiclient.risu.PeerCloneNativeProgress {
+-keep interface io.github.rsyumi.risunest.PeerCloneNativeProgress { *; }
+-keepclassmembers class * implements io.github.rsyumi.risunest.PeerCloneNativeProgress {
     void onProgress(long);
 }

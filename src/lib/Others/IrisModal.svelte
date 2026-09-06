@@ -23,13 +23,13 @@
 
     const introDialogue: Record<string, DialogueLine[]> = {
         en: [
-            { speaker: "Iris", text: "Hello there. I've been waiting for you.", tip: "Iris can access various data through the Risuai system. It uses ax model defined in config." },
+            { speaker: "Iris", text: "Hello there. I've been waiting for you.", tip: "Iris can access various data through the RisuNest system. It uses ax model defined in config." },
         ],
         ko: [
-            { speaker: "Iris", text: "안녕하세요. 아이리스라고 합니다~.", tip: "아이리스는 보조 모델을 사용하며, Risuai의 전반적인 데이터에 접근할 수 있습니다." },
+            { speaker: "Iris", text: "안녕하세요. 아이리스라고 합니다~.", tip: "아이리스는 보조 모델을 사용하며, RisuNest의 전반적인 데이터에 접근할 수 있습니다." },
         ],
         'zh-Hant': [
-            { speaker: "Iris", text: "你好，我一直在等你。", tip: "Iris 可以通過 Risuai 系統訪問各種數據。它使用配置中定義的輔助模型。" },
+            { speaker: "Iris", text: "你好，我一直在等你。", tip: "Iris 可以通過 RisuNest 系統訪問各種數據。它使用配置中定義的輔助模型。" },
         ],
     };
 

@@ -10,7 +10,7 @@ export function dispatchRisuLocalUrl(value: string, handlers: RisuLocalUrlHandle
     } catch {
         return false
     }
-    if (url.protocol !== 'risuailocal:') return false
+    if (url.protocol !== 'risunestlocal:') return false
     const segments = url.pathname.split('/').filter(Boolean)
     const realmId = url.hostname === 'realm' && segments.length === 1
         ? segments[0]

@@ -1,14 +1,14 @@
-name: risuai
+name: risunest
 
 services:
-  risuai:
-    container_name: risuai
-    image: ghcr.io/kwaroran/risuai:latest
+  risunest:
+    container_name: risunest
+    build: .
     restart: always
     ports:
       - 6001:6001
     volumes:
-      - risuai-save:/app/save
+      - risunest-save:/app/save
 
 volumes:
-  risuai-save:
+  risunest-save:

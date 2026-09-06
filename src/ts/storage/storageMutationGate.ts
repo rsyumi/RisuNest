@@ -76,11 +76,11 @@ export function createStorageMutationGate(options: {
 
     return {
         runWrite: (operation) =>
-            locks.request('risuai-persistent-storage', { mode: 'shared' }, operation),
+            locks.request('risunest-persistent-storage', { mode: 'shared' }, operation),
         runKeyedWrite: (key, operation) =>
-            locks.request('risuai-persistent-storage', { mode: 'shared' }, () =>
-                locks.request(`risuai-blob:${key}`, { mode: 'exclusive' }, operation)),
+            locks.request('risunest-persistent-storage', { mode: 'shared' }, () =>
+                locks.request(`risunest-blob:${key}`, { mode: 'exclusive' }, operation)),
         runTransition: (operation) =>
-            locks.request('risuai-persistent-storage', { mode: 'exclusive' }, operation),
+            locks.request('risunest-persistent-storage', { mode: 'exclusive' }, operation),
     }
 }

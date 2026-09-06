@@ -260,7 +260,7 @@ describe('device sync controller', () => {
                 },
             },
         })
-        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
         expect(claimStagedClone).not.toHaveBeenCalled()
 
         await controller.claimStagedClone()
@@ -285,7 +285,7 @@ describe('device sync controller', () => {
             targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() } },
         })
         await controller.initialize()
-        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
 
         await controller.pullStagedDelta()
 
@@ -329,7 +329,7 @@ describe('device sync controller', () => {
                 },
             })
             await controller.initialize()
-            const valid = `risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+            const valid = `risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
             const run = lane === 'clone'
                 ? () => controller.claimStagedClone()
                 : lane === 'delta'
@@ -389,7 +389,7 @@ describe('device sync controller', () => {
                 },
             })
             await controller.initialize()
-            const valid = `risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+            const valid = `risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
             const run = lane === 'clone'
                 ? () => controller.claimStagedClone()
                 : lane === 'delta'
@@ -437,7 +437,7 @@ describe('device sync controller', () => {
             },
         })
         await controller.initialize()
-        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
         const pending = controller.pullStagedDelta()
         await vi.waitFor(() => expect(incomingSources).toHaveBeenCalledTimes(2))
 
@@ -520,7 +520,7 @@ describe('device sync controller', () => {
             targets: { delta: { snapshot: () => deltaSnapshot(), subscribe: () => () => undefined, initialize: async () => undefined, pullRegistered, abandonRetained: vi.fn() } },
         })
         await controller.initialize()
-        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
 
         await expect(controller.pullStagedDelta()).rejects.toMatchObject({ code: 'operation-failed' })
         expect(controller.snapshot().stagedLink).toBeNull()
@@ -740,7 +740,7 @@ describe('device sync controller', () => {
         await controller.initialize()
         await expect(controller.pullRegisteredDelta('source')).rejects.toMatchObject({ code: 'registration-expired' })
         expect(controller.snapshot().expiredSourceIds).toEqual(['source'])
-        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
         await controller.claimStagedClone()
         expect(controller.snapshot().expiredSourceIds).toEqual([])
         expect(reconnectRegisteredClone).toHaveBeenCalledWith('source')
@@ -827,7 +827,7 @@ describe('device sync controller', () => {
                 targets: { clone },
             })
             await controller.initialize()
-            controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+            controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
             await controller.claimStagedClone()
             await controller.selectRegisteredClone('selected-source')
 
@@ -866,7 +866,7 @@ describe('device sync controller', () => {
             targets: { bidirectional },
         })
         await controller.initialize()
-        controller.stageLink(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+        controller.stageLink(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
         await controller.syncStagedBidirectional()
         await controller.syncRegisteredBidirectional('bidi-source')
 
@@ -966,7 +966,7 @@ describe('device sync controller', () => {
 
     it('owns pending v2 receipt subscription and disposes it', () => {
         const subscribe = vi.fn((listener: (uri: string) => void) => {
-            listener(`risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
+            listener(`risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`)
             return vi.fn()
         })
         const controller = createDeviceSyncController({
@@ -987,7 +987,7 @@ describe('device sync controller', () => {
     })
 
     it('owns the raw pending link and retries a post-claim failure without claiming again', async () => {
-        const uri = `risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
+        const uri = `risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2%3A32145&session=123e4567-e89b-12d3-a456-426614174000&manifest=${'a'.repeat(64)}#claim=${'b'.repeat(64)}`
         const claimStagedClone = vi.fn(async () => ({
             sourceDeviceId: 'source', endpoint: 'http://192.168.1.2:32145/',
             sessionId: 'session', manifestId: 'a'.repeat(64),

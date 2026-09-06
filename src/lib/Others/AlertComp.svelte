@@ -40,10 +40,10 @@
     const userAgent = typeof navigator === "undefined" ? "Unknown" : navigator.userAgent || "Unknown";
     const stackTraceCodeBlock = $derived.by(() => {
         const lines = [
-            `Risu version: ${risuVersion}`,
+            `RisuNest version: ${risuVersion}`,
             `OS: ${osLabel}`,
             `User-Agent: ${userAgent}`,
-            `Risu environment: ${risuEnvironment}`
+            `RisuNest environment: ${risuEnvironment}`
         ]
 
         if (stackTraceTranslationFailed) {

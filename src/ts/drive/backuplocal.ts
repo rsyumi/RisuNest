@@ -148,7 +148,7 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
     const references = accumulator.finish()
 
     const writer = new LocalWriter()
-    const r = await writer.init('RisuAI Backup', ['bin'], 'risu-backup.bin')
+    const r = await writer.init('RisuNest Backup', ['bin'], 'risu-backup.bin')
     if(!r){
         alertError('Failed')
         return
@@ -308,7 +308,7 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
     }
 
     const writer = new LocalWriter()
-    const r = await writer.init('RisuAI Backup', ['bin'], 'risu-partial-backup.bin')
+    const r = await writer.init('RisuNest Backup', ['bin'], 'risu-partial-backup.bin')
     if(!r){
         alertError('Failed')
         return

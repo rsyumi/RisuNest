@@ -331,7 +331,7 @@ fn foreground_key(
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_attach(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerSyncForegroundNativeBridge_attach(
     mut environment: JNIEnv,
     _class: JClass,
     lane: JString,
@@ -349,7 +349,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_atta
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_cancel(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerSyncForegroundNativeBridge_cancel(
     mut environment: JNIEnv,
     _class: JClass,
     lane: JString,
@@ -367,7 +367,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_canc
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_detach(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerSyncForegroundNativeBridge_detach(
     mut environment: JNIEnv,
     _class: JClass,
     lane: JString,
@@ -385,7 +385,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerSyncForegroundNativeBridge_deta
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerCloneNativeBridge_resume(
     mut environment: JNIEnv,
     _class: JClass,
     job_id: JString,
@@ -427,7 +427,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume(
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_pause(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerCloneNativeBridge_pause(
     mut environment: JNIEnv,
     _class: JClass,
     job_id: JString,
@@ -444,7 +444,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_pause(
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_setForegroundAllowed(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerCloneNativeBridge_setForegroundAllowed(
     _environment: JNIEnv,
     _class: JClass,
     allowed: jboolean,
@@ -458,7 +458,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_setForeground
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_requestCancel(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerCloneNativeBridge_requestCancel(
     mut environment: JNIEnv,
     _class: JClass,
     job_id: JString,
@@ -479,7 +479,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_requestCancel
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_cancelAndCleanup(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerCloneNativeBridge_cancelAndCleanup(
     mut environment: JNIEnv,
     _class: JClass,
     job_id: JString,
@@ -500,7 +500,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_cancelAndClea
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_cleanupCompleted(
+pub extern "system" fn Java_io_github_rsyumi_risunest_PeerCloneNativeBridge_cleanupCompleted(
     mut environment: JNIEnv,
     _class: JClass,
     job_id: JString,

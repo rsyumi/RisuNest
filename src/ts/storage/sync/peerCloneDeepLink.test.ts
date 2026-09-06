@@ -11,7 +11,7 @@ import {
 describe('device sync registration bridge', () => {
     it('carries a canonical Tauri v2 URL from the dispatcher into pending controller state', () => {
         consumePendingDeviceSyncUri()
-        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2'
+        const uri = 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F192.168.1.2'
         const openSettings = vi.fn()
 
         expect(dispatchRisuLocalUrl(uri, {

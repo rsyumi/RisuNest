@@ -32,7 +32,7 @@ function singleSegment(name: string, prefix: string): string | null {
 
 /**
  * Maps a PocketRisu backup entry name to its handler, or null when the entry
- * uses the shared RisuAI namespace (database, cold storage, flat assets).
+ * uses the shared RisuNest namespace (database, cold storage, flat assets).
  */
 export function classifyPocketRisuEntry(name: string): PocketRisuEntry | null {
     if (name.startsWith('inlay/')) {

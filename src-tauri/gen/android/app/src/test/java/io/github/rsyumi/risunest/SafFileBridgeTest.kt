@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import java.io.ByteArrayInputStream
 import java.io.File

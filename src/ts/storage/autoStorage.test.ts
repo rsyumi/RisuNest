@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => {
             characters: [],
             account: { token: 'synthetic-token' },
         })),
-        alertInput: vi.fn(async () => 'RISUAI'),
+        alertInput: vi.fn(async () => 'RISUNEST'),
         collectColdStorageBackupPayloads: vi.fn(async () => ({
             payloads: [],
             missingKeys: [],

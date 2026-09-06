@@ -1,5 +1,5 @@
 {
-  "name": "hono-risuai-server",
+  "name": "hono-risunest-server",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",

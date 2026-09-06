@@ -483,7 +483,7 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
             release: true,
             realmDisabled: true,
             sourceRevision,
-            identifier: 'co.aiclient.risu.phase3benchmark.r742fb370742f.run123',
+            identifier: 'RisuNest.phase3benchmark.r742fb370742f.run123',
         },
         fixture: {
             kind: 'phase3-step5-save-large',

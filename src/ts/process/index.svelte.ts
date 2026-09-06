@@ -1788,7 +1788,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             try {
                 const permission = await Notification.requestPermission()
                 if(permission === 'granted'){
-                    const noti = new Notification('Risuai', {
+                    const noti = new Notification('RisuNest', {
                         body: result
                     })
                     noti.onclick = () => {

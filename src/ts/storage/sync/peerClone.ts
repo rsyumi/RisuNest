@@ -201,7 +201,7 @@ export function parsePeerCloneEndpoint(value: string): string {
 }
 
 /**
- * Parses the single device sync link shape: `risuailocal://peer-clone/v2` with
+ * Parses the single device sync link shape: `risunestlocal://peer-clone/v2` with
  * exactly `endpoint`, `session` and `manifest` query keys and a literal 64-hex
  * claim fragment. `invalid` carries the caller's own rejection wording.
  */
@@ -213,7 +213,7 @@ export function parsePeerPairingUri(value: string, invalid: () => never): PeerCl
     } catch {
         return invalid()
     }
-    if (uri.protocol !== 'risuailocal:' || uri.hostname !== 'peer-clone' || uri.pathname !== '/v2') {
+    if (uri.protocol !== 'risunestlocal:' || uri.hostname !== 'peer-clone' || uri.pathname !== '/v2') {
         return invalid()
     }
     const expectedKeys = ['endpoint', 'session', 'manifest']

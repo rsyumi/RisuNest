@@ -9,8 +9,8 @@ export class RisuAccessClient extends MCPClientLike {
 
   constructor() {
     const additionalServerInfo = `
-<About Risuai Features>
-Characters are the AI personas that Risuai users chat with. Fields:
+<About RisuNest Features>
+Characters are the AI personas that RisuNest users chat with. Fields:
 - 'name': The name of the character.
 - 'greeting': The greeting message of the character. This is the first message that the character will send when the chat starts.
 - 'description': The description of the character. This is used to describe the character in the chat.
@@ -64,10 +64,10 @@ Lorebooks are texts containing various information about the character with cond
 backgroundEmbedding is an HTML string mainly for custom styling. It can, and mostly include <style> tags with CSS. Note that all selectors will be prefixed with '.chattext ' so they cannot escape the chat boundary - No html, body, :root access.
 `
     super('internal:risuai')
-    this.serverInfo.serverInfo.name = 'Risuai Access MCP'
+    this.serverInfo.serverInfo.name = 'RisuNest Access MCP'
     this.serverInfo.serverInfo.version = '1.0.0'
     this.serverInfo.instructions =
-      "Risuai Access MCP provides access to Risuai's features and tools, which is the software currently running on. Use the available tools to interact with Risuai's functionalities." +
+      "RisuNest Access MCP provides access to RisuNest's features and tools, which is the software currently running on. Use the available tools to interact with RisuNest's functionalities." +
       additionalServerInfo
 
     this.handlers = [new CharacterHandler(), new ChatHandler(), new ModuleHandler()]

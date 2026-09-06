@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import android.content.ComponentCallbacks2
 import androidx.core.view.WindowInsetsCompat

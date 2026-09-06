@@ -7,8 +7,8 @@ REM
 REM Legal configuration:
 REM Set this to TRUE only for a personal private self-hosted instance, a development/testing
 REM fork intended to contribute back upstream, or a fork whose Terms of Service,
-REM Privacy Policy, and Risuai service usage alerts have been configured correctly.
-REM Builds without this flag show a legal warning screen and should not use Risuai
+REM Privacy Policy, and RisuAI service usage alerts have been configured correctly.
+REM Builds without this flag show a legal warning screen and should not use RisuAI
 REM services that require the original legal notices.
 REM if not defined VITE_RISU_LEGAL_CONFIGURED set "VITE_RISU_LEGAL_CONFIGURED=TRUE"
 

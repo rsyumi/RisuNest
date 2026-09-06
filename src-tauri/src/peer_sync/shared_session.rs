@@ -2270,7 +2270,7 @@ impl SharedPairingData {
         query.append_pair("session", &self.session_id);
         query.append_pair("manifest", &self.manifest_id);
         format!(
-            "risuailocal://peer-clone/v2?{}#claim={}",
+            "risunestlocal://peer-clone/v2?{}#claim={}",
             query.finish(),
             self.claim
         )

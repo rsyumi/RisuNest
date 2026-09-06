@@ -9,8 +9,8 @@ test('builds an isolated Tauri profile around the pilot frontend', () => {
   const config = buildTauriProfileConfig({
     build: { beforeBuildCommand: 'pnpm tauribuild', frontendDist: '../dist' },
     bundle: { active: true },
-    identifier: 'co.aiclient.risu',
-    app: { windows: [{ title: 'RisuAI' }] },
+    identifier: 'RisuNest',
+    app: { windows: [{ title: 'RisuNest' }] },
     plugins: { updater: { endpoints: ['https://example.invalid/latest.json'] } },
   }, 9229, 'abc-123')
 
@@ -18,7 +18,7 @@ test('builds an isolated Tauri profile around the pilot frontend', () => {
   assert.match(config.build.beforeBuildCommand, /lua-worker-pilot\/vite\.config\.ts/)
   assert.equal(config.bundle.active, false)
   assert.equal(config.plugins.updater.endpoints.length, 0)
-  assert.equal(config.identifier, 'co.aiclient.risu.luaworkerpilot.abc123')
+  assert.equal(config.identifier, 'RisuNest.luaworkerpilot.abc123')
   assert.match(config.app.windows[0].additionalBrowserArgs, /remote-debugging-port=9229/)
 })
 

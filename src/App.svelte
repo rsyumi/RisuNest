@@ -226,7 +226,7 @@
                             aprilFoolsPage = 0
                             aprilFools = false
                         }}>
-                            Go to Risuai  
+                            Go to RisuNest  
                         </a>
                     </p>
 

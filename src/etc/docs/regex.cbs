@@ -1,4 +1,4 @@
-Regex script, also called just Regex, is a script that is used in Risuai to replace the text in specific locations.
+Regex script, also called just Regex, is a script that is used in RisuNest to replace the text in specific locations.
 It has four fields: "Type" ,"IN", "OUT", and "FLAG".
 Type: A type of the regex script. it can be one of the following:
 - modify input: runs when user inputs a message. text is the message that user inputs.

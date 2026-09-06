@@ -81,7 +81,7 @@ export function buildBenchmarkConfig(original, port, runId) {
     }))
     return {
         ...structuredClone(original),
-        identifier: `co.aiclient.risu.tokenizerbenchmark.${safeRunId}`,
+        identifier: `RisuNest.tokenizerbenchmark.${safeRunId}`,
         bundle: { ...original.bundle, active: false },
         plugins: {
             ...original.plugins,

@@ -717,7 +717,7 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.hamburgerButtonBottom ??= false
     data.dynamicModelRegistry ??= true
     data.saveSignatures ??= false
-    // If the user uses plugins, its probably better to enable RisuAI Pro Tools by default
+    // If the user uses plugins, its probably better to enable RisuNest Pro Tools by default
     // Because its likely they are power users who would benefit from the features
     data.enableRisuaiProTools ??= data.plugins.length > 0
     data.keepSessionAlive ??= 'off'

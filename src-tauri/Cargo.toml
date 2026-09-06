@@ -1,10 +1,10 @@
 [package]
-name = "risuai"
+name = "risunest"
 version = "0.0.0"
-description = "A Tauri App"
+description = "RisuNest"
 authors = ["you"]
 license = ""
-repository = ""
+repository = "https://github.com/rsyumi/RisuNest"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -69,7 +69,7 @@ native-kei-upload-pilot = [
 ]
 
 [lib]
-name = "risuai_lib"
+name = "risunest_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

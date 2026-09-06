@@ -480,7 +480,7 @@ export async function loadData() {
                 language.saveCurrentDataToAccount,
             ]) === '0' ? 'pull' : 'push',
             confirmInitialPush: async () =>
-                await alertInput('to overwrite your data, type "RISUAI"') === 'RISUAI',
+                await alertInput('to overwrite your data, type "RISUNEST"') === 'RISUNEST',
             initializeProfile: (profile) => pluginCompatibility.initialize(profile),
             installDatabase: installPersistentWorkingSet,
             initializeWorkingSet: (database) => initializeActiveWorkingSet(database),

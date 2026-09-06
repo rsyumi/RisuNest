@@ -1,7 +1,7 @@
 //! Desktop file association delivery.
 //!
 //! The installer registers the `risum`, `risup` and `charx` associations, so opening one of
-//! those files launches `RisuAI.exe <path>`, or hands the path to the already running instance
+//! those files launches `RisuNest.exe <path>`, or hands the path to the already running instance
 //! through the single instance plugin. Both entry points park the paths here and the frontend
 //! drains them once with `opened_files_take`, so a file is never delivered twice.
 
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn opened_files_keep_only_existing_files_after_the_executable() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let executable = directory.path().join("RisuAI.exe");
+        let executable = directory.path().join("RisuNest.exe");
         std::fs::write(&executable, b"executable").expect("executable fixture");
         let card = directory.path().join("card.charx");
         std::fs::write(&card, b"card").expect("card fixture");
@@ -165,8 +165,8 @@ mod tests {
             OsString::from(executable.to_string_lossy().into_owned()),
             OsString::from(card.to_string_lossy().into_owned()),
             OsString::from(missing.to_string_lossy().into_owned()),
-            OsString::from("risuailocal://hub/1234"),
-            OsString::from("risuailocal:device-sync"),
+            OsString::from("risunestlocal://hub/1234"),
+            OsString::from("risunestlocal:device-sync"),
             OsString::from("--flag"),
             OsString::from("   "),
             OsString::from(preset.to_string_lossy().into_owned()),
@@ -187,7 +187,7 @@ mod tests {
         let argument = OsString::from(module.to_string_lossy().into_owned());
 
         let collected = collect_opened_files([
-            OsString::from("RisuAI.exe"),
+            OsString::from("RisuNest.exe"),
             argument.clone(),
             argument.clone(),
         ]);
@@ -197,8 +197,8 @@ mod tests {
 
     #[test]
     fn url_schemes_are_told_apart_from_windows_paths() {
-        assert!(has_url_scheme("risuailocal://hub/1"));
-        assert!(has_url_scheme("risuailocal:hub"));
+        assert!(has_url_scheme("risunestlocal://hub/1"));
+        assert!(has_url_scheme("risunestlocal:hub"));
         assert!(has_url_scheme("https://example.invalid/a.charx"));
         assert!(!has_url_scheme("C:\\Users\\risu\\card.charx"));
         assert!(!has_url_scheme("/home/risu/card.charx"));

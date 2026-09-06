@@ -56,10 +56,10 @@ test('summarizeUiEvidence counts mounted messages and unique live resource URLs'
 
 test('buildBenchmarkConfig isolates the Tauri identifier and WebView profile', () => {
     const original = {
-        identifier: 'co.aiclient.risu',
+        identifier: 'RisuNest',
         bundle: { active: true },
         app: {
-            windows: [{ label: 'main', title: 'RisuAI' }],
+            windows: [{ label: 'main', title: 'RisuNest' }],
         },
     }
 
@@ -70,12 +70,12 @@ test('buildBenchmarkConfig isolates the Tauri identifier and WebView profile', (
         '742fb370742fb370742fb370742fb370742fb370',
     )
 
-    assert.equal(config.identifier, 'co.aiclient.risu.phase3benchmark.r742fb370742f.run123')
+    assert.equal(config.identifier, 'RisuNest.phase3benchmark.r742fb370742f.run123')
     assert.equal(config.bundle.active, false)
     assert.equal(config.app.windows[0].dataDirectory, 'phase3-benchmark-run-123')
     assert.match(config.app.windows[0].additionalBrowserArgs, /--remote-debugging-port=9333/)
     assert.match(config.app.windows[0].additionalBrowserArgs, /--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection/)
-    assert.equal(original.identifier, 'co.aiclient.risu')
+    assert.equal(original.identifier, 'RisuNest')
     assert.equal(original.app.windows[0].dataDirectory, undefined)
 })
 
@@ -175,7 +175,7 @@ test('tauriBuildInvocation bypasses Windows command shims', () => {
 })
 
 test('benchmarkAppDataDirectory accepts only the exact isolated identifier layout', () => {
-    const identifier = 'co.aiclient.risu.phase3benchmark.run123'
+    const identifier = 'RisuNest.phase3benchmark.run123'
     const snapshot = `C:\\Users\\test\\AppData\\Roaming\\${identifier}\\persistent\\snapshots\\one.db`
 
     assert.equal(
@@ -184,7 +184,7 @@ test('benchmarkAppDataDirectory accepts only the exact isolated identifier layou
     )
     assert.throws(
         () => benchmarkAppDataDirectory(
-            'C:\\Users\\test\\AppData\\Roaming\\co.aiclient.risu\\persistent\\snapshots\\one.db',
+            'C:\\Users\\test\\AppData\\Roaming\\RisuNest\\persistent\\snapshots\\one.db',
             identifier,
         ),
         /isolated benchmark identifier/,

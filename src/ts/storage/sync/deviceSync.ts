@@ -228,7 +228,7 @@ export function safeDeviceSyncStatus(value: unknown): DeviceSyncStatus {
             query.append('endpoint', pairingEndpoint)
             query.append('session', sessionId)
             query.append('manifest', manifestId)
-            const canonical = `risuailocal://peer-clone/v2?${query.toString()}#claim=${pairing.claim}`
+            const canonical = `risunestlocal://peer-clone/v2?${query.toString()}#claim=${pairing.claim}`
             if (source.pairingUri !== canonical) throw new DeviceSyncError('state-unavailable')
             pairingUri = canonical
         } catch {

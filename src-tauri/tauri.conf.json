@@ -28,10 +28,10 @@
       }
     ]
   },
-  "productName": "RisuAI",
-  "mainBinaryName": "RisuAI",
+  "productName": "RisuNest",
+  "mainBinaryName": "RisuNest",
   "version": "2026.8.250",
-  "identifier": "co.aiclient.risu",
+  "identifier": "io.github.rsyumi.risunest",
   "plugins": {
     "updater": {
       "comment": "RisuNest has no update server yet. The endpoint list is intentionally empty and the pubkey is intentionally blank so that check() fails fast with EmptyEndpoints instead of resolving upstream RisuAI releases. Do not delete this block: tauri_plugin_updater is still registered in lib.rs and its Config requires `pubkey`, so a missing `plugins.updater` aborts app startup. To re-enable updates, publish a latest.json, put its URL in `endpoints`, put the matching minisign public key in `pubkey`, set `bundle.createUpdaterArtifacts` back to true, sign the build with TAURI_SIGNING_PRIVATE_KEY, and flip UPDATER_ENDPOINT_CONFIGURED in src/ts/update.ts.",
@@ -43,11 +43,11 @@
     },
     "deep-link": {
       "desktop": {
-        "schemes": ["risuailocal"]
+        "schemes": ["risunestlocal"]
       },
       "mobile": [
         {
-          "scheme": ["risuailocal"],
+          "scheme": ["risunestlocal"],
           "appLink": false
         }
       ]
@@ -59,7 +59,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "Risuai",
+        "title": "RisuNest",
         "width": 1024,
         "height": 768,
         "minWidth": 300,

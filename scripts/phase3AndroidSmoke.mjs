@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { compressSync, decompressSync } from 'fflate'
 import { Packr, Unpackr } from 'msgpackr/index-no-eval'
 
-const PACKAGE = 'co.aiclient.risu'
+const PACKAGE = 'io.github.rsyumi.risunest'
 const ACTIVITY = `${PACKAGE}/.MainActivity`
 const RISUSAVE_COMPRESSED_HEADER = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8])
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))

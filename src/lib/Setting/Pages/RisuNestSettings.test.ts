@@ -179,7 +179,7 @@ describe('RisuNest startup failure language schema', () => {
 
     it('names the Windows data folder the user has to clear', () => {
         for (const translation of [languageEnglish, languageKorean]) {
-            expect(translation.risuNest.boot.dataPathWindows).toContain('%APPDATA%\\co.aiclient.risu\\')
+            expect(translation.risuNest.boot.dataPathWindows).toContain('%APPDATA%\\RisuNest\\')
         }
     })
 })

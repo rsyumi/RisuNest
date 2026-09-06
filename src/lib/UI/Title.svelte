@@ -67,18 +67,20 @@ let specialDay = $state('')
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <h2 class="text-4xl text-textcolor mb-0 mt-6 font-black relative" class:text-bordered={specialDay === 'newYear'} onclick={onClick}>
     {#if specialDay === 'midAutumn'}
-        <span class="text-amber-400">🐉Risuai🐉</span>
+        <span class="text-amber-400">🐉RisuNest🐉</span>
     {:else if specialDay === 'chuseok'}
         <div class="flex">
             <span class="text-blue-500">R</span>
             <span class="text-red-500">i</span>
             <span class="text-yellow-500">s</span>
             <span class="text-white">u</span>
-            <span class="text-black">A</span>
-            <span class="text-blue-500">I</span>
+            <span class="text-black">N</span>
+            <span class="text-blue-500">e</span>
+            <span class="text-red-500">s</span>
+            <span class="text-yellow-500">t</span>
         </div>
     {:else}
-        Risuai
+        RisuNest
     {/if}
     {#if specialDay === 'christmas'}
         <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -119,7 +121,7 @@ let specialDay = $state('')
     <h1>
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <span class="text-2xl font-extralight italic text-amber-400 hover:text-amber-600 cursor-pointer transition" role="button" tabindex="-1" onclick={() => {
-            openURL('https://risuai.net')
+            openURL('https://github.com/rsyumi/RisuNest')
         }}>Happy {
             new Date().getFullYear() - 2023
         }{getNumberPostfix(new Date().getFullYear() - 2023)} Anniversary!</span>

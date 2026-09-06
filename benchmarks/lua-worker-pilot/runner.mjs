@@ -20,7 +20,7 @@ export function buildTauriProfileConfig(original, port, runId) {
   ].join(' ')
   return {
     ...structuredClone(original),
-    identifier: `co.aiclient.risu.luaworkerpilot.${safeRunId}`,
+    identifier: `RisuNest.luaworkerpilot.${safeRunId}`,
     build: {
       ...original.build,
       beforeBuildCommand: 'pnpm exec vite build --config benchmarks/lua-worker-pilot/vite.config.ts',

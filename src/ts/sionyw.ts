@@ -205,7 +205,7 @@ async function loginToSionywSPAVersion(){
             'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-            client_name: 'Risuai Client',
+            client_name: 'RisuNest Client',
             redirect_uris: ['risuai://sionyw/callback'],
             grant_types: ['refresh_token', 'authorization_code'],
             response_types: ['code'],

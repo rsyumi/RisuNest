@@ -930,7 +930,7 @@
   {#if sideBarMode === 0}
     {#if $selectedCharID < 0 || $settingsOpen}
       <div>
-        <h1 class="text-xl">Welcome to RisuAI!</h1>
+        <h1 class="text-xl">Welcome to RisuNest!</h1>
         <span class="text-xs text-textcolor2">Select a bot to start chatting</span>
       </div>
     {:else if DBState.db.characters[$selectedCharID]?.chaId === '§playground'}

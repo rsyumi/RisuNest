@@ -19,7 +19,7 @@ export class ModuleHandler extends MCPToolHandler {
   getTools(): MCPTool[] {
     return [
       {
-        description: 'List installed Risuai modules (excluding MCP modules).',
+        description: 'List installed RisuNest modules (excluding MCP modules).',
         inputSchema: {
           properties: {
             count: {
@@ -39,7 +39,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-list-modules',
       },
       {
-        description: 'Get information about a specific Risuai module.',
+        description: 'Get information about a specific RisuNest module.',
         inputSchema: {
           properties: {
             fields: {
@@ -69,7 +69,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-get-module-info',
       },
       {
-        description: 'Set information about a specific Risuai module.',
+        description: 'Set information about a specific RisuNest module.',
         inputSchema: {
           properties: {
             data: {
@@ -95,7 +95,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-set-module-info',
       },
       {
-        description: 'List the lorebooks of a Risuai module.',
+        description: 'List the lorebooks of a RisuNest module.',
         inputSchema: {
           properties: {
             count: {
@@ -119,7 +119,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-list-module-lorebooks',
       },
       {
-        description: 'Get lorebooks with specific names from a Risuai module.',
+        description: 'Get lorebooks with specific names from a RisuNest module.',
         inputSchema: {
           properties: {
             id: {
@@ -138,7 +138,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-get-module-lorebook',
       },
       {
-        description: 'Update an existing lorebook of a Risuai module, or create a new one if it does not exist.',
+        description: 'Update an existing lorebook of a RisuNest module, or create a new one if it does not exist.',
         inputSchema: {
           properties: {
             alwaysActive: {
@@ -174,7 +174,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-set-module-lorebook',
       },
       {
-        description: 'Delete a lorebook from a Risuai module.',
+        description: 'Delete a lorebook from a RisuNest module.',
         inputSchema: {
           properties: {
             id: {
@@ -192,7 +192,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-delete-module-lorebook',
       },
       {
-        description: 'Get regex scripts from a Risuai module.',
+        description: 'Get regex scripts from a RisuNest module.',
         inputSchema: {
           properties: {
             id: {
@@ -206,7 +206,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-get-module-regex-scripts',
       },
       {
-        description: 'Update an existing regex script in a Risuai module, or create a new one if it does not exist.',
+        description: 'Update an existing regex script in a RisuNest module, or create a new one if it does not exist.',
         inputSchema: {
           properties: {
             ableFlag: {
@@ -250,7 +250,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-set-module-regex-script',
       },
       {
-        description: 'Delete a regex script from a Risuai module.',
+        description: 'Delete a regex script from a RisuNest module.',
         inputSchema: {
           properties: {
             id: {
@@ -268,7 +268,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-delete-module-regex-script',
       },
       {
-        description: 'Get the Lua script from a Risuai module trigger.',
+        description: 'Get the Lua script from a RisuNest module trigger.',
         inputSchema: {
           properties: {
             id: {
@@ -282,7 +282,7 @@ export class ModuleHandler extends MCPToolHandler {
         name: 'risu-get-module-lua-script',
       },
       {
-        description: 'Update the Lua script of a Risuai module.',
+        description: 'Update the Lua script of a RisuNest module.',
         inputSchema: {
           properties: {
             code: {

@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use risuai_lib::import_export_jobs::{
+use risunest_lib::import_export_jobs::{
     classify_content, parse_json_card, parse_risum, ContentKind, FormatErrorKind, ImportLimits,
     JobStaging,
 };
@@ -211,7 +211,7 @@ impl Seek for ChunkedSeekReader {
 #[test]
 fn rpack_decode_matches_the_frozen_javascript_map() {
     assert_eq!(
-        risuai_lib::import_export_jobs::decode_rpack(GOLDEN_MODULE_RPACK).unwrap(),
+        risunest_lib::import_export_jobs::decode_rpack(GOLDEN_MODULE_RPACK).unwrap(),
         GOLDEN_MODULE_JSON
     );
 }

@@ -7,8 +7,8 @@ set -eu
 # Legal configuration:
 # Set this to TRUE only for a personal private self-hosted instance, a development/testing
 # fork intended to contribute back upstream, or a fork whose Terms of Service,
-# Privacy Policy, and Risuai service usage alerts have been configured correctly.
-# Builds without this flag show a legal warning screen and should not use Risuai
+# Privacy Policy, and RisuAI service usage alerts have been configured correctly.
+# Builds without this flag show a legal warning screen and should not use RisuAI
 # services that require the original legal notices.
 # export VITE_RISU_LEGAL_CONFIGURED="${VITE_RISU_LEGAL_CONFIGURED:-TRUE}"
 

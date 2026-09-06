@@ -7,14 +7,14 @@ export class ChatHandler extends MCPToolHandler {
     return [
       {
         name: 'risu-get-chat-history',
-        description: 'Get the chat history with user and a Risuai character. ordered by time, newest first.',
+        description: 'Get the chat history with user and a RisuNest character. ordered by time, newest first.',
         inputSchema: {
           type: 'object',
           properties: {
             id: {
               type: 'string',
               description:
-                'The ID or name of the Risuai character. This can be a character name or ID. if its blank string, it will use the current character.',
+                'The ID or name of the RisuNest character. This can be a character name or ID. if its blank string, it will use the current character.',
             },
             count: {
               type: 'integer',

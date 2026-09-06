@@ -19,7 +19,7 @@ export function buildBenchmarkConfig(original, port, runId) {
     ].join(' ')
     return {
         ...structuredClone(original),
-        identifier: `co.aiclient.risu.regexnativepilot.${safeRunId}`,
+        identifier: `RisuNest.regexnativepilot.${safeRunId}`,
         build: {
             ...original.build,
             beforeBuildCommand: 'pnpm exec vite build --config benchmarks/regex-native-pilot/vite.config.ts',

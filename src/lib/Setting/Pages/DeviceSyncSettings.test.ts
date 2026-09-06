@@ -55,7 +55,7 @@ const cloneBase = {
 const deltaBase = { pullPhase: 'idle' as const, retained: null, error: null }
 const bidiBase = { operationPhase: 'idle' as const, operationRetained: false, operationError: null }
 const genericFailure = 'The task did not finish. Try again, and if it keeps failing restart the app on both devices.'
-const validRegistrationUri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F10.1.2.3%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+const validRegistrationUri = 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F10.1.2.3%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
 
 function snapshot(partial: Partial<DeviceSyncControllerSnapshot> = {}): DeviceSyncControllerSnapshot {
     return { source: { phase: 'idle' }, sources: [], devices: [], error: null, sourceError: null, workError: null, remoteCommitNotice: null, stagedLink: null, stagedUri: null, stagedSourceDeviceId: null, activeCloneSourceDeviceId: null, activeBidirectionalSourceDeviceId: null, expiredSourceIds: [], targets: { clone: cloneBase, delta: deltaBase, bidirectional: bidiBase }, ...partial }
@@ -245,7 +245,7 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('shows a pending registration link that the controller consumed before page mount', async () => {
-        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+        const uri = 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
         await render(snapshot({ stagedUri: uri, stagedLink: { endpoint: 'http://127.0.0.1:32145', sessionId: 'session', manifestId: 'a'.repeat(64), claim: 'b'.repeat(64) } }))
 
         expect(target.querySelector<HTMLSelectElement>('#device-sync-target')?.value).toBe('new-link')
@@ -254,7 +254,7 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('updates the mounted input from controller-owned links and stages only a genuine manual replacement', async () => {
-        const pending = 'risuailocal://peer-clone/v2?pending'
+        const pending = 'risunestlocal://peer-clone/v2?pending'
         const replacement = validRegistrationUri
         await render(snapshot())
 
@@ -395,7 +395,7 @@ describe('DeviceSyncSettings', () => {
 
     it('shows QR, localized countdown, and rotates using permissions selected before the link', async () => {
         vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-02T00:00:00Z'))
-        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+        const uri = 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
         await render(snapshot({ source: { phase: 'running', pairingUri: uri, expiresAtMs: Date.now() + 125_000 } }))
         await vi.advanceTimersByTimeAsync(0); await tick()
         expect(target.querySelector('img[alt="Register a new device"]')).not.toBeNull()
@@ -405,7 +405,7 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('removes the old QR immediately while a replacement QR is still generating', async () => {
-        const uri = (claim: string) => 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + claim.repeat(64)
+        const uri = (claim: string) => 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + claim.repeat(64)
         await render(snapshot({ source: { phase: 'running', pairingUri: uri('b'), expiresAtMs: Date.now() + 60_000 } }))
         await vi.waitFor(() => expect(target.querySelector('img')).not.toBeNull())
         let release!: (value: string) => void
@@ -419,7 +419,7 @@ describe('DeviceSyncSettings', () => {
     })
 
     it('preserves the rendered QR when polling repeats the same pairing URI', async () => {
-        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+        const uri = 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
         const running = snapshot({ source: { phase: 'running', pairingUri: uri, expiresAtMs: Date.now() + 60_000 } })
         await render(running)
         await vi.waitFor(() => expect(target.querySelector('img')).not.toBeNull())
@@ -959,7 +959,7 @@ describe('DeviceSyncSettings', () => {
     it('refuses a second link rotation instead of reporting an unavailable slot', async () => {
         let release!: () => void
         controllerState.controller.rotateLink.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve(undefined) }))
-        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+        const uri = 'risunestlocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
         await render(snapshot({ source: { phase: 'running', pairingUri: uri, expiresAtMs: Date.now() + 60_000 } }))
 
         button('Create new link')!.click(); await tick()

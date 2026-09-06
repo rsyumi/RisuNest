@@ -1,4 +1,4 @@
-package co.aiclient.risu
+package io.github.rsyumi.risunest
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -15,8 +15,8 @@ import java.util.UUID
 internal const val PEER_SYNC_FOREGROUND_START_MODE = Service.START_NOT_STICKY
 internal const val PEER_SYNC_FOREGROUND_CHANNEL = "risu-peer-sync-source"
 private const val PEER_SYNC_FOREGROUND_NOTIFICATION_ID = 0x52535031
-private const val PEER_SYNC_FOREGROUND_START = "co.aiclient.risu.PEER_SYNC_SOURCE_START"
-internal const val PEER_SYNC_FOREGROUND_STOP_ACTION = "co.aiclient.risu.PEER_SYNC_SOURCE_STOP"
+private const val PEER_SYNC_FOREGROUND_START = "io.github.rsyumi.risunest.PEER_SYNC_SOURCE_START"
+internal const val PEER_SYNC_FOREGROUND_STOP_ACTION = "io.github.rsyumi.risunest.PEER_SYNC_SOURCE_STOP"
 internal const val PEER_SYNC_FOREGROUND_STOP_PENDING_FLAGS =
   PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
 private const val PEER_SYNC_LANE_EXTRA = "lane"
@@ -80,7 +80,7 @@ internal fun shouldStopPeerSyncForegroundWithoutIdentity(
 
 internal object PeerSyncForegroundNativeBridge {
   init {
-    System.loadLibrary("risuai_lib")
+    System.loadLibrary("risunest_lib")
   }
 
   @JvmStatic external fun attach(lane: String, operationId: String, generation: Long): Boolean

@@ -26,7 +26,7 @@ const productionDependencies: LegacyLocalBackupFileRouteDependencies = {
         const selected = await open({
             multiple: false,
             directory: false,
-            filters: [{ name: 'RisuAI Backup', extensions: ['bin'] }],
+            filters: [{ name: 'RisuNest Backup', extensions: ['bin'] }],
         })
         return typeof selected === 'string'
             ? { type: 'desktopPath', path: selected }
@@ -38,7 +38,7 @@ const productionDependencies: LegacyLocalBackupFileRouteDependencies = {
         }
         const path = await save({
             defaultPath: 'risu-backup.bin',
-            filters: [{ name: 'RisuAI Backup', extensions: ['bin'] }],
+            filters: [{ name: 'RisuNest Backup', extensions: ['bin'] }],
         })
         return path ? { type: 'desktopPath', path } : null
     },

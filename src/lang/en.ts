@@ -26,7 +26,7 @@ export const languageEnglish = {
         vertexAuthError: "Vertex AI authentication details are missing.",
         networkFetch: "This happens when the network is unstable or the server is down.",
         networkFetchWeb:
-            "This can be a CORS error. this only happens when using web version due to limitations of the browser. try using desktop local version, or other version of Risuai.",
+            "This can be a CORS error. this only happens when using web version due to limitations of the browser. try using desktop local version, or other version of RisuNest.",
         networkFetchPlain: "This can be a plain fetch error. try disabling force plain fetch option in settings.",
         requestLogRemoved: "This request log is removed.",
         requestLogRemovedDesc: "This request log removes when client is refreshed or reloaded.",
@@ -166,7 +166,7 @@ export const languageEnglish = {
         additionalParams:
             'Additional parameters that would be added to the request body. If you want to exclude some parameters, you can put `{{none}}` to the value. If you want to add a header instead of body, you can put `header::` in front of the key like `header::Authorization`. If you want value as json, you can put `json::` in front of the value like `json::{"key":"value"}`. otherwise, type of the value would be determined automatically.',
         antiClaudeOverload:
-            "If Claude overload happens, Risuai would try to prevent it by continuing with same prompt, making it less likely to happen. Works only for streamed responses. This could not work for non-official api endpoints.",
+            "If Claude overload happens, RisuNest would try to prevent it by continuing with same prompt, making it less likely to happen. Works only for streamed responses. This could not work for non-official api endpoints.",
         triggerScript:
             'Trigger Script is a custom script that runs when a condition is met. It can be used to modify the chat data, run a command, change variable, and etc. the type depends when it is triggered. It can also be run by buttons, which can be used with {{button::Display::TriggerName}}, or HTML buttons with `risu-trigger="<TriggerName>"` attribute.',
         autoContinueChat: "If enabled, it will try to continue the chat if it doesn't ends with a punctuation. DONT USE THIS WITH LANGUAGES THAT DOESN'T USE PUNCTUATION.",
@@ -181,7 +181,7 @@ export const languageEnglish = {
         customPromptTemplateToggle:
             "Here you can define your own prompt toggles. Use `<toggle variable>=<toggle name>` format, seperated by newline. for example, `cot=Toggle COT`. You can use these toggles in prompt by using `{{getglobalvar::toggle_<toggle variable>}}`. like `{{getglobalvar::toggle_cot}}`.",
         defaultVariables:
-            "Here you can define your own default variables. Use `<variable name>=<variable value>` format, seperated by newline. For example, `name=Risuai`, which then can be used with trigger scripts and variables CBS like `{{getvar::A}}`, `{{setvar::A::B}}` or `{{? $A + 1}}`. If prompt template's default variable and character's default variable has same name, character's default variable will be used.",
+            "Here you can define your own default variables. Use `<variable name>=<variable value>` format, seperated by newline. For example, `name=RisuNest`, which then can be used with trigger scripts and variables CBS like `{{getvar::A}}`, `{{setvar::A::B}}` or `{{? $A + 1}}`. If prompt template's default variable and character's default variable has same name, character's default variable will be used.",
         lowLevelAccess:
             "If enabled, it will enable access to features that requires high computing powers and executing AI model via triggers in the character. Do not enable this unless you really need these features.",
         triggerLLMPrompt:
@@ -209,8 +209,8 @@ export const languageEnglish = {
         enableScrollToActiveChar: "If enabled, pressing the hotkey or holding Ctrl while dragging a character will scroll to the currently active character. Folders will be opened automatically if closed.",
         unrecommended: "This is a unrecommended setting. It is not recommended to use this setting.",
         jsonSchema:
-            "This is a JSON Schema that will be sent to the AI model if AI model supports JSON Schema.\n\nHowever, since JSON Schema is hard to learn, In Risuai, you can use subset of TypeScript interface instead of JSON Schema. Risuai will convert it in runtime." +
-            'For example, if you want to send a JSON like this:\n\n```js\n{\n  "name": "Risuai", //name must be Risuai,\n  "age": 1, //age must be number,\n  "icon": "slim", //icon must be \'slim\' or \'rounded\'\n  "thoughts": ["Good View!", "Lorem"] //thoughts must be array of strings\n}\n```\n\n' +
+            "This is a JSON Schema that will be sent to the AI model if AI model supports JSON Schema.\n\nHowever, since JSON Schema is hard to learn, In RisuNest, you can use subset of TypeScript interface instead of JSON Schema. RisuNest will convert it in runtime." +
+            'For example, if you want to send a JSON like this:\n\n```js\n{\n  "name": "RisuNest", //name must be RisuNest,\n  "age": 1, //age must be number,\n  "icon": "slim", //icon must be \'slim\' or \'rounded\'\n  "thoughts": ["Good View!", "Lorem"] //thoughts must be array of strings\n}\n```\n\n' +
             "You can put this TypeScript interface:\n\n```typescript\ninterface Schema {\n  name: string;\n  age: number;\n  icon: 'slim'|'rounded'\n  thoughts: string[]\n}\n```\n\n" +
             "Name of the interface doesn't matter. for more information, see the typescript documentation. (https://www.typescriptlang.org/docs/handbook/interfaces.html), and to Check what subset of TypeScript is supported, see the below." +
             "<details><summary>Supported TypeScript Subset</summary>\n\n" +
@@ -334,13 +334,13 @@ export const languageEnglish = {
         themeDescClassic: "Suitable for All devices",
         texttheme: "Select your text color",
         inputName: "Lastly, input your Nickname.",
-        welcome: "Welcome to Risuai! I am Airisu, I am here to guide you through the Risuai setup. First, what may I call you?",
+        welcome: "Welcome to RisuNest! I am Airisu, I am here to guide you through the RisuNest setup. First, what may I call you?",
         welcome2: "Hello {username}! Before we start, I will ask you some questions. You can change these settings later in settings.\n\nFirst select the AI provider.",
         openRouterProvider: "OpenRouter has a lot of models, some of them unfiltered and some of them free, but it is not as good as OpenAI.",
         hordeProvider: "Horde is a free provider, but the response time is long and the quality is low.",
         setProviderLater: "There are other providers, but you can set it later in settings. Select this if you want to set it later.",
         setupOpenAI:
-            "To use OpenAI, you need to get an API key. \n1. Go to https://beta.openai.com/ \n2. Login with your account \n3. Go to https://beta.openai.com/account/api-keys \n4. Click 'Create New API Key' and name your key whatever you want. \n5. Copy the key in the website.\n6. Go back to Risuai\n7. Paste it, and click send button.",
+            "To use OpenAI, you need to get an API key. \n1. Go to https://beta.openai.com/ \n2. Login with your account \n3. Go to https://beta.openai.com/account/api-keys \n4. Click 'Create New API Key' and name your key whatever you want. \n5. Copy the key in the website.\n6. Go back to RisuNest\n7. Paste it, and click send button.",
         setupClaude: "To use Claude, you need to get an API key.",
         setupClaudeSteps: [
             "Go to this URL and Login as Google",
@@ -357,7 +357,7 @@ export const languageEnglish = {
             "Copy the key, and paste it in here and send it.",
         ],
         setupOpenRouter:
-            "To use OpenRouter, you need to get an API key. \n1. Go to https://openrouter.ai/keys\n2. Click 'Create Key'\n3. Set key name whatever you want.\n4. Copy the key in the website\n5. Go back to Risuai\n6. Paste it, and click send button.",
+            "To use OpenRouter, you need to get an API key. \n1. Go to https://openrouter.ai/keys\n2. Click 'Create Key'\n3. Set key name whatever you want.\n4. Copy the key in the website\n5. Go back to RisuNest\n6. Paste it, and click send button.",
         allDone: "All Done! Please wait a moment.",
         setupLaterMessage: "Welcome {username}! Do you want me to guide you to setup or do it yourself?",
         setupMessageOption1: "Guide me to setup",
@@ -978,9 +978,9 @@ export const languageEnglish = {
     proxyAPIKey: "Key/Password",
     proxyRequestModel: "Request Model",
     officialWiki: "Official Wiki",
-    officialWikiDesc: "Official Wiki for Risuai. Feel free to see.",
+    officialWikiDesc: "Official Wiki for RisuNest. Feel free to see.",
     officialDiscord: "Official Discord",
-    officialDiscordDesc: "Official Discord to talk about Risuai",
+    officialDiscordDesc: "Official Discord to talk about RisuNest",
     persona: "Persona",
     icon: "Icon",
     account: "Account",
@@ -1093,7 +1093,7 @@ export const languageEnglish = {
     import: "Import",
     supporterThanks: "Supporter Thanks",
     supporterThanksDesc: "Thank you for your support!",
-    donatorPatreonDesc: "For default, it will not be shown in the list for privacy. If you want to show your nickname, go to Risuai's patreon page and press the link button.",
+    donatorPatreonDesc: "For default, it will not be shown in the list for privacy. If you want to show your nickname, go to RisuNest's patreon page and press the link button.",
     useNamePrefix: "Use Name Prefix",
     textAdventureNAI: "Run as Text Adventure",
     appendNameNAI: "Append Name on NAI",
@@ -1161,7 +1161,7 @@ export const languageEnglish = {
     inputCardPassword: "Input Card Password",
     ccv2Desc: "Character Card V2 is a format widely used in chatbot programs.",
     ccv3Desc: "Character Card V3 is a next generation format that is used in chatbot programs.",
-    realmDesc: "RisuRealm is a content sharing platform for Risuai. You can share your character to other users.",
+    realmDesc: "RisuRealm is a content sharing platform for RisuNest. You can share your character to other users.",
     rccDesc: "Risu Refined Character Card is a format with additional features like password, integrity check and etc.",
     password: "Password",
     license: "License",
@@ -1232,8 +1232,8 @@ export const languageEnglish = {
     trash: "Trash",
     trashDesc: "Deleted characters are moved to trash. You can restore or delete them permanently. Deleted characters are automatically purged after 3 days.",
     shareExport: "Share/Export",
-    risupresetDesc: "Risupreset format is a format specifically designed for Risuai presets.",
-    risuMDesc: "RisuM format is a format that is specifically designed for Risuai modules.",
+    risupresetDesc: "Risupreset format is a format specifically designed for RisuNest presets.",
+    risuMDesc: "RisuM format is a format that is specifically designed for RisuNest modules.",
     jsonDesc: "JSON format is a format that is easy to read and write for both humans and machines.",
     nickname: "Nickname",
     useRegexLorebook: "Use Regex",
@@ -1390,7 +1390,7 @@ export const languageEnglish = {
     home: "Home",
     showSavingIcon: "Show Saving Icon",
     pluginVersionWarn:
-        "This is {{plugin_version}} version of the plugin. Which is not compatible with this version of Risuai. Please update the plugin to {{required_version}} version.",
+        "This is {{plugin_version}} version of the plugin. Which is not compatible with this version of RisuNest. Please update the plugin to {{required_version}} version.",
     imageTranslation: "Image Translation",
     banCharacterset: "Auto Regenerate On Characterset",
     realmDirectOpen: "Directly open character in RisuRealm",
@@ -1603,10 +1603,10 @@ export const languageEnglish = {
     nightlyWarning:
         "## Nightly Builds\n\nYou are connecting to a nightly build of the software. This version is meant for testing and most likely contains bugs. **In this version, even if you encounter issues, we do not support resolving them directly.**",
     loginSionyw: "Login with Sionyw Account",
-    pluginRiskDetectedAlert: "Risuai detected code that may be harmful which can STOLE YOUR API KEY OR PERSONAL DATA. We recommend you to NOT INSTALL THIS PLUGIN.",
+    pluginRiskDetectedAlert: "RisuNest detected code that may be harmful which can STOLE YOUR API KEY OR PERSONAL DATA. We recommend you to NOT INSTALL THIS PLUGIN.",
     doNotInstall: "Do Not Install",
     continueAnyway: "Continue Anyway",
-    pluginNoRiskButAlert: "Risuai did not detect harmful code, but please be aware that installing plugins from untrusted sources can pose security risks.",
+    pluginNoRiskButAlert: "RisuNest did not detect harmful code, but please be aware that installing plugins from untrusted sources can pose security risks.",
 
     pluginRisksInuserFriendly: {
         eval: "Evaluating Code from Strings",
@@ -1690,8 +1690,8 @@ export const languageEnglish = {
     blockquoteStyling: "Blockquote Styling",
     dynamicModelRegistry: "Dynamic Model Registry",
     confirmInstallPluginViaPlugin: "You are trying to install a plugin via another plugin. This can be dangerous if the source plugin is not trustworthy. Do you want to continue?",
-    risuaiProTools: "Risuai Pro Tools",
-    enableRisuaiProTools: "Enable Risuai Pro Tools",
+    risuaiProTools: "RisuNest Pro Tools",
+    enableRisuaiProTools: "Enable RisuNest Pro Tools",
     easyPanel: "Easy Panel",
     mainModel: "Main Model",
     epEnabled: "Easy Panel Override",
@@ -1764,7 +1764,7 @@ export const languageEnglish = {
         storage: { title: 'Storage', total: 'Total data', media: 'Images & media', inlays: 'Chat attachments', plugins: 'Plugin data', snapshots: 'Snapshots', conflictBackups: 'Conflict backups', counts: '{0} characters · {1} chats · {2} messages', createSnapshot: 'Create snapshot now', cleanSyncTemp: 'Clean up sync temp files', calculateSize: 'Calculate size', calculateSizeFailed: "Couldn't calculate temporary file size. Refresh the information and try again.", tempUsage: '{size} used', gcRun: 'Clean up unused images', gcRunConfirm: 'Confirm cleanup', gcResult: 'Removable: {0} items ({1})', gcDeletedResult: 'Deleted: {0} items ({1})', gcConfirm: 'This will delete {0} unused images ({1}). Continue?', deleteSnapshotConfirm: "Delete this snapshot? You won't be able to restore to this point.", deleteConflictBackupConfirm: 'Delete this conflict backup? This conflict backup cannot be recovered after deletion.', syncBackups: 'Sync backups', deleteSyncBackupConfirm: "Delete this sync backup? You won't be able to roll back to the state before that sync.", syncBackupInUse: "This backup is used by a sync in progress and can't be deleted.", cleanSyncTempNote: 'Removes leftover temporary files only. Backups and tasks in progress are not touched.', trashedCount: '({0} in trash)', loadFailed: "Couldn't load storage information.", staleTotals: 'Storage totals may be out of date. Refresh the information and try again.', emptyList: 'Nothing saved yet.', retry: 'Retry', actionFailed: "Couldn't complete the action. Some changes may already have been applied. Refresh the information and try again." },
         backup: { title: 'Backup & restore', officialPublish: 'Create official account backup', officialRestore: 'Restore official account backup', officialCancel: 'Cancel backup upload', officialRestoreConfirm: 'Replace local data with the official account backup?', officialRestoreInlayWarning: 'Official snapshots do not include separate chat attachments. Referenced images, audio, video, and signatures may not be restored. The app will restart after restoring the backup. Continue?', officialMissing: 'No official account backup was found. Local data was not changed.', officialPublishConfirm: 'Overwrite the official account backup with current local data?', officialPublished: 'Official account backup published.', actionFailed: "Couldn't complete the backup operation. Some changes may already have been applied.", progressPreparing: 'Preparing', progressTransferring: 'Transferring data', progressFinalizing: 'Finishing', localBackupSaved: 'Local backup saved.', localBackupRestored: 'Local backup restored.' },
         platform: { title: 'Platform', notifications: 'Notifications', notificationsOn: 'Allowed', notificationsOff: 'Off', openSettings: 'Open system settings', keepAlive: 'Keep app alive while generating', keepAliveHelp: "Shows a notification while receiving an AI response so the system doesn't stop the app in the background.", keepAliveNeedsNotifications: "This feature doesn't work while notifications are off.", operatingSystem: 'Operating system', webView: 'WebView', transferMode: 'Transfer mode' },
-        boot: { title: 'RisuNest could not start', schemaUnsupported: 'The data folder holds a persistent store from an incompatible pre-release build. RisuNest cannot open it and will not convert it. Remove that store from the data folder yourself, then start RisuNest again.', storeOpen: 'The local data store could not be opened. Another copy of RisuNest may still be using it, or the data folder may be unreadable. Close any other running copy, then start RisuNest again.', unknown: 'Startup failed before the app finished loading. The details below show what went wrong.', restart: 'Restart', copyDetails: 'Copy error details', copied: 'Error details copied.', dataPathWindows: 'Windows: %APPDATA%\\co.aiclient.risu\\', dataPathAndroid: 'Android: App info > Storage > Clear data', stage: 'Stage' },
+        boot: { title: 'RisuNest could not start', schemaUnsupported: 'The data folder holds a persistent store from an incompatible pre-release build. RisuNest cannot open it and will not convert it. Remove that store from the data folder yourself, then start RisuNest again.', storeOpen: 'The local data store could not be opened. Another copy of RisuNest may still be using it, or the data folder may be unreadable. Close any other running copy, then start RisuNest again.', unknown: 'Startup failed before the app finished loading. The details below show what went wrong.', restart: 'Restart', copyDetails: 'Copy error details', copied: 'Error details copied.', dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\', dataPathAndroid: 'Android: App info > Storage > Clear data', stage: 'Stage' },
         diag: { title: 'Diagnostics', viewLog: 'View error log', copyLog: 'Copy error log', fileLog: 'Save error log to a file', fileLogHelp: 'Attach this file when reporting a problem. Secrets such as API keys are masked before being written.', logEmpty: 'No errors recorded.', actionFailed: 'Diagnostics are unavailable right now. Restart the app and try again.' },
         sync: { menuTitle: 'Device sync', intro: 'Copy or sync your data with another device.', registrationExpired: 'Registration expired. Register again with a new link.', errorGeneric: 'The task did not finish. Try again, and if it keeps failing restart the app on both devices.', errorTransportUnavailable: 'Could not reach the other device. Check that it is turned on, that sharing is running there, and that both devices are on the same network.', share: { title: 'Sharing', stateOff: 'Off', statePreparing: 'Preparing', stateListening: 'Listening', stateStopping: 'Stopping', stateError: 'Error', errorPortUnavailable: 'That port is already in use. Choose another port.', errorInvalidConfiguration: 'Check the sharing method, port, and public address.', errorCleanupFailed: 'Sharing stopped, but cleanup did not finish. Try stopping again.', methodLan: 'Same network (LAN)', methodQuick: 'Temporary internet address', methodFixed: 'Fixed address (advanced)', port: 'Port', publicUrl: 'Public address (URL)', quickNote: 'The address changes when you restart the app. Devices must then be registered again.', fixedNote: 'Connect the port below to your public address using your own tunnel or port forwarding. The address is saved, and registered devices reconnect without registering again.', fixedGuideTitle: 'How to connect it yourself', fixedGuideBody: 'If you use Cloudflare Tunnel: create a tunnel in the Cloudflare dashboard, install cloudflared as a service on this computer, and point the tunnel at http://127.0.0.1:{0}. The app never stores or needs the tunnel token.', autoListen: 'Start listening automatically when the app opens', start: 'Start sharing', stop: 'Stop sharing', pairTitle: 'Register a new device', pairNote: 'A registration link works for 10 minutes and for one device only.', pairRemaining: '{0} left', durationMinute: '{0} minute', durationMinutes: '{0} minutes', durationSecond: '{0} second', durationSeconds: '{0} seconds', pairExpired: 'Expired. Create a new link.', copyLink: 'Copy link', newLink: 'Create new link', permRead: 'Allow copying data', permBidirectional: 'Allow two-way sync', permBidirectionalHelp: 'If allowed, the other device can also change data on this device.' }, devices: { title: 'Registered devices', note: 'Once registered, a device reconnects without registering again.', outgoingTitle: 'Devices that copy from this device', incomingTitle: 'Devices this device copies from', permRead: 'Copy', permBidirectional: 'Two-way', outgoingEmpty: 'None yet. Start sharing and open the registration link on another device to add it here.', incomingEmpty: "None yet. Use another device's registration link in Sync tasks below to save it here.", lastSeen: 'Last connected {0} · {1} total', revoke: 'Remove', revokeConfirm: "Remove this device? It won't be able to connect until you register it again." }, work: { title: 'Sync tasks', target: 'Target device', useNewLink: 'Use a new registration link...', linkPlaceholder: 'Paste a registration link', linkInvalid: 'That is not a registration link. Copy the whole link from the other device, or open its QR code.', receiving: 'Receiving...', conflictSelectTarget: 'Choose the other device under Target device first, then pick which side to keep.', clone: 'Copy everything', cloneConfirm: 'This replaces all data on this device with the other device\'s data. Your current data is kept as a backup first. Continue?', delta: 'Get changes only', bidirectional: 'Two-way sync', blockedWhileSharing: 'Stop sharing to run a receive task.', registerBlockedByActiveWork: 'Finish or stop the current operation before registering a new device.', sourceInUse: 'A sync task is still using this device. Finish or cancel it, then try again.', sourceChanged: "The target device's registration changed. Select the target device again and retry.", deltaBlockedByRetained: 'An unfinished earlier update is still pending. Continue or cancel it under Sync tasks.', deltaRetained: 'An earlier update from {0} did not finish.', deltaRetainedResumable: 'Turn the other device back on and continue to finish it. Cancel if that device is no longer available.', deltaRetainedAmbiguous: "This device's data changed afterwards, so it cannot continue. Cancel to unblock receiving, removing, and registering.", deltaAbandonConfirm: "Cancel the pending update? Data on this device stays as it is, but the other device's transfer statistics may not update.", unknownDevice: 'Unknown device', peerOutdated: 'The other device runs an older RisuNest. Update both devices to the same version and try again.', progress: 'Receiving {0}%', cancel: 'Cancel', conflictTitle: 'There are conflicts', conflictBody: 'The same items changed on both devices. Choose which side to keep. The other side is kept as a backup.', conflictOthers: '{0} other items', keepThis: 'Keep this device', keepOther: 'Keep other device', resume: 'Continue', abandon: 'Abandon task', abandonConfirm: 'Cancel this sync? Nothing received so far will be applied.', doneUpToDate: 'Already up to date.', doneUpdated: 'Received {0} items ({1}).', needClone: 'A full copy is required. Use Copy everything above.', backupNote: 'Your previous data is kept as a backup.', dismiss: 'Dismiss', progressLabel: 'Progress', deltaConflictBothChanged: 'The same items changed on both devices, so the changes could not be received. No data was changed. Use two-way sync instead.', deltaConflictLocalChanged: 'Local data changed while the update was starting. No data was changed. Retry the update.', bidirectionalSyncing: 'Exchanging and verifying changes...', bidirectionalResumeRequired: 'The local change is committed. Resume to finish the other device and acknowledgement.', bidirectionalSourceUnavailable: 'Cannot connect to the other device. Check that sharing is on there, then continue. If that device uses a temporary internet address and restarted the app, register it again.', bidirectionalRefreshPending: 'Both devices are committed, but the local screen could not refresh.', bidirectionalEditsDiscarded: "The other device's changes were applied, and recent unsaved edits on this device were lost. The screen may differ from what you last saw." }, lanWarning: 'LAN connections are not encrypted. Use them only on networks you trust.', androidLanOnly: 'Android supports same-network (LAN) connections only.', notificationsDisabledWarning: 'Notifications are turned off for this app, so Android will not show the transfer notification with its Stop button. You can still stop sharing from this screen, or allow notifications in system settings to get the notification Stop control back.' },
     },
