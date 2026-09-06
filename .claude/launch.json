@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dev:agent",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["dev:agent"],
+      "port": 5174
+    }
+  ]
+}

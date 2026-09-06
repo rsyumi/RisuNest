@@ -7,7 +7,6 @@ These scripts measure the Roadmap 14 Highlight and SortableJS bundle gates witho
 Build the ordinary production application with source maps and a Vite manifest, then measure the static entry closure. Dynamic imports are intentionally excluded.
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 pnpm exec vite build --manifest .vite/manifest.json --outDir dist --sourcemap
 node benchmarks/w8/bundle-gates.mjs --dist dist
 ```
@@ -62,7 +61,6 @@ try {
 
     Push-Location $w8CandidateRoot
     try {
-        $env:VITE_DISABLE_REALM = 'true'
         pnpm install --frozen-lockfile
         pnpm exec vite build --manifest .vite/manifest.json --outDir dist --sourcemap
         node benchmarks/w8/bundle-gates.mjs --dist dist
@@ -99,7 +97,6 @@ The `finally` block narrowly removes only known generated directories with `-Lit
 Build the production-minified benchmark entry into a temporary directory and run it in installed Edge or Chrome. The runner disables the browser cache, reloads a fresh JavaScript realm for each sample, parses a JavaScript code block through the real `ParseMarkdown` function, and verifies highlighted output.
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 $w8Output = Join-Path $env:TEMP 'risunest-w8-highlight-measurement'
 pnpm exec vite build --config benchmarks/w8/vite.highlight.config.ts --outDir $w8Output --emptyOutDir
 node benchmarks/w8/highlight-first-use.mjs --dist $w8Output --samples 20
@@ -112,7 +109,6 @@ Set `RISUNEST_W8_BROWSER` to an explicit Edge or Chrome executable when automati
 This build replaces every SortableJS import with a no-op build-only shim. It is not a runnable behavior candidate. The byte difference is the maximum initial graph saving available before a real lazy loader adds its own runtime code.
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 pnpm exec vite build --config benchmarks/w8/vite.sortable-upper-bound.config.ts --manifest .vite/manifest.json --outDir dist --sourcemap
 node benchmarks/w8/bundle-gates.mjs --dist dist
 ```

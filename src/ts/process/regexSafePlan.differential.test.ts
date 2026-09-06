@@ -228,7 +228,6 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
                     cwd: resolve(process.cwd(), 'src-tauri'),
                     env: {
                         ...process.env,
-                        VITE_DISABLE_REALM: 'true',
                     },
                     stdio: ['pipe', 'pipe', 'pipe'],
                 },
@@ -306,7 +305,6 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
                     cwd: resolve(process.cwd(), 'src-tauri'),
                     env: {
                         ...process.env,
-                        VITE_DISABLE_REALM: 'true',
                     },
                     stdio: ['pipe', 'pipe', 'pipe'],
                 },

@@ -4,12 +4,11 @@ import path from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 
-import { createRoadmap14Result, requireRealmDisabled } from './result.mjs'
+import { createRoadmap14Result } from './result.mjs'
 import { listRoadmap14Scenarios } from './scenarios.mjs'
 import { validateRoadmap14Result } from './result-schema.mjs'
 
 export function createPendingAndroidResults({ sourceRevision, appVersion, recordedAt }) {
-    requireRealmDisabled()
     return listRoadmap14Scenarios().map(({ name }) =>
         createRoadmap14Result({
             scenario: name,
@@ -64,7 +63,6 @@ export function createPendingAndroidResults({ sourceRevision, appVersion, record
 }
 
 export function validateAndroidInstrumentationResults(results) {
-    requireRealmDisabled()
     if (!Array.isArray(results)) throw new Error('Android instrumentation output must be an array')
     const expectedNames = listRoadmap14Scenarios().map(({ name }) => name)
     const actualNames = results.map(({ scenario }) => scenario)

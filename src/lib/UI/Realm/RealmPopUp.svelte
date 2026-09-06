@@ -2,7 +2,8 @@
     import { BookIcon, FlagIcon, ImageIcon, PaperclipIcon, SmileIcon, TrashIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { alertConfirm, alertInput, alertNormal } from "src/ts/alert";
-    import { hubURL, type hubType, downloadRisuHub, getRealmInfo } from "src/ts/characterCards";
+    import { realmHubURL, type hubType, downloadRisuHub, getRealmInfo } from "src/ts/characterCards";
+    import { REALM_SITE_URL } from "src/ts/realmEndpoints";
     
     import { DBState } from 'src/ts/stores.svelte';
     import RealmLicense from "./RealmLicense.svelte";
@@ -41,7 +42,7 @@
                         <span class="text-4xl">?</span>
                     </div>
                 {:else}
-                    <img class="h-36 w-36 rounded-md object-top object-cover" alt={openedData.name} src={`${hubURL}/resource/` + openedData.img}>
+                    <img class="h-36 w-36 rounded-md object-top object-cover" alt={openedData.name} src={`${realmHubURL}/resource/` + openedData.img}>
                 {/if}
                 <MultiLangDisplay value={openedData.desc} markdown={true} />
             </div>
@@ -83,7 +84,7 @@
                 const conf = await alertConfirm('Report this character?')
                 if(conf){
                     const report = await alertInput('Write a report text that would be sent to the admin (for copywrite issues, use email)')
-                    const da = await fetch(hubURL + '/hub/report', {
+                    const da = await fetch(realmHubURL + '/hub/report', {
                         method: "POST",
                         body: JSON.stringify({
                             id: openedData.id,
@@ -100,7 +101,7 @@
                     e.stopPropagation()
                     const conf = await alertConfirm('Do you want to remove this character from Realm?')
                     if(conf){
-                        const da = await fetch(hubURL + '/hub/remove', {
+                        const da = await fetch(realmHubURL + '/hub/remove', {
                             method: "POST",
                             body: JSON.stringify({
                                 id: openedData.id,
@@ -115,7 +116,7 @@
             {/if}
             <button class="text-textcolor2 hover:text-green-500" onclick={(async (e) => {
                 e.stopPropagation()
-                await navigator.clipboard.writeText(`https://realm.risuai.net/character/${openedData.id}`)
+                await navigator.clipboard.writeText(`${REALM_SITE_URL}/character/${openedData.id}`)
                 alertNormal(language.clipboardSuccess)
             })}>
                 <PaperclipIcon />

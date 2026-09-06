@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, relative, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { compressSync, decompressSync } from 'fflate'
 import { Packr, Unpackr } from 'msgpackr/index-no-eval'
@@ -36,7 +37,10 @@ const onePixelPng = Buffer.from(
 function usage() {
     return `Phase 3 Step 6 Android smoke helper
 
-Every command requires VITE_DISABLE_REALM=true.
+fresh-install cuts the device off the network (airplane mode plus wifi and data off) and
+refuses to continue until dumpsys connectivity reports no default network, so no
+third-party RisuRealm content can reach a screenshot or a logcat dump. The smoke itself
+only uses adb, so nothing needs the network. Run restore-network when the device is done.
 
 Commands:
   generate
@@ -49,6 +53,9 @@ Commands:
   launch --serial <adb-serial>
   home --serial <adb-serial>
   force-stop --serial <adb-serial>
+
+  restore-network --serial <adb-serial>
+      Turn airplane mode off and the wifi and data radios back on after a smoke run.
 
   collect --serial <adb-serial> --label <label>
       Collect logcat, dumpsys, screenshot, private persistent.db, snapshots, and SQLite
@@ -73,10 +80,51 @@ function parseArguments(argv) {
     return { command, options }
 }
 
-function assertRealmDisabled() {
-    if (process.env.VITE_DISABLE_REALM !== 'true') {
-        throw new Error('Set VITE_DISABLE_REALM=true before running this helper')
+// 이 스모크는 adb만 쓰고 앱도 로컬 persistent store만 검증하므로 네트워크가 전혀
+// 필요 없다. 그래서 아예 끊는다. RisuRealm 목록과 카드 이미지가 screencap이나
+// logcat을 타고 나올 수 없게 만드는 가장 확실한 지점이다.
+//
+// 명령의 종료 코드는 믿지 않는다. `svc wifi disable`은 eth0으로 나가는 에뮬레이터
+// 이미지에서 0을 돌려주면서도 아무것도 끊지 않는다. 그래서 ConnectivityService가
+// 보고하는 기본 네트워크가 사라질 때까지 기다렸다가, 남아 있으면 거부한다.
+// `run`과 `sleep`은 테스트에서 adb 없이 돌리기 위한 주입 지점이다.
+export async function cutDeviceNetwork(serial, { run = adb, sleep = delay, attempts = 20 } = {}) {
+    // 라디오 명령은 기기와 API 레벨에 따라 있고 없고가 달라 실패를 허용한다.
+    // 실제 검증은 아래 dumpsys 확인이 한다.
+    run(serial, ['shell', 'cmd', 'connectivity', 'airplane-mode', 'enable'], { allowFailure: true })
+    run(serial, ['shell', 'svc', 'wifi', 'disable'], { allowFailure: true })
+    run(serial, ['shell', 'svc', 'data', 'disable'], { allowFailure: true })
+
+    let activeNetwork
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        activeNetwork = readActiveDefaultNetwork(serial, run)
+        if (activeNetwork === 'none') return
+        if (attempt + 1 < attempts) await sleep(500)
     }
+    if (activeNetwork === undefined) {
+        throw new Error(
+            'Refusing to run: could not verify that device networking is off because ' +
+                'dumpsys connectivity did not report an "Active default network" line',
+        )
+    }
+    throw new Error(
+        `Refusing to run: device networking is still reachable (active default network ${activeNetwork}). ` +
+            'An emulator image that routes through eth0 is not affected by airplane mode; ' +
+            'take that interface down (adb root, ip link set eth0 down) and retry.',
+    )
+}
+
+// ConnectivityService.dump()가 찍는 "Active default network: <netId|none>" 줄을 읽는다.
+function readActiveDefaultNetwork(serial, run) {
+    const dump = String(run(serial, ['shell', 'dumpsys', 'connectivity'], { allowFailure: true }).stdout || '')
+    const match = dump.match(/^Active default network:\s*(\S+)/m)
+    return match ? match[1] : undefined
+}
+
+export function restoreDeviceNetwork(serial, { run = adb } = {}) {
+    run(serial, ['shell', 'cmd', 'connectivity', 'airplane-mode', 'disable'], { allowFailure: true })
+    run(serial, ['shell', 'svc', 'wifi', 'enable'], { allowFailure: true })
+    run(serial, ['shell', 'svc', 'data', 'enable'], { allowFailure: true })
 }
 
 function sha256(bytes) {
@@ -255,6 +303,7 @@ async function freshInstall(options) {
 
     const install = adb(serial, ['install', '-r', '-t', apk])
     assert.match(String(install.stdout), /Success/)
+    await cutDeviceNetwork(serial)
     adb(serial, ['shell', 'mkdir', '-p', '/sdcard/Download/RisuNest-Step6'])
     for (const variant of ['a', 'b']) {
         const source = resolve(fixtureDirectory, `phase3-step6-${variant}.bin`)
@@ -400,13 +449,14 @@ async function main() {
         process.stdout.write(usage())
         return
     }
-    assertRealmDisabled()
     if (command === 'generate') {
         await generateFixtures()
     } else if (command === 'fresh-install') {
         await freshInstall(options)
     } else if (['launch', 'home', 'force-stop'].includes(command)) {
         lifecycleCommand(command, options)
+    } else if (command === 'restore-network') {
+        restoreDeviceNetwork(requireSerial(options))
     } else if (command === 'collect') {
         await collectEvidence(options)
     } else if (command === 'inspect') {
@@ -417,7 +467,12 @@ async function main() {
     }
 }
 
-main().catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`)
-    process.exitCode = 1
-})
+// 테스트가 cutDeviceNetwork를 import할 수 있도록, 직접 실행됐을 때만 main을 돌린다.
+const invokedDirectly =
+    Boolean(process.argv[1]) && import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+if (invokedDirectly) {
+    main().catch((error) => {
+        process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`)
+        process.exitCode = 1
+    })
+}

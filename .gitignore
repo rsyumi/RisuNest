@@ -49,6 +49,8 @@ dist.zip
 /scripts/*
 !/scripts/exportPersistentFixture.ts
 !/scripts/phase3AndroidSmoke.mjs
+!/scripts/phase3AndroidSmoke.test.ts
+!/scripts/realmBlocklist.mjs
 .env
 /server/node/ssl/certificate
 .worktrees/

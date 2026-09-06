@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
 
 const CDP_HOST = '127.0.0.1'
 const DEFAULT_TIMEOUT_MS = 180_000
@@ -422,7 +423,7 @@ async function startBrowser(repositoryRoot, temporaryRoot, port, timeoutMs) {
     String(previewPort),
   ], {
     cwd: repositoryRoot,
-    env: { ...process.env, VITE_DISABLE_REALM: 'true' },
+    env: { ...process.env },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -464,7 +465,6 @@ async function startTauri(repositoryRoot, temporaryRoot, port) {
   await writeFile(configPath, JSON.stringify(config), 'utf8')
   const environment = {
     ...process.env,
-    VITE_DISABLE_REALM: 'true',
     VITE_RISU_LEGAL_CONFIGURED: 'TRUE',
     APPDATA: path.join(temporaryRoot, 'roaming'),
     LOCALAPPDATA: path.join(temporaryRoot, 'local'),
@@ -545,7 +545,7 @@ async function runPilot(options) {
         'benchmarks/lua-worker-pilot/vite.config.ts',
       ], {
         cwd: repositoryRoot,
-        env: { ...process.env, VITE_DISABLE_REALM: 'true' },
+        env: { ...process.env },
       })
     }
     const started = options.mode === 'browser'
@@ -558,6 +558,9 @@ async function runPilot(options) {
     browser = new CdpClient(cdp.version.webSocketDebuggerUrl)
     await Promise.all([page.connect(options.timeoutMs), browser.connect(options.timeoutMs)])
     await page.call('Runtime.enable')
+    await page.call('Network.enable')
+    // RisuRealm만 브라우저 레벨에서 끊는다. 측정 번들은 프로덕션과 동일하다.
+    await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
     await waitForPilot(page, options.timeoutMs)
     const baselineMemory = await captureMemory('baseline', page, browser, appProcess.pid)
     await evaluate(page, `globalThis.__RISUNEST_LUA_WORKER_PILOT__.createIdleWorkers()`)

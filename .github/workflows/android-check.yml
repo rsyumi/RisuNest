@@ -15,9 +15,6 @@ on:
 permissions:
   contents: read
 
-env:
-  VITE_DISABLE_REALM: 'true'
-
 jobs:
   android-debug-apk:
     runs-on: ubuntu-latest

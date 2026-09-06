@@ -127,7 +127,14 @@ pnpm android:build:arm64
 pnpm hono:build
 ```
 
-Set `VITE_DISABLE_REALM=true` for all automated tests, benchmarks, and agent-operated builds or app runs. It replaces RisuRealm network access with local synthetic data. The flag defaults to off; production builds leave it unset.
+RisuRealm serves third-party content this project does not control. The rule is that none of it reaches an agent's context, screenshots and page reads included. A rule alone cannot un-render a screen, so the block lives in the surrounding tooling rather than in product code, there is no build flag, and default builds are untouched:
+
+- `pnpm test` blocks Realm requests from `vitest.setup.ts`: `fetch` throws synchronously naming the caller, and a happy-dom fetch interceptor stops iframe, script and XHR loads that never touch `fetch`. `src/ts/realmEndpoints.test.ts` pins both.
+- Every benchmark CDP runner blocks Realm for the whole session with `Network.setBlockedURLs`, so they still measure the production bundle.
+- Whenever an agent runs the app and looks at it, use the `:agent` scripts: `pnpm dev:agent`, `pnpm tauri:dev:agent`, `pnpm build:agent`, `pnpm windows:build:agent`, `pnpm tauri:build:agent`, `pnpm android:build:emulator:agent`, `pnpm android:build:arm64:agent`. They run vite with `--mode agent`, which swaps `src/ts/realmEndpoints.ts` for an unresolvable-address version; the Tauri variants route through `src-tauri/tauri.agent.conf.json`, and `.claude/launch.json` points the app-preview tooling at `dev:agent`. Vite loads only `.env.<mode>`, so `.env.agent` must carry what `.env.desktop` and `.env.android` carry. Plain `pnpm dev`, `pnpm tauri dev` and `pnpm build` stay unblocked for the user.
+- `scripts/phase3AndroidSmoke.mjs` cuts device networking during `fresh-install` and refuses to continue until `dumpsys connectivity` reports no default network; `restore-network` turns it back on.
+
+`scripts/realmBlocklist.mjs` holds the single path list. `sv.risuai.xyz` is not a Realm-only host: account backup keys, the Drive OAuth callback, the embedding-model CDN and account login share it and stay reachable, so Realm is matched by path, never by host. `/rs/` is the one dual-use path (account assets and Realm-shared assets); it is treated as Realm, and product code builds it only from `realmHubURL` so the vite swap and the blocklist agree.
 
 ### Type Checking
 

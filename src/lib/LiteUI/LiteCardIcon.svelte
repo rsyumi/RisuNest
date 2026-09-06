@@ -1,6 +1,6 @@
 <script lang="ts">
 
-    import { type hubType } from "src/ts/characterCards";
+    import { realmHubURL, type hubType } from "src/ts/characterCards";
     interface Props {
         card: hubType;
         onclick?: (event: MouseEvent & {
@@ -14,7 +14,7 @@
 <button class="border p-4 flex hover:ring-2 rounded-md transition items-start justify-start" onclick={onclick}>
     <div class="bg-white rounded-md shadow-md p-4 relative w-32 h-48 min-w-32 min-h-48">
         {#key card.img}
-            <img src={"https://sv.risuai.xyz/resource/" + card.img} alt={card.name} class="absolute inset-0 w-full h-full object-cover rounded-md">
+            <img src={`${realmHubURL}/resource/` + card.img} alt={card.name} class="absolute inset-0 w-full h-full object-cover rounded-md">
         {/key}
     </div>
     <div class="ml-4 mt-4 flex flex-col items-start text-start">

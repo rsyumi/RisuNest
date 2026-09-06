@@ -1435,7 +1435,6 @@ test('settles a resumed coroutine rejection without leaving an unhandled rejecti
       env: {
         ...process.env,
         RISUNEST_A4_COROUTINE_CHILD: 'true',
-        VITE_DISABLE_REALM: 'true',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })

@@ -21,7 +21,7 @@ import { loadPlugins } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertMd, alertNormal, alertNormalWait, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { hasher } from "./parser/parser.svelte";
-import { characterURLImport, hubURL } from "./characterCards";
+import { characterURLImport, hubURL, realmHubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
 import { saveDbKei } from "./kei/backup";
@@ -241,7 +241,9 @@ export async function getFileSrc(loc: string) {
                 console.error(error)
             }
         }
-        return hubURL + `/rs/` + loc
+        // `/rs/` is classified as a Realm path (scripts/realmBlocklist.mjs), so it
+        // must come from realmHubURL for the agent-mode swap to cover it.
+        return realmHubURL + `/rs/` + loc
     }
     if (route === 'tauri-asset') {
         const url = await resolveTauriAssetUrl(loc)

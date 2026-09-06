@@ -30,6 +30,9 @@ vi.mock('./storage/autoStorage', () => ({
 }))
 vi.mock('./characterCards', () => ({
     hubURL: 'https://hub.example',
+    // `/rs/` is a Realm-classified path (scripts/realmBlocklist.mjs), so the
+    // account asset route must build it from realmHubURL, not hubURL.
+    realmHubURL: 'https://realm-hub.example',
     characterURLImport: vi.fn(),
 }))
 vi.mock('./util', () => ({
@@ -158,12 +161,12 @@ describe('getFileSrc account route', () => {
         expect(src).toBe(`data:image/png;base64,${Buffer.from(bytes).toString('base64')}`)
     })
 
-    test('falls back to the hub URL when the local store misses the key', async () => {
+    test('falls back to the Realm-routed hub URL when the local store misses the key', async () => {
         state.blobStore = createFakeBlobStore({})
         ;(forageStorage as any).isAccount = true
 
         const src = await getFileSrc('assets/acc-remote.png')
-        expect(src).toBe('https://hub.example/rs/assets/acc-remote.png')
+        expect(src).toBe('https://realm-hub.example/rs/assets/acc-remote.png')
     })
 
     test('serves the resolved file URL on Tauri before the hub URL', async () => {

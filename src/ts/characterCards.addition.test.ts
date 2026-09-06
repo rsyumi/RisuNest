@@ -140,10 +140,6 @@ vi.mock('./process/modules', () => ({
 vi.mock('@tauri-apps/plugin-fs', () => ({ readFile: vi.fn() }))
 vi.mock('@tauri-apps/plugin-deep-link', () => ({ getCurrent: vi.fn(), onOpenUrl: vi.fn() }))
 vi.mock('./storage/accountStorage', () => ({ AccountStorage: class {} }))
-vi.mock('./realmAccess', () => ({
-    fetchRealmResource: vi.fn(),
-    isRealmAccessDisabled: () => true,
-}))
 vi.mock('./media', () => ({
     compressImage: mocks.compressImage,
     getImageType: vi.fn(() => 'Unknown'),

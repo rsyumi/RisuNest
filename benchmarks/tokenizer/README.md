@@ -16,7 +16,6 @@ The expected IDs are checked in. Tests never derive expected values from a nativ
 Run the provenance and exact-parity checks with:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 pnpm test:tokenizer-corpus
 ```
 
@@ -25,7 +24,6 @@ pnpm test:tokenizer-corpus
 Run the retained JavaScript baseline with:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 pnpm benchmark:tokenizer:oracle -- --samples 20 --output tokenizer-oracle.json
 ```
 
@@ -38,7 +36,6 @@ This output is a JavaScript oracle baseline only. `nativeCandidateMeasured` is a
 Run the release benchmark from the repository root with the shared Roadmap 14 Cargo target:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 $env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\.worktrees\_cargo-target-r14'
 pnpm benchmark:tokenizer:tauri -- --output "$env:CARGO_TARGET_DIR\k2-tokenizer-windows.json"
 ```
@@ -54,7 +51,6 @@ The runner does not access live RisuRealm or live account services.
 Measure the Rust core without IPC separately:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 $env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\.worktrees\_cargo-target-r14'
 pnpm benchmark:tokenizer:core
 ```

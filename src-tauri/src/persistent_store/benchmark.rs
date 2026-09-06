@@ -966,11 +966,6 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
 #[test]
 #[ignore = "release-only first-post-lease commit benchmark"]
 fn first_post_lease_commit_measurements() {
-    assert_eq!(
-        std::env::var("VITE_DISABLE_REALM").as_deref(),
-        Ok("true"),
-        "persistent store benchmarks require VITE_DISABLE_REALM=true"
-    );
     let mut database = generate_save_large(
         POST_LEASE_CHARACTERS,
         POST_LEASE_CHATS_PER_CHARACTER,
@@ -1037,11 +1032,6 @@ fn first_post_lease_commit_measurements() {
 #[test]
 #[ignore = "release-only Phase 3 Step 5 benchmark"]
 fn phase3_step5_measurements() {
-    assert_eq!(
-        std::env::var("VITE_DISABLE_REALM").as_deref(),
-        Ok("true"),
-        "Phase 3 benchmarks require VITE_DISABLE_REALM=true"
-    );
     let database = generate_save_large(
         NORMAL_CHARACTERS,
         CHATS_PER_CHARACTER,

@@ -81,7 +81,6 @@ fn clone_child_command(mode: &str, session_url: &str, staging_root: &Path) -> Co
         .arg("--exact")
         .arg("peer_sync::tests::clone_process_child")
         .arg("--nocapture")
-        .env("VITE_DISABLE_REALM", "true")
         .env(CHILD_MODE_ENV, mode)
         .env(CHILD_SESSION_URL_ENV, session_url)
         .env(CHILD_STAGING_ROOT_ENV, staging_root);

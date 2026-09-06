@@ -3,14 +3,12 @@
 Run the release benchmark from the repository root:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 pnpm benchmark:phase3:tauri -- --output src-tauri/target/phase3-tauri-cdp.json
 ```
 
 Run the runner unit tests with:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 node --test benchmarks/phase3/tauri-cdp.node-test.mjs
 ```
 

@@ -45,8 +45,3 @@ export function createRoadmap14Result({
     return result
 }
 
-export function requireRealmDisabled(environment = process.env) {
-    if (environment.VITE_DISABLE_REALM !== 'true') {
-        throw new Error('Roadmap 14 runners require VITE_DISABLE_REALM=true')
-    }
-}

@@ -1,7 +1,7 @@
 <script lang="ts">
     import { BookIcon, ImageIcon, SmileIcon } from "@lucide/svelte";
     import { alertNormal } from "src/ts/alert";
-    import { hubURL, type hubType } from "src/ts/characterCards";
+    import { realmHubURL, type hubType } from "src/ts/characterCards";
     import { DBState } from "src/ts/stores.svelte";
     import { parseMultilangString } from "src/ts/util";
 
@@ -22,7 +22,7 @@
             <span class="text-4xl">?</span>
         </div>
     {:else}
-        <img class="w-20 min-w-20 h-20 sm:h-28 sm:w-28 rounded-md object-top object-cover" alt={chara.name} src={`${hubURL}/resource/` + chara.img}>
+        <img class="w-20 min-w-20 h-20 sm:h-28 sm:w-28 rounded-md object-top object-cover" alt={chara.name} src={`${realmHubURL}/resource/` + chara.img}>
     {/if}
     <div class="flex flex-col grow min-w-0">
         <span class="text-textcolor text-lg min-w-0 max-w-full text-ellipsis whitespace-nowrap overflow-hidden text-start">{chara.name}</span>

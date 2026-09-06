@@ -513,12 +513,6 @@ fn owner_manifest_release_benchmark() {
         !cfg!(debug_assertions),
         "owner manifest benchmark requires a release build"
     );
-    assert_eq!(
-        std::env::var("VITE_DISABLE_REALM").as_deref(),
-        Ok("true"),
-        "owner manifest benchmark requires VITE_DISABLE_REALM=true"
-    );
-
     let fixtures = [
         ("absent", make_benchmark_fixture(FixtureKind::Absent, 0)),
         ("empty", make_benchmark_fixture(FixtureKind::Empty, 0)),

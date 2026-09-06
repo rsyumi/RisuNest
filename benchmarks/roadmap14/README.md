@@ -1,8 +1,9 @@
 # Roadmap 14 platform baseline
 
 This directory defines the version 2 result contract and the four synthetic
-blocking scenarios used by Windows and Android measurements. Every command must
-run with `VITE_DISABLE_REALM=true`. The fixtures are local and synthetic.
+blocking scenarios used by Windows and Android measurements. The fixtures are
+local and synthetic, and the CDP runners block RisuRealm for the whole session
+(see `scripts/realmBlocklist.mjs`).
 
 ## Result contract
 
@@ -32,7 +33,6 @@ browser resources that are no longer referenced by the DOM.
 Run the focused contract tests with:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 node --test benchmarks/roadmap14/result-schema.node-test.mjs benchmarks/phase3/tauri-cdp.node-test.mjs
 ```
 
@@ -61,7 +61,6 @@ through the same native commands. The CDP measurement records memory, DOM,
 mounted message, and live resource URL counts for that same fixture.
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 node benchmarks/roadmap14/windows.mjs `
   --run-existing `
   --platform-identity windows-reference-host `
@@ -71,7 +70,6 @@ node benchmarks/roadmap14/windows.mjs `
 Existing raw results can be converted without rerunning the measurements:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 node benchmarks/roadmap14/windows.mjs `
   --phase3-result <phase3-save-large.json> `
   --tauri-result <phase3-tauri-cdp.json> `
@@ -100,7 +98,6 @@ included in this directory unless the release measurement actually ran.
 Until a working physical device is available, generate explicit pending records:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 node benchmarks/roadmap14/android.mjs `
   --source-revision <revision> `
   --output src-tauri/target/roadmap14-baseline/android-pending.json
@@ -115,7 +112,6 @@ counts, operation samples, bytes, and canonical output SHA-256. Validate and cop
 the device output with:
 
 ```powershell
-$env:VITE_DISABLE_REALM = 'true'
 node benchmarks/roadmap14/android.mjs `
   --measurement <physical-device-results.json> `
   --output <validated-results.json>

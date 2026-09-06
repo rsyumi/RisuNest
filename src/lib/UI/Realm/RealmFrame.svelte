@@ -1,7 +1,7 @@
 <script lang="ts">
     import { alertMd } from "src/ts/alert";
     import { shareRealmCardData } from "src/ts/realm";
-    import { isRealmAccessDisabled } from "src/ts/realmAccess";
+    import { REALM_SITE_URL } from "src/ts/realmEndpoints";
     import { downloadPreset } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID, ShowRealmFrameStore } from "src/ts/stores.svelte";
@@ -16,7 +16,6 @@
     const id = DBState.db?.account?.id
     let loadingStage = $state(0)
     let pongGot = false
-    const realmAccessDisabled = isRealmAccessDisabled()
 
     const pmfunc = (e:MessageEvent) => {
         if(e.data.type === 'filedata' && e.data.success){
@@ -29,7 +28,7 @@
             close()
         }
         if(e.data.type === 'success'){
-            alertMd(`## Upload Success\n\nYour character has been uploaded to Realm successfully.\n\n${"```\nhttps://realm.risuai.net/character/" +  e.data.id + "\n```"}`)
+            alertMd(`## Upload Success\n\nYour character has been uploaded to Realm successfully.\n\n${"```\n" + REALM_SITE_URL + "/character/" +  e.data.id + "\n```"}`)
             if($ShowRealmFrameStore.startsWith('preset') || $ShowRealmFrameStore.startsWith('module')){
                 //TODO, add preset edit
             }
@@ -53,11 +52,6 @@
     }
 
     onMount(async () => {
-        if(realmAccessDisabled){
-            close()
-            return
-        }
-
         window.addEventListener('message', pmfunc)
 
         let data:{
@@ -104,7 +98,7 @@
     })
 
     const getUrl = () => {
-        let url = tk ? `https://realm.risuai.net/upload?token=${tk}&token_id=${id}` : 'https://realm.risuai.net/upload'
+        let url = tk ? `${REALM_SITE_URL}/upload?token=${tk}&token_id=${id}` : `${REALM_SITE_URL}/upload`
         if($ShowRealmFrameStore.startsWith('preset') || $ShowRealmFrameStore.startsWith('module')){
             //TODO, add preset edit
         }
@@ -130,10 +124,8 @@
         <div class="loadmove"></div>
     </div>
     {/if}
-    {#if !realmAccessDisabled}
-        <iframe bind:this={iframe}
-            src={getUrl()}
-            title="upload" class="w-full flex-1" class:hidden={loadingStage < 1}
-        ></iframe>
-    {/if}
+    <iframe bind:this={iframe}
+        src={getUrl()}
+        title="upload" class="w-full flex-1" class:hidden={loadingStage < 1}
+    ></iframe>
 </div>

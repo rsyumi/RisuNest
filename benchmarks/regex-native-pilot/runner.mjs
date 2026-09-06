@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
 
 const CDP_HOST = '127.0.0.1'
 const TEMP_PREFIX = 'risunest-regex-native-pilot-'
@@ -239,7 +240,6 @@ async function runPilot(options) {
         await writeFile(configPath, JSON.stringify(config), 'utf8')
         const environment = {
             ...process.env,
-            VITE_DISABLE_REALM: 'true',
             VITE_RISU_LEGAL_CONFIGURED: 'TRUE',
             CARGO_BUILD_JOBS: '1',
             APPDATA: path.join(temporaryRoot, 'roaming'),
@@ -273,6 +273,9 @@ async function runPilot(options) {
         page = new CdpClient(target.webSocketDebuggerUrl)
         await page.connect(options.timeoutMs)
         await page.call('Runtime.enable')
+        await page.call('Network.enable')
+        // RisuRealm만 브라우저 레벨에서 끊는다. 측정 번들은 프로덕션과 동일하다.
+        await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
         await waitForPilot(page, options.timeoutMs)
         const pilot = await evaluate(page, 'globalThis.__RISUNEST_REGEX_NATIVE_PILOT__.run()')
         return {

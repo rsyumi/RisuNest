@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_FIXTURE_BYTES = 64 * 1024 * 1024
@@ -636,7 +637,6 @@ async function runBenchmark(options) {
         await writeFile(configPath, JSON.stringify(benchmarkConfig), 'utf8')
         const benchmarkEnvironment = {
             ...process.env,
-            VITE_DISABLE_REALM: 'true',
             VITE_RISU_LEGAL_CONFIGURED: 'TRUE',
             APPDATA: isolatedRoaming,
             LOCALAPPDATA: isolatedLocal,
@@ -667,7 +667,11 @@ async function runBenchmark(options) {
         await Promise.all([
             page.call('Runtime.enable'),
             page.call('Performance.enable'),
+            page.call('Network.enable'),
         ])
+        // 측정하는 번들은 프로덕션과 동일하게 두고, RisuRealm만 브라우저 레벨에서
+        // 끊는다. 제3자 카드와 이미지가 이 세션의 화면이나 로그에 들어오지 못한다.
+        await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
         await evaluate(page, INSTALL_LONG_TASK_OBSERVER)
         await waitForInteractive(page, options.timeoutMs)
         // Probe the store IPC so readiness failures surface before any measured operation.

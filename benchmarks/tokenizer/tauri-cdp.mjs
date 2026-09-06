@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
 import corpus from './native-tokenizer-corpus.json' with { type: 'json' }
 
 const CDP_HOST = '127.0.0.1'
@@ -485,7 +486,6 @@ async function runBenchmark(options) {
         await writeFile(configPath, JSON.stringify(benchmarkConfig), 'utf8')
         const environment = {
             ...process.env,
-            VITE_DISABLE_REALM: 'true',
             VITE_RISU_LEGAL_CONFIGURED: 'TRUE',
             VITE_TOKENIZER_BENCHMARK: 'true',
             APPDATA: isolatedRoaming,
@@ -527,6 +527,9 @@ async function runBenchmark(options) {
         page = new CdpClient(target.webSocketDebuggerUrl)
         await page.connect(options.timeoutMs)
         await page.call('Runtime.enable')
+        await page.call('Network.enable')
+        // RisuRealm만 브라우저 레벨에서 끊는다. 측정 번들은 프로덕션과 동일하다.
+        await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
         await page.call('HeapProfiler.enable')
         await waitForInvoke(page, options.timeoutMs)
         await waitForBenchmarkSeam(page, options.timeoutMs)

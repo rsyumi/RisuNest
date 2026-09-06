@@ -7,7 +7,7 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { createRoadmap14Result, requireRealmDisabled } from './result.mjs'
+import { createRoadmap14Result } from './result.mjs'
 import { getRoadmap14Scenario } from './scenarios.mjs'
 
 const EXPORT_DIGEST_PROVENANCE = 'sha256-of-u64le-length-prefixed-json-fragments-in-export-traversal-order-after-append'
@@ -23,7 +23,6 @@ export function convertExistingWindowsMeasurements({
     osVersion,
     architecture,
 }) {
-    requireRealmDisabled()
     if (phase3?.benchmark !== 'phase3-step5-persistent-store') {
         throw new Error('Expected the Phase 3 save-large persistent-store result')
     }
@@ -240,7 +239,6 @@ async function runExistingMeasurements(repositoryRoot, rawOutputDirectory, sourc
     const tauriResult = path.join(rawOutputDirectory, 'phase3-tauri-cdp.json')
     const environment = {
         ...process.env,
-        VITE_DISABLE_REALM: 'true',
         RISUNEST_PHASE3_BENCH_OUTPUT: phase3Result,
         RISUNEST_PHASE3_FIXTURE_OUTPUT: phase3Fixture,
         RISUNEST_PHASE3_BENCH_REVISION: sourceRevision,
@@ -294,7 +292,6 @@ function usage() {
 }
 
 async function main() {
-    requireRealmDisabled()
     const options = parseArguments(process.argv.slice(2))
     if (options.help) {
         process.stdout.write(`${usage()}${os.EOL}`)

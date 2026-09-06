@@ -19,7 +19,7 @@ import { exportModuleLegacy, readModule, type RisuModule } from "./process/modul
 import { readFile } from "@tauri-apps/plugin-fs"
 import { open } from "@tauri-apps/plugin-dialog"
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
-import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
+import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_NODE_PROXY_BASE, REALM_SITE_URL } from "./realmEndpoints"
 import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
 import { registerOpenedFileListeners } from "./openedFiles"
 import { receiveDeviceSyncUri } from "./storage/sync/peerCloneDeepLink"
@@ -35,11 +35,22 @@ import { exportNativeCharacterCardFromPicker } from './storage/nativeCharacterCa
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
 const NIGHTLY_HUB_URL = 'https://nightly.sv.risuai.xyz'
+const useNightlyHub = import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE' || localStorage.getItem('hub') === 'nightly'
 export const hubURL = isNodeServer
     ? '/hub-proxy'
-    : (import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE' || localStorage.getItem('hub') === 'nightly')
-    ? NIGHTLY_HUB_URL 
+    : useNightlyHub
+    ? NIGHTLY_HUB_URL
     : EXTERNAL_HUB_URL;
+
+// 같은 호스트지만 RisuRealm 경로만 `realmEndpoints`를 거친다. 계정 로그인과 Drive
+// 콜백은 위의 `hubURL`을 그대로 쓰므로 agent 모드에서도 영향을 받지 않는다.
+// `/rs/`는 계정 자산과 Realm 공유 자산이 같이 사는 이중 용도 경로라 Realm 쪽으로
+// 분류한다(scripts/realmBlocklist.mjs). 그래서 `/rs/` URL을 만드는 곳도 이 값을 쓴다.
+export const realmHubURL = isNodeServer
+    ? REALM_NODE_PROXY_BASE
+    : useNightlyHub
+    ? REALM_NIGHTLY_HUB_URL
+    : REALM_HUB_URL;
 
 const nativeCharacterContentImportEnabled = true
 
@@ -286,29 +297,26 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
             if(db.account?.useSync && f.lightningRealmImport){
                 const id = await hasher(assetData)
                 const xid = 'assets/' + id + '.png'
-                const realmAssetRequest = fetchRealmResource('https://sv.risuai.xyz/rs/' + xid)
-                if(realmAssetRequest){
-                    queueFetchKey.push(assetIndex)
-                    queueFetchData.push(assetData)
-                    queueFetch.push(realmAssetRequest)
-                    assets[assetIndex] =  'xid:' + xid
-                    if(queueFetch.length > 10){
-                        const res = await Promise.all(queueFetch)
-                        for(let i=0;i<res.length;i++){
-                            if(res[i].status !== 200){
-                                const assetId = await saveAsset(queueFetchData[i])
-                                assets[queueFetchKey[i]] = assetId
-                            }
-                            else{
-                                assets[queueFetchKey[i]] = assets[queueFetchKey[i]].replace('xid:', '')
-                            }
+                queueFetchKey.push(assetIndex)
+                queueFetchData.push(assetData)
+                queueFetch.push(fetch(`${REALM_HUB_URL}/rs/` + xid))
+                assets[assetIndex] =  'xid:' + xid
+                if(queueFetch.length > 10){
+                    const res = await Promise.all(queueFetch)
+                    for(let i=0;i<res.length;i++){
+                        if(res[i].status !== 200){
+                            const assetId = await saveAsset(queueFetchData[i])
+                            assets[queueFetchKey[i]] = assetId
                         }
-                        queueFetch = []
-                        queueFetchKey = []
-                        queueFetchData = []
+                        else{
+                            assets[queueFetchKey[i]] = assets[queueFetchKey[i]].replace('xid:', '')
+                        }
                     }
-                    continue
+                    queueFetch = []
+                    queueFetchKey = []
+                    queueFetchData = []
                 }
+                continue
             }
 
 
@@ -428,15 +436,11 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
 }
 
 export const getRealmInfo = async (realmPath:string) => {
-    if(isRealmAccessDisabled()){
-        return
-    }
-
     const url = new URL(location.href);
     url.searchParams.delete('realm');
     window.history.pushState(null, '', url.toString());
 
-    const res = await fetch(`${hubURL}/hub/info/${realmPath}`)
+    const res = await fetch(`${realmHubURL}/hub/info/${realmPath}`)
     if(res.status !== 200){
         alertError(await res.text())
         return
@@ -1943,10 +1947,6 @@ export async function shareRisuHub2(char:character, arg:{
     anon: boolean,
     update: boolean
 }) {
-    if(isRealmAccessDisabled()){
-        return
-    }
-
     try {
         char = safeStructuredClone(char)
         char.license = arg.license
@@ -1969,14 +1969,14 @@ export async function shareRisuHub2(char:character, arg:{
         await exportCharacterCard(char, 'png', {writer: writer})
         const dat = Buffer.from(writer.buf.buffer).toString('base64') + '&' + 'rt.png'
 
-        openURL(`https://realm.risuai.net/hub/realm/upload#filedata=${encodeURIComponent(dat)}`)
+        openURL(`${REALM_SITE_URL}/hub/realm/upload#filedata=${encodeURIComponent(dat)}`)
 
         let testMode = true
         if(testMode){
             return
         }
     
-        const fetchPromise = fetch(hubURL + '/hub/realm/upload', {
+        const fetchPromise = fetch(realmHubURL + '/hub/realm/upload', {
             method: "POST",
             body: writer.buf.buffer as any,
             headers: {
@@ -2040,15 +2040,11 @@ export async function getRisuHub(arg:{
     nsfw:boolean
     sort:string
 }):Promise<hubType[]> {
-    if(isRealmAccessDisabled()){
-        return []
-    }
-
     try {
         arg.search += ' __shared'
         const stringArg = `search==${arg.search}&&page==${arg.page}&&nsfw==${arg.nsfw}&&sort==${arg.sort}&&web==${(!isNodeServer && !isTauri) ? 'web' : 'other'}`
 
-        const da = await fetch(hubURL + '/realm/' + encodeURIComponent(stringArg) + "?cache=30", {
+        const da = await fetch(realmHubURL + '/realm/' + encodeURIComponent(stringArg) + "?cache=30", {
             headers: {
                 "x-risuai-info": appVer + ';' + (isNodeServer ? 'node' : (isTauri ? 'tauri' : 'web'))
             }
@@ -2070,10 +2066,6 @@ export async function getRisuHub(arg:{
 export async function downloadRisuHub(id:string, arg:{
     forceRedirect?: boolean
 } = {}) {
-    if(isRealmAccessDisabled()){
-        return
-    }
-
     try {
         if(!arg.forceRedirect){
             if(!(await alertTOS())){
@@ -2084,7 +2076,7 @@ export async function downloadRisuHub(id:string, arg:{
                 msg: "Downloading..."
             })
         }
-        const res = await fetch("https://realm.risuai.net/api/v1/download/dynamic/" + id + '?cors=true', {
+        const res = await fetch(`${REALM_SITE_URL}/api/v1/download/dynamic/` + id + '?cors=true', {
             headers: {
                 "x-risu-api-version": "4"
             }
@@ -2148,11 +2140,7 @@ export async function downloadRisuHub(id:string, arg:{
 }
 
 export async function getHubResources(id:string) {
-    if(isRealmAccessDisabled()){
-        throw new Error('RisuRealm access is disabled for this test build')
-    }
-
-    const res = await fetch(`${hubURL}/resource/${id}`)
+    const res = await fetch(`${realmHubURL}/resource/${id}`)
     if(res.status !== 200){
         throw (await res.text())
     }
