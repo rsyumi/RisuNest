@@ -18,15 +18,16 @@ function expectExactRustBlock(source: string, block: string): void {
 }
 
 describe('RisuNest settings navigation', () => {
-    it('places RisuNest and Tauri-only Device Sync before Support', () => {
+    it('places RisuNest and Tauri-only Device Sync before plugin-added entries', () => {
         expect(settingsSource).toContain('Wrench')
         expect(settingsSource).toContain('$SettingsMenuIndex === 17')
         expect(settingsSource).toContain('language.risuNest.menuTitle')
         expect(settingsSource).toContain('MonitorSmartphone')
         expect(settingsSource).toContain('{#if isTauri}')
         expect(settingsSource).toContain('$SettingsMenuIndex === 18')
-        expect(settingsSource.indexOf('$SettingsMenuIndex === 17')).toBeLessThan(settingsSource.indexOf('$SettingsMenuIndex === 77'))
-        expect(settingsSource.indexOf('$SettingsMenuIndex === 18')).toBeLessThan(settingsSource.indexOf('$SettingsMenuIndex === 77'))
+        expect(settingsSource).toContain('{#each additionalSettingsMenu as menu}')
+        expect(settingsSource.indexOf('$SettingsMenuIndex === 17')).toBeLessThan(settingsSource.indexOf('{#each additionalSettingsMenu as menu}'))
+        expect(settingsSource.indexOf('$SettingsMenuIndex === 18')).toBeLessThan(settingsSource.indexOf('{#each additionalSettingsMenu as menu}'))
     })
 
     it('dispatches both dedicated pages', () => {

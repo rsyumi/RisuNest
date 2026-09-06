@@ -890,8 +890,6 @@ export const languageChineseTraditional = {
     "importPersona": "匯入使用者設定",
     "export": "匯出",
     "import": "匯入",
-    "supporterThanks": "支持者鳴謝",
-    "supporterThanksDesc": "感謝您的支持！",
     "donatorPatreonDesc": "為保護隱私，預設不會顯示在名單中。若想顯示您的暱稱，請前往 RisuNest 的 Patreon 頁面並點擊連結按鈕。",
     "useNamePrefix": "使用名稱前綴",
     "textAdventureNAI": "以文字冒險形式運行",

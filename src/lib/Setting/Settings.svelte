@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, BoxIcon, CodeIcon, ContactIcon, LanguagesIcon, MonitorIcon, MonitorSmartphone, Sailboat, UserIcon, CircleXIcon, KeyboardIcon, SparkleIcon, Wrench } from "@lucide/svelte";
+    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, ContactIcon, LanguagesIcon, MonitorIcon, MonitorSmartphone, Sailboat, UserIcon, CircleXIcon, KeyboardIcon, SparkleIcon, Wrench } from "@lucide/svelte";
     import { language } from "src/lang";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
     import UserSettings from "./Pages/UserSettings.svelte";
@@ -18,7 +18,6 @@
     import AccessibilitySettings from "./Pages/AccessibilitySettings.svelte";
     import PersonaSettings from "./Pages/PersonaSettings.svelte";
     import PromptSettings from "./Pages/PromptSettings.svelte";
-    import ThanksPage from "./Pages/ThanksPage.svelte";
     import ModuleSettings from "./Pages/Module/ModuleSettings.svelte";
   import { isLite } from "src/ts/lite";
     import HotkeySettings from "./Pages/HotkeySettings.svelte";
@@ -166,15 +165,6 @@
                             <span>{language.risuNest.sync.menuTitle}</span>
                         </button>
                     {/if}
-                    <button class="flex gap-2 items-center hover:text-textcolor"
-                        class:text-textcolor={$SettingsMenuIndex === 77}
-                        class:text-textcolor2={$SettingsMenuIndex !== 77}
-                        onclick={() => {
-                        $SettingsMenuIndex = 77
-                    }}>
-                        <BoxIcon />
-                        <span>{language.supporterThanks}</span>
-                    </button>
                     {#each additionalSettingsMenu as menu}
                         <button class="flex gap-2 items-center hover:text-textcolor text-textcolor2"
                             onclick={() => {
@@ -256,8 +246,6 @@
                         }}/>
                     {:else if $SettingsMenuIndex === 15 && window.innerWidth >= 768}
                         <HotkeySettings/>
-                    {:else if $SettingsMenuIndex === 77}
-                        <ThanksPage/>
                     {/if}
             </div>
             {/key}

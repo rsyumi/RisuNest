@@ -886,8 +886,6 @@ export const languageVietnamese = {
     "importPersona": "Nhập khẩu nhân vật",
     "export": "Xuất khẩu",
     "import": "Nhập khẩu",
-    "supporterThanks": "Người ủng hộ Cảm ơn",
-    "supporterThanksDesc": "Cảm ơn sự hỗ trợ của bạn!",
     "donatorPatreonDesc": "Theo mặc định, nó sẽ không được hiển thị trong danh sách bảo mật. nếu bạn muốn hiển thị biệt danh của mình, hãy truy cập trang patreon của RisuNest và nhấn nút liên kết.",
     "useNamePrefix": "Sử dụng tiền tố tên",
     "textAdventureNAI": "Chạy dưới dạng cuộc phiêu lưu văn bản",
