@@ -45,6 +45,7 @@ import kotlinx.coroutines.withContext
 private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
 private const val EXIT_FLUSH_TIMEOUT_MILLIS = 1_500L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
+private const val OPENED_FILES_EVENT = "risu-opened-files"
 private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
 private const val SAF_BRIDGE_NAME = "RisuSafBridge"
 private const val PEER_CLONE_BRIDGE_NAME = "RisuPeerCloneBridge"
@@ -228,6 +229,41 @@ internal fun escapeJsStringLiteral(value: String): String = buildString {
 internal fun openedFilesScript(paths: List<String>): String {
   val values = paths.joinToString(",") { "\"${escapeJsStringLiteral(it)}\"" }
   return "window.tauriOpenedFiles=[$values];"
+}
+
+/**
+ * How the files that the legacy opened file path handles reach the web app.
+ *
+ * A cold start injects them before the document runs, a warm start has to reach a page that is
+ * already loaded.
+ */
+internal enum class LegacyOpenedFileDelivery {
+  DOCUMENT_START_INJECTION,
+  RUNTIME_EVENT,
+}
+
+internal fun legacyOpenedFileDelivery(coldStart: Boolean): LegacyOpenedFileDelivery =
+  if (coldStart) {
+    LegacyOpenedFileDelivery.DOCUMENT_START_INJECTION
+  } else {
+    LegacyOpenedFileDelivery.RUNTIME_EVENT
+  }
+
+/**
+ * Announces files opened while the app was already running.
+ *
+ * The event is cancelable so the web app can report that it consumed the payload. When nothing
+ * listens yet, because the page is still booting, the files fall back to the same startup queue the
+ * cold start path fills.
+ */
+internal fun openedFilesEventScript(paths: List<String>): String {
+  val values = paths.joinToString(",") { "\"${escapeJsStringLiteral(it)}\"" }
+  return "(function(){var files=[$values];" +
+    "var event=new CustomEvent('$OPENED_FILES_EVENT',{detail:{files:files},cancelable:true});" +
+    "if(window.dispatchEvent(event)){" +
+    "window.tauriOpenedFiles=" +
+    "(Array.isArray(window.tauriOpenedFiles)?window.tauriOpenedFiles:[]).concat(files);" +
+    "}})();"
 }
 
 private data class OpenedFileSource(
@@ -1735,7 +1771,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     val (nativeJobSources, legacySources) = openedSources.partition { source ->
       shouldUseNativeFileJobSpool(source.displayName)
     }
-    if (includeLegacyFiles) injectLegacyOpenedFiles(webView, legacySources.map { it.uri })
+    val legacyUris = legacySources.map { it.uri }
+    when (legacyOpenedFileDelivery(coldStart = includeLegacyFiles)) {
+      LegacyOpenedFileDelivery.DOCUMENT_START_INJECTION ->
+        injectLegacyOpenedFiles(webView, legacyUris)
+      LegacyOpenedFileDelivery.RUNTIME_EVENT -> dispatchLegacyOpenedFiles(webView, legacyUris)
+    }
     if (nativeJobSources.isEmpty()) return
     val requestId = UUID.randomUUID().toString()
     val cancellation = AtomicBoolean(false)
@@ -1863,6 +1904,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     } else {
       webView.evaluateJavascript(script, null)
     }
+  }
+
+  private fun dispatchLegacyOpenedFiles(webView: WebView, uris: List<Uri>) {
+    val openedFiles = copyLegacyOpenedFiles(uris)
+    if (openedFiles.isEmpty()) return
+    webView.evaluateJavascript(openedFilesEventScript(openedFiles), null)
   }
 
   private fun copyLegacyOpenedFiles(uris: List<Uri>): List<String> {

@@ -368,11 +368,11 @@ pub(crate) struct SystemTunnelProcess {
 }
 
 #[cfg(windows)]
-struct KillOnCloseJob(OwnedHandle);
+pub(crate) struct KillOnCloseJob(OwnedHandle);
 
 #[cfg(windows)]
 impl KillOnCloseJob {
-    fn create() -> std::io::Result<Self> {
+    pub(crate) fn create() -> std::io::Result<Self> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(std::io::Error::last_os_error());
@@ -396,7 +396,7 @@ impl KillOnCloseJob {
         Ok(Self(handle))
     }
 
-    fn assign(&self, child: &Child) -> std::io::Result<()> {
+    pub(crate) fn assign(&self, child: &Child) -> std::io::Result<()> {
         let assigned =
             unsafe { AssignProcessToJobObject(self.0.as_raw_handle(), child.as_raw_handle()) };
         if assigned == 0 {

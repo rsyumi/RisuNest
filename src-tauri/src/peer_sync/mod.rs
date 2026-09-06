@@ -52,7 +52,7 @@ mod device_registry_tests;
 mod shared_session_tests;
 
 #[cfg(desktop)]
-mod tunnel;
+pub(crate) mod tunnel;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod tunnel_lifecycle;
 

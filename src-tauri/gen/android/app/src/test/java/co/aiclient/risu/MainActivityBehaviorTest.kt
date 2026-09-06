@@ -64,6 +64,40 @@ class MainActivityBehaviorTest {
   }
 
   @Test
+  fun `legacy opened files are injected on a cold start and dispatched on a warm start`() {
+    assertEquals(
+      LegacyOpenedFileDelivery.DOCUMENT_START_INJECTION,
+      legacyOpenedFileDelivery(coldStart = true),
+    )
+    assertEquals(
+      LegacyOpenedFileDelivery.RUNTIME_EVENT,
+      legacyOpenedFileDelivery(coldStart = false),
+    )
+  }
+
+  @Test
+  fun `warm start delivery dispatches the opened files and falls back to the startup queue`() {
+    val script = openedFilesEventScript(listOf("/data/cache/opened_files/1-0-preset.risup"))
+
+    assertEquals(true, script.contains("new CustomEvent('risu-opened-files'"))
+    assertEquals(true, script.contains("cancelable:true"))
+    assertEquals(true, script.contains("\"/data/cache/opened_files/1-0-preset.risup\""))
+    assertEquals(true, script.contains("if(window.dispatchEvent(event)){"))
+    assertEquals(true, script.contains("window.tauriOpenedFiles="))
+    // The cold start contract stays a plain assignment, the warm start one never replaces it.
+    assertEquals(false, script.startsWith("window.tauriOpenedFiles="))
+  }
+
+  @Test
+  fun `warm start delivery escapes opened file paths the same way the cold start does`() {
+    assertEquals(
+      true,
+      openedFilesEventScript(listOf("C:\\opened\nfile.risup"))
+        .contains("\"C:\\\\opened\\u000afile.risup\""),
+    )
+  }
+
+  @Test
   fun `restored intent payload is consumed only once before asynchronous work`() {
     var consumed = false
     val marker = RestoredIntentConsumptionMarker(

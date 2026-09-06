@@ -21,6 +21,7 @@ import { open } from "@tauri-apps/plugin-dialog"
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
 import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
+import { registerOpenedFileListeners } from "./openedFiles"
 import { receiveDeviceSyncUri } from "./storage/sync/peerCloneDeepLink"
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
@@ -583,17 +584,8 @@ export async function characterURLImport() {
         });
     }
 
-    if("tauriOpenedFiles" in window){
-        //@ts-expect-error tauriOpenedFiles is custom Tauri property, not defined in Window interface
-        const files:string[] = window.tauriOpenedFiles
-        if(files){
-            for(const file of files){
-                const data = await readFile(file)
-                await importFile(file, data)
-            }
-        }
-    }
-    
+    registerOpenedFileListeners(importFile)
+
     if(isTauri){
         const handleUrls = (urls: string[]) => {
             for(const url of urls){

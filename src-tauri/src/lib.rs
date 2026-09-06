@@ -11,6 +11,8 @@ pub mod native_file_jobs;
 pub(crate) mod native_log;
 mod native_media;
 mod native_tokenizer;
+#[cfg(desktop)]
+mod opened_files;
 mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]
@@ -423,30 +425,94 @@ fn install_py_dependencies(path: String, dependency: String) -> Result<(), Strin
     }
 }
 
+/// The local Python server child, kept so it can be killed when the app exits.
+#[cfg(desktop)]
+#[derive(Default)]
+struct PyServerState {
+    process: Mutex<Option<PyServerProcess>>,
+}
+
+#[cfg(desktop)]
+struct PyServerProcess {
+    child: std::process::Child,
+    #[cfg(windows)]
+    _kill_on_close_job: peer_sync::tunnel::KillOnCloseJob,
+}
+
+#[cfg(desktop)]
+impl PyServerState {
+    fn store(&self, process: PyServerProcess) {
+        let mut guard = self
+            .process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = guard.replace(process) {
+            terminate_py_server(previous);
+        }
+    }
+
+    fn shutdown(&self) {
+        let taken = self
+            .process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(process) = taken {
+            terminate_py_server(process);
+        }
+    }
+}
+
+#[cfg(desktop)]
+fn terminate_py_server(mut process: PyServerProcess) {
+    if let Err(error) = process.child.kill() {
+        crate::nlog!("warn", "Python server termination failed: {error}");
+    }
+    let _ = process.child.wait();
+}
+
 #[cfg(desktop)]
 #[tauri::command]
-fn run_py_server(handle: tauri::AppHandle, py_path: String) {
+fn run_py_server(handle: tauri::AppHandle, py_path: String) -> Result<(), String> {
     let py_exec_path = Path::new(&py_path).join("python").join("python.exe");
     let server_path = handle
         .path()
         .resolve("src-python/run.py", BaseDirectory::Resource)
-        .expect("failed to resolve resource");
+        .map_err(|error| format!("failed to resolve the Python server resource: {error}"))?;
+    let working_directory = server_path
+        .parent()
+        .ok_or_else(|| "the Python server resource has no parent directory".to_string())?;
 
     let mut py_server = Command::new(&py_exec_path);
     //set working directory to server path
-    py_server.current_dir(server_path.parent().unwrap());
+    py_server.current_dir(working_directory);
 
     crate::nlog!("info", "starting Python server");
-    let mut _child = py_server
+    #[cfg(windows)]
+    let kill_on_close_job = peer_sync::tunnel::KillOnCloseJob::create()
+        .map_err(|error| format!("failed to create the Python server job object: {error}"))?;
+    let child = py_server
         .arg("-m")
         .arg("uvicorn")
         .arg("--port")
         .arg("10026")
         .arg("main:app")
         .spawn()
-        .expect("failed to execute process");
+        .map_err(|error| {
+            crate::nlog!("warn", "Python server start failed: {error}");
+            format!("failed to start the Python server: {error}")
+        })?;
+    #[cfg(windows)]
+    if let Err(error) = kill_on_close_job.assign(&child) {
+        crate::nlog!("warn", "Python server job assignment failed: {error}");
+    }
+    handle.state::<PyServerState>().store(PyServerProcess {
+        child,
+        #[cfg(windows)]
+        _kill_on_close_job: kill_on_close_job,
+    });
     crate::nlog!("info", "Python server started");
-    return;
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -459,11 +525,14 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder
-            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            .manage(opened_files::OpenedFilesState::from_launch_arguments())
+            .manage(PyServerState::default())
+            .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
                 let _ = app
                     .get_webview_window("main")
                     .expect("no main window")
                     .set_focus();
+                opened_files::deliver_single_instance_arguments(app, &args);
             }))
             .plugin(tauri_plugin_updater::Builder::new().build());
     }
@@ -542,6 +611,8 @@ pub fn run() {
             run_py_server,
             #[cfg(desktop)]
             install_py_dependencies,
+            #[cfg(desktop)]
+            opened_files::opened_files_take,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_capabilities,
             #[cfg(desktop)]
@@ -747,6 +818,7 @@ pub fn run() {
     app.run(|app, event| {
         #[cfg(desktop)]
         if run_event_requires_peer_sync_shutdown(&event) {
+            app.state::<PyServerState>().shutdown();
             peer_sync::bidirectional_commands::cleanup_reverse_tunnels_for_exit();
             if let Err(error) = app
                 .state::<peer_sync::shared_session::DeviceSyncSourceState>()
