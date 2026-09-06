@@ -2,7 +2,7 @@
     import { customSideBarConfigDialogStore, DBState } from "src/ts/stores.svelte";
     import Button from "../UI/GUI/Button.svelte";
     import { language } from "src/lang";
-    import { getFullSettingsData } from "src/ts/setting/utils";
+    import { getFullSettingsData, getLabel } from "src/ts/setting/utils";
     import TextInput from "../UI/GUI/TextInput.svelte";
 
 
@@ -161,12 +161,12 @@
                                 id: crypto.randomUUID(),
                                 type: "setting",
                                 subType: type.id,
-                                label: language[type.labelKey] || type.id,
+                                label: getLabel(type) || type.id,
                             });
                             configPage = "list";
                         }}
                     >
-                        {language[type.labelKey] || type.id}
+                        {getLabel(type) || type.id}
                     </Button>
                 {/each}
             </div>

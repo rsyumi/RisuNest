@@ -2,6 +2,7 @@
     import { getInlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
     import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
     import { isTauri } from 'src/ts/platform'
+    import { language } from 'src/lang'
 
     interface Props {
         id: string
@@ -11,6 +12,7 @@
     let source: InlayRenderSource | null = $state(null)
     let descriptor: InlayRenderSource | null = $state(null)
     let previewRoot: HTMLDivElement | null = $state(null)
+    let unavailable = $state(false)
     let visible = $state(typeof IntersectionObserver === 'undefined')
     let playing = $state(false)
     const shouldLoad = $derived(visible || playing)
@@ -43,6 +45,7 @@
     $effect(() => {
         id
         descriptor = null
+        unavailable = false
         playing = false
     })
 
@@ -81,7 +84,14 @@
             }
             source = nextSource
             if (nextSource) descriptor = { ...nextSource, url: '', objectUrl: false }
+            // A stored attachment that cannot be resolved (never synced from
+            // another device, or deleted) must say so instead of leaving an
+            // empty box that looks like a stuck loading state.
+            else unavailable = true
             objectUrl = nextSource?.objectUrl ? nextSource.url : null
+        }, (error) => {
+            console.error('Inlay preview failed', error)
+            if (!disposed) unavailable = true
         })
         return () => {
             disposed = true
@@ -108,6 +118,11 @@
             </audio>
         {:else if descriptor}
             <div class="max-w-24 max-h-24">{id}</div>
+        {:else if unavailable}
+            <div class="flex h-full w-full flex-col items-center justify-center gap-1 border border-darkborderc p-2 text-center text-xs text-textcolor2">
+                <span>{language.inlayUnavailable}</span>
+                <span class="w-full break-all">{id}</span>
+            </div>
         {/if}
     </div>
 </div>

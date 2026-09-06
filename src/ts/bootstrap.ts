@@ -16,7 +16,7 @@ import { getProductionDeviceSyncController } from './storage/sync/deviceSyncProd
 import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
-import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
+import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
 import { loadPlugins, pluginCompatibility } from "./plugins/plugins.svelte";
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
@@ -170,13 +170,46 @@ function registerAndroidScreenshotPublicationRecovery() {
 }
 
 /**
+ * Boot stages whose failures mean the local persistent store could not be
+ * opened or bootstrapped. Both of them go through `store.open()`.
+ */
+const persistentStoreOpenStages = new Set(['persistent-storage', 'persistent-database'])
+
+function describeBootFailureError(error: unknown): string {
+    if (error instanceof Error) return error.message
+    if (typeof error === 'string') return error
+    if (error && typeof error === 'object') {
+        const message = (error as { message?: unknown }).message
+        if (typeof message === 'string') return message
+    }
+    return String(error)
+}
+
+/**
+ * Classifies a startup failure so the recovery panel can explain what the user
+ * has to do. Pure so it can be tested without booting the application.
+ */
+export function classifyBootFailure(error: unknown, stage?: string): BootFailure {
+    const message = describeBootFailureError(error)
+    if (message.includes('unsupported persistent schema version')) {
+        return { kind: 'schema-unsupported', message, stage }
+    }
+    if (stage !== undefined && persistentStoreOpenStages.has(stage)) {
+        return { kind: 'store-open', message, stage }
+    }
+    return { kind: 'unknown', message, stage }
+}
+
+/**
  * Loads the application data.
  */
 export async function loadData() {
     if (get(loadedStore)) return
+    let stage = 'startup'
     try {
         const deviceSettings = getDeviceSettings()
         if (isTauri) {
+            stage = 'native-log'
             try {
                 await setNativeLogFileEnabled(deviceSettings.nativeFileLogEnabled)
             } catch (error) {
@@ -184,6 +217,7 @@ export async function loadData() {
             }
         }
         if (isTauri) {
+            stage = 'app-data-directories'
             LoadingStatusState.text = 'Checking Files...'
             if (isTauriDesktop) appWindow.maximize()
             if (!await exists('', { baseDir: BaseDirectory.AppData })) {
@@ -193,10 +227,13 @@ export async function loadData() {
                 await mkdir('assets', { baseDir: BaseDirectory.AppData })
             }
         } else {
+            stage = 'browser-storage'
             await forageStorage.Init()
         }
 
+        stage = 'persistent-storage'
         await initializePersistentStorage()
+        stage = 'native-file-jobs'
         const recoveredNativeFileJobs = isTauri
             ? await reconcileNativeFileJobsBeforeBootstrap(undefined, {
                 reconcileRestores: shouldReconcileNativeFileJobs(
@@ -222,7 +259,9 @@ export async function loadData() {
                 createCatalogPresetWorkingSet(input.presetCatalog, input.activePreset),
             ),
         })
+        stage = 'persistent-database'
         const local = await resolvePersistentWorkingSet()
+        stage = 'asset-repository'
         const assetRepositoryRevision = await activateNativeAssetRepository()
         if (assetRepositoryRevision !== null) local.revision = assetRepositoryRevision
         const nativeAppKv = isTauri ? createNativeAppKv() : null
@@ -410,6 +449,7 @@ export async function loadData() {
             },
         })
         let officialReconcilePublish = false
+        stage = 'account-bootstrap'
         const accountBootstrap = await initializeOfficialAccountBootstrap({
             isTauri,
             local,
@@ -536,6 +576,7 @@ export async function loadData() {
         }
         performance.mark('boot:account-ready')
         if (isTauri) {
+            stage = 'device-sync'
             const deviceSyncController = getProductionDeviceSyncController()
             try {
                 await deviceSyncController.initialize()
@@ -559,14 +600,17 @@ export async function loadData() {
         })
 
         if (isTauriDesktop) {
+            stage = 'update-check'
             LoadingStatusState.text = 'Checking Update...'
             await checkRisuUpdate()
             await changeFullscreen()
         }
 
         if (!isTauri) {
+            stage = 'drive-sync'
             LoadingStatusState.text = 'Checking Drive Sync...'
             if (await checkDriverInit()) return
+            stage = 'service-worker'
             LoadingStatusState.text = 'Checking Service Worker...'
             if (navigator.serviceWorker) {
                 setUsingSw(true)
@@ -577,6 +621,7 @@ export async function loadData() {
         }
         if (getDatabase().didFirstSetup) void characterURLImport()
 
+        stage = 'format-update'
         LoadingStatusState.text = 'Checking For Format Update...'
         const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
         const coldStorageChanged = fullDatabaseResident ? await makeColdData() : false
@@ -587,6 +632,7 @@ export async function loadData() {
         )
 
         performance.mark('boot:cold-storage-ready')
+        stage = 'plugins'
         LoadingStatusState.text = 'Loading Plugins...'
         let pluginsLoaded = false
         try {
@@ -605,6 +651,7 @@ export async function loadData() {
         }
         performance.mark('boot:plugins-ready')
         if (!isTauri && getDatabase().account) {
+            stage = 'account-data'
             LoadingStatusState.text = 'Checking Account Data...'
             try {
                 await loadRisuAccountData()
@@ -620,6 +667,7 @@ export async function loadData() {
         } catch {}
 
         const database = getDatabase()
+        stage = 'ui-state'
         LoadingStatusState.text = 'Updating States...'
         updateColorScheme()
         updateTextThemeAndCSS()
@@ -655,7 +703,14 @@ export async function loadData() {
             if (accepted === false) location.reload()
         })
     } catch (error) {
-        alertError(error)
+        console.error('RisuNest startup failed', error)
+        const failure = classifyBootFailure(error, stage)
+        bootFailure.set(failure)
+        // The classified store failures are explained by the startup panel, so
+        // an extra error modal on top of it would only get in the way. Anything
+        // else can still fail after the app turned interactive, where no panel
+        // is shown, so those keep the modal.
+        if (failure.kind === 'unknown') alertError(error)
     }
 }
 

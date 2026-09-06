@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onDestroy, onMount } from "svelte";
+    import { language } from "src/lang";
     import { selectedCharID } from "src/ts/stores.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import NumberInput from "../UI/GUI/NumberInput.svelte";
@@ -116,17 +117,21 @@
     
     let autopilot = $state([])
     let devToolReady = $state(false)
+    let devToolPending = $state(true)
     const panelLease = new DevToolConversationLease()
     let panelRefreshGeneration = 0
 
     function refreshPanelLease(): void {
         const generation = ++panelRefreshGeneration
         devToolReady = false
+        devToolPending = true
         void panelLease.acquire(
             captureSelectedConversationTarget(),
             acquireCompleteConversation,
         ).then((ready) => {
-            if (generation === panelRefreshGeneration) devToolReady = ready
+            if (generation !== panelRefreshGeneration) return
+            devToolReady = ready
+            devToolPending = false
         })
     }
 
@@ -354,4 +359,8 @@
 <Button className="mt-2" onclick={() => {
     alertMd(getRequestLog())
 }}>Request Log</Button>
+{:else}
+<span class="text-textcolor2 p-2">
+    {devToolPending ? language.loading : language.devToolUnavailable}
+</span>
 {/if}

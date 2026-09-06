@@ -32,6 +32,19 @@
         .join('\n')
     }
 
+    /**
+     * Log lines are shown through a markdown renderer, so they have to be fenced
+     * to stay verbatim. The fence is a run of tildes that is always longer than
+     * any tilde run inside the log itself, so log content can never close it.
+     */
+    function fenceLog(text: string) {
+        const tildeRuns: string[] = text.match(/~+/g) ?? []
+        const longestTildeRun = tildeRuns
+            .reduce((longest, run) => Math.max(longest, run.length), 0)
+        const fence = '~'.repeat(Math.max(4, longestTildeRun + 1))
+        return `${fence}\n${text}\n${fence}`
+    }
+
     const unsubscribe = subscribeDeviceSettings((settings) => {
         fileLogEnabled = settings.nativeFileLogEnabled
         if (fileLogEnabled && !fileLogUpdatePending) void loadFilePath()
@@ -51,7 +64,7 @@
         try {
             fileLogPath = await getNativeLogFilePath()
         } catch {
-            errorMessage = language.error
+            errorMessage = language.risuNest.diag.actionFailed
         }
     }
 
@@ -63,9 +76,10 @@
             entries = freshEntries
             logLoaded = true
             errorMessage = ''
-            alertMd(formatLog(freshEntries) || language.risuNest.diag.logEmpty)
+            const text = formatLog(freshEntries)
+            alertMd(text ? fenceLog(text) : language.risuNest.diag.logEmpty)
         } catch {
-            if (request === viewRequest) errorMessage = language.error
+            if (request === viewRequest) errorMessage = language.risuNest.diag.actionFailed
         }
     }
 
@@ -98,7 +112,7 @@
             clipboardWriteQueue = pendingWrite.catch(() => undefined)
             await pendingWrite
         } catch {
-            if (request === copyRequest) errorMessage = language.error
+            if (request === copyRequest) errorMessage = language.risuNest.diag.actionFailed
         }
     }
 
@@ -113,7 +127,7 @@
             if (enabled) await loadFilePath()
         } catch {
             fileLogEnabled = getDeviceSettings().nativeFileLogEnabled
-            errorMessage = language.error
+            errorMessage = language.risuNest.diag.actionFailed
         } finally {
             fileLogUpdatePending = false
         }

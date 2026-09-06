@@ -60,8 +60,9 @@
             alertError(language.risuSaveRevisionConflict)
             return
         }
-        const detail = error instanceof Error ? error.message : String(error)
-        alertError(partialDestinationMayRemain ? `${detail} ${language.screenshotPartialDestinationMayRemain}` : detail)
+        alertError(partialDestinationMayRemain
+            ? `${language.risuNest.backup.actionFailed} ${language.screenshotPartialDestinationMayRemain}`
+            : language.risuNest.backup.actionFailed)
     }
     async function runLocalBackupOperation(kind: 'import' | 'export'): Promise<void> {
         if(risuSaveOperation) return
@@ -73,7 +74,9 @@
             alertNormal(
                 result.warningCodes.includes('cleanup-failed')
                     ? language.risuSaveCleanupWarning
-                    : 'Success',
+                    : kind === 'import'
+                        ? language.risuNest.backup.localBackupRestored
+                        : language.risuNest.backup.localBackupSaved,
             )
         } catch(error) {
             showRisuSaveError(error)

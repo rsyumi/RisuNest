@@ -62,7 +62,12 @@
             activeRegistry?.clear()
             activeRegistry = job.registry
         }
-        void mountSources(job)
+        // A failed parse still has to release the job's registry; letting the
+        // rejection escape leaks it and reports an unhandled rejection.
+        void mountSources(job).catch((error) => {
+            job.registry.clear()
+            console.error('Deferred markdown render failed', error)
+        })
     })
 
     onDestroy(() => {

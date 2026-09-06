@@ -42,6 +42,7 @@
     let rollup = $derived(state.stats
         ? storageDashboardRollup(state.stats, state.snapshots, state.conflictBackups, state.peerBackups)
         : null)
+    const backupActionClass = 'shrink-0 rounded-md border border-darkborderc bg-darkbutton px-3 py-1 text-textcolor transition-colors hover:bg-selected disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2'
     const labels = {
         total: language.risuNest.storage.total,
         media: language.risuNest.storage.media,
@@ -144,19 +145,25 @@
     <details data-storage-backup-list class="mt-3">
         <summary>{language.risuNest.storage.snapshots}</summary>
         {#each state.snapshots as snapshot}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button disabled={isBusy(`delete-snapshot:${snapshot.path}`)} onclick={() => deleteSnapshot(snapshot.path)}>{isBusy(`delete-snapshot:${snapshot.path}`) ? language.loading : language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span class="min-w-0 break-words">{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button class={backupActionClass} disabled={isBusy(`delete-snapshot:${snapshot.path}`)} onclick={() => deleteSnapshot(snapshot.path)}>{isBusy(`delete-snapshot:${snapshot.path}`) ? language.loading : language.remove}</button></div>
+        {:else}
+            <p class="py-1 text-sm text-textcolor2">{language.risuNest.storage.emptyList}</p>
         {/each}
     </details>
     <details data-storage-backup-list class="mt-2">
         <summary>{language.risuNest.storage.conflictBackups}</summary>
         {#each state.conflictBackups as backup}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.createdAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.byteLength)})</span><button disabled={isBusy(`delete-conflict-backup:${backup.id}`)} onclick={() => deleteConflictBackup(backup.id)}>{isBusy(`delete-conflict-backup:${backup.id}`) ? language.loading : language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span class="min-w-0 break-words">{new Date(backup.createdAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.byteLength)})</span><button class={backupActionClass} disabled={isBusy(`delete-conflict-backup:${backup.id}`)} onclick={() => deleteConflictBackup(backup.id)}>{isBusy(`delete-conflict-backup:${backup.id}`) ? language.loading : language.remove}</button></div>
+        {:else}
+            <p class="py-1 text-sm text-textcolor2">{language.risuNest.storage.emptyList}</p>
         {/each}
     </details>
     <details data-storage-backup-list class="mt-2">
         <summary>{language.risuNest.storage.syncBackups}</summary>
         {#each state.peerBackups as backup}
-            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span>{new Date(backup.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.bytes)})</span><button data-path={backup.path} disabled={isBusy(`delete-peer-backup:${backup.path}`)} onclick={() => deletePeerBackup(backup.path)}>{isBusy(`delete-peer-backup:${backup.path}`) ? language.loading : language.remove}</button></div>
+            <div class="flex items-center justify-between gap-2 py-1 text-sm"><span class="min-w-0 break-words">{new Date(backup.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(backup.bytes)})</span><button class={backupActionClass} data-path={backup.path} disabled={isBusy(`delete-peer-backup:${backup.path}`)} onclick={() => deletePeerBackup(backup.path)}>{isBusy(`delete-peer-backup:${backup.path}`) ? language.loading : language.remove}</button></div>
+        {:else}
+            <p class="py-1 text-sm text-textcolor2">{language.risuNest.storage.emptyList}</p>
         {/each}
     </details>
 
@@ -167,7 +174,7 @@
         {:else}
             <Button disabled={isBusy('calculate-temp')} onclick={calculateTempSize}>{isBusy('calculate-temp') ? language.loading : language.risuNest.storage.calculateSize}</Button>
         {/if}
-        <Button disabled={isBusy('preview-gc') || isBusy('execute-gc')} onclick={runGc}>{isBusy('preview-gc') || isBusy('execute-gc') ? language.loading : language.risuNest.storage.gcRun}</Button>
+        <Button disabled={isBusy('preview-gc') || isBusy('execute-gc')} onclick={runGc}>{isBusy('preview-gc') || isBusy('execute-gc') ? language.loading : state.gcPreview ? language.risuNest.storage.gcRunConfirm : language.risuNest.storage.gcRun}</Button>
     </div>
     <div role="status" aria-live="polite">
         <p class="mt-1 text-sm text-textcolor2">{language.risuNest.storage.cleanSyncTempNote}</p>

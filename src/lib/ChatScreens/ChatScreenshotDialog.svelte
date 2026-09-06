@@ -33,6 +33,11 @@
     let cancellationRequested = false
     let validation = $derived(validateScreenshotRange(totalTurns, start, end))
     let selectedTurns = $derived(validation.ok ? validation.end - validation.start + 1 : 0)
+    // The live range keeps reacting to the inputs and to a parent that retotals
+    // the conversation, so the progress line uses the count captured when the
+    // run started instead of the current selection.
+    let runTurns = $state<number | null>(null)
+    let progressTurns = $derived(runTurns ?? selectedTurns)
 
     function applyRange(range: { start: number; end: number }) {
         start = range.start
@@ -60,26 +65,42 @@
         onCancel()
     }
 
+    function handleKeydown(event: KeyboardEvent) {
+        // The global hotkey handler already calls preventDefault on Escape from
+        // its own document listener, so defaultPrevented cannot gate this.
+        if (event.key !== 'Escape') return
+        event.preventDefault()
+        if (running) {
+            cancelCapture()
+            return
+        }
+        onClose()
+    }
+
     $effect(() => {
         if (!running) {
             cancellationRequested = false
+            runTurns = null
             return
         }
+        runTurns = untrack(() => selectedTurns)
         return cancelCapture
     })
 
 </script>
 
+<svelte:window onkeydown={handleKeydown} />
+
 <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50 p-4" role="presentation">
     <div
-        class="w-full max-w-md rounded-lg border border-darkborderc bg-darkbg p-5 text-textcolor shadow-xl"
+        class="w-full max-w-md max-h-full overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-5 text-textcolor shadow-xl"
         role="dialog"
         aria-modal="true"
         aria-labelledby="chat-screenshot-title"
     >
         <div class="flex items-center justify-between gap-4">
             <h2 id="chat-screenshot-title" class="text-lg font-semibold">{language.screenshot}</h2>
-            <button type="button" class="text-textcolor2 hover:text-textcolor" onclick={closeDialog} aria-label={language.cancel}>×</button>
+            <button type="button" class="-mr-2 flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-xl text-textcolor2 hover:text-textcolor" onclick={closeDialog} aria-label={language.cancel}>×</button>
         </div>
 
         <p class="mt-2 text-sm text-textcolor2">
@@ -92,9 +113,9 @@
                 <div class="mb-2 text-sm">
                     {language.screenshotProgress
                         .replace('{completed}', String(completedTurns))
-                        .replace('{total}', String(selectedTurns))}
+                        .replace('{total}', String(progressTurns))}
                 </div>
-                <progress class="w-full" max={Math.max(1, selectedTurns)} value={completedTurns}></progress>
+                <progress class="w-full" max={Math.max(1, progressTurns)} value={completedTurns}></progress>
                 <button
                     type="button"
                     data-cancel

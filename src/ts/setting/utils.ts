@@ -6,6 +6,7 @@ import { advancedSettingsItems } from './advancedSettingsData';
 import { basicParameterItems, modelSpecificParameterItems, penaltyParameterItems, samplingParameterItems, seedSetting } from './botSettingsParamsData';
 import { chatFormatSettingsItems } from './chatFormatSettingsData';
 import { displaySettingsItems } from './displaySettingsData.svelte';
+import { risuNestSettingsItems } from './risuNestSettingsData';
 
 /**
  * Sentinel value representing an uninitialized local state in wrapper components.
@@ -86,6 +87,7 @@ export function getFullSettingsData(searchTerm = '') {
         modelSpecificParameterItems,
         chatFormatSettingsItems,
         displaySettingsItems,
+        risuNestSettingsItems,
     );
 
     if(!searchTerm) return full;

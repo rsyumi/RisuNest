@@ -47,6 +47,7 @@ vi.mock('src/lang', () => ({
                 fileLog: 'Save error log to a file',
                 fileLogHelp: 'File logging help',
                 logEmpty: 'No errors recorded.',
+                actionFailed: 'Localized error',
             },
         },
     },
@@ -112,7 +113,21 @@ describe('RisuNestLogViewer', () => {
 
         expect(nativeLog.getNativeLogTail).toHaveBeenCalledOnce()
         expect(alerts.alertMd).toHaveBeenCalledWith(
-            '[1970-01-01T00:00:01.000Z] [error] newer\n[1970-01-01T00:00:00.000Z] [warn] older',
+            '~~~~\n[1970-01-01T00:00:01.000Z] [error] newer\n[1970-01-01T00:00:00.000Z] [warn] older\n~~~~',
+        )
+    })
+
+    it('lengthens the fence past any tilde run inside the log', async () => {
+        nativeLog.getNativeLogTail.mockResolvedValueOnce([
+            { tsMs: 0, level: 'error', target: 'native', message: '<b>raw</b> ~~~~~ "quoted"' },
+        ])
+
+        await render()
+        target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
+        await settleAction()
+
+        expect(alerts.alertMd).toHaveBeenCalledWith(
+            '~~~~~~\n[1970-01-01T00:00:00.000Z] [error] <b>raw</b> ~~~~~ "quoted"\n~~~~~~',
         )
     })
 
@@ -169,7 +184,7 @@ describe('RisuNestLogViewer', () => {
         await settleAction()
 
         expect(alerts.alertMd).toHaveBeenCalledOnce()
-        expect(alerts.alertMd).toHaveBeenCalledWith('[1970-01-01T00:00:02.000Z] [error] newest')
+        expect(alerts.alertMd).toHaveBeenCalledWith('~~~~\n[1970-01-01T00:00:02.000Z] [error] newest\n~~~~')
     })
 
     it('ignores a stale copy result when a newer copy finishes first', async () => {

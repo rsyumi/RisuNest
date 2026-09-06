@@ -167,8 +167,25 @@ describe('RisuNest native command integration', () => {
     })
 })
 
+describe('RisuNest startup failure language schema', () => {
+    const required = ['title', 'schemaUnsupported', 'storeOpen', 'unknown', 'restart', 'copyDetails', 'copied', 'dataPathWindows', 'dataPathAndroid', 'stage']
+
+    it.each([languageEnglish, languageKorean])('contains every startup recovery string', (translation) => {
+        for (const key of required) {
+            expect(translation.risuNest.boot[key as keyof typeof translation.risuNest.boot])
+                .toEqual(expect.any(String))
+        }
+    })
+
+    it('names the Windows data folder the user has to clear', () => {
+        for (const translation of [languageEnglish, languageKorean]) {
+            expect(translation.risuNest.boot.dataPathWindows).toContain('%APPDATA%\\co.aiclient.risu\\')
+        }
+    })
+})
+
 describe('RisuNest sync language schema', () => {
-    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'work.progressLabel', 'work.deltaConflictBothChanged', 'work.deltaConflictLocalChanged', 'work.bidirectionalSyncing', 'work.bidirectionalResumeRequired', 'work.bidirectionalSourceUnavailable', 'work.bidirectionalRefreshPending', 'work.bidirectionalEditsDiscarded', 'lanWarning', 'androidLanOnly', 'notificationsDisabledWarning']
+    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'errorGeneric', 'errorTransportUnavailable', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.linkInvalid', 'work.receiving', 'work.conflictSelectTarget', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'work.progressLabel', 'work.deltaConflictBothChanged', 'work.deltaConflictLocalChanged', 'work.bidirectionalSyncing', 'work.bidirectionalResumeRequired', 'work.bidirectionalSourceUnavailable', 'work.bidirectionalRefreshPending', 'work.bidirectionalEditsDiscarded', 'lanWarning', 'androidLanOnly', 'notificationsDisabledWarning']
 
     it.each([languageEnglish, languageKorean])('contains every required nested sync branch', (translation) => {
         for (const path of required) {

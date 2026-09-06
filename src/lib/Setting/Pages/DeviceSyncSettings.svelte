@@ -2,7 +2,7 @@
     import { onMount } from 'svelte'
     import { MonitorSmartphone } from '@lucide/svelte'
     import { language } from 'src/lang'
-    import { alertConfirm } from 'src/ts/alert'
+    import { alertConfirm, alertToast } from 'src/ts/alert'
     import { isTauriAndroid } from 'src/ts/platform'
     import { getDatabase } from 'src/ts/storage/database.svelte'
     import { getDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
@@ -28,12 +28,19 @@
     let observedStagedUri = initialSnapshot.stagedUri
     let qrDataUrl = $state('')
     let qrUri = ''
+    let copyFailed = $state(false)
     let now = $state(Date.now())
     let notificationsEnabled = $state<boolean | null>(null)
     let sourceTransition = $state(false)
     let activeWork = $state<WorkLane | null>(null)
     let suppressWorkInference = false
     let workActionPending = $state(false)
+    // Held across a confirmation dialog so a second click cannot open a second
+    // dialog, without claiming the operation itself is already running.
+    let confirmPending = $state(false)
+    // A terminal desktop clone stays resumable forever, so the reader needs a
+    // way to say they are done with it or every other task stays locked out.
+    let cloneDismissed = $state(false)
     let shareActionError = $state<string | null>(null)
     let workActionError = $state<string | null>(null)
 
@@ -49,8 +56,20 @@
     const bidiPhase = $derived(bidi?.operationPhase ?? 'idle')
     const selectedIncoming = $derived(snapshot.sources.find((source) => source.deviceId === targetId))
     const selectedExpired = $derived(targetId !== 'new-link' && snapshot.expiredSourceIds.includes(targetId))
+    const stagedLinkInvalid = $derived(
+        targetId === 'new-link' && stagedUri.trim().length > 0 && !parsesAsLink(stagedUri),
+    )
+    // A link that grants nothing registers a device that can never do anything,
+    // so it is refused here rather than after the other device scans it.
+    const permissionsChosen = $derived(permissions.read || permissions.bidirectional)
+    // A recovered conflict has no in-memory source, so the reader has to name
+    // the device before either winner can be sent.
+    const conflictSourceId = $derived(
+        snapshot.activeBidirectionalSourceDeviceId ?? snapshot.stagedSourceDeviceId ?? selectedIncoming?.deviceId ?? null,
+    )
+    const cloneTerminal = $derived(cloneTarget?.phase === 'cancelled' || cloneTarget?.phase === 'failed')
     const cloneRetryable = $derived(Boolean(clone?.resumeAvailable) || (
-        !isTauriAndroid && (cloneTarget?.phase === 'cancelled' || cloneTarget?.phase === 'failed')
+        !isTauriAndroid && cloneTerminal && !cloneDismissed
     ))
     const cloneBusy = $derived(
         workActionPending && activeWork === 'clone'
@@ -140,6 +159,14 @@
         const secondText = format(seconds === 1 ? sync.share.durationSecond : sync.share.durationSeconds, seconds)
         return minutes > 0 ? `${minuteText} ${secondText}` : secondText
     }
+    function parsesAsLink(value: string): boolean {
+        try {
+            parseDeviceSyncUri(value)
+            return true
+        } catch {
+            return false
+        }
+    }
     function safeError(code: unknown): string {
         const safeCode = classifyDeviceSyncFailure(code).code
         // The controller stores its own classified code, so both shapes reach here.
@@ -153,7 +180,10 @@
         if (safeCode === 'port-unavailable') return sync.share.errorPortUnavailable
         if (safeCode === 'invalid-configuration') return sync.share.errorInvalidConfiguration
         if (safeCode === 'cleanup-failed') return sync.share.errorCleanupFailed
-        return sync.share.stateError
+        if (safeCode === 'transport-unavailable') return sync.errorTransportUnavailable
+        // Every remaining bounded code names an internal state the reader can do
+        // nothing with, so they all share one readable next step.
+        return sync.errorGeneric
     }
     function cloneBackupPaths(): string[] {
         const paths = cloneTarget?.backupPaths
@@ -191,30 +221,58 @@
             qrUri = uri
         }
     }
-    async function startOrStop(): Promise<void> {
-        if (sourceTransition) return
+    // Every sharing-side command shares one native slot, so a second click has
+    // to be refused here instead of surfacing as an unavailable-state failure.
+    async function runShareAction(action: () => Promise<unknown>): Promise<boolean> {
+        if (sourceTransition) return false
         sourceTransition = true
-        await runAction(async () => {
+        try {
+            return await runAction(action)
+        } finally {
+            sourceTransition = false
+        }
+    }
+    async function confirmOnce(message: string): Promise<boolean> {
+        if (confirmPending) return false
+        confirmPending = true
+        try {
+            return await alertConfirm(message)
+        } finally {
+            confirmPending = false
+        }
+    }
+    async function startOrStop(): Promise<void> {
+        await runShareAction(async () => {
             if (snapshot.source.phase === 'running') { await controller.stop(); return }
             if (snapshot.source.phase !== 'prepared') await controller.prepare(sourceRequest())
             await controller.start(permissions)
         })
-        sourceTransition = false
     }
     async function copyLink(): Promise<void> {
-        if (pairUri && !expired) await runAction(() => navigator.clipboard.writeText(pairUri))
+        if (!pairUri || expired) return
+        try {
+            await navigator.clipboard.writeText(pairUri)
+            copyFailed = false
+            alertToast(language.clipboardSuccess)
+        } catch {
+            // Without a clipboard the link has to become readable on screen, or
+            // it has no way at all of reaching the other device.
+            copyFailed = true
+        }
     }
     async function rotate(): Promise<void> {
-        if (await runAction(() => controller.rotateLink(permissions))) await createQr()
+        copyFailed = false
+        if (await runShareAction(() => controller.rotateLink(permissions))) await createQr()
     }
     async function revoke(direction: 'incoming' | 'outgoing', deviceId: string): Promise<void> {
-        if (!await alertConfirm(sync.devices.revokeConfirm)) return
-        const removed = await runAction(() => direction === 'incoming' ? controller.revokeIncoming(deviceId) : controller.revokeOutgoing(deviceId))
+        if (sourceTransition || !await confirmOnce(sync.devices.revokeConfirm)) return
+        const removed = await runShareAction(() => direction === 'incoming' ? controller.revokeIncoming(deviceId) : controller.revokeOutgoing(deviceId))
         if (removed && direction === 'incoming' && targetId === deviceId) targetId = 'new-link'
     }
     async function beginWork(lane: WorkLane, action: () => Promise<unknown>): Promise<void> {
         if (receiveBusy || !workAllowed(lane)) return
         suppressWorkInference = false
+        cloneDismissed = false
         activeWork = lane
         if (await runWorkAction(action)) {
             controller.clearStagedLink()
@@ -225,12 +283,7 @@
         if (selectedExpired) return false
         if (targetId === 'new-link') {
             if (!stagedUri.trim()) return Boolean(snapshot.stagedSourceDeviceId)
-            try {
-                parseDeviceSyncUri(stagedUri)
-                return true
-            } catch {
-                return false
-            }
+            return parsesAsLink(stagedUri)
         }
         return lane === 'bidirectional'
             ? Boolean(selectedIncoming?.permissions.includes('bidirectional'))
@@ -255,7 +308,7 @@
         if (!value.trim()) controller.clearStagedLink()
     }
     async function startClone(): Promise<void> {
-        if (!await alertConfirm(sync.work.cloneConfirm)) return
+        if (!await confirmOnce(sync.work.cloneConfirm)) return
         await beginWork('clone', async () => {
             stageSelectedLink()
             if (targetId === 'new-link') await controller.claimStagedClone()
@@ -279,7 +332,7 @@
         })
     }
     async function resolve(winner: 'local' | 'remote'): Promise<void> {
-        const sourceId = snapshot.activeBidirectionalSourceDeviceId ?? snapshot.stagedSourceDeviceId ?? selectedIncoming?.deviceId
+        const sourceId = conflictSourceId
         if (sourceId) await runWorkAction(() => controller.resolveRegisteredBidirectional(sourceId, winner))
     }
     async function resumeBidi(): Promise<void> {
@@ -290,14 +343,10 @@
         await runWorkAction(() => controller.resumeBidirectional())
     }
     async function abandon(): Promise<void> {
-        if (workActionPending) return
-        workActionPending = true
-        try {
-            const confirmed = await alertConfirm(sync.work.abandonConfirm)
-            if (confirmed && await runAction(() => controller.abandonBidirectional(), 'work')) dismissWork()
-        } finally {
-            workActionPending = false
-        }
+        // The confirmation runs outside the pending flag so the panel does not
+        // claim the sync is running while it asks whether to cancel it.
+        if (workActionPending || !await confirmOnce(sync.work.abandonConfirm)) return
+        if (await runWorkAction(() => controller.abandonBidirectional())) dismissWork()
     }
     async function resumeRetainedDelta(): Promise<void> {
         const sourceDeviceId = deltaRetained?.sourceDeviceId
@@ -305,20 +354,10 @@
         await runWorkAction(() => controller.pullRegisteredDelta(sourceDeviceId))
     }
     async function abandonRetainedDelta(): Promise<void> {
-        if (workActionPending) return
-        workActionPending = true
-        try {
-            const confirmed = await alertConfirm(sync.work.deltaAbandonConfirm)
-            // A cancellation the target reports as still retained leaves the
-            // panel up, so the only way out stays where the reader left it.
-            if (
-                confirmed
-                && await runAction(() => controller.abandonDelta(), 'work')
-                && !deltaRetained
-            ) dismissWork()
-        } finally {
-            workActionPending = false
-        }
+        if (workActionPending || !await confirmOnce(sync.work.deltaAbandonConfirm)) return
+        // A cancellation the target reports as still retained leaves the
+        // panel up, so the only way out stays where the reader left it.
+        if (await runWorkAction(() => controller.abandonDelta()) && !deltaRetained) dismissWork()
     }
     async function acknowledgeBidi(): Promise<void> {
         if (await runWorkAction(() => controller.acknowledgeBidirectional())) dismissWork()
@@ -331,6 +370,7 @@
         if (isTauriAndroid && cloneTarget?.phase === 'failed') {
             if (!await runWorkAction(() => controller.cancelClone())) return
         }
+        cloneDismissed = true
         dismissWork()
     }
     function conflictNames(): { names: string[], otherCount: number } {
@@ -358,6 +398,17 @@
         return { names: [...new Set(names)], otherCount }
     }
 
+    function refreshNotificationState(): void {
+        notificationsEnabled = androidPeerSyncNotificationsEnabled()
+    }
+    function openNotificationSettings(): void {
+        try {
+            window.RisuGenerationKeepAlive?.openNotificationSettings()
+        } catch {
+            // Android resumes this WebView with the real state either way.
+        }
+    }
+
     onMount(() => {
         activeWork ??= inferWork(snapshot)
         const unsubscribe = controller.subscribe((next) => {
@@ -373,11 +424,18 @@
             if (!activeWork && !suppressWorkInference) activeWork = inferWork(next)
             void createQr()
         })
-        void controller.initialize().catch(() => { shareActionError = sync.share.stateError })
-        notificationsEnabled = androidPeerSyncNotificationsEnabled()
+        void controller.initialize().catch((error) => { shareActionError = safeError(error) })
+        refreshNotificationState()
+        // Granting the permission happens in Android settings, so the warning
+        // has to be re-read when the reader comes back rather than at mount only.
+        window.addEventListener('focus', refreshNotificationState)
         const timer = setInterval(() => { now = Date.now() }, 1000)
         void createQr()
-        return () => { clearInterval(timer); unsubscribe() }
+        return () => {
+            clearInterval(timer)
+            unsubscribe()
+            window.removeEventListener('focus', refreshNotificationState)
+        }
     })
 </script>
 
@@ -385,7 +443,10 @@
     <h3 class="text-xl font-bold">{sync.menuTitle}</h3>
     <p data-sync-intro class="mt-1 text-sm text-textcolor2">{sync.intro}</p>
     {#if isTauriAndroid && notificationsEnabled === false}
-        <p data-notification-warning class="mt-3 rounded-md border border-draculared bg-darkbg p-3 text-sm text-draculared">{sync.notificationsDisabledWarning}</p>
+        <div class="mt-3 rounded-md border border-draculared bg-darkbg p-3">
+            <p data-notification-warning class="text-sm text-draculared">{sync.notificationsDisabledWarning}</p>
+            <Button className="mt-2" size="sm" styled="outlined" onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
+        </div>
     {/if}
     <div data-sync-card="sharing" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
         <div class="flex items-center justify-between gap-3">
@@ -409,7 +470,7 @@
         {/if}
         {#if settings.syncListenMethod === 'fixed-url' && !isTauriAndroid}
             <label class="mt-3 block text-sm font-bold" for="device-sync-public-url">{sync.share.publicUrl}</label>
-            <input id="device-sync-public-url" type="url" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncPublicBaseUrl} oninput={(event) => updateSettings({ syncPublicBaseUrl: event.currentTarget.value })} />
+            <input id="device-sync-public-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncPublicBaseUrl} oninput={(event) => updateSettings({ syncPublicBaseUrl: event.currentTarget.value })} />
             <p class="mt-2 text-sm text-textcolor2">{sync.share.fixedNote}</p>
             <details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.share.fixedGuideTitle}</summary><p class="mt-2">{format(sync.share.fixedGuideBody, settings.syncFixedPort)}</p></details>
         {/if}
@@ -419,7 +480,7 @@
             <label class="mt-2 flex gap-2 text-sm"><input type="checkbox" checked={permissions.bidirectional} onchange={(event) => { permissions.bidirectional = event.currentTarget.checked; if (permissions.bidirectional) permissions.read = true }} />{sync.share.permBidirectional}</label>
             <p class="mt-1 text-xs text-textcolor2">{sync.share.permBidirectionalHelp}</p>
         </div>
-        <Button className="mt-3" disabled={sourceTransition || ['preparing', 'starting', 'stopping'].includes(snapshot.source.phase) || (snapshot.source.phase !== 'running' && receiveWorkBusy)} styled={snapshot.source.phase === 'running' ? 'danger' : 'primary'} onclick={startOrStop}>{snapshot.source.phase === 'running' ? sync.share.stop : sync.share.start}</Button>
+        <Button className="mt-3" disabled={sourceTransition || ['preparing', 'starting', 'stopping'].includes(snapshot.source.phase) || (snapshot.source.phase !== 'running' && (receiveWorkBusy || !permissionsChosen))} styled={snapshot.source.phase === 'running' ? 'danger' : 'primary'} onclick={startOrStop}>{snapshot.source.phase === 'running' ? sync.share.stop : sync.share.start}</Button>
 
         {#if snapshot.source.phase === 'running' && pairUri}
             <div class="mt-4 border-t border-darkborderc pt-4">
@@ -429,7 +490,8 @@
                         <h5 class="font-bold">{sync.share.pairTitle}</h5>
                         <p class="mt-1 text-sm text-textcolor2">{sync.share.pairNote}</p>
                         <p class="mt-2 text-sm">{expired ? sync.share.pairExpired : format(sync.share.pairRemaining, formatDuration(remaining))}</p>
-                        <div class="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={expired} onclick={copyLink}>{sync.share.copyLink}</Button><Button size="sm" styled="outlined" onclick={rotate}>{sync.share.newLink}</Button></div>
+                        <div class="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={expired} onclick={copyLink}>{sync.share.copyLink}</Button><Button size="sm" styled="outlined" disabled={sourceTransition || !permissionsChosen} onclick={rotate}>{sync.share.newLink}</Button></div>
+                        {#if copyFailed && !expired}<p data-pair-uri class="mt-2 break-all rounded-md border border-darkborderc bg-bgcolor p-2 text-xs select-all">{pairUri}</p>{/if}
                     </div>
                 </div>
             </div>
@@ -446,8 +508,8 @@
             {#if snapshot.devices.length === 0}<p class="mt-2 text-sm text-textcolor2">{sync.devices.outgoingEmpty}</p>{:else}
                 {#each snapshot.devices as device (device.deviceId)}
                     <div class="mt-2 flex items-center justify-between gap-3 border-t border-darkborderc pt-2 text-sm">
-                        <div class="flex min-w-0 items-center gap-3"><span data-device-icon aria-hidden="true"><MonitorSmartphone size={18} /></span><div><p>{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
-                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.outgoingTitle}`} class="rounded-md border border-draculared bg-draculared/80 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared" onclick={() => revoke('outgoing', device.deviceId)}>{sync.devices.revoke}</button>
+                        <div class="flex min-w-0 items-center gap-3"><span data-device-icon class="shrink-0" aria-hidden="true"><MonitorSmartphone size={18} /></span><div class="min-w-0"><p class="break-words">{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
+                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.outgoingTitle}`} disabled={sourceTransition} class="shrink-0 rounded-md border border-draculared bg-draculared/80 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared disabled:cursor-not-allowed disabled:opacity-50" onclick={() => revoke('outgoing', device.deviceId)}>{sync.devices.revoke}</button>
                     </div>
                 {/each}
             {/if}
@@ -456,8 +518,8 @@
             {#if snapshot.sources.length === 0}<p class="mt-2 text-sm text-textcolor2">{sync.devices.incomingEmpty}</p>{:else}
                 {#each snapshot.sources as device (device.deviceId)}
                     <div class="mt-2 flex items-center justify-between gap-3 border-t border-darkborderc pt-2 text-sm">
-                        <div class="flex min-w-0 items-center gap-3"><span data-device-icon aria-hidden="true"><MonitorSmartphone size={18} /></span><div><p>{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
-                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.incomingTitle}`} class="rounded-md border border-draculared bg-draculared/80 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared" onclick={() => revoke('incoming', device.deviceId)}>{sync.devices.revoke}</button>
+                        <div class="flex min-w-0 items-center gap-3"><span data-device-icon class="shrink-0" aria-hidden="true"><MonitorSmartphone size={18} /></span><div class="min-w-0"><p class="break-words">{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
+                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.incomingTitle}`} disabled={sourceTransition} class="shrink-0 rounded-md border border-draculared bg-draculared/80 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared disabled:cursor-not-allowed disabled:opacity-50" onclick={() => revoke('incoming', device.deviceId)}>{sync.devices.revoke}</button>
                     </div>
                 {/each}
             {/if}
@@ -470,15 +532,16 @@
         <select id="device-sync-target" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={targetId} onchange={(event) => { targetId = event.currentTarget.value }}>
             {#each snapshot.sources as source (source.deviceId)}<option value={source.deviceId}>{source.name || source.deviceId.slice(0, 8)}</option>{/each}<option value="new-link">{sync.work.useNewLink}</option>
         </select>
-        {#if targetId === 'new-link'}<label class="sr-only" for="device-sync-link">{sync.work.linkPlaceholder}</label><input id="device-sync-link" class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" placeholder={sync.work.linkPlaceholder} value={stagedUri} oninput={(event) => updateStagedUri(event.currentTarget.value)} />{/if}
+        {#if targetId === 'new-link'}<label class="sr-only" for="device-sync-link">{sync.work.linkPlaceholder}</label><input id="device-sync-link" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-invalid={stagedLinkInvalid} class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" placeholder={sync.work.linkPlaceholder} value={stagedUri} oninput={(event) => updateStagedUri(event.currentTarget.value)} />{/if}
+        {#if stagedLinkInvalid}<p data-link-invalid class="mt-2 text-sm text-draculared">{sync.work.linkInvalid}</p>{/if}
         <div class="mt-3 flex flex-col gap-2 sm:flex-row"><Button disabled={receiveBusy || !workAllowed('clone')} onclick={startClone}>{sync.work.clone}</Button><Button disabled={receiveBusy || !workAllowed('delta')} onclick={startDelta}>{sync.work.delta}</Button><Button disabled={receiveBusy || !workAllowed('bidirectional')} onclick={startBidi}>{sync.work.bidirectional}</Button></div>
         {#if sourceBusy}<p class="mt-2 text-sm text-textcolor2">{sync.work.blockedWhileSharing}</p>{/if}
         {#if selectedExpired && !(activeWork && latestWorkError)}<p role="alert" class="mt-2 text-sm text-draculared">{sync.registrationExpired}</p>{/if}
 
         {#if activeWork}
-            <div data-work-status aria-live="polite" class="mt-4 border-t border-darkborderc pt-4">
+            <div data-work-status aria-live="polite" aria-busy={workActionPending} class="mt-4 border-t border-darkborderc pt-4">
                 {#if activeWork === 'clone'}
-                    {#if workActionPending || cloneTarget?.phase === 'confirmed'}<p class="text-sm">{format(sync.work.progress, 0)}</p>
+                    {#if workActionPending || cloneTarget?.phase === 'confirmed'}<progress class="w-full" aria-label={sync.work.receiving}></progress><p class="mt-1 text-sm">{sync.work.receiving}</p>
                     {:else if cloneTarget?.phase === 'downloading'}
                         {#if cloneTarget.totalBytes !== undefined}
                             {@const percent = Math.round((cloneTarget.completedBytes / Math.max(1, cloneTarget.totalBytes)) * 100)}
@@ -486,13 +549,16 @@
                         {:else}<progress class="w-full" aria-label={sync.work.progressLabel}></progress><p class="mt-1 text-sm">{sync.work.progressLabel}</p>{/if}
                         <Button className="mt-2" size="sm" styled="danger" disabled={workActionPending} onclick={() => runWorkAction(() => controller.cancelClone())}>{sync.work.cancel}</Button>
                     {:else if cloneRetryable}
-                        <Button size="sm" disabled={workActionPending} onclick={() => runWorkAction(() => controller.resumeClone())}>{sync.work.resume}</Button>
+                        <div class="flex flex-wrap gap-2">
+                            <Button size="sm" disabled={workActionPending} onclick={() => runWorkAction(() => controller.resumeClone())}>{sync.work.resume}</Button>
+                            {#if cloneTerminal}<Button size="sm" styled="danger" disabled={workActionPending} onclick={dismissClone}>{sync.work.dismiss}</Button>{/if}
+                        </div>
                     {:else if cloneTarget?.phase === 'failed' || cloneTarget?.phase === 'cancelled'}
                         <Button className="mt-2" size="sm" disabled={workActionPending} onclick={dismissClone}>{sync.work.dismiss}</Button>
                     {:else if cloneTarget?.phase === 'completed'}
                         {@const backupPaths = cloneBackupPaths()}
                         <p class="text-sm">{format(sync.work.doneUpdated, 1, formatRisuNestStorageBytes(cloneTarget.totalBytes ?? cloneTarget.completedBytes))}</p>
-                        {#if backupPaths.length > 0}<p class="mt-2 text-sm text-textcolor2">{sync.work.backupNote}</p><details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.work.backupNote}</summary><ul class="mt-1 list-inside list-disc">{#each backupPaths as path}<li>{path}</li>{/each}</ul></details>{/if}
+                        {#if backupPaths.length > 0}<details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.work.backupNote}</summary><ul class="mt-1 list-inside list-disc">{#each backupPaths as path}<li class="break-all">{path}</li>{/each}</ul></details>{/if}
                         <Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {/if}
                 {:else if activeWork === 'delta'}
@@ -505,7 +571,7 @@
                             {/if}
                             <Button size="sm" styled="danger" disabled={workActionPending || sourceBusy} onclick={abandonRetainedDelta}>{sync.work.abandon}</Button>
                         </div>
-                    {:else if workActionPending || delta?.pullPhase === 'running'}<p class="text-sm">{format(sync.work.progress, 0)}</p>
+                    {:else if workActionPending || delta?.pullPhase === 'running'}<progress class="w-full" aria-label={sync.work.receiving}></progress><p class="mt-1 text-sm">{sync.work.receiving}</p>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'noChanges'}<p class="text-sm">{sync.work.doneUpToDate}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'updated'}<p class="text-sm">{format(sync.work.doneUpdated, delta.pullResult.transferredObjects, formatRisuNestStorageBytes(delta.pullResult.transferredBytes))}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'fullCloneRequired'}<p class="text-sm">{sync.work.needClone}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
@@ -515,7 +581,7 @@
                     {#if workActionPending || bidiPhase === 'running'}<p class="text-sm">{sync.work.bidirectionalSyncing}</p>
                     {:else if bidiPhase === 'awaitingConflict'}
                         {@const conflict = conflictNames()}
-                        <div class="rounded-md border border-draculared p-3"><p class="font-bold text-draculared">{sync.work.conflictTitle}</p><p class="mt-1 text-sm text-textcolor2">{sync.work.conflictBody}</p><ul class="mt-2 list-inside list-disc text-sm">{#each conflict.names as name}<li>{name}</li>{/each}{#if conflict.otherCount > 0}<li>{format(sync.work.conflictOthers, conflict.otherCount)}</li>{/if}</ul><div class="mt-2 flex flex-wrap gap-2"><Button size="sm" onclick={() => resolve('local')}>{sync.work.keepThis}</Button><Button size="sm" onclick={() => resolve('remote')}>{sync.work.keepOther}</Button></div></div>
+                        <div class="rounded-md border border-draculared p-3"><p class="font-bold text-draculared">{sync.work.conflictTitle}</p><p class="mt-1 text-sm text-textcolor2">{sync.work.conflictBody}</p><ul class="mt-2 list-inside list-disc text-sm">{#each conflict.names as name}<li>{name}</li>{/each}{#if conflict.otherCount > 0}<li>{format(sync.work.conflictOthers, conflict.otherCount)}</li>{/if}</ul><div class="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={!conflictSourceId} onclick={() => resolve('local')}>{sync.work.keepThis}</Button><Button size="sm" disabled={!conflictSourceId} onclick={() => resolve('remote')}>{sync.work.keepOther}</Button></div>{#if !conflictSourceId}<p data-conflict-target class="mt-2 text-sm text-draculared">{sync.work.conflictSelectTarget}</p>{/if}</div>
                     {:else if bidiPhase === 'sourcePrepared'}<p class="text-sm text-textcolor2">{sync.share.start}: {sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={!['idle', 'error', 'prepared'].includes(snapshot.source.phase)} onclick={resumeBidi}>{sync.work.resume}</Button>{#if snapshot.source.phase === 'idle'}<Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button>{/if}</div>
                     {:else if ['sourceUnavailable', 'localCommitted', 'targetPrepared'].includes(bidiPhase)}<p class="text-sm text-textcolor2">{bidiPhase === 'sourceUnavailable' ? sync.work.bidirectionalSourceUnavailable : sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" onclick={resumeBidi}>{sync.work.resume}</Button><Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button></div>
                     {:else if bidiPhase === 'refreshPending'}<p class="text-sm text-textcolor2">{sync.work.bidirectionalRefreshPending}</p><Button className="mt-2" size="sm" onclick={resumeBidi}>{sync.work.resume}</Button>
@@ -523,7 +589,7 @@
                     {:else if bidiPhase === 'completed' && bidi?.operationResult?.kind !== 'conflict'}
                         {@const result = bidi.operationResult}
                         <p class="text-sm">{result?.kind === 'noChanges' ? sync.work.doneUpToDate : result?.kind === 'updated' ? format(sync.work.doneUpdated, result.transferredObjects, formatRisuNestStorageBytes(result.transferredBytes)) : sync.work.doneUpToDate}</p>
-                        {#if result && 'backups' in result && result.backups.length > 0}<p class="mt-2 text-sm text-textcolor2">{sync.work.backupNote}</p><details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.work.backupNote}</summary><ul class="mt-1 list-inside list-disc">{#each result.backups as backup (backup.packageId)}<li>{backup.path}</li>{/each}</ul></details>{/if}
+                        {#if result && 'backups' in result && result.backups.length > 0}<details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.work.backupNote}</summary><ul class="mt-1 list-inside list-disc">{#each result.backups as backup (backup.packageId)}<li class="break-all">{backup.path}</li>{/each}</ul></details>{/if}
                         <Button className="mt-2" size="sm" onclick={acknowledgeBidi}>{sync.work.dismiss}</Button>
                     {/if}
                 {/if}

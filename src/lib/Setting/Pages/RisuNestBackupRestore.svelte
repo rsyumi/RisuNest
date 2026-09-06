@@ -11,26 +11,15 @@
     import { DBState } from 'src/ts/stores.svelte'
     import { nativeFileOperation, importRisuSaveFromSystemPicker, exportRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
     import { alertPartialDestinationWarning, hasPartialDestinationWarning } from 'src/ts/storage/risuSaveFileRoute'
-    import { NativeFileJobActivationCommittedError, NativeFileJobError, type NativeFileJobStatus } from 'src/ts/storage/nativeFileJobs'
+    import { NativeFileJobActivationCommittedError, NativeFileJobError } from 'src/ts/storage/nativeFileJobs'
     import { cancelActiveNativeFileOperation } from 'src/ts/storage/nativeFileJobManager'
+    import { nativeFileJobProgressText } from 'src/ts/gui/nativeFileJobProgress'
 
     let nativeAccountBusy = $state(false)
+    let snapshotRestoreBusy = $state(false)
     let nativePublishController = $state<AbortController | null>(null)
     let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null)
     let risuSaveStatus = $derived($nativeFileOperation?.status)
-
-    function risuSaveProgressText(status: NativeFileJobStatus | undefined): string {
-        if (!status) return ''
-        const label = status.phase === 'reading-source' || status.phase === 'writing-export' || status.phase === 'uploading-database'
-            ? language.risuNest.backup.progressTransferring
-            : status.phase === 'activating-database' || status.phase === 'publishing-destination' || status.phase === 'finalizing-publication' || status.phase === 'finalizing-export' || status.phase === 'complete'
-                ? language.risuNest.backup.progressFinalizing
-                : language.risuNest.backup.progressPreparing
-        const total = status.progress.totalBytes
-        if (total && total > 0) return `${label}: ${Math.min(100, Math.round(status.progress.completedBytes * 100 / total))}%`
-        const bytes = status.progress.completedBytes
-        return bytes > 0 ? `${label}: ${(bytes / (1024 * 1024)).toFixed(1)} MiB` : label
-    }
 
     function showRisuSaveError(error: unknown): void {
         const partialDestinationMayRemain = hasPartialDestinationWarning(error)
@@ -85,12 +74,14 @@
 {/if}
 {#if risuSaveOperation}
     <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
-        <span>{risuSaveProgressText(risuSaveStatus)}</span>
+        <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
         <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
     </div>
 {/if}
 {#if isTauri}
-    <Button onclick={async () => {
+    <Button disabled={snapshotRestoreBusy} onclick={async () => {
+        if (snapshotRestoreBusy) return
+        snapshotRestoreBusy = true
         try {
             await restoreNativePersistentSnapshot({
                 choose: async (snapshots) => {
@@ -103,9 +94,10 @@
                 onEmpty: () => alertNormal(language.noLocalSnapshots),
             })
         } catch { alertError(language.risuNest.backup.actionFailed) }
+        finally { snapshotRestoreBusy = false }
     }} className="mt-2">{language.restoreLocalSnapshot}</Button>
 {/if}
-<Button onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
+<Button disabled={risuSaveOperation !== null} onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
 <Button onclick={() => openSyncConflictBackups()} className="mt-2">{language.syncConflictBackups}</Button>
 {#if isTauri && DBState.db.account}
     <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {

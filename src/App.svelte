@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { DynamicGUI, settingsOpen, sideBarStore, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore } from './ts/stores.svelte';
+    import { DynamicGUI, settingsOpen, sideBarStore, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, type BootFailure } from './ts/stores.svelte';
     import Sidebar from './lib/SideBars/Sidebar.svelte';
     import { DBState } from './ts/stores.svelte';
     import ChatScreen from './lib/ChatScreens/ChatScreen.svelte';
@@ -12,7 +12,7 @@
     import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { readModule } from './ts/process/modules';
-    import { alertNormal } from './ts/alert';
+    import { alertNormal, alertToast } from './ts/alert';
     import { language } from './lang';
     import RealmFrame from './lib/UI/Realm/RealmFrame.svelte';
     import SavePopupIconComp from './lib/Others/SavePopupIcon.svelte';
@@ -43,6 +43,10 @@
         cancelActiveNativeFileOperation,
         nativeFileOperation,
     } from './ts/storage/nativeFileJobManager';
+    import {
+        nativeFileJobProgressText,
+        nativeFileJobTitle,
+    } from './ts/gui/nativeFileJobProgress';
 
 
   
@@ -65,6 +69,38 @@
 
     const markAppInternalDrag = (e:DragEvent) => {
         e.dataTransfer?.setData(RISU_APP_INTERNAL_DRAG_TYPE, 'true')
+    }
+
+    const bootFailureExplanation = (failure: BootFailure) => {
+        switch (failure.kind) {
+            case 'schema-unsupported': return language.risuNest.boot.schemaUnsupported
+            case 'store-open': return language.risuNest.boot.storeOpen
+            default: return language.risuNest.boot.unknown
+        }
+    }
+
+    const bootFailureDetails = (failure: BootFailure) => [
+        language.risuNest.boot.title,
+        failure.message,
+        failure.stage ? `${language.risuNest.boot.stage}: ${failure.stage}` : '',
+    ].filter((line) => line !== '').join('\n')
+
+    const copyBootFailure = async (failure: BootFailure) => {
+        const details = bootFailureDetails(failure)
+        try {
+            await navigator.clipboard.writeText(details)
+        } catch {
+            const textarea = document.createElement('textarea')
+            textarea.value = details
+            document.body.appendChild(textarea)
+            textarea.select()
+            try {
+                document.execCommand('copy')
+            } finally {
+                document.body.removeChild(textarea)
+            }
+        }
+        alertToast(language.risuNest.boot.copied)
     }
 
 </script>
@@ -200,17 +236,44 @@
             <span class="absolute top-4 left-4 font-bold text-[#bbbbbb] text-md md:text-lg">RisyGTP 9+ Mytho Ultra Free</span>
         </div>
     {:else if !$loadedStore}
-        <div class="w-full h-full flex justify-center items-center text-textcolor text-xl bg-gray-900 flex-col">
-            <div class="flex flex-row items-center">
-                <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-textcolor" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
-                </svg>
-                <span>Loading...</span>
+        {#if $bootFailure}
+            <div class="w-full h-full overflow-y-auto bg-darkbg text-textcolor flex justify-center items-start">
+                <div class="w-full max-w-xl flex flex-col p-4 sm:p-6 gap-3">
+                    <h1 class="text-xl font-bold">{language.risuNest.boot.title}</h1>
+                    <p class="text-sm text-textcolor2">{bootFailureExplanation($bootFailure)}</p>
+                    {#if $bootFailure.kind === 'schema-unsupported'}
+                        <div class="flex flex-col gap-1 text-xs text-textcolor2 border border-darkborderc rounded-md p-3">
+                            <span class="select-text break-all">{language.risuNest.boot.dataPathWindows}</span>
+                            <span class="select-text break-all">{language.risuNest.boot.dataPathAndroid}</span>
+                        </div>
+                    {/if}
+                    <code class="text-xs font-mono select-text break-all whitespace-pre-wrap border border-darkborderc rounded-md p-3 text-textcolor2">{$bootFailure.message}</code>
+                    {#if $bootFailure.stage}
+                        <span class="text-xs text-textcolor2 select-text">{language.risuNest.boot.stage}: {$bootFailure.stage}</span>
+                    {/if}
+                    <div class="flex flex-wrap gap-2 mt-1">
+                        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-sm hover:bg-selected" onclick={() => location.reload()}>
+                            {language.risuNest.boot.restart}
+                        </button>
+                        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-sm hover:bg-selected" onclick={() => copyBootFailure($bootFailure)}>
+                            {language.risuNest.boot.copyDetails}
+                        </button>
+                    </div>
+                </div>
             </div>
+        {:else}
+            <div class="w-full h-full flex justify-center items-center text-textcolor text-xl bg-gray-900 flex-col">
+                <div class="flex flex-row items-center">
+                    <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-textcolor" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    <span>Loading...</span>
+                </div>
 
-            <span class="text-sm mt-2 text-textcolor2">{LoadingStatusState.text}</span>
-        </div>
+                <span class="text-sm mt-2 text-textcolor2">{LoadingStatusState.text}</span>
+            </div>
+        {/if}
     {:else if $CustomGUISettingMenuStore}
         <CustomGUISettingMenu />
     {:else if !didFirstSetup}
@@ -291,11 +354,9 @@
             role="status"
             aria-live="polite">
             <div class="flex flex-col items-center gap-3 rounded-lg border border-borderc bg-darkbg p-5">
-                <span>{language[$nativeFileOperation.kind === 'import'
-                    ? 'importRisuSave'
-                    : 'exportRisuSave']}</span>
+                <span>{nativeFileJobTitle($nativeFileOperation.kind, $nativeFileOperation.status)}</span>
                 <span class="text-sm text-textcolor2">
-                    {$nativeFileOperation.status?.phase ?? ''}
+                    {nativeFileJobProgressText($nativeFileOperation.status)}
                 </span>
                 <button
                     class="rounded border border-borderc px-3 py-1 disabled:opacity-50"

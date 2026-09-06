@@ -1,45 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-
-const startup = vi.hoisted(() => {
-    const calls: string[] = []
-    const stopAfterAutoListen = new Error('stop after auto-listen wiring')
-    const controller = {
-        initialize: vi.fn(async () => undefined),
-        prepare: vi.fn(async () => ({ phase: 'prepared' as const })),
-        start: vi.fn(async () => ({ phase: 'running' as const })),
-    }
-    return {
-        calls,
-        controller,
-        settings: {
-            nativeFileLogEnabled: true,
-            syncAutoListen: true,
-            syncListenMethod: 'fixed-url' as const,
-            syncFixedPort: 32145,
-            syncPublicBaseUrl: 'https://sync.example.com',
-        },
-        stopAfterAutoListen,
-        startAutoListen: vi.fn(async () => {
-            calls.push('auto-listen')
-            throw stopAfterAutoListen
-        }),
-        alertError: vi.fn(),
-        bootFailure: vi.fn(),
-    }
-})
+import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('@tauri-apps/plugin-fs', () => ({
     BaseDirectory: { AppData: 'app-data' },
-    exists: vi.fn(async () => true), mkdir: vi.fn(), readDir: vi.fn(), readFile: vi.fn(),
+    exists: vi.fn(), mkdir: vi.fn(), readDir: vi.fn(), readFile: vi.fn(),
     remove: vi.fn(), writeFile: vi.fn(),
 }))
 vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: () => ({ maximize: vi.fn() }) }))
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: vi.fn() }))
 vi.mock('@tauri-apps/api/path', () => ({ appDataDir: vi.fn(), join: vi.fn() }))
-vi.mock('svelte/store', async (importOriginal) => ({
-    ...await importOriginal<typeof import('svelte/store')>(),
-    get: () => false,
-}))
 vi.mock('./util', () => ({ changeFullscreen: vi.fn(), sleep: vi.fn() }))
 vi.mock('./update', () => ({ checkRisuUpdate: vi.fn() }))
 vi.mock('./gui/animation', () => ({ updateAnimationSpeed: vi.fn() }))
@@ -65,36 +33,19 @@ vi.mock('./storage/nativeFileJobs', () => ({
 vi.mock('./storage/androidRisuSaveRouteProduction.svelte', () => ({ registerAndroidRisuSaveRoute: vi.fn() }))
 vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('./platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriDesktop: false }))
-vi.mock('./storage/deviceSettings', () => ({ getDeviceSettings: () => startup.settings }))
-vi.mock('./storage/sync/deviceSyncProduction', () => ({
-    getProductionDeviceSyncController: vi.fn(() => {
-        startup.calls.push('production-controller')
-        return startup.controller
-    }),
-}))
-vi.mock('./storage/sync/deviceSyncController', () => ({
-    startDeviceSyncAutoListen: startup.startAutoListen,
-}))
-vi.mock('./nativeLog', () => ({
-    setNativeLogFileEnabled: vi.fn(async () => { startup.calls.push('native-log') }),
-}))
+vi.mock('./storage/deviceSettings', () => ({ getDeviceSettings: () => ({ nativeFileLogEnabled: false }) }))
+vi.mock('./storage/sync/deviceSyncProduction', () => ({ getProductionDeviceSyncController: vi.fn() }))
+vi.mock('./storage/sync/deviceSyncController', () => ({ startDeviceSyncAutoListen: vi.fn() }))
+vi.mock('./nativeLog', () => ({ setNativeLogFileEnabled: vi.fn() }))
 vi.mock('./storage/persistentStorageRuntime', () => ({
-    initializePersistentStorage: vi.fn(async () => { startup.calls.push('persistent-storage') }),
-    activateNativeAssetRepository: vi.fn(async () => null),
+    initializePersistentStorage: vi.fn(), activateNativeAssetRepository: vi.fn(),
 }))
 vi.mock('./storage/nativeFileJobRecovery', () => ({
     shouldReconcileNativeFileJobs: vi.fn(() => false),
-    reconcileNativeFileJobsBeforeBootstrap: vi.fn(async () => ({
-        pendingRestoreAcknowledgements: [], pendingOfficialPublications: [],
-    })),
+    reconcileNativeFileJobsBeforeBootstrap: vi.fn(),
     acknowledgeRecoveredNativeRestores: vi.fn(),
 }))
-vi.mock('./storage/persistentBootstrap', () => ({
-    bootstrapPersistentDatabase: vi.fn(async () => {
-        startup.calls.push('persistent-database')
-        return { database: { characters: [], botPresets: [] }, profile: 'default', revision: 1 }
-    }),
-}))
+vi.mock('./storage/persistentBootstrap', () => ({ bootstrapPersistentDatabase: vi.fn() }))
 vi.mock('./storage/database.svelte', () => ({ setDatabase: vi.fn(), getDatabase: vi.fn(() => ({})) }))
 vi.mock('./storage/databasePreparation', () => ({
     checkNewFormat: vi.fn(), prepareDatabaseForPersistence: vi.fn(), preparePersistentRootForWorkingSet: vi.fn(),
@@ -125,11 +76,7 @@ vi.mock('./storage/sync/officialAccountSnapshot', () => ({
     OfficialAccountSnapshotAdapter: class {}, createOfficialAssociationMarkers: () => ({}),
 }))
 vi.mock('./storage/sync/officialAccountBootstrap', () => ({
-    initializeOfficialAccountBootstrap: vi.fn(async () => {
-        startup.calls.push('official-account')
-        return { officialEnabled: false }
-    }),
-    publishOfficialRevisionIfChanged: vi.fn(),
+    initializeOfficialAccountBootstrap: vi.fn(), publishOfficialRevisionIfChanged: vi.fn(),
 }))
 vi.mock('./storage/sync/officialAssetLedger', () => ({
     createAccountScopedOfficialAssetLedger: () => ({ reset: vi.fn() }),
@@ -162,50 +109,70 @@ vi.mock('./globalApi.svelte', () => ({
 }))
 vi.mock('./stores.svelte', () => ({
     MobileGUI: { set: vi.fn() }, botMakerMode: { set: vi.fn() }, selectedCharID: { set: vi.fn() },
-    loadedStore: {}, DBState: {}, LoadingStatusState: { text: '' },
-    bootFailure: { set: (...args: unknown[]) => startup.bootFailure(...args) },
+    loadedStore: {}, DBState: {}, LoadingStatusState: { text: '' }, bootFailure: { set: vi.fn() },
 }))
 vi.mock('./alert', () => ({
-    alertConfirm: vi.fn(), alertError: (...args: unknown[]) => startup.alertError(...args),
-    alertInput: vi.fn(), alertLogin: vi.fn(), alertMd: vi.fn(), alertNormal: vi.fn(),
-    alertSelect: vi.fn(), alertTOS: vi.fn(), waitAlert: vi.fn(),
+    alertConfirm: vi.fn(), alertError: vi.fn(), alertInput: vi.fn(), alertLogin: vi.fn(), alertMd: vi.fn(),
+    alertNormal: vi.fn(), alertSelect: vi.fn(), alertTOS: vi.fn(), waitAlert: vi.fn(),
 }))
 vi.mock('./characterCards', () => ({ characterURLImport: vi.fn(), hubURL: 'https://hub.invalid' }))
 vi.mock('./storage/androidSafBridge', () => ({ isAndroidSafFileJobsEnabled: vi.fn(() => false) }))
 vi.mock('./storage/lifecycleCommit', () => ({ registerLifecycleCommitListeners: vi.fn() }))
 
-describe('device sync bootstrap wiring', () => {
-    beforeEach(() => {
-        startup.calls.length = 0
-        startup.startAutoListen.mockClear()
-        startup.controller.initialize.mockClear()
-        startup.alertError.mockClear()
-        startup.bootFailure.mockClear()
+import { classifyBootFailure } from './bootstrap'
+
+describe('classifyBootFailure', () => {
+    it('names an incompatible persistent schema wherever it is thrown', () => {
+        expect(classifyBootFailure(
+            new Error('unsupported persistent schema version 17'),
+            'persistent-storage',
+        )).toEqual({
+            kind: 'schema-unsupported',
+            message: 'unsupported persistent schema version 17',
+            stage: 'persistent-storage',
+        })
+        expect(classifyBootFailure(
+            new Error('unsupported persistent schema version 17'),
+            'plugins',
+        ).kind).toBe('schema-unsupported')
     })
 
-    it('connects the production controller to auto-listen after native data initialization', async () => {
-        const { loadData } = await import('./bootstrap')
+    it.each(['persistent-storage', 'persistent-database'])(
+        'treats a failure in the %s stage as a store that could not be opened',
+        (stage) => {
+            expect(classifyBootFailure(new Error('disk I/O error'), stage)).toEqual({
+                kind: 'store-open',
+                message: 'disk I/O error',
+                stage,
+            })
+        },
+    )
 
-        await loadData()
+    it.each([undefined, 'startup', 'plugins', 'ui-state'])(
+        'falls back to an unknown failure for the %s stage',
+        (stage) => {
+            expect(classifyBootFailure(new Error('boom'), stage)).toEqual({
+                kind: 'unknown',
+                message: 'boom',
+                stage,
+            })
+        },
+    )
 
-        expect(startup.calls).toEqual([
-            'native-log',
-            'persistent-storage',
+    it('reads a message out of a raw string and a native rejection object', () => {
+        expect(classifyBootFailure('unsupported persistent schema version 17')).toEqual({
+            kind: 'schema-unsupported',
+            message: 'unsupported persistent schema version 17',
+            stage: undefined,
+        })
+        expect(classifyBootFailure(
+            { code: 'store-error', message: 'unsupported persistent schema version 17' },
             'persistent-database',
-            'official-account',
-            'production-controller',
-            'auto-listen',
-        ])
-        expect(startup.controller.initialize).toHaveBeenCalledOnce()
-        expect(startup.startAutoListen).toHaveBeenCalledWith(
-            startup.settings,
-            expect.objectContaining({ controller: startup.controller }),
-        )
-        expect(startup.alertError).toHaveBeenCalledWith(startup.stopAfterAutoListen)
-        expect(startup.bootFailure).toHaveBeenCalledWith({
+        ).kind).toBe('schema-unsupported')
+        expect(classifyBootFailure(null, 'plugins')).toEqual({
             kind: 'unknown',
-            message: startup.stopAfterAutoListen.message,
-            stage: 'device-sync',
+            message: 'null',
+            stage: 'plugins',
         })
     })
 })

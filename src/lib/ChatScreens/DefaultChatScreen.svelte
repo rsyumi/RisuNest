@@ -761,18 +761,14 @@
         })
     }
 
-    async function openScreenshotDialog() {
-        if (
-            screenshotOpening
-            || screenshotRunning
-            || screenshotDialogOpen
-            || screenshotSourceLease
-        ) return
-        screenshotError = ''
-        screenshotCompletedTurns = 0
+    /**
+     * Opens a fresh source lease for the dialog. A lease is consumed by the job
+     * it creates, so a retry after a failed capture has to acquire another one.
+     */
+    async function acquireScreenshotSource(): Promise<boolean> {
         const source = currentCharacter
         const chat = source?.chats[source.chatPage]
-        if (!source || !chat) return
+        if (!source || !chat) return false
 
         const openGeneration = ++screenshotOpenGeneration
         screenshotOpening = true
@@ -794,21 +790,35 @@
             })
             if (openGeneration !== screenshotOpenGeneration) {
                 await lease.close()
-                return
+                return false
             }
             screenshotSourceLease = lease
             screenshotDialogSnapshot = lease.snapshot
             screenshotTotalTurns = lease.snapshot.totalTurns
-            screenshotDialogOpen = true
+            return true
         } catch (error) {
+            if (openGeneration !== screenshotOpenGeneration) return false
             if (!(error instanceof DOMException && error.name === 'AbortError')) {
                 const detail = error instanceof Error ? error.message : String(error)
                 screenshotError = language.screenshotFailed.replace('{error}', detail)
                 alertError(screenshotError)
             }
+            return false
         } finally {
             if (openGeneration === screenshotOpenGeneration) screenshotOpening = false
         }
+    }
+
+    async function openScreenshotDialog() {
+        if (
+            screenshotOpening
+            || screenshotRunning
+            || screenshotDialogOpen
+            || screenshotSourceLease
+        ) return
+        screenshotError = ''
+        screenshotCompletedTurns = 0
+        if (await acquireScreenshotSource()) screenshotDialogOpen = true
     }
 
     function cancelScreenshot() {
@@ -1062,6 +1072,7 @@
         screenshotRunning = true
         screenshotCompletedTurns = 0
         screenshotError = ''
+        let retryableFailure = ''
 
         try {
             const job = await sourceLease.createJob(start, end, controller.signal)
@@ -1110,7 +1121,6 @@
         } catch (error) {
             if (screenshotSourceLease === sourceLease) screenshotSourceLease = null
             await sourceLease.close().catch(console.error)
-            screenshotDialogOpen = false
             screenshotDialogSnapshot = null
             const partialDestinationMayRemain = !!(
                 error
@@ -1131,11 +1141,24 @@
                 )
                 screenshotError = language.screenshotFailed.replace('{error}', detail)
                 alertError(screenshotError)
+                // Keep the dialog open so the failure is readable and the entered
+                // range can be captured again without reopening the dialog.
+                retryableFailure = screenshotError
+            } else {
+                screenshotDialogOpen = false
             }
         } finally {
             if (screenshotController === controller) screenshotController = null
             screenshotRunning = false
         }
+
+        if (!retryableFailure || !screenshotDialogOpen) return
+        if (await acquireScreenshotSource()) {
+            screenshotError = retryableFailure
+            return
+        }
+        screenshotDialogOpen = false
+        screenshotDialogSnapshot = null
     }
 
     onDestroy(() => {
@@ -1354,7 +1377,7 @@
                               bind:value={messageInputTranslate}
                               bind:this={inputTranslateEle}
                               onkeydown={(e) => {
-                            if(e.key.toLocaleLowerCase() === "enter" && (!e.shiftKey)){
+                            if(e.key.toLocaleLowerCase() === "enter" && (!e.shiftKey) && !e.isComposing){
                                 if(DBState.db.sendWithEnter){
                                     send()
                                     e.preventDefault()

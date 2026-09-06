@@ -36,11 +36,21 @@
         }
     }
 
+    function refreshOnVisible(): void {
+        if (document.visibilityState === 'visible') refresh()
+    }
+
     onMount(() => {
         refresh()
         void getDetailedOSLabel().then((label) => { operatingSystem = label })
+        // Returning from the system notification screen restores the WebView through either
+        // event depending on the Android version, so both are observed.
         window.addEventListener('focus', refresh)
-        return () => window.removeEventListener('focus', refresh)
+        document.addEventListener('visibilitychange', refreshOnVisible)
+        return () => {
+            window.removeEventListener('focus', refresh)
+            document.removeEventListener('visibilitychange', refreshOnVisible)
+        }
     })
     onDestroy(unsubscribe)
 
@@ -71,7 +81,13 @@
     {#if notificationStatus === false}
         <span class="text-draculared text-sm" role="alert">{language.risuNest.platform.keepAliveNeedsNotifications}</span>
     {/if}
-    <span>{language.risuNest.platform.operatingSystem}: {operatingSystem}</span>
-    <span>{language.risuNest.platform.webView}: {webView}</span>
-    <span>{language.risuNest.platform.transferMode}: {transfer}</span>
+    {#if operatingSystem}
+        <span>{language.risuNest.platform.operatingSystem}: {operatingSystem}</span>
+    {/if}
+    {#if webView}
+        <span>{language.risuNest.platform.webView}: {webView}</span>
+    {/if}
+    {#if transfer}
+        <span>{language.risuNest.platform.transferMode}: {transfer}</span>
+    {/if}
 </div>

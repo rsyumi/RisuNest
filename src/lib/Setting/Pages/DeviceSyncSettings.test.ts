@@ -54,6 +54,7 @@ const cloneBase = {
 }
 const deltaBase = { pullPhase: 'idle' as const, retained: null, error: null }
 const bidiBase = { operationPhase: 'idle' as const, operationRetained: false, operationError: null }
+const genericFailure = 'The task did not finish. Try again, and if it keeps failing restart the app on both devices.'
 const validRegistrationUri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F10.1.2.3%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
 
 function snapshot(partial: Partial<DeviceSyncControllerSnapshot> = {}): DeviceSyncControllerSnapshot {
@@ -138,7 +139,7 @@ describe('DeviceSyncSettings', () => {
         controllerState.controller.stop.mockRejectedValueOnce(new Error('raw native secret'))
         await render(snapshot({ source: { phase: 'running' } }))
         button('Stop sharing')!.click()
-        await vi.waitFor(() => expect(target.querySelector('[data-share-error]')?.textContent).toBe('Error'))
+        await vi.waitFor(() => expect(target.querySelector('[data-share-error]')?.textContent).toBe(genericFailure))
         expect(target.querySelector('[data-sync-card="sharing"]')?.contains(target.querySelector('[data-share-error]'))).toBe(true)
         expect(target.textContent).not.toContain('raw native secret')
     })
@@ -199,7 +200,7 @@ describe('DeviceSyncSettings', () => {
 
         button('Get changes only')!.click()
 
-        await vi.waitFor(() => expect(target.querySelector('[data-work-error]')?.textContent).toBe('Error'))
+        await vi.waitFor(() => expect(target.querySelector('[data-work-error]')?.textContent).toBe(genericFailure))
         expect(target.querySelector('[data-sync-card="work"]')?.contains(target.querySelector('[data-work-error]'))).toBe(true)
         expect(target.querySelector('[data-sync-card="sharing"]')?.querySelector('[role="alert"]')).toBeNull()
         expect(target.textContent).not.toContain('private target detail')
@@ -538,7 +539,7 @@ describe('DeviceSyncSettings', () => {
         ['downloading', false, 'Receiving 50%', 'Cancel'],
         ['cancelled', false, 'Continue', 'Continue'],
         ['joined', true, 'Continue', 'Continue'],
-        ['failed', false, 'Error', 'Continue'],
+        ['failed', false, 'did not finish', 'Continue'],
     ] as const)('maps clone %s with resumeAvailable=%s', async (phase, resumeAvailable, expected, action) => {
         const clone = { ...cloneBase, resumeAvailable, platform: phase === 'joined' ? 'android' as const : 'desktop' as const, error: phase === 'failed' ? 'operation-failed' as const : null, state: { ...cloneBase.state, target: { ...cloneBase.state.target, phase, completedBytes: 50, totalBytes: 100 } } }
         await render(snapshot({ targets: { clone, delta: deltaBase, bidirectional: bidiBase } }))
@@ -568,11 +569,11 @@ describe('DeviceSyncSettings', () => {
     })
 
     it.each([
-        ['running', undefined, 'Receiving 0%'],
+        ['running', undefined, 'Receiving...'],
         ['completed', { kind: 'noChanges', revision: 1, transferredObjects: 0, transferredBytes: 0 }, 'Already up to date.'],
         ['fullCloneRequired', { kind: 'fullCloneRequired', reason: 'noExactCommonBase' }, 'A full copy is required.'],
         ['conflict', { kind: 'conflict', reason: 'localAndRemoteChanged' }, 'The same items changed on both devices, so the changes could not be received.'],
-        ['failed', undefined, 'Error'],
+        ['failed', undefined, 'did not finish'],
     ] as const)('maps delta %s safely', async (phase, pullResult, expected) => {
         const delta = { ...deltaBase, pullPhase: phase, pullResult, error: phase === 'failed' ? 'operation-failed' as const : null }
         await render(snapshot({ targets: { clone: cloneBase, delta, bidirectional: bidiBase } }))
@@ -800,7 +801,7 @@ describe('DeviceSyncSettings', () => {
 
         expect(target.querySelector('[data-delta-retained]')).toBeNull()
         expect(button('Abandon task')).toBeUndefined()
-        expect(target.querySelector('[data-work-status]')!.textContent).toContain('Receiving 0%')
+        expect(target.querySelector('[data-work-status]')!.textContent).toContain('Receiving...')
     })
 
     it('locks both retained delta actions while this device shares, but never the stop control', async () => {
@@ -891,5 +892,95 @@ describe('DeviceSyncSettings', () => {
         const removal = [...target.querySelectorAll<HTMLButtonElement>('[data-sync-card="devices"] button')]
         expect(removal.length).toBeGreaterThan(0)
         expect(removal.every((candidate) => candidate.disabled)).toBe(false)
+    })
+
+    it('lets a terminal desktop clone be dismissed so the other tasks unlock again', async () => {
+        const cancelled = { ...cloneBase, state: { ...cloneBase.state, target: { ...cloneBase.state.target, phase: 'cancelled' as const } } }
+        await render(snapshot({ sources: registeredSourceA, targets: { clone: cancelled, delta: deltaBase, bidirectional: bidiBase } }))
+        const select = target.querySelector<HTMLSelectElement>('#device-sync-target')!
+        select.value = 'source-a'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+        expect(button('Get changes only')?.disabled).toBe(true)
+        expect(button('Start sharing')?.disabled).toBe(true)
+
+        button('Dismiss')!.click()
+        await vi.waitFor(() => expect(target.querySelector('[data-work-status]')).toBeNull())
+
+        expect(controllerState.controller.cancelClone).not.toHaveBeenCalled()
+        expect(button('Get changes only')?.disabled).toBe(false)
+        expect(button('Start sharing')?.disabled).toBe(false)
+    })
+
+    it('explains a pasted link that is not a registration link', async () => {
+        await render()
+        const link = target.querySelector<HTMLInputElement>('#device-sync-link')!
+
+        link.value = 'https://example.com/not-a-link'
+        link.dispatchEvent(new Event('input', { bubbles: true }))
+        await tick()
+        expect(target.querySelector('[data-link-invalid]')?.textContent).toBe('That is not a registration link. Copy the whole link from the other device, or open its QR code.')
+
+        link.value = validRegistrationUri
+        link.dispatchEvent(new Event('input', { bubbles: true }))
+        await tick()
+        expect(target.querySelector('[data-link-invalid]')).toBeNull()
+    })
+
+    it('names the missing target instead of leaving a recovered conflict choice inert', async () => {
+        const conflict = { ...bidiBase, operationPhase: 'awaitingConflict' as const, operationRetained: true, operationResult: { kind: 'conflict' as const, operationId: 'op', conflicts: [], localManifestHash: 'local', remoteManifestHash: 'remote' } }
+        await render(snapshot({
+            sources: [{ deviceId: 'source-a', name: 'Source A', permissions: ['read', 'bidirectional'] }],
+            targets: { clone: cloneBase, delta: deltaBase, bidirectional: conflict },
+        }))
+
+        expect(button('Keep this device')?.disabled).toBe(true)
+        expect(target.querySelector('[data-conflict-target]')?.textContent)
+            .toBe('Choose the other device under Target device first, then pick which side to keep.')
+
+        const select = target.querySelector<HTMLSelectElement>('#device-sync-target')!
+        select.value = 'source-a'; select.dispatchEvent(new Event('change', { bubbles: true })); await tick()
+
+        expect(button('Keep this device')?.disabled).toBe(false)
+        expect(target.querySelector('[data-conflict-target]')).toBeNull()
+        button('Keep this device')!.click()
+        await vi.waitFor(() => expect(controllerState.controller.resolveRegisteredBidirectional).toHaveBeenCalledWith('source-a', 'local'))
+    })
+
+    it('refuses to share a link that would grant nothing', async () => {
+        await render()
+        const permissionInputs = target.querySelectorAll<HTMLInputElement>('[data-permissions] input')
+
+        permissionInputs[0].click(); await tick()
+
+        expect(button('Start sharing')?.disabled).toBe(true)
+        permissionInputs[1].click(); await tick()
+        expect(button('Start sharing')?.disabled).toBe(false)
+    })
+
+    it('refuses a second link rotation instead of reporting an unavailable slot', async () => {
+        let release!: () => void
+        controllerState.controller.rotateLink.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve(undefined) }))
+        const uri = 'risuailocal://peer-clone/v2?endpoint=http%3A%2F%2F127.0.0.1%3A32145&session=00000000-0000-4000-8000-000000000001&manifest=' + 'a'.repeat(64) + '#claim=' + 'b'.repeat(64)
+        await render(snapshot({ source: { phase: 'running', pairingUri: uri, expiresAtMs: Date.now() + 60_000 } }))
+
+        button('Create new link')!.click(); await tick()
+
+        expect(button('Create new link')?.disabled).toBe(true)
+        button('Create new link')!.click(); await tick()
+        expect(controllerState.controller.rotateLink).toHaveBeenCalledTimes(1)
+        expect(target.querySelector('[data-share-error]')).toBeNull()
+        release()
+    })
+
+    it('re-reads the Android notification warning when the page regains focus', async () => {
+        environment.android = true
+        await render()
+        expect(target.querySelector('[data-notification-warning]')).toBeNull()
+
+        environment.notifications = false
+        window.dispatchEvent(new Event('focus'))
+        await tick()
+
+        expect(target.querySelector('[data-notification-warning]')).not.toBeNull()
+        expect(button('Open system settings')).toBeDefined()
     })
 })

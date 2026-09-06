@@ -123,6 +123,63 @@ describe('ChatScreenshotDialog', () => {
         expect(onClose).toHaveBeenCalledOnce()
     })
 
+    test('closes on Escape when idle and cancels on Escape while running', async () => {
+        const onCancel = vi.fn()
+        const onClose = vi.fn()
+        mounted = mount(ChatScreenshotDialog, {
+            target,
+            props: { totalTurns: 10, onStart: vi.fn(), onCancel, onClose },
+        })
+
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        expect(onClose).toHaveBeenCalledOnce()
+        expect(onCancel).not.toHaveBeenCalled()
+
+        await unmount(mounted)
+        mounted = mount(ChatScreenshotDialog, {
+            target,
+            props: { totalTurns: 10, running: true, onStart: vi.fn(), onCancel, onClose },
+        })
+
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        expect(onCancel).toHaveBeenCalledOnce()
+        expect(onClose).toHaveBeenCalledOnce()
+    })
+
+    test('keeps the turn count captured at the start of the run', async () => {
+        mounted = mount(ChatScreenshotDialogHarness, {
+            target,
+            props: { onCancel: vi.fn(), initialRunning: false },
+        })
+        const harness = mounted as { setRunning(next: boolean): void, setTotalTurns(next: number): void }
+        await tick()
+
+        harness.setRunning(true)
+        await tick()
+        expect(target.textContent).toContain('0 of 10 turns')
+
+        harness.setTotalTurns(0)
+        await tick()
+        expect(target.textContent).toContain('0 of 10 turns')
+    })
+
+    test('shows the error while the dialog stays open after a failed capture', async () => {
+        mounted = mount(ChatScreenshotDialog, {
+            target,
+            props: {
+                totalTurns: 10,
+                running: false,
+                error: 'Screenshot failed: disk full',
+                onStart: vi.fn(),
+                onCancel: vi.fn(),
+                onClose: vi.fn(),
+            },
+        })
+
+        expect(target.textContent).toContain('Screenshot failed: disk full')
+        expect(target.querySelector<HTMLButtonElement>('[data-capture]')!.disabled).toBe(false)
+    })
+
     test('cancels a running job when its parent destroys the dialog', async () => {
         const onCancel = vi.fn()
         mounted = mount(ChatScreenshotDialogHarness, { target, props: { onCancel } })

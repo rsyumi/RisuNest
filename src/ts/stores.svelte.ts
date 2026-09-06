@@ -22,6 +22,18 @@ export const SizeStore = writable({
 })
 
 export const loadedStore = writable(false)
+
+/**
+ * Why startup stopped before the app became interactive. `loadedStore` never
+ * turns true in that case, so this drives the recovery panel instead of the
+ * loading spinner.
+ */
+export type BootFailure = {
+    kind: 'schema-unsupported' | 'store-open' | 'unknown'
+    message: string
+    stage?: string
+}
+export const bootFailure = writable<BootFailure | null>(null)
 export const DynamicGUI = writable(false)
 export const sideBarClosing = writable(false)
 export const sideBarStore = writable(window.innerWidth > 1024)

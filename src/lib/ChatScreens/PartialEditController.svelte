@@ -445,6 +445,9 @@
     }
 
     function handleKeydown(e: KeyboardEvent) {
+        // While an IME is composing, Escape and Enter belong to the composition,
+        // not to this editor; acting on them discards the pending edit.
+        if (e.isComposing) return;
         if (e.key === 'Escape') {
             handleCancel();
         } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
