@@ -7,6 +7,19 @@ import { relaunch } from '@tauri-apps/plugin-process'
 
 const UPDATE_REMINDER_KEY = 'risu_update_reminder'
 
+/**
+ * RisuNest ships no update server yet, and `plugins.updater.endpoints` in
+ * src-tauri/tauri.conf.json is intentionally empty. Leaving the check enabled would either
+ * fail on every launch (the Rust updater returns EmptyEndpoints when no endpoint is set) or,
+ * with upstream RisuAI's endpoint and pubkey restored, silently replace an installed RisuNest
+ * with upstream RisuAI, because upstream's release artifacts verify against upstream's key.
+ *
+ * To re-enable in-app updates: publish a RisuNest latest.json, fill `endpoints` and `pubkey`
+ * in tauri.conf.json, set `bundle.createUpdaterArtifacts` to true, sign the build with
+ * TAURI_SIGNING_PRIVATE_KEY, then flip this constant to true.
+ */
+const UPDATER_ENDPOINT_CONFIGURED = false
+
 interface UpdateReminder {
     until: number
 }
@@ -44,8 +57,11 @@ function isUpdateReminderActive(): boolean {
 }
 
 export async function checkRisuUpdate(){
+    if(!UPDATER_ENDPOINT_CONFIGURED){
+        return
+    }
     try {
-        const checked = await check()     
+        const checked = await check()
         if(checked){
             if (isUpdateReminderActive()) {
                 return
