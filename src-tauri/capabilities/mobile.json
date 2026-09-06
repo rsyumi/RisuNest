@@ -5,8 +5,10 @@
   "platforms": ["android"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-fullscreen",
     "fs:allow-read-file",
     "fs:allow-write-file",
+    "fs:allow-write",
     "fs:allow-read-dir",
     "fs:allow-copy-file",
     "fs:allow-mkdir",
