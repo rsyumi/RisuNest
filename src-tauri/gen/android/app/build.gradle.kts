@@ -21,6 +21,27 @@ val enableExperimentalPeerCloneClient = providers
     .map { it.equals("true", ignoreCase = true) }
     .orElse(true)
 
+// Release signing. `keystore.properties` lives next to this module (in
+// src-tauri/gen/android) and is gitignored, so a checkout without it still
+// builds; the release artifact is then simply unsigned. Never fall back to the
+// debug key: an APK signed with the debug key looks installable but can never
+// be upgraded by a properly signed build.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val releaseStoreFile = keystoreProperties.getProperty("storeFile")
+    ?.takeIf { it.isNotBlank() }
+    ?.let { file(it) }
+val releaseSigningReady = keystorePropertiesFile.exists() &&
+    releaseStoreFile != null &&
+    releaseStoreFile.exists() &&
+    !keystoreProperties.getProperty("storePassword").isNullOrBlank() &&
+    !keystoreProperties.getProperty("keyAlias").isNullOrBlank() &&
+    !keystoreProperties.getProperty("keyPassword").isNullOrBlank()
+
 android {
     compileSdk = 36
     ndkVersion = "28.2.13676358"
@@ -45,21 +66,34 @@ android {
             enableExperimentalPeerCloneClient.get().toString(),
         )
     }
+    signingConfigs {
+        if (releaseSigningReady) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
     buildTypes {
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {
-                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
-                jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
-            }
+            // The Tauri template kept the full DWARF debug info of the Rust
+            // cdylib in the APK. The dev-profile librisuai_lib.so is ~470 MB,
+            // of which ~285 MB is debug info, and `useLegacyPackaging = false`
+            // stores it uncompressed, so the debug APK was ~476 MB. Letting AGP
+            // strip the packaged copy leaves the unstripped library in
+            // src-tauri/target/<triple>/debug/ for ndk-stack symbolication.
         }
         getByName("release") {
             isMinifyEnabled = true
+            if (releaseSigningReady) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
@@ -97,6 +131,20 @@ dependencies {
 apply(from = "tauri.build.gradle.kts")
 
 afterEvaluate {
+    if (!releaseSigningReady) {
+        tasks.matching {
+            (it.name.startsWith("assemble") || it.name.startsWith("bundle")) &&
+                it.name.endsWith("Release")
+        }.configureEach {
+            doLast {
+                logger.warn(
+                    "RisuNest: release signing is not configured (${keystorePropertiesFile.path} " +
+                        "missing or incomplete), so this release artifact is UNSIGNED and cannot be " +
+                        "installed. See docs/research/android-build-audit-2026-09-06.md.",
+                )
+            }
+        }
+    }
     val universalDebugUnitTest = tasks.named(
         "testUniversalDebugUnitTest",
         org.gradle.api.tasks.testing.Test::class.java,

@@ -5,6 +5,12 @@ import strip from '@rollup/plugin-strip';
 import tailwindcss from '@tailwindcss/vite'
 // https://vitejs.dev/config/
 export default defineConfig(({command, mode}) => {
+  // `pnpm tauribuild:android` runs with `--mode android`, and `tauri android
+  // build` additionally exports TAURI_ENV_PLATFORM=android. Either signal means
+  // the bundle is about to be embedded into the Android cdylib, where source
+  // maps are dead weight: they cannot be opened on device and they inflate the
+  // APK by tens of megabytes. Desktop and web builds are untouched.
+  const isAndroidBundle = mode === 'android' || process.env.TAURI_ENV_PLATFORM === 'android'
   return {
     plugins: [
       svelte({
@@ -39,8 +45,8 @@ export default defineConfig(({command, mode}) => {
       target:'baseline-widely-available',
       // don't minify for debug builds
       minify: process.env.TAURI_ENV_DEBUG === 'true' ? false : 'oxc',
-      // produce sourcemaps for debug builds
-      sourcemap: process.env.TAURI_ENV_DEBUG === 'true',
+      // produce sourcemaps for debug builds, except on Android
+      sourcemap: !isAndroidBundle && process.env.TAURI_ENV_DEBUG === 'true',
       chunkSizeWarningLimit: 2000,
     },
     

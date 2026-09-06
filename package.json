@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build --sourcemap",
-    "tauribuild": "vite build",
+    "tauribuild": "vite build --mode desktop",
     "tauribuild:android": "vite build --mode android",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
@@ -29,6 +29,9 @@
     "android:init": "tauri android init --ci --skip-targets-install",
     "android:build:emulator": "tauri android build --debug --apk --target x86_64 --ci",
     "android:build:arm64": "tauri android build --debug --apk --target aarch64 --ci",
+    "android:build:release:arm64": "tauri android build --apk --target aarch64 --ci",
+    "android:build:release:aab": "tauri android build --aab --target aarch64 --ci",
+    "windows:build": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "buildsite": "vite build --outDir dist",
     "runserver": "node server/node/server.cjs",
     "sync": "node electron/sync",

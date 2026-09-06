@@ -29,6 +29,7 @@ src-others/
 *.sln
 *.sw?
 /src-tauri/target/
+/src-tauri/target-*/
 /src-tauri/gen/schemas/acl-manifests.json
 /src-tauri/gen/schemas/*-schema.json
 /build/
@@ -52,3 +53,8 @@ dist.zip
 /server/node/ssl/certificate
 .worktrees/
 temp
+
+# Android release signing (never commit a keystore or its passwords)
+/src-tauri/gen/android/keystore.properties
+/src-tauri/gen/android/*.jks
+/src-tauri/gen/android/*.keystore
