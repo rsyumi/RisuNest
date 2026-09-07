@@ -25,8 +25,12 @@ pub(crate) struct OpenedFilesState {
 impl OpenedFilesState {
     /// Seeds the state with the paths this process was launched with.
     pub(crate) fn from_launch_arguments() -> Self {
+        let launch_directory = std::env::current_dir().ok();
         Self {
-            pending: Mutex::new(collect_opened_files(std::env::args_os())),
+            pending: Mutex::new(collect_opened_files(
+                std::env::args_os(),
+                launch_directory.as_deref(),
+            )),
         }
     }
 
@@ -52,8 +56,12 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Records the files a second launch carried and wakes the running frontend.
-pub(crate) fn deliver_single_instance_arguments(app: &AppHandle, args: &[String]) {
-    let files = collect_opened_files(args);
+pub(crate) fn deliver_single_instance_arguments(
+    app: &AppHandle,
+    args: &[String],
+    launch_directory: &str,
+) {
+    let files = collect_opened_files(args, Some(Path::new(launch_directory)));
     if files.is_empty() {
         return;
     }
@@ -91,14 +99,14 @@ pub(crate) fn opened_files_take(app: AppHandle) -> Vec<String> {
 ///
 /// Deep link URLs stay with the deep link plugin, switches are ignored, and every kept path is
 /// canonicalized so the filesystem scope grant matches what the frontend later reads.
-fn collect_opened_files<I, S>(args: I) -> Vec<PathBuf>
+fn collect_opened_files<I, S>(args: I, launch_directory: Option<&Path>) -> Vec<PathBuf>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let mut collected: Vec<PathBuf> = Vec::new();
     for arg in args.into_iter().skip(1) {
-        let Some(path) = normalize_opened_file(arg.as_ref()) else {
+        let Some(path) = normalize_opened_file(arg.as_ref(), launch_directory) else {
             continue;
         };
         if !collected.contains(&path) {
@@ -108,17 +116,24 @@ where
     collected
 }
 
-fn normalize_opened_file(arg: &OsStr) -> Option<PathBuf> {
+fn normalize_opened_file(arg: &OsStr, launch_directory: Option<&Path>) -> Option<PathBuf> {
     let text = arg.to_string_lossy();
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.starts_with('-') || has_url_scheme(trimmed) {
         return None;
     }
     let path = Path::new(arg);
-    if !path.is_file() {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let launch_directory =
+            launch_directory.filter(|directory| directory.is_absolute() && directory.is_dir())?;
+        launch_directory.join(path)
+    };
+    if !path.is_absolute() || !path.is_file() {
         return None;
     }
-    let canonical = std::fs::canonicalize(path).ok()?;
+    let canonical = std::fs::canonicalize(&path).ok()?;
     match FilePath::Path(canonical).simplified() {
         FilePath::Path(path) => Some(path),
         FilePath::Url(_) => None,
@@ -161,16 +176,19 @@ mod tests {
         std::fs::write(&preset, b"preset").expect("preset fixture");
         let missing = directory.path().join("missing.risum");
 
-        let collected = collect_opened_files([
-            OsString::from(executable.to_string_lossy().into_owned()),
-            OsString::from(card.to_string_lossy().into_owned()),
-            OsString::from(missing.to_string_lossy().into_owned()),
-            OsString::from("risunestlocal://hub/1234"),
-            OsString::from("risunestlocal:device-sync"),
-            OsString::from("--flag"),
-            OsString::from("   "),
-            OsString::from(preset.to_string_lossy().into_owned()),
-        ]);
+        let collected = collect_opened_files(
+            [
+                OsString::from(executable.to_string_lossy().into_owned()),
+                OsString::from(card.to_string_lossy().into_owned()),
+                OsString::from(missing.to_string_lossy().into_owned()),
+                OsString::from("risunestlocal://hub/1234"),
+                OsString::from("risunestlocal:device-sync"),
+                OsString::from("--flag"),
+                OsString::from("   "),
+                OsString::from(preset.to_string_lossy().into_owned()),
+            ],
+            None,
+        );
 
         let names: Vec<&str> = collected
             .iter()
@@ -186,13 +204,95 @@ mod tests {
         std::fs::write(&module, b"module").expect("module fixture");
         let argument = OsString::from(module.to_string_lossy().into_owned());
 
-        let collected = collect_opened_files([
-            OsString::from("RisuNest.exe"),
-            argument.clone(),
-            argument.clone(),
-        ]);
+        let collected = collect_opened_files(
+            [
+                OsString::from("RisuNest.exe"),
+                argument.clone(),
+                argument.clone(),
+            ],
+            None,
+        );
 
         assert_eq!(collected.len(), 1);
+    }
+
+    #[test]
+    fn relative_opened_file_uses_the_supplied_launch_directory() {
+        let first_directory = tempfile::tempdir().expect("first temporary directory");
+        let second_directory = tempfile::tempdir().expect("second temporary directory");
+        let first_card = first_directory.path().join("card.charx");
+        let second_card = second_directory.path().join("card.charx");
+        std::fs::write(&first_card, b"first card").expect("first card fixture");
+        std::fs::write(&second_card, b"second card").expect("second card fixture");
+
+        let collected = collect_opened_files(
+            [OsString::from("RisuNest.exe"), OsString::from("card.charx")],
+            Some(second_directory.path()),
+        );
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(
+            std::fs::read(&collected[0]).expect("read selected card"),
+            b"second card"
+        );
+    }
+
+    #[test]
+    fn missing_relative_opened_file_is_ignored() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let collected = collect_opened_files(
+            [
+                OsString::from("RisuNest.exe"),
+                OsString::from("missing.charx"),
+            ],
+            Some(directory.path()),
+        );
+
+        assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn absolute_opened_file_does_not_require_a_launch_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let card = directory.path().join("card.charx");
+        std::fs::write(&card, b"card").expect("card fixture");
+
+        let collected = collect_opened_files(
+            [
+                OsString::from("RisuNest.exe"),
+                OsString::from(card.as_os_str()),
+            ],
+            None,
+        );
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(
+            std::fs::read(&collected[0]).expect("read selected card"),
+            b"card"
+        );
+    }
+
+    #[test]
+    fn relative_opened_file_requires_a_valid_launch_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let card = directory.path().join("card.charx");
+        std::fs::write(&card, b"card").expect("card fixture");
+        let missing_directory = directory.path().join("missing");
+        let relative_directory = Path::new("relative-directory");
+
+        for launch_directory in [
+            None,
+            Some(Path::new("")),
+            Some(relative_directory),
+            Some(&missing_directory),
+        ] {
+            let collected = collect_opened_files(
+                [OsString::from("RisuNest.exe"), OsString::from("card.charx")],
+                launch_directory,
+            );
+            assert!(collected.is_empty());
+        }
     }
 
     #[test]

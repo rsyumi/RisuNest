@@ -527,12 +527,12 @@ pub fn run() {
         builder = builder
             .manage(opened_files::OpenedFilesState::from_launch_arguments())
             .manage(PyServerState::default())
-            .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
                 let _ = app
                     .get_webview_window("main")
                     .expect("no main window")
                     .set_focus();
-                opened_files::deliver_single_instance_arguments(app, &args);
+                opened_files::deliver_single_instance_arguments(app, &args, &cwd);
             }))
             .plugin(tauri_plugin_updater::Builder::new().build());
     }

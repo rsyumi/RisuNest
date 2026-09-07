@@ -127,4 +127,31 @@ describe('opened file delivery', () => {
         expect(imported).toEqual(['C:\\cards\\first.charx', 'C:\\cards\\second.risup'])
         expect(mocks.invoke).toHaveBeenCalledTimes(2)
     })
+
+    it('imports files queued while the desktop subscription is still being established', async () => {
+        let subscriptionReady!: (unlisten: () => void) => void
+        mocks.listen.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    subscriptionReady = resolve
+                }),
+        )
+        let pending: string[] = []
+        mocks.invoke.mockImplementation(async () => {
+            const files = pending
+            pending = []
+            return files
+        })
+        const { imported, importFile } = importerSpy()
+
+        registerOpenedFileListeners(importFile)
+        await flush()
+        // A second process queues a file before native event delivery is subscribed.
+        pending.push('C:\\cards\\during-startup.risup')
+        subscriptionReady(() => {})
+        await flush()
+
+        expect(imported).toEqual(['C:\\cards\\during-startup.risup'])
+        expect(pending).toEqual([])
+    })
 })

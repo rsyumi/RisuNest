@@ -75,13 +75,15 @@ export function registerOpenedFileListeners(importFile: OpenedFileImporter): voi
     window.addEventListener(OPENED_FILES_EVENT, domListener)
 
     if (isTauriDesktop) {
-        void drainDesktopOpenedFiles()
         void listen(OPENED_FILES_EVENT, () => {
             void drainDesktopOpenedFiles()
         }).then((unlisten) => {
             unlistenNative = unlisten
+            // Subscribe before draining so a launch during setup cannot lose its notification.
+            void drainDesktopOpenedFiles()
         }).catch((error) => {
             console.warn('Failed to subscribe to opened files:', error)
+            void drainDesktopOpenedFiles()
         })
     }
 }
