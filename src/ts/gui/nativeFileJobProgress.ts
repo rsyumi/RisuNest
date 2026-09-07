@@ -22,6 +22,10 @@ const FINALIZING_PHASES = new Set<NativeFileJobPhase>([
 /** Localized phase word for a running native file job. Never exposes the internal phase code. */
 export function nativeFileJobPhaseLabel(status: NativeFileJobStatus | undefined): string {
     if (!status) return ''
+    // Imports read the selected file; only exports and uploads move data somewhere else.
+    if (status.phase === 'reading-source' && status.kind.startsWith('restore-')) {
+        return language.risuNest.backup.progressReading
+    }
     if (TRANSFERRING_PHASES.has(status.phase)) return language.risuNest.backup.progressTransferring
     if (FINALIZING_PHASES.has(status.phase)) return language.risuNest.backup.progressFinalizing
     return language.risuNest.backup.progressPreparing

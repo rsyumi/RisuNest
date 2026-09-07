@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import appSource from '../../App.svelte?raw'
+import dialogSource from '../../lib/Others/NativeFileJobDialog.svelte?raw'
 import { languageEnglish } from 'src/lang/en'
 import type { NativeFileJobStatus } from '../storage/nativeFileJobs'
 import {
@@ -30,6 +31,7 @@ describe('nativeFileJobProgress', () => {
         ]
         const localized = new Set([
             languageEnglish.risuNest.backup.progressPreparing,
+            languageEnglish.risuNest.backup.progressReading,
             languageEnglish.risuNest.backup.progressTransferring,
             languageEnglish.risuNest.backup.progressFinalizing,
         ])
@@ -42,11 +44,18 @@ describe('nativeFileJobProgress', () => {
         expect(nativeFileJobPhaseLabel(undefined)).toBe('')
     })
 
+    it('says an import is reading the file while an export is transferring it', () => {
+        expect(nativeFileJobPhaseLabel(status({ kind: 'restore-legacy-local-backup', phase: 'reading-source' })))
+            .toBe(languageEnglish.risuNest.backup.progressReading)
+        expect(nativeFileJobPhaseLabel(status({ kind: 'export-legacy-local-backup', phase: 'writing-export' })))
+            .toBe(languageEnglish.risuNest.backup.progressTransferring)
+    })
+
     it('adds a percentage when the job reports a total and megabytes otherwise', () => {
         expect(nativeFileJobProgressText(status({
             phase: 'reading-source',
             progress: { completedBytes: 512, totalBytes: 1024, completedItems: 0 },
-        }))).toBe(`${languageEnglish.risuNest.backup.progressTransferring}: 50%`)
+        }))).toBe(`${languageEnglish.risuNest.backup.progressReading}: 50%`)
         expect(nativeFileJobProgressText(status({
             phase: 'writing-export',
             progress: { completedBytes: 2 * 1024 * 1024, completedItems: 0 },
@@ -65,9 +74,11 @@ describe('nativeFileJobProgress', () => {
         expect(nativeFileJobTitle('export', undefined)).toBe(languageEnglish.exportRisuSave)
     })
 
-    it('keeps the blocking overlay free of raw job phase codes', () => {
-        expect(appSource).not.toContain('status?.phase ?? ')
-        expect(appSource).toContain('nativeFileJobProgressText($nativeFileOperation.status)')
-        expect(appSource).toContain('nativeFileJobTitle($nativeFileOperation.kind, $nativeFileOperation.status)')
+    it('mounts the shared dialog instead of an inline overlay and keeps raw job codes out of it', () => {
+        expect(appSource).toContain('<NativeFileJobDialog />')
+        expect(appSource).not.toContain('nativeFileJobProgressText(')
+        expect(dialogSource).toContain('buildNativeFileJobDialogModel(')
+        expect(dialogSource).not.toContain('.phase')
+        expect(dialogSource).not.toContain('status?.')
     })
 })

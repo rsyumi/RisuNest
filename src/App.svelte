@@ -39,14 +39,7 @@
     import { RISU_APP_INTERNAL_DRAG_TYPE, RISU_SIDEBAR_DRAG_TYPE } from './ts/dragTypes';
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauriMobile } from './ts/platform';
-    import {
-        cancelActiveNativeFileOperation,
-        nativeFileOperation,
-    } from './ts/storage/nativeFileJobManager';
-    import {
-        nativeFileJobProgressText,
-        nativeFileJobTitle,
-    } from './ts/gui/nativeFileJobProgress';
+    import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
 
 
   
@@ -348,26 +341,5 @@
     {#if customSideBarConfigDialogStore.open}
         <CustomSidebarConfig />
     {/if}
-    {#if $nativeFileOperation?.blocking}
-        <div
-            class="fixed inset-0 z-[1000] flex items-center justify-center bg-bgcolor/90"
-            role="status"
-            aria-live="polite">
-            <div class="flex flex-col items-center gap-3 rounded-lg border border-borderc bg-darkbg p-5">
-                <span>{nativeFileJobTitle($nativeFileOperation.kind, $nativeFileOperation.status)}</span>
-                <span class="text-sm text-textcolor2">
-                    {nativeFileJobProgressText($nativeFileOperation.status)}
-                </span>
-                <button
-                    class="rounded border border-borderc px-3 py-1 disabled:opacity-50"
-                    disabled={
-                        $nativeFileOperation.status?.phase === 'activating-database'
-                        || $nativeFileOperation.status?.state === 'succeeded'
-                    }
-                    onclick={cancelActiveNativeFileOperation}>
-                    {language.cancelRisuSaveOperation}
-                </button>
-            </div>
-        </div>
-    {/if}
+    <NativeFileJobDialog />
 </main>
