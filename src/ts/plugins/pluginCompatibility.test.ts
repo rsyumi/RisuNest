@@ -38,6 +38,24 @@ describe('manual plugin installation compatibility', () => {
 })
 
 describe('plugin compatibility profiles', () => {
+    it('preserves errors and identifies the V2 plugin in evaluated code stacks', async () => {
+        const source = createAwaitablePluginLoaderSource(
+            "throw new TypeError('synthetic failure')",
+            'fixture/with\nnewline',
+        )
+        let caught: Error | undefined
+        try {
+            await runAwaitablePluginLoader(source)
+        } catch (error) {
+            caught = error as Error
+        }
+        expect(caught).toBeInstanceOf(TypeError)
+        expect(caught?.stack).toContain(
+            'risu-plugin-v2/fixture%2Fwith%0Anewline.js',
+        )
+        expect(caught?.message).toBe('synthetic failure')
+    })
+
     it('keeps direct maximum full-object replacements gated', () => {
         expect(() => assertPluginFullObjectCompatibility(
             'scalable-v3',

@@ -823,7 +823,7 @@ export class SandboxHost {
         this.activeStreamCleanups.clear();
     }
 
-    public run(container: HTMLElement|HTMLIFrameElement, userCode: string) {
+    public run(container: HTMLElement|HTMLIFrameElement, userCode: string, sourceLabel = 'anonymous') {
         if(container instanceof HTMLIFrameElement) {
             this.iframe = container;
         } else {
@@ -922,7 +922,9 @@ export class SandboxHost {
                 } catch (err: any) {
                     rollbackStreams();
                     delete response.result;
-                    response.error = err?.message || String(err || "Host execution error");
+                    const method = typeof data.method === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,79}$/.test(data.method)
+                        ? data.method : 'unknown';
+                    response.error = `[Plugin API: ${method}] ` + (err?.message || String(err || "Host execution error"));
                 } finally {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
@@ -973,6 +975,7 @@ export class SandboxHost {
                     ${userCode}
                 })()
             })();
+            //# sourceURL=risu-plugin-v3/${encodeURIComponent(sourceLabel)}.js
         </script>
       </body>
       </html>

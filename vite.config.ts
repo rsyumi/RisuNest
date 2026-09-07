@@ -80,8 +80,8 @@ export default defineConfig(({command, mode}) => {
       target:'baseline-widely-available',
       // don't minify for debug builds
       minify: process.env.TAURI_ENV_DEBUG === 'true' ? false : 'oxc',
-      // produce sourcemaps for debug builds, except on Android
-      sourcemap: !isAndroidBundle && process.env.TAURI_ENV_DEBUG === 'true',
+      // Desktop release errors must remain translatable offline. Android excludes maps.
+      sourcemap: !isAndroidBundle && (mode === 'desktop' || process.env.TAURI_ENV_PLATFORM === 'windows' || process.env.TAURI_ENV_DEBUG === 'true'),
       chunkSizeWarningLimit: 2000,
     },
     

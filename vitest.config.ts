@@ -6,6 +6,8 @@ const exclude = [
   '**/dist/**',
   '**/.git/**',
   '**/.worktrees/**',
+  '**/.superpowers/**',
+  '**/docs/research/**',
 ]
 
 export default defineConfig({

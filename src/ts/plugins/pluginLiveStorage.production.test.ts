@@ -10,7 +10,7 @@ vi.mock('../parser/parser.svelte', () => ({
 
 import { DBState } from '../stores.svelte'
 import { getDatabase, setDatabaseLite, type Database } from '../storage/database.svelte'
-import { getV2PluginAPIs, pluginCompatibility, pluginStorageStore } from './plugins.svelte'
+import { getV2PluginAPIs, pluginCompatibility, pluginStorageStore, pluginV2 } from './plugins.svelte'
 
 afterEach(() => {
     pluginCompatibility.initialize('scalable-v3')
@@ -19,6 +19,24 @@ afterEach(() => {
 })
 
 describe('live V2 plugin storage synchronization', () => {
+    it.each(['display', 'input', 'output', 'process'] as const)(
+        'registers and removes both spellings of the %s script mode',
+        (mode) => {
+            const api = getV2PluginAPIs()
+            const handler = vi.fn((text: string) => text)
+            const key = `edit${mode}` as const
+            api.addRisuScriptHandler(key, handler)
+            expect(pluginV2[key].has(handler)).toBe(true)
+            api.removeRisuScriptHandler(mode, handler)
+            expect(pluginV2[key].has(handler)).toBe(false)
+            api.addRisuScriptHandler(mode, handler)
+            api.removeRisuScriptHandler(key, handler)
+            expect(pluginV2[key].has(handler)).toBe(false)
+            expect(() =>
+                api.addRisuScriptHandler('secret-fixture' as never, handler),
+            ).toThrow('addRisuScriptHandler: mode must be')
+        },
+    )
     it('reads a detached storage value without snapshotting unrelated database fields', () => {
         const unrelated = vi.fn(() => ({ payload: 'unrelated' }))
         const database = {

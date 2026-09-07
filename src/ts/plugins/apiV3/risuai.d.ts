@@ -261,7 +261,8 @@ type IconType = 'html' | 'img' | 'none';
 /**
  * Script handler mode
  */
-type ScriptMode = 'display' | 'output' | 'input' | 'process';
+type ScriptMode = 'display' | 'output' | 'input' | 'process'
+    | 'editdisplay' | 'editoutput' | 'editinput' | 'editprocess';
 
 /**
  * Replacer type

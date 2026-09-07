@@ -98,10 +98,13 @@ export function shouldProjectScalableWorkingSet(
     )
 }
 
-export function createAwaitablePluginLoaderSource(body: string): string {
+export function createAwaitablePluginLoaderSource(
+    body: string,
+    sourceLabel?: string,
+): string {
     return `return (async () => {
 ${body}
-})();`
+})();${sourceLabel === undefined ? '' : `\n//# sourceURL=risu-plugin-v2/${encodeURIComponent(sourceLabel)}.js`}`
 }
 
 export async function runAwaitablePluginLoader(source: string): Promise<void> {

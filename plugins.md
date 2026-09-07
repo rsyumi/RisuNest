@@ -874,6 +874,8 @@ Risuai.addRisuScriptHandler('input', async (content) => {
 Risuai.removeRisuScriptHandler('display', handlerFunction);
 ```
 
+Script modes are `display`, `output`, `input`, and `process`. The equivalent `editdisplay`, `editoutput`, `editinput`, and `editprocess` spellings are also accepted for registration and removal.
+
 **Available modes:**
 - `'display'` - Modify content before showing to user
 - `'output'` - Modify AI output

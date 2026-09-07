@@ -1,160 +1,126 @@
-import { SourceMapConsumer } from 'source-map';
+import { SourceMapConsumer } from 'source-map'
+import sourceMapWasmUrl from 'source-map/lib/mappings.wasm?url'
 
-// Initialize the source-map library with the wasm file location
+// Use the bundled decoder so native error reports also work offline.
 // @ts-expect-error initialize is a static method but typed as instance method
-SourceMapConsumer.initialize({
-    'lib/mappings.wasm': 'https://cdn.jsdelivr.net/npm/source-map@0.7.4/lib/mappings.wasm'
-});
+SourceMapConsumer.initialize({ 'lib/mappings.wasm': sourceMapWasmUrl })
 
-// Timeout for fetch requests (10 seconds)
-const FETCH_TIMEOUT_MS = 10000;
+const FETCH_TIMEOUT_MS = 10_000
+const FAILURE_TTL_MS = 60_000
+const MAX_CACHED_MAPS = 4
+interface CachedMap {
+    promise: Promise<SourceMapConsumer | null>
+    users: number
+    failedAt?: number
+}
+const maps = new Map<string, CachedMap>()
+
+function discardMap(url: string, entry: CachedMap): void {
+    maps.delete(url)
+    void entry.promise.then((consumer) => consumer?.destroy())
+}
+
+function trimMaps(): void {
+    for (const [url, entry] of maps) {
+        if (maps.size <= MAX_CACHED_MAPS) break
+        if (entry.users === 0) discardMap(url, entry)
+    }
+}
+
+function acquireMap(url: string): CachedMap {
+    let entry = maps.get(url)
+    if (
+        entry?.failedAt !== undefined &&
+        entry.users === 0 &&
+        Date.now() - entry.failedAt >= FAILURE_TTL_MS
+    ) {
+        discardMap(url, entry)
+        entry = undefined
+    }
+    if (!entry) {
+        const created: CachedMap = { promise: Promise.resolve(null), users: 0 }
+        created.promise = (async () => {
+            const controller = new AbortController()
+            const timeout = setTimeout(
+                () => controller.abort(),
+                FETCH_TIMEOUT_MS,
+            )
+            try {
+                const response = await fetch(url, {
+                    method: 'GET',
+                    signal: controller.signal,
+                })
+                if (!response.ok) throw new Error('Sourcemap unavailable')
+                return await new SourceMapConsumer(await response.json())
+            } catch {
+                created.failedAt = Date.now()
+                return null
+            } finally {
+                clearTimeout(timeout)
+            }
+        })()
+        entry = created
+    }
+    entry.users += 1
+    maps.delete(url)
+    maps.set(url, entry)
+    trimMaps()
+    return entry
+}
 
 export interface StackTraceTranslationResult {
-    stackTrace: string;
-    didTranslate: boolean;
+    stackTrace: string
+    didTranslate: boolean
 }
 
-export async function translateStackTrace(stackTrace: string): Promise<StackTraceTranslationResult> {
-    if (!stackTrace) {
-        return {
-            stackTrace: '',
-            didTranslate: false
-        };
+export async function translateStackTrace(
+    stackTrace: string,
+): Promise<StackTraceTranslationResult> {
+    if (!stackTrace) return { stackTrace: '', didTranslate: false }
+    const lines = stackTrace.split('\n')
+    const linePattern = /(http[s]?:\/\/[^\s)]+\.js):(\d+):(\d+)/
+    const leases = new Map<string, CachedMap>()
+    for (const line of lines) {
+        const match = line.match(linePattern)
+        if (match && !leases.has(match[1]))
+            leases.set(match[1], acquireMap(match[1] + '.map'))
     }
-
-    const stackLines = stackTrace.split('\n');
-    const newStackLines: string[] = [];
-    
-    // Cache for SourceMapConsumer instances to avoid fetching/parsing the same map file multiple times
-    const consumerCache = new Map<string, SourceMapConsumer>();
-    // Track failed URLs to avoid duplicate warnings and repeated fetch attempts
-    const failedUrls = new Map<string, string>(); // url -> error message
-
-    // Step 1: Collect all unique mapUrls from stack trace
-    const urlsToFetch = new Set<string>();
-    const linePattern = /(http[s]?:\/\/[^\s)]+\.js):(\d+):(\d+)/;
-    
-    for (const line of stackLines) {
-        const match = line.match(linePattern);
-        if (match) {
-            const mapUrl = match[1] + '.map';
-            urlsToFetch.add(mapUrl);
-        }
-    }
-
-    if (urlsToFetch.size === 0) {
-        return {
-            stackTrace,
-            didTranslate: false
-        };
-    }
-
-    // Step 2: Fetch all sourcemaps in parallel
-    await Promise.all(
-        Array.from(urlsToFetch).map(async (mapUrl) => {
+    try {
+        const consumers = new Map(
+            await Promise.all(
+                [...leases].map(
+                    async ([url, entry]) => [url, await entry.promise] as const,
+                ),
+            ),
+        )
+        let translated = false
+        const result = lines.map((line) => {
+            const match = line.match(linePattern)
+            if (!match) return line
+            const consumer = consumers.get(match[1])
+            if (!consumer) return line
             try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-                
-                try {
-                    const mapRes = await fetch(mapUrl, { 
-                        method: 'GET',
-                        signal: controller.signal
-                    });
-                    
-                    clearTimeout(timeoutId);
-                    
-                    if (mapRes.ok) {
-                        try {
-                            const mapContent = await mapRes.json();
-                            const consumer = await new SourceMapConsumer(mapContent);
-                            consumerCache.set(mapUrl, consumer);
-                        } catch (parseError) {
-                            const errorMsg = `Failed to parse sourcemap: ${getFileName(mapUrl)}`;
-                            failedUrls.set(mapUrl, errorMsg);
-                            console.error(errorMsg, parseError);
-                        }
-                    } else {
-                        const errorMsg = `Sourcemap not found: ${getFileName(mapUrl)} (${mapRes.status} ${mapRes.statusText})`;
-                        failedUrls.set(mapUrl, errorMsg);
-                        console.error(errorMsg);
-                    }
-                } catch (fetchError) {
-                    clearTimeout(timeoutId);
-                    
-                    if (fetchError instanceof Error && fetchError.name === 'AbortError') {
-                        const errorMsg = `Sourcemap fetch timed out: ${getFileName(mapUrl)}`;
-                        failedUrls.set(mapUrl, errorMsg);
-                        console.error(errorMsg);
-                    } else {
-                        const errorMsg = `Failed to fetch sourcemap: ${getFileName(mapUrl)}`;
-                        failedUrls.set(mapUrl, errorMsg);
-                        console.error(errorMsg, fetchError);
-                    }
-                }
-            } catch (e) {
-                const errorMsg = `Failed to fetch sourcemap: ${getFileName(mapUrl)}`;
-                failedUrls.set(mapUrl, errorMsg);
-                console.error(errorMsg, e);
+                const position = consumer.originalPositionFor({
+                    line: Number(match[2]),
+                    // Browser stacks count columns from one; source maps count from zero.
+                    column: Math.max(0, Number(match[3]) - 1),
+                })
+                if (!position.source) return line
+                translated = true
+                const location = `${position.source}:${position.line}:${position.column}`
+                return position.name
+                    ? `    at ${position.name} (${location})`
+                    : `    at ${location}`
+            } catch {
+                return line
             }
         })
-    );
-
-    // Step 3: Process all stack lines in parallel while maintaining order
-    let translatedFrameCount = 0;
-    try {
-        const processedLines = await Promise.all(
-            stackLines.map((line) => {
-                const match = line.match(linePattern);
-                if (match) {
-                    const [, url, lineNumber, columnNumber] = match;
-                    const mapUrl = url + '.map';
-                    
-                    const consumer = consumerCache.get(mapUrl);
-                    if (consumer) {
-                        const originalPosition = consumer.originalPositionFor({
-                            line: parseInt(lineNumber),
-                            column: parseInt(columnNumber)
-                        });
-                        if (originalPosition.source) {
-                            translatedFrameCount += 1;
-                            if (originalPosition.name) {
-                                return `    at ${originalPosition.name} (${originalPosition.source}:${originalPosition.line}:${originalPosition.column})`;
-                            }
-                            return `    at ${originalPosition.source}:${originalPosition.line}:${originalPosition.column}`;
-                        }
-                    }
-                }
-                return line;
-            })
-        );
-        newStackLines.push(...processedLines);
-    } finally {
-        // Clean up all cached consumers
-        for (const consumer of consumerCache.values()) {
-            consumer.destroy();
-        }
-    }
-
-    if (translatedFrameCount === 0) {
         return {
-            stackTrace,
-            didTranslate: false
-        };
-    }
-
-    return {
-        stackTrace: newStackLines.join('\n'),
-        didTranslate: true
-    };
-}
-
-// Helper function to extract filename from URL for cleaner error messages
-function getFileName(url: string): string {
-    try {
-        const urlObj = new URL(url);
-        return urlObj.pathname.split('/').pop() || url;
-    } catch {
-        return url;
+            stackTrace: translated ? result.join('\n') : stackTrace,
+            didTranslate: translated,
+        }
+    } finally {
+        for (const entry of leases.values()) entry.users -= 1
+        trimMaps()
     }
 }

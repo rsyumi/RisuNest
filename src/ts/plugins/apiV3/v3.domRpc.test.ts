@@ -264,6 +264,59 @@ function __postToParent(message) {
         vi.restoreAllMocks()
     })
 
+    it('returns method-specific icon errors through the real bridge without argument contents', async () => {
+        await startFixture('icon-errors-fixture')
+        const errors = JSON.parse(
+            String(
+                await guest(
+                    'icon-errors-fixture',
+                    `
+            const errors = [];
+            for (const call of [
+                () => risuai.registerSetting('fixture', () => {}, '', 'secret-fixture'),
+                () => risuai.registerButton({ name: 'fixture', icon: '', iconType: 'secret-fixture' }, () => {}),
+                () => risuai.registerButton(null, () => {}),
+            ]) {
+                try { await call(); } catch (error) { errors.push(error.message); }
+            }
+            return JSON.stringify(errors);
+        `,
+                ),
+            ),
+        ) as string[]
+        expect(errors[0]).toMatch(/^\[Plugin API: registerSetting\]/)
+        expect(errors[0]).toContain(
+            "registerSetting: fourth argument iconType must be 'html', 'img' or 'none'",
+        )
+        expect(errors[1]).toContain(
+            "registerButton: options.iconType must be 'html', 'img' or 'none'",
+        )
+        expect(errors[2]).toContain(
+            'registerButton: first argument must be an options object',
+        )
+        expect(errors.join()).not.toContain('secret-fixture')
+    })
+
+    it('identifies the originating plugin in uncaught guest code stacks', async () => {
+        await startFixture(
+            'stack-fixture',
+            `
+            globalThis.rpcReady = Promise.resolve();
+            globalThis.throwFixture = () => { throw new TypeError('synthetic failure'); };
+        `,
+        )
+        const stack = String(
+            await guest(
+                'stack-fixture',
+                `
+            try { globalThis.throwFixture(); } catch (error) { return error.stack; }
+        `,
+            ),
+        )
+        expect(stack).toContain('risu-plugin-v3/stack-fixture.js')
+        expect(stack).toContain('TypeError: synthetic failure')
+    })
+
     it('does not reuse a provider permission decision for mainDom', async () => {
         await startFixture()
 

@@ -659,6 +659,32 @@ export function applyPreparedPluginDatabaseUpdate(
     else setDatabase(db)
 }
 
+type PluginScriptMode = 'display' | 'output' | 'input' | 'process' | ScriptMode
+
+function resolvePluginScriptMode(
+    name: PluginScriptMode,
+    method: string,
+): ScriptMode {
+    switch (name) {
+        case 'display':
+        case 'editdisplay':
+            return 'editdisplay'
+        case 'output':
+        case 'editoutput':
+            return 'editoutput'
+        case 'input':
+        case 'editinput':
+            return 'editinput'
+        case 'process':
+        case 'editprocess':
+            return 'editprocess'
+        default:
+            throw new Error(
+                `${method}: mode must be 'display', 'output', 'input' or 'process' (the 'edit' prefix is also accepted)`,
+            )
+    }
+}
+
 export const getV2PluginAPIs = () => {
     return {
         risuFetch: globalFetch,
@@ -688,21 +714,11 @@ export const getV2PluginAPIs = () => {
             pluginV2.providerOptions.set(name, options ?? {})
             customProviderStore.set(provs)
         },
-        addRisuScriptHandler: (name: ScriptMode, func: EditFunction) => {
-            if (pluginV2['edit' + name]) {
-                pluginV2['edit' + name].add(func)
-            }
-            else {
-                throw (`script handler named ${name} not found`)
-            }
+        addRisuScriptHandler: (name: PluginScriptMode, func: EditFunction) => {
+            pluginV2[resolvePluginScriptMode(name, 'addRisuScriptHandler')].add(func)
         },
-        removeRisuScriptHandler: (name: ScriptMode, func: EditFunction) => {
-            if (pluginV2['edit' + name]) {
-                pluginV2['edit' + name].delete(func)
-            }
-            else {
-                throw (`script handler named ${name} not found`)
-            }
+        removeRisuScriptHandler: (name: PluginScriptMode, func: EditFunction) => {
+            pluginV2[resolvePluginScriptMode(name, 'removeRisuScriptHandler')].delete(func)
         },
         addRisuReplacer: (name: string, func: ReplacerFunction) => {
             if (pluginV2['replacer' + name]) {
@@ -1098,7 +1114,7 @@ export async function loadV2Plugin(
                         ` : ''}
 
                         ${data}
-                    `)
+                    `, plugin.name)
                 }
             });
 

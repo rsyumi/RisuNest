@@ -1163,7 +1163,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             id?:string
         ) => {
             if(iconType !== 'html' && iconType !== 'img' && iconType !== 'none'){
-                throw new Error("iconType must be 'html', 'img' or 'none'");
+                throw new Error("registerSetting: fourth argument iconType must be 'html', 'img' or 'none'");
             }
             if(typeof name !== 'string' || name.trim() === ''){
                 throw new Error("name must be a non-empty string");
@@ -1229,10 +1229,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             },
             callback: () => void
         ) => {
+            if (!arg || typeof arg !== 'object' || Array.isArray(arg)) {
+                throw new Error('registerButton: first argument must be an options object');
+            }
             let { name, icon, iconType, location, id: providedId } = arg;
             location = location || 'action';
             if(iconType !== 'html' && iconType !== 'img' && iconType !== 'none'){
-                throw new Error("iconType must be 'html', 'img' or 'none'");
+                throw new Error("registerButton: options.iconType must be 'html', 'img' or 'none'");
             }
             if(typeof name !== 'string' || name.trim() === ''){
                 throw new Error("name must be a non-empty string");
@@ -1661,7 +1664,7 @@ export async function executePluginV3(plugin:RisuPlugin){
         name: plugin.name,
         host
     });
-    host.run(iframe, plugin.script);
+    host.run(iframe, plugin.script, plugin.name);
     console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
 }
 
