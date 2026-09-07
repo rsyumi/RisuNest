@@ -188,14 +188,14 @@ beforeEach(() => {
 describe('setInlayAsset', () => {
     test('normalizes absent and malformed configured options at the encoding boundary', () => {
         expect(getInlayEncodeOptions()).toEqual({
-            format: 'webp', quality: 85, maxDimension: 0, skipReencode: false,
+            format: 'webp', quality: 85, maxDimension: 0, skipReencode: true,
         })
         vi.mocked(getDatabase).mockReturnValue({
             risunestInlayFormat: 'invalid', risunestInlayWebpQuality: 140.6,
             risunestInlayMaxDimension: -4.4, risunestInlaySkipReencode: 'yes',
         } as any)
         expect(getInlayEncodeOptions()).toEqual({
-            format: 'webp', quality: 100, maxDimension: 0, skipReencode: false,
+            format: 'webp', quality: 100, maxDimension: 0, skipReencode: true,
         })
     })
 

@@ -12,7 +12,7 @@ export interface InlayEncodeOptions {
 export const MAX_INLAY_DIMENSION = 0xffff_ffff
 
 export const defaultInlayEncodeOptions: InlayEncodeOptions = {
-    format: 'webp', quality: 85, maxDimension: 0, skipReencode: false,
+    format: 'webp', quality: 85, maxDimension: 0, skipReencode: true,
 }
 
 export function normalizeInlayEncodeOptions(
@@ -27,7 +27,8 @@ export function normalizeInlayEncodeOptions(
     const maxDimension = Math.min(MAX_INLAY_DIMENSION, Math.max(0, Math.round(
         Number.isFinite(input?.maxDimension) ? input!.maxDimension! : defaultInlayEncodeOptions.maxDimension,
     )))
-    return { format, quality, maxDimension, skipReencode: input?.skipReencode === true }
+    const skipReencode = typeof input?.skipReencode === 'boolean' ? input.skipReencode : defaultInlayEncodeOptions.skipReencode
+    return { format, quality, maxDimension, skipReencode }
 }
 
 export interface AssetBlobMetadata {

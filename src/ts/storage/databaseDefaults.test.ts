@@ -31,7 +31,7 @@ describe('RisuNest inlay database defaults', () => {
         expect(database.risunestInlayFormat).toBe('webp')
         expect(database.risunestInlayWebpQuality).toBe(85)
         expect(database.risunestInlayMaxDimension).toBe(0)
-        expect(database.risunestInlaySkipReencode).toBe(false)
+        expect(database.risunestInlaySkipReencode).toBe(true)
     })
 
     it('clamps and integer-normalizes persisted inlay numbers', () => {
