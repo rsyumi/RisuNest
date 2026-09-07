@@ -1075,6 +1075,138 @@ describe('sendChat generation session integration', () => {
         expect(session.pinCount('transaction')).toBe(0)
     })
 
+    it.each([
+        { continuing: false, rejects: false },
+        { continuing: true, rejects: false },
+        { continuing: false, rejects: true },
+        { continuing: true, rejects: true },
+    ])(
+        'does not apply non-streamed output after cancellation (continue=$continuing, rejects=$rejects)',
+        async ({ continuing, rejects }) => {
+            const initialChat = continuing
+                ? makeChat([
+                      {
+                          role: 'char',
+                          data: 'existing',
+                          chatId: 'existing-output',
+                      },
+                  ])
+                : makeChat()
+            const { chat, session } = installDatabase(initialChat)
+            DBState.db.ttsAutoSpeech = true
+            const controller = new AbortController()
+            const enteredOutput = deferred<void>()
+            const finishOutput = deferred<void>()
+            mocks.modelResponse = { type: 'success', result: ' late' }
+            mocks.processScriptFull.mockImplementation(async (_char, data, mode) => {
+                if (mode === 'editoutput') {
+                    enteredOutput.resolve()
+                    await finishOutput.promise
+                    if (rejects) throw controller.signal.reason
+                }
+                return { data, emoChanged: false }
+            })
+            const sending = sendChat(-1, { continue: continuing, signal: controller.signal })
+            await enteredOutput.promise
+            expect(
+                mocks.processScriptFull.mock.calls.find((call) => call[2] === 'editoutput')?.[5]
+                    ?.signal,
+            ).toBe(controller.signal)
+            controller.abort()
+            finishOutput.resolve()
+
+            await expect(sending).resolves.toBe(false)
+            expect(chat.message.map((message) => message.data)).toEqual([
+                continuing ? 'existing' : 'hello',
+            ])
+            expect(mocks.events).not.toContain('output-trigger')
+            expect(mocks.sayTTS).not.toHaveBeenCalled()
+            expect(session.pinCount('transaction')).toBe(0)
+        },
+    )
+
+    it.each(['streaming', 'success'] as const)(
+        'retains committed output when cancelled during %s inlay work',
+        async (responseType) => {
+            const { session } = installDatabase()
+            DBState.db.ttsAutoSpeech = true
+            const controller = new AbortController()
+            const enteredInlay = deferred<void>()
+            const finishInlay = deferred<string>()
+            mocks.modelResponse =
+                responseType === 'streaming'
+                    ? streamingResponse('answer')
+                    : { type: 'success', result: 'answer' }
+            mocks.outputTrigger = (currentChat) => ({ chat: currentChat })
+            mocks.inlay = (data) => {
+                enteredInlay.resolve()
+                return { text: data, promise: finishInlay.promise }
+            }
+            const sending = sendChat(-1, { signal: controller.signal })
+            await enteredInlay.promise
+            controller.abort()
+            finishInlay.resolve('late inlay')
+
+            await expect(sending).resolves.toBe(false)
+            expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe('answer')
+            expect(mocks.sayTTS).not.toHaveBeenCalled()
+            expect(session.pinCount('transaction')).toBe(0)
+        },
+    )
+
+    it.each(['streaming', 'success'] as const)(
+        'discards a pending %s output trigger result after cancellation',
+        async (responseType) => {
+            const { session } = installDatabase()
+            const controller = new AbortController()
+            const enteredTrigger = deferred<void>()
+            const finishTrigger = deferred<void>()
+            mocks.modelResponse =
+                responseType === 'streaming'
+                    ? streamingResponse('answer')
+                    : { type: 'success', result: 'answer' }
+            mocks.outputTrigger = async (chat) => {
+                enteredTrigger.resolve()
+                await finishTrigger.promise
+                chat.message.at(-1).data = 'late trigger'
+                return { chat }
+            }
+            const listener = vi.fn()
+            mocks.listeners.add(listener)
+            const sending = sendChat(-1, { signal: controller.signal })
+            await enteredTrigger.promise
+            controller.abort()
+            finishTrigger.resolve()
+
+            await expect(sending).resolves.toBe(false)
+            expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe('answer')
+            expect(listener).not.toHaveBeenCalled()
+            expect(session.pinCount('transaction')).toBe(0)
+        },
+    )
+
+    it('does not start another output listener after cancellation during a pending listener', async () => {
+        const { session } = installDatabase()
+        const controller = new AbortController()
+        const enteredListener = deferred<void>()
+        const finishListener = deferred<void>()
+        mocks.listeners.add(async () => {
+            enteredListener.resolve()
+            await finishListener.promise
+        })
+        const nextListener = vi.fn()
+        mocks.listeners.add(nextListener)
+        const sending = sendChat(-1, { signal: controller.signal })
+        await enteredListener.promise
+        controller.abort()
+        finishListener.resolve()
+
+        await expect(sending).resolves.toBe(false)
+        expect(nextListener).not.toHaveBeenCalled()
+        expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe('answer')
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
     it('continues the captured message without appending and disposes its operation pin', async () => {
         const chat = makeChat([{
             role: 'char',

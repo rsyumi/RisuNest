@@ -440,12 +440,14 @@ export function createPromptScriptOperationScope(
 }
 
 export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
+    options.signal?.throwIfAborted()
     const captureContext = options.captureContext
     const promptOperationScope = captureContext ? undefined : options.promptOperationScope
     let db = captureContext?.parserContext.database ?? promptOperationScope?.database ?? getDatabase()
     let emoChanged = false
     if (!captureContext) {
         data = await runLuaEditTrigger(char, mode, data, { index:chatID })
+        options.signal?.throwIfAborted()
     }
 
     if(mode === 'editdisplay' && !captureContext){
@@ -467,6 +469,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
             }
         }
     }
+    options.signal?.throwIfAborted()
 
     const conversationOwner = captureContext
         ? null
@@ -481,6 +484,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         try {
             for(const plugin of pluginV2[mode]){
                 const res = await plugin(data)
+                options.signal?.throwIfAborted()
                 if(res !== null && res !== undefined){
                     data = res
                 }
@@ -577,6 +581,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         })
     let conversationOperationCommitted = false
     const finish = <T>(result: T): T => {
+        options.signal?.throwIfAborted()
         if (conversationOperation && ownsConversationOperation) {
             conversationOperation.commit(peekActiveConversationSession())
             conversationOperationCommitted = true
@@ -782,6 +787,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         let result: RegexExecutionResult | undefined
         try {
             result = await tryExecuteNativeRegexBatch(plan, data, { signal: options.signal })
+            options.signal?.throwIfAborted()
         } catch (error) {
             if(options.signal?.aborted){
                 throw error
@@ -791,6 +797,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         if(result === undefined){
             try {
                 result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
+                options.signal?.throwIfAborted()
             } catch (error) {
                 // A pathological ruleset must not be retried on the UI thread, and a cancelled
                 // generation must stay cancelled. Anything else means the Worker is unusable here.
@@ -833,6 +840,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
 
         const processer = new HypaProcesser()
         await processer.addText(assetNames)
+        options.signal?.throwIfAborted()
         const matches = data.matchAll(assetRegex)
 
         for(const match of matches){
@@ -845,6 +853,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                 }
                 else if(!assetNames.includes(assetName)){
                     const searched = await processer.similaritySearch(assetName)
+                    options.signal?.throwIfAborted()
                     const bestMatch = searched[0]
                     if(bestMatch){
                         data = data.replaceAll(match[0], `{{${type}::${bestMatch}}}`)
@@ -862,11 +871,14 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
     return finish({data, emoChanged})
     } catch (error) {
         try {
-            if (ownsConversationOperation && conversationOperation?.hasPendingMutations()) {
+            if (
+                !options.signal?.aborted &&
+                ownsConversationOperation &&
+                conversationOperation?.hasPendingMutations()
+            ) {
                 conversationOperation.commit(peekActiveConversationSession())
                 conversationOperationCommitted = true
-            }
-            else if (conversationAccess === 'read-only' && conversationOwner) {
+            } else if (conversationAccess === 'read-only' && conversationOwner) {
                 requireScriptConversationOwner(conversationOwner)
             }
         } catch (cleanupError) {

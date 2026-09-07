@@ -233,4 +233,108 @@ describe('plugin chat output listeners', () => {
         expect(snapshotCall).toHaveBeenCalledTimes(2)
         expect(listener).toHaveBeenCalledOnce()
     })
+
+    it('does no event work when already aborted', async () => {
+        const { listeners, provenance } = registry()
+        const listener = vi.fn()
+        registerChatOutputListener(listeners, provenance, listener, 'v3-legacy')
+        const controller = new AbortController()
+        controller.abort()
+        const snapshotSpy = vi.fn()
+        const snapshot = <T>(value: T): T => {
+            snapshotSpy(value)
+            return structuredClone(value)
+        }
+        const projectScalable = vi.fn()
+
+        await dispatchChatOutputListeners({
+            listeners,
+            provenance,
+            profile: 'maximum-compatibility',
+            char: liveChar,
+            chat: liveChat,
+            characterIndex: 0,
+            chatIndex: 0,
+            messageIndex: 1,
+            snapshot,
+            projectScalable,
+            onError: vi.fn(),
+            signal: controller.signal,
+        })
+
+        expect(snapshotSpy).not.toHaveBeenCalled()
+        expect(projectScalable).not.toHaveBeenCalled()
+        expect(listener).not.toHaveBeenCalled()
+    })
+
+    it('does not launch a listener when aborted during scalable projection', async () => {
+        const { listeners, provenance } = registry()
+        const listener = vi.fn()
+        registerChatOutputListener(listeners, provenance, listener, 'v3-legacy')
+        const controller = new AbortController()
+        let resolveProjection!: (value: { char: PluginCompleteCharacter; chat: Chat }) => void
+        const projection = new Promise<{
+            char: PluginCompleteCharacter
+            chat: Chat
+        }>((resolve) => {
+            resolveProjection = resolve
+        })
+        const projectScalable = vi.fn(() => projection)
+
+        const dispatching = dispatchChatOutputListeners({
+            listeners,
+            provenance,
+            profile: 'scalable-v3',
+            char: liveChar,
+            chat: liveChat,
+            characterIndex: 0,
+            chatIndex: 0,
+            messageIndex: 1,
+            snapshot: structuredClone,
+            projectScalable,
+            onError: vi.fn(),
+            signal: controller.signal,
+        })
+        await vi.waitFor(() => expect(projectScalable).toHaveBeenCalledOnce())
+        controller.abort()
+        resolveProjection({ char: exactChar, chat: exactChat })
+        await dispatching
+
+        expect(listener).not.toHaveBeenCalled()
+    })
+
+    it('does not launch later listeners after aborting a pending listener', async () => {
+        const { listeners, provenance } = registry()
+        const started = deferred()
+        const finish = deferred()
+        const first = async () => {
+            started.resolve()
+            await finish.promise
+        }
+        const second = vi.fn()
+        registerChatOutputListener(listeners, provenance, first, 'v3-legacy')
+        registerChatOutputListener(listeners, provenance, second, 'v3-legacy')
+        const controller = new AbortController()
+
+        const dispatching = dispatchChatOutputListeners({
+            listeners,
+            provenance,
+            profile: 'maximum-compatibility',
+            char: liveChar,
+            chat: liveChat,
+            characterIndex: 0,
+            chatIndex: 0,
+            messageIndex: 1,
+            snapshot: structuredClone,
+            projectScalable: vi.fn(),
+            onError: vi.fn(),
+            signal: controller.signal,
+        })
+        await started.promise
+        controller.abort()
+        finish.resolve()
+        await dispatching
+
+        expect(second).not.toHaveBeenCalled()
+    })
 })

@@ -30,6 +30,7 @@ export interface ChatOutputDispatchInput {
     snapshot<T>(value: T): T
     projectScalable: PluginChatOutputProjector
     onError(error: unknown): void
+    signal?: AbortSignal
 }
 
 export function registerChatOutputListener(
@@ -54,6 +55,7 @@ export function removeChatOutputListener(
 export async function dispatchChatOutputListeners(
     input: ChatOutputDispatchInput,
 ): Promise<void> {
+    if (input.signal?.aborted) return
     if (input.listeners.size === 0) return
     const captured = [...input.listeners]
     const needsProjection = input.profile === 'scalable-v3' && captured.some(
@@ -72,6 +74,7 @@ export async function dispatchChatOutputListeners(
                 liveConversation: input.chat,
             })
         } catch (error) {
+            if (input.signal?.aborted) return
             // All listeners of one output event share a single consistent
             // event object, so a projection failure skips the whole event,
             // including live-profile listeners that would not have needed
@@ -87,6 +90,7 @@ export async function dispatchChatOutputListeners(
     }
 
     for (const listener of captured) {
+        if (input.signal?.aborted) return
         if (!input.listeners.has(listener)) continue
         try {
             await listener({

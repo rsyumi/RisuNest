@@ -94,7 +94,7 @@ const projectPluginChatOutput = createProductionPluginChatOutputProjector(
     <T>(value: T) => $state.snapshot(value) as T,
 )
 
-export async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
+export async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number, signal?: AbortSignal){
     if(pluginV2.chatOutput.size === 0){
         return
     }
@@ -107,6 +107,7 @@ export async function runChatOutputListeners(char: any, chat: any, characterInde
         characterIndex,
         chatIndex,
         messageIndex,
+        signal,
         snapshot: <T>(value: T) => $state.snapshot(value) as T,
         projectScalable: projectPluginChatOutput,
         onError: (error) => console.error(error),
@@ -1858,6 +1859,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                 selectedChar,
                 selectedChat,
                 messageIndex,
+                abortSignal,
             ),
             speak: (data) => sayTTS(currentChar, data),
             addRerolls,

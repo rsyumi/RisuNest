@@ -79,6 +79,8 @@ export interface GenerationResponseApplication {
 export async function applyGenerationResponse(
     options: ApplyGenerationResponseOptions,
 ): Promise<GenerationResponseApplication | null> {
+    const isOwnerCurrent = () => !options.abortSignal.aborted
+        && options.operation.isOwnerCurrent()
     let outputTarget: GenerationConversationOperation | null = null
     let generationHadOperation = false
     const generationChat = options.operation.getTargetChat()
@@ -90,7 +92,7 @@ export async function applyGenerationResponse(
             getCurrentSession: options.operation.getCurrentSession,
             chat: generationChat,
             getCurrentChat: options.operation.getTargetChat,
-            isOwnerCurrent: options.operation.isOwnerCurrent,
+            isOwnerCurrent,
         })
         : null
     const getOutputTarget = () => outputTarget ?? legacyFallbackTarget
@@ -131,7 +133,7 @@ export async function applyGenerationResponse(
                 getCurrentSession: options.operation.getCurrentSession,
                 chat: targetChat,
                 getCurrentChat: options.operation.getTargetChat,
-                isOwnerCurrent: options.operation.isOwnerCurrent,
+                isOwnerCurrent,
                 ...(options.continueGeneration ? { continueLast: true } : {
                     append: {
                         role: 'char',
@@ -245,14 +247,14 @@ export async function applyGenerationResponse(
             if (currentChat !== previousChat) options.operation.invalidateSession()
             options.operation.publishTargetChat(currentChat)
             const publishedChat = options.operation.getTargetChat()
-            if (!publishedChat || !options.operation.isOwnerCurrent()) return null
+            if (!publishedChat || !isOwnerCurrent()) return null
             currentChat = publishedChat
             outputTarget = recaptureGenerationConversationOperation({
                 session: options.operation.getCurrentSession(),
                 getCurrentSession: options.operation.getCurrentSession,
                 chat: currentChat,
                 getCurrentChat: options.operation.getTargetChat,
-                isOwnerCurrent: options.operation.isOwnerCurrent,
+                isOwnerCurrent,
                 messageId: outputMessageId,
             })
             if (!outputTarget || !outputTarget.isOwned()) return null
@@ -285,7 +287,7 @@ export async function applyGenerationResponse(
                 const message = messages[index]
                 const messageText = message[1]
                 const operationChat = options.operation.getTargetChat()
-                if (!operationChat || !options.operation.isOwnerCurrent()) return null
+                if (!operationChat || !isOwnerCurrent()) return null
                 let messageIndex = operationChat.message.length
                 const continuingFirstMessage = index === 0 && options.continueGeneration
                 let continueBaseData = ''
@@ -295,7 +297,7 @@ export async function applyGenerationResponse(
                         getCurrentSession: options.operation.getCurrentSession,
                         chat: operationChat,
                         getCurrentChat: options.operation.getTargetChat,
-                        isOwnerCurrent: options.operation.isOwnerCurrent,
+                        isOwnerCurrent,
                         continueLast: true,
                     })
                     generationHadOperation = true
@@ -308,15 +310,20 @@ export async function applyGenerationResponse(
                     processed = await options.callbacks.processOutput(
                         messageText,
                         messageIndex,
+                        { cache: 'normal', signal: options.abortSignal, regexWorker: true },
                     )
+                    if (!isOwnerCurrent()) return null
                     if (continuingFirstMessage) {
                         messageIndex = outputTarget!.absoluteIndex
                         processed = await options.callbacks.processOutput(
                             continueBaseData + messageText,
                             messageIndex,
+                            { cache: 'normal', signal: options.abortSignal, regexWorker: true },
                         )
+                        if (!isOwnerCurrent()) return null
                     }
                 } catch (error) {
+                    if (options.abortSignal.aborted) return null
                     const fallbackData = options.callbacks.reformatContent(
                         continueBaseData + messageText,
                     )
@@ -336,14 +343,14 @@ export async function applyGenerationResponse(
                         } else if (
                             index === 0
                             && options.operation.getTargetChat() === operationChat
-                            && options.operation.isOwnerCurrent()
+                            && isOwnerCurrent()
                         ) {
                             outputTarget = captureGenerationConversationOperation({
                                 session: options.operation.getCurrentSession(),
                                 getCurrentSession: options.operation.getCurrentSession,
                                 chat: operationChat,
                                 getCurrentChat: options.operation.getTargetChat,
-                                isOwnerCurrent: options.operation.isOwnerCurrent,
+                                isOwnerCurrent,
                                 append: {
                                     role: message[0],
                                     data: fallbackData,
@@ -395,14 +402,14 @@ export async function applyGenerationResponse(
                 } else if (index === 0) {
                     if (
                         options.operation.getTargetChat() !== operationChat
-                        || !options.operation.isOwnerCurrent()
+                        || !isOwnerCurrent()
                     ) return null
                     outputTarget = captureGenerationConversationOperation({
                         session: options.operation.getCurrentSession(),
                         getCurrentSession: options.operation.getCurrentSession,
                         chat: operationChat,
                         getCurrentChat: options.operation.getTargetChat,
-                        isOwnerCurrent: options.operation.isOwnerCurrent,
+                        isOwnerCurrent,
                         append: {
                             role: message[0],
                             data: result,
@@ -434,7 +441,7 @@ export async function applyGenerationResponse(
             }
 
             const outputChat = options.operation.getTargetChat()
-            if (!outputChat || !options.operation.isOwnerCurrent()) return null
+            if (!outputChat || !isOwnerCurrent()) return null
             if (outputTarget && !outputTarget.isOwned()) return null
             let currentChat = options.callbacks.runCurrentChatParser(outputChat)
             options.operation.publishTargetChat(currentChat)
@@ -448,7 +455,7 @@ export async function applyGenerationResponse(
             if (nextChat !== previousChat) options.operation.invalidateSession()
             options.operation.publishTargetChat(nextChat)
             const publishedChat = options.operation.getTargetChat()
-            if (!publishedChat || !options.operation.isOwnerCurrent()) return null
+            if (!publishedChat || !isOwnerCurrent()) return null
             currentChat = publishedChat
             if (generationHadOperation) {
                 if (!outputMessageId) return null
@@ -457,7 +464,7 @@ export async function applyGenerationResponse(
                     getCurrentSession: options.operation.getCurrentSession,
                     chat: currentChat,
                     getCurrentChat: options.operation.getTargetChat,
-                    isOwnerCurrent: options.operation.isOwnerCurrent,
+                    isOwnerCurrent,
                     messageId: outputMessageId,
                 })
                 if (!outputTarget || !outputTarget.isOwned()) return null

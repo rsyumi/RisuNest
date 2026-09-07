@@ -53,6 +53,9 @@ const moduleMocks = vi.hoisted(() => ({
     getModuleAssets: vi.fn(() => []),
     getModuleRegexScripts: vi.fn(() => []),
 }))
+const scriptingsMocks = vi.hoisted(() => ({
+    runLuaEditTrigger: vi.fn(async (_char: unknown, _mode: unknown, data: string) => data),
+}))
 
 vi.mock('svelte/store', () => ({
     get: (store: unknown) => {
@@ -102,9 +105,7 @@ vi.mock('src/ts/process/memory/hypamemory', () => ({
         }
     },
 }))
-vi.mock('src/ts/process/scriptings', () => ({
-    runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => data,
-}))
+vi.mock('src/ts/process/scriptings', () => scriptingsMocks)
 vi.mock('src/ts/plugins/plugins.svelte', () => ({
     pluginV2: mocks.pluginV2,
 }))
@@ -227,6 +228,7 @@ describe('processScriptFull result caching', () => {
         mocks.state.onHypaAddText = null
         mocks.database.dynamicAssets = false
         mocks.database.characters = [] as never[]
+        scriptingsMocks.runLuaEditTrigger.mockClear()
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
     })
 
@@ -489,6 +491,7 @@ describe('history-sensitive regex conversation operations', () => {
         mocks.state.onHypaAddText = null
         mocks.database.dynamicAssets = false
         mocks.database.characters = [] as never[]
+        scriptingsMocks.runLuaEditTrigger.mockClear()
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
     })
 
@@ -722,6 +725,82 @@ describe('history-sensitive regex conversation operations', () => {
         expect(session.version).toBe(1)
     })
 
+    it('stops plugin and history processing when cancellation occurs in a plugin callback', async () => {
+        const chat = {
+            id: 'cancelled-plugin-chat',
+            message: [{ role: 'user', data: 'original', chatId: 'message-0' }],
+        } as Chat
+        const char = makeCharacter([makeScript('input-plugin', '@@inject')])
+        char.chaId = 'cancelled-plugin-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 32,
+        })
+        const controller = new AbortController()
+        let secondPluginCalls = 0
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.pluginV2.editoutput.add(async (data) => {
+            controller.abort()
+            return `${data}-plugin`
+        })
+        mocks.pluginV2.editoutput.add(async (data) => {
+            secondPluginCalls++
+            return data
+        })
+
+        await expect(
+            processScriptFull(
+                char,
+                'input',
+                'editoutput',
+                0,
+                {},
+                {
+                    cache: 'bypass',
+                    regexWorker: false,
+                    signal: controller.signal,
+                },
+            ),
+        ).rejects.toThrow(/abort/i)
+
+        expect(secondPluginCalls).toBe(0)
+        expect(chat.message[0].data).toBe('original')
+        expect(session.version).toBe(0)
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it('does not invoke Lua or plugins for a pre-aborted call', async () => {
+        const character = makeCharacter([])
+        const plugin = vi.fn(async (data: string) => data)
+        const controller = new AbortController()
+        mocks.pluginV2.editoutput.add(plugin)
+        controller.abort()
+
+        await expect(
+            processScriptFull(
+                character,
+                'input',
+                'editoutput',
+                -1,
+                {},
+                {
+                    cache: 'bypass',
+                    regexWorker: false,
+                    signal: controller.signal,
+                },
+            ),
+        ).rejects.toThrow(/abort/i)
+
+        expect(scriptingsMocks.runLuaEditTrigger).not.toHaveBeenCalled()
+        expect(plugin).not.toHaveBeenCalled()
+    })
+
     it('keeps a mutating Plugin v2 prompt scope off the transaction path', async () => {
         const chat = {
             id: 'prompt-plugin-chat',
@@ -890,6 +969,49 @@ describe('history-sensitive regex conversation operations', () => {
 
         expect(chat.message[0].data).toBe('x')
         expect(session.version).toBe(1)
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it('discards a staged inject mutation when later processing is cancelled', async () => {
+        const chat = {
+            id: 'regex-cancelled-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message-0' }],
+        } as Chat
+        const char = makeCharacter([makeScript('x', '@@inject')])
+        char.chaId = 'regex-cancelled-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        char.additionalAssets = [['asset', 'source', '']]
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 33,
+        })
+        const controller = new AbortController()
+        mocks.database.dynamicAssets = true
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.state.onHypaAddText = () => controller.abort()
+
+        await expect(
+            processScriptFull(
+                char,
+                'x',
+                'editoutput',
+                0,
+                {},
+                {
+                    cache: 'bypass',
+                    regexWorker: false,
+                    signal: controller.signal,
+                },
+            ),
+        ).rejects.toThrow(/addText/)
+
+        expect(chat.message[0].data).toBe('before')
+        expect(session.version).toBe(0)
         expect(session.activePinReasons).toEqual([])
     })
 
