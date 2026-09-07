@@ -536,6 +536,9 @@ export const acquireDestructiveReplacementFence = (
     expected: PersistentMutationToken,
 ): Promise<PersistentDestructiveReplacementFence> =>
     getPersistentDataRuntime().acquireDestructiveReplacementFence(expected)
+export const acquireCommittedWorkingSetRefreshFence =
+(): Promise<PersistentDestructiveReplacementFence> =>
+    getPersistentDataRuntime().acquireCommittedWorkingSetRefreshFence()
 export const materializePersistentDatabaseSnapshot = (reason: string): Promise<Database> =>
     getPersistentDataRuntime().materializePersistentDatabaseSnapshot(reason)
 export const materializePersistentDatabaseSnapshotWithRevision = (

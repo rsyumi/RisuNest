@@ -452,6 +452,7 @@ export class SaveCoordinator {
         acceptsPostPublicationDirty: boolean
         queuedPostPublicationDirty: boolean
         blockedPrePublicationDirty: boolean
+        refreshBaseline?: CapturedState
     } | null = null
     private selectedConversationTransitionActive = false
     private persistenceWasBusy = false
@@ -526,6 +527,9 @@ export class SaveCoordinator {
         this.setCharacterBaseline(captured)
         this.dirtyGeneration = 0
         this.pendingByteCount = 0
+        if (this.pendingPublication) {
+            this.pendingPublicationCleanup.add(this.pendingPublication)
+        }
         this.pendingPublication = null
         this.pendingPublicationRevision = null
         this.deferredPublicationRevision = null
@@ -681,7 +685,10 @@ export class SaveCoordinator {
         const fence = this.destructiveReplacementFence
         if (fence?.state === 'held') {
             if (!fence.acceptsPostPublicationDirty) {
-                if (!this.captureMatchesBaseline()) {
+                const matchesFenceBaseline = fence.refreshBaseline
+                    ? this.captureMatchesCapturedState(fence.refreshBaseline)
+                    : this.captureMatchesBaseline()
+                if (!matchesFenceBaseline) {
                     fence.blockedPrePublicationDirty = true
                 }
                 throw new PersistentMutationFencedError()
@@ -778,7 +785,11 @@ export class SaveCoordinator {
 
     flushPendingDataLocally(reason: string): Promise<void> {
         this.assertInitialized()
-        this.assertSelectedConversationTransitionInactive()
+        try {
+            this.assertPersistentMutationAllowed()
+        } catch (error) {
+            return Promise.reject(error)
+        }
         this.cancelDebounce()
         if (this.localFlushPromise) return this.localFlushPromise
         const promise = this.runLocalFlush(reason)
@@ -794,6 +805,7 @@ export class SaveCoordinator {
         while (this.queuedOperationCount > 0 && !this.publicationInProgress) {
             await this.waitForOperationStateChange()
         }
+        this.assertPersistentMutationAllowed()
         if (this.publicationInProgress) {
             const promise = this.flushIterations(reason, false)
             this.localFlushDuringPublicationPromise = promise
@@ -806,7 +818,10 @@ export class SaveCoordinator {
                 }
             }
         }
-        await this.enqueue(() => this.flushIterations(reason, false))
+        await this.enqueue(async () => {
+            this.assertPersistentMutationAllowed()
+            await this.flushIterations(reason, false)
+        })
     }
 
     replacePersistentDatabase(
@@ -1819,6 +1834,40 @@ export class SaveCoordinator {
         })
     }
 
+    /**
+     * Fences projection of an already-committed authoritative revision. It intentionally
+     * preserves dirty state instead of flushing it, and captures that live state after
+     * earlier queued operations drain so only later projection-time edits invalidate it.
+     */
+    acquireCommittedWorkingSetRefreshFence(): Promise<symbol> {
+        this.assertInitialized()
+        if (this.destructiveReplacementFence) throw new PersistentMutationFencedError()
+        const owner = Symbol('committed-working-set-refresh')
+        this.destructiveReplacementFence = {
+            owner,
+            state: 'acquiring',
+            acceptsPostPublicationDirty: false,
+            queuedPostPublicationDirty: false,
+            blockedPrePublicationDirty: false,
+        }
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            try {
+                if (this.destructiveReplacementFence?.owner !== owner) {
+                    throw new Error('Committed working-set refresh fence ownership changed')
+                }
+                this.destructiveReplacementFence.refreshBaseline = this.capture()
+                this.destructiveReplacementFence.state = 'held'
+                return owner
+            } catch (error) {
+                if (this.destructiveReplacementFence?.owner === owner) {
+                    this.destructiveReplacementFence = null
+                }
+                throw error
+            }
+        })
+    }
+
     assertDestructiveReplacementFence(owner: symbol): void {
         if (
             this.destructiveReplacementFence?.owner !== owner ||
@@ -1831,7 +1880,11 @@ export class SaveCoordinator {
         }
         if (
             !this.destructiveReplacementFence.acceptsPostPublicationDirty
-            && !this.captureMatchesBaseline()
+            && !(this.destructiveReplacementFence.refreshBaseline
+                ? this.captureMatchesCapturedState(
+                    this.destructiveReplacementFence.refreshBaseline,
+                )
+                : this.captureMatchesBaseline())
         ) {
             this.destructiveReplacementFence.blockedPrePublicationDirty = true
             throw new PersistentMutationFencedError()
@@ -3904,5 +3957,25 @@ export class SaveCoordinator {
                 || captured.presetsCanonical === this.presetsBaseline
             )
             && this.selectedCaptureMatchesBaseline(captured)
+    }
+
+    private captureMatchesCapturedState(expected: CapturedState): boolean {
+        const captured = this.capture()
+        if (
+            captured.rootCanonical !== expected.rootCanonical
+            || captured.pluginStorageCanonical !== expected.pluginStorageCanonical
+            || captured.presetsCanonical !== expected.presetsCanonical
+        ) return false
+        if (expected.windowedCharacter || captured.windowedCharacter) {
+            return expected.windowedCharacter !== null
+                && captured.windowedCharacter !== null
+                && captured.windowedCharacter.shellCanonical ===
+                    expected.windowedCharacter.shellCanonical
+                && sameWindowedAuthority(
+                    captured.windowedCharacter.authority,
+                    expected.windowedCharacter.authority,
+                )
+        }
+        return captured.characterCanonical === expected.characterCanonical
     }
 }

@@ -7,6 +7,7 @@ import {
     safeDeviceSyncStatus,
     type DeviceSyncInvoke,
     type DeviceSyncLinkPermissions,
+    type DeviceSyncMutationRuntime,
     type DeviceSyncSettingsInput,
     type DeviceSyncStatus,
 } from './deviceSync'
@@ -14,7 +15,6 @@ import { createPeerAndroidSourceForeground } from './peerAndroidSourceForeground
 import type {
     PeerSyncForegroundBridge,
     PeerSyncInvoke,
-    PeerSyncMutationRuntime,
 } from './peerSyncShared'
 
 export interface AndroidDeviceSyncForegroundIdentity {
@@ -26,7 +26,7 @@ export interface AndroidDeviceSyncForegroundIdentity {
 export interface AndroidDeviceSyncFacadeOptions {
     invoke?: DeviceSyncInvoke
     bridge?: PeerSyncForegroundBridge
-    runtime: PeerSyncMutationRuntime
+    runtime: DeviceSyncMutationRuntime
 }
 
 function nativeBridge(): PeerSyncForegroundBridge {

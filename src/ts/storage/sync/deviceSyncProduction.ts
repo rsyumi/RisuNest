@@ -1,5 +1,6 @@
 import { isTauriAndroid } from '../../platform'
 import {
+    acquireCommittedWorkingSetRefreshFence,
     acquireDestructiveReplacementFence,
     capturePersistentMutationToken,
     flushPendingData,
@@ -59,6 +60,8 @@ export function createAndroidDeviceSyncCloneTarget(
     const listeners = new Set<(snapshot: PeerCloneControllerSnapshot) => void>()
     let capabilities: Awaited<ReturnType<AndroidCloneFacade['capabilities']>> | undefined
     let timer: unknown
+    let polling = false
+    let targetEpoch = 0
     let error = ''
 
     const snapshot = (): PeerCloneControllerSnapshot & {
@@ -96,14 +99,21 @@ export function createAndroidDeviceSyncCloneTarget(
         timer = undefined
     }
     const poll = async (): Promise<void> => {
+        if (polling) return
+        polling = true
+        const epoch = targetEpoch
         try {
             const status = await facade.targetStatus()
+            if (epoch !== targetEpoch) return
             error = ''
             publish()
             if (status.phase === 'completed' || status.phase === 'cancelled' || status.phase === 'failed') stopPolling()
         } catch (cause) {
+            if (epoch !== targetEpoch) return
             error = cause instanceof Error ? cause.message : String(cause)
             publish()
+        } finally {
+            polling = false
         }
     }
     const startPolling = (): void => {
@@ -140,7 +150,10 @@ export function createAndroidDeviceSyncCloneTarget(
             throw new Error('Android registered clone target requires a source device identity')
         },
         joinRegistered(deviceId): Promise<void> {
-            return run(async () => { await facade.joinRegistered(deviceId) })
+            return run(async () => {
+                await facade.joinRegistered(deviceId)
+                targetEpoch += 1
+            })
         },
         confirmDestructiveReplace(): void {
             try {
@@ -154,15 +167,28 @@ export function createAndroidDeviceSyncCloneTarget(
             }
         },
         download(): Promise<void> {
-            return run(async () => { await facade.download(); startPolling() })
+            return run(async () => {
+                await facade.download()
+                targetEpoch += 1
+                startPolling()
+            })
         },
         resume(): Promise<void> {
-            return run(async () => { await facade.resume(); startPolling() })
+            return run(async () => {
+                await facade.resume()
+                targetEpoch += 1
+                startPolling()
+            })
         },
         cancel(): Promise<void> {
-            return run(async () => { await facade.cancel(); stopPolling() })
+            return run(async () => {
+                await facade.cancel()
+                targetEpoch += 1
+                stopPolling()
+            })
         },
         dispose(): void {
+            targetEpoch += 1
             stopPolling()
             listeners.clear()
         },
@@ -173,6 +199,7 @@ const productionRuntime = {
     flushPendingData,
     capturePersistentMutationToken,
     acquireDestructiveReplacementFence,
+    acquireCommittedWorkingSetRefreshFence,
 }
 
 type ProductionFactories = {

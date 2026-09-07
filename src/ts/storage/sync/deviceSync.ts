@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
+import type { PersistentDestructiveReplacementFence } from '../persistentDataRuntime'
 import { parsePeerCloneEndpoint, parsePeerPairingUri } from './peerClone'
-import type { PeerSyncMutationRuntime } from './peerSyncShared'
 
 export type DeviceSyncInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
@@ -96,6 +96,12 @@ export interface DeviceSyncRemoteCommitRefresh {
      * The store is authoritative at that point, so the edits are gone.
      */
     discardedPendingEdits: boolean
+}
+
+/** Renderer mutation operations required only by a sharing source. */
+export interface DeviceSyncMutationRuntime {
+    flushPendingData(reason: string): Promise<void>
+    acquireCommittedWorkingSetRefreshFence(): Promise<PersistentDestructiveReplacementFence>
 }
 
 export interface DeviceSyncStatus {
@@ -304,7 +310,7 @@ function safeDevices(value: unknown): RegisteredDevice[] {
 
 export function createDeviceSyncFacade(options: {
     invoke?: DeviceSyncInvoke
-    runtime: PeerSyncMutationRuntime
+    runtime: DeviceSyncMutationRuntime
 }) {
     const nativeInvoke = options.invoke ?? invoke
     const validate = (settings: DeviceSyncSettingsInput): void => {
@@ -346,8 +352,7 @@ export function createDeviceSyncFacade(options: {
                 discardedPendingEdits = true
             }
             try {
-                const token = await options.runtime.capturePersistentMutationToken('device-sync-remote-commit')
-                const fence = await options.runtime.acquireDestructiveReplacementFence(token)
+                const fence = await options.runtime.acquireCommittedWorkingSetRefreshFence()
                 try {
                     await fence.refreshCommittedWorkingSet(commit.committedRevision)
                 } finally {

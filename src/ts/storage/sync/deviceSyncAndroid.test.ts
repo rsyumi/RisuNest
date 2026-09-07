@@ -17,11 +17,7 @@ const runtimeStub = (flushPendingData?: (reason: string) => Promise<void>) => {
     return {
         fence,
         flushPendingData: vi.fn(flushPendingData ?? (async (_reason: string) => undefined)),
-        capturePersistentMutationToken: vi.fn(async (_reason: string) => ({ revision: 1, mutationGeneration: 1 })),
-        acquireDestructiveReplacementFence: vi.fn(async (_token: {
-            revision: number
-            mutationGeneration: number
-        }) => fence),
+        acquireCommittedWorkingSetRefreshFence: vi.fn(async () => fence),
     }
 }
 

@@ -4,6 +4,7 @@ vi.mock('../persistentDataRuntime.svelte', () => ({
     flushPendingData: vi.fn(),
     capturePersistentMutationToken: vi.fn(),
     acquireDestructiveReplacementFence: vi.fn(),
+    acquireCommittedWorkingSetRefreshFence: vi.fn(),
 }))
 
 import {
@@ -12,11 +13,27 @@ import {
 } from './deviceSyncProduction'
 import { createDeviceSyncController, startDeviceSyncAutoListen } from './deviceSyncController'
 
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    let reject!: (cause: unknown) => void
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+    })
+    return { promise, resolve, reject }
+}
+
+async function settleAsyncWork(): Promise<void> {
+    await Promise.resolve()
+    await Promise.resolve()
+}
+
 describe('production device sync composition', () => {
     it('selects the Android unified source facade while leaving desktop composition injectable', () => {
         const runtime = {
             flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),
             acquireDestructiveReplacementFence: vi.fn(),
+            acquireCommittedWorkingSetRefreshFence: vi.fn(),
         }
         const androidFacade = { platform: 'android-source' }
         const sourceAndroid = vi.fn(() => androidFacade)
@@ -47,6 +64,7 @@ describe('production device sync composition', () => {
         const runtime = {
             flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),
             acquireDestructiveReplacementFence: vi.fn(),
+            acquireCommittedWorkingSetRefreshFence: vi.fn(),
         }
         const desktopFacade = { platform: 'desktop-source' }
         const sourceDesktop = vi.fn(() => desktopFacade)
@@ -77,6 +95,7 @@ describe('production device sync composition', () => {
         const runtime = {
             flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),
             acquireDestructiveReplacementFence: vi.fn(),
+            acquireCommittedWorkingSetRefreshFence: vi.fn(),
         }
         const clone = { kind: 'clone' }
         const delta = { kind: 'delta' }
@@ -268,5 +287,157 @@ describe('production device sync composition', () => {
         expect(target.snapshot().state.target.backupPaths)
             .toEqual(['/data/user/0/app/pre-clone.lossless'])
         target.dispose()
+    })
+
+    it('serializes Android clone status polls and resumes polling after the active call settles', async () => {
+        const scheduled: Array<() => void> = []
+        const firstStatus = deferred<{
+            sourceDeviceId: string
+            jobId: string
+            phase: 'downloading'
+            completedBytes: number
+        }>()
+        let state = {
+            phase: 'idle' as 'idle' | 'downloading',
+            destructiveConfirmed: false,
+            activationCommitted: false,
+            completedBytes: 0,
+        }
+        const facade = {
+            getState: () => state,
+            capabilities: vi.fn(async () => ({
+                androidClient: true, atomicActivationReady: true, losslessBackupReady: true,
+                httpTransportReady: true, productionEnabled: true,
+            })),
+            recover: vi.fn(async () => null),
+            joinRegistered: vi.fn(),
+            confirmDestructiveReplace: vi.fn(),
+            download: vi.fn(async () => { state = { ...state, phase: 'downloading' } }),
+            resume: vi.fn(),
+            cancel: vi.fn(),
+            targetStatus: vi.fn()
+                .mockImplementationOnce(() => firstStatus.promise)
+                .mockResolvedValue({
+                    sourceDeviceId: 'source', jobId: 'job',
+                    phase: 'downloading', completedBytes: 2,
+                }),
+        }
+        const target = createAndroidDeviceSyncCloneTarget(facade as never, {
+            schedule: (listener) => { scheduled.push(listener); return 1 },
+            cancelSchedule: vi.fn(),
+        })
+        await target.initialize()
+        await target.download()
+
+        scheduled[0]!()
+        scheduled[0]!()
+        scheduled[0]!()
+        expect(facade.targetStatus).toHaveBeenCalledTimes(1)
+
+        firstStatus.resolve({
+            sourceDeviceId: 'source', jobId: 'job',
+            phase: 'downloading', completedBytes: 1,
+        })
+        await settleAsyncWork()
+        scheduled[0]!()
+        expect(facade.targetStatus).toHaveBeenCalledTimes(2)
+        target.dispose()
+    })
+
+    it('ignores an old Android clone poll rejection after cancel changes the target', async () => {
+        const scheduled: Array<() => void> = []
+        const status = deferred<never>()
+        let state = {
+            phase: 'idle' as 'idle' | 'downloading' | 'cancelled',
+            destructiveConfirmed: false,
+            activationCommitted: false,
+            completedBytes: 0,
+        }
+        const facade = {
+            getState: () => state,
+            capabilities: vi.fn(async () => ({
+                androidClient: true, atomicActivationReady: true, losslessBackupReady: true,
+                httpTransportReady: true, productionEnabled: true,
+            })),
+            recover: vi.fn(async () => null),
+            joinRegistered: vi.fn(),
+            confirmDestructiveReplace: vi.fn(),
+            download: vi.fn(async () => { state = { ...state, phase: 'downloading' } }),
+            resume: vi.fn(),
+            cancel: vi.fn(async () => { state = { ...state, phase: 'cancelled' } }),
+            targetStatus: vi.fn(() => status.promise),
+        }
+        const target = createAndroidDeviceSyncCloneTarget(facade as never, {
+            schedule: (listener) => { scheduled.push(listener); return 1 },
+            cancelSchedule: vi.fn(),
+        })
+        const published = vi.fn()
+        target.subscribe(published)
+        await target.initialize()
+        await target.download()
+        scheduled[0]!()
+
+        await target.cancel()
+        const publicationsAfterCancel = published.mock.calls.length
+        status.reject(new Error('stale native poll failure'))
+        await settleAsyncWork()
+
+        expect(target.snapshot().error).toBe('')
+        expect(target.snapshot().state.target.phase).toBe('cancelled')
+        expect(published).toHaveBeenCalledTimes(publicationsAfterCancel)
+        target.dispose()
+    })
+
+    it('does not apply an Android clone poll result after disposal', async () => {
+        const scheduled: Array<() => void> = []
+        const firstStatus = deferred<never>()
+        const lateStatus = deferred<{
+            sourceDeviceId: string
+            jobId: string
+            phase: 'downloading'
+            completedBytes: number
+        }>()
+        let state = {
+            phase: 'idle' as 'idle' | 'downloading',
+            destructiveConfirmed: false,
+            activationCommitted: false,
+            completedBytes: 0,
+        }
+        const facade = {
+            getState: () => state,
+            capabilities: vi.fn(async () => ({
+                androidClient: true, atomicActivationReady: true, losslessBackupReady: true,
+                httpTransportReady: true, productionEnabled: true,
+            })),
+            recover: vi.fn(async () => null),
+            joinRegistered: vi.fn(),
+            confirmDestructiveReplace: vi.fn(),
+            download: vi.fn(async () => { state = { ...state, phase: 'downloading' } }),
+            resume: vi.fn(),
+            cancel: vi.fn(),
+            targetStatus: vi.fn()
+                .mockImplementationOnce(() => firstStatus.promise)
+                .mockImplementationOnce(() => lateStatus.promise),
+        }
+        const target = createAndroidDeviceSyncCloneTarget(facade as never, {
+            schedule: (listener) => { scheduled.push(listener); return 1 },
+            cancelSchedule: vi.fn(),
+        })
+        await target.initialize()
+        await target.download()
+        scheduled[0]!()
+        firstStatus.reject(new Error('current poll failure'))
+        await settleAsyncWork()
+        expect(target.snapshot().error).toBe('current poll failure')
+
+        scheduled[0]!()
+        target.dispose()
+        lateStatus.resolve({
+            sourceDeviceId: 'source', jobId: 'job',
+            phase: 'downloading', completedBytes: 1,
+        })
+        await settleAsyncWork()
+
+        expect(target.snapshot().error).toBe('current poll failure')
     })
 })

@@ -18,6 +18,7 @@ import type {
     PersistentRoot,
     PluginStorageMutation,
 } from './persistentDataStore'
+import { RevisionConflictError } from './persistentDataStore'
 import {
     SaveCoordinator,
     PersistentMutationFencedError,
@@ -402,6 +403,7 @@ export interface PersistentDataRuntime {
     acquireDestructiveReplacementFence(
         expected: PersistentMutationToken,
     ): Promise<PersistentDestructiveReplacementFence>
+    acquireCommittedWorkingSetRefreshFence(): Promise<PersistentDestructiveReplacementFence>
     materializePersistentDatabaseSnapshot(reason: string): Promise<Database>
     materializePersistentDatabaseSnapshotWithRevision(
         reason: string,
@@ -768,6 +770,29 @@ export function createPersistentDataRuntime(
                         )
                     }
                     return refreshCommittedWorkingSet(revision, owner, options)
+                },
+                release() {
+                    if (released) return
+                    coordinator.releaseDestructiveReplacementFence(owner)
+                    released = true
+                },
+            }
+        },
+        async acquireCommittedWorkingSetRefreshFence() {
+            const owner = await coordinator.acquireCommittedWorkingSetRefreshFence()
+            let released = false
+            return {
+                async refreshCommittedWorkingSet(minimumRevision, options) {
+                    if (released) {
+                        throw new Error('Destructive persistent replacement fence was released')
+                    }
+                    coordinator.assertDestructiveReplacementFence(owner)
+                    const latest = await dependencies.store.readRoot()
+                    coordinator.assertDestructiveReplacementFence(owner)
+                    if (latest.revision < minimumRevision) {
+                        throw new RevisionConflictError(minimumRevision, latest.revision)
+                    }
+                    return refreshCommittedWorkingSet(latest.revision, owner, options)
                 },
                 release() {
                     if (released) return

@@ -10,11 +10,7 @@ const runtimeStub = () => {
     return {
         fence,
         flushPendingData: vi.fn(async (_reason: string) => undefined),
-        capturePersistentMutationToken: vi.fn(async (_reason: string) => ({ revision: 1, mutationGeneration: 1 })),
-        acquireDestructiveReplacementFence: vi.fn(async (_token: {
-            revision: number
-            mutationGeneration: number
-        }) => fence),
+        acquireCommittedWorkingSetRefreshFence: vi.fn(async () => fence),
     }
 }
 
@@ -385,11 +381,7 @@ describe('device sync facade', () => {
         const order: string[] = []
         const runtime = runtimeStub()
         runtime.flushPendingData.mockImplementation(async () => { order.push('flush') })
-        runtime.capturePersistentMutationToken.mockImplementation(async () => {
-            order.push('token')
-            return { revision: 4, mutationGeneration: 2 }
-        })
-        runtime.acquireDestructiveReplacementFence.mockImplementation(async () => {
+        runtime.acquireCommittedWorkingSetRefreshFence.mockImplementation(async () => {
             order.push('fence')
             return runtime.fence
         })
@@ -401,10 +393,9 @@ describe('device sync facade', () => {
             operationId: canonicalOperationId, committedRevision: 12,
         })).resolves.toEqual({ discardedPendingEdits: false })
 
-        expect(order).toEqual(['flush', 'token', 'fence', 'refresh', 'release'])
+        expect(order).toEqual(['flush', 'fence', 'refresh', 'release'])
         expect(runtime.flushPendingData).toHaveBeenCalledWith('device-sync-remote-commit')
-        expect(runtime.capturePersistentMutationToken).toHaveBeenCalledWith('device-sync-remote-commit')
-        expect(runtime.acquireDestructiveReplacementFence).toHaveBeenCalledWith({ revision: 4, mutationGeneration: 2 })
+        expect(runtime.acquireCommittedWorkingSetRefreshFence).toHaveBeenCalledOnce()
         expect(runtime.fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(12)
     })
 
@@ -417,6 +408,8 @@ describe('device sync facade', () => {
             operationId: canonicalOperationId, committedRevision: 12,
         })).resolves.toEqual({ discardedPendingEdits: true })
 
+        expect(runtime.flushPendingData).toHaveBeenCalledOnce()
+        expect(runtime.acquireCommittedWorkingSetRefreshFence).toHaveBeenCalledOnce()
         expect(runtime.fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(12)
         expect(runtime.fence.release).toHaveBeenCalledOnce()
     })
