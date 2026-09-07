@@ -1,5 +1,5 @@
 use super::*;
-use crate::local_backup::NeverCancelled;
+use crate::local_backup::{parse_legacy_local_backup_v1, NeverCancelled};
 use crate::native_file_jobs::{JobKind, JobRegistry};
 use std::io::Cursor;
 
@@ -112,6 +112,7 @@ impl StrictLocalBackupDatabaseRestore for Import<'_> {
             1,
             self.job,
             &sink,
+            restore::RestoreProgressScale::default(),
             || Ok(None),
         );
         sink.durable

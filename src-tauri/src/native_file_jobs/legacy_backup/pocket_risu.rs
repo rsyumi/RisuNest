@@ -2,8 +2,9 @@
 //! `inlay_sidecar/<id>` JSON. Pair staged paths, never retain media in memory.
 use super::{
     cancellation_io, check_cancelled, invalid, open_staged, to_alias_size, AssetAlias,
-    CancellationProbe, CancellationReader, CasObjectRole, DurableCasJob, HashMap, LocalBackupError,
-    LocalBackupErrorCode, Map, PayloadCas, StagedLocalBackupEntry, Value, MAX_METADATA_BYTES,
+    CancellationProbe, CancellationReader, CasObjectRole, DurableCasJob, HashMap,
+    LegacyPrepareObserver, LocalBackupError, LocalBackupErrorCode, Map, PayloadCas,
+    StagedLocalBackupEntry, Value, MAX_METADATA_BYTES,
 };
 use serde::Deserialize;
 use std::io::{BufReader, Read};
@@ -97,6 +98,7 @@ pub(super) fn prepare(
     cas: &PayloadCas,
     durable: &mut DurableCasJob,
     cancellation: &dyn CancellationProbe,
+    observer: &dyn LegacyPrepareObserver,
 ) -> Result<AssetAlias, LocalBackupError> {
     check_cancelled(cancellation)?;
     let mut retained_metadata = Map::new();
@@ -136,7 +138,7 @@ pub(super) fn prepare(
             .map(|(_, mime)| mime)
             .unwrap_or("application/octet-stream")
     };
-    let mut reader = CancellationReader::new(open_staged(entry)?, cancellation);
+    let mut reader = CancellationReader::observed(open_staged(entry)?, cancellation, observer);
     let payload = durable
         .prepare_reader_expected(
             cas,

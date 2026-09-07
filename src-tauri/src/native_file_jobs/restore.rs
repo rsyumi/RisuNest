@@ -1,4 +1,7 @@
-use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError, OpenedJobSource};
+use super::{
+    ImportCounts, JobControl, JobDetail, JobPhase, JobProgress, JobResultSummary, JobStage,
+    NativeJobError, OpenedJobSource, StageUnit,
+};
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
 use flate2::bufread::GzDecoder;
 use rmpv::Value as MessagePackValue;
@@ -51,6 +54,7 @@ pub(crate) trait RestoreControl {
     fn start(&self, phase: JobPhase) -> Result<(), String>;
     fn set_phase(&self, phase: JobPhase) -> Result<(), String>;
     fn set_progress(&self, progress: JobProgress) -> Result<(), String>;
+    fn set_detail(&self, detail: JobDetail) -> Result<(), String>;
 }
 
 impl RestoreControl for JobControl {
@@ -69,6 +73,26 @@ impl RestoreControl for JobControl {
     fn set_progress(&self, progress: JobProgress) -> Result<(), String> {
         JobControl::set_progress(self, progress)
     }
+
+    fn set_detail(&self, detail: JobDetail) -> Result<(), String> {
+        JobControl::set_detail(self, detail)
+    }
+}
+
+/// How the database read maps onto the job's top-level progress. A plain
+/// RisuSave restore reports the file itself; a legacy backup restore has
+/// already spent part of a larger budget reading and preparing the archive,
+/// so it offsets the database bytes and keeps the archive's entry count.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RestoreProgressScale {
+    /// Bytes already counted before the database read started.
+    pub(crate) base_bytes: u64,
+    /// Fixed total for the whole job; `None` uses the database size.
+    pub(crate) total_bytes: Option<u64>,
+    /// Keeps the top-level item counter at this value instead of counting blocks.
+    pub(crate) fixed_items: Option<(u64, Option<u64>)>,
+    /// Counters gathered before the database read, carried into every report.
+    pub(crate) counts: ImportCounts,
 }
 
 pub(crate) fn restore_block_risu_save(
@@ -85,6 +109,7 @@ pub(crate) fn restore_block_risu_save(
         sink,
         RestoreLimits::default(),
         true,
+        RestoreProgressScale::default(),
         || Ok(None),
     )
 }
@@ -108,6 +133,7 @@ where
         sink,
         RestoreLimits::default(),
         true,
+        RestoreProgressScale::default(),
         before_activation,
     )
 }
@@ -117,6 +143,7 @@ pub(crate) fn restore_started_risu_save_with_pre_activation<F>(
     expected_revision: i64,
     job: &JobControl,
     sink: &dyn ReplacementSink,
+    scale: RestoreProgressScale,
     before_activation: F,
 ) -> Result<JobResultSummary, NativeJobError>
 where
@@ -130,6 +157,7 @@ where
         sink,
         RestoreLimits::default(),
         false,
+        scale,
         before_activation,
     )
 }
@@ -241,6 +269,7 @@ fn restore_risu_save_reader<R: Read>(
         sink,
         limits,
         true,
+        RestoreProgressScale::default(),
         || Ok(None),
     )
 }
@@ -253,6 +282,7 @@ fn restore_risu_save_reader_with_pre_activation<R, F>(
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
     start_job: bool,
+    scale: RestoreProgressScale,
     before_activation: F,
 ) -> Result<JobResultSummary, NativeJobError>
 where
@@ -269,7 +299,7 @@ where
         job.start(JobPhase::ReadingSource)
             .map_err(|error| job_error(job, error))?;
     }
-    let mut reader = TrackedReader::new(source, total_bytes, job);
+    let mut reader = TrackedReader::new_with_scale(source, total_bytes, job, scale);
     let format = read_risu_save_format(&mut reader)?;
 
     let staging_id = sink.begin().map_err(store_error)?.staging_id;
@@ -444,6 +474,7 @@ fn parse_and_stage_legacy<R: Read>(
     if remaining > limits.max_decoded_block_bytes {
         return Err(invalid("decoded legacy RisuSave limit exceeded"));
     }
+    reader.set_stage(JobStage::DecodingDatabase)?;
     let source = RemainingSourceReader { reader, remaining };
     let decoded = DecodedLimitReader::new(
         source,
@@ -453,7 +484,7 @@ fn parse_and_stage_legacy<R: Read>(
     );
     let value = decode_messagepack(decoded, job)?.0;
     reader.complete_item()?;
-    stage_legacy_database(value, staging_id, job, sink)
+    stage_legacy_database(value, staging_id, job, reader, sink)
 }
 
 fn parse_and_stage_compressed_legacy<R: Read>(
@@ -467,6 +498,7 @@ fn parse_and_stage_compressed_legacy<R: Read>(
     if remaining > limits.max_encoded_block_bytes {
         return Err(invalid("encoded legacy RisuSave limit exceeded"));
     }
+    reader.set_stage(JobStage::DecodingDatabase)?;
     let source = RemainingSourceReader { reader, remaining };
     let buffered = BufReader::with_capacity(READ_CHUNK_BYTES, source);
     let decoder = GzDecoder::new(buffered);
@@ -483,7 +515,7 @@ fn parse_and_stage_compressed_legacy<R: Read>(
         return Err(corrupt("trailing data in legacy RisuSave gzip stream"));
     }
     reader.complete_item()?;
-    stage_legacy_database(value, staging_id, job, sink)
+    stage_legacy_database(value, staging_id, job, reader, sink)
 }
 
 fn decode_messagepack<'a, R: Read>(
@@ -509,10 +541,11 @@ fn decode_messagepack<'a, R: Read>(
     Ok((value, buffered.into_inner()))
 }
 
-fn stage_legacy_database(
+fn stage_legacy_database<R: Read>(
     value: Value,
     staging_id: &str,
     job: &JobControl,
+    reader: &mut TrackedReader<'_, R>,
     sink: &dyn ReplacementSink,
 ) -> Result<ParsedCounts, NativeJobError> {
     let mut root = match value {
@@ -537,6 +570,10 @@ fn stage_legacy_database(
         }
     }
 
+    let character_total = characters.len() as u64;
+    reader.counts.characters_total = Some(character_total);
+    reader.counts.presets = presets.len() as u64;
+    reader.report_stage_items(JobStage::StagingCharacters, 0, Some(character_total))?;
     let mut start = 0;
     while start < characters.len() {
         if job.is_cancel_requested() {
@@ -557,10 +594,17 @@ fn stage_legacy_database(
         sink.add_characters(staging_id, &characters[start..end])
             .map_err(store_error)?;
         start = end;
+        reader.counts.characters = start as u64;
+        reader.report_stage_items(
+            JobStage::StagingCharacters,
+            start as u64,
+            Some(character_total),
+        )?;
     }
 
     job.set_phase(JobPhase::StagingDatabase)
         .map_err(|error| job_error(job, error))?;
+    reader.report_stage_items(JobStage::FinalizingStaging, 0, None)?;
     sink.put_root(staging_id, &Value::Object(root))
         .map_err(store_error)?;
     sink.put_presets(staging_id, &presets)
@@ -898,6 +942,7 @@ fn parse_and_stage<R: Read>(
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
                 character_batch.push(value);
                 character_count += 1;
+                reader.counts.characters = character_count;
                 if character_batch.len() >= CHARACTER_BATCH_COUNT
                     || character_batch_bytes >= CHARACTER_BATCH_BYTES
                 {
@@ -908,12 +953,12 @@ fn parse_and_stage<R: Read>(
                 }
             }
             4 if name == "preset" => {
-                presets = Some(
-                    value
-                        .as_array()
-                        .cloned()
-                        .ok_or_else(|| invalid("preset block must be a JSON array"))?,
-                );
+                let list = value
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| invalid("preset block must be a JSON array"))?;
+                reader.counts.presets = list.len() as u64;
+                presets = Some(list);
             }
             5 if name == "modules" => {
                 if !value.is_array() {
@@ -950,6 +995,7 @@ fn parse_and_stage<R: Read>(
                 )))
             }
         }
+        reader.counts.blocks += 1;
         reader.complete_item()?;
     }
 
@@ -987,6 +1033,7 @@ fn parse_and_stage<R: Read>(
 
     job.set_phase(JobPhase::StagingDatabase)
         .map_err(|error| job_error(job, error))?;
+    reader.report_stage_items(JobStage::FinalizingStaging, 0, None)?;
     let mut root = root.ok_or_else(|| invalid("missing required block root"))?;
     root.insert(
         "modules".to_owned(),
@@ -1156,10 +1203,23 @@ struct TrackedReader<'a, R: Read> {
     completed_items: u64,
     hasher: Sha256,
     job: &'a dyn RestoreControl,
+    scale: RestoreProgressScale,
+    counts: ImportCounts,
+    stage: JobStage,
 }
 
 impl<'a, R: Read> TrackedReader<'a, R> {
     fn new(source: R, total: u64, job: &'a dyn RestoreControl) -> Self {
+        Self::new_with_scale(source, total, job, RestoreProgressScale::default())
+    }
+
+    fn new_with_scale(
+        source: R,
+        total: u64,
+        job: &'a dyn RestoreControl,
+        scale: RestoreProgressScale,
+    ) -> Self {
+        let counts = scale.counts.clone();
         Self {
             source,
             total,
@@ -1167,7 +1227,69 @@ impl<'a, R: Read> TrackedReader<'a, R> {
             completed_items: 0,
             hasher: Sha256::new(),
             job,
+            scale,
+            counts,
+            stage: JobStage::ReadingDatabase,
         }
+    }
+
+    fn top_level_progress(&self) -> JobProgress {
+        let total = self.scale.total_bytes.unwrap_or(self.total);
+        let (completed_items, total_items) = match self.scale.fixed_items {
+            Some((completed, total)) => (completed, total),
+            None => (self.completed_items, None),
+        };
+        JobProgress {
+            completed_bytes: self
+                .scale
+                .base_bytes
+                .saturating_add(self.completed)
+                .min(total),
+            total_bytes: Some(total),
+            completed_items,
+            total_items,
+        }
+    }
+
+    /// Reports the byte-level database read under the current stage.
+    fn report(&mut self) -> Result<(), NativeJobError> {
+        self.job
+            .set_progress(self.top_level_progress())
+            .map_err(|error| job_error(self.job, error))?;
+        self.job
+            .set_detail(JobDetail::new(
+                self.stage,
+                StageUnit::Bytes,
+                self.completed,
+                Some(self.total),
+                self.counts.clone(),
+            ))
+            .map_err(|error| job_error(self.job, error))
+    }
+
+    fn set_stage(&mut self, stage: JobStage) -> Result<(), NativeJobError> {
+        self.stage = stage;
+        self.report()
+    }
+
+    /// Reports an item-counted stage (character batches, final staging) that
+    /// happens after the database bytes were read.
+    fn report_stage_items(
+        &mut self,
+        stage: JobStage,
+        completed: u64,
+        total: Option<u64>,
+    ) -> Result<(), NativeJobError> {
+        self.stage = stage;
+        self.job
+            .set_detail(JobDetail::new(
+                stage,
+                StageUnit::Items,
+                completed,
+                total,
+                self.counts.clone(),
+            ))
+            .map_err(|error| job_error(self.job, error))
     }
 
     fn read_exact_checked(&mut self, buffer: &mut [u8]) -> Result<(), NativeJobError> {
@@ -1200,14 +1322,7 @@ impl<'a, R: Read> TrackedReader<'a, R> {
         }
         self.hasher.update(&buffer[..read]);
         self.completed += read as u64;
-        self.job
-            .set_progress(JobProgress {
-                completed_bytes: self.completed,
-                total_bytes: Some(self.total),
-                completed_items: self.completed_items,
-                total_items: None,
-            })
-            .map_err(|error| job_error(self.job, error))?;
+        self.report()?;
         Ok(read)
     }
 
@@ -1227,14 +1342,7 @@ impl<'a, R: Read> TrackedReader<'a, R> {
 
     fn complete_item(&mut self) -> Result<(), NativeJobError> {
         self.completed_items += 1;
-        self.job
-            .set_progress(JobProgress {
-                completed_bytes: self.completed,
-                total_bytes: Some(self.total),
-                completed_items: self.completed_items,
-                total_items: None,
-            })
-            .map_err(|error| job_error(self.job, error))
+        self.report()
     }
 }
 
@@ -1843,11 +1951,16 @@ mod tests {
             .unwrap();
         job.start(JobPhase::ReadingSource).unwrap();
         let staging_id = sink.begin().unwrap().staging_id;
-        stage_legacy_database(database.clone(), &staging_id, &job, &sink).unwrap();
+        let mut reader = TrackedReader::new(io::empty(), 0, &*job);
+        stage_legacy_database(database.clone(), &staging_id, &job, &mut reader, &sink).unwrap();
         sink.commit(&staging_id, 1).unwrap();
         let restored = sink.store.lock().unwrap().materialize(None).unwrap();
         let chats = restored["characters"][0]["chats"].as_array().unwrap();
         assert_eq!(chats.len(), 3);
+        let detail = job.status().detail.expect("legacy staging reports detail");
+        assert_eq!(detail.stage, JobStage::FinalizingStaging);
+        assert_eq!(detail.counts.characters, 1);
+        assert_eq!(detail.counts.characters_total, Some(1));
         assert_eq!(chats[1]["id"], "retained-chat");
         assert_eq!(
             chats[0]["message"],

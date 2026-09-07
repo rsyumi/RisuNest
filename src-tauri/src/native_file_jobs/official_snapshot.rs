@@ -62,6 +62,7 @@ pub(crate) fn restore_official_snapshot(
         expected_revision,
         job,
         sink,
+        restore::RestoreProgressScale::default(),
         || {
             let store = recovery
                 .borrow_mut()

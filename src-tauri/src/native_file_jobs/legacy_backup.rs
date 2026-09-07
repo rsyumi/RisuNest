@@ -1,14 +1,16 @@
 use super::{
-    restore, JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError, OpenedJobSource,
+    restore, ImportCounts, JobControl, JobDetail, JobPhase, JobProgress, JobResultSummary,
+    JobStage, NativeJobError, OpenedJobSource, StageUnit,
 };
 use crate::asset_repository::job_pins::{
     CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
 };
 use crate::asset_repository::{owner_manifest_codec, PayloadCas};
 use crate::local_backup::{
-    parse_legacy_local_backup_v1, write_legacy_local_backup_v1, CancellationProbe,
+    parse_legacy_local_backup_v1_observed, write_legacy_local_backup_v1, CancellationProbe,
     LegacyBackupWriteEntry, LegacyBackupWriteSource, LocalBackupError, LocalBackupErrorCode,
-    PayloadTarget, StagedLocalBackupEntry, StrictLocalBackupDatabaseRestore,
+    LocalBackupParseObserver, PayloadTarget, StagedLocalBackupEntry,
+    StrictLocalBackupDatabaseRestore,
 };
 use crate::persistent_store::export::{self, destination};
 use crate::persistent_store::{
@@ -45,6 +47,222 @@ impl CancellationProbe for JobCancellation<'_> {
     }
 }
 
+const PROGRESS_REPORT_INTERVAL_BYTES: u64 = 1024 * 1024;
+
+/// Observes attachments being copied into the CAS during a legacy restore.
+pub(crate) trait LegacyPrepareObserver {
+    fn begin(&self, _total: u64) {}
+    fn item_started(&self, _logical_name: &str) {}
+    fn item_bytes(&self, _bytes: u64) {}
+    fn item_done(&self) {}
+}
+
+#[cfg(test)]
+pub(crate) struct NoopPrepareObserver;
+
+#[cfg(test)]
+impl LegacyPrepareObserver for NoopPrepareObserver {}
+
+#[derive(Default)]
+struct LegacyProgressState {
+    read_bytes: u64,
+    prepared_bytes: u64,
+    last_reported_bytes: u64,
+    counts: ImportCounts,
+    stage: Option<JobStage>,
+    stage_completed: u64,
+    stage_total: Option<u64>,
+    stage_unit: Option<StageUnit>,
+    current_item: Option<String>,
+}
+
+/// Progress reporter for a legacy backup restore. It is the cancellation
+/// probe, the archive parse observer, and the attachment observer at once, and
+/// it charges every stage against one fixed budget of twice the archive size:
+/// each byte is read from the archive once and then either copied into the
+/// CAS or parsed as the database. Reports never fail the restore; a rejected
+/// report only costs the dialog one update.
+struct LegacyRestoreProgress<'a> {
+    job: &'a JobControl,
+    archive_bytes: u64,
+    state: RefCell<LegacyProgressState>,
+}
+
+impl<'a> LegacyRestoreProgress<'a> {
+    fn new(job: &'a JobControl, archive_bytes: u64) -> Self {
+        Self {
+            job,
+            archive_bytes,
+            state: RefCell::new(LegacyProgressState::default()),
+        }
+    }
+
+    fn budget(&self) -> u64 {
+        self.archive_bytes.saturating_mul(2).max(1)
+    }
+
+    fn completed_bytes(&self, state: &LegacyProgressState) -> u64 {
+        state
+            .read_bytes
+            .saturating_add(state.prepared_bytes)
+            .min(self.budget())
+    }
+
+    fn report(&self) {
+        let mut state = self.state.borrow_mut();
+        let completed = self.completed_bytes(&state);
+        state.last_reported_bytes = completed;
+        let _ = self.job.set_progress(JobProgress {
+            completed_bytes: completed,
+            total_bytes: Some(self.budget()),
+            completed_items: state.counts.entries_read,
+            total_items: state.counts.entries_total,
+        });
+        if let (Some(stage), Some(unit)) = (state.stage, state.stage_unit) {
+            let mut detail = JobDetail::new(
+                stage,
+                unit,
+                state.stage_completed,
+                state.stage_total,
+                state.counts.clone(),
+            );
+            if let Some(item) = &state.current_item {
+                detail = detail.with_current_item(item.clone());
+            }
+            let _ = self.job.set_detail(detail);
+        }
+    }
+
+    fn report_if_due(&self) {
+        let due = {
+            let state = self.state.borrow();
+            self.completed_bytes(&state)
+                .saturating_sub(state.last_reported_bytes)
+                >= PROGRESS_REPORT_INTERVAL_BYTES
+        };
+        if due {
+            self.report();
+        }
+    }
+
+    fn classify(counts: &mut ImportCounts, logical_name: &str) {
+        if matches!(logical_name, DATABASE_ENTRY | ENCRYPTION_ENTRY) {
+            return;
+        }
+        match pocket_risu::classify(logical_name) {
+            Ok(Some(pocket_risu::Entry::Payload { .. })) => counts.pocket_media += 1,
+            Ok(Some(
+                pocket_risu::Entry::Metadata { .. } | pocket_risu::Entry::Provenance { .. },
+            )) => counts.pocket_metadata += 1,
+            Ok(Some(pocket_risu::Entry::Cache)) => counts.skipped += 1,
+            Ok(None) => {
+                if cold_key(logical_name).is_some() {
+                    counts.cold_storage += 1
+                } else if inlay_key_hex(logical_name).is_some() {
+                    counts.inlays += 1
+                } else {
+                    counts.assets += 1
+                }
+            }
+            // Invalid names fail the preflight that follows; they are not counted.
+            Err(_) => {}
+        }
+    }
+
+    /// Scale for the database read: it continues the same byte budget and
+    /// keeps the archive's entry counter instead of counting RisuSave blocks.
+    fn restore_scale(&self) -> restore::RestoreProgressScale {
+        let state = self.state.borrow();
+        restore::RestoreProgressScale {
+            base_bytes: state.read_bytes.saturating_add(state.prepared_bytes),
+            total_bytes: Some(self.budget()),
+            fixed_items: Some((state.counts.entries_read, state.counts.entries_total)),
+            counts: state.counts.clone(),
+        }
+    }
+}
+
+impl CancellationProbe for LegacyRestoreProgress<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.job.is_cancel_requested()
+    }
+}
+
+impl LocalBackupParseObserver for LegacyRestoreProgress<'_> {
+    fn entry_started(&self, logical_name: &str, _byte_length: u64, index: usize) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.counts.entries_read = index as u64 + 1;
+            Self::classify(&mut state.counts, logical_name);
+            state.stage = Some(JobStage::ReadingArchive);
+            state.stage_unit = Some(StageUnit::Bytes);
+            state.stage_completed = state.read_bytes;
+            state.stage_total = Some(self.archive_bytes);
+            state.current_item = Some(logical_name.to_owned());
+        }
+        self.report();
+    }
+
+    fn bytes_read(&self, total_read: u64) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.read_bytes = total_read.min(self.archive_bytes);
+            state.stage_completed = state.read_bytes;
+        }
+        self.report_if_due();
+    }
+
+    fn entries_complete(&self, count: usize) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.counts.entries_total = Some(count as u64);
+            state.stage_completed = state.read_bytes;
+            state.current_item = None;
+        }
+        self.report();
+    }
+}
+
+impl LegacyPrepareObserver for LegacyRestoreProgress<'_> {
+    fn begin(&self, total: u64) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.stage = Some(JobStage::PreparingAttachments);
+            state.stage_unit = Some(StageUnit::Items);
+            state.stage_completed = 0;
+            state.stage_total = Some(total);
+            state.current_item = None;
+        }
+        self.report();
+    }
+
+    fn item_started(&self, logical_name: &str) {
+        self.state.borrow_mut().current_item = Some(logical_name.to_owned());
+        self.report();
+    }
+
+    fn item_bytes(&self, bytes: u64) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.prepared_bytes = state
+                .prepared_bytes
+                .saturating_add(bytes)
+                .min(self.archive_bytes);
+        }
+        self.report_if_due();
+    }
+
+    fn item_done(&self) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.counts.attachments_prepared += 1;
+            state.stage_completed += 1;
+            state.current_item = None;
+        }
+        self.report();
+    }
+}
+
 pub(crate) fn restore_legacy_local_backup(
     mut source: OpenedJobSource,
     expected_revision: i64,
@@ -56,21 +274,23 @@ pub(crate) fn restore_legacy_local_backup(
     job.start(JobPhase::ReadingSource)
         .map_err(job_state_error)?;
     let cas = PayloadCas::new(repository_root).map_err(io_job_error)?;
-    let cancellation = JobCancellation(job);
+    let progress = LegacyRestoreProgress::new(job, source.total_bytes);
     let mut callback = LegacyDatabaseRestore {
         app,
         cas: &cas,
         repository_root,
         expected_revision,
         job,
+        progress: &progress,
         result: None,
     };
-    let parsed = parse_legacy_local_backup_v1(
+    let parsed = parse_legacy_local_backup_v1_observed(
         &mut source.file,
         owned_directory,
         PayloadTarget::JobStaging,
         &mut callback,
-        &cancellation,
+        &progress,
+        &progress,
     );
     match parsed {
         Ok(report) => {
@@ -638,6 +858,7 @@ struct LegacyDatabaseRestore<'a> {
     repository_root: &'a std::path::Path,
     expected_revision: i64,
     job: &'a JobControl,
+    progress: &'a LegacyRestoreProgress<'a>,
     result: Option<Result<JobResultSummary, NativeJobError>>,
 }
 
@@ -659,11 +880,12 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             now_millis(),
         )
         .map_err(LocalBackupError::io)?;
-        let payloads = match prepare_legacy_restore_payloads(
+        let payloads = match prepare_legacy_restore_payloads_observed(
             entries,
             self.cas,
             &mut durable,
-            &JobCancellation(self.job),
+            self.progress,
+            self.progress,
         ) {
             Ok(payloads) => payloads,
             Err(error) => {
@@ -671,7 +893,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
                 return Err(error);
             }
         };
-        if let Err(error) = check_cancelled(&JobCancellation(self.job)) {
+        if let Err(error) = check_cancelled(self.progress) {
             let _ = durable.release(CasReleaseOutcome::Aborted);
             return Err(error);
         }
@@ -689,6 +911,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             self.expected_revision,
             self.job,
             &sink,
+            self.progress.restore_scale(),
             || Ok(None),
         );
         match result {
@@ -876,11 +1099,40 @@ pub(crate) struct PreparedLegacyRestorePayloads {
     pub(crate) cold_aliases: Vec<ColdAlias>,
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_legacy_restore_payloads(
     entries: &[StagedLocalBackupEntry],
     cas: &PayloadCas,
     durable: &mut DurableCasJob,
     cancellation: &dyn CancellationProbe,
+) -> Result<PreparedLegacyRestorePayloads, LocalBackupError> {
+    prepare_legacy_restore_payloads_observed(
+        entries,
+        cas,
+        durable,
+        cancellation,
+        &NoopPrepareObserver,
+    )
+}
+
+/// Whether an archive entry becomes an asset or cold alias. Metadata and cache
+/// entries only feed the payloads they describe.
+fn produces_alias(logical_name: &str) -> bool {
+    if matches!(logical_name, DATABASE_ENTRY | ENCRYPTION_ENTRY) {
+        return false;
+    }
+    matches!(
+        pocket_risu::classify(logical_name),
+        Ok(Some(pocket_risu::Entry::Payload { .. })) | Ok(None)
+    )
+}
+
+pub(crate) fn prepare_legacy_restore_payloads_observed(
+    entries: &[StagedLocalBackupEntry],
+    cas: &PayloadCas,
+    durable: &mut DurableCasJob,
+    cancellation: &dyn CancellationProbe,
+    observer: &dyn LegacyPrepareObserver,
 ) -> Result<PreparedLegacyRestorePayloads, LocalBackupError> {
     preflight_legacy_restore_entries(entries)?;
     let pocket_metadata = pocket_risu::index_metadata(entries, cancellation)?;
@@ -888,6 +1140,12 @@ pub(crate) fn prepare_legacy_restore_payloads(
     let mut cold_aliases = Vec::new();
     let mut asset_keys = HashSet::new();
     let mut cold_keys = HashSet::new();
+    observer.begin(
+        entries
+            .iter()
+            .filter(|entry| produces_alias(&entry.logical_name))
+            .count() as u64,
+    );
 
     for entry in entries {
         check_cancelled(cancellation)?;
@@ -902,6 +1160,7 @@ pub(crate) fn prepare_legacy_restore_payloads(
                 if !asset_keys.insert(("inlay".to_owned(), id.to_owned())) {
                     return Err(invalid("legacy backup contains a duplicate Inlay key"));
                 }
+                observer.item_started(&entry.logical_name);
                 asset_aliases.push(pocket_risu::prepare(
                     entry,
                     id,
@@ -910,30 +1169,41 @@ pub(crate) fn prepare_legacy_restore_payloads(
                     cas,
                     durable,
                     cancellation,
+                    observer,
                 )?);
+                observer.item_done();
             }
             continue;
         }
+        observer.item_started(&entry.logical_name);
         if let Some(key) = cold_key(&entry.logical_name) {
             if !cold_keys.insert(key.clone()) {
                 return Err(invalid(
                     "legacy backup contains a duplicate cold payload key",
                 ));
             }
-            cold_aliases.push(prepare_cold(entry, key, cas, durable, cancellation)?);
+            cold_aliases.push(prepare_cold(
+                entry,
+                key,
+                cas,
+                durable,
+                cancellation,
+                observer,
+            )?);
         } else if let Some(encoded_key) = inlay_key_hex(&entry.logical_name) {
-            let alias = prepare_inlay(entry, encoded_key, cas, durable, cancellation)?;
+            let alias = prepare_inlay(entry, encoded_key, cas, durable, cancellation, observer)?;
             if !asset_keys.insert((alias.kind.clone(), alias.key.clone())) {
                 return Err(invalid("legacy backup contains a duplicate Inlay key"));
             }
             asset_aliases.push(alias);
         } else {
-            let alias = prepare_asset(entry, cas, durable, cancellation)?;
+            let alias = prepare_asset(entry, cas, durable, cancellation, observer)?;
             if !asset_keys.insert((alias.kind.clone(), alias.key.clone())) {
                 return Err(invalid("legacy backup contains a duplicate asset key"));
             }
             asset_aliases.push(alias);
         }
+        observer.item_done();
     }
     check_cancelled(cancellation)?;
     Ok(PreparedLegacyRestorePayloads {
@@ -979,9 +1249,10 @@ fn prepare_asset(
     cas: &PayloadCas,
     durable: &mut DurableCasJob,
     cancellation: &dyn CancellationProbe,
+    observer: &dyn LegacyPrepareObserver,
 ) -> Result<AssetAlias, LocalBackupError> {
     let file = open_staged(entry)?;
-    let mut source = CancellationReader::new(file, cancellation);
+    let mut source = CancellationReader::observed(file, cancellation, observer);
     let payload = durable
         .prepare_reader(cas, &mut source, CasObjectRole::DirectObject)
         .map_err(|error| cancellation_io(error, cancellation))?;
@@ -1017,6 +1288,7 @@ fn prepare_inlay(
     cas: &PayloadCas,
     durable: &mut DurableCasJob,
     cancellation: &dyn CancellationProbe,
+    observer: &dyn LegacyPrepareObserver,
 ) -> Result<AssetAlias, LocalBackupError> {
     let expected_key = String::from_utf8(
         hex::decode(encoded_key).map_err(|_| invalid("invalid Inlay entry name"))?,
@@ -1055,7 +1327,7 @@ fn prepare_inlay(
     ) {
         return Err(invalid("legacy backup Inlay type is invalid"));
     }
-    let mut source = CancellationReader::new(file, cancellation);
+    let mut source = CancellationReader::observed(file, cancellation, observer);
     let payload = durable
         .prepare_reader(cas, &mut source, CasObjectRole::DirectObject)
         .map_err(|error| cancellation_io(error, cancellation))?;
@@ -1090,9 +1362,10 @@ fn prepare_cold(
     cas: &PayloadCas,
     durable: &mut DurableCasJob,
     cancellation: &dyn CancellationProbe,
+    observer: &dyn LegacyPrepareObserver,
 ) -> Result<ColdAlias, LocalBackupError> {
     let file = open_staged(entry)?;
-    let source = CancellationReader::new(file, cancellation);
+    let source = CancellationReader::observed(file, cancellation, observer);
     let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(source));
     if !serde::de::Deserializer::deserialize_any(&mut deserializer, ColdRootVisitor).map_err(
         |_| {
@@ -1185,6 +1458,7 @@ impl<'de> Visitor<'de> for ColdRootVisitor {
 struct CancellationReader<'a, R> {
     inner: R,
     cancellation: &'a dyn CancellationProbe,
+    observer: Option<&'a dyn LegacyPrepareObserver>,
 }
 
 impl<'a, R> CancellationReader<'a, R> {
@@ -1192,6 +1466,19 @@ impl<'a, R> CancellationReader<'a, R> {
         Self {
             inner,
             cancellation,
+            observer: None,
+        }
+    }
+
+    fn observed(
+        inner: R,
+        cancellation: &'a dyn CancellationProbe,
+        observer: &'a dyn LegacyPrepareObserver,
+    ) -> Self {
+        Self {
+            inner,
+            cancellation,
+            observer: Some(observer),
         }
     }
 }
@@ -1204,7 +1491,11 @@ impl<R: Read> Read for CancellationReader<'_, R> {
                 "legacy backup operation was cancelled",
             ));
         }
-        self.inner.read(buffer)
+        let read = self.inner.read(buffer)?;
+        if let Some(observer) = self.observer {
+            observer.item_bytes(read as u64);
+        }
+        Ok(read)
     }
 }
 
@@ -1279,7 +1570,7 @@ mod tests {
     };
     use crate::native_file_jobs::content::content_classification_limits;
     use crate::native_file_jobs::{
-        character_json_export::export_character_json, JobKind, JobRegistry,
+        character_json_export::export_character_json, JobKind, JobRegistry, JobState,
     };
     use crate::persistent_store::{
         AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState, ColdPayloadAuthorityState,
@@ -1381,6 +1672,105 @@ mod tests {
             blocks.push((block_type, name, value));
         }
         blocks
+    }
+
+    #[test]
+    fn legacy_restore_progress_charges_read_prepare_and_database_against_one_budget() {
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreLegacyLocalBackup)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let progress = LegacyRestoreProgress::new(&job, 1_000);
+
+        progress.entry_started("assets/portrait.png", 300, 0);
+        progress.bytes_read(300);
+        progress.entry_started("inlay/picture.webp", 200, 1);
+        progress.entry_started("inlay_sidecar/picture", 10, 2);
+        progress.entry_started("inlay_meta/picture", 10, 3);
+        progress.entry_started("inlay_thumb/picture", 10, 4);
+        progress.entry_started("coldstorage/cold-1.json", 40, 5);
+        progress.entry_started("database.risudat", 430, 6);
+        progress.bytes_read(1_000);
+        progress.entries_complete(7);
+
+        let status = job.status();
+        assert_eq!(
+            status.progress,
+            JobProgress {
+                completed_bytes: 1_000,
+                total_bytes: Some(2_000),
+                completed_items: 7,
+                total_items: Some(7),
+            }
+        );
+        let detail = status.detail.expect("archive read reports detail");
+        assert_eq!(detail.stage, JobStage::ReadingArchive);
+        assert_eq!(detail.stage_unit, StageUnit::Bytes);
+        assert_eq!(
+            (detail.stage_completed, detail.stage_total),
+            (1_000, Some(1_000))
+        );
+        assert!(detail.current_item.is_none());
+        assert_eq!(
+            detail.counts,
+            ImportCounts {
+                entries_read: 7,
+                entries_total: Some(7),
+                assets: 1,
+                pocket_media: 1,
+                pocket_metadata: 2,
+                skipped: 1,
+                cold_storage: 1,
+                ..ImportCounts::default()
+            }
+        );
+
+        progress.begin(3);
+        progress.item_started("assets/portrait.png");
+        let started = job.status().detail.unwrap();
+        assert_eq!(started.stage, JobStage::PreparingAttachments);
+        assert_eq!(started.current_item.as_deref(), Some("assets/portrait.png"));
+        progress.item_bytes(300);
+        progress.item_done();
+
+        let status = job.status();
+        assert_eq!(status.progress.completed_bytes, 1_300);
+        assert_eq!(status.progress.total_bytes, Some(2_000));
+        assert_eq!(status.progress.completed_items, 7);
+        let detail = status.detail.unwrap();
+        assert_eq!(detail.stage, JobStage::PreparingAttachments);
+        assert_eq!(detail.stage_unit, StageUnit::Items);
+        assert_eq!((detail.stage_completed, detail.stage_total), (1, Some(3)));
+        assert_eq!(detail.counts.attachments_prepared, 1);
+        assert!(detail.current_item.is_none());
+
+        let scale = progress.restore_scale();
+        assert_eq!(scale.base_bytes, 1_300);
+        assert_eq!(scale.total_bytes, Some(2_000));
+        assert_eq!(scale.fixed_items, Some((7, Some(7))));
+        assert_eq!(scale.counts.cold_storage, 1);
+    }
+
+    #[test]
+    fn legacy_restore_progress_never_exceeds_its_budget_or_reports_backwards() {
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreLegacyLocalBackup)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let progress = LegacyRestoreProgress::new(&job, 100);
+        progress.entry_started("assets/a.png", 100, 0);
+        progress.bytes_read(100);
+        progress.entries_complete(1);
+        progress.begin(1);
+        progress.item_started("assets/a.png");
+        // A reader that overshoots (for example a re-read) is clamped to the archive size.
+        progress.item_bytes(150);
+        progress.item_done();
+        let status = job.status();
+        assert_eq!(status.progress.completed_bytes, 200);
+        assert_eq!(status.progress.total_bytes, Some(200));
+        assert_eq!(status.state, JobState::Running);
+        assert_eq!(progress.restore_scale().base_bytes, 200);
     }
 
     #[test]

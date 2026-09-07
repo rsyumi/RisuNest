@@ -13,7 +13,7 @@ use crate::{
     },
     native_file_jobs::{
         restore::{self as block_restore, ReplacementSink, RestoreControl},
-        JobPhase, JobProgress,
+        JobDetail, JobPhase, JobProgress,
     },
     persistent_store::{
         materialized_asset_owner_entries, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
@@ -524,6 +524,10 @@ impl RestoreControl for LosslessRestoreControl<'_> {
     }
 
     fn set_progress(&self, _progress: JobProgress) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_detail(&self, _detail: JobDetail) -> Result<(), String> {
         Ok(())
     }
 }

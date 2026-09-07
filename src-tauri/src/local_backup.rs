@@ -81,6 +81,18 @@ impl CancellationProbe for NeverCancelled {
     }
 }
 
+/// Observes archive parsing so a job can report entry-level progress. The
+/// methods take `&self` so one object can double as the cancellation probe.
+pub(crate) trait LocalBackupParseObserver {
+    fn entry_started(&self, _logical_name: &str, _byte_length: u64, _index: usize) {}
+    fn bytes_read(&self, _total_read: u64) {}
+    fn entries_complete(&self, _count: usize) {}
+}
+
+pub(crate) struct NoopParseObserver;
+
+impl LocalBackupParseObserver for NoopParseObserver {}
+
 pub(crate) struct AtomicCancellation {
     cancelled: Arc<AtomicBool>,
 }
@@ -132,6 +144,24 @@ pub(crate) fn parse_legacy_local_backup_v1(
     payload_target: PayloadTarget<'_>,
     database_restore: &mut dyn StrictLocalBackupDatabaseRestore,
     cancellation: &dyn CancellationProbe,
+) -> Result<LegacyLocalBackupParseReport, LocalBackupError> {
+    parse_legacy_local_backup_v1_observed(
+        reader,
+        job_staging_root,
+        payload_target,
+        database_restore,
+        cancellation,
+        &NoopParseObserver,
+    )
+}
+
+pub(crate) fn parse_legacy_local_backup_v1_observed(
+    reader: &mut impl Read,
+    job_staging_root: &Path,
+    payload_target: PayloadTarget<'_>,
+    database_restore: &mut dyn StrictLocalBackupDatabaseRestore,
+    cancellation: &dyn CancellationProbe,
+    observer: &dyn LocalBackupParseObserver,
 ) -> Result<LegacyLocalBackupParseReport, LocalBackupError> {
     check_cancelled(cancellation)?;
     let staging_directory = prepare_staging_directory(job_staging_root)?;
@@ -190,6 +220,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
             "truncated legacy backup entry length",
         )?;
         let byte_length = u32::from_le_bytes(length_bytes) as u64;
+        observer.entry_started(&logical_name, byte_length, entries.len());
         let staged = if is_database || matches!(payload_target, PayloadTarget::JobStaging) {
             stage_entry(
                 &mut source,
@@ -197,13 +228,21 @@ pub(crate) fn parse_legacy_local_backup_v1(
                 logical_name,
                 byte_length,
                 cancellation,
+                observer,
                 &mut staging_ownership,
             )?
         } else {
             let PayloadTarget::ImmutableCas(cas) = payload_target else {
                 unreachable!("payload target was matched above")
             };
-            prepare_entry_in_cas(&mut source, cas, logical_name, byte_length, cancellation)?
+            prepare_entry_in_cas(
+                &mut source,
+                cas,
+                logical_name,
+                byte_length,
+                cancellation,
+                observer,
+            )?
         };
         if is_database {
             database_index = Some(entries.len());
@@ -218,6 +257,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
         )
     })?;
     check_cancelled(cancellation)?;
+    observer.entries_complete(entries.len());
     database_restore.restore_database(&entries[database_index], &entries)?;
     staging_ownership.release();
 
@@ -254,6 +294,7 @@ fn stage_entry(
     logical_name: String,
     byte_length: u64,
     cancellation: &dyn CancellationProbe,
+    observer: &dyn LocalBackupParseObserver,
     staging_ownership: &mut ParseStagingOwnership,
 ) -> Result<StagedLocalBackupEntry, LocalBackupError> {
     let staged_path = staging_directory.join(format!("{}.entry", uuid::Uuid::new_v4()));
@@ -285,6 +326,7 @@ fn stage_entry(
             .map_err(LocalBackupError::io)?;
         hasher.update(&buffer[..read]);
         remaining -= read as u64;
+        observer.bytes_read(source.bytes_read);
     }
     check_cancelled(cancellation)?;
     output.flush().map_err(LocalBackupError::io)?;
@@ -307,12 +349,14 @@ fn prepare_entry_in_cas(
     logical_name: String,
     byte_length: u64,
     cancellation: &dyn CancellationProbe,
+    observer: &dyn LocalBackupParseObserver,
 ) -> Result<StagedLocalBackupEntry, LocalBackupError> {
     check_cancelled(cancellation)?;
     let mut entry_reader = DeclaredEntryReader {
         source,
         remaining: byte_length,
         cancellation,
+        observer,
     };
     let prepared = cas.prepare_reader(&mut entry_reader).map_err(|error| {
         if cancellation.is_cancelled() {
@@ -346,6 +390,7 @@ struct DeclaredEntryReader<'a, 'b, R> {
     source: &'a mut TrackedReader<'b, R>,
     remaining: u64,
     cancellation: &'a dyn CancellationProbe,
+    observer: &'a dyn LocalBackupParseObserver,
 }
 
 impl<R: Read> Read for DeclaredEntryReader<'_, '_, R> {
@@ -369,6 +414,7 @@ impl<R: Read> Read for DeclaredEntryReader<'_, '_, R> {
             ));
         }
         self.remaining -= read as u64;
+        self.observer.bytes_read(self.source.bytes_read);
         Ok(read)
     }
 }

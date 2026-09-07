@@ -2681,6 +2681,174 @@ pub(crate) struct JobProgress {
     pub(crate) total_items: Option<u64>,
 }
 
+/// Sub-phase of an import job, in the order the work happens. The renderer's
+/// progress dialog shows one row per stage; the ordering is also what
+/// `set_detail` enforces, so a job can never report an earlier stage again.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum JobStage {
+    ReadingArchive,
+    PreparingAttachments,
+    ReadingDatabase,
+    DecodingDatabase,
+    StagingCharacters,
+    FinalizingStaging,
+    AwaitingActivation,
+    Activating,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum StageUnit {
+    Bytes,
+    Items,
+}
+
+/// Running totals of what an import has classified so far. Every counter is
+/// monotonic for the life of the job; the `*_total` fields are learned once.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportCounts {
+    pub(crate) entries_read: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) entries_total: Option<u64>,
+    pub(crate) assets: u64,
+    pub(crate) inlays: u64,
+    pub(crate) cold_storage: u64,
+    pub(crate) pocket_media: u64,
+    pub(crate) pocket_metadata: u64,
+    pub(crate) skipped: u64,
+    pub(crate) attachments_prepared: u64,
+    pub(crate) characters: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) characters_total: Option<u64>,
+    pub(crate) presets: u64,
+    pub(crate) blocks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JobDetail {
+    pub(crate) stage: JobStage,
+    pub(crate) stage_completed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stage_total: Option<u64>,
+    pub(crate) stage_unit: StageUnit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) current_item: Option<String>,
+    pub(crate) counts: ImportCounts,
+}
+
+const MAX_CURRENT_ITEM_CHARS: usize = 120;
+
+impl JobDetail {
+    pub(crate) fn new(
+        stage: JobStage,
+        stage_unit: StageUnit,
+        stage_completed: u64,
+        stage_total: Option<u64>,
+        counts: ImportCounts,
+    ) -> Self {
+        Self {
+            stage,
+            stage_completed,
+            stage_total,
+            stage_unit,
+            current_item: None,
+            counts,
+        }
+    }
+
+    pub(crate) fn with_current_item(mut self, item: impl Into<String>) -> Self {
+        self.current_item = Some(item.into());
+        self
+    }
+
+    /// Starts the next stage while carrying the counters forward.
+    pub(crate) fn advance(
+        &self,
+        stage: JobStage,
+        stage_unit: StageUnit,
+        stage_total: Option<u64>,
+    ) -> Self {
+        Self::new(stage, stage_unit, 0, stage_total, self.counts.clone())
+    }
+
+    fn bounded(mut self) -> Self {
+        if let Some(item) = self.current_item.as_mut() {
+            let chars = item.chars().count();
+            if chars > MAX_CURRENT_ITEM_CHARS {
+                let tail: String = item
+                    .chars()
+                    .skip(chars - (MAX_CURRENT_ITEM_CHARS - 1))
+                    .collect();
+                *item = format!("…{tail}");
+            }
+        }
+        self
+    }
+}
+
+/// Detail for the activation hand-off, carrying the counts the restore gathered.
+fn activation_detail(previous: Option<&JobDetail>, stage: JobStage) -> JobDetail {
+    match previous {
+        Some(previous) => previous.advance(stage, StageUnit::Items, None),
+        None => JobDetail::new(stage, StageUnit::Items, 0, None, ImportCounts::default()),
+    }
+}
+
+fn validate_detail_transition(
+    previous: Option<&JobDetail>,
+    next: &JobDetail,
+) -> Result<(), String> {
+    if next
+        .stage_total
+        .is_some_and(|total| next.stage_completed > total)
+    {
+        return Err("native job stage progress exceeds its total".to_owned());
+    }
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if next.stage < previous.stage {
+        return Err("native job stage cannot move backwards".to_owned());
+    }
+    if next.stage == previous.stage
+        && (next.stage_completed < previous.stage_completed
+            || previous
+                .stage_total
+                .is_some_and(|total| next.stage_total != Some(total)))
+    {
+        return Err("native job stage progress is invalid or non-monotonic".to_owned());
+    }
+    let before = &previous.counts;
+    let after = &next.counts;
+    let counters = [
+        (before.entries_read, after.entries_read),
+        (before.assets, after.assets),
+        (before.inlays, after.inlays),
+        (before.cold_storage, after.cold_storage),
+        (before.pocket_media, after.pocket_media),
+        (before.pocket_metadata, after.pocket_metadata),
+        (before.skipped, after.skipped),
+        (before.attachments_prepared, after.attachments_prepared),
+        (before.characters, after.characters),
+        (before.presets, after.presets),
+        (before.blocks, after.blocks),
+    ];
+    if counters.iter().any(|(old, new)| new < old)
+        || before
+            .entries_total
+            .is_some_and(|total| after.entries_total != Some(total))
+        || before
+            .characters_total
+            .is_some_and(|total| after.characters_total != Some(total))
+    {
+        return Err("native job import counts cannot decrease".to_owned());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JobStatus {
@@ -2689,6 +2857,8 @@ pub(crate) struct JobStatus {
     pub(crate) state: JobState,
     pub(crate) phase: JobPhase,
     pub(crate) progress: JobProgress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<JobDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expected_revision: Option<i64>,
     pub(crate) warning_codes: Vec<String>,
@@ -2821,6 +2991,7 @@ impl JobRegistry {
                 state: JobState::Queued,
                 phase: JobPhase::Queued,
                 progress: JobProgress::default(),
+                detail: None,
                 expected_revision,
                 warning_codes,
                 result: None,
@@ -3053,6 +3224,10 @@ impl JobControl {
         wait.restore_finalized = true;
         status.state = JobState::Running;
         status.phase = JobPhase::ActivatingDatabase;
+        status.detail = Some(activation_detail(
+            status.detail.as_ref(),
+            JobStage::Activating,
+        ));
         drop(wait);
         drop(status);
         self.wait_changed.notify_all();
@@ -3081,10 +3256,18 @@ impl JobControl {
             }
             if !self.requires_restore_finalization {
                 status.phase = JobPhase::ActivatingDatabase;
+                status.detail = Some(activation_detail(
+                    status.detail.as_ref(),
+                    JobStage::Activating,
+                ));
                 return Ok(());
             }
             status.state = JobState::WaitingForInput;
             status.phase = JobPhase::AwaitingActivation;
+            status.detail = Some(activation_detail(
+                status.detail.as_ref(),
+                JobStage::AwaitingActivation,
+            ));
         }
 
         let mut wait = self
@@ -3288,6 +3471,23 @@ impl JobControl {
             return Err("native job progress is invalid or non-monotonic".to_owned());
         }
         status.progress = progress;
+        Ok(())
+    }
+
+    /// Records the import sub-stage, its own progress, and the running counts.
+    /// Stages only move forward and counters only grow, so a stale or reordered
+    /// report is rejected instead of making the dialog go backwards.
+    pub(crate) fn set_detail(&self, detail: JobDetail) -> Result<(), String> {
+        let detail = detail.bounded();
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.state != JobState::Running {
+            return Err("native job detail requires a running job".to_owned());
+        }
+        validate_detail_transition(status.detail.as_ref(), &detail)?;
+        status.detail = Some(detail);
         Ok(())
     }
 
@@ -6093,6 +6293,197 @@ mod tests {
         job.start(JobPhase::ReadingSource).unwrap();
         job.finish_success(result(1)).unwrap();
         assert!(expiring.status(&id).is_err());
+    }
+
+    fn detail(
+        stage: JobStage,
+        completed: u64,
+        total: Option<u64>,
+        counts: ImportCounts,
+    ) -> JobDetail {
+        JobDetail::new(stage, StageUnit::Items, completed, total, counts)
+    }
+
+    #[test]
+    fn import_detail_only_moves_forward_and_keeps_counts_monotonic() {
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreLegacyLocalBackup)
+            .unwrap();
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingArchive,
+                0,
+                None,
+                ImportCounts::default()
+            ))
+            .is_err());
+        job.start(JobPhase::ReadingSource).unwrap();
+
+        let mut counts = ImportCounts {
+            entries_read: 3,
+            assets: 2,
+            ..ImportCounts::default()
+        };
+        job.set_detail(
+            detail(JobStage::ReadingArchive, 10, Some(100), counts.clone())
+                .with_current_item("assets/portrait.png"),
+        )
+        .unwrap();
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingArchive,
+                9,
+                Some(100),
+                counts.clone()
+            ))
+            .is_err());
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingArchive,
+                10,
+                Some(200),
+                counts.clone()
+            ))
+            .is_err());
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingArchive,
+                500,
+                Some(100),
+                counts.clone()
+            ))
+            .is_err());
+        counts.assets = 1;
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingArchive,
+                20,
+                Some(100),
+                counts.clone()
+            ))
+            .is_err());
+        counts.assets = 2;
+        counts.entries_total = Some(3);
+        job.set_detail(detail(
+            JobStage::ReadingArchive,
+            100,
+            Some(100),
+            counts.clone(),
+        ))
+        .unwrap();
+        counts.entries_total = Some(4);
+        assert!(job
+            .set_detail(detail(
+                JobStage::PreparingAttachments,
+                0,
+                Some(3),
+                counts.clone()
+            ))
+            .is_err());
+        counts.entries_total = Some(3);
+        job.set_detail(detail(
+            JobStage::PreparingAttachments,
+            0,
+            Some(2),
+            counts.clone(),
+        ))
+        .unwrap();
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingArchive,
+                100,
+                Some(100),
+                counts.clone()
+            ))
+            .is_err());
+        job.set_detail(detail(
+            JobStage::ReadingDatabase,
+            5,
+            Some(50),
+            counts.clone(),
+        ))
+        .unwrap();
+
+        let status = job.status();
+        let current = status.detail.expect("detail retained");
+        assert_eq!(current.stage, JobStage::ReadingDatabase);
+        assert_eq!(current.stage_completed, 5);
+        assert_eq!(current.counts.entries_total, Some(3));
+        assert!(current.current_item.is_none());
+    }
+
+    #[test]
+    fn import_detail_bounds_the_current_item_and_survives_terminal_states() {
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreLegacyLocalBackup)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let long_name = format!("inlay/{}.webp", "x".repeat(400));
+        job.set_detail(
+            detail(JobStage::ReadingArchive, 1, None, ImportCounts::default())
+                .with_current_item(long_name.clone()),
+        )
+        .unwrap();
+        let item = job.status().detail.unwrap().current_item.unwrap();
+        assert_eq!(item.chars().count(), MAX_CURRENT_ITEM_CHARS);
+        assert!(item.starts_with('…'));
+        assert!(item.ends_with(".webp"));
+
+        job.finish_failure("invalid-source", "synthetic").unwrap();
+        let terminal = job.status();
+        assert_eq!(terminal.state, JobState::Failed);
+        assert_eq!(terminal.detail.unwrap().stage, JobStage::ReadingArchive);
+        assert!(job
+            .set_detail(detail(
+                JobStage::ReadingDatabase,
+                0,
+                None,
+                ImportCounts::default()
+            ))
+            .is_err());
+    }
+
+    #[test]
+    fn activation_hand_off_records_its_stages_with_the_gathered_counts() {
+        let registry = JobRegistry::default();
+        // Only jobs created with a restore context wait for the renderer's finalize call.
+        let job = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(1), Vec::new())
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let counts = ImportCounts {
+            characters: 4,
+            presets: 1,
+            blocks: 9,
+            ..ImportCounts::default()
+        };
+        job.set_detail(detail(JobStage::FinalizingStaging, 0, None, counts.clone()))
+            .unwrap();
+        job.set_phase(JobPhase::StagingDatabase).unwrap();
+
+        let waiter = Arc::clone(&job);
+        let handle = std::thread::spawn(move || waiter.wait_for_restore_finalization());
+        loop {
+            let status = job.status();
+            if status.state == JobState::WaitingForInput {
+                assert_eq!(
+                    status.detail.as_ref().unwrap().stage,
+                    JobStage::AwaitingActivation
+                );
+                assert_eq!(status.detail.as_ref().unwrap().counts, counts);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            registry.finalize(&job.id()).unwrap(),
+            FinalizeOutcome::Requested
+        ));
+        handle.join().unwrap().unwrap();
+        let status = job.status();
+        assert_eq!(status.phase, JobPhase::ActivatingDatabase);
+        assert_eq!(status.detail.as_ref().unwrap().stage, JobStage::Activating);
+        assert_eq!(status.detail.as_ref().unwrap().counts, counts);
     }
 
     #[test]
