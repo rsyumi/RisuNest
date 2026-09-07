@@ -1,0 +1,70 @@
+{
+  "username": "Synthetic PocketRisu restore",
+  "characters": [
+    {
+      "type": "character",
+      "chaId": "synthetic-active",
+      "name": "Synthetic active",
+      "image": "assets/portrait.png",
+      "chats": [
+        {
+          "id": "synthetic-chat",
+          "name": "Synthetic chat",
+          "message": [
+            {
+              "role": "user",
+              "data": "{{inlay::picture}} {{inlay::voice}} {{inlay::movie}} {{inlay::signature}}"
+            }
+          ]
+        }
+      ],
+      "additionalAssets": [["module-art", "assets/module.png", "png"]],
+      "emotionImages": []
+    },
+    {
+      "type": "character",
+      "chaId": "synthetic-archived-inline",
+      "name": "Synthetic archived export",
+      "chats": [
+        {
+          "id": "archived-chat",
+          "name": "Archived chat",
+          "message": [
+            {
+              "role": "char",
+              "data": "Archived chat preserved"
+            }
+          ]
+        }
+      ],
+      "trashTime": 1234
+    }
+  ],
+  "botPresets": [
+    {
+      "id": "synthetic-preset",
+      "name": "Synthetic preset",
+      "apiType": "openai"
+    }
+  ],
+  "modules": [
+    {
+      "id": "synthetic-module",
+      "name": "Synthetic module",
+      "assets": [["art", "assets/module.png", "png"]]
+    }
+  ],
+  "plugins": [
+    {
+      "name": "synthetic-plugin",
+      "script": "// synthetic, never executed"
+    }
+  ],
+  "pluginCustomStorage": {
+    "synthetic-plugin": {
+      "text": "한글 보존",
+      "values": [1, false, null]
+    }
+  },
+  "loadouts": []
+}

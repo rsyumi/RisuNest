@@ -27,6 +27,10 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
+mod pocket_risu;
+#[cfg(test)]
+mod pocket_risu_tests;
+
 const DATABASE_ENTRY: &str = "database.risudat";
 const ENCRYPTION_ENTRY: &str = "encryption.risudat";
 const MAX_METADATA_BYTES: u32 = 1024 * 1024;
@@ -49,6 +53,8 @@ pub(crate) fn restore_legacy_local_backup(
     app: AppHandle,
     job: &JobControl,
 ) -> Result<JobResultSummary, NativeJobError> {
+    job.start(JobPhase::ReadingSource)
+        .map_err(job_state_error)?;
     let cas = PayloadCas::new(repository_root).map_err(io_job_error)?;
     let cancellation = JobCancellation(job);
     let mut callback = LegacyDatabaseRestore {
@@ -675,7 +681,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             durable: Mutex::new(durable),
             migration_id: format!("legacy-backup-{}", self.job.id()),
         };
-        let result = restore::restore_block_risu_save(
+        let result = restore::restore_started_risu_save_with_pre_activation(
             OpenedJobSource {
                 file,
                 total_bytes: database.byte_length,
@@ -683,6 +689,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             self.expected_revision,
             self.job,
             &sink,
+            || Ok(None),
         );
         match result {
             Ok(summary) => {
@@ -876,6 +883,7 @@ pub(crate) fn prepare_legacy_restore_payloads(
     cancellation: &dyn CancellationProbe,
 ) -> Result<PreparedLegacyRestorePayloads, LocalBackupError> {
     preflight_legacy_restore_entries(entries)?;
+    let pocket_metadata = pocket_risu::index_metadata(entries, cancellation)?;
     let mut asset_aliases = Vec::new();
     let mut cold_aliases = Vec::new();
     let mut asset_keys = HashSet::new();
@@ -887,6 +895,23 @@ pub(crate) fn prepare_legacy_restore_payloads(
             entry.logical_name.as_str(),
             DATABASE_ENTRY | ENCRYPTION_ENTRY
         ) {
+            continue;
+        }
+        if let Some(pocket_entry) = pocket_risu::classify(&entry.logical_name)? {
+            if let pocket_risu::Entry::Payload { id, ext } = pocket_entry {
+                if !asset_keys.insert(("inlay".to_owned(), id.to_owned())) {
+                    return Err(invalid("legacy backup contains a duplicate Inlay key"));
+                }
+                asset_aliases.push(pocket_risu::prepare(
+                    entry,
+                    id,
+                    ext,
+                    &pocket_metadata,
+                    cas,
+                    durable,
+                    cancellation,
+                )?);
+            }
             continue;
         }
         if let Some(key) = cold_key(&entry.logical_name) {
@@ -921,20 +946,8 @@ fn preflight_legacy_restore_entries(
     entries: &[StagedLocalBackupEntry],
 ) -> Result<(), LocalBackupError> {
     reject_account_encryption(entries)?;
-    reject_pocket_risu_entries(entries)
-}
-
-fn reject_pocket_risu_entries(entries: &[StagedLocalBackupEntry]) -> Result<(), LocalBackupError> {
-    if entries.iter().any(|entry| {
-        matches!(
-            entry.logical_name.split('/').next(),
-            Some("inlay" | "inlay_sidecar" | "inlay_info" | "inlay_meta" | "inlay_thumb")
-        )
-    }) {
-        return Err(LocalBackupError::new(
-            LocalBackupErrorCode::UnsupportedFormat,
-            "PocketRisu Inlay entries require the compatibility importer",
-        ));
+    for entry in entries {
+        pocket_risu::classify(&entry.logical_name)?;
     }
     Ok(())
 }
@@ -1935,12 +1948,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pocket_risu_inlays_before_preparing_any_payload_object() {
+    fn imports_pocket_risu_110_inlays_with_sidecars_after_payloads() {
         let directory = tempfile::tempdir().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let bytes = [
             entry(b"portrait.png", b"original"),
             entry(b"inlay/pocket.webp", b"webp"),
+            entry(b"inlay/voice.mp3", b"audio"),
+            entry(b"inlay_meta/pocket", br#"{"derived":true}"#),
+            entry(b"inlay_thumb/pocket", b"thumbnail"),
+            entry(
+                b"inlay_sidecar/pocket",
+                br#"{"ext":"webp","name":"original.webp","type":"image","width":2,"height":3}"#,
+            ),
+            entry(
+                b"inlay_sidecar/voice",
+                br#"{"ext":"mp3","name":"voice.mp3","type":"audio"}"#,
+            ),
             entry(b"database.risudat", b"RISUSAVE\0"),
         ]
         .concat();
@@ -1956,26 +1980,47 @@ mod tests {
             prepared: None,
         };
 
-        let error = parse_legacy_local_backup_v1(
+        parse_legacy_local_backup_v1(
             &mut Cursor::new(bytes),
             directory.path(),
             PayloadTarget::JobStaging,
             &mut planner,
             &NeverCancelled,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(
-            error.code,
-            crate::local_backup::LocalBackupErrorCode::UnsupportedFormat
-        );
-        assert_eq!(
-            fs::read_dir(directory.path().join("assets-v2/objects"))
-                .map(|entries| entries.count())
-                .unwrap_or(0),
-            0,
-        );
-        assert_eq!(planner.durable.pin_count(), 0);
+        let prepared = planner.prepared.take().unwrap();
+        assert_eq!(prepared.asset_aliases.len(), 3);
+        for (key, bytes, mime, inlay_type) in [
+            ("pocket", b"webp".as_slice(), "image/webp", "image"),
+            ("voice", b"audio".as_slice(), "audio/mpeg", "audio"),
+        ] {
+            let alias = prepared
+                .asset_aliases
+                .iter()
+                .find(|alias| alias.key == key)
+                .unwrap();
+            assert_eq!(alias.kind, "inlay");
+            assert_eq!(alias.mime, mime);
+            assert_eq!(alias.inlay_type.as_deref(), Some(inlay_type));
+            assert_eq!(
+                fs::read(
+                    cas.object_path(alias.object_hash.as_deref().unwrap())
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                bytes
+            );
+        }
+        let image = &prepared.asset_aliases[1];
+        assert_eq!(image.name, "original.webp");
+        assert_eq!((image.width, image.height), (Some(2), Some(3)));
+        assert!(!directory
+            .path()
+            .join("persistent/persistent.sqlite3")
+            .exists());
+        assert_eq!(planner.durable.pin_count(), 3);
         planner.durable.release(CasReleaseOutcome::Aborted).unwrap();
     }
 
