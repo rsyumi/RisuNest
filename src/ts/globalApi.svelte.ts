@@ -25,6 +25,7 @@ import { characterURLImport, hubURL, realmHubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
 import { saveDbKei } from "./kei/backup";
+import { measurePendingDataSize } from './storage/pendingDataSize';
 import { decodeRisuSave } from "./storage/risuSave";
 import { AutoStorage } from "./storage/autoStorage";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -434,30 +435,21 @@ function subscribeDeep(value: unknown): void {
     }
 }
 
-function measureJsonLength(read: () => unknown): number {
-    try {
-        return JSON.stringify(read())?.length ?? 0
-    } catch {
-        return 0
-    }
-}
-
 /**
- * Serializing the observed state on every keystroke is too expensive, so a full
- * measurement runs at most once per refresh window and dirty marks in between
- * reuse the last known estimate.
+ * Bound size hints at the immediate-flush threshold and reuse them between
+ * refreshes, avoiding full JSON copies of large stores on every keystroke.
  */
 export function createThrottledSizeEstimator(read: () => unknown): () => number {
     let lastEstimate = -1
     let timer: ReturnType<typeof setTimeout> | undefined
     return () => {
         if (lastEstimate < 0) {
-            lastEstimate = measureJsonLength(read)
+            lastEstimate = measurePendingDataSize(read)
         }
         else if (timer === undefined) {
             timer = setTimeout(() => {
                 timer = undefined
-                lastEstimate = measureJsonLength(read)
+                lastEstimate = measurePendingDataSize(read)
             }, SAVE_ESTIMATE_REFRESH_MS)
         }
         return lastEstimate

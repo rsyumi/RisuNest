@@ -19,6 +19,31 @@ afterEach(() => {
 })
 
 describe('live V2 plugin storage synchronization', () => {
+    it('reads a detached storage value without snapshotting unrelated database fields', () => {
+        const unrelated = vi.fn(() => ({ payload: 'unrelated' }))
+        const database = {
+            characters: [],
+            plugins: [],
+            botPresets: [],
+            pluginCustomStorage: { requested: { items: ['saved'] } },
+        } as unknown as Database
+        Object.defineProperty(database, 'unrelated', {
+            enumerable: true,
+            get: unrelated,
+        })
+        setDatabaseLite(database)
+        unrelated.mockClear()
+
+        const storage = getV2PluginAPIs().pluginStorage
+        const result = storage.getItem('requested') as { items: string[] }
+        result.items.push('detached')
+        expect(storage.getItem('missing')).toBeNull()
+        expect(getDatabase().pluginCustomStorage.requested).toEqual({
+            items: ['saved'],
+        })
+        expect(unrelated).not.toHaveBeenCalled()
+    })
+
     it.each(['custom-property', 'explicit-storage'] as const)(
         'keeps nested reactive %s writes readable by V3',
         async (access) => {

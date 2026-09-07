@@ -30,6 +30,7 @@ import {
     replacePersistentDatabase,
 } from "../storage/persistentDataRuntime.svelte";
 import { getPersistentDataStore } from "../storage/persistentDataStoreFactory";
+import { capturePersistentPluginStorage } from "../storage/persistentDataRuntime";
 import { workingSetResidency } from "../storage/workingSetResidency";
 import {
     createPluginStorageStore,
@@ -510,6 +511,10 @@ function scheduleWorkingSetReleaseRetry(retry: () => void): () => void {
 export const pluginStorageStore = createPluginStorageStore({
     store: getPersistentDataStore,
     mutate: (mutations) => mutatePersistentPluginStorage('plugin-v3-storage', mutations),
+    readCompatibilityStorage: () =>
+        !pluginCompatibility.allowsEviction
+            ? capturePersistentPluginStorage(getDatabase())
+            : null,
 })
 registerPluginStorageLifecycle(pluginStorageStore)
 
@@ -917,9 +922,8 @@ export const getV2PluginAPIs = () => {
         },
         pluginStorage: {
             getItem: (key: string) => {
-                const db = getDatabase({ snapshot: true });
-                db.pluginCustomStorage ??= {}
-                return readCompatibilityPluginStorageValue(db.pluginCustomStorage, key);
+                const storage = getDatabase().pluginCustomStorage ?? {};
+                return $state.snapshot(readCompatibilityPluginStorageValue(storage, key));
             },
             setItem: (key: string, value: string) => {
                 const db = getDatabase();

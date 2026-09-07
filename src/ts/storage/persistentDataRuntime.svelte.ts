@@ -53,7 +53,15 @@ import {
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
-import { notifyPluginStorageAuthorityReplacement } from '../plugins/pluginStorageStore'
+import {
+    notifyPluginStorageAuthorityReplacement,
+    notifyPluginStorageCompatibilityMutation,
+    notifyPluginStorageCompatibilityOrder,
+} from '../plugins/pluginStorageStore'
+import {
+    applyPluginStorageMutationsInPlace,
+    orderPluginStorageKeys,
+} from './saveCoordinatorHelpers'
 import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
 import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
 import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
@@ -82,6 +90,16 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         publishPluginStorageWorkingSet(storage) {
             getDatabase().pluginCustomStorage = storage
             notifyPluginStorageAuthorityReplacement(storage)
+        },
+        publishPluginStorageMutations(mutations, keys) {
+            const storage = (getDatabase().pluginCustomStorage ??= {})
+            applyPluginStorageMutationsInPlace(storage, mutations)
+            const ordered = orderPluginStorageKeys(storage, keys)
+            if (ordered !== storage) getDatabase().pluginCustomStorage = ordered
+            for (const mutation of mutations) {
+                notifyPluginStorageCompatibilityMutation(mutation)
+            }
+            notifyPluginStorageCompatibilityOrder(keys)
         },
         capturePresets() {
             return capturePersistentPresets(getDatabase())

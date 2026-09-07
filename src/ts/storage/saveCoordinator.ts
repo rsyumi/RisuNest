@@ -29,6 +29,8 @@ import type {
 import { safeStructuredClone } from '../polyfill'
 import {
     applyPluginStorageMutations,
+    orderPluginStorageKeys,
+    PluginStorageBaseline,
     canonicalClone,
     canonicalDatabaseClone,
     canonicalJson,
@@ -41,10 +43,15 @@ import {
     splitDatabase,
 } from './saveCoordinatorHelpers'
 
+import {
+    capturePluginMutationScope,
+    rebasePluginMutationPublication,
+} from './pluginMutationPublication'
+import { PENDING_SAVE_BYTE_LIMIT as PENDING_BYTE_LIMIT } from './pendingDataSize'
+
 export { canonicalJson }
 
 const SAVE_DEBOUNCE_MS = 500
-const PENDING_BYTE_LIMIT = 1_048_576
 /** Official publishes upload the full database snapshot, so they are spaced like upstream's save loop. */
 const OFFICIAL_PUBLISH_MIN_INTERVAL_MS = 3_000
 const CONCURRENT_CHARACTER_COMPENSATION_ATTEMPTS = 3
@@ -72,6 +79,10 @@ export interface SaveCoordinatorDependencies {
     captureRoot(): RootDatabase
     capturePluginStorage?(): Database['pluginCustomStorage'] | null
     publishPluginStorageWorkingSet?(storage: Database['pluginCustomStorage']): void
+    publishPluginStorageMutations?(
+        mutations: readonly PluginStorageMutation[],
+        keys: readonly string[],
+    ): void
     capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
     captureSelectedConversationAuthority?(): WindowedConversationPersistenceAuthority | null
@@ -416,7 +427,14 @@ export class SaveCoordinator {
     private currentRevision: DataRevision | null = null
     private authorityEpoch = 0
     private rootBaseline: string | null = null
-    private pluginStorageBaseline: string | null = null
+    private pluginStorageBaselineEntries: PluginStorageBaseline | null = null
+    private get pluginStorageBaseline(): string | null {
+        return this.pluginStorageBaselineEntries?.json ?? null
+    }
+    private set pluginStorageBaseline(value: string | null) {
+        this.pluginStorageBaselineEntries =
+            value === null ? null : new PluginStorageBaseline(value)
+    }
     private presetsBaseline: string | null = null
     private characterBaseline: string | null = null
     private characterBaselineId: string | null = null
@@ -1161,31 +1179,62 @@ export class SaveCoordinator {
             await this.flushIterations(reason, true)
             if (mutations.length === 0) return
             const revision = this.revision
-            const baseline = this.pluginStorageBaseline === null
-                ? null
-                : JSON.parse(this.pluginStorageBaseline) as Database['pluginCustomStorage']
-            const committedStorage = applyPluginStorageMutations(baseline ?? {}, mutations)
-            const liveBeforeCommit = this.capture().pluginStorage
+            const baseline = this.pluginStorageBaselineEntries
+            const committedMutations = canonicalClone(
+                mutations,
+            ) as PluginStorageMutation[]
+            const readLiveStorage = () =>
+                this.dependencies.capturePluginStorage
+                    ? this.dependencies.capturePluginStorage()
+                    : ((
+                          this.dependencies.captureRoot() as RootDatabase & {
+                              pluginCustomStorage?: Database['pluginCustomStorage']
+                          }
+                      ).pluginCustomStorage ?? null)
+            const liveBeforeCommit =
+                baseline === null ? null : readLiveStorage()
+            const beforeScope =
+                liveBeforeCommit === null
+                    ? null
+                    : capturePluginMutationScope(
+                          liveBeforeCommit,
+                          committedMutations,
+                      )
             const committed = await this.dependencies.store.commit({
                 expectedRevision: revision,
-                pluginStorage: canonicalClone(mutations) as PluginStorageMutation[],
+                pluginStorage: committedMutations,
             })
             this.currentRevision = committed.revision
             this.dirtyGeneration++
             if (baseline !== null) {
-                this.pluginStorageBaseline = pluginStorageJson(committedStorage)
-                const liveAfterCommit = this.capture().pluginStorage
-                const publishedStorage =
-                    liveBeforeCommit !== null && liveAfterCommit !== null
-                        ? rebaseConcurrentPluginStorage(
-                            liveBeforeCommit,
+                baseline.apply(committedMutations)
+                const liveAfterCommit = readLiveStorage()
+                if (beforeScope !== null && liveAfterCommit !== null) {
+                    const publication = rebasePluginMutationPublication(
+                        committedMutations,
+                        beforeScope,
+                        capturePluginMutationScope(
                             liveAfterCommit,
-                            committedStorage,
+                            committedMutations,
+                        ),
+                    )
+                    if (this.dependencies.publishPluginStorageMutations) {
+                        this.dependencies.publishPluginStorageMutations(
+                            publication.mutations,
+                            publication.keys,
                         )
-                        : committedStorage
-                this.dependencies.publishPluginStorageWorkingSet?.(
-                    publishedStorage,
-                )
+                    } else {
+                        this.dependencies.publishPluginStorageWorkingSet?.(
+                            orderPluginStorageKeys(
+                                applyPluginStorageMutations(
+                                    liveAfterCommit,
+                                    publication.mutations,
+                                ),
+                                publication.keys,
+                            ),
+                        )
+                    }
+                }
             }
             this.dependencies.onLocalRevision?.(committed.revision)
             this.pendingByteCount = 0
@@ -2040,6 +2089,7 @@ export class SaveCoordinator {
             const captured = this.capture()
             const pendingConversationMutations = [...this.pendingConversationMutations]
             const windowedCapture = this.requireMatchingWindowedCapture(captured)
+            let yieldedAfterCapture = windowedCapture !== null
             const selectionSwitched =
                 windowedCapture === null &&
                 captured.character !== null &&
@@ -2134,6 +2184,7 @@ export class SaveCoordinator {
                 commit.addCharacter ||
                 commit.conversations
             ) {
+                yieldedAfterCapture = true
                 const committedConversationKeys = new Set(
                     (commit.conversations ?? []).map(
                         (mutation) => `${mutation.characterId}\u0000${mutation.conversationId}`,
@@ -2235,7 +2286,9 @@ export class SaveCoordinator {
                 !commit.replaceCharacter
             ) this.setCharacterBaseline(captured)
 
-            const current = this.capture()
+            // With no await or commit, the live state cannot have changed between
+            // these captures. Reuse the snapshot instead of serializing it twice.
+            const current = yieldedAfterCapture ? this.capture() : captured
             const currentAddition = this.capturePendingAddition()
             if (
                 generation === this.dirtyGeneration &&

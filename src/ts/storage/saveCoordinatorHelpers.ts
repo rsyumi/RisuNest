@@ -329,17 +329,25 @@ export function rebaseConcurrentLiveDelta<T>(base: T, live: T, candidate: T): T 
             }
             if (!liveHasKey) continue
             if (!baseHasKey) {
-                candidateRecord[key] = canonicalClone(liveRecord[key])
+                defineOwnEnumerableProperty(
+                    candidateRecord,
+                    key,
+                    canonicalClone(liveRecord[key]),
+                )
                 continue
             }
             if (!canonicalValuesEqual(baseRecord[key], liveRecord[key])) {
-                candidateRecord[key] = Object.hasOwn(candidateRecord, key)
-                    ? rebaseConcurrentLiveDelta(
-                        baseRecord[key],
-                        liveRecord[key],
-                        candidateRecord[key],
-                    )
-                    : canonicalClone(liveRecord[key])
+                defineOwnEnumerableProperty(
+                    candidateRecord,
+                    key,
+                    Object.hasOwn(candidateRecord, key)
+                        ? rebaseConcurrentLiveDelta(
+                              baseRecord[key],
+                              liveRecord[key],
+                              candidateRecord[key],
+                          )
+                        : canonicalClone(liveRecord[key]),
+                )
             }
         }
         return candidateRecord as T
@@ -416,20 +424,82 @@ export function applyPluginStorageMutations(
     mutations: readonly PluginStorageMutation[],
 ): Database['pluginCustomStorage'] {
     const next = pluginStorageClone(storage)
+    applyPluginStorageMutationsInPlace(next, mutations)
+    return next
+}
+
+/** Detached canonical values, updated by key without rebuilding a large baseline. */
+export class PluginStorageBaseline {
+    private readonly entries = new Map<string, string>()
+    private serialized: string | undefined
+
+    constructor(serialized: string) {
+        const storage = JSON.parse(serialized) as Record<string, unknown>
+        for (const key of Object.keys(storage)) {
+            this.entries.set(key, JSON.stringify(storage[key]))
+        }
+        this.serialized = serialized
+    }
+
+    apply(mutations: readonly PluginStorageMutation[]): void {
+        for (const mutation of mutations) {
+            if (mutation.type === 'clear') this.entries.clear()
+            else if (mutation.type === 'delete')
+                this.entries.delete(mutation.key)
+            else this.entries.set(mutation.key, canonicalJson(mutation.value))
+        }
+        this.serialized = undefined
+    }
+
+    get json(): string {
+        // Object.keys supplies JavaScript's integer-key ordering after insertions.
+        return (this.serialized ??= `{${Object.keys(
+            Object.fromEntries(this.entries),
+        )
+            .map((key) => `${JSON.stringify(key)}:${this.entries.get(key)}`)
+            .join(',')}}`)
+    }
+}
+
+/** Svelte's original property order cannot be changed by delete/reinsert. */
+export function orderPluginStorageKeys<T extends Record<string, unknown>>(
+    storage: T,
+    keys: readonly string[],
+): T {
+    const current = Object.keys(storage)
+    if (
+        current.length === keys.length &&
+        current.every((key, index) => key === keys[index])
+    )
+        return storage
+    const ordered = {} as T
+    for (const key of keys) {
+        if (Object.hasOwn(storage, key))
+            defineOwnEnumerableProperty(ordered, key, storage[key])
+    }
+    return ordered
+}
+
+/** Applies detached values without cloning unrelated keys in a resident store. */
+export function applyPluginStorageMutationsInPlace(
+    next: Database['pluginCustomStorage'],
+    mutations: readonly PluginStorageMutation[],
+): void {
     for (const mutation of mutations) {
         if (mutation.type === 'clear') {
             for (const key of Object.keys(next)) delete next[key]
         } else if (mutation.type === 'delete') {
             delete next[mutation.key]
         } else {
-            defineOwnEnumerableProperty(
-                next,
-                mutation.key,
-                canonicalClone(mutation.value),
-            )
+            const value = canonicalClone(mutation.value)
+            // Assignment subscribes new keys and wraps nested values in Svelte.
+            // Shadow inherited names first to avoid the __proto__ setter.
+            if (!Object.hasOwn(next, mutation.key) && mutation.key in next) {
+                defineOwnEnumerableProperty(next, mutation.key, value)
+            }
+            next[mutation.key] = value
         }
     }
-    return next
 }
 
 export function rebaseConcurrentPluginStorage(

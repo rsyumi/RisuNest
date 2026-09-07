@@ -243,6 +243,10 @@ export interface PersistentDataRuntimeStateAdapter {
     captureRoot(): RootDatabase
     capturePluginStorage?(): Database['pluginCustomStorage'] | null
     publishPluginStorageWorkingSet?(storage: Database['pluginCustomStorage']): void
+    publishPluginStorageMutations?(
+        mutations: readonly PluginStorageMutation[],
+        keys: readonly string[],
+    ): void
     capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
     captureCharacter(id: string): CompleteCharacter | null
@@ -525,6 +529,7 @@ export function createPersistentDataRuntime(
         captureRoot: dependencies.state.captureRoot,
         capturePluginStorage: dependencies.state.capturePluginStorage,
         publishPluginStorageWorkingSet: dependencies.state.publishPluginStorageWorkingSet,
+        publishPluginStorageMutations: dependencies.state.publishPluginStorageMutations,
         capturePresets: dependencies.state.capturePresets,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureSelectedConversationAuthority: () =>

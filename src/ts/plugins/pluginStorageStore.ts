@@ -15,6 +15,8 @@ export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
 interface PluginStorageStoreDependencies {
     store: PersistentDataStore | (() => PersistentDataStore)
     mutate(mutations: PluginStorageMutation[]): Promise<void>
+    /** Hydrated maximum-compatibility state, or null for revisioned/cache reads. */
+    readCompatibilityStorage?(): Record<string, unknown> | null
 }
 
 export interface PluginStorageStore {
@@ -33,6 +35,7 @@ export interface PluginStorageStore {
     setEvictionAllowed(allowed: boolean): void
     synchronizeCompatibilityStorage(storage: Record<string, unknown>): void
     synchronizeCompatibilityMutation(mutation: PluginStorageMutation): void
+    synchronizeCompatibilityOrder(keys: readonly string[]): void
 }
 
 let lifecycleStore: PluginStorageStore | null = null
@@ -49,6 +52,18 @@ export function notifyPluginStorageAuthorityReplacement(
 ): void {
     if (compatibilityStorage === null) lifecycleStore?.invalidate()
     else lifecycleStore?.synchronizeCompatibilityStorage(compatibilityStorage)
+}
+
+export function notifyPluginStorageCompatibilityMutation(
+    mutation: PluginStorageMutation,
+): void {
+    lifecycleStore?.synchronizeCompatibilityMutation(mutation)
+}
+
+export function notifyPluginStorageCompatibilityOrder(
+    keys: readonly string[],
+): void {
+    lifecycleStore?.synchronizeCompatibilityOrder(keys)
 }
 
 export function observePluginStorageValue<T>(value: T, onMutation: (value: T) => void): T {
@@ -87,7 +102,11 @@ export function readCompatibilityPluginStorageValue(
     storage: Record<string, unknown>,
     key: string,
 ): unknown | null {
-    return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : null
+    // Svelte retains the original descriptor after deletion, while its `has`
+    // trap reports the current live membership.
+    return Object.prototype.hasOwnProperty.call(storage, key) && key in storage
+        ? storage[key]
+        : null
 }
 
 interface CacheEntry {
@@ -243,6 +262,14 @@ export function createPluginStorageStore(
     }
 
     const read = async (key: string): Promise<unknown | null> => {
+        const live = dependencies.readCompatibilityStorage?.()
+        if (live != null) {
+            // Arbitrary live edits can bypass the cache notifier. Detach only
+            // this value, preserving the full compatibility API's read behavior.
+            return clonePluginStorageValue(
+                readCompatibilityPluginStorageValue(live, key),
+            )
+        }
         await initialize()
         const cached = cache.get(key)
         if (cached) {
@@ -316,14 +343,20 @@ export function createPluginStorageStore(
             await mutate([{ type: 'clear' }])
         },
         async key(position) {
+            const live = dependencies.readCompatibilityStorage?.()
+            if (live != null) return Object.keys(live)[position] ?? null
             await initialize()
             return orderedKeys()[position] ?? null
         },
         async keys() {
+            const live = dependencies.readCompatibilityStorage?.()
+            if (live != null) return Object.keys(live)
             await initialize()
             return orderedKeys()
         },
         async length() {
+            const live = dependencies.readCompatibilityStorage?.()
+            if (live != null) return Object.keys(live).length
             await initialize()
             return index.size
         },
@@ -379,6 +412,14 @@ export function createPluginStorageStore(
         synchronizeCompatibilityMutation(mutation) {
             authorityGeneration++
             applyCommittedMutation(mutation)
+        },
+        synchronizeCompatibilityOrder(keys) {
+            const entries = keys.flatMap((key) => {
+                const entry = index.get(key)
+                return entry ? [entry] : []
+            })
+            index.clear()
+            for (const entry of entries) index.set(entry.key, entry)
         },
     }
 }
