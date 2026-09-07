@@ -3,6 +3,7 @@
     import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
     import { isTauri } from 'src/ts/platform'
     import { language } from 'src/lang'
+    import { loadMediaSource } from '../UI/mediaSource'
 
     interface Props {
         id: string
@@ -77,6 +78,7 @@
             unloadMedia()
             return
         }
+        unavailable = false
         void getInlayRenderSource(assetId, isTauri).then((nextSource) => {
             if (disposed) {
                 if (nextSource?.objectUrl) URL.revokeObjectURL(nextSource.url)
@@ -103,26 +105,26 @@
 
 <div bind:this={previewRoot} data-inlay-file-preview>
     <div data-inlay-file-preview-box style={placeholderStyle}>
-        {#if descriptor?.type === 'image'}
+        {#if unavailable}
+            <div class="flex h-full w-full flex-col items-center justify-center gap-1 border border-darkborderc p-2 text-center text-xs text-textcolor2">
+                <span>{language.inlayUnavailable}</span>
+                <span class="w-full break-all">{id}</span>
+            </div>
+        {:else if descriptor?.type === 'image'}
             <img src={source?.url} alt="Inlay" class="w-full h-full object-contain border border-darkborderc">
         {:else if descriptor?.type === 'video'}
             <video controls class="w-full h-full border border-darkborderc" onplay={markPlaying} onpause={markStopped} onended={markStopped}>
-                <source src={source?.url} type={descriptor.mime} />
+                <source use:loadMediaSource={source?.url} type={descriptor.mime} />
                 <track kind="captions" />
                 Your browser does not support the video tag.
             </video>
         {:else if descriptor?.type === 'audio'}
             <audio controls class="w-full max-h-24 border border-darkborderc" onplay={markPlaying} onpause={markStopped} onended={markStopped}>
-                <source src={source?.url} type={descriptor.mime} />
+                <source use:loadMediaSource={source?.url} type={descriptor.mime} />
                 Your browser does not support the audio tag.
             </audio>
         {:else if descriptor}
             <div class="max-w-24 max-h-24">{id}</div>
-        {:else if unavailable}
-            <div class="flex h-full w-full flex-col items-center justify-center gap-1 border border-darkborderc p-2 text-center text-xs text-textcolor2">
-                <span>{language.inlayUnavailable}</span>
-                <span class="w-full break-all">{id}</span>
-            </div>
         {/if}
     </div>
 </div>

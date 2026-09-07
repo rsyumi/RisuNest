@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { language } from 'src/lang'
 
 const inlayMocks = vi.hoisted(() => ({
     getInlayAssetBlob: vi.fn(),
@@ -146,6 +147,52 @@ describe('InlayFilePreview', () => {
         expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
     })
 
+    test('shows an unavailable attachment on failed reentry and recovers on the next load', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const metadata = {
+            key: 'image-id',
+            kind: 'inlay',
+            size: 12,
+            mime: 'image/png',
+            name: 'image.png',
+            ext: 'png',
+            inlayType: 'image',
+        }
+        inlayMocks.getInlayAssetMetadata
+            .mockResolvedValueOnce(metadata)
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce(metadata)
+        inlayMocks.getInlayAssetRenderUrl
+            .mockResolvedValueOnce('http://risuasset.localhost/image-id')
+            .mockResolvedValueOnce('http://risuasset.localhost/image-id?retry=1')
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(InlayFilePreview, { target, props: { id: 'image-id' } })
+        await tick()
+        const root = target.querySelector('[data-inlay-file-preview]')!
+
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() =>
+            expect(target.querySelector('img')?.getAttribute('src')).toBe(
+                'http://risuasset.localhost/image-id',
+            ),
+        )
+        TestIntersectionObserver.instance?.setVisible(root, false)
+        await tick()
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() => expect(target.textContent).toContain(language.inlayUnavailable))
+
+        TestIntersectionObserver.instance?.setVisible(root, false)
+        await tick()
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() =>
+            expect(target.querySelector('img')?.getAttribute('src')).toBe(
+                'http://risuasset.localhost/image-id?retry=1',
+            ),
+        )
+        expect(target.textContent).not.toContain(language.inlayUnavailable)
+    })
+
     test.each([
         ['audio', 'pause'],
         ['video', 'ended'],
@@ -192,5 +239,13 @@ describe('InlayFilePreview', () => {
         media.dispatchEvent(new Event(stopEvent))
         await vi.waitFor(() => expect(target.querySelector('source')?.getAttribute('src')).toBeNull())
         expect(revokeObjectURL).toHaveBeenCalledOnce()
+
+        const loadedSources: Array<string | null> = []
+        media.load = vi.fn(() => {
+            loadedSources.push(media.querySelector('source')?.getAttribute('src') ?? null)
+        })
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() => expect(loadedSources).toContain(`blob:${type}`))
+        expect(target.querySelector(type)).toBe(media)
     })
 })

@@ -94,6 +94,52 @@ describe('PlaygroundInlayExplorer native previews', () => {
         vi.clearAllMocks()
     })
 
+    test.each(['audio', 'video'] as const)(
+        'loads an asynchronous %s source and unloads it offscreen',
+        async (type) => {
+            vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+            inlayMocks.listInlayAssetMetadata.mockResolvedValue([
+                {
+                    key: 'clip-id',
+                    kind: 'inlay',
+                    size: 12,
+                    mime: `${type}/webm`,
+                    name: 'clip.webm',
+                    ext: 'webm',
+                    inlayType: type,
+                },
+            ])
+            inlayMocks.getInlayAssetRenderUrl.mockResolvedValue(
+                'http://risuasset.localhost/clip-id',
+            )
+            const target = document.createElement('div')
+            document.body.appendChild(target)
+            mounted = mount(PlaygroundInlayExplorer, { target })
+            await vi.waitFor(() => expect(target.querySelector(type)).not.toBeNull())
+            const media = target.querySelector(type) as HTMLMediaElement
+            const loadedSources: Array<string | null> = []
+            media.load = vi.fn(() => {
+                loadedSources.push(media.querySelector('source')?.getAttribute('src') ?? null)
+            })
+            const card = target.querySelector('[data-inlay-preview-id]')!
+            const observer = TestIntersectionObserver.instances.find((entry) =>
+                entry.observed.has(card),
+            )!
+
+            observer.setVisible(card, true)
+            await vi.waitFor(() =>
+                expect(loadedSources).toContain('http://risuasset.localhost/clip-id'),
+            )
+            expect(media.querySelector('source')?.getAttribute('type')).toBe(`${type}/webm`)
+            observer.setVisible(card, false)
+            await vi.waitFor(() => expect(loadedSources.at(-1)).toBeNull())
+            observer.setVisible(card, true)
+            await vi.waitFor(() =>
+                expect(loadedSources.at(-1)).toBe('http://risuasset.localhost/clip-id'),
+            )
+        },
+    )
+
     test('lists metadata and requests the original native URL without loading the payload', async () => {
         const target = document.createElement('div')
         document.body.appendChild(target)

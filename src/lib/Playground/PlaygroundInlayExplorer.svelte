@@ -11,6 +11,7 @@
   import type { InlayBlobMetadata } from 'src/ts/storage/blobStore'
   import Button from '../UI/GUI/Button.svelte'
   import CheckInput from '../UI/GUI/CheckInput.svelte'
+  import { loadMediaSource } from '../UI/mediaSource'
 
   const PAGE_SIZE = 36
 
@@ -293,12 +294,12 @@
               <img alt={asset.name} class="w-full h-40 object-contain rounded bg-black/20" src={previewSources.get(asset.key)?.url} width={asset.width} height={asset.height} />
             {:else if asset.inlayType === 'video'}
               <video class="w-full h-40 object-contain rounded bg-black/20" controls onplay={() => markPreviewPlaying(asset.key)} onpause={() => markPreviewStopped(asset.key)} onended={() => markPreviewStopped(asset.key)}>
-                <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
+                <source use:loadMediaSource={previewSources.get(asset.key)?.url} type={asset.mime} />
                 <track kind="captions" />
               </video>
             {:else if asset.inlayType === 'audio'}
               <audio class="w-full min-h-12" controls onplay={() => markPreviewPlaying(asset.key)} onpause={() => markPreviewStopped(asset.key)} onended={() => markPreviewStopped(asset.key)}>
-                <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
+                <source use:loadMediaSource={previewSources.get(asset.key)?.url} type={asset.mime} />
                 <track kind="captions" />
               </audio>
             {/if}
