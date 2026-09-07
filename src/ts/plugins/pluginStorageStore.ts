@@ -99,6 +99,54 @@ function serializedByteSize(value: unknown): number {
     return new TextEncoder().encode(JSON.stringify(value) ?? 'null').byteLength
 }
 
+function clonePluginStorageValue<T>(value: T): T {
+    try {
+        return structuredClone(value)
+    } catch (error) {
+        if (
+            !error ||
+            typeof error !== 'object' ||
+            !('name' in error) ||
+            error.name !== 'DataCloneError'
+        ) {
+            throw error
+        }
+    }
+
+    const clones = new WeakMap<object, object>()
+    const detachReactiveValue = (candidate: unknown): unknown => {
+        if (candidate === null) return candidate
+        if (typeof candidate === 'symbol' || typeof candidate === 'function') {
+            return structuredClone(candidate)
+        }
+        if (typeof candidate !== 'object') return candidate
+
+        const existing = clones.get(candidate)
+        if (existing) return existing
+
+        const isArray = Array.isArray(candidate)
+        const prototype = Object.getPrototypeOf(candidate)
+        if (!isArray && prototype !== Object.prototype && prototype !== null) {
+            return structuredClone(candidate)
+        }
+
+        const clone: Record<string, unknown> | unknown[] = isArray
+            ? new Array(candidate.length)
+            : Object.create(prototype)
+        clones.set(candidate, clone)
+        for (const key of Object.keys(candidate)) {
+            defineOwnEnumerableProperty(
+                clone,
+                key,
+                detachReactiveValue((candidate as Record<string, unknown>)[key]),
+            )
+        }
+        return clone
+    }
+
+    return detachReactiveValue(value) as T
+}
+
 export function createPluginStorageStore(
     dependencies: PluginStorageStoreDependencies,
     byteBudget = PLUGIN_STORAGE_CACHE_BYTE_BUDGET,
@@ -154,7 +202,7 @@ export function createPluginStorageStore(
     }
 
     const putCached = (key: string, value: unknown, byteSize: number) => {
-        cache.set(key, { value: structuredClone(value), byteSize })
+        cache.set(key, { value: clonePluginStorageValue(value), byteSize })
     }
 
     const replaceCachedStorage = (storage: Record<string, unknown>) => {

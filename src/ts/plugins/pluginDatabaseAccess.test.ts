@@ -10,7 +10,10 @@ import type {
 } from '../storage/persistentDataStore'
 import { RevisionConflictError } from '../storage/persistentDataStore'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
-import { createCatalogCharacterStub } from '../storage/workingSetCatalog'
+import {
+    createCatalogCharacterStub,
+    createCatalogPresetWorkingSet,
+} from '../storage/workingSetCatalog'
 import { createConversationSummaryStubFromChat } from '../storage/conversationResidency'
 import {
     createPluginDatabaseAccess,
@@ -87,6 +90,7 @@ function createHarness() {
     const getSelectedCharacterId = vi.fn(() => selectedCharacterId)
     const materializedDatabases: Database[] = []
     const pinnedDatabases: Database[] = []
+    const pinnedCharacterQueries: unknown[] = []
     const releasedLeases: Array<ReturnType<typeof vi.fn>> = []
     const authoritativeSnapshots: Array<{
         database: Database
@@ -122,6 +126,7 @@ function createHarness() {
             }),
             readPreset: async (id: string) => ({ revision, value: presets[Number(id)] }),
             queryCharacters: async ({ trash, limit, cursor }) => {
+                pinnedCharacterQueries.push({ trash, limit, cursor })
                 const values = characters
                     .map((character, configuredIndex) => ({ character, configuredIndex }))
                     .filter(({ character }) => Boolean(character.trashTime) === trash)
@@ -285,6 +290,7 @@ function createHarness() {
         readPluginStorageSnapshot,
         invalidatePluginStorage,
         pinnedDatabases,
+        pinnedCharacterQueries,
         releasedLeases,
         replacePersistentDatabase,
         replacePersistentCompleteCharacter,
@@ -1256,6 +1262,44 @@ describe('plugin database access', () => {
         expect(harness.store.open).not.toHaveBeenCalled()
         expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
         expect(harness.flushPendingData).not.toHaveBeenCalled()
+    })
+
+    it('hydrates requested scalable presets without traversing characters', async () => {
+        const harness = createHarness()
+        const durablePresets = [
+            { name: 'First', image: 'first.png', mainPrompt: 'full first body' },
+            { name: 'Second', image: 'second.png', mainPrompt: 'full second body' },
+        ] as Database['botPresets']
+        const catalog = {
+            revision: 4,
+            items: durablePresets.map((preset, configuredIndex) => ({
+                id: String(configuredIndex),
+                configuredIndex,
+                name: preset.name,
+                image: preset.image,
+            })),
+        }
+        harness.compatibilityDatabase.botPresets = createCatalogPresetWorkingSet(catalog, null)
+        harness.pinnedDatabases.push({
+            characters: [makeCharacter('must-not-be-read')],
+            botPresets: durablePresets,
+        } as unknown as Database)
+
+        const result = await harness.access.getDatabaseSnapshot(
+            ['botPresets', 'username'],
+            ['characters', 'botPresets'],
+        )
+
+        expect(result).toEqual({ botPresets: durablePresets })
+        expect(harness.pinnedCharacterQueries).toEqual([])
+        expect(harness.store.readCharacter).not.toHaveBeenCalled()
+        const resultPresets = result.botPresets as Database['botPresets']
+        resultPresets[0].mainPrompt = 'mutated snapshot'
+        expect(durablePresets[0].mainPrompt).toBe('full first body')
+        expect(harness.compatibilityDatabase.botPresets[0]).toEqual({
+            name: 'First',
+            image: 'first.png',
+        })
     })
 
     it('reads requested scalable plugin storage through the per-key authority', async () => {

@@ -973,15 +973,15 @@ export function createPluginDatabaseAccess(
                 includeOnly === 'all'
                     ? [...allowedKeys]
                     : allowedKeys.filter((key) => includeOnly.includes(key))
+            const compatibilityProfile = dependencies.getCompatibilityProfile()
             const needsCharacters = requestedKeys.includes('characters')
-            if (!needsCharacters) {
+            const needsPersistentPresets =
+                compatibilityProfile === 'scalable-v3' && requestedKeys.includes('botPresets')
+            if (!needsCharacters && !needsPersistentPresets) {
                 const compatibilityDatabase = dependencies.getCompatibilityDatabase()
                 const result: Record<string, unknown> = {}
                 for (const key of requestedKeys) {
-                    if (
-                        key === 'pluginCustomStorage' &&
-                        dependencies.getCompatibilityProfile() === 'scalable-v3'
-                    ) {
+                    if (key === 'pluginCustomStorage' && compatibilityProfile === 'scalable-v3') {
                         await dependencies.flushPendingData('plugin-storage-snapshot')
                         result[key] = await dependencies.readPluginStorageSnapshot()
                     } else {
@@ -992,7 +992,6 @@ export function createPluginDatabaseAccess(
                 }
                 return result
             }
-            const compatibilityProfile = dependencies.getCompatibilityProfile()
             if (compatibilityProfile === 'scalable-v3') {
                 await dependencies.flushPendingData('plugin-full-database-snapshot')
                 await openStore()

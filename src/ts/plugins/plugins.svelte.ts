@@ -645,7 +645,8 @@ export function applyPreparedPluginDatabaseUpdate(
     applyPluginDatabaseUpdate(db, database, allowedDbKeys)
     if (
         pluginCompatibility.profile === 'maximum-compatibility' &&
-        Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage')
+        (Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage') ||
+            Object.keys(database).some((key) => !allowedDbKeys.includes(key)))
     ) {
         pluginStorageStore.synchronizeCompatibilityStorage(db.pluginCustomStorage ?? {})
     }
