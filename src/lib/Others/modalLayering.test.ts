@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
@@ -67,7 +68,7 @@ const workDialogSources: Record<string, string> = {
 }
 
 // Vitest serves CSS modules as empty strings, so read the stylesheet from disk.
-const styles = readFileSync(new URL('../../styles.css', import.meta.url), 'utf8')
+const styles = readFileSync(join(process.cwd(), 'src', 'styles.css'), 'utf8')
 
 function count(source: string, token: string): number {
     return source.split(token).length - 1
