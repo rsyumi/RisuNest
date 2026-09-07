@@ -39,6 +39,13 @@ impl restore::ReplacementSink for StoreSink {
                 compatibility_hash: payload_compatibility_hash(&self.payloads),
             },
         )?;
+        store.replace_put_cold_payload_authority(
+            id,
+            &ColdPayloadAuthorityState::V2 {
+                migration_id: "synthetic-pocket-restore".to_owned(),
+                compatibility_hash: payload_compatibility_hash(&self.payloads),
+            },
+        )?;
         self.durable
             .lock()
             .unwrap()
@@ -155,18 +162,24 @@ fn both_pocket_versions_restore_database_and_media_into_the_persistent_store() {
         let store = PersistentStore::open(directory.path()).unwrap();
         let actual = store.materialize(None).unwrap();
         let expected: Value = serde_json::from_str(include_str!("fixtures/expected.json")).unwrap();
-        for key in [
-            "username",
-            "characters",
-            "botPresets",
-            "modules",
-            "plugins",
-            "pluginCustomStorage",
-            "loadouts",
-        ] {
-            assert_eq!(actual[key], expected[key], "lost database field: {key}");
+        for (key, expected_value) in expected.as_object().unwrap() {
+            assert_eq!(&actual[key], expected_value, "lost database field: {key}");
         }
         let cas = PayloadCas::new(directory.path()).unwrap();
+        let cold = store
+            .read_cold_alias("9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6", None)
+            .unwrap()
+            .unwrap()
+            .value;
+        let cold_file = cas
+            .open_object(cold.object_hash.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        let cold_value: Value = serde_json::from_reader(GzDecoder::new(cold_file)).unwrap();
+        assert_eq!(
+            cold_value,
+            serde_json::json!([{ "id": "synthetic-cold-chat", "message": [{ "role": "user", "data": "Synthetic cold message" }] }])
+        );
         for (key, payload, kind, mime) in [
             ("picture", "synthetic picture", "image", "image/webp"),
             ("voice", "synthetic voice", "audio", "audio/mpeg"),
@@ -251,6 +264,96 @@ fn archive_entry(name: &str, data: &[u8]) -> Vec<u8> {
         data,
     ]
     .concat()
+}
+
+// Local diagnostic only: never print archive values, internal names, or raw errors.
+#[test]
+#[ignore = "requires RISUNEST_DIAGNOSTIC_BACKUP; imports into a disposable isolated store"]
+fn private_backup_diagnostic() {
+    let source = std::env::var_os("RISUNEST_DIAGNOSTIC_BACKUP").expect("source not configured");
+    let mut source = File::open(source).expect("cannot open diagnostic source");
+    let directory = tempfile::tempdir().unwrap();
+    seed(directory.path());
+    let job = JobRegistry::default()
+        .create(JobKind::RestoreLegacyLocalBackup)
+        .unwrap();
+    job.start(JobPhase::ReadingSource).unwrap();
+    let result = parse_legacy_local_backup_v1(
+        &mut source,
+        directory.path(),
+        PayloadTarget::JobStaging,
+        &mut Import {
+            root: directory.path(),
+            job: &job,
+            fail_database: false,
+        },
+        &NeverCancelled,
+    );
+    let succeeded = result.is_ok();
+    match result {
+        Ok(_) => println!("PRIVATE_DIAGNOSTIC: native import succeeded in disposable store"),
+        Err(error) => {
+            let safe_reasons = [
+                "requires unique, nonempty chat IDs",
+                "requires a nonempty character ID",
+                "requires unique character IDs",
+                "PocketRisu Inlay metadata is invalid",
+                "PocketRisu Inlay entry must have a single filename",
+                "PocketRisu Inlay needs metadata for this extension",
+                "binary values are unsupported in a legacy MessagePack database",
+                "unsupported legacy MessagePack extension",
+                "legacy backup cold payload is invalid",
+                "decoded legacy RisuSave limit exceeded",
+                "invalid legacy MessagePack",
+                "truncated legacy backup entry body",
+                "legacy backup does not contain database.risudat",
+            ];
+            let reason = safe_reasons
+                .iter()
+                .find(|reason| error.message.contains(**reason))
+                .copied()
+                .unwrap_or("unclassified error (details withheld)");
+            println!(
+                "PRIVATE_DIAGNOSTIC: code={:?}; phase={:?}; reason={reason}",
+                error.code,
+                job.status().phase
+            );
+        }
+    }
+    assert!(
+        succeeded,
+        "PRIVATE_DIAGNOSTIC: native import failed (details withheld)"
+    );
+}
+
+#[test]
+fn pocket_namespaced_cold_storage_is_restored_as_cold_payload() {
+    for key in ["9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6", "custom-cold-key"] {
+        let result = plan(
+            archive_entry(&format!("coldstorage/{key}.json"), br#"[{"message":[]}]"#),
+            &NeverCancelled,
+        )
+        .unwrap();
+        assert_eq!(result.cold_aliases.len(), 1);
+        assert_eq!(result.cold_aliases[0].key, key);
+        assert!(result.asset_aliases.is_empty());
+    }
+}
+
+#[test]
+fn duplicate_cold_namespaces_and_invalid_cold_data_cannot_activate() {
+    let key = "9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6";
+    let duplicates = [
+        archive_entry(&format!("coldstorage/{key}.json"), b"[]"),
+        archive_entry(&format!("coldstorage_{key}.json"), b"[]"),
+    ]
+    .concat();
+    assert!(plan(duplicates, &NeverCancelled).is_err());
+    assert!(plan(
+        archive_entry(&format!("coldstorage/{key}.json"), b"invalid"),
+        &NeverCancelled
+    )
+    .is_err());
 }
 
 fn plan(

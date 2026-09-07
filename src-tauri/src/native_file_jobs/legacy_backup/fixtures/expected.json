@@ -38,6 +38,20 @@
         }
       ],
       "trashTime": 1234
+    },
+    {
+      "type": "group",
+      "chaId": "synthetic-group",
+      "name": "Synthetic group",
+      "characters": ["synthetic-active"],
+      "chats": [
+        {
+          "id": "group-chat",
+          "name": "Synthetic group chat",
+          "message": []
+        }
+      ],
+      "coldstorage": "9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6"
     }
   ],
   "botPresets": [
@@ -66,5 +80,47 @@
       "values": [1, false, null]
     }
   },
-  "loadouts": []
+  "loadouts": [],
+  "personas": [
+    {
+      "id": "synthetic-persona",
+      "name": "Synthetic persona",
+      "icon": "assets/portrait.png",
+      "customField": {
+        "nested": [true, null, "한글"]
+      }
+    }
+  ],
+  "lorebook": [
+    {
+      "name": "Synthetic lore",
+      "data": [
+        {
+          "key": "test",
+          "content": "Synthetic lore text"
+        }
+      ]
+    }
+  ],
+  "globalRegex": [
+    {
+      "in": "synthetic",
+      "out": "replacement",
+      "type": "editdisplay"
+    }
+  ],
+  "characterOrder": [
+    "synthetic-active",
+    {
+      "name": "Synthetic folder",
+      "data": ["synthetic-group"]
+    }
+  ],
+  "unknownPocketField": {
+    "nested": [
+      {
+        "value": "preserve unknown fields"
+      }
+    ]
+  }
 }

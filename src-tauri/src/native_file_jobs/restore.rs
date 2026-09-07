@@ -519,10 +519,11 @@ fn stage_legacy_database(
         Value::Object(root) => root,
         _ => return Err(invalid("legacy MessagePack database must be an object")),
     };
-    let characters = match root.shift_remove("characters") {
+    let mut characters = match root.shift_remove("characters") {
         Some(Value::Array(characters)) => characters,
         _ => return Err(invalid("legacy MessagePack characters must be an array")),
     };
+    assign_legacy_chat_ids(&mut characters)?;
     let presets = match root.shift_remove("botPresets") {
         Some(Value::Array(presets)) => presets,
         Some(_) => return Err(invalid("legacy MessagePack botPresets must be an array")),
@@ -573,6 +574,40 @@ fn stage_legacy_database(
 enum JsonSlot {
     Value(Value),
     Undefined,
+}
+
+// PocketRisu and upstream RisuAI assign absent/duplicate chat IDs when loading
+// legacy saves. Do that before staging; the persistent store remains strict.
+fn assign_legacy_chat_ids(characters: &mut [Value]) -> Result<(), NativeJobError> {
+    for character in characters {
+        let Some(chats) = character.get_mut("chats").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut reserved: HashSet<String> = chats
+            .iter()
+            .filter_map(|chat| chat.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let mut seen = HashSet::new();
+        for chat in chats {
+            let chat = chat
+                .as_object_mut()
+                .ok_or_else(|| invalid("legacy chat must be an object"))?;
+            match chat.get("id") {
+                Some(Value::String(id)) if !id.is_empty() && seen.insert(id.clone()) => continue,
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                _ => return Err(invalid("legacy chat ID must be a string when present")),
+            }
+            let id = loop {
+                let candidate = uuid::Uuid::new_v4().to_string();
+                if reserved.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            seen.insert(id.clone());
+            chat.insert("id".to_owned(), Value::String(id));
+        }
+    }
+    Ok(())
 }
 
 fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobError> {
@@ -1788,6 +1823,42 @@ mod tests {
         let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
         assert_eq!(canonical_hash(&second), canonical_hash(&first));
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn legacy_chat_ids_are_assigned_without_discarding_chats_or_changing_existing_ids() {
+        let (_directory, sink) = fixture();
+        let database = json!({
+            "characters": [{
+                "chaId": "synthetic-character", "name": "Synthetic", "type": "character",
+                "chats": [
+                    {"name": "Without ID", "message": [{"role": "user", "data": "Keep this"}]},
+                    {"id": "retained-chat", "name": "Existing ID", "message": []},
+                    {"id": "retained-chat", "name": "Duplicate ID", "message": []}
+                ]
+            }], "botPresets": []
+        });
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let staging_id = sink.begin().unwrap().staging_id;
+        stage_legacy_database(database.clone(), &staging_id, &job, &sink).unwrap();
+        sink.commit(&staging_id, 1).unwrap();
+        let restored = sink.store.lock().unwrap().materialize(None).unwrap();
+        let chats = restored["characters"][0]["chats"].as_array().unwrap();
+        assert_eq!(chats.len(), 3);
+        assert_eq!(chats[1]["id"], "retained-chat");
+        assert_eq!(
+            chats[0]["message"],
+            database["characters"][0]["chats"][0]["message"]
+        );
+        let ids = chats
+            .iter()
+            .map(|chat| chat["id"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| !id.is_empty()));
     }
 
     #[test]

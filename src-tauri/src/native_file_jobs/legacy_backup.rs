@@ -1229,6 +1229,10 @@ fn inlay_key_hex(name: &str) -> Option<&str> {
 }
 
 fn cold_key(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("coldstorage/") {
+        let key = rest.strip_suffix(".json")?;
+        return (!key.is_empty() && !key.contains(['/', '\\'])).then(|| key.to_owned());
+    }
     let key = name.strip_prefix("coldstorage_")?.strip_suffix(".json")?;
     uuid::Uuid::parse_str(key)
         .ok()

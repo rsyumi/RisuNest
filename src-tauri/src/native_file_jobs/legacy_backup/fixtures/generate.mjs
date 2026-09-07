@@ -5,12 +5,14 @@ import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import { capturePocketExport } from "./export.mjs";
 
 const repository = process.argv[2];
 if (!repository) throw new Error("Provide the PocketRisu reference checkout");
 const requireReference = createRequire(resolve(repository, "package.json"));
 const { Packr } = requireReference("msgpackr");
 const fflate = requireReference("fflate");
+const coldKey = "9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6";
 const expected = {
   username: "Synthetic PocketRisu restore",
   characters: [
@@ -47,6 +49,14 @@ const expected = {
       ],
       trashTime: 1234,
     },
+    {
+      type: "group",
+      chaId: "synthetic-group",
+      name: "Synthetic group",
+      characters: ["synthetic-active"],
+      chats: [{ id: "group-chat", name: "Synthetic group chat", message: [] }],
+      coldstorage: coldKey,
+    },
   ],
   botPresets: [
     { id: "synthetic-preset", name: "Synthetic preset", apiType: "openai" },
@@ -65,20 +75,32 @@ const expected = {
     "synthetic-plugin": { text: "한글 보존", values: [1, false, null] },
   },
   loadouts: [],
+  personas: [
+    {
+      id: "synthetic-persona",
+      name: "Synthetic persona",
+      icon: "assets/portrait.png",
+      customField: { nested: [true, null, "한글"] },
+    },
+  ],
+  lorebook: [
+    {
+      name: "Synthetic lore",
+      data: [{ key: "test", content: "Synthetic lore text" }],
+    },
+  ],
+  globalRegex: [{ in: "synthetic", out: "replacement", type: "editdisplay" }],
+  characterOrder: [
+    "synthetic-active",
+    { name: "Synthetic folder", data: ["synthetic-group"] },
+  ],
+  unknownPocketField: { nested: [{ value: "preserve unknown fields" }] },
 };
 const directory = fileURLToPath(new URL(".", import.meta.url));
 writeFileSync(
   `${directory}expected.json`,
   `${JSON.stringify(expected, null, 2)}\n`,
 );
-function entry(name, data) {
-  const nameBytes = Buffer.from(name);
-  const header = Buffer.alloc(4);
-  const size = Buffer.alloc(4);
-  header.writeUInt32LE(nameBytes.length);
-  size.writeUInt32LE(data.length);
-  return Buffer.concat([header, nameBytes, size, data]);
-}
 for (const [tag, compression] of [
   ["v1.10.0", "compression"],
   ["v1.12.0", "noCompression"],
@@ -116,41 +138,46 @@ for (const [tag, compression] of [
     Uint8Array.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]),
     Uint8Array.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8]),
   );
-  const files = [
-    entry("portrait.png", Buffer.from("synthetic portrait")),
-    entry("module.png", Buffer.from("synthetic module")),
-  ];
-  const metadata = [];
+  const inlays = [];
   for (const [id, ext, type, payload] of [
     ["picture", "webp", "image", "synthetic picture"],
     ["voice", "mp3", "audio", "synthetic voice"],
     ["movie", "mp4", "video", "synthetic movie"],
     ["signature", "json", "signature", '{"strokes":[]}'],
   ]) {
-    files.push(entry(`inlay/${id}.${ext}`, Buffer.from(payload)));
-    metadata.push(
-      entry(
-        `inlay_sidecar/${id}`,
-        Buffer.from(
-          JSON.stringify({
-            ext,
-            name: `${id}.${ext}`,
-            type,
-            ...(type === "image" ? { width: 2, height: 3 } : {}),
-          }),
-        ),
-      ),
-    );
+    inlays.push({ id, ext, type, payload });
   }
-  files.push(
-    entry(
-      "inlay_meta/picture",
-      Buffer.from(
-        '{"createdAt":123,"updatedAt":456,"charId":"synthetic-active","chatId":"synthetic-chat"}',
-      ),
-    ),
-    ...metadata,
-    entry("database.risudat", encode(expected, compression)),
+  const serverSource = execFileSync(
+    "git",
+    [
+      "-C",
+      repository,
+      "-c",
+      `safe.directory=${repository.replaceAll("\\", "/")}`,
+      "show",
+      `${tag}:server/node/server.cjs`,
+    ],
+    { encoding: "utf8" },
   );
-  writeFileSync(`${directory}pocket-risu-${tag}.bin`, Buffer.concat(files));
+  const archive = await capturePocketExport(
+    serverSource,
+    encode(expected, compression),
+    new Map([
+      ["assets/portrait.png", Buffer.from("synthetic portrait")],
+      ["assets/module.png", Buffer.from("synthetic module")],
+    ]),
+    inlays,
+    new Map([
+      [
+        `coldstorage/${coldKey}`,
+        [
+          {
+            id: "synthetic-cold-chat",
+            message: [{ role: "user", data: "Synthetic cold message" }],
+          },
+        ],
+      ],
+    ]),
+  );
+  writeFileSync(`${directory}pocket-risu-${tag}.bin`, archive);
 }
