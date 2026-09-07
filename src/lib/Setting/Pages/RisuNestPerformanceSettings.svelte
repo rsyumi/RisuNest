@@ -21,7 +21,7 @@
 
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.perf.title}</h2>
 <span class="text-textcolor">{language.risuNest.perf.profile}</span>
-<div class="mb-4 inline-flex gap-0.5 rounded-lg border border-darkborderc bg-darkbg p-1" role="group" aria-label={language.risuNest.perf.profile}>
+<div class="mb-4 inline-flex self-start gap-0.5 rounded-lg border border-darkborderc bg-darkbg p-1" role="group" aria-label={language.risuNest.perf.profile}>
     {#each [
         { value: 'normal', label: language.risuNest.perf.profileNormal },
         { value: 'low-spec', label: language.risuNest.perf.profileLowSpec },

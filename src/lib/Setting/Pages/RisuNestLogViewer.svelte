@@ -135,12 +135,12 @@
 </script>
 
 <section class="flex flex-col gap-2 text-textcolor">
-    <h2 class="mb-2 text-2xl font-bold mt-2">{language.risuNest.diag.title}</h2>
+    <h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.diag.title}</h2>
     <div class="flex gap-2 flex-wrap">
-        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-view-log onclick={viewLog}>
+        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 hover:bg-selected focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-view-log onclick={viewLog}>
             {language.risuNest.diag.viewLog}
         </button>
-        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-copy-log onclick={() => void copyLog()}>
+        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 hover:bg-selected focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-copy-log onclick={() => void copyLog()}>
             {language.risuNest.diag.copyLog}
         </button>
     </div>
@@ -153,8 +153,12 @@
             disabled={fileLogUpdatePending}
             onchange={(event) => void changeFileLogging(event.currentTarget.checked)}
         />
-        <span class="w-5 h-5 rounded-md border-2 border-darkborderc flex justify-center items-center" class:bg-darkborderc={fileLogEnabled}>
-            {#if fileLogEnabled}✓{/if}
+        <span class="w-5 h-5 min-w-5 min-h-5 rounded-md border-2 border-darkborderc flex justify-center items-center transition-colors duration-200 {fileLogEnabled ? 'bg-darkborderc' : 'bg-darkbutton'}" aria-hidden="true">
+            {#if fileLogEnabled}
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="white" class="w-3 h-3" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+            {/if}
         </span>
         <span>{language.risuNest.diag.fileLog}</span>
     </label>

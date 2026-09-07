@@ -69,7 +69,7 @@ describe('RisuNest Android platform settings', () => {
         await tick()
 
         expect(target.textContent).toContain('Platform')
-        expect(target.textContent).toContain('Open system settings')
+        expect(target.textContent).toContain('Open notification settings')
         expect(target.textContent).toContain('Keep app alive while generating')
         expect(target.textContent).toContain('Android 16')
         expect(target.textContent).toContain('140.0.1')
@@ -94,6 +94,11 @@ describe('RisuNest Android platform settings', () => {
         expect(notificationBadge?.classList.contains('border-success-500')).toBe(true)
         expect(notificationBadge?.classList.contains('text-textcolor')).toBe(true)
         expect(target.querySelector('[role="status"] button')).toBeNull()
+        const toggle = target.querySelector('input[type="checkbox"]')!
+        const action = target.querySelector('button')!
+        expect(action.textContent?.trim()).toBe('Open notification settings')
+        expect(Boolean(toggle.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
+        expect(Boolean(action.compareDocumentPosition(target.querySelector('[data-platform-info]')!) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
         target.querySelector('button')?.click()
         expect(mocks.openNotificationSettings).toHaveBeenCalledOnce()
         mocks.updateDeviceSettings.mockClear()

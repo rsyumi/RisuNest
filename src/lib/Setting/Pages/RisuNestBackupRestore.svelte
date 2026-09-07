@@ -62,24 +62,7 @@
         }
     }
 
-    onDestroy(() => nativePublishController?.abort())
-</script>
-
-<h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.backup.title}</h2>
-{#if !isTauri || isTauriDesktop}
-    <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('import')} className="mt-2">{language.importRisuSave}</Button>
-{/if}
-{#if !isTauri || isTauriDesktop || isTauriAndroid}
-    <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('export')} className="mt-2">{language.exportRisuSave}</Button>
-{/if}
-{#if risuSaveOperation}
-    <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
-        <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
-        <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
-    </div>
-{/if}
-{#if isTauri}
-    <Button disabled={snapshotRestoreBusy} onclick={async () => {
+    async function restoreLocalSnapshot(): Promise<void> {
         if (snapshotRestoreBusy) return
         snapshotRestoreBusy = true
         try {
@@ -95,28 +78,76 @@
             })
         } catch { alertError(language.risuNest.backup.actionFailed) }
         finally { snapshotRestoreBusy = false }
-    }} className="mt-2">{language.restoreLocalSnapshot}</Button>
-{/if}
-<Button disabled={risuSaveOperation !== null} onclick={async () => { if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup() }} className="mt-2">{language.loadPocketRisuBackup}</Button>
-<Button onclick={() => openSyncConflictBackups()} className="mt-2">{language.syncConflictBackups}</Button>
-{#if isTauri && DBState.db.account}
-    <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {
-        if (!await alertConfirm(language.risuNest.backup.officialRestoreConfirm)) return
-        if (!await alertConfirm(language.risuNest.backup.officialRestoreInlayWarning)) return
-        try {
-            const result = await getNativeOfficialAccountFlow().restore()
-            if (result.kind === 'missing') alertNormal(language.risuNest.backup.officialMissing)
-        } catch { alertError(language.risuNest.backup.actionFailed) }
-    })} className="mt-2">{language.risuNest.backup.officialRestore}</Button>
-    <Button disabled={nativeAccountBusy} onclick={() => runNativeAccountOperation(async () => {
-        if (!await alertConfirm(language.risuNest.backup.officialPublishConfirm)) return
-        const controller = new AbortController()
-        nativePublishController = controller
-        try { await getNativeOfficialAccountFlow().publish(controller.signal); alertNormal(language.risuNest.backup.officialPublished) }
-        catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) alertError(language.risuNest.backup.actionFailed) }
-        finally { if (nativePublishController === controller) nativePublishController = null }
-    })} className="mt-2">{language.risuNest.backup.officialPublish}</Button>
-    {#if nativePublishController}
-        <Button onclick={() => nativePublishController?.abort()} className="mt-2">{language.risuNest.backup.officialCancel}</Button>
+    }
+
+    async function loadPocketRisuBackup(): Promise<void> {
+        if ((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))) LoadLocalBackup()
+    }
+
+    function restoreOfficialBackup(): Promise<void | undefined> {
+        return runNativeAccountOperation(async () => {
+            if (!await alertConfirm(language.risuNest.backup.officialRestoreConfirm)) return
+            if (!await alertConfirm(language.risuNest.backup.officialRestoreInlayWarning)) return
+            try {
+                const result = await getNativeOfficialAccountFlow().restore()
+                if (result.kind === 'missing') alertNormal(language.risuNest.backup.officialMissing)
+            } catch { alertError(language.risuNest.backup.actionFailed) }
+        })
+    }
+
+    function publishOfficialBackup(): Promise<void | undefined> {
+        return runNativeAccountOperation(async () => {
+            if (!await alertConfirm(language.risuNest.backup.officialPublishConfirm)) return
+            const controller = new AbortController()
+            nativePublishController = controller
+            try { await getNativeOfficialAccountFlow().publish(controller.signal); alertNormal(language.risuNest.backup.officialPublished) }
+            catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) alertError(language.risuNest.backup.actionFailed) }
+            finally { if (nativePublishController === controller) nativePublishController = null }
+        })
+    }
+
+    onDestroy(() => nativePublishController?.abort())
+</script>
+
+<h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.backup.title}</h2>
+<div class="flex flex-col gap-4">
+    <div data-backup-group="files" class="flex flex-col gap-2">
+        <span class="text-sm text-textcolor2">{language.risuNest.backup.groupFiles}</span>
+        <div class="flex flex-wrap gap-2">
+            {#if !isTauri || isTauriDesktop}
+                <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('import')}>{language.importRisuSave}</Button>
+            {/if}
+            {#if !isTauri || isTauriDesktop || isTauriAndroid}
+                <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('export')}>{language.exportRisuSave}</Button>
+            {/if}
+        </div>
+        {#if risuSaveOperation}
+            <div class="flex items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
+                <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
+                <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
+            </div>
+        {/if}
+    </div>
+    <div data-backup-group="restore" class="flex flex-col gap-2">
+        <span class="text-sm text-textcolor2">{language.risuNest.backup.groupRestore}</span>
+        <div class="flex flex-wrap gap-2">
+            {#if isTauri}
+                <Button disabled={snapshotRestoreBusy} onclick={restoreLocalSnapshot}>{language.restoreLocalSnapshot}</Button>
+            {/if}
+            <Button disabled={risuSaveOperation !== null} onclick={loadPocketRisuBackup}>{language.loadPocketRisuBackup}</Button>
+            <Button onclick={() => openSyncConflictBackups()}>{language.syncConflictBackups}</Button>
+        </div>
+    </div>
+    {#if isTauri && DBState.db.account}
+        <div data-backup-group="account" class="flex flex-col gap-2">
+            <span class="text-sm text-textcolor2">{language.risuNest.backup.groupAccount}</span>
+            <div class="flex flex-wrap gap-2">
+                <Button disabled={nativeAccountBusy} onclick={restoreOfficialBackup}>{language.risuNest.backup.officialRestore}</Button>
+                <Button disabled={nativeAccountBusy} onclick={publishOfficialBackup}>{language.risuNest.backup.officialPublish}</Button>
+                {#if nativePublishController}
+                    <Button onclick={() => nativePublishController?.abort()}>{language.risuNest.backup.officialCancel}</Button>
+                {/if}
+            </div>
+        </div>
     {/if}
-{/if}
+</div>

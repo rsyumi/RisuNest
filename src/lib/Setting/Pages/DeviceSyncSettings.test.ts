@@ -981,6 +981,6 @@ describe('DeviceSyncSettings', () => {
         await tick()
 
         expect(target.querySelector('[data-notification-warning]')).not.toBeNull()
-        expect(button('Open system settings')).toBeDefined()
+        expect(button('Open notification settings')).toBeDefined()
     })
 })

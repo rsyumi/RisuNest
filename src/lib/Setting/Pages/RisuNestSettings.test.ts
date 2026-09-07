@@ -55,6 +55,18 @@ describe('RisuNest settings navigation', () => {
 })
 
 describe('RisuNest backup and restore layout', () => {
+    it('groups actions into file, restore, and official account rows', () => {
+        for (const group of ['groupFiles', 'groupRestore', 'groupAccount']) {
+            expect(backupRestoreSource).toContain(`{language.risuNest.backup.${group}}`)
+            expect(languageEnglish.risuNest.backup[group as keyof typeof languageEnglish.risuNest.backup]).toEqual(expect.any(String))
+            expect(languageKorean.risuNest.backup[group as keyof typeof languageKorean.risuNest.backup]).toEqual(expect.any(String))
+        }
+        expect(backupRestoreSource).toContain('data-backup-group')
+        expect(backupRestoreSource).not.toContain('className="mt-2"')
+        expect(backupRestoreSource.indexOf('{language.risuNest.backup.groupFiles}')).toBeLessThan(backupRestoreSource.indexOf('{language.risuNest.backup.groupRestore}'))
+        expect(backupRestoreSource.indexOf('{language.risuNest.backup.groupRestore}')).toBeLessThan(backupRestoreSource.indexOf('{language.risuNest.backup.groupAccount}'))
+    })
+
     it('keeps local snapshot restore above PocketRisu restore', () => {
         const localSnapshotRestore = backupRestoreSource.indexOf('{language.restoreLocalSnapshot}</Button>')
         const pocketRisuRestore = backupRestoreSource.indexOf('{language.loadPocketRisuBackup}</Button>')

@@ -94,14 +94,62 @@ describe('RisuNestStorageDashboard', () => {
         await vi.waitFor(() => expect(button('Clean up sync temp files')?.disabled).toBe(false))
         button('Clean up sync temp files')?.click()
         await vi.waitFor(() => expect(maintenance.cleanupPeerTemp).toHaveBeenCalledOnce())
+        expect(button('Calculate size')).toBeDefined()
         button('Clean up unused images')?.click()
         await vi.waitFor(() => expect(target.textContent).toContain('Removable: 2 items (2.0 KiB)'))
-        expect(button('Clean up unused images')).toBeUndefined()
-        expect(languageKorean.risuNest.storage.gcRunConfirm).toBe('정리 실행 확인')
-        button('Confirm cleanup')?.click()
+        expect(button('Clean up unused images')).toBeDefined()
+        expect(languageKorean.risuNest.storage.gcRunConfirm).toBe('지금 삭제')
+        button('Delete now')?.click()
         await vi.waitFor(() => expect(maintenance.executeNativePersistentAssetGc).toHaveBeenCalledOnce())
         expect(alerts.alertConfirm).toHaveBeenCalledWith('This will delete 2 unused images (2.0 KiB). Continue?')
         expect(target.textContent).toContain('Deleted: 2 items (2.0 KiB)')
+        expect(button('Delete now')).toBeUndefined()
+    })
+
+    it('keeps each maintenance result next to the button that produced it', async () => {
+        const target = setup()
+        maintenance.getPeerTempUsage.mockResolvedValue({ count: 2, bytes: 1024 })
+        maintenance.previewNativePersistentAssetGc.mockResolvedValue({ candidateCount: 2, candidateBytes: 2048, deletedCount: 0, deletedBytes: 0, blockers: [] })
+        await vi.waitFor(() => expect(target.textContent).toContain('Calculate size'))
+        const button = (text: string) => [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === text)
+        const rowOf = (element: Element | undefined) => element?.closest<HTMLElement>('[data-storage-action]') ?? null
+        expect(target.textContent).not.toContain('Removes leftover temporary files only.')
+
+        button('Calculate size')?.click()
+        await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB used'))
+        const tempRow = rowOf(button('Calculate size'))
+        expect(tempRow?.textContent).toContain('1.0 KiB used')
+        expect(tempRow?.contains(button('Clean up sync temp files') ?? null)).toBe(true)
+        expect(target.textContent).toContain('Removes leftover temporary files only.')
+
+        button('Clean up unused images')?.click()
+        await vi.waitFor(() => expect(target.textContent).toContain('Removable: 2 items (2.0 KiB)'))
+        const gcRow = rowOf(button('Clean up unused images'))
+        expect(gcRow?.textContent).toContain('Removable: 2 items (2.0 KiB)')
+        expect(gcRow?.contains(button('Delete now') ?? null)).toBe(true)
+        expect(gcRow).not.toBe(tempRow)
+    })
+
+    it('summarizes each backup list with its count and size and keeps delete beside the row text', async () => {
+        const target = setup()
+        await vi.waitFor(() => expect(target.textContent).toContain('Snapshots'))
+
+        const summaries = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list] > summary')]
+        expect(summaries.map((summary) => summary.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+            'Snapshots (1 items · 1.0 KiB)',
+            'Conflict backups (1 items · 4.0 KiB)',
+            'Sync backups (1 items · 2.0 KiB)',
+        ])
+        const row = target.querySelector<HTMLElement>('[data-storage-backup-list] [data-storage-backup-row]')
+        expect(row?.className).not.toContain('justify-between')
+        expect(target.textContent).toContain('2 characters · 3 chats · 4 messages')
+    })
+
+    it('formats large counts with locale separators', async () => {
+        const target = setup(Promise.resolve({ ...stats, conversations: { count: 1200, messageCount: 15231 } }))
+        await vi.waitFor(() => expect(target.textContent).toContain('Total data'))
+
+        expect(target.textContent).toContain(`${(1200).toLocaleString()} chats · ${(15231).toLocaleString()} messages`)
     })
 
     it('uses localized safe errors for a backup that is in use', async () => {
