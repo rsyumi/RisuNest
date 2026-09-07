@@ -69,7 +69,7 @@
                 </div>
                 {#if model.sourceName || model.elapsed}
                     <div class="flex items-center justify-between gap-3 text-sm text-textcolor2">
-                        <span class="truncate">{model.sourceName}{#if model.sourceName && model.sourceSize} · {model.sourceSize}{/if}</span>
+                        <span class="truncate">{model.sourceName}{#if model.sourceName && model.sourceSize}{' · '}{model.sourceSize}{/if}</span>
                         <span class="shrink-0 tabular-nums">{model.elapsed}</span>
                     </div>
                 {/if}
@@ -78,7 +78,7 @@
             {#if model.terminal}
                 <div class="flex flex-col gap-1 text-sm" role="status">
                     <p
-                        class:text-selected={model.terminal.state === 'succeeded'}
+                        class:text-borderc={model.terminal.state === 'succeeded'}
                         class:text-textcolor2={model.terminal.state === 'cancelled'}
                         class:text-danger-400={model.terminal.state === 'failed'}>
                         {model.terminal.summary}
@@ -92,9 +92,9 @@
             <div class="flex flex-col gap-1" aria-live="polite">
                 <div class="h-2 w-full overflow-hidden rounded-md border border-darkborderc bg-bgcolor">
                     {#if model.indeterminate}
-                        <div class="h-full w-full bg-selected/60 motion-safe:animate-pulse"></div>
+                        <div class="h-full w-full bg-borderc/60 motion-safe:animate-pulse"></div>
                     {:else}
-                        <div class="h-full bg-selected transition-[width] duration-300" style:width={`${model.overallPercent ?? 0}%`}></div>
+                        <div class="h-full bg-borderc transition-[width] duration-300" style:width={`${model.overallPercent ?? 0}%`}></div>
                     {/if}
                 </div>
                 <div class="flex justify-between text-xs tabular-nums text-textcolor2">
@@ -108,9 +108,9 @@
                     {#each model.stages as row (row.stage)}
                         <li class="flex items-center gap-2" data-stage={row.stage} data-stage-state={row.state}>
                             {#if row.state === 'done'}
-                                <CheckIcon size={16} class="shrink-0 text-selected" />
+                                <CheckIcon size={16} class="shrink-0 text-borderc" />
                             {:else if row.state === 'active'}
-                                <LoaderCircleIcon size={16} class="shrink-0 text-selected motion-safe:animate-spin" />
+                                <LoaderCircleIcon size={16} class="shrink-0 text-borderc motion-safe:animate-spin" />
                             {:else if row.state === 'stopped'}
                                 <XIcon size={16} class="shrink-0 text-danger-400" />
                             {:else}
@@ -149,12 +149,12 @@
             {/if}
 
             {#if model.terminal?.details}
-                <div class="flex flex-col gap-2">
+                <div class="flex flex-col items-start gap-2">
                     <Button styled="outlined" size="sm" onclick={() => { showDetails = !showDetails }}>
                         {copy.errorDetails}
                     </Button>
                     {#if showDetails}
-                        <div class="relative">
+                        <div class="relative w-full">
                             <button
                                 type="button"
                                 class="absolute top-1 right-1 rounded-sm p-1 text-textcolor2 hover:text-textcolor"
