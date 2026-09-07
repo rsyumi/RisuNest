@@ -114,7 +114,7 @@
     })
 </script>
 
-<div class="top-0 left-0 z-50 fixed w-full h-full flex flex-col justify-center items-center text-textcolor bg-white">
+<div class="top-0 left-0 z-modal fixed w-full h-full flex flex-col justify-center items-center text-textcolor bg-white">
     <div class="bg-darkbg border-b border-b-darkborderc w-full flex p-2">
         <h1 class="text-2xl font-bold max-w-full overflow-hidden whitespace-nowrap text-ellipsis">Upload to Realm</h1>
         <button class="text-textcolor text-lg hover:text-red-500 ml-auto" onclick={close}>&times;</button>

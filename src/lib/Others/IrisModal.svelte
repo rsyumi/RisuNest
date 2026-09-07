@@ -288,7 +288,7 @@
 <svelte:window onkeydown={handleKey} />
 
 <div
-    class="fixed inset-0 z-50 flex items-end justify-center bg-black/60"
+    class="fixed inset-0 z-modal flex items-end justify-center bg-black/60"
     transition:fade={{ duration: 300 }}
     role="presentation"
 >

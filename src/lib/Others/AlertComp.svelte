@@ -204,7 +204,7 @@
 }}></svelte:window>
 
 {#if $alertStore.type !== 'none' &&  $alertStore.type !== 'toast' &&  $alertStore.type !== 'cardexport' && $alertStore.type !== 'branches' && $alertStore.type !== 'selectModule' && $alertStore.type !== 'pukmakkurit' && $alertStore.type !== 'requestlogs'}
-    <div class="absolute w-full h-full z-50 bg-black/50 flex justify-center items-center" class:vis={ $alertStore.type === 'wait2'}>
+    <div class="absolute w-full h-full z-modal bg-black/50 flex justify-center items-center" class:vis={ $alertStore.type === 'wait2'}>
         <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl  max-h-full overflow-y-auto">
             {#if $alertStore.type === 'error'}
                 <h2 class="text-red-700 mt-0 mb-2 w-40 max-w-full">Error</h2>
@@ -738,7 +738,7 @@
 
 {:else if $alertStore.type === 'cardexport'}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div  class="fixed top-0 left-0 h-full w-full bg-black/50 flex flex-col z-50 items-center justify-center" role="button" tabindex="0" onclick={close}>
+    <div  class="fixed top-0 left-0 h-full w-full bg-black/50 flex flex-col z-modal items-center justify-center" role="button" tabindex="0" onclick={close}>
         <div class="bg-darkbg rounded-md p-4 max-w-full flex flex-col w-2xl" role="button" tabindex="0" onclick={(e) => {
             e.stopPropagation()
         }}>
@@ -819,7 +819,7 @@
     </div>
 
 {:else if $alertStore.type === 'toast'}
-    <div class="toast-anime absolute right-0 bottom-0 bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl  max-h-11/12 overflow-y-auto z-50 text-textcolor"
+    <div class="toast-anime absolute right-0 bottom-0 bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl  max-h-11/12 overflow-y-auto z-modal text-textcolor"
         onanimationend={() => {
             alertStore.set({
                 type: 'none',
@@ -838,14 +838,14 @@
     <!-- Log Generator by dootaang, GPL3 -->
     <!-- Svelte, Typescript version by Kwaroran -->
     
-    <div class="absolute w-full h-full z-50 bg-black/50 flex justify-center items-center">
+    <div class="absolute w-full h-full z-modal bg-black/50 flex justify-center items-center">
         <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl  max-h-full overflow-y-auto">
             <h2 class="text-green-700 mt-0 mb-2 w-40 max-w-full">{language.preview}</h2>
 
         </div>
     </div>
 {:else if $alertStore.type === 'branches'}
-    <div class="absolute w-full h-full z-50 bg-black/80 flex justify-center items-center overflow-x-auto overflow-y-auto">
+    <div class="absolute w-full h-full z-modal bg-black/80 flex justify-center items-center overflow-x-auto overflow-y-auto">
         {#if branchHover !== null}
             <div class="z-30 whitespace-pre-wrap p-4 text-textcolor bg-darkbg border-darkborderc border rounded-md absolute" style="top: {branchHover.y * 80 + 24}px; left: {(branchHover.x + 1) * 80 + 24}px">
                 {branchHover.content}
@@ -916,7 +916,7 @@
     </div>
 {:else if $alertStore.type === 'requestlogs'}
     {@const logs = getFetchLogs()}
-    <div class="fixed inset-0 z-50 bg-black/80 flex justify-center items-start overflow-y-auto p-4">
+    <div class="fixed inset-0 z-modal bg-black/80 flex justify-center items-start overflow-y-auto p-4">
         <div class="bg-darkbg rounded-lg w-full max-w-4xl my-4 flex flex-col max-h-[90vh]">
             <div class="flex items-center justify-between p-4 border-b border-darkborderc sticky top-0 bg-darkbg z-10">
                 <h1 class="text-xl font-bold text-textcolor">{language.ShowLog}</h1>

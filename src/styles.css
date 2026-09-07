@@ -478,6 +478,12 @@ body {
   z-index: 100;
 }
 
+/* Alerts, confirmations, permission prompts, and other full-screen modals. Sits above the
+   z-[1000] work dialogs (import progress, screenshot) so errors and confirmations stay visible. */
+@utility z-modal {
+  z-index: 2000;
+}
+
 .saving-animation {
   animation: saving-anime 1s infinite;
   background-size: 200% auto;
