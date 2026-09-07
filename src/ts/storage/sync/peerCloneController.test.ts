@@ -19,6 +19,36 @@ afterEach(() => {
 })
 
 describe('peer clone controller lifecycle', () => {
+    it('ignores a progress response delivered after cancellation succeeds', async () => {
+        vi.useFakeTimers()
+        let resolveStatus!: (status: unknown) => void
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_target_status') {
+                return await new Promise((resolve) => { resolveStatus = resolve }) as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+        })
+        const controller = createPeerCloneController({ facade, targetPollMilliseconds: 10 })
+        controller.joinClaimed(claimedTarget)
+        controller.confirmDestructiveReplace()
+        await controller.download()
+        await vi.advanceTimersByTimeAsync(10)
+        await controller.cancel()
+
+        resolveStatus({ phase: 'downloading', completedBytes: 8, totalBytes: 10 })
+        await vi.advanceTimersByTimeAsync(0)
+
+        expect(facade.getState().target.phase).toBe('cancelled')
+        expect(controller.snapshot().state.target.phase).toBe('cancelled')
+        expect(controller.snapshot().targetPhase).toBe('cancelled')
+        expect(controller.snapshot().error).toBe('')
+    })
+
     it('initializes only target capabilities for the unified controller', async () => {
         const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
             if (command === 'peer_clone_capabilities') return capabilities() as T

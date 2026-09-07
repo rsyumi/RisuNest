@@ -158,6 +158,7 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
     const platformBridge = options.bridge ?? browserBridge()
     let state = initialState
     let jobId: string | undefined
+    let targetEpoch = 0
     let finalization: Promise<AndroidPeerCloneStatus> | undefined
     let committedRecovery: {
         status: AndroidPeerCloneStatus
@@ -344,6 +345,7 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
                 { deviceId },
             ))
             if (claimed.sourceDeviceId !== deviceId) invalidStatus()
+            targetEpoch += 1
             adoptStatus(claimed)
             state = { ...state, destructiveConfirmed: false }
             return state
@@ -391,11 +393,19 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             } else {
                 await nativeInvoke('peer_clone_android_cancel_foreground', { jobId: id })
             }
+            targetEpoch += 1
             state = { ...state, phase: 'cancelled' }
         },
         async targetStatus(): Promise<AndroidPeerCloneStatus> {
             if (committedRecovery) return finalize(committedRecovery.status)
+            const epoch = targetEpoch
             const current = safeCurrentStatus(await nativeInvoke<unknown>('peer_clone_android_current'))
+            // A reply sampled before cancellation or another join cannot own
+            // the current job or trigger its activation.
+            if (epoch !== targetEpoch) {
+                if (!current) throw new Error('Android peer clone job is unavailable')
+                return current
+            }
             const status = adoptStatus(current)
             if (!status) throw new Error('Android peer clone job is unavailable')
             return status.phase === 'awaitingActivation' ? finalize(status) : status

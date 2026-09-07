@@ -34,6 +34,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
     let initialization: Promise<void> | undefined
     let targetTimer: ReturnType<typeof setInterval> | undefined
     let targetPolling = false
+    let targetEpoch = 0
 
     const publish = () => {
         snapshot = {
@@ -58,8 +59,10 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
     const pollTarget = async () => {
         if (targetPolling) return
         targetPolling = true
+        const epoch = targetEpoch
         try {
             const status = await facade.targetStatus()
+            if (epoch !== targetEpoch) return
             snapshot = { ...snapshot, targetPhase: status.phase }
             const phase = facade.getState().target.phase
             if (phase === 'failed') {
@@ -70,6 +73,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
             }
             if (phase === 'completed' || phase === 'failed') stopTargetPolling()
         } catch (cause) {
+            if (epoch !== targetEpoch) return
             failure(cause)
             if (facade.getState().target.phase === 'failed') stopTargetPolling()
         } finally {
@@ -114,6 +118,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         },
         joinClaimed(target: { endpoint: string, sessionId: string, manifestId: string }): void {
             facade.joinClaimed(target)
+            targetEpoch += 1
             snapshot = { ...snapshot, targetPhase: 'idle' }
             success()
         },
@@ -133,6 +138,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         }),
         cancel: () => run(async () => {
             await facade.cancel()
+            targetEpoch += 1
             snapshot = { ...snapshot, targetPhase: 'cancelled' }
             stopTargetPolling()
         }),

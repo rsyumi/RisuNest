@@ -31,6 +31,41 @@ function bridge(mode: 'foreground' | 'uidt' = 'uidt') {
 }
 
 describe('Android peer clone facade', () => {
+    it.each(['downloading', 'awaitingActivation'] as const)(
+        'ignores a delayed %s status after cancellation succeeds',
+        async (phase) => {
+            const status: AndroidRegisteredCloneStatus = {
+                sourceDeviceId: '00000000-0000-4000-8000-000000000101',
+                jobId: '11111111-1111-4111-8111-111111111111',
+                phase: 'downloading', completedBytes: 1,
+            }
+            let resolveStatus!: (status: AndroidRegisteredCloneStatus) => void
+            let reads = 0
+            const invoke = vi.fn<AndroidPeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+                if (command === 'peer_clone_android_current') {
+                    if (reads++ === 0) return status as T
+                    return await new Promise<AndroidRegisteredCloneStatus>((resolve) => {
+                        resolveStatus = resolve
+                    }) as T
+                }
+                return undefined as T
+            })
+            const facade = createAndroidPeerCloneFacade({
+                invoke: invoke as unknown as AndroidPeerCloneInvoke,
+                bridge: bridge(),
+                runtime: runtime().replacement,
+            })
+            await facade.recover()
+            const pending = facade.targetStatus()
+            await facade.cancel()
+            resolveStatus({ ...status, phase })
+            await pending
+
+            expect(facade.getState().phase).toBe('cancelled')
+            expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_android_finalize')).toBe(false)
+        },
+    )
+
     it('exposes only the safe registered failure category', () => {
         expectTypeOf<AndroidRegisteredCloneStatus['error']>()
             .toEqualTypeOf<'transferFailed' | undefined>()

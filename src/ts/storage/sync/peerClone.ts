@@ -399,6 +399,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         async cancel(): Promise<void> {
             supported()
             await nativeInvoke('peer_clone_cancel', targetArgs())
+            targetIdentityEpoch += 1
             state = reducePeerCloneState(state, { type: 'target-cancelled' })
         },
         async targetStatus(): Promise<PeerCloneTargetStatus> {
