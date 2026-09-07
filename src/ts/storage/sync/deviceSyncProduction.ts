@@ -195,11 +195,28 @@ export function createAndroidDeviceSyncCloneTarget(
     }
 }
 
+async function withRestoredPlugins(
+    pendingFence: ReturnType<typeof acquireDestructiveReplacementFence>,
+): ReturnType<typeof acquireDestructiveReplacementFence> {
+    const fence = await pendingFence
+    return {
+        ...fence,
+        async refreshCommittedWorkingSet(...args) {
+            await fence.refreshCommittedWorkingSet(...args)
+            const plugins = await import('../../plugins/plugins.svelte')
+            await plugins.loadPluginsAfterAuthoritativeRestore()
+        },
+    }
+}
+
 const productionRuntime = {
     flushPendingData,
     capturePersistentMutationToken,
-    acquireDestructiveReplacementFence,
-    acquireCommittedWorkingSetRefreshFence,
+    acquireDestructiveReplacementFence: (
+        ...args: Parameters<typeof acquireDestructiveReplacementFence>
+    ) => withRestoredPlugins(acquireDestructiveReplacementFence(...args)),
+    acquireCommittedWorkingSetRefreshFence: () =>
+        withRestoredPlugins(acquireCommittedWorkingSetRefreshFence()),
 }
 
 type ProductionFactories = {
@@ -239,10 +256,6 @@ const defaultFactories: ProductionFactories = {
     cloneAndroid: (runtime) => createAndroidDeviceSyncCloneTarget(getAndroidPeerCloneFacade({
         capturePersistentMutationToken: runtime.capturePersistentMutationToken,
         acquireDestructiveReplacementFence: runtime.acquireDestructiveReplacementFence,
-        afterRefresh: async () => {
-            const plugins = await import('../../plugins/plugins.svelte')
-            await plugins.loadPluginsAfterAuthoritativeRestore()
-        },
     })),
     deltaDesktop: (runtime) => getDesktopPeerDeltaController(runtime),
     deltaAndroid: (runtime) => getAndroidPeerDeltaController(runtime),

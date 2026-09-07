@@ -17,7 +17,7 @@ import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
-import { loadPlugins, pluginCompatibility } from "./plugins/plugins.svelte";
+import { loadPlugins, loadPluginsAfterAuthoritativeRestore, pluginCompatibility } from "./plugins/plugins.svelte";
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
@@ -532,7 +532,7 @@ export async function loadData() {
                                         token: credential.token,
                                     },
                                 },
-                                { afterRefresh: loadPlugins },
+                                { afterRefresh: loadPluginsAfterAuthoritativeRestore },
                             )
                             if (result.kind !== 'activated') return result
                             officialAdapter.rememberNativeActivation(

@@ -84,11 +84,17 @@ export function createFullCompatibilityPersistence<T>(
 }
 
 export function shouldProjectScalableWorkingSet(
-    controller: Pick<PluginCompatibilityController, 'profile' | 'allowsEviction'>,
-    forceScalableProjection = false,
+    controller: Pick<
+        PluginCompatibilityController,
+        'profile' | 'allowsEviction'
+    >,
+    forceScalableProjection?: boolean,
 ): boolean {
-    return forceScalableProjection || (
-        controller.profile === 'scalable-v3' && controller.allowsEviction
+    // A committed replacement chooses its projection from the restored plugins,
+    // before the controller has switched away from the previous database's mode.
+    return (
+        forceScalableProjection ??
+        (controller.profile === 'scalable-v3' && controller.allowsEviction)
     )
 }
 

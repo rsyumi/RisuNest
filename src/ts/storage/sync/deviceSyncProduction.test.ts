@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 
+vi.mock('../../plugins/plugins.svelte', () => ({ loadPluginsAfterAuthoritativeRestore: vi.fn() }))
+import { loadPluginsAfterAuthoritativeRestore } from '../../plugins/plugins.svelte'
+import { acquireDestructiveReplacementFence, acquireCommittedWorkingSetRefreshFence } from '../persistentDataRuntime.svelte'
+
 vi.mock('../persistentDataRuntime.svelte', () => ({
     flushPendingData: vi.fn(),
     capturePersistentMutationToken: vi.fn(),
@@ -29,6 +33,72 @@ async function settleAsyncWork(): Promise<void> {
 }
 
 describe('production device sync composition', () => {
+    it.each(['replacement', 'remote-commit'] as const)(
+        'reloads restored plugins within the %s fence and permits retry',
+        async (kind) => {
+            const events: string[] = []
+            const refresh = vi.fn(async () => {
+                events.push('refresh')
+            })
+            const release = vi.fn(() => {
+                events.push('release')
+            })
+            const acquire =
+                kind === 'replacement'
+                    ? acquireDestructiveReplacementFence
+                    : acquireCommittedWorkingSetRefreshFence
+            vi.mocked(acquire).mockResolvedValue({
+                refreshCommittedWorkingSet: refresh,
+                release,
+            } as never)
+            vi.mocked(loadPluginsAfterAuthoritativeRestore)
+                .mockReset()
+                .mockImplementationOnce(async () => {
+                    events.push('plugins-failed')
+                    throw new Error('synthetic failure')
+                })
+                .mockImplementation(async () => {
+                    events.push('plugins')
+                })
+            let runtime: any
+            createProductionDeviceSyncController({
+                platform: 'desktop',
+                factories: {
+                    sourceDesktop: ((value: unknown) => {
+                        runtime = value
+                        return {}
+                    }) as never,
+                    cloneDesktop: vi.fn(() => ({ initialize: vi.fn() }) as never),
+                    deltaDesktop: vi.fn(() => ({ initialize: vi.fn() }) as never),
+                    cloneAndroid: vi.fn(),
+                    deltaAndroid: vi.fn(),
+                    bidirectional: vi.fn(() => ({ initialize: vi.fn() }) as never),
+                    controller: vi.fn(() => ({})) as never,
+                },
+            })
+            const fence =
+                kind === 'replacement'
+                    ? await runtime.acquireDestructiveReplacementFence({
+                          revision: 1,
+                          mutationGeneration: 0,
+                      })
+                    : await runtime.acquireCommittedWorkingSetRefreshFence()
+            await expect(fence.refreshCommittedWorkingSet(2)).rejects.toThrow(
+                'synthetic failure',
+            )
+            expect(release).not.toHaveBeenCalled()
+            await fence.refreshCommittedWorkingSet(2)
+            fence.release()
+            expect(events).toEqual([
+                'refresh',
+                'plugins-failed',
+                'refresh',
+                'plugins',
+                'release',
+            ])
+        },
+    )
+
     it('selects the Android unified source facade while leaving desktop composition injectable', () => {
         const runtime = {
             flushPendingData: vi.fn(), capturePersistentMutationToken: vi.fn(),

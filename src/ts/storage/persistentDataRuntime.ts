@@ -621,13 +621,17 @@ export function createPersistentDataRuntime(
         fenceOwner?: symbol,
         options?: PersistentCommittedWorkingSetRefreshOptions,
     ): Promise<void> => {
-        if (fenceOwner === undefined && coordinator.hasDestructiveReplacementFence) {
+        if (
+            fenceOwner === undefined &&
+            coordinator.hasDestructiveReplacementFence
+        ) {
             throw new PersistentMutationFencedError()
         }
         if (fenceOwner !== undefined) {
             coordinator.assertDestructiveReplacementFence(fenceOwner)
         }
-        const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
+        const selectedCharacterId =
+            dependencies.state.getSelectedCharacterId() ?? null
         const selectedConversationId =
             dependencies.state.getSelectedConversationId?.() ?? null
         const activeCharacterIds = workingSet.activeCharacterIds
@@ -640,10 +644,10 @@ export function createPersistentDataRuntime(
                 activeCharacterIds,
             },
         )
-        if (
+        const maximumCompatibility =
             selectPluginCompatibilityProfile(database.plugins ?? []) ===
             'maximum-compatibility'
-        ) {
+        if (maximumCompatibility) {
             database = await dependencies.store.materializeDatabase(revision)
         }
         if (fenceOwner !== undefined) {
@@ -653,7 +657,7 @@ export function createPersistentDataRuntime(
         dependencies.state.replaceDatabase(
             database,
             activeCharacterIds,
-            options?.forceScalableProjection ?? true,
+            options?.forceScalableProjection ?? !maximumCompatibility,
         )
         workingSet.installCommittedWorkingSet(database, revision)
     }
