@@ -35,6 +35,24 @@ afterEach(() => {
 })
 
 describe('fetchTauriHttpStream', () => {
+    test.each(['DELETE', 'PATCH'])(
+        'preserves %s request bodies',
+        async (method) => {
+            pluginFetch.mockResolvedValue(new Response(null, { status: 204 }))
+            const body = new TextEncoder().encode('synthetic payload')
+            await fetchTauriHttpStream({
+                url: 'https://api.example.invalid:8443/',
+                method,
+                headers: {},
+                body,
+            })
+            expect(pluginFetch).toHaveBeenCalledWith(
+                'https://api.example.invalid:8443/',
+                expect.objectContaining({ method, body }),
+            )
+        },
+    )
+
     test('preserves request bytes, response metadata, and chunk boundaries', async () => {
         const chunks = [new Uint8Array([4, 5]), new Uint8Array([6, 7, 8])]
         const upstream = new ReadableStream<Uint8Array>({
@@ -415,7 +433,7 @@ describe('fetchTauriHttpStream', () => {
 
         expect(result).toBe(response)
         expect(result.body).toBeNull()
-        expect(pluginFetch.mock.calls[0][1].body).toBeUndefined()
+        expect(pluginFetch.mock.calls[0][1].body).toEqual(new Uint8Array([1, 2, 3]))
         expect(onFinish).toHaveBeenCalledOnce()
     })
 

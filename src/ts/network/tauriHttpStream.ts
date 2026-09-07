@@ -7,7 +7,7 @@ export type TauriHttpStreamFinish = () => void
 
 export interface TauriHttpStreamOptions {
     url: string
-    method: 'POST' | 'GET' | 'PUT' | 'DELETE'
+    method: string
     headers: { [key: string]: string }
     body?: Uint8Array
     signal?: AbortSignal
@@ -73,7 +73,7 @@ export async function fetchTauriHttpStream(options: TauriHttpStreamOptions): Pro
         response = await tauriFetch(options.url, {
             method: options.method,
             headers: options.headers,
-            body: options.method === 'GET' || options.method === 'DELETE'
+            body: options.method === 'GET' || options.method === 'HEAD'
                 ? undefined
                 : options.body as unknown as BodyInit,
             signal: lifecycle.signal,

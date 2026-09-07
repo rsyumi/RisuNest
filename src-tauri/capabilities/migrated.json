@@ -2,9 +2,7 @@
   "identifier": "migrated",
   "description": "permissions that were migrated from v1",
   "local": true,
-  "windows": [
-    "main"
-  ],
+  "windows": ["main"],
   "platforms": ["macOS", "windows", "linux"],
   "permissions": [
     "core:default",
@@ -46,19 +44,10 @@
       "identifier": "http:default",
       "allow": [
         {
-          "url": "https://*/*"
+          "url": "https://*:*"
         },
         {
-          "url": "https://*/**/*"
-        },
-        {
-          "url": "http://*/*"
-        },
-        {
-          "url": "http://*/**/*"
-        },
-        {
-          "url": "http://*:**"
+          "url": "http://*:*"
         }
       ]
     },

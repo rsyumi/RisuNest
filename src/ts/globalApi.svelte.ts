@@ -524,7 +524,6 @@ export function getFetchData(id: string) {
 }
 
 const knownHostes = ["localhost", "127.0.0.1", "0.0.0.0"];
-const webLocalNetworkBlockedMessage = "웹에서는 사설망 직접 호출 불가. Tauri 또는 LAN Node self-host 사용";
 const defaultProxyJobHeartbeatSec = 15;
 
 function getProxy2Url() {
@@ -658,16 +657,9 @@ export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promi
         if (arg.abortSignal?.aborted) { return { ok: false, data: 'aborted', headers: {}, status: 400 }; }
 
         const urlHost = new URL(url).hostname
-        const useLocalNetworkRoute = arg.networkRoute === 'local_network' && isLocalNetworkUrl(url)
+        const useLocalNetworkRoute = isLocalNetworkUrl(url)
+            && (arg.networkRoute === 'local_network' || (!isTauri && !isNodeServer))
         const forcePlainFetch = ((knownHostes.includes(urlHost) && !isTauri) || db.usePlainFetch || arg.plainFetchForce) && !arg.plainFetchDeforce && !useLocalNetworkRoute
-
-        if (useLocalNetworkRoute && !isTauri && !isNodeServer) {
-            return { ok: false, headers: {}, status: 400, data: webLocalNetworkBlockedMessage };
-        }
-
-        if (knownHostes.includes(urlHost) && !isTauri && !isNodeServer) {
-            return { ok: false, headers: {}, status: 400, data: 'You are trying local request on web version. This is not allowed due to browser security policy. Use the desktop version instead, or use a tunneling service like ngrok and set the CORS to allow all.' };
-        }
 
         if(arg.interceptor){
             for (const interceptor of bodyIntercepterStore) {
@@ -689,6 +681,11 @@ export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promi
             if (useLocalNetworkRoute) {
                 if (isTauri) {
                     return await fetchWithTauri(url, requestArg);
+                }
+                if (!isNodeServer) {
+                    return window.userScriptFetch
+                        ? await fetchWithUSFetch(url, requestArg)
+                        : await fetchWithPlainFetch(url, requestArg);
                 }
                 return await fetchWithProxy(url, requestArg);
             }
@@ -1434,7 +1431,7 @@ async function fetchViaProxyJobWs(url: string, arg: {
 export async function fetchNative(url: string, arg: {
     body?: string | Uint8Array | ArrayBuffer,
     headers?: { [key: string]: string },
-    method?: "POST" | "GET" | "PUT" | "DELETE",
+    method?: string,
     signal?: AbortSignal,
     useRisuTk?: boolean,
     chatId?: string
@@ -1442,20 +1439,22 @@ export async function fetchNative(url: string, arg: {
     logFetch?: boolean
     requestTimeoutMs?: number
     networkRoute?: 'auto' | 'local_network'
-}): Promise<Response> {
+} = {}): Promise<Response> {
 
     const useInterceptor = !!arg.interceptor
     console.log(arg.body, 'body')
-    if (arg.body === undefined && (arg.method === 'POST' || arg.method === 'PUT')) {
-        throw new Error('Body is required for POST and PUT requests')
+    // Keep implicit POST for existing callers that provide a body.
+    arg = {
+        ...arg,
+        method: (
+            arg.method ?? (arg.body === undefined ? 'GET' : 'POST')
+        ).toUpperCase(),
     }
-
-    arg.method = arg.method ?? 'POST'
 
     let headers = arg.headers ?? {}
     let realBody: Uint8Array
 
-    if (arg.method === 'GET' || arg.method === 'DELETE') {
+    if (arg.body === undefined || arg.method === 'GET' || arg.method === 'HEAD') {
         realBody = undefined
     }
     else if (typeof arg.body === 'string') {
@@ -1483,16 +1482,14 @@ export async function fetchNative(url: string, arg: {
     }
 
     const db = getDatabase()
-    const useLocalNetworkRoute = arg.networkRoute === 'local_network' && isLocalNetworkUrl(url)
-    if (useLocalNetworkRoute && !isTauri && !isNodeServer) {
-        throw new Error(webLocalNetworkBlockedMessage)
-    }
+    const useLocalNetworkRoute = isLocalNetworkUrl(url)
+        && (arg.networkRoute === 'local_network' || (!isTauri && !isNodeServer))
     let throughProxy = (!isTauri) && (!isNodeServer) && (!db.usePlainFetch)
     if (useLocalNetworkRoute) {
         if (isNodeServer) {
             throughProxy = true
         }
-        else if (isTauri) {
+        else {
             throughProxy = false
         }
     }
@@ -1557,7 +1554,7 @@ export async function fetchNative(url: string, arg: {
                 return await fetchViaProxyJobWs(url, {
                     body: realBody,
                     headers,
-                    method: arg.method,
+                    method: 'POST',
                     signal: requestSignal,
                     requestTimeoutMs: arg.requestTimeoutMs,
                     chatId: arg.chatId,

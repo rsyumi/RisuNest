@@ -3,9 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer } from 'src/ts/model/types'
 import { fetchNative } from 'src/ts/globalApi.svelte'
 import { callTool } from '../../mcp/mcp'
-import { __testResponsesAPI, requestOpenAIResponseAPI } from './requests'
+import { __testResponsesAPI, requestOpenAI, requestOpenAIResponseAPI } from './requests'
 
 const mocks = vi.hoisted(() => ({
+    isNodeServer: true,
     db: {
         OaiCompAPIKeys: {},
         additionalParams: [],
@@ -56,7 +57,7 @@ vi.mock('src/ts/alert', () => ({
 }))
 
 vi.mock('src/ts/platform', () => ({
-    isNodeServer: true,
+    get isNodeServer() { return mocks.isNodeServer },
     isTauri: false,
 }))
 
@@ -180,6 +181,7 @@ function sseStream(events: string[]) {
 
 describe('OpenAI Responses API helpers', () => {
     beforeEach(() => {
+        mocks.isNodeServer = true
         mocks.fetchNative.mockReset()
         mocks.globalFetch.mockReset()
         mocks.db.OaiCompAPIKeys = {}
@@ -193,6 +195,26 @@ describe('OpenAI Responses API helpers', () => {
         mocks.db.reasoningEffort = 2
         mocks.db.simplifiedToolUse = false
         mocks.db.autofillRequestUrl = false
+    })
+
+    it('attempts a browser localhost streaming request instead of rejecting its URL', async () => {
+        mocks.isNodeServer = false
+        mocks.fetchNative.mockResolvedValue(
+            new Response('synthetic endpoint reached', { status: 503 }),
+        )
+        const url = 'http://localhost:11434/v1/chat/completions'
+        await requestOpenAI(
+            baseArg({
+                aiModel: 'gpt-fixture',
+                formated: [{ role: 'user', content: 'synthetic' }],
+                customURL: url,
+                useStreaming: true,
+            }),
+        )
+        expect(mocks.fetchNative).toHaveBeenCalledWith(
+            url,
+            expect.objectContaining({ method: 'POST' }),
+        )
     })
 
     it('builds a Responses request body for text, developer role, multimodal input, tools, and model parameters', async () => {

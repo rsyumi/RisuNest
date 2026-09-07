@@ -47,7 +47,8 @@ android {
     ndkVersion = "28.2.13676358"
     namespace = "io.github.rsyumi.risunest"
     defaultConfig {
-        manifestPlaceholders["usesCleartextTraffic"] = "false"
+        // User-configured endpoints and plugin resources may use HTTP on a LAN.
+        manifestPlaceholders["usesCleartextTraffic"] = "true"
         manifestPlaceholders["enableExperimentalPeerCloneClient"] =
             enableExperimentalPeerCloneClient.get().toString()
         applicationId = "io.github.rsyumi.risunest"

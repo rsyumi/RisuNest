@@ -35,7 +35,8 @@ tauri-plugin-os = "2.3.2"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-shell = "2.3.5"
-tauri-plugin-http = "2.5.9"
+# Native callers may supply Cookie, Origin, Referer and other HTTP headers.
+tauri-plugin-http = { version = "2.5.9", features = ["unsafe-headers"] }
 oauth2 = "5.0.0"
 tokio = { version = "1.47.1", features = ["net", "rt", "time"] }
 tokio-util = { version = "0.7.19", features = ["io"], optional = true }
@@ -104,6 +105,7 @@ reqwest = { version = "0.11.16", default-features = false, features = ["blocking
 reqwest = { version = "0.11.16", features = ["json", "stream"] }
 
 [dev-dependencies]
+tauri = { version = "2.11.5", features = ["test"] }
 if-addrs = "0.14.0"
 regex = "1.13.1"
 tempfile = "3"

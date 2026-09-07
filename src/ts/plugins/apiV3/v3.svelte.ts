@@ -715,11 +715,22 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
     return false;
 }
 
-const urlBlacklist = [
-    'risuai.xyz',
-    'risuai.net',
-    'sionyw.com',
-]
+const urlBlacklist = ['risuai.xyz', 'risuai.net', 'sionyw.com']
+
+function assertPluginRequestUrlAllowed(url: string): void {
+    // A trailing DNS root dot does not change the destination domain.
+    const hostname = new URL(url, document.baseURI).hostname
+        .toLowerCase()
+        .replace(/\.$/, '')
+    const blocked = urlBlacklist.find(
+        (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+    )
+    if (blocked) {
+        throw new Error(
+            `Requests to ${blocked} are blocked for security reasons.`,
+        )
+    }
+}
 
 const authorizationHeaders = [
     'x-api-key',
@@ -763,12 +774,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         //Old APIs from v2.1
         risuFetch: (url, options) => {
             console.error(`[DEPRECATION WARNING] risuFetch is deprecated and will be removed in future versions. Please use nativeFetch instead.`)
-            for(const blocked of urlBlacklist){
-                if(url.toLowerCase().includes(blocked)){
-                    throw new Error(`Requests to ${blocked} are blocked for security reasons.`);
-                }
-            }
-
+            assertPluginRequestUrlAllowed(url)
             //scan headers
             const headers = options?.headers || {};
             for(const headerName in headers){
@@ -779,12 +785,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return oldApis.risuFetch(url, options);
         },
         nativeFetch: (url, options) => {
-            for(const blocked of urlBlacklist){
-                if(url.toLowerCase().includes(blocked)){
-                    throw new Error(`Requests to ${blocked} are blocked for security reasons.`);
-                }
-            }
-
+            assertPluginRequestUrlAllowed(url)
             //scan headers
             const headers = options?.headers || {};
             for(const headerName in headers){

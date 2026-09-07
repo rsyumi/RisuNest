@@ -36,13 +36,7 @@
     "dialog:allow-confirm",
     {
       "identifier": "http:default",
-      "allow": [
-        { "url": "https://*/*" },
-        { "url": "https://*/**/*" },
-        { "url": "http://*/*" },
-        { "url": "http://*/**/*" },
-        { "url": "http://*:**" }
-      ]
+      "allow": [{ "url": "https://*:*" }, { "url": "http://*:*" }]
     },
     "os:default",
     "process:default",
