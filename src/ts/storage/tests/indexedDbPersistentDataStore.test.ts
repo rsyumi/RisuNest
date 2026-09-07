@@ -632,6 +632,42 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    it('preserves conversation order when appending and inserting after a deletion', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            `conversation-order-${databaseSequence++}`, new IDBFactory(), IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const deleted = await store.commit({
+            expectedRevision: imported.revision,
+            conversations: [{ type: 'delete', characterId: 'char-a', conversationId: 'conv-long' }],
+        })
+        const append = await store.commit({
+            expectedRevision: deleted.revision,
+            conversations: [{
+                type: 'replace-range', characterId: 'char-a', conversationId: 'conv-appended',
+                start: 0, deleteCount: 0, messages: [],
+                conversation: { id: 'conv-appended', name: 'Appended', note: '', localLore: [] },
+            }],
+        })
+        const query = () => store.queryConversations({ characterId: 'char-a', order: 'configured', limit: 10 })
+        expect((await query()).items.map(({ id }) => id)).toEqual(['conv-short', 'conv-appended'])
+        await store.commit({
+            expectedRevision: append.revision,
+            conversations: [{
+                type: 'replace-range', characterId: 'char-a', conversationId: 'conv-inserted',
+                start: 0, deleteCount: 0, messages: [], configuredIndex: 1,
+                conversation: { id: 'conv-inserted', name: 'Inserted', note: '', localLore: [] },
+            }],
+        })
+        expect((await query()).items.map(({ id }) => id)).toEqual([
+            'conv-short', 'conv-inserted', 'conv-appended',
+        ])
+        expect((await store.materializeDatabase()).characters[1].chats.map(({ id }) => id)).toEqual([
+            'conv-short', 'conv-inserted', 'conv-appended',
+        ])
+    })
+
     function rejectPluginPayloadIndexScans() {
         const original = IDBIndex.prototype.getAll
         return vi.spyOn(IDBIndex.prototype, 'getAll').mockImplementation(function (

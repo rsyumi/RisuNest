@@ -2475,14 +2475,30 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 generation,
                 mutation.characterId,
             )
-            const configuredIndex = Math.min(
+            const position = Math.min(
                 conversationCount,
                 Math.max(0, mutation.configuredIndex ?? conversationCount),
             )
-            if (configuredIndex < conversationCount) {
-                const index = transaction.objectStore('conversations').index(
-                    'byGenerationCharacterConfigured',
-                )
+            const index = transaction.objectStore('conversations').index(
+                'byGenerationCharacterConfigured',
+            )
+            const appending = position === conversationCount
+            const cursorRequest = index.openCursor(this.keyRangeFactory.bound(
+                [generation, mutation.characterId, 0],
+                [generation, mutation.characterId, MAX_INDEX_VALUE],
+            ), appending ? 'prev' : 'next')
+            let cursor = await requestResult(cursorRequest)
+            if (cursor && !appending && position > 0) {
+                cursor.advance(position)
+                cursor = await requestResult(cursorRequest)
+            }
+            // Deletion leaves order-key gaps. The requested position is an ordinal,
+            // while appending must follow the highest surviving order key.
+            const configuredIndex = cursor
+                ? (cursor.value as StoredRecord<StoredConversation>).value.summary.configuredIndex
+                    + (appending ? 1 : 0)
+                : 0
+            if (!appending) {
                 const records = await requestResult(index.getAll(this.keyRangeFactory.bound(
                     [generation, mutation.characterId, configuredIndex],
                     [generation, mutation.characterId, MAX_INDEX_VALUE],

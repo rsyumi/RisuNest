@@ -568,6 +568,11 @@ pub(super) fn replace_add_characters(
 ) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
+    let mut configured_index: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM characters WHERE generation = ?1",
+        [staging_id],
+        |row| row.get(0),
+    )?;
     for character in characters {
         validate_character(character, "Persistent data import")?;
         let character_id = required_string(character, "chaId", "Persistent data import")?;
@@ -576,12 +581,8 @@ pub(super) fn replace_add_characters(
                 "Persistent data import requires unique character IDs",
             ));
         }
-        let configured_index: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM characters WHERE generation = ?1",
-            [staging_id],
-            |row| row.get(0),
-        )?;
         put_full_character(&transaction, staging_id, character, configured_index)?;
+        configured_index += 1;
     }
     transaction.commit()?;
     Ok(())
@@ -1638,18 +1639,21 @@ fn put_character_detail(
     detail: &Value,
 ) -> StoreResult<()> {
     let character_id = required_string(detail, "chaId", "Character update")?;
-    let configured_index = transaction
+    let configured_index = match transaction
         .query_row(
             "SELECT configured_index FROM characters WHERE generation = ?1 AND character_id = ?2",
             params![generation, character_id],
             |row| row.get(0),
         )
         .optional()?
-        .unwrap_or(transaction.query_row(
+    {
+        Some(configured_index) => configured_index,
+        None => transaction.query_row(
             "SELECT COUNT(*) FROM characters WHERE generation = ?1",
             [generation],
             |row| row.get(0),
-        )?);
+        )?,
+    };
     let conversation_count: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM conversations WHERE generation = ?1 AND character_id = ?2",
         params![generation, character_id],
@@ -1670,18 +1674,21 @@ fn replace_character(
     character: &Value,
 ) -> StoreResult<()> {
     let character_id = required_string(character, "chaId", "Character replacement")?;
-    let configured_index = transaction
+    let configured_index = match transaction
         .query_row(
             "SELECT configured_index FROM characters WHERE generation = ?1 AND character_id = ?2",
             params![generation, character_id],
             |row| row.get(0),
         )
         .optional()?
-        .unwrap_or(transaction.query_row(
+    {
+        Some(configured_index) => configured_index,
+        None => transaction.query_row(
             "SELECT COALESCE(MAX(configured_index) + 1, 0) FROM characters WHERE generation = ?1",
             [generation],
             |row| row.get(0),
-        )?);
+        )?,
+    };
 
     delete_character_contents(transaction, generation, character_id)?;
     put_full_character(transaction, generation, character, configured_index)
@@ -1960,15 +1967,34 @@ fn apply_conversation_mutation(
                 let mut value = object(detail, "Conversation")?.clone();
                 value.insert("id".to_owned(), Value::String(conversation_id.clone()));
                 value.insert("message".to_owned(), Value::Array(messages.clone()));
-                let conversation_count: i64 = transaction.query_row(
-                    "SELECT COUNT(*) FROM conversations WHERE generation = ?1 AND character_id = ?2",
-                    params![generation, character_id],
-                    |row| row.get(0),
-                )?;
-                let configured_index = requested_configured_index
-                    .unwrap_or(conversation_count)
-                    .clamp(0, conversation_count);
-                if configured_index < conversation_count {
+                let (conversation_count, append_configured_index): (i64, i64) = transaction
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(MAX(configured_index) + 1, 0)
+                     FROM conversations WHERE generation = ?1 AND character_id = ?2",
+                        params![generation, character_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                let requested_ordinal = requested_configured_index
+                    .map(|configured_index| configured_index.clamp(0, conversation_count));
+                let shifts_siblings = requested_ordinal
+                    .is_some_and(|configured_index| configured_index < conversation_count);
+                let configured_index = if let Some(ordinal) = requested_ordinal {
+                    if shifts_siblings {
+                        transaction.query_row(
+                            "SELECT configured_index FROM conversations
+                             WHERE generation = ?1 AND character_id = ?2
+                             ORDER BY configured_index ASC, conversation_id ASC
+                             LIMIT 1 OFFSET ?3",
+                            params![generation, character_id, ordinal],
+                            |row| row.get(0),
+                        )?
+                    } else {
+                        append_configured_index
+                    }
+                } else {
+                    append_configured_index
+                };
+                if shifts_siblings {
                     transaction.execute(
                         "UPDATE conversations SET configured_index = configured_index + 1
                          WHERE generation = ?1 AND character_id = ?2 AND configured_index >= ?3",
@@ -1983,7 +2009,7 @@ fn apply_conversation_mutation(
                     configured_index,
                 )?;
                 refresh_character_summary(transaction, generation, character_id)?;
-                let shifted_index = if configured_index < conversation_count {
+                let shifted_index = if shifts_siblings {
                     Some((
                         character_id.clone(),
                         u64::try_from(configured_index).map_err(|_| {

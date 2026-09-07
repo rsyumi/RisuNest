@@ -5291,6 +5291,51 @@ mod tests {
     }
 
     #[test]
+    fn sparse_visible_insertion_refreshes_shifted_sibling_envelopes_without_body_reads() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        seed_conversation(&store, "first", 0, 1);
+        seed_conversation(&store, "sibling", 2, 1);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        reset_message_page_rehash_reads();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.conversations = Some(vec![
+            ConversationMutation::Delete {
+                character_id: "char".to_owned(),
+                conversation_id: "first".to_owned(),
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "inserted".to_owned(),
+                start: 0,
+                delete_count: 0,
+                messages: Vec::new(),
+                conversation: Some(json!({"name": "Inserted", "lastDate": 50})),
+                configured_index: Some(1),
+            },
+        ]);
+
+        store.commit(&commit).unwrap();
+        assert!(take_message_page_rehash_reads().is_empty());
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "chat"),
+            1
+        );
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "inserted"),
+            2
+        );
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "sibling"),
+            3
+        );
+    }
+
+    #[test]
     fn distant_fixed_replacements_rehash_only_disjoint_message_pages() {
         let (_directory, mut store, cas) = open_j2_fixture();
         seed_all_record_families(&store, &cas);

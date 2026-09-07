@@ -1011,6 +1011,98 @@ fn cas_conflict_preserves_current_revision() {
 }
 
 #[test]
+fn conversation_append_after_deletion_preserves_configured_order() {
+    let (_directory, mut store, _) = open_fixture();
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::Delete {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+        },
+    );
+    commit(
+        &mut store,
+        revision,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-appended".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: vec![message("appended")],
+            conversation: Some(json!({"name": "Appended"})),
+            configured_index: None,
+        },
+    );
+    let page = store
+        .query_conversations(
+            &ConversationQuery {
+                character_id: "char-a".to_owned(),
+                order: QueryOrder::Configured,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| (item.id.as_str(), item.configured_index))
+            .collect::<Vec<_>>(),
+        vec![("conv-short", 1), ("conv-appended", 2)]
+    );
+}
+
+#[test]
+fn conversation_insert_after_deletion_uses_the_visible_position() {
+    let (_directory, mut store, _) = open_fixture();
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-third".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: Vec::new(),
+            conversation: Some(json!({"name": "Third"})),
+            configured_index: None,
+        },
+    );
+    let revision = commit(
+        &mut store,
+        revision,
+        ConversationMutation::Delete {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+        },
+    );
+    commit(
+        &mut store,
+        revision,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-inserted".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: Vec::new(),
+            conversation: Some(json!({"name": "Inserted"})),
+            configured_index: Some(1),
+        },
+    );
+    assert_eq!(
+        store.materialize(None).unwrap()["characters"][1]["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|chat| chat["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["conv-short", "conv-inserted", "conv-third"]
+    );
+}
+
+#[test]
 fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
     let (_directory, mut store, database) = open_fixture();
     let mut replacement = database["characters"][1].clone();
@@ -1257,6 +1349,42 @@ fn invalid_staged_replacement_is_aborted_without_activation() {
         store.materialize(None).expect("materialize active data"),
         database
     );
+}
+
+#[test]
+fn staged_character_batches_preserve_order_and_roll_back_a_partial_duplicate_batch() {
+    let directory = tempfile::tempdir().expect("create staged batch directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let database = fixture();
+    let characters = database["characters"]
+        .as_array()
+        .expect("fixture characters");
+    let staging = store.replace_begin().expect("begin staged replacement");
+    store
+        .replace_add_characters(&staging.staging_id, &characters[..1])
+        .expect("stage first character batch");
+    store
+        .replace_add_characters(&staging.staging_id, &characters[1..])
+        .expect("stage second character batch");
+
+    let mut transient = characters[0].clone();
+    transient["chaId"] = json!("char-transient");
+    transient["name"] = json!("Transient");
+    transient["chats"] = json!([]);
+    assert!(matches!(
+        store.replace_add_characters(&staging.staging_id, &[transient, characters[1].clone()],),
+        Err(StoreError::Validation { .. })
+    ));
+
+    let staged_characters = store
+        .materialize_staging(&staging.staging_id)
+        .expect("materialize staged characters")["characters"]
+        .as_array()
+        .expect("staged character array")
+        .iter()
+        .map(|character| character["chaId"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(staged_characters, vec!["char-b", "char-a", "char-c"]);
 }
 
 #[test]
