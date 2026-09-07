@@ -14,6 +14,8 @@ const SNAPSHOT_FILE: &str = "official-account-snapshot.risudat";
 const SNAPSHOT_PART_FILE: &str = "official-account-snapshot.risudat.part";
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+const NETWORK_CANCEL_POLL: Duration = Duration::from_millis(250);
+const NETWORK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -105,26 +107,39 @@ async fn download_snapshot(
     owned_directory: &Path,
     job: &JobControl,
 ) -> Result<DownloadOutcome, NativeJobError> {
+    download_snapshot_with_idle_timeout(request, owned_directory, job, NETWORK_IDLE_TIMEOUT).await
+}
+
+async fn download_snapshot_with_idle_timeout(
+    request: &OfficialSnapshotRestoreRequest,
+    owned_directory: &Path,
+    job: &JobControl,
+    idle_timeout: Duration,
+) -> Result<DownloadOutcome, NativeJobError> {
     let endpoint = snapshot_endpoint(&request.base_url)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         .build()
         .map_err(transport_error)?;
-    let response = client
-        .get(endpoint)
-        .headers(authenticated_headers(&request.credential)?)
-        .header("x-risu-key", DATABASE_KEY)
-        .header("x-risu-save-date", "0")
-        .send()
-        .await
-        .map_err(transport_error)?;
+    let response = await_network_operation(
+        client
+            .get(endpoint)
+            .headers(authenticated_headers(&request.credential)?)
+            .header("x-risu-key", DATABASE_KEY)
+            .header("x-risu-save-date", "0")
+            .send(),
+        job,
+        idle_timeout,
+        "Official account snapshot request was cancelled",
+    )
+    .await?;
     let status = response.status().as_u16();
     if status == 204 {
         return Ok(DownloadOutcome::Missing);
     }
     if status == 303 {
-        let bytes = bounded_response_bytes(response, job).await?;
+        let bytes = bounded_response_bytes(response, job, idle_timeout).await?;
         let value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| {
             NativeJobError::new(
                 "invalid-response",
@@ -157,7 +172,8 @@ async fn download_snapshot(
     }
     if !(200..300).contains(&status) {
         let message =
-            String::from_utf8_lossy(&bounded_response_bytes(response, job).await?).into_owned();
+            String::from_utf8_lossy(&bounded_response_bytes(response, job, idle_timeout).await?)
+                .into_owned();
         return Err(NativeJobError::new(
             "http-status",
             format!("Official account snapshot download returned {status}: {message}"),
@@ -188,16 +204,13 @@ async fn download_snapshot(
     let mut response = response;
     let mut written = 0u64;
     loop {
-        if job.is_cancel_requested() {
-            return Err(NativeJobError::new(
-                "cancelled",
-                "Official account snapshot download was cancelled",
-            ));
-        }
-        let chunk = match tokio::time::timeout(Duration::from_millis(250), response.chunk()).await {
-            Ok(result) => result.map_err(transport_error)?,
-            Err(_) => continue,
-        };
+        let chunk = await_network_operation(
+            response.chunk(),
+            job,
+            idle_timeout,
+            "Official account snapshot download was cancelled",
+        )
+        .await?;
         let Some(chunk) = chunk else { break };
         written = written.checked_add(chunk.len() as u64).ok_or_else(|| {
             NativeJobError::new("invalid-input", "Official account snapshot length overflow")
@@ -270,19 +283,17 @@ fn authenticated_headers(
 async fn bounded_response_bytes(
     mut response: reqwest::Response,
     job: &JobControl,
+    idle_timeout: Duration,
 ) -> Result<Vec<u8>, NativeJobError> {
     let mut bytes = Vec::new();
     loop {
-        if job.is_cancel_requested() {
-            return Err(NativeJobError::new(
-                "cancelled",
-                "Official account snapshot request was cancelled",
-            ));
-        }
-        let chunk = match tokio::time::timeout(Duration::from_millis(250), response.chunk()).await {
-            Ok(result) => result.map_err(transport_error)?,
-            Err(_) => continue,
-        };
+        let chunk = await_network_operation(
+            response.chunk(),
+            job,
+            idle_timeout,
+            "Official account snapshot request was cancelled",
+        )
+        .await?;
         let Some(chunk) = chunk else { break };
         if bytes.len().saturating_add(chunk.len()) > MAX_ERROR_BYTES {
             return Err(NativeJobError::new(
@@ -293,6 +304,42 @@ async fn bounded_response_bytes(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+async fn await_network_operation<F, T>(
+    operation: F,
+    job: &JobControl,
+    idle_timeout: Duration,
+    cancelled_message: &'static str,
+) -> Result<T, NativeJobError>
+where
+    F: std::future::Future<Output = Result<T, reqwest::Error>>,
+{
+    let mut operation = Box::pin(operation);
+    let deadline = tokio::time::Instant::now() + idle_timeout;
+    loop {
+        if job.is_cancel_requested() {
+            return Err(NativeJobError::new("cancelled", cancelled_message));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(network_idle_timeout());
+        }
+        let wait = std::cmp::min(NETWORK_CANCEL_POLL, remaining);
+        if let Ok(result) = tokio::time::timeout(wait, operation.as_mut()).await {
+            if job.is_cancel_requested() {
+                return Err(NativeJobError::new("cancelled", cancelled_message));
+            }
+            return result.map_err(transport_error);
+        }
+    }
+}
+
+fn network_idle_timeout() -> NativeJobError {
+    NativeJobError::new(
+        "network-error",
+        "Official account snapshot request timed out while waiting for network progress",
+    )
 }
 
 fn transport_error(error: reqwest::Error) -> NativeJobError {
@@ -313,7 +360,9 @@ mod tests {
     use crate::native_file_jobs::{JobKind, JobRegistry};
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     fn server(response: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {
@@ -342,6 +391,77 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    fn stalled_server(
+        response_prefix: Vec<u8>,
+    ) -> (
+        String,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(&response_prefix).unwrap();
+            stream.flush().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = stop_rx.recv_timeout(Duration::from_secs(5));
+        });
+        (format!("http://{address}"), ready_rx, stop_tx, handle)
+    }
+
+    fn scripted_server(steps: Vec<(Duration, Vec<u8>)>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            for (delay, bytes) in steps {
+                thread::sleep(delay);
+                stream.write_all(&bytes).unwrap();
+                stream.flush().unwrap();
+            }
+            stream.shutdown(Shutdown::Write).unwrap();
+            while stream.read(&mut buffer).unwrap() != 0 {}
+        });
+        (format!("http://{address}"), handle)
+    }
+
     fn request(base_url: String) -> OfficialSnapshotRestoreRequest {
         OfficialSnapshotRestoreRequest {
             base_url,
@@ -358,6 +478,167 @@ mod tests {
             .unwrap();
         job.start(JobPhase::ReadingSource).unwrap();
         job
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_response_stalled_before_headers() {
+        let (base_url, request_received, stop_server, server) = stalled_server(Vec::new());
+        let directory = TempDir::new().unwrap();
+        let job = job();
+        let cancelling_job = std::sync::Arc::clone(&job);
+        let canceller = thread::spawn(move || {
+            request_received
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            cancelling_job.request_cancel().unwrap();
+        });
+
+        let started = Instant::now();
+        let result = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                download_snapshot(&request(base_url), directory.path(), &job),
+            )
+            .await
+        });
+
+        let _ = stop_server.send(());
+        server.join().unwrap();
+        canceller.join().unwrap();
+        let error = match result.expect("header-stalled request must stop after cancellation") {
+            Err(error) => error,
+            Ok(_) => panic!("header-stalled request must be cancelled"),
+        };
+        assert_eq!(error.code, "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_response_stalled_between_body_chunks() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\npartial".to_vec();
+        let (base_url, body_started, stop_server, server) = stalled_server(response);
+        let directory = TempDir::new().unwrap();
+        let job = job();
+        let cancelling_job = std::sync::Arc::clone(&job);
+        let canceller = thread::spawn(move || {
+            body_started.recv_timeout(Duration::from_secs(1)).unwrap();
+            cancelling_job.request_cancel().unwrap();
+        });
+
+        let result = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                download_snapshot(&request(base_url), directory.path(), &job),
+            )
+            .await
+        });
+
+        let _ = stop_server.send(());
+        server.join().unwrap();
+        canceller.join().unwrap();
+        let error = match result.expect("body-stalled request must stop after cancellation") {
+            Err(error) => error,
+            Ok(_) => panic!("body-stalled request must be cancelled"),
+        };
+        assert_eq!(error.code, "cancelled");
+    }
+
+    #[test]
+    fn idle_timeout_ends_a_stalled_snapshot_body() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\npartial".to_vec();
+        let (base_url, _body_started, stop_server, server) = stalled_server(response);
+        let directory = TempDir::new().unwrap();
+        let job = job();
+
+        let result = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                download_snapshot_with_idle_timeout(
+                    &request(base_url),
+                    directory.path(),
+                    &job,
+                    Duration::from_millis(100),
+                ),
+            )
+            .await
+        });
+
+        let _ = stop_server.send(());
+        server.join().unwrap();
+        let error = match result.expect("stalled body must respect its idle timeout") {
+            Err(error) => error,
+            Ok(_) => panic!("stalled body must fail"),
+        };
+        assert_eq!(error.code, "network-error");
+    }
+
+    #[test]
+    fn idle_timeout_ends_a_stalled_error_response_body() {
+        let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\npartial"
+            .to_vec();
+        let (base_url, _body_started, stop_server, server) = stalled_server(response);
+        let directory = TempDir::new().unwrap();
+        let job = job();
+
+        let result = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                download_snapshot_with_idle_timeout(
+                    &request(base_url),
+                    directory.path(),
+                    &job,
+                    Duration::from_millis(100),
+                ),
+            )
+            .await
+        });
+
+        let _ = stop_server.send(());
+        server.join().unwrap();
+        let error = match result.expect("stalled error body must respect its idle timeout") {
+            Err(error) => error,
+            Ok(_) => panic!("stalled error body must fail"),
+        };
+        assert_eq!(error.code, "network-error");
+    }
+
+    #[test]
+    fn body_progress_resets_the_idle_timeout() {
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n".to_vec();
+        let steps = vec![
+            (Duration::ZERO, headers),
+            (Duration::from_millis(300), b"a".to_vec()),
+            (Duration::from_millis(300), b"b".to_vec()),
+            (Duration::from_millis(300), b"c".to_vec()),
+        ];
+        let (base_url, server) = scripted_server(steps);
+        let directory = TempDir::new().unwrap();
+        let job = job();
+
+        let outcome = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                download_snapshot_with_idle_timeout(
+                    &request(base_url),
+                    directory.path(),
+                    &job,
+                    Duration::from_millis(500),
+                ),
+            )
+            .await
+        })
+        .expect("progressing download must finish")
+        .unwrap();
+
+        let DownloadOutcome::File(mut source) = outcome else {
+            panic!("snapshot must download");
+        };
+        let mut bytes = Vec::new();
+        source.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abc");
+        server.join().unwrap();
     }
 
     #[test]
