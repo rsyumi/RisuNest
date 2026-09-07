@@ -319,14 +319,17 @@ describe('coordinated staged asset activation', () => {
             handles,
             preparationStarted,
             runtime,
-            setFailure(value: typeof failure) { failure = value },
-            setPrepareHook(value: (() => Promise<void>) | null) { prepareHook = value },
-            bumpAuthorityEpoch() { authorityEpoch++ },
-            blob: createCoordinatorOwnedAssetBlobStore(
-                dispatcher,
-                authority as never,
-                runtime,
-            ),
+            v2Remove: v2.remove,
+            setFailure(value: typeof failure) {
+                failure = value
+            },
+            setPrepareHook(value: (() => Promise<void>) | null) {
+                prepareHook = value
+            },
+            bumpAuthorityEpoch() {
+                authorityEpoch++
+            },
+            blob: createCoordinatorOwnedAssetBlobStore(dispatcher, authority as never, runtime),
         }
     }
 
@@ -375,5 +378,30 @@ describe('coordinated staged asset activation', () => {
 
         expect(test.handles[0].abort).toHaveBeenCalledOnce()
         expect(test.handles[0].activate).not.toHaveBeenCalled()
+    })
+
+    it('rejects a queued delete after destructive replacement and settles the key tail', async () => {
+        const test = harness()
+        let releasePrepare!: () => void
+        const prepareBlocked = new Promise<void>((resolve) => {
+            releasePrepare = resolve
+        })
+        test.setPrepareHook(async () => prepareBlocked)
+
+        const write = test.blob.put('assets/item.bin', Uint8Array.of(4), metadata)
+        await test.preparationStarted
+        const remove = test.blob.remove('assets/item.bin')
+        const writeRejection = expect(write).rejects.toThrow('authority changed')
+        const removeRejection = expect(remove).rejects.toThrow('authority changed')
+
+        test.bumpAuthorityEpoch()
+        releasePrepare()
+
+        await writeRejection
+        await removeRejection
+        expect(test.v2Remove).not.toHaveBeenCalled()
+
+        await expect(test.blob.remove('assets/item.bin')).resolves.toBeUndefined()
+        expect(test.v2Remove).toHaveBeenCalledOnce()
     })
 })

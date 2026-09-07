@@ -171,9 +171,10 @@ export function createCoordinatorOwnedAssetBlobStore(
         operation: () => Promise<T>,
     ): Promise<T> => {
         const invocation = reserveInvocation(key)
+        const expectedAuthorityEpoch = runtime.getStorageAuthorityEpoch()
         try {
             await invocation.previous
-            return await mutate(key, operation)
+            return await mutate(key, operation, expectedAuthorityEpoch)
         } finally {
             invocation.release()
         }
