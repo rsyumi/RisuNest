@@ -3847,11 +3847,9 @@ mod tests {
 
         let waiter = Arc::clone(&job);
         let waited = std::thread::spawn(move || waiter.wait_for_restore_finalization());
-        for _ in 0..100 {
-            if job.status().phase == JobPhase::AwaitingActivation {
-                break;
-            }
-            std::thread::yield_now();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.status().state != JobState::WaitingForInput && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(job.status().state, JobState::WaitingForInput);
         assert_eq!(job.status().phase, JobPhase::AwaitingActivation);

@@ -1241,6 +1241,64 @@ describe('native file jobs', () => {
         ])
     })
 
+    it.each(['fence', 'blocking'] as const)('cancels before activation when aborted during %s acquisition', async (abortAt) => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        const release = vi.fn()
+        const refresh = vi.fn()
+        let finishAcquisition!: () => void
+        let acquisitionStarted!: () => void
+        const acquired = new Promise<void>((resolve) => { acquisitionStarted = resolve })
+        const acquisition = new Promise<void>((resolve) => { finishAcquisition = resolve })
+        const statuses: NativeFileJobStatus[] = [
+            { ...status('waitingForInput'), phase: 'awaiting-activation' },
+            status('cancelled'),
+        ]
+        const result = runNativeBlockRisuSaveRestore(
+            restoreRuntime(2, {
+                acquire: async () => {
+                    acquisitionStarted()
+                    await acquisition
+                },
+                refresh,
+                release,
+            }),
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
+            {
+                signal: controller.signal,
+                onBlockingChange: (blocking) => {
+                    if (blocking && abortAt === 'blocking') controller.abort()
+                },
+            },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_cancel') return 'requested'
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+        await acquired
+        if (abortAt === 'fence') controller.abort()
+        finishAcquisition()
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+        expect(refresh).not.toHaveBeenCalled()
+        expect(release).toHaveBeenCalledOnce()
+    })
+
     it('does not start a native job when cancellation arrives during the flush', async () => {
         const controller = new AbortController()
         const commands: string[] = []

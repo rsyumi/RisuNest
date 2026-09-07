@@ -785,6 +785,13 @@ async function runNativeReplacementRestore(
                     continue
                 }
                 options.onBlockingChange?.(true)
+                if (options.signal?.aborted) {
+                    cancellationRequested = true
+                    await invokeNative(dependencies, 'native_file_job_cancel', {
+                        jobId: started.jobId,
+                    })
+                    continue
+                }
                 await invokeNative(dependencies, 'native_file_job_finalize', {
                     jobId: started.jobId,
                 })
