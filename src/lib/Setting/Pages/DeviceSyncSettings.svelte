@@ -597,5 +597,4 @@
             </div>
         {/if}
     </div>
-    <p data-lan-warning class="mt-4 rounded-md border border-darkborderc bg-selected p-3 text-sm text-textcolor">{sync.lanWarning}</p>
 </section>

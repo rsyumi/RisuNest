@@ -90,7 +90,6 @@ describe('DeviceSyncSettings', () => {
         const permissionPanel = target.querySelector('[data-permissions]')!
         const start = button('Start sharing')!
         expect(permissionPanel.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-        expect(target.textContent).toContain('LAN connections are not encrypted')
     })
 
     it('persists method-specific fields without exposing a tunnel token', async () => {
@@ -689,15 +688,15 @@ describe('DeviceSyncSettings', () => {
 
     it('uses project theme tokens instead of raw red and yellow colors', async () => {
         await render()
-        const warning = target.querySelector('[data-lan-warning]')!
-        expect(warning.className).toContain('border-darkborderc')
-        expect(warning.className).toContain('bg-selected')
+        const card = target.querySelector('[data-sync-card="sharing"]')!
+        expect(card.className).toContain('border-darkborderc')
+        expect(card.className).toContain('bg-darkbg')
 
         await unmount(mounted!); mounted = undefined; target.replaceChildren()
         await render(snapshot({ devices: [{ deviceId: 'out-a', name: 'Outgoing', permissions: ['read'] }] }))
         const remove = [...target.querySelectorAll<HTMLButtonElement>('button')]
             .find((candidate) => candidate.getAttribute('aria-label')?.startsWith('Remove: Outgoing'))!
-        expect(`${warning.className} ${remove.className}`).not.toMatch(/(?:red|yellow)-\d/)
+        expect(`${card.className} ${remove.className}`).not.toMatch(/(?:red|yellow)-\d/)
         expect(remove.className).toContain('bg-draculared')
     })
 
