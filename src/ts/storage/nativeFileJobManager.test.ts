@@ -1,29 +1,44 @@
 import { get } from 'svelte/store'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
     cancelActiveNativeFileOperation,
+    dismissNativeFileOperationOutcome,
     NativeFileOperationBusyError,
     nativeFileOperation,
+    nativeFileOperationOutcome,
     runExternalAndroidNativeFileOperation,
     runSharedNativeFileOperation,
+    type NativeFileOperationOutcome,
+    type SharedNativeFileOperationContext,
 } from './nativeFileJobManager'
+import {
+    NativeFileJobActivationCommittedError,
+    NativeFileJobError,
+    type NativeFileJobStage,
+    type NativeFileJobStatus,
+} from './nativeFileJobs'
+
+function status(patch: Partial<NativeFileJobStatus> = {}): NativeFileJobStatus {
+    return {
+        jobId: 'restore-1',
+        kind: 'restore-legacy-local-backup',
+        state: 'running',
+        phase: 'reading-source',
+        progress: { completedBytes: 64, totalBytes: 128, completedItems: 0 },
+        ...patch,
+    }
+}
 
 describe('renderer-lifetime native file job manager', () => {
+    beforeEach(() => {
+        dismissNativeFileOperationOutcome()
+    })
+
     it('coalesces remounted callers onto one operation and exposes shared progress', async () => {
         let finish!: (value: string) => void
-        const operation = vi.fn(async ({ onStatus }: {
-            signal: AbortSignal
-            onStatus(status: never): void
-            setBlocking(value: boolean): void
-        }) => {
-            onStatus({
-                jobId: 'restore-1',
-                kind: 'restore-block-risu-save',
-                state: 'running',
-                phase: 'reading-source',
-                progress: { completedBytes: 64, totalBytes: 128, completedItems: 0 },
-            } as never)
+        const operation = vi.fn(async ({ onStatus }: SharedNativeFileOperationContext) => {
+            onStatus(status({ kind: 'restore-block-risu-save' }))
             return await new Promise<string>((resolve) => finish = resolve)
         })
 
@@ -33,6 +48,7 @@ describe('renderer-lifetime native file job manager', () => {
         expect(first).toBe(second)
         expect(operation).toHaveBeenCalledOnce()
         expect(get(nativeFileOperation)?.status?.progress.completedBytes).toBe(64)
+        expect(get(nativeFileOperation)?.presentation).toBe('inline')
 
         finish('done')
         await expect(first).resolves.toBe('done')
@@ -49,7 +65,9 @@ describe('renderer-lifetime native file job manager', () => {
         })
 
         expect(observedSignal.aborted).toBe(false)
+        expect(get(nativeFileOperation)?.cancelRequested).toBe(false)
         cancelActiveNativeFileOperation()
+        expect(get(nativeFileOperation)?.cancelRequested).toBe(true)
         await expect(promise).rejects.toBeDefined()
         expect(observedSignal.aborted).toBe(true)
     })
@@ -106,5 +124,224 @@ describe('renderer-lifetime native file job manager', () => {
 
         finish()
         await first
+    })
+
+    it('exposes the source and presentation of a dialog operation while it runs', async () => {
+        let finish!: () => void
+        const promise = runSharedNativeFileOperation(
+            'import',
+            'legacy-local-backup-import',
+            async ({ setSource, onStatus }) => {
+                setSource({ name: 'risu-backup.bin', bytes: 4096 })
+                onStatus(status())
+                await new Promise<void>((resolve) => finish = resolve)
+                return { warningCodes: [] }
+            },
+            { presentation: 'dialog', format: 'local-backup' },
+        )
+
+        const running = get(nativeFileOperation)
+        expect(running?.presentation).toBe('dialog')
+        expect(running?.format).toBe('local-backup')
+        expect(running?.source).toEqual({ name: 'risu-backup.bin', bytes: 4096 })
+        expect(running?.status?.jobId).toBe('restore-1')
+        expect(running?.observedStages).toEqual(['reading-archive'])
+        expect(typeof running?.startedAt).toBe('number')
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+
+        finish()
+        await promise
+    })
+
+    it('records each distinct stage in order, from detail when present and from the phase otherwise', async () => {
+        const detail = (stage: NativeFileJobStage) => ({
+            stage,
+            stageCompleted: 0,
+            stageUnit: 'items' as const,
+            counts: {
+                entriesRead: 0, assets: 0, inlays: 0, coldStorage: 0, pocketMedia: 0, pocketMetadata: 0,
+                skipped: 0, attachmentsPrepared: 0, characters: 0, presets: 0, blocks: 0,
+            },
+        })
+        await runSharedNativeFileOperation(
+            'import',
+            'risu-save-import',
+            async ({ onStatus }) => {
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'queued' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'reading-source' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'reading-source' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'staging-database' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'awaiting-activation', state: 'waitingForInput' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'activating-database' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'complete', state: 'succeeded' }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'complete', state: 'succeeded', detail: detail('refreshing-app') }))
+                onStatus(status({ kind: 'restore-block-risu-save', phase: 'complete', state: 'succeeded', detail: detail('reloading-plugins') }))
+                return { warningCodes: [] }
+            },
+            { presentation: 'dialog', format: 'risu-save' },
+        )
+        expect(get(nativeFileOperationOutcome)?.observedStages).toEqual([
+            'reading-database', 'finalizing-staging', 'awaiting-activation', 'activating',
+            'refreshing-app', 'reloading-plugins',
+        ])
+        expect(get(nativeFileOperationOutcome)?.format).toBe('risu-save')
+    })
+
+    it('publishes a dialog outcome carrying the final status when the operation succeeds', async () => {
+        const terminal = status({
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 128, totalBytes: 128, completedItems: 3 },
+            result: {
+                revision: 7,
+                sourceBytes: 128,
+                sourceSha256: 'abc',
+                characterCount: 2,
+                presetCount: 1,
+                warningCodes: ['cleanup-failed'],
+            },
+        })
+
+        const value = await runSharedNativeFileOperation(
+            'import',
+            'legacy-local-backup-import',
+            async ({ setSource, onStatus }) => {
+                setSource({ name: 'risu-backup.bin', bytes: 128 })
+                onStatus(status())
+                onStatus(terminal)
+                return { mode: 'native', warningCodes: ['partial-destination-may-remain'] }
+            },
+            { presentation: 'dialog' },
+        )
+
+        expect(value.mode).toBe('native')
+        expect(get(nativeFileOperation)).toBeNull()
+        const outcome = get(nativeFileOperationOutcome)
+        expect(outcome).toMatchObject({
+            kind: 'import',
+            state: 'succeeded',
+            source: { name: 'risu-backup.bin', bytes: 128 },
+            partialWritesPossible: false,
+        })
+        expect(outcome?.status).toEqual(terminal)
+        expect(outcome?.result).toEqual(terminal.result)
+        expect(outcome?.warningCodes).toEqual(['partial-destination-may-remain', 'cleanup-failed'])
+        expect(outcome?.finishedAt).toBeGreaterThanOrEqual(outcome?.startedAt ?? Infinity)
+
+        dismissNativeFileOperationOutcome()
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+    })
+
+    it('keeps inline operations and cancelled pickers out of the outcome store', async () => {
+        await runSharedNativeFileOperation('import', 'risu-save-import', async ({ onStatus }) => {
+            onStatus(status({ state: 'succeeded', phase: 'complete' }))
+            return { warningCodes: [] }
+        })
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+
+        await runSharedNativeFileOperation(
+            'import',
+            'risu-save-import',
+            async () => null,
+            { presentation: 'dialog' },
+        )
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+    })
+
+    it('maps cancellation and failure kinds onto the dialog outcome', async () => {
+        const cases: Array<{
+            error: unknown
+            expected: Partial<NativeFileOperationOutcome>
+        }> = [
+            {
+                error: Object.assign(new DOMException('cancelled', 'AbortError'), {
+                    warningCodes: ['partial-destination-may-remain'],
+                }),
+                expected: { state: 'cancelled', warningCodes: ['partial-destination-may-remain'] },
+            },
+            {
+                error: new NativeFileJobActivationCommittedError(9, new Error('refresh exploded')),
+                expected: {
+                    state: 'failed',
+                    error: {
+                        code: 'activation-committed-refresh-failed',
+                        message: 'refresh exploded',
+                        recoveryRequired: true,
+                    },
+                },
+            },
+            {
+                error: new NativeFileJobError('unsupported-format', 'not a backup'),
+                expected: {
+                    state: 'failed',
+                    error: { code: 'unsupported-format', message: 'not a backup', recoveryRequired: false },
+                },
+            },
+            {
+                error: new TypeError('boom'),
+                expected: {
+                    state: 'failed',
+                    error: { code: 'import-error', message: 'boom', recoveryRequired: false },
+                },
+            },
+        ]
+
+        for (const testCase of cases) {
+            dismissNativeFileOperationOutcome()
+            await expect(runSharedNativeFileOperation(
+                'import',
+                'legacy-local-backup-import',
+                async ({ onStatus }) => {
+                    onStatus(status())
+                    throw testCase.error
+                },
+                { presentation: 'dialog' },
+            )).rejects.toBe(testCase.error)
+            expect(get(nativeFileOperation)).toBeNull()
+            expect(get(nativeFileOperationOutcome)).toMatchObject({ kind: 'import', ...testCase.expected })
+            expect(get(nativeFileOperationOutcome)?.status?.jobId).toBe('restore-1')
+        }
+    })
+
+    it('records partial writes for a cancelled dialog operation', async () => {
+        await expect(runSharedNativeFileOperation(
+            'import',
+            'legacy-local-backup-import',
+            async ({ setPartialWritesPossible, signal }) => {
+                setPartialWritesPossible(true)
+                expect(get(nativeFileOperation)?.partialWritesPossible).toBe(true)
+                cancelActiveNativeFileOperation()
+                expect(signal.aborted).toBe(true)
+                throw new DOMException('cancelled', 'AbortError')
+            },
+            { presentation: 'dialog' },
+        )).rejects.toBeInstanceOf(DOMException)
+
+        expect(get(nativeFileOperationOutcome)).toMatchObject({
+            state: 'cancelled',
+            partialWritesPossible: true,
+        })
+    })
+
+    it('clears a stale outcome when the next dialog operation starts', async () => {
+        await runSharedNativeFileOperation(
+            'import',
+            'legacy-local-backup-import',
+            async () => ({ warningCodes: [] }),
+            { presentation: 'dialog' },
+        )
+        expect(get(nativeFileOperationOutcome)?.state).toBe('succeeded')
+
+        let finish!: () => void
+        const next = runSharedNativeFileOperation(
+            'import',
+            'risu-save-import',
+            () => new Promise<null>((resolve) => finish = () => resolve(null)),
+            { presentation: 'dialog' },
+        )
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+        finish()
+        await next
+        expect(get(nativeFileOperationOutcome)).toBeNull()
     })
 })

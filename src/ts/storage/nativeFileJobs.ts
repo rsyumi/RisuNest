@@ -158,6 +158,95 @@ export type NativeOfficialPublicationRunResult =
           receipt: NativeOfficialPublicationReceipt
       }
 
+/**
+ * Sub-phase of a native file job. The first group mirrors the Rust
+ * `JobStage` enum; the second group is synthesized by TypeScript routes for
+ * work that happens outside the native job (Android SAF copies, renderer
+ * refresh, plugin reload, WebView-path restarts, compatibility re-selection).
+ */
+export type NativeFileJobStage =
+    | 'reading-archive'
+    | 'preparing-attachments'
+    | 'reading-database'
+    | 'decoding-database'
+    | 'staging-characters'
+    | 'finalizing-staging'
+    | 'awaiting-activation'
+    | 'activating'
+    | 'copying-source'
+    | 'refreshing-app'
+    | 'reloading-plugins'
+    | 'restarting-app'
+    | 'awaiting-reselect'
+
+export interface NativeImportCounts {
+    entriesRead: number
+    entriesTotal?: number
+    assets: number
+    inlays: number
+    coldStorage: number
+    pocketMedia: number
+    pocketMetadata: number
+    skipped: number
+    attachmentsPrepared: number
+    characters: number
+    charactersTotal?: number
+    presets: number
+    blocks: number
+}
+
+export interface NativeFileJobDetail {
+    stage: NativeFileJobStage
+    stageCompleted: number
+    stageTotal?: number
+    stageUnit: 'bytes' | 'items'
+    currentItem?: string
+    counts: NativeImportCounts
+}
+
+/** Which user-facing import a dialog-presented operation belongs to. */
+export type NativeFileOperationFormat = 'risu-save' | 'local-backup' | 'lossless-backup'
+
+/**
+ * Resolves the stage a status describes. Statuses carrying `detail` name it
+ * directly; older statuses (and jobs that never report detail) fall back to
+ * the coarse job phase, which only knows the format-dependent first stage.
+ */
+export function resolveNativeFileJobStage(
+    status: NativeFileJobStatus,
+    format?: NativeFileOperationFormat,
+): NativeFileJobStage | null {
+    if (status.detail) return status.detail.stage
+    switch (status.phase) {
+        case 'reading-source':
+            return format === 'local-backup' ? 'reading-archive' : 'reading-database'
+        case 'staging-database':
+            return 'finalizing-staging'
+        case 'awaiting-activation':
+            return 'awaiting-activation'
+        case 'activating-database':
+            return 'activating'
+        default:
+            return null
+    }
+}
+
+export function emptyNativeImportCounts(): NativeImportCounts {
+    return {
+        entriesRead: 0,
+        assets: 0,
+        inlays: 0,
+        coldStorage: 0,
+        pocketMedia: 0,
+        pocketMetadata: 0,
+        skipped: 0,
+        attachmentsPrepared: 0,
+        characters: 0,
+        presets: 0,
+        blocks: 0,
+    }
+}
+
 export interface NativeFileJobStatus {
     jobId: string
     kind:
@@ -198,6 +287,7 @@ export interface NativeFileJobStatus {
         completedItems: number
         totalItems?: number
     }
+    detail?: NativeFileJobDetail
     publicationAttempt?: NativeOfficialPublicationAttemptResult
     result?: NativeFileJobResult
     preparedContent?: PreparedNativeContent
