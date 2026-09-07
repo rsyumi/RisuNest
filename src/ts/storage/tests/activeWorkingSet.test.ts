@@ -1332,6 +1332,116 @@ describe('ActiveWorkingSet', () => {
         })
     })
 
+    it('persists navigation and selected edits without rebuilding inactive conversations', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            'conversation-selection-after-navigation',
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const readConversation = vi.spyOn(store, 'readConversation')
+        const chatA = {
+            ...makeChat('chat-a'),
+            message: [{ role: 'user', data: 'first body' }],
+        } as Chat
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'second body' }],
+        } as Chat
+        let database = {
+            username: 'Fixture',
+            botPresets: [],
+            characters: [makeCharacter('char-a', [chatA, chatB])],
+        } as unknown as Database
+        database.characters[0].chatPage = 0
+        await store.replaceFromDatabase(database)
+        const commit = vi.spyOn(store, 'commit')
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: {
+                captureRoot: () => capturePersistentRoot(database),
+                capturePresets: () => database.botPresets,
+                captureSelectedCharacter: () => database.characters[0],
+                captureCharacter: (id) =>
+                    database.characters.find((character) => character.chaId === id) ?? null,
+                getSelectedCharacterId: () => 'char-a',
+                getSelectedConversationId: () =>
+                    database.characters[0].chats[database.characters[0].chatPage].id,
+                replaceDatabase: (value) => { database = value },
+                publishCharacter: (value) => { database.characters[0] = value },
+                publishConversation: (_characterId, conversation, nextCharacter) => {
+                    if (nextCharacter) {
+                        database.characters[0] = nextCharacter
+                        return
+                    }
+                    const character = database.characters[0]
+                    const index = character.chats.findIndex((chat) => chat.id === conversation.id)
+                    character.chats[index] = conversation
+                    character.chatPage = index
+                },
+                shouldHydrateFullCharacter: () => false,
+                canReleaseConversation: () => true,
+            },
+            prepareDatabase: async (value) => value,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        expect(await runtime.activateCharacter('char-a')).toBe(true)
+        expect(await runtime.activateConversation('chat-b')).toBe(true)
+        readConversation.mockClear()
+
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingData('conversation-selection-test')
+
+        expect(readConversation).not.toHaveBeenCalled()
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            character: { chaId: 'char-a', chatPage: 1 },
+        })
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('conversations')
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
+        expect((await store.readCharacter('char-a'))?.value.chatPage).toBe(1)
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.message).toEqual([
+            { role: 'user', data: 'first body' },
+        ])
+        expect((await store.readConversation('char-a', 'chat-b'))?.value.message).toEqual([
+            { role: 'char', data: 'second body' },
+        ])
+
+        commit.mockClear()
+        expect(await runtime.activateConversation('chat-a')).toBe(true)
+        readConversation.mockClear()
+        runtime.getActiveConversationSession()!.append({
+            role: 'char',
+            data: 'selected edit',
+        })
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingData('conversation-selection-and-edit-test')
+
+        expect(readConversation).not.toHaveBeenCalled()
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            character: { chaId: 'char-a', chatPage: 0 },
+            conversations: [{
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'chat-a',
+                start: 1,
+                deleteCount: 0,
+                messages: [{ role: 'char', data: 'selected edit' }],
+            }],
+        })
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
+        expect((await store.readCharacter('char-a'))?.value.chatPage).toBe(0)
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.message).toEqual([
+            { role: 'user', data: 'first body' },
+            { role: 'char', data: 'selected edit' },
+        ])
+        expect((await store.readConversation('char-a', 'chat-b'))?.value.message).toEqual([
+            { role: 'char', data: 'second body' },
+        ])
+    })
+
     it('discards hydration when the coordinator revision changes', async () => {
         const lease = makeLease({ revision: 1, characterId: 'char-a' })
         const harness = makeHarness(lease)

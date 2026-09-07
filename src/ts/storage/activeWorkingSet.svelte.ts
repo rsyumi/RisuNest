@@ -814,7 +814,7 @@ export class ActiveWorkingSet {
             if (!this.dependencies.coordinator.adoptHydratedCharacter(
                 revision,
                 mutationGeneration,
-                nextCharacter,
+                { ...nextCharacter, chatPage: resident.chatPage } as CompleteCharacter,
             )) return false
         }
         this.dependencies.publishConversation(characterId, conversation.value, nextCharacter)

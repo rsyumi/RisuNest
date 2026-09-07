@@ -2041,8 +2041,19 @@ export class SaveCoordinator {
                 )
             ) {
                 const conversations = recordedConversations ?? this.diffSelectedConversations(captured)
-                if (conversations) commit.conversations = conversations
-                else commit.replaceCharacter = captured.conversationStubIds.size > 0
+                if (conversations) {
+                    if (conversations.length > 0) commit.conversations = conversations
+                    if (this.characterBaseline !== null) {
+                        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+                        if (
+                            baseline.chaId === captured.character.chaId &&
+                            baseline.chatPage !== captured.character.chatPage
+                        ) {
+                            const { chats: _chats, ...character } = captured.character
+                            commit.character = character
+                        }
+                    }
+                } else commit.replaceCharacter = captured.conversationStubIds.size > 0
                     ? await this.reconstructCapturedCharacter(captured)
                     : captured.character
             }
@@ -2065,6 +2076,7 @@ export class SaveCoordinator {
                 commit.root ||
                 commit.pluginStorage ||
                 commit.replacePresets ||
+                commit.character ||
                 commit.replaceCharacter ||
                 commit.addCharacter ||
                 commit.conversations
@@ -2115,6 +2127,9 @@ export class SaveCoordinator {
                                 ? detached.canonical
                                 : captured.characterCanonical!
                         }
+                    }
+                    if (commit.character && captured.character) {
+                        this.setCharacterBaseline(captured)
                     }
                     if (commit.conversations && captured.character) {
                         this.setCharacterBaseline(captured)
@@ -3299,8 +3314,16 @@ export class SaveCoordinator {
         const baselineChats = baseline.chats
         if (!Array.isArray(capturedChats) || !Array.isArray(baselineChats)) return null
         if (capturedChats.length !== baselineChats.length) return null
-        const { chats: _capturedChats, ...capturedDetail } = character
-        const { chats: _baselineChats, ...baselineDetail } = baseline
+        const {
+            chats: _capturedChats,
+            chatPage: capturedChatPage,
+            ...capturedDetail
+        } = character
+        const {
+            chats: _baselineChats,
+            chatPage: baselineChatPage,
+            ...baselineDetail
+        } = baseline
         if (JSON.stringify(capturedDetail) !== JSON.stringify(baselineDetail)) return null
 
         const mutations: ConversationMutation[] = []
@@ -3327,7 +3350,11 @@ export class SaveCoordinator {
                 conversation,
             })
         }
-        return mutations.length > 0 ? mutations : null
+        return mutations.length > 0
+            ? mutations
+            : capturedChatPage !== baselineChatPage
+                ? []
+                : null
     }
 
     /** Returns the last tracked character when the selection moved away before its edits were committed. */
