@@ -6,6 +6,7 @@ import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentData
 import type { PersistentDataRuntime } from '../storage/persistentDataRuntime'
 import { decodeRisuSave, encodeRisuSaveLegacy } from '../storage/risuSave'
 import { risuSaveFixtureDatabase } from '../storage/tests/risuSaveFixtures'
+import { sleep } from '../util'
 import { getBackupInlayName } from './backupAssets'
 
 const state = vi.hoisted(() => ({
@@ -30,6 +31,12 @@ const state = vi.hoisted(() => ({
     replacePersistentDatabase: vi.fn(async (_database: Database, _reason: string) => undefined),
     confirmColdStorage: vi.fn(async () => true),
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
+    fallbackContext: {
+        signal: new AbortController().signal,
+        onStatus: vi.fn(),
+        setSource: vi.fn(),
+        setPartialWritesPossible: vi.fn(),
+    },
 }))
 
 vi.mock('../alert', () => ({
@@ -138,9 +145,11 @@ vi.mock('./legacyLocalBackupFileRouteProduction.svelte', () => ({
     exportLegacyLocalBackupFromSystemPicker: vi.fn(async () => {
         throw { code: 'capability-unavailable' }
     }),
-    importLegacyLocalBackupFromSystemPicker: vi.fn(async () => {
-        throw { code: 'capability-unavailable' }
-    }),
+    // The real route falls back inside the shared operation; the mock hands the
+    // WebView importer the same context it would receive there.
+    importLegacyLocalBackupFromSystemPicker: vi.fn(async (
+        options?: { onNativeFallback?(context: unknown): Promise<unknown> },
+    ) => await options?.onNativeFallback?.(state.fallbackContext) ?? null),
 }))
 vi.mock('../util', () => ({
     decryptBuffer: vi.fn(),
@@ -218,6 +227,7 @@ describe('local backup persistent snapshot', () => {
             offset += entry.byteLength
         }
         const file = {
+            name: 'backup.bin',
             size: archive.byteLength,
             stream: () => new ReadableStream<Uint8Array>({
                 start(controller) {
@@ -237,36 +247,136 @@ describe('local backup persistent snapshot', () => {
         const createElement = vi.spyOn(document, 'createElement')
             .mockReturnValueOnce(input as unknown as HTMLInputElement)
         const { LoadLocalBackup } = await import('./backuplocal')
+        const { alertWait } = await import('../alert')
 
-        LoadLocalBackup()
+        const pending = LoadLocalBackup()
         await vi.waitFor(() => expect(input.onchange).not.toBeNull())
         await input.onchange?.()
+        await pending
         createElement.mockRestore()
 
         expect(state.restoreEvents).toEqual([`cold:${coldKey}`, 'database'])
         expect(state.restoredCold.get(coldKey)).toEqual(cold)
         expect(state.replacePersistentDatabase).toHaveBeenCalledOnce()
+        expect(alertWait).not.toHaveBeenCalled()
+
+        const context = state.fallbackContext
+        expect(context.setSource).toHaveBeenCalledExactlyOnceWith({ name: 'backup.bin', bytes: archive.byteLength })
+        expect(context.setPartialWritesPossible).toHaveBeenCalledExactlyOnceWith(true)
+        const stages = context.onStatus.mock.calls.map(([status]) => status.detail?.stage)
+        expect(stages[0]).toBe('reading-archive')
+        expect(stages.filter((stage, index) => stage !== stages[index - 1])).toEqual([
+            'reading-archive', 'decoding-database', 'activating', 'restarting-app',
+        ])
+        const last = context.onStatus.mock.calls.at(-1)?.[0]
+        expect(last?.kind).toBe('restore-legacy-local-backup')
+        expect(last?.progress).toEqual({
+            completedBytes: archive.byteLength,
+            totalBytes: archive.byteLength,
+            completedItems: 2,
+            totalItems: 2,
+        })
+        expect(last?.detail?.counts).toMatchObject({
+            entriesRead: 2,
+            entriesTotal: 2,
+            coldStorage: 1,
+            assets: 0,
+            skipped: 0,
+            characters: database.characters.length,
+            charactersTotal: database.characters.length,
+            presets: database.botPresets.length,
+        })
+        expect(JSON.stringify(context.onStatus.mock.calls)).toContain(`coldstorage_${coldKey}.json`)
     })
 
-    it('shows the native failure code and reason instead of blaming the backup file', async () => {
+    it('stops a WebView import at the next chunk after cancellation and flags partial writes', async () => {
+        const coldKey = 'partial-cold'
+        const cold = { message: [{ role: 'user', data: 'already written' }] }
+        const encodedName = new TextEncoder().encode(`coldstorage_${coldKey}.json`)
+        const data = new TextEncoder().encode(JSON.stringify(cold))
+        const entry = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
+        const view = new DataView(entry.buffer)
+        view.setUint32(0, encodedName.byteLength, true)
+        entry.set(encodedName, 4)
+        view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
+        entry.set(data, 8 + encodedName.byteLength)
+        const controller = new AbortController()
+        // The importer yields between entries; cancelling there leaves the cold payload written.
+        vi.mocked(sleep).mockImplementationOnce(async () => controller.abort())
+        const file = {
+            name: 'partial.bin',
+            size: entry.byteLength,
+            stream: () => new ReadableStream<Uint8Array>({
+                start(stream) {
+                    stream.enqueue(entry)
+                    stream.close()
+                },
+            }),
+        } as File
+        const input = {
+            type: '',
+            accept: '',
+            files: [file],
+            onchange: null as null | (() => Promise<void>),
+            click: vi.fn(),
+            remove: vi.fn(),
+        }
+        const createElement = vi.spyOn(document, 'createElement')
+            .mockReturnValueOnce(input as unknown as HTMLInputElement)
+        const { importLegacyBackupWithWebView } = await import('./backuplocal')
+        const context = {
+            signal: controller.signal,
+            onStatus: vi.fn(),
+            setSource: vi.fn(),
+            setPartialWritesPossible: vi.fn(),
+        }
+
+        const pending = importLegacyBackupWithWebView(context)
+        await vi.waitFor(() => expect(input.onchange).not.toBeNull())
+        await input.onchange?.()
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        createElement.mockRestore()
+
+        expect(state.restoredCold.get(coldKey)).toEqual(cold)
+        expect(context.setPartialWritesPossible).toHaveBeenCalledWith(true)
+        expect(state.replacePersistentDatabase).not.toHaveBeenCalled()
+    })
+
+    it('resolves to nothing when the WebView picker is closed or the operation is cancelled first', async () => {
+        const controller = new AbortController()
+        controller.abort()
+        const { importLegacyBackupWithWebView } = await import('./backuplocal')
+        const context = {
+            signal: controller.signal,
+            onStatus: vi.fn(),
+            setSource: vi.fn(),
+            setPartialWritesPossible: vi.fn(),
+        }
+
+        await expect(importLegacyBackupWithWebView(context)).resolves.toBeNull()
+        expect(context.setSource).not.toHaveBeenCalled()
+    })
+
+    it('records the native failure code and reason for diagnostics without a second alert', async () => {
         const { importLegacyLocalBackupFromSystemPicker } =
             await import('./legacyLocalBackupFileRouteProduction.svelte')
         const { NativeFileJobError } = await import('../storage/nativeFileJobs')
         const { alertError } = await import('../alert')
+        const { recordNativeLogError } = await import('../nativeLog')
+        vi.mocked(recordNativeLogError).mockClear()
         vi.mocked(alertError).mockClear()
         vi.mocked(importLegacyLocalBackupFromSystemPicker).mockRejectedValueOnce(
             new NativeFileJobError('revision-conflict', 'The database changed during import'),
         )
         const { LoadLocalBackup } = await import('./backuplocal')
-        LoadLocalBackup()
-        await vi.waitFor(() =>
-            expect(alertError).toHaveBeenCalledWith(
-                'Backup import failed [revision-conflict]: The database changed during import',
-            ),
+        await LoadLocalBackup()
+        expect(recordNativeLogError).toHaveBeenCalledWith(
+            'Backup import failed [revision-conflict]: The database changed during import',
         )
+        expect(alertError).not.toHaveBeenCalled()
     })
 
-    it('distinguishes an imported database from a failed screen refresh', async () => {
+    it('distinguishes an imported database from a failed screen refresh in diagnostics', async () => {
         const { importLegacyLocalBackupFromSystemPicker } =
             await import('./legacyLocalBackupFileRouteProduction.svelte')
         const { NativeFileJobActivationCommittedError } = await import('../storage/nativeFileJobs')
@@ -278,16 +388,31 @@ describe('local backup persistent snapshot', () => {
             new NativeFileJobActivationCommittedError(2, new Error('Synthetic refresh failed')),
         )
         const { LoadLocalBackup } = await import('./backuplocal')
-        LoadLocalBackup()
-        await vi.waitFor(() =>
-            expect(alertError).toHaveBeenCalledWith(
-                expect.stringContaining('Backup data was imported, but the app could not refresh'),
-            ),
+        await LoadLocalBackup()
+        expect(recordNativeLogError).toHaveBeenCalledWith(
+            expect.stringContaining('Backup data was imported, but the app could not refresh'),
         )
-        expect(alertError).toHaveBeenCalledWith(expect.stringContaining('Synthetic refresh failed'))
         expect(recordNativeLogError).toHaveBeenCalledWith(
             expect.stringContaining('activation-committed-refresh-failed'),
         )
+        expect(recordNativeLogError).toHaveBeenCalledWith(expect.stringContaining('Synthetic refresh failed'))
+        expect(alertError).not.toHaveBeenCalled()
+    })
+
+    it('stays silent for cancelled imports because the dialog already reported them', async () => {
+        const { importLegacyLocalBackupFromSystemPicker } =
+            await import('./legacyLocalBackupFileRouteProduction.svelte')
+        const { alertError } = await import('../alert')
+        const { recordNativeLogError } = await import('../nativeLog')
+        vi.mocked(recordNativeLogError).mockClear()
+        vi.mocked(alertError).mockClear()
+        vi.mocked(importLegacyLocalBackupFromSystemPicker).mockRejectedValueOnce(
+            new DOMException('cancelled', 'AbortError'),
+        )
+        const { LoadLocalBackup } = await import('./backuplocal')
+        await LoadLocalBackup()
+        expect(recordNativeLogError).not.toHaveBeenCalled()
+        expect(alertError).not.toHaveBeenCalled()
     })
 
     it('writes database and cold enumeration from the flushed store revision', async () => {

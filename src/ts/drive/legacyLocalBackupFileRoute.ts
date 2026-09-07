@@ -8,7 +8,10 @@ import type {
     NativeFileJobOptions,
     NativeFileRestoreJobOptions,
 } from '../storage/nativeFileJobs'
-import type { NativeFileOperationSource } from '../storage/nativeFileJobManager'
+import type {
+    NativeFileOperationSource,
+    SharedNativeFileOperationContext,
+} from '../storage/nativeFileJobManager'
 
 interface LegacyLocalBackupExportRuntime {
     readonly revision: number
@@ -18,6 +21,22 @@ interface LegacyLocalBackupExportRuntime {
 export interface LegacyLocalBackupImportOptions extends NativeFileRestoreJobOptions {
     /** Receives the picked file's name and size for the progress dialog. */
     onSource?(source: NativeFileOperationSource): void
+}
+
+/** What the WebView importer needs from the shared operation when the native job hands over. */
+export type LegacyLocalBackupFallbackContext = Pick<
+    SharedNativeFileOperationContext,
+    'signal' | 'onStatus' | 'setSource' | 'setPartialWritesPossible'
+>
+
+/**
+ * Native legacy backup jobs give up on inputs they cannot read (no native
+ * capability, or a format only the JavaScript importer understands). Those
+ * are the only failures that continue in the WebView instead of failing.
+ */
+export function isNativeLegacyBackupFallback(error: unknown): boolean {
+    if (typeof error !== 'object' || error === null || !('code' in error)) return false
+    return error.code === 'capability-unavailable' || error.code === 'unsupported-format'
 }
 
 export interface LegacyLocalBackupFileRouteDependencies {

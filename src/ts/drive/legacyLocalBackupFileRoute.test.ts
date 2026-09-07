@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     exportLegacyLocalBackupFromPicker,
     importLegacyLocalBackupFromPicker,
+    isNativeLegacyBackupFallback,
     type LegacyLocalBackupFileRouteDependencies,
 } from './legacyLocalBackupFileRoute'
 
@@ -93,6 +94,14 @@ describe('legacy local backup native file route', () => {
 
         expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: 'backup.bin', bytes: 4096 })
         expect(vi.mocked(deps.runImport).mock.calls[0][2]).not.toHaveProperty('onSource')
+    })
+
+    it('treats only missing capability and unsupported formats as WebView fallbacks', () => {
+        expect(isNativeLegacyBackupFallback({ code: 'capability-unavailable' })).toBe(true)
+        expect(isNativeLegacyBackupFallback({ code: 'unsupported-format' })).toBe(true)
+        expect(isNativeLegacyBackupFallback({ code: 'corrupt-input' })).toBe(false)
+        expect(isNativeLegacyBackupFallback(new Error('plain'))).toBe(false)
+        expect(isNativeLegacyBackupFallback(null)).toBe(false)
     })
 
     it('does not start a job when the system picker is cancelled', async () => {

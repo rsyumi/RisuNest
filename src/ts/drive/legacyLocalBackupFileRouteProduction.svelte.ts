@@ -9,12 +9,15 @@ import {
     runNativeLegacyLocalBackupRestore,
     syntheticNativeFileJobStatus,
     type NativeFileJobOptions,
+    type NativeFileJobResult,
 } from '../storage/nativeFileJobs'
 import { describeDesktopSource } from '../storage/nativeFileSourceInfo'
 import { getPersistentDataRuntime } from '../storage/persistentDataRuntime.svelte'
 import {
     exportLegacyLocalBackupFromPicker,
     importLegacyLocalBackupFromPicker,
+    isNativeLegacyBackupFallback,
+    type LegacyLocalBackupFallbackContext,
     type LegacyLocalBackupFileRouteDependencies,
     type LegacyLocalBackupImportOptions,
 } from './legacyLocalBackupFileRoute'
@@ -67,28 +70,45 @@ const productionDependencies: LegacyLocalBackupFileRouteDependencies = {
     reloadPluginsAfterRestore: loadPluginsAfterAuthoritativeRestore,
 }
 
+export interface LegacyLocalBackupSystemImportOptions extends LegacyLocalBackupImportOptions {
+    /**
+     * Continues inside the same operation with the WebView importer when the
+     * native job cannot read the file, so the progress dialog stays open.
+     */
+    onNativeFallback?(context: LegacyLocalBackupFallbackContext): Promise<{ warningCodes: string[] } | null>
+}
+
 export const importLegacyLocalBackupFromSystemPicker = (
-    options: LegacyLocalBackupImportOptions = {},
-) => runSharedNativeFileOperation(
+    options: LegacyLocalBackupSystemImportOptions = {},
+): Promise<NativeFileJobResult | { warningCodes: string[] } | null> => runSharedNativeFileOperation(
     'import',
     'legacy-local-backup-import',
-    ({ signal, onStatus, setBlocking, setSource }) =>
-        importLegacyLocalBackupFromPicker({
-            ...options,
-            signal,
-            onStatus: (status) => {
-                onStatus(status)
-                options.onStatus?.(status)
-            },
-            onBlockingChange: (blocking) => {
-                setBlocking(blocking)
-                options.onBlockingChange?.(blocking)
-            },
-            onSource: (source) => {
-                setSource(source)
-                options.onSource?.(source)
-            },
-        }, productionDependencies),
+    async ({ signal, onStatus, setBlocking, setSource, setPartialWritesPossible }) => {
+        const { onNativeFallback, ...importOptions } = options
+        try {
+            return await importLegacyLocalBackupFromPicker({
+                ...importOptions,
+                signal,
+                onStatus: (status) => {
+                    onStatus(status)
+                    options.onStatus?.(status)
+                },
+                onBlockingChange: (blocking) => {
+                    setBlocking(blocking)
+                    options.onBlockingChange?.(blocking)
+                },
+                onSource: (source) => {
+                    setSource(source)
+                    options.onSource?.(source)
+                },
+            }, productionDependencies)
+        }
+        catch (error) {
+            if (!onNativeFallback || !isNativeLegacyBackupFallback(error)) throw error
+            onStatus(syntheticNativeFileJobStatus({ kind: 'restore-legacy-local-backup' }, 'awaiting-reselect'))
+            return await onNativeFallback({ signal, onStatus, setSource, setPartialWritesPossible })
+        }
+    },
     { presentation: 'dialog', format: 'local-backup' },
 )
 
