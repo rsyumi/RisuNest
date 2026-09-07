@@ -3,6 +3,7 @@ import type { Database } from './database.svelte'
 import { coldStorageHeader } from '../process/coldstorageData'
 import { hasIncompletePersistentWorkingSet } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
+import { canonicalJson } from './saveCoordinatorHelpers'
 
 type ColdStorageCompactionDependencies = {
     now: number
@@ -60,12 +61,9 @@ function hasCompactionCandidates(database: Database, now: number, coldTime: numb
     ))
 }
 
-function isVerifiedCharacterPayload(value: any): boolean {
-    return Boolean(value && (Array.isArray(value) || value.character))
-}
-
-function isVerifiedChatPayload(value: any): boolean {
-    return Boolean(value && (Array.isArray(value) || value.message))
+function isVerifiedPayload(value: unknown, expected: unknown): boolean {
+    // The cold payload codec persists JSON, including omission of undefined fields.
+    return canonicalJson(value) === canonicalJson(JSON.parse(JSON.stringify(expected)))
 }
 
 export async function compactColdStorageDatabase(
@@ -85,6 +83,7 @@ export async function compactColdStorageDatabase(
     }
 
     const candidate = safeStructuredClone(database)
+    const sourceSnapshot = JSON.stringify(database)
     let changed = false
 
     const characterTasks = candidate.characters.map((_character, index) => async () => {
@@ -94,7 +93,8 @@ export async function compactColdStorageDatabase(
         }
 
         const key = dependencies.createId()
-        if (!await dependencies.write(key, { character: safeStructuredClone(character) })) {
+        const payload = { character: safeStructuredClone(character) }
+        if (!await dependencies.write(key, payload)) {
             dependencies.onFailure?.({ kind: 'write', target: 'character', characterIndex: index })
             return
         }
@@ -105,7 +105,7 @@ export async function compactColdStorageDatabase(
             dependencies.onFailure?.({ kind: 'read', target: 'character', characterIndex: index })
             return
         }
-        if (!isVerifiedCharacterPayload(verifiedPayload)) {
+        if (!isVerifiedPayload(verifiedPayload, payload)) {
             dependencies.onFailure?.({ kind: 'verify', target: 'character', characterIndex: index })
             return
         }
@@ -180,7 +180,7 @@ export async function compactColdStorageDatabase(
                     })
                     return
                 }
-                if (!isVerifiedChatPayload(verifiedPayload)) {
+                if (!isVerifiedPayload(verifiedPayload, payload)) {
                     dependencies.onFailure?.({
                         kind: 'verify',
                         target: 'chat',
@@ -211,6 +211,9 @@ export async function compactColdStorageDatabase(
     }
 
     if (changed) {
+        if (JSON.stringify(database) !== sourceSnapshot) {
+            throw new Error('Database changed during cold storage compaction')
+        }
         await dependencies.replaceDatabase(candidate, 'cold-storage-compaction')
     }
     return changed

@@ -10,8 +10,8 @@ import { coldStorageHeader, getColdStorageAffectedCharacters, getColdStorageBack
 import { compactColdStorageDatabase } from "../storage/coldStorageCompaction"
 import {
     getActiveConversationSession,
+    getPersistentDataRuntime,
     getPersistentNavigationGeneration,
-    replacePersistentDatabase,
 } from "../storage/persistentDataRuntime.svelte"
 import type { LocalColdStorageRuntime } from "../storage/localColdStorageRuntime"
 import { hasIncompletePersistentWorkingSet } from '../storage/workingSetCatalog'
@@ -307,12 +307,31 @@ export async function confirmIncompleteColdStorageOperation(
 
 export async function makeColdData():Promise<boolean>{
     try {
-        return await compactColdStorageDatabase(DBState.db, {
+        if (
+            !DBState.db.coldstorage
+            || hasIncompletePersistentWorkingSet(DBState.db, workingSetResidency)
+        ) return false
+        const runtime = getPersistentDataRuntime()
+        const token = await runtime.capturePersistentMutationToken('cold-storage-compaction')
+        const database = DBState.db
+        const authorityEpoch = runtime.getStorageAuthorityEpoch()
+        return await compactColdStorageDatabase(database, {
             now: Date.now(),
             createId: () => crypto.randomUUID(),
             write: setLocalColdStorageItem,
             read: (key) => getColdStorageItem(key, { accountFallback: true }),
-            replaceDatabase: replacePersistentDatabase,
+            replaceDatabase: (candidate, reason) => {
+                if (
+                    DBState.db !== database
+                    || runtime.getStorageAuthorityEpoch() !== authorityEpoch
+                ) {
+                    throw new Error('Database changed during cold storage compaction')
+                }
+                return runtime.replacePersistentDatabase(candidate, reason, {
+                    expectedMutationGeneration: token.mutationGeneration,
+                    expectedRevision: runtime.revision,
+                })
+            },
             onProgress: (phase, remaining) => {
                 const target = phase === 'character' ? 'character' : 'chat'
                 alertWait(`Creating ${target} cold storage data... ${remaining} items left`)

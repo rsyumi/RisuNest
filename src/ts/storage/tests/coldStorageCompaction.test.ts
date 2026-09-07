@@ -35,6 +35,68 @@ function fixtureDatabase(): Database {
 }
 
 describe('compactColdStorageDatabase', () => {
+    it.each(['character', 'chat'] as const)('rejects a changed %s payload after a successful write', async (target) => {
+        const live = fixtureDatabase()
+        const now = 20 * 24 * 60 * 60 * 1000
+        if (target === 'chat') live.characters[0].lastInteraction = now
+        const original = structuredClone(live)
+        const replaceDatabase = vi.fn()
+        const failures: unknown[] = []
+        const changed = await compactColdStorageDatabase(live, {
+            now,
+            createId: () => 'corrupt-payload',
+            write: async () => true,
+            read: async () => target === 'character' ? { character: {} } : { message: [] },
+            replaceDatabase,
+            onFailure: (failure) => failures.push(failure),
+        })
+        expect(changed).toBe(false)
+        expect(replaceDatabase).not.toHaveBeenCalled()
+        expect(failures).toContainEqual(expect.objectContaining({ kind: 'verify', target }))
+        expect(live).toEqual(original)
+    })
+
+    it('keeps edits made while cold payloads are written', async () => {
+        const live = fixtureDatabase()
+        const payloads = new Map<string, unknown>()
+        const replaceDatabase = vi.fn()
+        await expect(compactColdStorageDatabase(live, {
+            now: 20 * 24 * 60 * 60 * 1000,
+            createId: () => 'cold-character',
+            write: async (key, payload) => {
+                payloads.set(key, structuredClone(payload))
+                live.characters[0].chats[0].message[0].data = 'edited during compaction'
+                return true
+            },
+            read: async (key) => payloads.get(key),
+            replaceDatabase,
+        })).rejects.toThrow('changed during cold storage compaction')
+        expect(replaceDatabase).not.toHaveBeenCalled()
+        expect(live.characters[0].chats[0].message[0].data).toBe('edited during compaction')
+    })
+
+    it('accepts payloads normalized by the JSON cold storage codec', async () => {
+        const live = fixtureDatabase()
+        live.characters[0].lastInteraction = 20 * 24 * 60 * 60 * 1000
+        live.characters[0].chats[0].scriptstate = {
+            codecDate: new Date('2026-09-07T00:00:00.000Z'),
+            omitted: undefined,
+        } as any
+        const payloads = new Map<string, unknown>()
+        const replaceDatabase = vi.fn()
+        expect(await compactColdStorageDatabase(live, {
+            now: 20 * 24 * 60 * 60 * 1000,
+            createId: () => 'cold-chat',
+            write: async (key, value) => {
+                payloads.set(key, JSON.parse(JSON.stringify(value)))
+                return true
+            },
+            read: async (key) => payloads.get(key),
+            replaceDatabase,
+        })).toBe(true)
+        expect(replaceDatabase).toHaveBeenCalledTimes(1)
+    })
+
     it('activates verified character stubs through replacement without mutating the live database', async () => {
         const live = fixtureDatabase()
         const original = structuredClone(live)
