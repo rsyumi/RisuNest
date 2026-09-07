@@ -4,7 +4,7 @@ use super::{
 use crate::asset_repository::job_pins::{
     CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
 };
-use crate::asset_repository::PayloadCas;
+use crate::asset_repository::{owner_manifest_codec, PayloadCas};
 use crate::local_backup::{
     parse_legacy_local_backup_v1, write_legacy_local_backup_v1, CancellationProbe,
     LegacyBackupWriteEntry, LegacyBackupWriteSource, LocalBackupError, LocalBackupErrorCode,
@@ -12,14 +12,14 @@ use crate::local_backup::{
 };
 use crate::persistent_store::export::{self, destination};
 use crate::persistent_store::{
-    AssetAlias, AssetRepositoryAuthorityState, ColdAlias, ColdPayloadAuthorityState,
-    PersistentStore, RevisionResult, StagingResult, StoreResult,
+    AssetAlias, AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState, ColdAlias,
+    ColdPayloadAuthorityState, PersistentStore, RevisionResult, StagingResult, StoreResult,
 };
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -30,6 +30,7 @@ use uuid::Uuid;
 const DATABASE_ENTRY: &str = "database.risudat";
 const ENCRYPTION_ENTRY: &str = "encryption.risudat";
 const MAX_METADATA_BYTES: u32 = 1024 * 1024;
+const MAX_OWNER_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const ARCHIVE_FILE: &str = "archive.bin.part";
 
 struct JobCancellation<'a>(&'a JobControl);
@@ -101,29 +102,21 @@ pub(crate) fn export_legacy_local_backup(
     let mut durable = None;
     let mut database_path = None;
     let outcome = (|| {
-        let asset_authority = store
-            .read_asset_repository_authority(Some(&prepared.lease))
-            .map_err(store_job_error)?;
-        let cold_authority = store
-            .read_cold_payload_authority(Some(&prepared.lease))
+        let inventory = export::pinned_legacy_backup_inventory(&reader.connection, &reader.target)
             .map_err(store_job_error)?;
         if !matches!(
-            asset_authority.value,
+            inventory.asset_authority,
             AssetRepositoryAuthorityState::V2 { .. }
-        ) || !matches!(cold_authority.value, ColdPayloadAuthorityState::V2 { .. })
-        {
+        ) || !matches!(
+            inventory.cold_authority,
+            ColdPayloadAuthorityState::V2 { .. }
+        ) {
             return Err(NativeJobError::new(
                 "capability-unavailable",
                 "native legacy backup export requires migrated asset and cold repositories",
             ));
         }
-        let assets = store
-            .list_asset_aliases(Some(&prepared.lease))
-            .map_err(store_job_error)?;
-        let cold = store
-            .list_cold_aliases(Some(&prepared.lease))
-            .map_err(store_job_error)?;
-        if assets.revision != expected_revision || cold.revision != expected_revision {
+        if inventory.revision != expected_revision {
             return Err(NativeJobError::new(
                 "revision-conflict",
                 "legacy backup payload inventory does not match the requested revision",
@@ -141,12 +134,19 @@ pub(crate) fn export_legacy_local_backup(
         let pins = durable
             .as_mut()
             .expect("durable CAS job was just initialized");
-        for (hash, size) in assets
-            .value
+        let owner_manifest_hashes = inventory
+            .owner_heads
+            .iter()
+            .filter(|head| head.present)
+            .filter_map(|head| head.manifest_hash.as_deref())
+            .collect::<HashSet<_>>();
+        for (hash, size) in inventory
+            .assets
             .iter()
             .map(|alias| (&alias.object_hash, alias.size))
             .chain(
-                cold.value
+                inventory
+                    .cold
                     .iter()
                     .map(|alias| (&alias.object_hash, alias.size)),
             )
@@ -157,17 +157,30 @@ pub(crate) fn export_legacy_local_backup(
                     "legacy backup alias is missing its object hash",
                 )
             })?;
-            pins.pin_existing(&cas, hash, size as u64, CasObjectRole::DirectObject)
+            let role = if owner_manifest_hashes.contains(hash) {
+                CasObjectRole::OwnerManifest
+            } else {
+                CasObjectRole::DirectObject
+            };
+            pins.pin_existing(&cas, hash, size as u64, role)
                 .map_err(io_job_error)?;
         }
+        let owner_projection = prepare_owner_export_projection(
+            &cas,
+            &inventory.assets,
+            &inventory.owner_heads,
+            &owner_manifest_hashes,
+            pins,
+            &cancellation,
+        )?;
         pins.seal(&mut store, now_millis()).map_err(io_job_error)?;
 
-        let database = export::create_controlled(
+        let database = export::create_legacy_backup_controlled(
             &reader.connection,
             &prepared.snapshots_dir,
             &reader.target,
             &prepared.lease,
-            true,
+            owner_projection.replacement_keys,
             || job.is_cancel_requested(),
             |completed_bytes, completed_items, total_items| {
                 let _ = job.set_progress(JobProgress {
@@ -183,10 +196,15 @@ pub(crate) fn export_legacy_local_backup(
         let mut entries = materialize_export_entries(
             owned_directory,
             &cas,
-            &assets.value,
-            &cold.value,
+            &inventory.assets,
+            &inventory.cold,
             &cancellation,
         )?;
+        entries.extend(materialize_owner_export_entries(
+            &cas,
+            &owner_projection.payloads,
+            &cancellation,
+        )?);
         entries.push(LegacyBackupWriteEntry {
             logical_name: DATABASE_ENTRY.to_owned(),
             source: LegacyBackupWriteSource::File(database.path.clone().into()),
@@ -368,6 +386,187 @@ fn materialize_export_entries(
         });
     }
     Ok(entries)
+}
+
+struct LegacyOwnerExportProjection {
+    replacement_keys: HashMap<AssetOwnerLocator, Vec<String>>,
+    payloads: Vec<(String, String)>,
+}
+
+fn prepare_owner_export_projection(
+    cas: &PayloadCas,
+    assets: &[AssetAlias],
+    owner_heads: &[AssetOwnerHead],
+    owner_manifest_hashes: &HashSet<&str>,
+    pins: &mut DurableCasJob,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LegacyOwnerExportProjection, NativeJobError> {
+    let mut manifests = Vec::new();
+    for head in owner_heads.iter().filter(|head| head.present) {
+        check_cancelled(cancellation).map_err(local_backup_error)?;
+        let hash = head.manifest_hash.as_deref().ok_or_else(|| {
+            NativeJobError::new(
+                "invalid-source",
+                "legacy backup owner head is missing its manifest hash",
+            )
+        })?;
+        let size = cas
+            .stat_object(hash)
+            .map_err(io_job_error)?
+            .ok_or_else(|| {
+                NativeJobError::new("invalid-source", "legacy backup owner manifest is missing")
+            })?;
+        if size > MAX_OWNER_MANIFEST_BYTES {
+            return Err(NativeJobError::new(
+                "invalid-source",
+                "legacy backup owner manifest exceeds the decode limit",
+            ));
+        }
+        pins.pin_existing(cas, hash, size, CasObjectRole::OwnerManifest)
+            .map_err(io_job_error)?;
+        manifests.push((head, hash.to_owned(), size));
+    }
+
+    let mut used_keys = assets
+        .iter()
+        .map(|alias| alias.key.clone())
+        .collect::<HashSet<_>>();
+    let mut replacement_keys = HashMap::with_capacity(manifests.len());
+    let mut payloads = Vec::new();
+    let mut payload_keys = HashMap::<(String, String), String>::new();
+    for (head, manifest_hash, manifest_size) in manifests {
+        check_cancelled(cancellation).map_err(local_backup_error)?;
+        let entries = read_owner_manifest(cas, &manifest_hash, manifest_size, cancellation)?;
+        if entries.len() as i64 != head.entry_count {
+            return Err(NativeJobError::new(
+                "invalid-source",
+                "legacy backup owner manifest entry count mismatch",
+            ));
+        }
+        let mut keys = Vec::with_capacity(entries.len());
+        for entry in entries {
+            check_cancelled(cancellation).map_err(local_backup_error)?;
+            let extension = safe_owner_extension(&entry.tuple[2]);
+            let key = if let Some(payload_hash) = entry.payload_hash {
+                let payload_hash = hex::encode(payload_hash);
+                let identity = (payload_hash.clone(), extension.clone());
+                if let Some(key) = payload_keys.get(&identity) {
+                    key.clone()
+                } else {
+                    let size = cas
+                        .stat_object(&payload_hash)
+                        .map_err(io_job_error)?
+                        .ok_or_else(|| {
+                            NativeJobError::new(
+                                "invalid-source",
+                                "legacy backup owner payload is missing",
+                            )
+                        })?;
+                    let role = if owner_manifest_hashes.contains(payload_hash.as_str()) {
+                        CasObjectRole::OwnerManifest
+                    } else {
+                        CasObjectRole::DirectObject
+                    };
+                    pins.pin_existing(cas, &payload_hash, size, role)
+                        .map_err(io_job_error)?;
+                    let key = fresh_owner_asset_key(&extension, &mut used_keys);
+                    payloads.push((key.clone(), payload_hash));
+                    payload_keys.insert(identity, key.clone());
+                    key
+                }
+            } else {
+                fresh_owner_asset_key(&extension, &mut used_keys)
+            };
+            keys.push(key);
+        }
+        replacement_keys.insert(head.owner.clone(), keys);
+    }
+    Ok(LegacyOwnerExportProjection {
+        replacement_keys,
+        payloads,
+    })
+}
+
+fn read_owner_manifest(
+    cas: &PayloadCas,
+    hash: &str,
+    expected_size: u64,
+    cancellation: &dyn CancellationProbe,
+) -> Result<Vec<owner_manifest_codec::OwnerManifestEntry>, NativeJobError> {
+    check_cancelled(cancellation).map_err(local_backup_error)?;
+    let file = cas
+        .open_object(hash)
+        .map_err(io_job_error)?
+        .ok_or_else(|| {
+            NativeJobError::new("invalid-source", "legacy backup owner manifest is missing")
+        })?;
+    let mut bytes = Vec::with_capacity(expected_size as usize);
+    CancellationReader::new(file, cancellation)
+        .take(MAX_OWNER_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| local_backup_error(cancellation_io(error, cancellation)))?;
+    if bytes.len() as u64 != expected_size || bytes.len() as u64 > MAX_OWNER_MANIFEST_BYTES {
+        return Err(NativeJobError::new(
+            "invalid-source",
+            "legacy backup owner manifest changed while being read",
+        ));
+    }
+    if owner_manifest_codec::owner_manifest_identity(&bytes) != hash {
+        return Err(NativeJobError::new(
+            "invalid-source",
+            "legacy backup owner manifest content hash mismatch",
+        ));
+    }
+    owner_manifest_codec::decode_owner_manifest(&bytes).map_err(|error| {
+        NativeJobError::new(
+            "invalid-source",
+            format!("legacy backup owner manifest is invalid: {error}"),
+        )
+    })
+}
+
+fn fresh_owner_asset_key(extension: &str, used_keys: &mut HashSet<String>) -> String {
+    let extension = safe_owner_extension(extension);
+    loop {
+        let key = format!("assets/owner-{}.{}", Uuid::new_v4(), extension);
+        if used_keys.insert(key.clone()) {
+            return key;
+        }
+    }
+}
+
+fn safe_owner_extension(extension: &str) -> String {
+    if !extension.is_empty()
+        && extension.len() <= 16
+        && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        extension.to_ascii_lowercase()
+    } else {
+        "bin".to_owned()
+    }
+}
+
+fn materialize_owner_export_entries(
+    cas: &PayloadCas,
+    payloads: &[(String, String)],
+    cancellation: &dyn CancellationProbe,
+) -> Result<Vec<LegacyBackupWriteEntry>, NativeJobError> {
+    payloads
+        .iter()
+        .map(|(key, hash)| {
+            check_cancelled(cancellation).map_err(local_backup_error)?;
+            let source = cas
+                .object_path(hash)
+                .map_err(io_job_error)?
+                .ok_or_else(|| {
+                    NativeJobError::new("invalid-source", "legacy backup owner payload is missing")
+                })?;
+            Ok(LegacyBackupWriteEntry {
+                logical_name: legacy_asset_entry_name(key)?,
+                source: LegacyBackupWriteSource::File(source),
+            })
+        })
+        .collect()
 }
 
 fn legacy_asset_entry_name(key: &str) -> Result<String, NativeJobError> {
@@ -1055,7 +1254,7 @@ fn invalid(message: impl Into<String>) -> LocalBackupError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset_repository::PayloadCas;
+    use crate::asset_repository::{owner_manifest_codec, PayloadCas};
     use crate::import_export_jobs::{parse_json_card, JobStaging};
     use crate::local_backup::{
         parse_legacy_local_backup_v1, NeverCancelled, PayloadTarget, StagedLocalBackupEntry,
@@ -1065,7 +1264,9 @@ mod tests {
     use crate::native_file_jobs::{
         character_json_export::export_character_json, JobKind, JobRegistry,
     };
-    use crate::persistent_store::AssetRepositoryAuthorityState;
+    use crate::persistent_store::{
+        AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState, ColdPayloadAuthorityState,
+    };
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::Cursor;
@@ -1099,6 +1300,387 @@ mod tests {
         bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
         bytes.extend_from_slice(data);
         bytes
+    }
+
+    #[derive(Default)]
+    struct ArchiveCapture {
+        entries: Vec<(String, Vec<u8>)>,
+    }
+
+    impl StrictLocalBackupDatabaseRestore for ArchiveCapture {
+        fn restore_database(
+            &mut self,
+            _database: &StagedLocalBackupEntry,
+            entries: &[StagedLocalBackupEntry],
+        ) -> Result<(), crate::local_backup::LocalBackupError> {
+            self.entries = entries
+                .iter()
+                .map(|entry| {
+                    let bytes = fs::read(
+                        entry
+                            .staged_path
+                            .as_ref()
+                            .expect("job-staged archive entry has a path"),
+                    )
+                    .map_err(crate::local_backup::LocalBackupError::io)?;
+                    Ok((entry.logical_name.clone(), bytes))
+                })
+                .collect::<Result<_, crate::local_backup::LocalBackupError>>()?;
+            Ok(())
+        }
+    }
+
+    fn decode_risu_save_blocks(bytes: &[u8]) -> Vec<(u8, String, Value)> {
+        assert!(bytes.starts_with(b"RISUSAVE\0"));
+        let mut cursor = &bytes[b"RISUSAVE\0".len()..];
+        let mut blocks = Vec::new();
+        while !cursor.is_empty() {
+            let block_type = cursor[0];
+            let compression = cursor[1];
+            let name_length = cursor[2] as usize;
+            cursor = &cursor[3..];
+            let name = std::str::from_utf8(&cursor[..name_length])
+                .unwrap()
+                .to_owned();
+            cursor = &cursor[name_length..];
+            let payload_length = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
+            cursor = &cursor[4..];
+            let encoded = &cursor[..payload_length];
+            cursor = &cursor[payload_length..];
+            let decoded = match compression {
+                0 => encoded.to_vec(),
+                1 => {
+                    let mut decoded = Vec::new();
+                    GzDecoder::new(encoded).read_to_end(&mut decoded).unwrap();
+                    decoded
+                }
+                value => panic!("unexpected RisuSave compression {value}"),
+            };
+            let value = if decoded.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&decoded).unwrap()
+            };
+            blocks.push((block_type, name, value));
+        }
+        blocks
+    }
+
+    #[test]
+    fn legacy_backup_export_preserves_owner_only_asset_occurrence_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let first = cas.prepare_bytes(b"first-occurrence").unwrap();
+        let second = cas.prepare_bytes(b"second-owner-only-occurrence").unwrap();
+        let alias = AssetAlias {
+            key: "assets/shared.bin".to_owned(),
+            object_hash: Some(first.content_hash.clone()),
+            kind: "asset".to_owned(),
+            size: first.byte_size as i64,
+            mime: "application/octet-stream".to_owned(),
+            name: "shared.bin".to_owned(),
+            ext: "bin".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: serde_json::json!({}),
+        };
+        let manifest = cas
+            .prepare_bytes(
+                &owner_manifest_codec::encode_owner_manifest(&[
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: ["first".to_owned(), alias.key.clone(), "BIN".to_owned()],
+                        payload_hash: Some(
+                            hex::decode(&first.content_hash)
+                                .unwrap()
+                                .try_into()
+                                .unwrap(),
+                        ),
+                    },
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: ["second".to_owned(), alias.key.clone(), "bIn".to_owned()],
+                        payload_hash: Some(
+                            hex::decode(&second.content_hash)
+                                .unwrap()
+                                .try_into()
+                                .unwrap(),
+                        ),
+                    },
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: ["missing".to_owned(), alias.key.clone(), "BIN".to_owned()],
+                        payload_hash: None,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let root_manifest = cas
+            .prepare_bytes(
+                &owner_manifest_codec::encode_owner_manifest(&[
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: ["module".to_owned(), alias.key.clone(), "BIN".to_owned()],
+                        payload_hash: Some(
+                            hex::decode(&second.content_hash)
+                                .unwrap()
+                                .try_into()
+                                .unwrap(),
+                        ),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let persona_manifest = cas
+            .prepare_bytes(
+                &owner_manifest_codec::encode_owner_manifest(&[
+                    owner_manifest_codec::OwnerManifestEntry {
+                        tuple: ["persona".to_owned(), alias.key.clone(), "BIN".to_owned()],
+                        payload_hash: Some(
+                            hex::decode(&first.content_hash)
+                                .unwrap()
+                                .try_into()
+                                .unwrap(),
+                        ),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let character = serde_json::json!({
+            "type": "character",
+            "chaId": "legacy-owner-character",
+            "name": "Legacy Owner Character",
+            "additionalAssets": [
+                ["first", alias.key.clone(), "BIN"],
+                ["second", alias.key.clone(), "bIn"],
+                ["missing", alias.key.clone(), "BIN"]
+            ],
+            "chats": []
+        });
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(
+                &staging,
+                &serde_json::json!({
+                    "loadouts": [],
+                    "plugins": [],
+                    "modules": [{
+                        "assets": [["module", alias.key.clone(), "BIN", {"tail": 1}]]
+                    }],
+                    "personas": [{
+                        "embeddedModule": {
+                            "assets": [["persona", alias.key.clone(), "BIN", "tuple-tail"]]
+                        }
+                    }]
+                }),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_add_characters(&staging, &[character])
+            .unwrap();
+        store
+            .replace_put_asset_aliases(&staging, std::slice::from_ref(&alias))
+            .unwrap();
+        store
+            .replace_put_asset_owner_heads(
+                &staging,
+                &[
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::CharacterAdditionalAssets {
+                            character_id: "legacy-owner-character".to_owned(),
+                        },
+                        manifest.content_hash,
+                        3,
+                    ),
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::RootModuleAssets { index: 0 },
+                        root_manifest.content_hash,
+                        1,
+                    ),
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 },
+                        persona_manifest.content_hash,
+                        1,
+                    ),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &AssetRepositoryAuthorityState::V2 {
+                    migration_id: "legacy-owner-assets".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        store
+            .replace_put_cold_payload_authority(
+                &staging,
+                &ColdPayloadAuthorityState::V2 {
+                    migration_id: "legacy-owner-cold".to_owned(),
+                    compatibility_hash: "cd".repeat(32),
+                },
+            )
+            .unwrap();
+        let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+        let owned = directory.path().join("export-owned");
+        let handoff = directory.path().join("handoff");
+        let parsed = directory.path().join("parsed");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&handoff).unwrap();
+        fs::create_dir(&parsed).unwrap();
+        let destination = directory.path().join("owner-backup.bin");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportLegacyLocalBackup)
+            .unwrap();
+
+        let result =
+            export_legacy_local_backup(Some(&destination), revision, &owned, &handoff, store, &job)
+                .unwrap();
+
+        assert_eq!(result.revision, revision);
+        let mut capture = ArchiveCapture::default();
+        parse_legacy_local_backup_v1(
+            &mut fs::File::open(&destination).unwrap(),
+            &parsed,
+            PayloadTarget::JobStaging,
+            &mut capture,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let archived_payloads = capture
+            .entries
+            .iter()
+            .filter(|(name, _)| name != DATABASE_ENTRY)
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect::<Vec<_>>();
+        assert!(archived_payloads.contains(&b"first-occurrence".as_slice()));
+        assert!(archived_payloads.contains(&b"second-owner-only-occurrence".as_slice()));
+        assert_eq!(
+            archived_payloads
+                .iter()
+                .filter(|bytes| **bytes == b"second-owner-only-occurrence")
+                .count(),
+            1
+        );
+        let database = capture
+            .entries
+            .iter()
+            .find(|(name, _)| name == DATABASE_ENTRY)
+            .unwrap();
+        let blocks = decode_risu_save_blocks(&database.1);
+        let character = &blocks
+            .iter()
+            .find(|(block_type, name, _)| *block_type == 2 && name == "legacy-owner-character")
+            .unwrap()
+            .2;
+        let tuples = character["additionalAssets"].as_array().unwrap();
+        assert_eq!(tuples[0][0], "first");
+        assert_eq!(tuples[0][2], "BIN");
+        assert_eq!(tuples[1][0], "second");
+        assert_eq!(tuples[1][2], "bIn");
+        assert_eq!(tuples[2][0], "missing");
+        assert_eq!(tuples[2][2], "BIN");
+        let archived_for_key = |key: &str| {
+            capture.entries.iter().find(|(name, _)| {
+                key.strip_prefix("assets/")
+                    .is_some_and(|relative| relative == name)
+            })
+        };
+        let first_key = tuples[0][1].as_str().unwrap();
+        let second_key = tuples[1][1].as_str().unwrap();
+        let missing_key = tuples[2][1].as_str().unwrap();
+        assert_ne!(first_key, alias.key);
+        assert_ne!(second_key, alias.key);
+        assert_ne!(missing_key, alias.key);
+        assert_eq!(archived_for_key(first_key).unwrap().1, b"first-occurrence");
+        assert_eq!(
+            archived_for_key(second_key).unwrap().1,
+            b"second-owner-only-occurrence"
+        );
+        assert!(archived_for_key(missing_key).is_none());
+        let modules = &blocks
+            .iter()
+            .find(|(block_type, name, _)| *block_type == 5 && name == "modules")
+            .unwrap()
+            .2;
+        let module_tuple = &modules[0]["assets"][0];
+        assert_eq!(module_tuple[0], "module");
+        assert_eq!(module_tuple[2], "BIN");
+        assert_eq!(module_tuple[3], serde_json::json!({"tail": 1}));
+        assert_eq!(
+            archived_for_key(module_tuple[1].as_str().unwrap())
+                .unwrap()
+                .1,
+            b"second-owner-only-occurrence"
+        );
+        let root = &blocks
+            .iter()
+            .find(|(block_type, name, _)| *block_type == 1 && name == "root")
+            .unwrap()
+            .2;
+        let persona_tuple = &root["personas"][0]["embeddedModule"]["assets"][0];
+        assert_eq!(persona_tuple[0], "persona");
+        assert_eq!(persona_tuple[2], "BIN");
+        assert_eq!(persona_tuple[3], "tuple-tail");
+        assert_eq!(persona_tuple[1], tuples[0][1]);
+        assert_eq!(
+            archived_for_key(persona_tuple[1].as_str().unwrap())
+                .unwrap()
+                .1,
+            b"first-occurrence"
+        );
+    }
+
+    #[test]
+    fn legacy_backup_export_reads_ordinary_inventory_from_the_detached_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(
+                &staging,
+                &serde_json::json!({"modules": [], "loadouts": [], "plugins": []}),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &AssetRepositoryAuthorityState::V2 {
+                    migration_id: "ordinary-assets".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        store
+            .replace_put_cold_payload_authority(
+                &staging,
+                &ColdPayloadAuthorityState::V2 {
+                    migration_id: "ordinary-cold".to_owned(),
+                    compatibility_hash: "cd".repeat(32),
+                },
+            )
+            .unwrap();
+        let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+        let owned = directory.path().join("ordinary-owned");
+        let handoff = directory.path().join("ordinary-handoff");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&handoff).unwrap();
+        let destination = directory.path().join("ordinary.bin");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportLegacyLocalBackup)
+            .unwrap();
+
+        let result =
+            export_legacy_local_backup(Some(&destination), revision, &owned, &handoff, store, &job)
+                .unwrap();
+
+        assert_eq!(result.revision, revision);
+        assert!(fs::metadata(destination).unwrap().len() > 0);
     }
 
     #[test]

@@ -1,5 +1,9 @@
 use super::owner_projection::OwnerManifestProjector;
-use super::{compare_plugin_storage_keys, ReadTarget, StoreError, StoreResult};
+use super::{
+    compare_plugin_storage_keys, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
+    AssetRepositoryAuthorityState, ColdAlias, ColdPayloadAuthorityState, ReadTarget, StoreError,
+    StoreResult,
+};
 use crate::asset_repository::owner_manifest_codec::OwnerManifestEntry;
 use flate2::{Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,6 +29,29 @@ pub(crate) struct ProjectedCharacter {
 pub(crate) struct ProjectedRootModule {
     pub(crate) value: Value,
     pub(crate) asset_entries: Option<Vec<OwnerManifestEntry>>,
+}
+
+pub(crate) struct PinnedLegacyBackupInventory {
+    pub(crate) revision: i64,
+    pub(crate) assets: Vec<AssetAlias>,
+    pub(crate) owner_heads: Vec<AssetOwnerHead>,
+    pub(crate) cold: Vec<ColdAlias>,
+    pub(crate) asset_authority: AssetRepositoryAuthorityState,
+    pub(crate) cold_authority: ColdPayloadAuthorityState,
+}
+
+pub(crate) fn pinned_legacy_backup_inventory(
+    connection: &Connection,
+    target: &ReadTarget,
+) -> StoreResult<PinnedLegacyBackupInventory> {
+    Ok(PinnedLegacyBackupInventory {
+        revision: target.revision,
+        assets: super::query::list_asset_aliases(connection, target)?.value,
+        owner_heads: super::query::list_asset_owner_heads(connection, target)?.value,
+        cold: super::query::list_cold_aliases(connection, target)?.value,
+        asset_authority: super::query::read_asset_repository_authority(connection, target)?.value,
+        cold_authority: super::query::read_cold_payload_authority(connection, target)?.value,
+    })
 }
 
 pub(crate) fn projected_character(
@@ -167,6 +194,30 @@ pub(crate) fn create_controlled(
         omit_account,
         None,
         None,
+        None,
+        is_cancelled,
+        on_progress,
+    )
+}
+
+pub(crate) fn create_legacy_backup_controlled(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    target: &ReadTarget,
+    lease: &str,
+    replacement_keys: HashMap<AssetOwnerLocator, Vec<String>>,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> StoreResult<ExportedRisuSave> {
+    create_controlled_inner(
+        connection,
+        snapshots_dir,
+        target,
+        lease,
+        true,
+        None,
+        None,
+        Some(replacement_keys),
         is_cancelled,
         on_progress,
     )
@@ -189,6 +240,7 @@ pub(crate) fn create_projected_controlled(
         lease,
         omit_account,
         Some(replacements),
+        None,
         None,
         is_cancelled,
         on_progress,
@@ -214,6 +266,7 @@ pub(crate) fn create_projected_controlled_for_account(
         false,
         Some(replacements),
         Some(expected_account_id),
+        None,
         is_cancelled,
         on_progress,
     )
@@ -227,12 +280,20 @@ fn create_controlled_inner(
     omit_account: bool,
     replacements: Option<&HashMap<String, String>>,
     expected_account_id: Option<&str>,
+    owner_replacement_keys: Option<HashMap<AssetOwnerLocator, Vec<String>>>,
     is_cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(u64, u64, u64),
 ) -> StoreResult<ExportedRisuSave> {
     check_export_cancelled(&is_cancelled)?;
-    let owner_projector =
-        OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?;
+    let owner_projector = match owner_replacement_keys {
+        Some(replacement_keys) => OwnerManifestProjector::from_snapshots_dir_with_replacement_keys(
+            connection,
+            target,
+            snapshots_dir,
+            replacement_keys,
+        )?,
+        None => OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?,
+    };
     let exports_dir = export_directory(snapshots_dir)?;
     fs::create_dir_all(&exports_dir)?;
     let id = Uuid::new_v4();

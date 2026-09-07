@@ -11,6 +11,7 @@ use std::path::Path;
 pub(super) struct OwnerManifestProjector {
     cas: Option<PayloadCas>,
     heads: HashMap<AssetOwnerLocator, AssetOwnerHead>,
+    replacement_keys: HashMap<AssetOwnerLocator, Vec<String>>,
 }
 
 impl OwnerManifestProjector {
@@ -19,11 +20,26 @@ impl OwnerManifestProjector {
         target: &ReadTarget,
         snapshots_dir: &Path,
     ) -> StoreResult<Self> {
+        Self::from_snapshots_dir_with_replacement_keys(
+            connection,
+            target,
+            snapshots_dir,
+            HashMap::new(),
+        )
+    }
+
+    pub(super) fn from_snapshots_dir_with_replacement_keys(
+        connection: &Connection,
+        target: &ReadTarget,
+        snapshots_dir: &Path,
+        replacement_keys: HashMap<AssetOwnerLocator, Vec<String>>,
+    ) -> StoreResult<Self> {
         let authority = query::read_asset_repository_authority(connection, target)?.value;
         match authority {
             AssetRepositoryAuthorityState::Legacy => Ok(Self {
                 cas: None,
                 heads: HashMap::new(),
+                replacement_keys,
             }),
             AssetRepositoryAuthorityState::Preparing { .. } => Err(validation(
                 "owner manifest projection cannot read a preparing asset repository",
@@ -45,6 +61,7 @@ impl OwnerManifestProjector {
                         validation(format!("owner manifest repository is unavailable: {error}"))
                     })?),
                     heads,
+                    replacement_keys,
                 })
             }
         }
@@ -243,6 +260,23 @@ impl OwnerManifestProjector {
             return Err(validation(
                 "owner manifest does not match pinned legacy tuples",
             ));
+        }
+        if let Some(replacement_keys) = self.replacement_keys.get(&head.owner) {
+            if replacement_keys.len() != entries.len() {
+                return Err(validation(
+                    "owner manifest replacement key count does not match the manifest",
+                ));
+            }
+            let tuples = parent
+                .get_mut(property)
+                .and_then(Value::as_array_mut)
+                .expect("validated owner manifest property is an array");
+            for (tuple, replacement_key) in tuples.iter_mut().zip(replacement_keys) {
+                tuple
+                    .as_array_mut()
+                    .expect("validated owner tuple is an array")[1] =
+                    Value::String(replacement_key.clone());
+            }
         }
         Ok(entries)
     }
