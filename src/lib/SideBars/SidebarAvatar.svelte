@@ -86,6 +86,25 @@
         {@render children?.()}
       {/if}
         </div>
+      {:catch}
+      <div
+        class="bg-skin-border sidebar-avatar rounded-md bg-top flex items-center justify-center {
+          color === 'red' ? 'bg-red-700/50' :
+          color === 'yellow' ? 'bg-yellow-700/50' :
+          color === 'green' ? 'bg-green-700/50' :
+          color === 'blue' ? 'bg-blue-700/50' :
+          color === 'indigo' ? 'bg-indigo-700/50' :
+          color === 'purple' ? 'bg-purple-700/50' :
+          color === 'pink' ? 'bg-pink-700/50' :
+          'bg-darkbg/50'
+        }"
+        style:width={size + "px"}
+        style:height={size + "px"}
+        style:minWidth={size + "px"}
+        class:rounded-md={!rounded} class:rounded-full={rounded}
+      >
+        {@render children?.()}
+      </div>
     {/await}
     {:else}
       {#await src}
@@ -106,6 +125,14 @@
           class:rounded-md={!rounded} class:rounded-full={rounded} 
           alt="avatar"
         />
+      {:catch}
+        <div
+          class="bg-skin-border sidebar-avatar rounded-md bg-top"
+          style:width={size + "px"}
+          style:height={size + "px"}
+          style:minWidth={size + "px"}
+          class:rounded-md={!rounded} class:rounded-full={rounded}
+        ></div>
       {/await}
     {/if}
   {:else}

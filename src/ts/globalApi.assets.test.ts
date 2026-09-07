@@ -118,7 +118,16 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
 vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: vi.fn(() => ({})) }))
 vi.mock('@tauri-apps/plugin-http', () => ({ fetch: vi.fn() }))
 
-import { createThrottledSizeEstimator, downloadFile, forageStorage, getFileSrc, LocalWriter, saveAsset, TauriWriter } from './globalApi.svelte'
+import {
+    createThrottledSizeEstimator,
+    downloadFile,
+    forageStorage,
+    getFileSrc,
+    invalidateAssetSourceCache,
+    LocalWriter,
+    saveAsset,
+    TauriWriter,
+} from './globalApi.svelte'
 import { remove, writeFile } from '@tauri-apps/plugin-fs'
 import { save } from '@tauri-apps/plugin-dialog'
 
@@ -134,6 +143,16 @@ function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime:
         list: vi.fn(async () => []),
         remove: vi.fn(async () => undefined),
     }
+}
+
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+    })
+    return { promise, resolve, reject }
 }
 
 beforeEach(() => {
@@ -201,6 +220,81 @@ describe('getFileSrc tauri asset route', () => {
         expect(state.blobStore.put).toHaveBeenCalledTimes(1)
 
         expect(await getFileSrc('assets/avatar.png')).toBe('asset:///data/assets/avatar.png')
+        expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(2)
+    })
+
+    test('shares one in-flight native URL lookup for concurrent requests to the same key', async () => {
+        state.isTauri = true
+        const pending = deferred<string | null>()
+        const started = deferred<void>()
+        state.blobStore = createFakeBlobStore({
+            'assets/concurrent.png': { data: new Uint8Array([7]), mime: 'image/png' },
+        })
+        state.blobStore.resolveUrl = vi.fn(() => {
+            started.resolve()
+            return pending.promise
+        })
+
+        const first = getFileSrc('assets/concurrent.png')
+        const second = getFileSrc('assets/concurrent.png')
+        await started.promise
+
+        expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(1)
+        pending.resolve('asset:///data/assets/concurrent.png')
+        await expect(Promise.all([first, second])).resolves.toEqual([
+            'asset:///data/assets/concurrent.png',
+            'asset:///data/assets/concurrent.png',
+        ])
+    })
+
+    test('retries a native URL lookup after an in-flight rejection', async () => {
+        state.isTauri = true
+        state.blobStore = createFakeBlobStore({
+            'assets/retry.png': { data: new Uint8Array([7]), mime: 'image/png' },
+        })
+        state.blobStore.resolveUrl = vi.fn()
+            .mockRejectedValueOnce(new Error('synthetic resolver failure'))
+            .mockResolvedValueOnce('asset:///data/assets/retry.png')
+
+        await expect(getFileSrc('assets/retry.png')).rejects.toThrow('synthetic resolver failure')
+        await expect(getFileSrc('assets/retry.png')).resolves.toBe('asset:///data/assets/retry.png')
+        expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(2)
+    })
+
+    test('does not cache a native URL lookup that was invalidated while in flight', async () => {
+        state.isTauri = true
+        const stale = deferred<string | null>()
+        const fresh = deferred<string | null>()
+        const bothStarted = deferred<void>()
+        let starts = 0
+        state.blobStore = createFakeBlobStore({
+            'assets/invalidated.png': { data: new Uint8Array([7]), mime: 'image/png' },
+        })
+        state.blobStore.resolveUrl = vi.fn()
+            .mockImplementationOnce(() => {
+                if (++starts === 2) bothStarted.resolve()
+                return stale.promise
+            })
+            .mockImplementationOnce(() => {
+                if (++starts === 2) bothStarted.resolve()
+                return fresh.promise
+            })
+
+        const first = getFileSrc('assets/invalidated.png')
+        invalidateAssetSourceCache('assets/invalidated.png')
+        const second = getFileSrc('assets/invalidated.png')
+        await bothStarted.promise
+
+        stale.resolve('asset:///data/assets/invalidated-stale.png')
+        await expect(first).resolves.toBe('asset:///data/assets/invalidated-stale.png')
+        const third = getFileSrc('assets/invalidated.png')
+        expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(2)
+
+        fresh.resolve('asset:///data/assets/invalidated-fresh.png')
+        await expect(Promise.all([second, third])).resolves.toEqual([
+            'asset:///data/assets/invalidated-fresh.png',
+            'asset:///data/assets/invalidated-fresh.png',
+        ])
         expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(2)
     })
 

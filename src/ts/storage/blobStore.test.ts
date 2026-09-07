@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'vitest'
-import { createKeyValueBlobStore, type BlobKeyValueBackend } from './blobStore'
+import {
+    createKeyValueBlobStore,
+    inferBlobMime,
+    type BlobKeyValueBackend,
+} from './blobStore'
 
 function harness() {
     const values = new Map<string, Uint8Array>()
@@ -31,6 +35,27 @@ function harness() {
 }
 
 describe('BlobStore contract', () => {
+    test.each([
+        ['PNG', 'image/png'],
+        ['jpg', 'image/jpeg'],
+        ['jpeg', 'image/jpeg'],
+        ['AVIF', 'image/avif'],
+        ['gif', 'image/gif'],
+        ['webp', 'image/webp'],
+        ['flac', 'audio/flac'],
+        ['MP3', 'audio/mpeg'],
+        ['ogg', 'audio/ogg'],
+        ['wav', 'audio/wav'],
+        ['mkv', 'video/x-matroska'],
+        ['MP4', 'video/mp4'],
+        ['webm', 'video/webm'],
+        ['json', 'application/json'],
+        ['unknown', 'application/octet-stream'],
+        ['', 'application/octet-stream'],
+    ])('infers an effective MIME for the %s extension', (ext, expected) => {
+        expect(inferBlobMime('', ext)).toBe(expected)
+    })
+
     test('distinguishes missing and empty payloads', async () => {
         const { store } = harness()
         expect(await store.read('assets/missing')).toBeNull()

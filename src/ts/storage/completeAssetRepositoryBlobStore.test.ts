@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { BlobMetadata } from './blobStore'
+import { createTauriCasObjectUrl } from './platformBlobStore'
 import {
     createCompleteAssetRepositoryBlobStore,
     createCompleteTypedAssetRepository,
@@ -65,11 +66,16 @@ function createFacade(input: {
     legacyFallback?: boolean
     legacy?: ReturnType<typeof createLegacy>
     writeSessions?: DurableAssetWriteSessionFactory
+    resolveObjectUrl?: (
+        input: Parameters<typeof createTauriCasObjectUrl>[0],
+    ) => Promise<string | null>
 } = {}) {
     const store = input.store ?? createStore()
     const cas = input.cas ?? createCas()
     const legacy = input.legacy ?? createLegacy()
-    const resolveObjectUrl = vi.fn(async () => 'risuasset://cas-object')
+    const resolveObjectUrl = vi.fn(
+        input.resolveObjectUrl ?? (async () => 'risuasset://cas-object'),
+    )
     const encodeNewInlayImage = vi.fn(async () => ({
         data: new Uint8Array([8, 6, 7]),
         metadata: {
@@ -525,6 +531,57 @@ describe('complete AssetRepository BlobStore facade', () => {
         vi.mocked(cas.statObject).mockResolvedValueOnce(null)
         await expect(facade.resolveUrl('assets/photo.bin')).resolves.toBeNull()
         expect(legacy.resolveUrl).not.toHaveBeenCalled()
+    })
+
+    it('derives a display MIME for an empty-MIME CAS alias without mutating persisted metadata', async () => {
+        const alias = assetAlias({
+            key: 'assets/avatar.PNG',
+            mime: '',
+            ext: '.PNG',
+            name: 'avatar.PNG',
+        })
+        const persistedAlias = structuredClone(alias)
+        const store = createStore({
+            readAssetAlias: vi.fn(async () => ({ revision: 3, value: alias })),
+        })
+        const cas = createCas({ statObject: vi.fn(async () => 4) })
+        const converter = vi.fn(
+            (path: string, protocol?: string) => `${protocol}://localhost/${path}`,
+        )
+        const { facade, resolveObjectUrl } = createFacade({
+            store,
+            cas,
+            resolveObjectUrl: async (input) => createTauriCasObjectUrl(input, converter),
+        })
+
+        const url = await facade.resolveUrl('assets/avatar.PNG')
+
+        expect(url).toContain('?mime=image%2Fpng&size=4')
+        expect(resolveObjectUrl).toHaveBeenCalledWith({
+            contentHash: assetHash,
+            mime: 'image/png',
+            size: 4,
+        })
+        expect(alias).toEqual(persistedAlias)
+        expect(alias.mime).toBe('')
+        expect(cas.readObject).not.toHaveBeenCalled()
+        expect(cas.readObjectRange).not.toHaveBeenCalled()
+    })
+
+    it('preserves native URL header rejection for an invalid nonempty alias MIME', async () => {
+        const alias = assetAlias({ mime: 'image/png\0text/html', ext: 'png' })
+        const store = createStore({
+            readAssetAlias: vi.fn(async () => ({ revision: 3, value: alias })),
+        })
+        const cas = createCas({ statObject: vi.fn(async () => 4) })
+        const { facade } = createFacade({
+            store,
+            cas,
+            resolveObjectUrl: async (input) => createTauriCasObjectUrl(input),
+        })
+
+        await expect(facade.resolveUrl('assets/photo.bin')).rejects.toThrow('MIME')
+        expect(alias.mime).toBe('image/png\0text/html')
     })
 
     it('encodes a new Inlay once and publishes the returned encoded bytes without another transform', async () => {

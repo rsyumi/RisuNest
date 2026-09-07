@@ -164,6 +164,7 @@ subscribeRuntimePerformanceProfile(() => {
     browserAssetDataUrlCache = createBrowserAssetDataUrlCache()
 })
 const pendingBrowserAssetReads = new Map<string, Promise<string | null>>()
+const pendingTauriAssetUrls = new Map<string, Promise<string | null>>()
 const tauriAssetUrlCache = new ByteBudgetLru<string, string>(
     Number.POSITIVE_INFINITY,
     () => 0,
@@ -206,15 +207,29 @@ export function invalidateAssetSourceCache(key: string): void {
     tauriAssetUrlCache.delete(key)
     browserAssetDataUrlCache.delete(key)
     pendingBrowserAssetReads.delete(key)
+    pendingTauriAssetUrls.delete(key)
 }
 
-/** Resolves a Tauri asset URL once per key; the URL only depends on the key. */
+/** Resolves a Tauri asset URL once per key, including concurrent lookups. */
 async function resolveTauriAssetUrl(loc: string): Promise<string | null> {
     const cached = tauriAssetUrlCache.get(loc)
     if (cached !== undefined) return cached
-    const url = await (await resolveBlobStore()).resolveUrl(loc)
-    if (url) tauriAssetUrlCache.set(loc, url)
-    return url
+    let pending = pendingTauriAssetUrls.get(loc)
+    if (!pending) {
+        pending = (async () => {
+            const url = await (await resolveBlobStore()).resolveUrl(loc)
+            if (url && pendingTauriAssetUrls.get(loc) === pending) {
+                tauriAssetUrlCache.set(loc, url)
+            }
+            return url
+        })()
+        pendingTauriAssetUrls.set(loc, pending)
+        const cleanup = () => {
+            if (pendingTauriAssetUrls.get(loc) === pending) pendingTauriAssetUrls.delete(loc)
+        }
+        void pending.then(cleanup, cleanup)
+    }
+    return await pending
 }
 
 let checkedPaths: string[] = []

@@ -1,4 +1,5 @@
 import {
+    inferBlobMime,
     validateBlobReadRange,
     type BlobReadRange,
     type BlobMetadata,
@@ -560,7 +561,7 @@ export function createCompleteTypedAssetRepository(
             }
             return options.objectUrls.resolveObjectUrl({
                 contentHash: alias.objectHash,
-                mime: alias.mime,
+                mime: inferBlobMime(alias.mime, alias.ext),
                 size: alias.size,
             })
         },
