@@ -69,6 +69,11 @@ impl NativeLogState {
         self.record_inner(level, target, message.as_ref(), true);
     }
 
+    fn record_frontend_error(&self, message: &str) {
+        let bounded: String = message.chars().take(2048).collect();
+        self.record("error", "webview", bounded);
+    }
+
     fn record_ring_only(&self, level: &str, target: &str, message: impl AsRef<str>) {
         self.record_inner(level, target, message.as_ref(), false);
     }
@@ -503,6 +508,11 @@ pub(crate) fn native_log_tail(
     limit: Option<usize>,
 ) -> Vec<LogEntry> {
     state.tail(limit)
+}
+
+#[tauri::command]
+pub(crate) fn native_log_error(state: State<'_, NativeLogState>, message: String) {
+    state.record_frontend_error(&message);
 }
 
 fn file_path_for_command(state: &NativeLogState) -> Result<String, String> {

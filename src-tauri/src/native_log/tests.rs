@@ -8,6 +8,21 @@ use std::sync::{
 static PANIC_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn frontend_failures_reach_diagnostics_with_secrets_masked_and_bounded_text() {
+    let state = NativeLogState::for_tests();
+    state.record_frontend_error(&format!(
+        "Backup import failed: x-api-key: secret-value\n{}",
+        "한".repeat(3000)
+    ));
+    let entry = state.tail(None).pop().unwrap();
+    assert_eq!(entry.level, "error");
+    assert_eq!(entry.target, "webview");
+    assert!(entry.message.starts_with("Backup import failed:"));
+    assert!(!entry.message.contains("secret-value"));
+    assert!(entry.message.chars().count() <= 2048);
+}
+
+#[test]
 fn keeps_a_fifo_ring_and_returns_the_newest_tail() {
     let state = NativeLogState::for_tests();
     for number in 0..=1_000 {

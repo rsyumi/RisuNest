@@ -688,6 +688,7 @@ pub fn run() {
             peer_sync::maintenance::peer_temp_usage,
             peer_sync::maintenance::peer_temp_cleanup,
             native_log::native_log_tail,
+            native_log::native_log_error,
             native_log::native_log_file_path,
             native_log::native_log_set_file_enabled,
             #[cfg(any(desktop, target_os = "android"))]

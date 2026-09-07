@@ -41,6 +41,8 @@ vi.mock('../alert', () => ({
     alertWait: vi.fn(),
 }))
 
+vi.mock('../nativeLog', () => ({ recordNativeLogError: vi.fn(async () => undefined) }))
+
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: { Init: vi.fn(async () => undefined), isAccount: false },
     getUncleanables: state.getUncleanables,
@@ -244,6 +246,48 @@ describe('local backup persistent snapshot', () => {
         expect(state.restoreEvents).toEqual([`cold:${coldKey}`, 'database'])
         expect(state.restoredCold.get(coldKey)).toEqual(cold)
         expect(state.replacePersistentDatabase).toHaveBeenCalledOnce()
+    })
+
+    it('shows the native failure code and reason instead of blaming the backup file', async () => {
+        const { importLegacyLocalBackupFromSystemPicker } =
+            await import('./legacyLocalBackupFileRouteProduction.svelte')
+        const { NativeFileJobError } = await import('../storage/nativeFileJobs')
+        const { alertError } = await import('../alert')
+        vi.mocked(alertError).mockClear()
+        vi.mocked(importLegacyLocalBackupFromSystemPicker).mockRejectedValueOnce(
+            new NativeFileJobError('revision-conflict', 'The database changed during import'),
+        )
+        const { LoadLocalBackup } = await import('./backuplocal')
+        LoadLocalBackup()
+        await vi.waitFor(() =>
+            expect(alertError).toHaveBeenCalledWith(
+                'Backup import failed [revision-conflict]: The database changed during import',
+            ),
+        )
+    })
+
+    it('distinguishes an imported database from a failed screen refresh', async () => {
+        const { importLegacyLocalBackupFromSystemPicker } =
+            await import('./legacyLocalBackupFileRouteProduction.svelte')
+        const { NativeFileJobActivationCommittedError } = await import('../storage/nativeFileJobs')
+        const { alertError } = await import('../alert')
+        const { recordNativeLogError } = await import('../nativeLog')
+        vi.mocked(recordNativeLogError).mockClear()
+        vi.mocked(alertError).mockClear()
+        vi.mocked(importLegacyLocalBackupFromSystemPicker).mockRejectedValueOnce(
+            new NativeFileJobActivationCommittedError(2, new Error('Synthetic refresh failed')),
+        )
+        const { LoadLocalBackup } = await import('./backuplocal')
+        LoadLocalBackup()
+        await vi.waitFor(() =>
+            expect(alertError).toHaveBeenCalledWith(
+                expect.stringContaining('Backup data was imported, but the app could not refresh'),
+            ),
+        )
+        expect(alertError).toHaveBeenCalledWith(expect.stringContaining('Synthetic refresh failed'))
+        expect(recordNativeLogError).toHaveBeenCalledWith(
+            expect.stringContaining('activation-committed-refresh-failed'),
+        )
     })
 
     it('writes database and cold enumeration from the flushed store revision', async () => {

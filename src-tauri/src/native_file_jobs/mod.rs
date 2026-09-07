@@ -3487,6 +3487,17 @@ impl JobControl {
         if status.state.is_terminal() {
             return Err("native job is already terminal".to_owned());
         }
+        crate::native_log::global_state().record(
+            "error",
+            "native-file-job",
+            format!(
+                "Native file job {} ({:?}) failed at {:?} [{code}]: {}",
+                status.job_id,
+                status.kind,
+                status.phase,
+                bounded_message(message),
+            ),
+        );
         status.state = JobState::Failed;
         status.phase = JobPhase::Complete;
         status.result = None;
@@ -6082,6 +6093,26 @@ mod tests {
         job.start(JobPhase::ReadingSource).unwrap();
         job.finish_success(result(1)).unwrap();
         assert!(expiring.status(&id).is_err());
+    }
+
+    #[test]
+    fn failed_backup_job_records_diagnostic_code_and_failure_phase() {
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreLegacyLocalBackup)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.finish_failure("invalid-source", "synthetic backup rejected")
+            .unwrap();
+        let entry = crate::native_log::global_state()
+            .tail(None)
+            .into_iter()
+            .find(|entry| entry.target == "native-file-job" && entry.message.contains(&job.id()));
+        let entry =
+            entry.expect("backup failure must remain in diagnostics after the progress UI closes");
+        assert_eq!(entry.level, "error");
+        assert!(entry.message.contains("invalid-source"));
+        assert!(entry.message.contains("ReadingSource"));
+        assert!(entry.message.contains("synthetic backup rejected"));
     }
 
     #[test]

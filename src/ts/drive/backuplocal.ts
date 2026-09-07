@@ -27,6 +27,8 @@ import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation
 import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installLocalBackup } from "../storage/databaseRestore";
 import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
+import { NativeFileJobActivationCommittedError, NativeFileJobError } from "../storage/nativeFileJobs";
+import { recordNativeLogError } from "../nativeLog";
 
 const NATIVE_BACKUP_READ_BYTES = 1024 * 1024
 
@@ -384,9 +386,8 @@ export function LoadLocalBackup(){
 
 async function loadLocalBackupNativeFirst(): Promise<void> {
     try {
-        const { importLegacyLocalBackupFromSystemPicker } = await import(
-            './legacyLocalBackupFileRouteProduction.svelte'
-        )
+        const { importLegacyLocalBackupFromSystemPicker } =
+            await import('./legacyLocalBackupFileRouteProduction.svelte')
         const result = await importLegacyLocalBackupFromSystemPicker()
         if (result) alertNormal('Success')
     } catch (error) {
@@ -396,7 +397,17 @@ async function loadLocalBackupNativeFirst(): Promise<void> {
             return
         }
         console.error(error)
-        alertError('Failed, Is file corrupted?')
+        let message: string
+        if (error instanceof NativeFileJobActivationCommittedError) {
+            const detail = error.cause instanceof Error ? error.cause.message : String(error.cause)
+            message = `Backup data was imported, but the app could not refresh. Restart the app before trying another import.\n[${error.code}] ${detail}`
+        } else {
+            const code = error instanceof NativeFileJobError ? error.code : 'import-error'
+            const detail = error instanceof Error ? error.message : String(error)
+            message = `Backup import failed [${code}]: ${detail}`
+        }
+        void recordNativeLogError(message).catch(() => {})
+        alertError(message)
     }
 }
 
