@@ -19,6 +19,7 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.IntentCompat
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
@@ -804,11 +805,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     // peer-sync channel not silenced. The web UI warns when this is false.
     @JavascriptInterface
     fun notificationsEnabled(): Boolean {
-      val manager = androidx.core.app.NotificationManagerCompat.from(this@MainActivity)
+      val manager = NotificationManagerCompat.from(this@MainActivity)
       if (!manager.areNotificationsEnabled()) return false
-      val channel = manager.getNotificationChannel(PEER_SYNC_FOREGROUND_CHANNEL)
+      val channel = manager.getNotificationChannelCompat(PEER_SYNC_FOREGROUND_CHANNEL)
       return channel == null ||
-        channel.importance != android.app.NotificationManager.IMPORTANCE_NONE
+        channel.importance != NotificationManagerCompat.IMPORTANCE_NONE
     }
   }
 
@@ -832,9 +833,16 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
     @JavascriptInterface
     fun openNotificationSettings(): Boolean = runCatching {
-      startActivity(
-        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
-      )
+      val settingsIntent = if (Build.VERSION.SDK_INT >= 26) {
+        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+          .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+      } else {
+        Intent(
+          Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+          Uri.fromParts("package", packageName, null),
+        )
+      }
+      startActivity(settingsIntent)
       true
     }.getOrDefault(false)
 

@@ -1,11 +1,10 @@
 package io.github.rsyumi.risunest
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
@@ -162,12 +161,13 @@ class GenerationForegroundService : Service() {
   }
 
   private fun createNotificationChannel() {
-    getSystemService(NotificationManager::class.java).createNotificationChannel(
-      NotificationChannel(
+    NotificationManagerCompat.from(this).createNotificationChannel(
+      NotificationChannelCompat.Builder(
         GENERATION_FOREGROUND_CHANNEL,
-        getString(R.string.generation_notification_channel),
-        NotificationManager.IMPORTANCE_LOW,
-      ),
+        NotificationManagerCompat.IMPORTANCE_LOW,
+      )
+        .setName(getString(R.string.generation_notification_channel))
+        .build(),
     )
   }
 
@@ -201,8 +201,8 @@ class GenerationForegroundService : Service() {
     internal fun notificationsEnabled(context: Context): Boolean {
       val manager = NotificationManagerCompat.from(context)
       if (!manager.areNotificationsEnabled()) return false
-      val channel = manager.getNotificationChannel(GENERATION_FOREGROUND_CHANNEL)
-      return channel == null || channel.importance != NotificationManager.IMPORTANCE_NONE
+      val channel = manager.getNotificationChannelCompat(GENERATION_FOREGROUND_CHANNEL)
+      return channel == null || channel.importance != NotificationManagerCompat.IMPORTANCE_NONE
     }
   }
 }

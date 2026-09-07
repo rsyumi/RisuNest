@@ -1,14 +1,14 @@
 package io.github.rsyumi.risunest
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import java.util.UUID
 
@@ -162,12 +162,13 @@ class PeerSyncForegroundService : Service() {
   }
 
   private fun createNotificationChannel() {
-    getSystemService(NotificationManager::class.java).createNotificationChannel(
-      NotificationChannel(
+    NotificationManagerCompat.from(this).createNotificationChannel(
+      NotificationChannelCompat.Builder(
         PEER_SYNC_FOREGROUND_CHANNEL,
-        getString(R.string.peer_sync_source_notification_channel),
-        NotificationManager.IMPORTANCE_LOW,
-      ),
+        NotificationManagerCompat.IMPORTANCE_LOW,
+      )
+        .setName(getString(R.string.peer_sync_source_notification_channel))
+        .build(),
     )
   }
 
