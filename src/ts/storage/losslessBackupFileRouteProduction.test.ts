@@ -46,6 +46,8 @@ vi.mock('./nativeFileJobManager', () => ({
             signal: new AbortController().signal,
             onStatus: vi.fn(),
             setBlocking: vi.fn(),
+            setSource: vi.fn(),
+            setPartialWritesPossible: vi.fn(),
         }),
 }))
 

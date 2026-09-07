@@ -1484,7 +1484,10 @@ describe('native file jobs', () => {
             { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
             {
                 afterRefresh: () => { events.push('plugins-reloaded') },
-                onStatus: (status) => observedPhases.push(status.phase),
+                onStatus: (status) => {
+                    observedPhases.push(status.phase)
+                    if (status.detail) events.push(`stage:${status.detail.stage}`)
+                },
             },
             {
                 isTauri: () => true,
@@ -1513,7 +1516,9 @@ describe('native file jobs', () => {
         expect(events).toEqual([
             'fence-acquired',
             'native-finalized',
+            'stage:refreshing-app',
             'working-set-refreshed',
+            'stage:reloading-plugins',
             'plugins-reloaded',
             'terminal-acknowledged',
             'fence-released',

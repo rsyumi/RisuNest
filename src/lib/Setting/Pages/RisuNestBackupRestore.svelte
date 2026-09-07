@@ -12,7 +12,7 @@
     import { nativeFileOperation, importRisuSaveFromSystemPicker, exportRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
     import { alertPartialDestinationWarning, hasPartialDestinationWarning } from 'src/ts/storage/risuSaveFileRoute'
     import { NativeFileJobActivationCommittedError, NativeFileJobError } from 'src/ts/storage/nativeFileJobs'
-    import { cancelActiveNativeFileOperation } from 'src/ts/storage/nativeFileJobManager'
+    import { cancelActiveNativeFileOperation, NativeFileOperationBusyError } from 'src/ts/storage/nativeFileJobManager'
     import { nativeFileJobProgressText } from 'src/ts/gui/nativeFileJobProgress'
 
     let nativeAccountBusy = $state(false)
@@ -20,6 +20,8 @@
     let nativePublishController = $state<AbortController | null>(null)
     let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null)
     let risuSaveStatus = $derived($nativeFileOperation?.status)
+    // Imports open the shared progress dialog; only inline operations (exports) use this row.
+    let inlineOperation = $derived($nativeFileOperation?.presentation === 'inline')
 
     function showRisuSaveError(error: unknown): void {
         const partialDestinationMayRemain = hasPartialDestinationWarning(error)
@@ -43,10 +45,19 @@
     async function runRisuSaveOperation(kind: 'import' | 'export'): Promise<void> {
         if (risuSaveOperation) return
         if (kind === 'import' && (!await alertConfirm(language.risuSaveImportConfirm) || !await alertConfirm(language.backupLoadConfirm2))) return
+        if (kind === 'import') {
+            // The shared progress dialog reports progress, cancellation, and the outcome.
+            try {
+                await importRisuSaveFromSystemPicker()
+            } catch (error) {
+                if (error instanceof NativeFileOperationBusyError) alertError(language.risuNest.backup.actionFailed)
+            }
+            return
+        }
         try {
-            const result = kind === 'import' ? await importRisuSaveFromSystemPicker() : await exportRisuSaveFromSystemPicker()
+            const result = await exportRisuSaveFromSystemPicker()
             if (!result) return
-            alertNormal(result.warningCodes.includes('cleanup-failed') ? language.risuSaveCleanupWarning : kind === 'import' ? language.risuSaveImportComplete : language.risuSaveExportComplete)
+            alertNormal(result.warningCodes.includes('cleanup-failed') ? language.risuSaveCleanupWarning : language.risuSaveExportComplete)
         } catch (error) {
             showRisuSaveError(error)
         }
@@ -121,7 +132,7 @@
                 <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('export')}>{language.exportRisuSave}</Button>
             {/if}
         </div>
-        {#if risuSaveOperation}
+        {#if risuSaveOperation && inlineOperation}
             <div class="flex items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
                 <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
                 <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>

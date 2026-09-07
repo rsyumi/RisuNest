@@ -9,11 +9,15 @@ import type { PersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { listenRecoveredPublications } from './recoveredPublicationListener'
 import {
     NativeFileJobError,
+    syntheticNativeFileJobStatus,
     type NativeFileExportJobOptions,
     type NativeFileJobResult,
     type NativeFileJobSource,
+    type NativeFileJobStage,
     type NativeFileRestoreJobOptions,
 } from './nativeFileJobs'
+import type { NativeFileOperationSource } from './nativeFileJobManager'
+import { basenameOf } from './nativeFileSourceInfo'
 import type {
     PinnedRisuSaveExport,
     RisuSaveExportRuntime,
@@ -21,6 +25,7 @@ import type {
 
 type FileLike = {
     name: string
+    size?: number
     arrayBuffer(): Promise<ArrayBuffer>
 }
 
@@ -65,6 +70,8 @@ export interface RisuSaveFileRouteDependencies {
     acknowledgeAndroidExport(requestId: string): boolean
     reloadPlugins(): void | Promise<void>
     reloadPluginsAfterNativeRestore(): void | Promise<void>
+    /** Name and size of a picked desktop file for the progress dialog; defaults to the basename. */
+    describeNativeSource?(path: string): Promise<NativeFileOperationSource>
 }
 
 function deduplicateWarningCodes(codes: string[], requiredCode?: string): string[] {
@@ -300,6 +307,8 @@ export function listenRecoveredAndroidRisuSavePublications(
 
 export interface RisuSaveFileRouteOptions extends NativeFileRestoreJobOptions {
     omitAccount?: boolean
+    /** Receives the picked file's name and size for the progress dialog. */
+    onSource?(source: NativeFileOperationSource): void
 }
 
 export interface RisuSaveFileRouteResult {
@@ -321,30 +330,62 @@ function isNativeCompatibilityFallback(error: unknown): boolean {
         || error instanceof NativeFileJobError && error.code === 'unsupported-format'
 }
 
+const WEB_IMPORT_KIND = 'restore-block-risu-save' as const
+
+function webImportStatus(
+    options: RisuSaveFileRouteOptions,
+    stage: NativeFileJobStage,
+    bytes: number | undefined,
+    completed: number,
+): void {
+    options.onStatus?.(syntheticNativeFileJobStatus({ kind: WEB_IMPORT_KIND }, stage, {
+        stageUnit: 'bytes',
+        stageCompleted: completed,
+        ...(bytes === undefined ? {} : { stageTotal: bytes }),
+        progress: {
+            completedBytes: completed,
+            ...(bytes === undefined ? {} : { totalBytes: bytes }),
+            completedItems: 0,
+        },
+    }))
+}
+
 async function importWithBytes(
     runtime: FileRouteRuntime,
     bytes: Uint8Array,
+    options: RisuSaveFileRouteOptions,
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
+    webImportStatus(options, 'decoding-database', bytes.byteLength, bytes.byteLength)
     const database = await dependencies.decodeRisuSave(bytes) as Database
+    webImportStatus(options, 'activating', bytes.byteLength, bytes.byteLength)
     await runtime.replacePersistentDatabase(
         database,
         'risu-save-file-import',
         { authoritative: true },
     )
+    webImportStatus(options, 'reloading-plugins', bytes.byteLength, bytes.byteLength)
     await dependencies.reloadPlugins()
     return { mode: 'web', warningCodes: [], bytes: bytes.byteLength }
 }
 
 async function importWithWebCodec(
     runtime: FileRouteRuntime,
+    options: RisuSaveFileRouteOptions,
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult | null> {
     const files = await dependencies.chooseWebImport()
     const file = files?.[0]
     if (!file) return null
+    options.onSource?.({ name: file.name, ...(file.size === undefined ? {} : { bytes: file.size }) })
+    webImportStatus(options, 'reading-database', file.size, 0)
     const bytes = new Uint8Array(await file.arrayBuffer())
-    return importWithBytes(runtime, bytes, dependencies)
+    return importWithBytes(runtime, bytes, options, dependencies)
+}
+
+/** Tells the dialog the native job gave up and the user must pick the file again in the WebView. */
+function announceWebReselect(options: RisuSaveFileRouteOptions): void {
+    options.onStatus?.(syntheticNativeFileJobStatus({ kind: WEB_IMPORT_KIND }, 'awaiting-reselect'))
 }
 
 async function exportWithWebCodec(
@@ -365,6 +406,11 @@ export async function importRisuSaveFromPicker(
     if (dependencies.platform() === 'native-desktop') {
         const path = await dependencies.chooseNativeImport()
         if (!path) return null
+        if (options.onSource) {
+            options.onSource(dependencies.describeNativeSource
+                ? await dependencies.describeNativeSource(path)
+                : { name: basenameOf(path) })
+        }
         let result: NativeFileJobResult
         try {
             result = await dependencies.runNativeImport(
@@ -381,7 +427,8 @@ export async function importRisuSaveFromPicker(
         }
         catch (error) {
             if (isNativeCompatibilityFallback(error)) {
-                return importWithWebCodec(runtime, dependencies)
+                announceWebReselect(options)
+                return importWithWebCodec(runtime, options, dependencies)
             }
             throw error
         }
@@ -392,7 +439,7 @@ export async function importRisuSaveFromPicker(
         }
     }
 
-    return importWithWebCodec(runtime, dependencies)
+    return importWithWebCodec(runtime, options, dependencies)
 }
 
 export async function exportRisuSaveFromPicker(

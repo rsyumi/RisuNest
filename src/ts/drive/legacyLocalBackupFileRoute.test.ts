@@ -81,6 +81,20 @@ describe('legacy local backup native file route', () => {
         expect(JSON.stringify(vi.mocked(deps.runExport).mock.calls)).not.toContain('Uint8Array')
     })
 
+    it('hands the source callback to the picker without forwarding it to the native job', async () => {
+        const deps = dependencies()
+        const onSource = vi.fn()
+        vi.mocked(deps.chooseImport).mockImplementationOnce(async (options) => {
+            options.onSource?.({ name: 'backup.bin', bytes: 4096 })
+            return { type: 'desktopPath' as const, path: 'C:\\chosen\\backup.bin' }
+        })
+
+        await importLegacyLocalBackupFromPicker({ onSource }, deps)
+
+        expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: 'backup.bin', bytes: 4096 })
+        expect(vi.mocked(deps.runImport).mock.calls[0][2]).not.toHaveProperty('onSource')
+    })
+
     it('does not start a job when the system picker is cancelled', async () => {
         const deps = dependencies()
         vi.mocked(deps.chooseImport).mockResolvedValueOnce(null)

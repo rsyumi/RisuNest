@@ -278,7 +278,8 @@ describe('Android SAF bridge', () => {
             }
         }))
 
-        const source = await pickAndroidLegacyBackupSource({}, {
+        const onSource = vi.fn()
+        const source = await pickAndroidLegacyBackupSource({ onSource }, {
             createRequestId: () => 'source-picker-1',
             bridge: { copyExport: vi.fn(), pickLegacyBackupSource },
             addEventListener: (_name, listener) => listeners.add(listener),
@@ -289,6 +290,7 @@ describe('Android SAF bridge', () => {
             type: 'androidSpool',
             token: '11111111-1111-4111-8111-111111111111',
         })
+        expect(onSource).toHaveBeenCalledExactlyOnceWith({ displayName: 'backup.bin', bytes: 4_294_967_296 })
         expect(pickLegacyBackupSource).toHaveBeenCalledExactlyOnceWith('source-picker-1')
         expect(JSON.stringify(source)).not.toContain('Uint8Array')
         expect(listeners.size).toBe(0)

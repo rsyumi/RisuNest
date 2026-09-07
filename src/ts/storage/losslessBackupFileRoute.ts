@@ -1,4 +1,5 @@
 import type { PersistentDataRuntime } from './persistentDataRuntime.svelte'
+import type { NativeFileOperationSource } from './nativeFileJobManager'
 import type {
     NativeFileJobOptions,
     NativeFileJobResult,
@@ -17,10 +18,17 @@ type LosslessBackupRuntime = Pick<
 
 export type LosslessBackupPlatform = 'native-desktop' | 'native-android' | 'web'
 
+export interface LosslessBackupRestoreOptions extends NativeFileRestoreJobOptions {
+    /** Receives the picked file's name and size for the progress dialog. */
+    onSource?(source: NativeFileOperationSource): void
+}
+
 export interface LosslessBackupFileRouteDependencies {
     platform(): LosslessBackupPlatform
     runtime(): LosslessBackupRuntime
-    chooseNativeImport(options: Pick<NativeFileRestoreJobOptions, 'signal' | 'onStatus'>): Promise<NativeFileJobSource | null>
+    chooseNativeImport(
+        options: Pick<LosslessBackupRestoreOptions, 'signal' | 'onStatus' | 'onSource'>,
+    ): Promise<NativeFileJobSource | null>
     chooseDesktopExport(defaultName: string): Promise<string | null>
     runNativeRestore(
         runtime: LosslessBackupRuntime,
@@ -81,7 +89,7 @@ export async function exportLocalBackupFromPicker(
 }
 
 export async function restoreLocalBackupFromPicker(
-    options: NativeFileRestoreJobOptions,
+    options: LosslessBackupRestoreOptions,
     dependencies: LosslessBackupFileRouteDependencies,
 ): Promise<LosslessBackupFileRouteResult | null> {
     const platform = dependencies.platform()
@@ -93,11 +101,12 @@ export async function restoreLocalBackupFromPicker(
     const source = await dependencies.chooseNativeImport(options)
     if (!source) return null
 
+    const { onSource: _onSource, ...jobOptions } = options
     const result = await dependencies.runNativeRestore(
         dependencies.runtime(),
         source,
         {
-            ...options,
+            ...jobOptions,
             afterRefresh: dependencies.reloadPluginsAfterRestore,
         },
     )

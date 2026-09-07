@@ -157,6 +157,8 @@ export interface AndroidSafJavascriptBridge {
 export interface AndroidSafSourcePickerOptions {
     signal?: AbortSignal
     onProgress?(progress: AndroidSafProgress): void
+    /** Reports the picked file's name and size before the spool token is returned. */
+    onSource?(source: { displayName: string; bytes: number }): void
 }
 
 export interface AndroidSafSourcePickerDependencies {
@@ -297,6 +299,7 @@ function pickAndroidSpoolSource(
                 )))
                 return
             }
+            options.onSource?.({ displayName: source.displayName, bytes: source.bytes })
             finish(() => resolve({ type: 'androidSpool', token: source.token }))
         }
         const onProgress = (event: Event) => {

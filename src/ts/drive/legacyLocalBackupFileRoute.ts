@@ -8,15 +8,21 @@ import type {
     NativeFileJobOptions,
     NativeFileRestoreJobOptions,
 } from '../storage/nativeFileJobs'
+import type { NativeFileOperationSource } from '../storage/nativeFileJobManager'
 
 interface LegacyLocalBackupExportRuntime {
     readonly revision: number
     flushPendingData(reason: string): Promise<void>
 }
 
+export interface LegacyLocalBackupImportOptions extends NativeFileRestoreJobOptions {
+    /** Receives the picked file's name and size for the progress dialog. */
+    onSource?(source: NativeFileOperationSource): void
+}
+
 export interface LegacyLocalBackupFileRouteDependencies {
     runtime(): NativeBlockRestoreRuntime & LegacyLocalBackupExportRuntime
-    chooseImport(options: NativeFileRestoreJobOptions): Promise<NativeFileJobSource | null>
+    chooseImport(options: LegacyLocalBackupImportOptions): Promise<NativeFileJobSource | null>
     chooseExport(options: NativeFileJobOptions): Promise<NativeLegacyLocalBackupDestination | null>
     runImport(
         runtime: NativeBlockRestoreRuntime,
@@ -32,15 +38,16 @@ export interface LegacyLocalBackupFileRouteDependencies {
 }
 
 export async function importLegacyLocalBackupFromPicker(
-    options: NativeFileRestoreJobOptions,
+    options: LegacyLocalBackupImportOptions,
     dependencies: LegacyLocalBackupFileRouteDependencies,
 ): Promise<NativeFileJobResult | null> {
     const source = await dependencies.chooseImport(options)
     if (!source) return null
+    const { onSource: _onSource, ...jobOptions } = options
     return dependencies.runImport(
         dependencies.runtime(),
         source,
-        { ...options, afterRefresh: dependencies.reloadPluginsAfterRestore },
+        { ...jobOptions, afterRefresh: dependencies.reloadPluginsAfterRestore },
     )
 }
 

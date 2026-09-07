@@ -231,6 +231,39 @@ export function resolveNativeFileJobStage(
     }
 }
 
+/**
+ * Builds a status for work that happens outside the native job (renderer
+ * refresh, plugin reload, WebView imports). It reuses the last native status
+ * when there is one so counts and progress carry over into the new stage.
+ */
+export function syntheticNativeFileJobStatus(
+    base: Pick<NativeFileJobStatus, 'kind'> & Partial<NativeFileJobStatus>,
+    stage: NativeFileJobStage,
+    patch: Partial<Omit<NativeFileJobDetail, 'stage' | 'counts'>> & {
+        counts?: Partial<NativeImportCounts>
+        progress?: Partial<NativeFileJobStatus['progress']>
+        currentItem?: string
+    } = {},
+): NativeFileJobStatus {
+    const { counts, progress, ...detailPatch } = patch
+    return {
+        jobId: base.jobId ?? `synthetic-${base.kind}`,
+        kind: base.kind,
+        state: base.state ?? 'running',
+        phase: base.phase ?? 'reading-source',
+        progress: { ...(base.progress ?? { completedBytes: 0, completedItems: 0 }), ...progress },
+        ...(base.warningCodes ? { warningCodes: base.warningCodes } : {}),
+        ...(base.result ? { result: base.result } : {}),
+        detail: {
+            stageCompleted: 0,
+            stageUnit: 'items',
+            ...detailPatch,
+            stage,
+            counts: { ...(base.detail?.counts ?? emptyNativeImportCounts()), ...counts },
+        },
+    }
+}
+
 export function emptyNativeImportCounts(): NativeImportCounts {
     return {
         entriesRead: 0,
@@ -913,7 +946,9 @@ async function runNativeReplacementRestore(
                 )
             }
             try {
+                options.onStatus?.(syntheticNativeFileJobStatus(terminal, 'refreshing-app'))
                 await replacementFence.refreshCommittedWorkingSet(terminal.result.revision)
+                options.onStatus?.(syntheticNativeFileJobStatus(terminal, 'reloading-plugins'))
                 await options.afterRefresh?.()
             }
             catch (error) {

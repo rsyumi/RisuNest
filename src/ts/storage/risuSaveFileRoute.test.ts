@@ -31,6 +31,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         chooseNativeExport: vi.fn(async () => 'C:\\chosen\\destination.risudat'),
         chooseWebImport: vi.fn(async () => [{
             name: 'source.risudat',
+            size: 3,
             arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
         }]),
         runNativeImport: vi.fn(async (_runtime, _source, options) => {
@@ -660,12 +661,56 @@ describe('RisuSave picker route', () => {
         vi.mocked(deps.runNativeImport).mockRejectedValueOnce(
             new NativeFileJobError('unsupported-format', 'not a block save'),
         )
+        const stages: string[] = []
+        const onSource = vi.fn()
 
-        const result = await importRisuSaveFromPicker({}, deps)
+        const result = await importRisuSaveFromPicker({
+            onStatus: (status) => stages.push(status.detail?.stage ?? status.phase),
+            onSource,
+        }, deps)
 
         expect(result?.mode).toBe('web')
         expect(deps.chooseWebImport).toHaveBeenCalledOnce()
         expect(deps.decodeRisuSave).toHaveBeenCalledWith(Uint8Array.from([1, 2, 3]))
+        expect(stages).toEqual([
+            'awaiting-reselect', 'reading-database', 'decoding-database', 'activating', 'reloading-plugins',
+        ])
+        expect(onSource).toHaveBeenNthCalledWith(1, { name: 'source.risudat' })
+        expect(onSource).toHaveBeenNthCalledWith(2, { name: 'source.risudat', bytes: 3 })
+    })
+
+    it('reports the picked desktop file through the source describer when one is configured', async () => {
+        const deps = dependencies('native-desktop')
+        deps.describeNativeSource = vi.fn(async (path) => ({ name: `described:${path}`, bytes: 42 }))
+        const onSource = vi.fn()
+
+        await importRisuSaveFromPicker({ onSource }, deps)
+
+        expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: 'described:C:\\chosen\\source.risudat', bytes: 42 })
+    })
+
+    it('walks the web import through reading, decoding, activation, and plugin reload stages', async () => {
+        const deps = dependencies('web')
+        const statuses: Array<{ stage?: string; completed: number; total?: number }> = []
+        const onSource = vi.fn()
+
+        const result = await importRisuSaveFromPicker({
+            onStatus: (status) => statuses.push({
+                stage: status.detail?.stage,
+                completed: status.progress.completedBytes,
+                total: status.progress.totalBytes,
+            }),
+            onSource,
+        }, deps)
+
+        expect(result).toEqual({ mode: 'web', warningCodes: [], bytes: 3 })
+        expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: 'source.risudat', bytes: 3 })
+        expect(statuses).toEqual([
+            { stage: 'reading-database', completed: 0, total: 3 },
+            { stage: 'decoding-database', completed: 3, total: 3 },
+            { stage: 'activating', completed: 3, total: 3 },
+            { stage: 'reloading-plugins', completed: 3, total: 3 },
+        ])
     })
 
     it('does not fall back for invalid block input', async () => {

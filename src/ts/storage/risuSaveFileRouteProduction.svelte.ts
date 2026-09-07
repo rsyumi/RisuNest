@@ -20,6 +20,7 @@ import {
     runNativeBlockRisuSaveExport,
     runNativeBlockRisuSaveRestore,
 } from './nativeFileJobs'
+import { describeDesktopSource } from './nativeFileSourceInfo'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { decodeRisuSave } from './risuSave'
 import {
@@ -67,24 +68,34 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
     acknowledgeAndroidExport: acknowledgeAndroidSafExport,
     reloadPlugins: loadPlugins,
     reloadPluginsAfterNativeRestore: loadPluginsAfterAuthoritativeRestore,
+    describeNativeSource: describeDesktopSource,
 }
 
 export { nativeFileOperation }
 
 export const importRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions = {}) =>
-    runSharedNativeFileOperation('import', 'risu-save-import', ({ signal, onStatus, setBlocking }) =>
-        importRisuSaveFromPicker({
-            ...options,
-            signal,
-            onStatus: (status) => {
-                onStatus(status)
-                options.onStatus?.(status)
-            },
-            onBlockingChange: (blocking) => {
-                setBlocking(blocking)
-                options.onBlockingChange?.(blocking)
-            },
-        }, productionDependencies))
+    runSharedNativeFileOperation(
+        'import',
+        'risu-save-import',
+        ({ signal, onStatus, setBlocking, setSource }) =>
+            importRisuSaveFromPicker({
+                ...options,
+                signal,
+                onStatus: (status) => {
+                    onStatus(status)
+                    options.onStatus?.(status)
+                },
+                onBlockingChange: (blocking) => {
+                    setBlocking(blocking)
+                    options.onBlockingChange?.(blocking)
+                },
+                onSource: (source) => {
+                    setSource(source)
+                    options.onSource?.(source)
+                },
+            }, productionDependencies),
+        { presentation: 'dialog', format: 'risu-save' },
+    )
 
 export const exportRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions = {}) =>
     runSharedNativeFileOperation('export', 'risu-save-export', ({ signal, onStatus }) =>
