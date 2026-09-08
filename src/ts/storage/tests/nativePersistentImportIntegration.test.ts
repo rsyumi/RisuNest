@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { Database } from '../database.svelte'
 import type { PersistentRoot } from '../persistentDataStore'
+import { canonicalJson } from '../saveCoordinator'
 
 type StagedDatabase = {
     root: PersistentRoot | null
@@ -154,7 +155,17 @@ describe('native persistent local backup integration', () => {
             ? structuredClone(database)
             : structuredClone(preparedDefault)
         const store = createPersistentDataStore()
-        const result = await bootstrapPersistentDatabase({ store, prepareDatabase })
+        const prepareBootstrap = async (input: Database) => {
+            const database = await prepareDatabase(input)
+            return {
+                database,
+                changed: canonicalJson(database) !== canonicalJson(input),
+            }
+        }
+        const result = await bootstrapPersistentDatabase({
+            store,
+            prepareDatabase: prepareBootstrap,
+        })
 
         expect(store).toBeInstanceOf(SqlitePersistentDataStore)
         expect(result.revision).toBe(1)
@@ -187,7 +198,10 @@ describe('native persistent local backup integration', () => {
         expect(events).toEqual(['publish', 'relaunch'])
 
         const reopened = new SqlitePersistentDataStore()
-        const reopenedResult = await bootstrapPersistentDatabase({ store: reopened, prepareDatabase })
+        const reopenedResult = await bootstrapPersistentDatabase({
+            store: reopened,
+            prepareDatabase: prepareBootstrap,
+        })
         expect(reopenedResult.database).toEqual(fixtureDatabase)
 
         const rejectedCandidate = structuredClone(fixtureDatabase)

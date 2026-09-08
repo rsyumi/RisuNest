@@ -63,7 +63,10 @@ vi.mock('./storage/nativeFileJobs', () => ({
     NativeFileJobError: class extends Error {}, runNativeOfficialAccountSnapshotRestore: vi.fn(),
 }))
 vi.mock('./storage/androidRisuSaveRouteProduction.svelte', () => ({ registerAndroidRisuSaveRoute: vi.fn() }))
-vi.mock('src/lang', () => ({ language: {} }))
+vi.mock('src/lang', async () => ({
+    language: (await import('../lang/en')).languageEnglish,
+    changeLanguage: vi.fn(),
+}))
 vi.mock('./platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriDesktop: false }))
 vi.mock('./storage/deviceSettings', () => ({ getDeviceSettings: () => startup.settings }))
 vi.mock('./storage/sync/deviceSyncProduction', () => ({
@@ -97,6 +100,7 @@ vi.mock('./storage/persistentBootstrap', () => ({
 }))
 vi.mock('./storage/database.svelte', () => ({ setDatabase: vi.fn(), getDatabase: vi.fn(() => ({})) }))
 vi.mock('./storage/databasePreparation', () => ({
+    prepareDatabaseForBootstrap: vi.fn(),
     checkNewFormat: vi.fn(), prepareDatabaseForPersistence: vi.fn(), preparePersistentRootForWorkingSet: vi.fn(),
     assignIds: vi.fn(),
 }))
@@ -207,5 +211,7 @@ describe('device sync bootstrap wiring', () => {
             message: startup.stopAfterAutoListen.message,
             stage: 'device-sync',
         })
+        const { LoadingStatusState } = await import('./stores.svelte')
+        expect(LoadingStatusState.startedAt).toBeNull()
     })
 })

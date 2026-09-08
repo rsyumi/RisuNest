@@ -1757,6 +1757,18 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        startup: {
+            storage: 'Opening storage',
+            data: 'Preparing chat data',
+            compatibility: 'Preparing plugin compatibility data',
+            plugins: 'Preparing plugins',
+            sync: 'Preparing device sync',
+            account: 'Preparing account sync',
+            update: 'Checking for updates',
+            serviceWorker: 'Preparing offline support',
+            ui: 'Preparing the interface',
+            elapsed: (seconds: number) => `${seconds}s elapsed`,
+        },
         menuTitle: 'RisuNest',
         perf: { title: 'Performance', profile: 'Performance profile', profileNormal: 'Standard', profileLowSpec: 'Low-spec', profileHelp: 'Reduces memory usage on low-end devices. Smaller caches may make scrolling long chats slightly slower. Applies immediately.' },
         inlay: { title: 'Chat image attachments', format: 'Storage format', formatWebp: 'WebP (recommended)', formatPng: 'PNG (lossless)', formatOriginal: 'Keep original', formatHelp: 'Format used when saving images attached to chats. WebP is smaller; Keep original stores the file as-is.', quality: 'WebP quality', qualityHelp: 'Lower values save space but reduce image quality.', maxDimension: 'Maximum resolution (px, 0 = no limit)', maxDimensionHelp: 'Images larger than this on their long side are scaled down when saved. 0 means no limit.', skipReencode: "Don't re-convert images that are already WebP", skipReencodeHelp: 'Prevents gradual quality loss from repeated conversion.', unsupportedAnimated: "GIF and animated images can't be attached yet." },

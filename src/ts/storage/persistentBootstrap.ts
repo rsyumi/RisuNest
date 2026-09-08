@@ -3,6 +3,7 @@ import {
     type PluginCompatibilityProfile,
 } from '../plugins/pluginCompatibility'
 import type { Database, botPreset } from './database.svelte'
+import type { PreparedBootstrapDatabase } from './databasePreparation'
 import {
     RevisionConflictError,
     type CharacterSummary,
@@ -24,7 +25,11 @@ const NEW_DATABASE_SEED: Partial<Database> = {
 
 export interface PersistentBootstrapDependencies {
     store: PersistentDataStore
-    prepareDatabase(database: Database): Promise<Database>
+    onPhase?(
+        phase: 'storage' | 'data' | 'compatibility',
+        language?: string,
+    ): void | Promise<void>
+    prepareDatabase(database: Database): Promise<PreparedBootstrapDatabase>
     prepareRoot?(root: PersistentRoot): Promise<PersistentRoot>
     projectScalableWorkingSet?(input: ScalableBootstrapProjection): Database
     now?(): number
@@ -53,11 +58,13 @@ export interface PersistentBootstrapResult {
 export async function bootstrapPersistentDatabase(
     dependencies: PersistentBootstrapDependencies,
 ): Promise<PersistentBootstrapResult> {
+    await dependencies.onPhase?.('storage')
     await dependencies.store.open()
     const active = await dependencies.store.readRoot()
+    await dependencies.onPhase?.('data', active.value.language)
 
     if (active.revision === 0) {
-        const database = await dependencies.prepareDatabase({ ...NEW_DATABASE_SEED } as Database)
+        const { database } = await dependencies.prepareDatabase({ ...NEW_DATABASE_SEED } as Database)
         const { revision } = await dependencies.store.replaceFromDatabase(database, 0)
         const profile = selectPluginCompatibilityProfile(database.plugins ?? [])
         if (profile === 'scalable-v3' && dependencies.projectScalableWorkingSet) {
@@ -94,9 +101,10 @@ export async function bootstrapPersistentDatabase(
         !dependencies.prepareRoot ||
         !dependencies.projectScalableWorkingSet
     ) {
+        await dependencies.onPhase?.('compatibility', active.value.language)
         const persistent = await dependencies.store.materializeDatabase(active.revision)
-        const database = await dependencies.prepareDatabase(persistent)
-        if (canonicalJson(database) === canonicalJson(persistent)) {
+        const { database, changed } = await dependencies.prepareDatabase(persistent)
+        if (!changed) {
             return { database, revision: active.revision, profile }
         }
         const { revision } = await dependencies.store.replaceFromDatabase(

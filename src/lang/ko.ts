@@ -1570,6 +1570,18 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        startup: {
+            storage: '저장소 여는 중',
+            data: '대화 데이터 준비 중',
+            compatibility: '플러그인 호환 데이터 준비 중',
+            plugins: '플러그인 준비 중',
+            sync: '기기 동기화 준비 중',
+            account: '계정 동기화 준비 중',
+            update: '업데이트 확인 중',
+            serviceWorker: '오프라인 기능 준비 중',
+            ui: '화면 준비 중',
+            elapsed: (seconds: number) => `${seconds}초 경과`,
+        },
         menuTitle: 'RisuNest',
         perf: { title: '성능', profile: '성능 프로파일', profileNormal: '표준', profileLowSpec: '저사양', profileHelp: '저사양 기기에서 메모리 사용량을 줄입니다. 캐시가 줄어 긴 대화에서 스크롤이 약간 느려질 수 있습니다. 즉시 적용됩니다.' },
         inlay: { title: '채팅 첨부 이미지', format: '저장 형식', formatWebp: 'WebP (권장)', formatPng: 'PNG (무손실)', formatOriginal: '원본 유지', formatHelp: '채팅에 첨부한 이미지를 저장할 때 사용할 형식입니다. WebP는 용량이 작고, 원본 유지는 변환 없이 그대로 저장합니다.', quality: 'WebP 품질', qualityHelp: '낮출수록 용량이 줄지만 화질이 떨어집니다.', maxDimension: '최대 해상도 (픽셀, 0이면 제한 없음)', maxDimensionHelp: '긴 변이 이 값을 넘는 이미지는 저장할 때 축소됩니다. 0이면 제한하지 않습니다.', skipReencode: '이미 WebP인 이미지는 다시 변환하지 않기', skipReencodeHelp: '변환을 반복하며 화질이 조금씩 나빠지는 것을 막습니다.', unsupportedAnimated: 'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.' },

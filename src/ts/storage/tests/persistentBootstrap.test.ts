@@ -10,6 +10,7 @@ import {
     isCatalogCharacterStub,
     projectCatalogWorkingSet,
 } from '../workingSetCatalog'
+import { canonicalJson } from '../saveCoordinator'
 import { fixtureDatabase } from './persistentDataFixtures'
 
 const scheduling = vi.hoisted(() => ({
@@ -19,6 +20,13 @@ const scheduling = vi.hoisted(() => ({
 vi.mock('../../ui/yieldToUi', () => ({
     yieldToMainThread: scheduling.yieldToMainThread,
 }))
+
+function preparedResult(input: Database, output: Database) {
+    return {
+        database: structuredClone(output),
+        changed: canonicalJson(input) !== canonicalJson(output),
+    }
+}
 
 function plugin(version: '2.1', enabled: boolean): Database['plugins'][number] {
     return { enabled, version } as Database['plugins'][number]
@@ -89,7 +97,9 @@ describe('bootstrapPersistentDatabase', () => {
     it('starts a blank store from one prepared empty database', async () => {
         const store = createStore({ revision: 0, replacementRevision: 1 })
         const prepared = structuredClone(fixtureDatabase)
-        const prepareDatabase = vi.fn(async () => structuredClone(prepared))
+        const prepareDatabase = vi.fn(async (input) =>
+            preparedResult(input, prepared),
+        )
 
         const result = await bootstrapPersistentDatabase({ store, prepareDatabase })
 
@@ -111,7 +121,8 @@ describe('bootstrapPersistentDatabase', () => {
 
         const result = await bootstrapPersistentDatabase({
             store,
-            prepareDatabase: async (database) => structuredClone(database),
+            prepareDatabase: async (database) =>
+                preparedResult(database, database),
         })
 
         expect(store.materializeDatabase).toHaveBeenCalledWith(7)
@@ -123,6 +134,38 @@ describe('bootstrapPersistentDatabase', () => {
         })
     })
 
+    it('awaits visible storage and compatibility phases before their expensive work', async () => {
+        const persistent = structuredClone(fixtureDatabase)
+        persistent.plugins = [plugin('2.1', true)]
+        persistent.language = 'ko'
+        const store = createStore({ revision: 7, database: persistent })
+        const events: string[] = []
+        vi.mocked(store.open).mockImplementation(async () => {
+            events.push('open')
+        })
+        vi.mocked(store.materializeDatabase).mockImplementation(async () => {
+            events.push('materialize')
+            return persistent
+        })
+        await bootstrapPersistentDatabase({
+            store,
+            onPhase: async (phase, locale) => {
+                await Promise.resolve()
+                if (phase !== 'storage') expect(locale).toBe('ko')
+                events.push(phase)
+            },
+            prepareDatabase: async (database) =>
+                preparedResult(database, database),
+        })
+        expect(events).toEqual([
+            'storage',
+            'open',
+            'data',
+            'compatibility',
+            'materialize',
+        ])
+    })
+
     it('stores exactly one preparation change to persistent data', async () => {
         const persistent = structuredClone(fixtureDatabase)
         persistent.plugins = [plugin('2.1', true)]
@@ -132,7 +175,8 @@ describe('bootstrapPersistentDatabase', () => {
 
         const result = await bootstrapPersistentDatabase({
             store,
-            prepareDatabase: async () => structuredClone(changed),
+            prepareDatabase: async (database) =>
+                preparedResult(database, changed),
         })
 
         expect(store.replaceFromDatabase).toHaveBeenCalledTimes(1)
@@ -239,7 +283,8 @@ describe('bootstrapPersistentDatabase', () => {
 
         await bootstrapPersistentDatabase({
             store,
-            prepareDatabase: async (database) => structuredClone(database),
+            prepareDatabase: async (database) =>
+                preparedResult(database, database),
             prepareRoot: async (root) => structuredClone(root),
             projectScalableWorkingSet: () => structuredClone(fixtureDatabase),
         })
@@ -269,7 +314,8 @@ describe('bootstrapPersistentDatabase', () => {
         await expect(
             bootstrapPersistentDatabase({
                 store,
-                prepareDatabase: async (database) => structuredClone(database),
+                prepareDatabase: async (database) =>
+                    preparedResult(database, database),
                 prepareRoot: async (root) => structuredClone(root),
                 projectScalableWorkingSet: () =>
                     structuredClone(fixtureDatabase),
@@ -327,7 +373,8 @@ describe('bootstrapPersistentDatabase', () => {
         const result = await bootstrapPersistentDatabase({
             store,
             now: () => 500,
-            prepareDatabase: async () => structuredClone(prepared),
+            prepareDatabase: async (database) =>
+                preparedResult(database, prepared),
             projectScalableWorkingSet: (input) => projectCatalogWorkingSet(
                 input.root,
                 input.characters,
@@ -409,13 +456,15 @@ describe('bootstrapPersistentDatabase', () => {
         await store.open()
         await rival.open()
 
-        await expect(bootstrapPersistentDatabase({
-            store,
-            prepareDatabase: async () => {
-                await rival.replaceFromDatabase(structuredClone(fixtureDatabase))
-                return structuredClone(fixtureDatabase)
-            },
-        })).rejects.toBeInstanceOf(RevisionConflictError)
+        await expect(
+            bootstrapPersistentDatabase({
+                store,
+                prepareDatabase: async (database) => {
+                    await rival.replaceFromDatabase(structuredClone(fixtureDatabase))
+                    return preparedResult(database, fixtureDatabase)
+                },
+            }),
+        ).rejects.toBeInstanceOf(RevisionConflictError)
     })
 
     it('reports a conflict when another connection writes during normalization', async () => {
@@ -429,14 +478,16 @@ describe('bootstrapPersistentDatabase', () => {
         persistent.plugins = [plugin('2.1', true)]
         await store.replaceFromDatabase(persistent)
 
-        await expect(bootstrapPersistentDatabase({
-            store,
-            prepareDatabase: async (database) => {
-                const normalized = structuredClone(database)
-                normalized.username = 'Normalized user'
-                await rival.replaceFromDatabase(structuredClone(persistent))
-                return normalized
-            },
-        })).rejects.toBeInstanceOf(RevisionConflictError)
+        await expect(
+            bootstrapPersistentDatabase({
+                store,
+                prepareDatabase: async (database) => {
+                    const normalized = structuredClone(database)
+                    normalized.username = 'Normalized user'
+                    await rival.replaceFromDatabase(structuredClone(persistent))
+                    return preparedResult(database, normalized)
+                },
+            }),
+        ).rejects.toBeInstanceOf(RevisionConflictError)
     })
 })
