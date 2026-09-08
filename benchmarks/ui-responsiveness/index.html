@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>RisuNest synthetic UI responsiveness benchmark</title>
+        <script>
+            ;(() => {
+                const startedAt = performance.now()
+                const frameTimes = [startedAt]
+                const longTasks = []
+                const frame = (time) => {
+                    frameTimes.push(time)
+                    requestAnimationFrame(frame)
+                }
+                requestAnimationFrame(frame)
+                try {
+                    new PerformanceObserver((list) => {
+                        for (const entry of list.getEntries()) {
+                            longTasks.push({
+                                startTime: entry.startTime,
+                                duration: entry.duration,
+                            })
+                        }
+                    }).observe({ type: 'longtask', buffered: true })
+                } catch {}
+                window.__risuUiBenchmarkClock = {
+                    startedAt,
+                    frameTimes,
+                    longTasks,
+                }
+                window.addEventListener('error', (event) => {
+                    window.__risuUiBenchmarkLoadError = String(
+                        event.message || 'window-error',
+                    ).split('\n', 1)[0]
+                })
+                window.addEventListener('unhandledrejection', (event) => {
+                    const reason =
+                        event.reason instanceof Error
+                            ? event.reason.message
+                            : 'promise-rejection'
+                    window.__risuUiBenchmarkLoadError = String(reason).split(
+                        '\n',
+                        1,
+                    )[0]
+                })
+            })()
+        </script>
+    </head>
+    <body>
+        <div id="app"></div>
+        <script
+            type="module"
+            src="/benchmarks/ui-responsiveness/main.ts"
+        ></script>
+    </body>
+</html>
