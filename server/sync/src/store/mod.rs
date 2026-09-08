@@ -1,0 +1,223 @@
+mod commits;
+mod journal;
+mod objects;
+mod schema;
+pub use journal::{ChangeCursor, ChangePage, JournalChange};
+
+use crate::{Error, Result};
+use risunest_sync_wire::{canonical, hash, validate_id, RemoteHead, Sequence};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
+};
+
+pub struct Store {
+    root: PathBuf,
+    db: Mutex<Connection>,
+    _owner: File,
+}
+
+/// Tokens are emitted once by the administration CLI, never by a sync route.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCredential {
+    pub device_id: String,
+    pub library_id: String,
+    pub token: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub id: String,
+}
+
+pub(super) fn random_id() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|_| Error::new("entropy-unavailable", 503))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+pub(super) fn json<T: Serialize>(value: &T) -> Result<String> {
+    Ok(String::from_utf8(canonical::encode(value)?).unwrap())
+}
+pub(super) fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
+    canonical::decode(value.as_bytes(), risunest_sync_wire::MAX_METADATA_BYTES)
+        .map_err(|_| Error::new("corrupt-metadata", 503))
+}
+
+impl Store {
+    pub fn init(root: &Path) -> Result<Self> {
+        Self::open_inner(root, true)
+    }
+    pub fn open(root: &Path) -> Result<Self> {
+        Self::open_inner(root, false)
+    }
+    fn open_inner(root: &Path, create: bool) -> Result<Self> {
+        if !root.is_absolute() {
+            return Err(Error::new("absolute-data-dir-required", 400));
+        }
+        objects::check_path(root)?;
+        if create {
+            fs::create_dir_all(root)?;
+        }
+        let root = fs::canonicalize(root)?;
+        for name in [
+            "owner.lock",
+            "metadata.sqlite",
+            "metadata.sqlite-wal",
+            "metadata.sqlite-shm",
+            "objects",
+            "staging",
+        ] {
+            objects::check_path(&root.join(name))?;
+        }
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("owner.lock"))?;
+        owner
+            .try_lock()
+            .map_err(|_| Error::new("data-dir-busy", 409))?;
+        let db_path = root.join("metadata.sqlite");
+        if create && db_path.exists() {
+            return Err(Error::new("already-initialized", 409));
+        }
+        if !create && !db_path.is_file() {
+            return Err(Error::new("not-initialized", 404));
+        }
+        let mut db = Connection::open(db_path)?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        if create {
+            for name in ["objects", "staging"] {
+                fs::create_dir_all(root.join(name))?;
+            }
+            let tx = db.transaction()?;
+            tx.execute_batch(schema::SCHEMA)?;
+            let library_id = random_id()?;
+            let epoch = random_id()?;
+            let head_id = hash(&canonical::encode(&[
+                "risunest-sync-genesis-v1",
+                &library_id,
+                &epoch,
+            ])?);
+            let head = RemoteHead {
+                library_id,
+                epoch,
+                seq: 0.into(),
+                head_id,
+                min_retained_seq: 0.into(),
+            };
+            tx.execute("INSERT INTO library VALUES(1,?1)", [json(&head)?])?;
+            tx.commit()?;
+            objects::sync_directory(&root)?;
+        } else {
+            let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version != 1 {
+                return Err(Error::new("incompatible-store", 409));
+            }
+        }
+        let store = Self {
+            root,
+            db: Mutex::new(db),
+            _owner: owner,
+        };
+        store
+            .head()?
+            .validate()
+            .map_err(|_| Error::new("corrupt-metadata", 503))?;
+        Ok(store)
+    }
+    pub(super) fn db(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.db
+            .lock()
+            .map_err(|_| Error::new("writer-unavailable", 503))
+    }
+    pub fn head(&self) -> Result<RemoteHead> {
+        Self::read_head(&*self.db()?)
+    }
+    pub(super) fn read_head(db: &Connection) -> Result<RemoteHead> {
+        parse(&db.query_row::<String, _, _>(
+            "SELECT head FROM library WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn add_device(&self) -> Result<DeviceCredential> {
+        let token = random_id()?;
+        let device_id = random_id()?;
+        let db = self.db()?;
+        let library_id = Self::read_head(&db)?.library_id;
+        db.execute(
+            "INSERT INTO devices(id,verifier) VALUES(?1,?2)",
+            params![device_id, hash(token.as_bytes())],
+        )?;
+        Ok(DeviceCredential {
+            device_id,
+            library_id,
+            token,
+        })
+    }
+    pub fn revoke_device(&self, id: &str) -> Result<()> {
+        validate_id(id)?;
+        if self
+            .db()?
+            .execute("UPDATE devices SET revoked=1 WHERE id=?1", [id])?
+            == 0
+        {
+            return Err(Error::new("device-not-found", 404));
+        }
+        Ok(())
+    }
+    pub fn authenticate(&self, library: &str, token: &str) -> Result<Device> {
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::new("unauthorized", 401));
+        }
+        let db = self.db()?;
+        if Self::read_head(&db)?.library_id != library {
+            return Err(Error::new("unauthorized", 401));
+        }
+        let id = db
+            .query_row(
+                "SELECT id FROM devices WHERE verifier=?1 AND revoked=0",
+                [hash(token.as_bytes())],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|id| Device { id })
+            .ok_or(Error::new("unauthorized", 401))
+    }
+    pub(super) fn require_device(db: &Connection, device: &Device) -> Result<()> {
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND revoked=0)",
+            [&device.id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::new("unauthorized", 401));
+        }
+        Ok(())
+    }
+    pub fn acknowledge(&self, device: &Device, epoch: &str, seq: &Sequence) -> Result<()> {
+        let db = self.db()?;
+        Self::require_device(&db, device)?;
+        let head = Self::read_head(&db)?;
+        let old: String =
+            db.query_row("SELECT ack FROM devices WHERE id=?1", [&device.id], |r| {
+                r.get(0)
+            })?;
+        let old: Sequence = old.try_into()?;
+        if head.epoch != epoch || seq > &head.seq || seq < &old {
+            return Err(Error::new("invalid-ack", 409));
+        }
+        db.execute(
+            "UPDATE devices SET ack=?1 WHERE id=?2",
+            params![seq.as_str(), device.id],
+        )?;
+        Ok(())
+    }
+}

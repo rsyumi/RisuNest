@@ -1,0 +1,24 @@
+[
+  {
+    "input": {
+      "z": "",
+      "a": "line\n\t\u0000\"\\",
+      "seq": "9007199254740993",
+      "nested": { "b": null, "a": true }
+    },
+    "canonical": "{\"a\":\"line\\n\\t\\u0000\\\"\\\\\",\"nested\":{\"a\":true,\"b\":null},\"seq\":\"9007199254740993\",\"z\":\"\"}"
+  },
+  {
+    "input": {
+      "\ue000": "BMP",
+      "😀": "supplementary",
+      "é": "composed",
+      "é": "decomposed"
+    },
+    "canonical": "{\"é\":\"decomposed\",\"é\":\"composed\",\"😀\":\"supplementary\",\"\":\"BMP\"}"
+  },
+  {
+    "input": [null, false, true, "/", " ", " ", []],
+    "canonical": "[null,false,true,\"/\",\" \",\" \",[]]"
+  }
+]
