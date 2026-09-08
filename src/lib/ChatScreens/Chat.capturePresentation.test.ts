@@ -313,6 +313,42 @@ describe('Chat frozen capture presentation', () => {
         document.body.replaceChildren()
     })
 
+    test.each(['cardboard', 'mobilechat', 'customHTML'])(
+        'renders a greeting without reading metadata-only history (%s)',
+        async (theme) => {
+            const harness = makeWindowedEditHarness()
+            live.db = {
+                ...live.db,
+                theme,
+                guiHTML: '<div><RISUTEXTBOX></RISUTEXTBOX></div>',
+                characters: [harness.metadataCharacter],
+                translator: '',
+                useChatCopy: false,
+                enableBookmark: false,
+                swipe: false,
+            }
+            mounted = mount(Chat, {
+                target,
+                props: {
+                    message: 'Synthetic greeting',
+                    name: 'Live Character',
+                    role: 'char',
+                    idx: -1,
+                    firstMessage: true,
+                    totalLength: 2,
+                    isLastMemory: false,
+                },
+            })
+            await vi.waitFor(() =>
+                expect(target.querySelector('[data-chat-body-probe]')?.textContent).toBe(
+                    'Synthetic greeting',
+                ),
+            )
+            expect(target.querySelector('[data-chat-id]')?.getAttribute('data-chat-id')).toBe('')
+            expect(harness.withCompleteSelectedConversation).not.toHaveBeenCalled()
+        },
+    )
+
     test('renders normal branch comment presentation from the frozen message', async () => {
         const message = {
             role: 'char' as const,

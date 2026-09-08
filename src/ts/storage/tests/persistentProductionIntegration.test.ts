@@ -206,6 +206,13 @@ describe('persistent production runtime', () => {
         })
         const replacement = structuredClone(adapter.current().characters[0])
         replacement.name = 'Locally published replacement'
+        // Metadata-only publication deliberately retains the live session.
+        // Replace message content to exercise the whole-conversation refresh contract.
+        replacement.chats[0].message.push({
+            role: 'user',
+            data: 'Locally published synthetic message',
+            chatId: 'published-message',
+        })
 
         await expect(access.setCurrentCharacter(replacement, {
             pluginName: 'official-failure-plugin',
@@ -214,6 +221,7 @@ describe('persistent production runtime', () => {
 
         const resident = adapter.current().characters[0]
         expect(resident.name).toBe('Locally published replacement')
+        expect(resident.chats[0].message).toEqual(replacement.chats[0].message)
         expect(runtime.revision).toBe(2)
         const refreshedSession = runtime.getActiveConversationSession()
         expect(refreshedSession).not.toBeNull()

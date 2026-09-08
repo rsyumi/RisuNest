@@ -2,21 +2,34 @@
     let {
         label,
         detail,
+        elapsedText,
         compact = false,
-    }: { label: string; detail?: string; compact?: boolean } = $props()
+    }: { label: string; detail?: string; elapsedText?: string; compact?: boolean } = $props()
 </script>
 
-<div class="loading-indicator" class:compact role="status" aria-live="polite">
-    <span class="loading-ring" aria-hidden="true"></span>
-    <span class="loading-copy">
-        <span>{label}</span>
-        {#if detail}
-            <span class="loading-detail">{detail}</span>
-        {/if}
-    </span>
+<div class="loading-progress">
+    <div class="loading-indicator" class:compact role="status" aria-live="polite">
+        <span class="loading-ring" aria-hidden="true"></span>
+        <span class="loading-copy">
+            <span>{label}</span>
+            {#if detail}
+                <span class="loading-detail">{detail}</span>
+            {/if}
+        </span>
+    </div>
+    {#if elapsedText}
+        <span class="loading-detail" aria-live="off">{elapsedText}</span>
+    {/if}
 </div>
 
 <style>
+    .loading-progress {
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.25rem;
+    }
+
     .loading-indicator {
         display: flex;
         flex-direction: column;

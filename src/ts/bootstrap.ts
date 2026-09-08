@@ -26,7 +26,7 @@ import { loadRisuAccountData } from "./drive/accounter";
 import { decodeRisuSave } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
-import { language } from "src/lang";
+import { changeLanguage, language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
 import { initMobileGesture } from "./hotkey";
@@ -58,6 +58,7 @@ import { appDataDir, join } from "@tauri-apps/api/path";
 import {
     checkNewFormat as migrateDatabaseFormat,
     prepareDatabaseForPersistence,
+    prepareDatabaseForBootstrap,
     preparePersistentRootForWorkingSet,
 } from "./storage/databasePreparation";
 import { bootstrapPersistentDatabase } from "./storage/persistentBootstrap";
@@ -207,6 +208,14 @@ export function classifyBootFailure(error: unknown, stage?: string): BootFailure
 export async function loadData() {
     if (get(loadedStore)) return
     let stage = 'startup'
+    LoadingStatusState.startedAt = performance.now()
+    bootFailure.set(null)
+    const transition = async (nextStage: string, text: string) => {
+        stage = nextStage
+        LoadingStatusState.text = text
+        await yieldToUi()
+    }
+    LoadingStatusState.text = language.risuNest.startup.storage
     try {
         const deviceSettings = getDeviceSettings()
         if (isTauri) {
@@ -218,8 +227,7 @@ export async function loadData() {
             }
         }
         if (isTauri) {
-            stage = 'app-data-directories'
-            LoadingStatusState.text = 'Checking Files...'
+            await transition('app-data-directories', language.risuNest.startup.storage)
             if (isTauriDesktop) appWindow.maximize()
             if (!await exists('', { baseDir: BaseDirectory.AppData })) {
                 await mkdir('', { baseDir: BaseDirectory.AppData })
@@ -232,7 +240,7 @@ export async function loadData() {
             await forageStorage.Init()
         }
 
-        stage = 'persistent-storage'
+        await transition('persistent-storage', language.risuNest.startup.storage)
         await initializePersistentStorage()
         stage = 'native-file-jobs'
         const recoveredNativeFileJobs = isTauri
@@ -252,7 +260,15 @@ export async function loadData() {
         const runtime = getPersistentDataRuntime()
         const resolvePersistentWorkingSet = () => bootstrapPersistentDatabase({
             store: runtime.store,
-            prepareDatabase: prepareDatabaseForPersistence,
+            onPhase: async (phase, locale) => {
+                if (locale) changeLanguage(locale)
+                await transition(
+                    phase === 'storage' ? 'persistent-storage' : phase === 'compatibility'
+                        ? 'plugin-compatibility-data' : 'persistent-database',
+                    language.risuNest.startup[phase],
+                )
+            },
+            prepareDatabase: prepareDatabaseForBootstrap,
             prepareRoot: preparePersistentRootForWorkingSet,
             projectScalableWorkingSet: (input) => projectCatalogWorkingSet(
                 input.root,
@@ -262,7 +278,7 @@ export async function loadData() {
         })
         stage = 'persistent-database'
         const local = await resolvePersistentWorkingSet()
-        stage = 'asset-repository'
+        await transition('asset-repository', language.risuNest.startup.data)
         const assetRepositoryRevision = await activateNativeAssetRepository()
         if (assetRepositoryRevision !== null) local.revision = assetRepositoryRevision
         const nativeAppKv = isTauri ? createNativeAppKv() : null
@@ -450,7 +466,7 @@ export async function loadData() {
             },
         })
         let officialReconcilePublish = false
-        stage = 'account-bootstrap'
+        await transition('account-bootstrap', language.risuNest.startup.account)
         const accountBootstrap = await initializeOfficialAccountBootstrap({
             isTauri,
             local,
@@ -577,7 +593,7 @@ export async function loadData() {
         }
         performance.mark('boot:account-ready')
         if (isTauri) {
-            stage = 'device-sync'
+            await transition('device-sync', language.risuNest.startup.sync)
             const deviceSyncController = getProductionDeviceSyncController()
             try {
                 await deviceSyncController.initialize()
@@ -601,18 +617,15 @@ export async function loadData() {
         })
 
         if (isTauriDesktop) {
-            stage = 'update-check'
-            LoadingStatusState.text = 'Checking Update...'
+            await transition('update-check', language.risuNest.startup.update)
             await checkRisuUpdate()
             await changeFullscreen()
         }
 
         if (!isTauri) {
-            stage = 'drive-sync'
-            LoadingStatusState.text = 'Checking Drive Sync...'
+            await transition('drive-sync', language.risuNest.startup.account)
             if (await checkDriverInit()) return
-            stage = 'service-worker'
-            LoadingStatusState.text = 'Checking Service Worker...'
+            await transition('service-worker', language.risuNest.startup.serviceWorker)
             if (navigator.serviceWorker) {
                 setUsingSw(true)
                 await registerSw()
@@ -622,9 +635,7 @@ export async function loadData() {
         }
         if (getDatabase().didFirstSetup) void characterURLImport()
 
-        stage = 'format-update'
-        LoadingStatusState.text = 'Checking For Format Update...'
-        await yieldToUi()
+        await transition('format-update', language.risuNest.startup.data)
         const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
         const coldStorageChanged = fullDatabaseResident ? await makeColdData() : false
         await publishOfficialRevisionIfChanged(
@@ -634,9 +645,7 @@ export async function loadData() {
         )
 
         performance.mark('boot:cold-storage-ready')
-        stage = 'plugins'
-        LoadingStatusState.text = 'Loading Plugins...'
-        await yieldToUi()
+        await transition('plugins', language.risuNest.startup.plugins)
         let pluginsLoaded = false
         try {
             await loadPlugins()
@@ -654,8 +663,7 @@ export async function loadData() {
         }
         performance.mark('boot:plugins-ready')
         if (!isTauri && getDatabase().account) {
-            stage = 'account-data'
-            LoadingStatusState.text = 'Checking Account Data...'
+            await transition('account-data', language.risuNest.startup.account)
             try {
                 await loadRisuAccountData()
             } catch (error) {
@@ -670,9 +678,7 @@ export async function loadData() {
         } catch {}
 
         const database = getDatabase()
-        stage = 'ui-state'
-        LoadingStatusState.text = 'Updating States...'
-        await yieldToUi()
+        await transition('ui-state', language.risuNest.startup.ui)
         updateColorScheme()
         updateTextThemeAndCSS()
         updateAnimationSpeed()
@@ -693,6 +699,7 @@ export async function loadData() {
             MobileGUI.set(true)
         }
         registerAndroidScreenshotPublicationRecovery()
+        LoadingStatusState.startedAt = null
         loadedStore.set(true)
         performance.mark('boot:interactive')
         selectedCharID.set(-1)
@@ -716,6 +723,8 @@ export async function loadData() {
         // else can still fail after the app turned interactive, where no panel
         // is shown, so those keep the modal.
         if (failure.kind === 'unknown') alertError(error)
+    } finally {
+        LoadingStatusState.startedAt = null
     }
 }
 

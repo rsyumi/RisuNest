@@ -222,11 +222,34 @@ export async function prepareDatabaseForPersistence(
     options: DatabasePreparationOptions = {},
 ): Promise<Database> {
     const database = JSON.parse(canonicalJson(input)) as Database
+    await prepareDetachedDatabase(database, options)
+    return database
+}
+
+export interface PreparedBootstrapDatabase {
+    database: Database
+    changed: boolean
+}
+
+/** Reuse the detached clone's canonical input, within this preparation only. */
+export async function prepareDatabaseForBootstrap(
+    input: Database,
+    options: DatabasePreparationOptions = {},
+): Promise<PreparedBootstrapDatabase> {
+    const before = canonicalJson(input)
+    const database = JSON.parse(before) as Database
+    await prepareDetachedDatabase(database, options)
+    return { database, changed: canonicalJson(database) !== before }
+}
+
+async function prepareDetachedDatabase(
+    database: Database,
+    options: DatabasePreparationOptions,
+): Promise<void> {
     normalizeDatabaseDefaults(database)
     await checkNewFormat(database, { now: options.now })
     assignIds(database, options.createId)
     checkCharOrder(database)
-    return database
 }
 
 export async function preparePersistentRootForWorkingSet(

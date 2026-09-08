@@ -121,6 +121,7 @@ export const DBState = $state({
 
 export const LoadingStatusState = $state({
     text: '',
+    startedAt: null as number | null,
 })
 
 export const QuickSettings = $state({

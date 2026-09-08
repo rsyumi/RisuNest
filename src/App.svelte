@@ -37,6 +37,18 @@
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
 
+    let startupElapsedSeconds = $state(0)
+    $effect(() => {
+        const startedAt = LoadingStatusState.startedAt
+        if ($loadedStore || $bootFailure || startedAt === null) return
+        const updateElapsed = () => {
+            startupElapsedSeconds = Math.max(0, Math.floor((performance.now() - startedAt) / 1000))
+        }
+        updateElapsed()
+        const timer = setInterval(updateElapsed, 1000)
+        return () => clearInterval(timer)
+    })
+
     let settingsPromise:
         Promise<typeof import('./lib/Setting/Settings.svelte')> | undefined
     let gridCharsPromise:
@@ -283,6 +295,7 @@
                 <LoadingIndicator
                     label={language.loading}
                     detail={LoadingStatusState.text}
+                    elapsedText={language.risuNest.startup.elapsed(startupElapsedSeconds)}
                 />
             </div>
         {/if}

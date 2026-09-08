@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 
+vi.mock('../saveCoordinator', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../saveCoordinator')>()
+    return { ...actual, canonicalJson: vi.fn(actual.canonicalJson) }
+})
+
 vi.mock('../../util', () => ({
     checkNullish: (value: unknown) => value === null || value === undefined,
     decryptBuffer: vi.fn(),
@@ -52,10 +57,12 @@ import type { Database } from '../database.svelte'
 import {
     checkCharOrder,
     prepareDatabaseForPersistence,
+    prepareDatabaseForBootstrap,
     preparePersistentRootForWorkingSet,
 } from '../databasePreparation'
 import type { PersistentRoot } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
+import { canonicalJson } from '../saveCoordinator'
 
 function deterministicIds(...ids: string[]): () => string {
     let index = 0
@@ -63,6 +70,53 @@ function deterministicIds(...ids: string[]): () => string {
 }
 
 describe('prepareDatabaseForPersistence', () => {
+    it('reports real normalization changes and becomes unchanged after preparation', async () => {
+        const input = await prepareDatabaseForPersistence(fixtureDatabase, { now: 1_700_000_000_000 })
+        input.formatversion = 4
+        input.loreBookToken = 400
+        input.characters[0].chaId = ''
+        const original = structuredClone(input)
+        const options = {
+            now: 1_700_000_000_000,
+            createId: () => 'synthetic-prepared-id',
+        }
+
+        const expected = await prepareDatabaseForPersistence(input, options)
+        vi.mocked(canonicalJson).mockClear()
+        const prepared = await prepareDatabaseForBootstrap(input, options)
+        expect(canonicalJson).toHaveBeenCalledTimes(2)
+        expect(prepared.database).toEqual(expected)
+        expect(prepared.changed).toBe(true)
+        expect(input).toEqual(original)
+        expect(prepared.database).not.toBe(input)
+
+        const stable = await prepareDatabaseForBootstrap(
+            prepared.database,
+            options,
+        )
+        expect(stable.changed).toBe(false)
+        expect(stable.database).toEqual(prepared.database)
+        expect(stable.database).not.toBe(prepared.database)
+        vi.mocked(canonicalJson).mockClear()
+        await prepareDatabaseForPersistence(stable.database, options)
+        expect(canonicalJson).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps the bootstrap input intact when detached normalization fails', async () => {
+        const input = structuredClone(fixtureDatabase)
+        input.characters[0].chaId = ''
+        const original = structuredClone(input)
+        await expect(
+            prepareDatabaseForBootstrap(input, {
+                createId: () => {
+                    throw new Error('Synthetic preparation failed')
+                },
+                now: 0,
+            }),
+        ).rejects.toThrow('Synthetic preparation failed')
+        expect(input).toEqual(original)
+    })
+
     it('normalizes root data without treating the catalog order as missing characters', async () => {
         const database = structuredClone(fixtureDatabase)
         database.formatversion = 4

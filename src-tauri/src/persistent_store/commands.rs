@@ -39,7 +39,6 @@ impl Default for PersistentStoreState {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PersistentStoreOpenResult {
     revision: i64,
-    asset_gc_maintenance: crate::asset_repository::migration_gc::AssetGcDryRunPage,
     #[serde(skip_serializing_if = "Option::is_none")]
     restore_failure: Option<String>,
 }
@@ -246,28 +245,31 @@ pub(crate) fn pds_open(
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
 
-    if let Some(store) = store.as_mut() {
-        let revision = store.revision()?;
-        let asset_gc_maintenance = store.asset_gc_product_maintenance_page(current_time_ms()?)?;
-        let restore_failure = store.pending_restore_failure().map(str::to_owned);
-        return Ok(PersistentStoreOpenResult {
-            revision,
-            asset_gc_maintenance,
-            restore_failure,
-        });
-    }
-
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| StoreError::Store {
             message: format!("failed to resolve application data directory: {error}"),
         })?;
-    let mut persistent_store = PersistentStore::open(&app_data_dir)?;
-    sweep_peer_logical_staging_directories(&app_data_dir);
+    open_persistent_store(&app_data_dir, &mut store)
+}
+
+fn open_persistent_store(
+    app_data_dir: &Path,
+    store: &mut Option<PersistentStore>,
+) -> StoreResult<PersistentStoreOpenResult> {
+    if let Some(store) = store.as_mut() {
+        let revision = store.revision()?;
+        let restore_failure = store.pending_restore_failure().map(str::to_owned);
+        return Ok(PersistentStoreOpenResult {
+            revision,
+            restore_failure,
+        });
+    }
+
+    let persistent_store = PersistentStore::open(app_data_dir)?;
+    sweep_peer_logical_staging_directories(app_data_dir);
     let revision = persistent_store.revision()?;
-    let asset_gc_maintenance =
-        persistent_store.asset_gc_product_maintenance_page(current_time_ms()?)?;
     let restore_failure = persistent_store
         .pending_restore_failure()
         .map(str::to_owned);
@@ -275,7 +277,6 @@ pub(crate) fn pds_open(
 
     Ok(PersistentStoreOpenResult {
         revision,
-        asset_gc_maintenance,
         restore_failure,
     })
 }
@@ -1223,63 +1224,132 @@ mod tests {
     }
 
     #[test]
-    fn open_result_exposes_truthful_product_maintenance_evidence() {
-        let directory = tempdir().expect("create open result directory");
-        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
-        let result = PersistentStoreOpenResult {
-            revision: store.revision().expect("read revision"),
-            asset_gc_maintenance: store
-                .asset_gc_product_maintenance_page(100)
-                .expect("run product maintenance"),
-            restore_failure: None,
-        };
+    fn open_preserves_unreferenced_objects_and_the_maintenance_cursor() {
+        let directory = tempdir().unwrap();
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let generation = super::super::active_generation(&store.connection).unwrap();
+        let mut payloads = Vec::new();
+        for index in 0..5 {
+            let payload = cas
+                .prepare_bytes(format!("open-object-{index}").as_bytes())
+                .unwrap();
+            register_command_gc_candidate(&mut store, &payload);
+            if index > 0 {
+                store.connection.execute(
+                    "INSERT INTO asset_aliases (generation, logical_key, object_hash, kind, size, mime, name, ext)
+                     VALUES (?1, ?2, ?3, 'asset', ?4, 'application/octet-stream', ?2, 'bin')",
+                    rusqlite::params![generation, format!("assets/open-{index}.bin"), payload.content_hash, payload.byte_size as i64],
+                ).unwrap();
+            }
+            payloads.push(payload);
+        }
+        drop(store);
+        let mut slot = None;
+        for _ in 0..2 {
+            assert_eq!(
+                open_persistent_store(directory.path(), &mut slot)
+                    .unwrap()
+                    .revision,
+                0
+            );
+            let store = slot.as_ref().unwrap();
+            assert!(payloads
+                .iter()
+                .all(|payload| cas.stat_object(&payload.content_hash).unwrap()
+                    == Some(payload.byte_size)));
+            let deletions: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM asset_object_deletions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(deletions, 0);
+            let cursor: Option<String> = store
+                .connection
+                .query_row(
+                    "SELECT catalog_cursor FROM asset_gc_maintenance_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, None);
+        }
+    }
 
-        let encoded = serde_json::to_value(result).expect("serialize open result");
-        assert_eq!(encoded["revision"], 0);
+    #[test]
+    fn open_allows_missing_marked_objects_but_explicit_preview_detects_them() {
+        let directory = tempdir().unwrap();
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        let payload = cas.prepare_bytes(b"missing marked open object").unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        register_command_gc_candidate(&mut store, &payload);
+        let generation = super::super::active_generation(&store.connection).unwrap();
+        store.connection.execute(
+            "INSERT INTO asset_aliases (generation, logical_key, object_hash, kind, size, mime, name, ext)
+             VALUES (?1, 'assets/missing.bin', ?2, 'asset', ?3, 'application/octet-stream', 'missing', 'bin')",
+            rusqlite::params![generation, payload.content_hash, payload.byte_size as i64],
+        ).unwrap();
+        drop(store);
+        fs::remove_file(directory.path().join(&payload.physical_key)).unwrap();
+        let mut slot = None;
+        for _ in 0..2 {
+            assert_eq!(
+                open_persistent_store(directory.path(), &mut slot)
+                    .unwrap()
+                    .revision,
+                0
+            );
+            assert!(pds_asset_gc_preview_all(slot.as_ref().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn open_result_returns_current_revision_without_gc_report() {
+        let directory = tempdir().unwrap();
+        let mut slot = None;
+        let first = open_persistent_store(directory.path(), &mut slot).unwrap();
+        assert_eq!(serde_json::to_value(first).unwrap(), json!({"revision": 0}));
+        let store = slot.as_mut().unwrap();
+        let staging = store.replace_begin().unwrap();
+        store
+            .replace_put_root(&staging.staging_id, &json!({"username": "synthetic"}))
+            .unwrap();
+        store.replace_commit(&staging.staging_id, Some(0)).unwrap();
+        let repeated = open_persistent_store(directory.path(), &mut slot).unwrap();
         assert_eq!(
-            encoded["assetGcMaintenance"]["report"]["deletionEnabled"],
-            true
+            serde_json::to_value(repeated).unwrap(),
+            json!({"revision": 1})
         );
-        assert!(encoded["assetGcMaintenance"]["report"]["blockers"]
-            .as_array()
-            .expect("read blockers")
-            .is_empty());
-        assert!(encoded.get("restoreFailure").is_none());
     }
 
     #[test]
     fn open_result_reports_a_skipped_pending_restore() {
         let directory = tempdir().expect("create restore failure directory");
-        let store = PersistentStore::open(directory.path()).expect("open persistent store");
-        drop(store);
+        drop(PersistentStore::open(directory.path()).unwrap());
         fs::write(
             directory
                 .path()
                 .join("persistent/snapshots/pending-restore.json"),
             b"{ not json",
         )
-        .expect("write corrupt restore marker");
-
-        let mut store =
-            PersistentStore::open(directory.path()).expect("reopen with corrupt marker");
-        let failure = store
+        .unwrap();
+        let mut slot = None;
+        let result =
+            open_persistent_store(directory.path(), &mut slot).expect("reopen with corrupt marker");
+        let failure = slot
+            .as_ref()
+            .unwrap()
             .pending_restore_failure()
             .expect("skipped restore is reported")
             .to_owned();
         assert!(failure.contains("persistent snapshot restore skipped"));
-
-        let result = PersistentStoreOpenResult {
-            revision: store.revision().expect("read revision"),
-            asset_gc_maintenance: store
-                .asset_gc_product_maintenance_page(100)
-                .expect("run product maintenance"),
-            restore_failure: store.pending_restore_failure().map(str::to_owned),
-        };
-        let encoded = serde_json::to_value(result).expect("serialize open result");
         assert_eq!(
-            encoded["restoreFailure"].as_str().expect("restore failure"),
-            failure
+            serde_json::to_value(result).unwrap(),
+            json!({"revision": 0, "restoreFailure": failure})
         );
+        let repeated = open_persistent_store(directory.path(), &mut slot).unwrap();
+        assert_eq!(repeated.restore_failure.as_deref(), Some(failure.as_str()));
     }
 
     #[test]
