@@ -16,6 +16,13 @@ import { CONVERSATION_RANGE_MAX_LIMIT } from '../storage/persistentDataStore'
 
 export type ConversationOperationMode = 'prefetched' | 'compatibility'
 
+/** Only a successfully committed operation can advance a caller's captured target. */
+export interface ConversationOperationCommit {
+    follows(session: ActiveConversationSession | null, version: number | null, chat: Chat): boolean
+}
+
+export type ConversationCommitObserver = (commit: ConversationOperationCommit) => void
+
 export interface ConversationReplaceRangeBatchEntry {
     type: 'replace-range'
     startIndex: number
@@ -91,6 +98,7 @@ export class ConversationOperationContext {
     private readonly sourceMessages: Message[]
     private readonly sourceMessageIdentities: readonly Message[]
     private readonly pin: ActiveConversationPin
+    private readonly precedingGenerationVersion: number
     private released = false
 
     get characterId(): string {
@@ -104,36 +112,46 @@ export class ConversationOperationContext {
     constructor(
         private readonly session: ActiveConversationSession,
         private readonly sourceChat: Chat,
+        private readonly onCommitted?: ConversationCommitObserver,
     ) {
         if (session.materializeCompatibilityArray() !== sourceChat.message) {
-            throw new Error('Conversation operation source is not the active session chat')
+            throw new Error(
+                'Conversation operation source is not the active session chat',
+            )
         }
 
         this.baseVersion = session.version
+        this.precedingGenerationVersion = session.generationInvalidationVersion
         this.sourceMessages = sourceChat.message
         this.sourceMessageIdentities = [...sourceChat.message]
         const totalMessages = session.totalMessages
-        const pinReason = totalMessages <= CONVERSATION_RANGE_MAX_LIMIT &&
+        const pinReason =
+            totalMessages <= CONVERSATION_RANGE_MAX_LIMIT &&
             !exceedsCloneBudget(
                 sourceChat,
                 CONVERSATION_OPERATION_PREFETCH_MAX_BYTES,
             )
-            ? 'transaction'
-            : 'compatibility'
+                ? 'transaction'
+                : 'compatibility'
         this.mode = pinReason === 'transaction' ? 'prefetched' : 'compatibility'
         this.pin = session.acquirePin(pinReason)
 
-        const compatibilitySnapshot = this.mode === 'compatibility'
-            ? session.materializeCompatibilitySnapshot()
-            : null
+        const compatibilitySnapshot =
+            this.mode === 'compatibility'
+                ? session.materializeCompatibilitySnapshot()
+                : null
         try {
-            const messages = totalMessages === 0
-                ? []
-                : this.mode === 'prefetched'
-                    ? session.readRange(0, totalMessages).messages
-                    : compatibilitySnapshot!.takeMessages()
+            const messages =
+                totalMessages === 0
+                    ? []
+                    : this.mode === 'prefetched'
+                      ? session.readRange(0, totalMessages).messages
+                      : compatibilitySnapshot!.takeMessages()
             if (session.version !== this.baseVersion) {
-                throw new ConversationSessionStaleError(this.baseVersion, session.version)
+                throw new ConversationSessionStaleError(
+                    this.baseVersion,
+                    session.version,
+                )
             }
             this.originalMessages = messages
             this.originalMetadata = cloneConversationMetadata(sourceChat)
@@ -322,7 +340,9 @@ export class ConversationOperationContext {
         return batch
     }
 
-    commit(currentSession: ActiveConversationSession | null): ConversationMutationBatch {
+    commit(
+        currentSession: ActiveConversationSession | null,
+    ): ConversationMutationBatch {
         try {
             requireCurrentConversationSession(this.session, currentSession)
             if (this.session.version !== this.baseVersion) {
@@ -344,21 +364,26 @@ export class ConversationOperationContext {
                 expectedVersion: this.baseVersion,
                 expectedMetadata: this.originalMetadata,
                 metadata: metadata?.metadata ?? this.originalMetadata,
-                ...(range === undefined ? {} : {
-                    range: {
-                        position: range.position,
-                        deleteCount: range.deleteCount,
-                        messages: range.messages,
-                    },
-                }),
+                ...(range === undefined
+                    ? {}
+                    : {
+                          range: {
+                              position: range.position,
+                              deleteCount: range.deleteCount,
+                              messages: range.messages,
+                          },
+                      }),
             })
+            this.reportCommit(this.baseVersion + (batch.length > 0 ? 1 : 0))
             return batch
         } finally {
             this.release()
         }
     }
 
-    commitMetadata(currentSession: ActiveConversationSession | null): ConversationMutationBatch {
+    commitMetadata(
+        currentSession: ActiveConversationSession | null,
+    ): ConversationMutationBatch {
         try {
             requireCurrentConversationSession(this.session, currentSession)
             if (this.session.version !== this.baseVersion) {
@@ -367,10 +392,13 @@ export class ConversationOperationContext {
                     this.session.version,
                 )
             }
-            const currentMetadata = cloneConversationMetadata(
-                this.sourceChat,
-            )
-            if (!conversationMetadataEqual(this.originalMetadata, currentMetadata)) {
+            const currentMetadata = cloneConversationMetadata(this.sourceChat)
+            if (
+                !conversationMetadataEqual(
+                    this.originalMetadata,
+                    currentMetadata,
+                )
+            ) {
                 throw new MessageLocatorMismatchError(
                     'Conversation operation metadata baseline changed',
                 )
@@ -379,16 +407,33 @@ export class ConversationOperationContext {
             const batch: ConversationMutationBatch = conversationMetadataEqual(
                 this.originalMetadata,
                 metadata,
-            ) ? [] : [{ type: 'update-metadata', metadata }]
+            )
+                ? []
+                : [{ type: 'update-metadata', metadata }]
             this.session.applyOperation({
                 expectedVersion: this.baseVersion,
                 expectedMetadata: this.originalMetadata,
                 metadata,
             })
+            this.reportCommit(this.baseVersion + (batch.length > 0 ? 1 : 0))
             return batch
         } finally {
             this.release()
         }
+    }
+
+    private reportCommit(version: number): void {
+        this.onCommitted?.({
+            follows: (session, previousVersion, chat) =>
+                session === this.session &&
+                previousVersion !== null &&
+                previousVersion >= this.precedingGenerationVersion &&
+                previousVersion <= this.baseVersion &&
+                chat === this.sourceChat &&
+                session.isActive &&
+                session.version === version &&
+                session.materializeCompatibilityArray() === chat.message,
+        })
     }
 
     release(): void {
@@ -405,6 +450,7 @@ export class ConversationOperationContext {
 export function createConversationOperationContext(
     session: ActiveConversationSession,
     sourceChat: Chat,
+    onCommitted?: ConversationCommitObserver,
 ): ConversationOperationContext {
-    return new ConversationOperationContext(session, sourceChat)
+    return new ConversationOperationContext(session, sourceChat, onCommitted)
 }

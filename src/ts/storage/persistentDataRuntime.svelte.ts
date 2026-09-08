@@ -166,6 +166,8 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             Object.assign(getDatabase(), root)
         },
         publishCharacterMutation(state) {
+            const target = productionRuntime?.captureSelectedConversationTarget()
+            const session = productionRuntime?.getActiveConversationSession()
             const database = getDatabase()
             publishPersistentCharacterMutationToWorkingSet(
                 database,
@@ -174,11 +176,17 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
                 get(selectedCharID),
                 (index) => selectedCharID.set(index),
             )
+            if (target && session)
+                productionRuntime?.refreshSelectedConversationAfterReplacement(target, session)
             const selectedCharacterId = database.characters[get(selectedCharID)]?.chaId ?? null
             productionRuntime?.reconcileActiveCharacterIds(database, selectedCharacterId)
         },
         publishConversationReplacement(result) {
+            const target = productionRuntime?.captureSelectedConversationTarget()
+            const session = productionRuntime?.getActiveConversationSession()
             publishPersistentConversationReplacementToWorkingSet(getDatabase(), result)
+            if (target && session)
+                productionRuntime?.refreshSelectedConversationAfterReplacement(target, session)
         },
         installCompleteDatabase(database) {
             workingSetResidency.clear()

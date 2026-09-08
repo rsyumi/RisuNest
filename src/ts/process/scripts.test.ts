@@ -495,6 +495,44 @@ describe('history-sensitive regex conversation operations', () => {
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
     })
 
+    it('runs a mutating regex after a plugin saves conversation metadata', async () => {
+        const chat = {
+            id: 'regex-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message' }],
+        } as Chat
+        const char = makeCharacter([makeScript('x', '@@inject')])
+        char.chaId = 'regex-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id,
+            conversation: chat,
+            storeRevision: 21,
+        })
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.pluginV2.editoutput.add(async (data) => {
+            const next = structuredClone(chat)
+            next.scriptstate = { $plugin: 'saved' }
+            expect(session.adoptPersistedMetadata(next, 22)).toBe(true)
+            return data
+        })
+        const result = await processScriptFull(
+            char,
+            'x',
+            'editoutput',
+            0,
+            {},
+            { cache: 'bypass', regexWorker: false },
+        )
+        expect(result.data).toBe('')
+        expect(chat.message[0].data).toBe('x')
+        expect(chat.scriptstate).toEqual({ $plugin: 'saved' })
+        expect(session.activePinReasons).toEqual([])
+    })
+
     it('applies @@inject through the active session batch instead of direct DB mutation', async () => {
         const chat = {
             id: 'regex-chat',

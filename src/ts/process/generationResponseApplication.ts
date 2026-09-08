@@ -14,8 +14,10 @@ import {
 } from './generationConversationOperation'
 import type { requestDataResponse } from './request/request'
 import { consumeStreamingDisplayStream } from './streamingDisplayStream'
+import type { ConversationCommitObserver } from './conversationOperationContext'
 
 export interface GenerationResponseProcessingOptions {
+    onConversationCommit?: ConversationCommitObserver
     cache: 'normal' | 'bypass'
     signal: AbortSignal
     regexWorker: true
@@ -39,10 +41,17 @@ export interface GenerationResponseCallbacks {
     ): Promise<{ data: string; emoChanged: boolean }>
     runCurrentChatParser(chat: Chat): Chat
     runInlay(data: string): { text: string; promise?: Promise<string> }
-    runOutputTrigger(chat: Chat): Promise<{
-        chat?: Chat
-        sendAIprompt?: boolean
-    } | null | undefined>
+    runOutputTrigger(
+        chat: Chat,
+        onConversationCommit?: ConversationCommitObserver,
+    ): Promise<
+        | {
+              chat?: Chat
+              sendAIprompt?: boolean
+          }
+        | null
+        | undefined
+    >
     runOutputListeners(chat: Chat, messageIndex: number): Promise<void>
     speak(data: string): Promise<void>
     addRerolls(generationId: string, values: string[]): void
@@ -104,6 +113,11 @@ export async function applyGenerationResponse(
         return message !== null && target.commitMessage(update(message))
     }
     const hasOutputOwnership = () => getOutputTarget()?.isOwned() ?? false
+    const onConversationCommit: ConversationCommitObserver = (commit) => {
+        // The receipt proves that this callback committed from our captured version.
+        // An unrelated mutation still leaves the old locator invalid.
+        getOutputTarget()?.acceptCommit(commit)
+    }
     let released = false
     const release = () => {
         if (released) return
@@ -149,7 +163,6 @@ export async function applyGenerationResponse(
             generationHadOperation = true
             const initialOutput = outputTarget.snapshot()
             if (initialOutput === null) return null
-            const messageIndex = outputTarget.absoluteIndex
             const prefix = options.continueGeneration ? initialOutput.data : ''
             const outputMessageId = outputTarget.messageId
             const performanceMode = options.streamingDisplayOptimizationMode()
@@ -165,14 +178,16 @@ export async function applyGenerationResponse(
                 try {
                     return await options.callbacks.processOutput(
                         prefix + snapshot,
-                        messageIndex,
-                        { cache, signal, regexWorker: true },
+                        outputTarget!.absoluteIndex,
+                        { cache, signal, regexWorker: true, onConversationCommit },
                     )
                 } catch (error) {
                     if (signal.aborted) return null
-                    if (outputTarget?.commitData(
-                        options.callbacks.reformatContent(prefix + snapshot),
-                    )) {
+                    if (
+                        outputTarget?.commitData(
+                            options.callbacks.reformatContent(prefix + snapshot),
+                        )
+                    ) {
                         options.callbacks.markResponseApplied()
                         options.operation.incrementReloadKeys()
                     }
@@ -237,7 +252,10 @@ export async function applyGenerationResponse(
             let currentChat = options.callbacks.runCurrentChatParser(targetChat)
             options.operation.publishTargetChat(currentChat)
             if (!outputTarget.refresh()) return null
-            const triggerResult = await options.callbacks.runOutputTrigger(currentChat)
+            const triggerResult = await options.callbacks.runOutputTrigger(
+                currentChat,
+                onConversationCommit,
+            )
             if (!outputTarget.isOwned()) return null
             if (triggerResult?.chat) currentChat = triggerResult.chat
             if (triggerResult?.sendAIprompt) resendChat = true
@@ -307,18 +325,24 @@ export async function applyGenerationResponse(
                 }
                 let processed: Awaited<ReturnType<GenerationResponseCallbacks['processOutput']>>
                 try {
-                    processed = await options.callbacks.processOutput(
-                        messageText,
-                        messageIndex,
-                        { cache: 'normal', signal: options.abortSignal, regexWorker: true },
-                    )
+                    processed = await options.callbacks.processOutput(messageText, messageIndex, {
+                        cache: 'normal',
+                        signal: options.abortSignal,
+                        regexWorker: true,
+                        onConversationCommit,
+                    })
                     if (!isOwnerCurrent()) return null
                     if (continuingFirstMessage) {
                         messageIndex = outputTarget!.absoluteIndex
                         processed = await options.callbacks.processOutput(
                             continueBaseData + messageText,
                             messageIndex,
-                            { cache: 'normal', signal: options.abortSignal, regexWorker: true },
+                            {
+                                cache: 'normal',
+                                signal: options.abortSignal,
+                                regexWorker: true,
+                                onConversationCommit,
+                            },
                         )
                         if (!isOwnerCurrent()) return null
                     }
@@ -330,15 +354,17 @@ export async function applyGenerationResponse(
                     let applied = false
                     try {
                         if (continuingFirstMessage) {
-                            applied = outputTarget?.commitMessage({
-                                role: 'char',
-                                data: fallbackData,
-                                saying: options.sayingCharacterId,
-                                time: Date.now(),
-                                generationInfo: options.generationInfo,
-                                promptInfo: options.promptInfo,
-                                chatId: options.generationId,
-                            }) ?? false
+                            applied =
+                                outputTarget?.commitMessage({
+                                    ...outputTarget.snapshot(),
+                                    role: 'char',
+                                    data: fallbackData,
+                                    saying: options.sayingCharacterId,
+                                    time: Date.now(),
+                                    generationInfo: options.generationInfo,
+                                    promptInfo: options.promptInfo,
+                                    chatId: options.generationId,
+                                }) ?? false
                             outputMessageId = outputTarget?.messageId
                         } else if (
                             index === 0
@@ -384,15 +410,19 @@ export async function applyGenerationResponse(
                 result = inlay.text
                 emoChanged = processed.emoChanged
                 if (continuingFirstMessage) {
-                    if (!outputTarget?.commitMessage({
-                        role: 'char',
-                        data: result,
-                        saying: options.sayingCharacterId,
-                        time: Date.now(),
-                        generationInfo: options.generationInfo,
-                        promptInfo: options.promptInfo,
-                        chatId: options.generationId,
-                    })) return null
+                    if (
+                        !outputTarget?.commitMessage({
+                            ...outputTarget.snapshot(),
+                            role: 'char',
+                            data: result,
+                            saying: options.sayingCharacterId,
+                            time: Date.now(),
+                            generationInfo: options.generationInfo,
+                            promptInfo: options.promptInfo,
+                            chatId: options.generationId,
+                        })
+                    )
+                        return null
                     options.callbacks.markResponseApplied()
                     if (inlay.promise) {
                         const inlayData = await inlay.promise
@@ -446,7 +476,10 @@ export async function applyGenerationResponse(
             let currentChat = options.callbacks.runCurrentChatParser(outputChat)
             options.operation.publishTargetChat(currentChat)
             if (!getOutputTarget()?.refresh()) return null
-            const triggerResult = await options.callbacks.runOutputTrigger(currentChat)
+            const triggerResult = await options.callbacks.runOutputTrigger(
+                currentChat,
+                onConversationCommit,
+            )
             if (!hasOutputOwnership()) return null
             if (triggerResult?.sendAIprompt) resendChat = true
             const previousChat = currentChat

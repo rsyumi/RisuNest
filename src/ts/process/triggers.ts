@@ -19,6 +19,7 @@ import { calcString } from "./infunctions";
 import {
     createConversationOperationContext,
     type ConversationOperationContext,
+    type ConversationCommitObserver,
 } from "./conversationOperationContext";
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
 
@@ -1107,6 +1108,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     displayData?: string
     tempVars?: Record<string, string>
     conversationOperation?: ConversationOperationContext
+    onConversationCommit?: ConversationCommitObserver
 }){
     arg.recursiveCount ??= 0
     const moduleTriggers = getModuleTriggers()
@@ -1123,6 +1125,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
             ownedConversationOperation = createConversationOperationContext(
                 activeSession,
                 arg.chat,
+                arg.onConversationCommit,
             )
         }
     }

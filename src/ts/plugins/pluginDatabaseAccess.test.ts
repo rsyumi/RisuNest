@@ -17,6 +17,7 @@ import {
 import { createConversationSummaryStubFromChat } from '../storage/conversationResidency'
 import {
     createPluginDatabaseAccess,
+    applyPluginDatabaseUpdate,
     createProductionPluginDatabaseAccess,
     createProductionPluginChatOutputProjector,
     linkPluginQueryAbortSignals,
@@ -1689,14 +1690,40 @@ describe('plugin database access', () => {
 
         expect(harness.applyCompatibilityDatabaseLite).toHaveBeenCalledWith(liteUpdate)
         expect(harness.applyCompatibilityDatabase).not.toHaveBeenCalled()
-        expect(harness.materializeDatabaseSnapshot).toHaveBeenCalledWith('plugin-database-set')
-        expect(harness.replacePersistentDatabase).toHaveBeenCalledWith(
-            expect.objectContaining({ username: 'Async' }),
-            'plugin-database-set',
-            expect.objectContaining({ expectedRevision: 9 }),
-        )
-        expect(harness.invalidatePluginStorage).toHaveBeenCalledOnce()
+        expect(harness.applyCompatibilityDatabaseLite).toHaveBeenCalledWith(asyncUpdate)
+        expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(harness.replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(harness.flushPendingData).toHaveBeenCalledWith('plugin-root-update')
     })
+
+    it.each(['scalable-v3', 'maximum-compatibility'] as const)(
+        'persists a %s root-only update without replacing a concurrently edited character',
+        async (profile) => {
+            const harness = createHarness()
+            harness.setCompatibilityProfile(profile)
+            harness.compatibilityDatabase.characters = [
+                { chaId: 'character', name: 'Before', chats: [] },
+            ] as Database['characters']
+            harness.authoritativeSnapshots.push({
+                database: structuredClone(harness.compatibilityDatabase) as Database,
+                revision: 9,
+            })
+            const character = harness.compatibilityDatabase.characters[0]
+            harness.applyCompatibilityDatabaseLite.mockImplementation((update) => {
+                applyPluginDatabaseUpdate(harness.compatibilityDatabase as Database, update, [
+                    'username',
+                ])
+            })
+            harness.flushPendingData.mockImplementation(async () => {
+                character.name = 'Concurrent edit'
+            })
+            await harness.access.setDatabase({ username: 'Plugin root edit' }, ['username'])
+            expect(harness.compatibilityDatabase.username).toBe('Plugin root edit')
+            expect(harness.compatibilityDatabase.characters[0]).toBe(character)
+            expect(character.name).toBe('Concurrent edit')
+            expect(harness.replacePersistentDatabase).not.toHaveBeenCalled()
+        },
+    )
 
     it('routes scalable lite plugin storage replacement through atomic per-key mutations', async () => {
         const harness = createHarness()
@@ -1793,8 +1820,14 @@ describe('plugin database access', () => {
         })
 
         const outcomes = await Promise.allSettled([
-            harness.access.setDatabase({ username: 'First' }, ['username']),
-            harness.access.setDatabase({ username: 'Second' }, ['username']),
+            harness.access.setDatabase({ username: 'First', characters: [] }, [
+                'username',
+                'characters',
+            ]),
+            harness.access.setDatabase({ username: 'Second', characters: [] }, [
+                'username',
+                'characters',
+            ]),
         ])
 
         expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
@@ -1816,10 +1849,15 @@ describe('plugin database access', () => {
         storeDatabase.characters[0].name = 'Concurrent character edit'
         harness.replacePersistentDatabase.mockRejectedValueOnce(new Error('revision-conflict'))
 
-        await expect(harness.access.setDatabase(
-            { username: 'Plugin root edit' },
-            ['username'],
-        )).rejects.toThrow('revision-conflict')
+        await expect(
+            harness.access.setDatabase(
+                {
+                    username: 'Plugin root edit',
+                    characters: [{ chaId: 'char', name: 'Before', chats: [] }],
+                },
+                ['username', 'characters'],
+            ),
+        ).rejects.toThrow('revision-conflict')
 
         expect(harness.replacePersistentDatabase).toHaveBeenCalledWith(
             expect.anything(),
@@ -1850,7 +1888,10 @@ describe('plugin database access', () => {
             }
         })
 
-        await harness.access.setDatabase({ username: 'After' }, ['username'])
+        await harness.access.setDatabase({ username: 'After', characters: [] }, [
+            'username',
+            'characters',
+        ])
 
         expect(currentRevision).toBe(51)
         expect(harness.replacePersistentDatabase).toHaveBeenCalledWith(
@@ -1891,10 +1932,12 @@ describe('plugin database access', () => {
             }
         })
 
-        await expect(harness.access.setDatabase(
-            { username: 'Plugin edit' },
-            ['username'],
-        )).rejects.toThrow('mutation-generation-conflict')
+        await expect(
+            harness.access.setDatabase({ username: 'Plugin edit', characters: [] }, [
+                'username',
+                'characters',
+            ]),
+        ).rejects.toThrow('mutation-generation-conflict')
 
         expect(harness.replacePersistentDatabase).toHaveBeenCalledWith(
             expect.anything(),

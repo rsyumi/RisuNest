@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
+import { createConversationOperationContext, type ConversationCommitObserver } from './conversationOperationContext'
 
 const mocks = vi.hoisted(() => ({
     session: null as any,
@@ -30,6 +31,7 @@ const mocks = vi.hoisted(() => ({
             cache?: 'normal' | 'bypass'
             signal?: AbortSignal
             regexWorker?: boolean
+            onConversationCommit?: ConversationCommitObserver
         },
     ) => {
         if (mode === 'editoutput') mocks.events.push('output-script')
@@ -635,6 +637,38 @@ describe('sendChat generation session integration', () => {
         ])
     })
 
+    it.each(['success', 'streaming'] as const)(
+        'applies a %s response after persisted plugin metadata and character publication',
+        async (type) => {
+            const { chat, currentCharacter, session } = installDatabase()
+            const response = deferred<any>()
+            mocks.modelResponse = response.promise
+            const sending = sendChat()
+            while (mocks.modelRequestCount === 0) await Promise.resolve()
+            const next = JSON.parse(JSON.stringify(currentCharacter))
+            next.name = 'Updated character metadata'
+            next.chats[0].scriptstate = { $bridge: 'on' }
+            next.chats[0].message[0].__translation = 'record'
+            expect(session.adoptPersistedMetadata(next.chats[0], 2)).toBe(true)
+            next.chats[0] = chat
+            DBState.db.characters[0] = next
+            response.resolve(
+                type === 'success'
+                    ? { type: 'success', result: 'answer' }
+                    : streamingResponse('answer'),
+            )
+            await expect(sending).resolves.toBe(true)
+            const completed = DBState.db.characters[0].chats[0]
+            expect(completed.message.at(-1)?.data).toBe('answer')
+            expect(completed.message[0]).toMatchObject({
+                data: 'hello',
+                __translation: 'record',
+            })
+            expect(completed.scriptstate).toEqual({ $bridge: 'on' })
+            expect(session.pinCount('transaction')).toBe(0)
+        },
+    )
+
     it('does not append after character navigation while the model request is pending', async () => {
         const second = makeCharacter(makeChat(), 'character-b')
         const { chat, session } = installDatabase(makeChat(), [second])
@@ -1207,6 +1241,38 @@ describe('sendChat generation session integration', () => {
         expect(session.pinCount('transaction')).toBe(0)
     })
 
+    it('passes the moved output index to later streaming edit hooks', async () => {
+        const { chat, session } = installDatabase()
+        mocks.modelResponse = streamingSnapshots('First', 'Second')
+        const indexes: number[] = []
+        mocks.processScriptFull.mockImplementation(
+            async (_char, data, mode, index, _conditions, processing) => {
+                if (mode === 'editoutput') {
+                    indexes.push(index!)
+                    if (indexes.length === 1) {
+                        const operation = createConversationOperationContext(
+                            session,
+                            chat,
+                            processing?.onConversationCommit,
+                        )
+                        operation.chat.message.unshift({
+                            role: 'user',
+                            data: 'inserted',
+                            chatId: 'inserted',
+                        })
+                        operation.commit(session)
+                    }
+                }
+                return { data, emoChanged: false }
+            },
+        )
+
+        await expect(sendChat()).resolves.toBe(true)
+        expect(indexes).toEqual([1, 2])
+        expect(chat.message.map((message) => message.data)).toEqual(['inserted', 'hello', 'Second'])
+        expect(session.activePinReasons).toEqual([])
+    })
+
     it('continues the captured message without appending and disposes its operation pin', async () => {
         const chat = makeChat([{
             role: 'char',
@@ -1214,12 +1280,16 @@ describe('sendChat generation session integration', () => {
             chatId: 'existing-output',
         }])
         const { session } = installDatabase(chat)
+        Object.assign(chat.message[0], { __translation: 'existing-record' })
         mocks.modelResponse = { type: 'success', result: ' plus' }
 
         await expect(sendChat(-1, { continue: true })).resolves.toBe(true)
 
         expect(DBState.db.characters[0].chats[0].message).toHaveLength(1)
         expect(DBState.db.characters[0].chats[0].message[0].data).toBe('existing plus')
+        expect(DBState.db.characters[0].chats[0].message[0]).toMatchObject({
+            __translation: 'existing-record',
+        })
         expect(session.pinCount('transaction')).toBe(0)
     })
 })

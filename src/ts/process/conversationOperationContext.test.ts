@@ -30,6 +30,22 @@ function createSession(conversation: Chat) {
     })
 }
 
+test('does not reuse a commit receipt after an external mutation', () => {
+    const conversation = chat([message('before', 'message')])
+    const session = createSession(conversation)
+    let receipt: import('./conversationOperationContext').ConversationOperationCommit | undefined
+    const operation = createConversationOperationContext(session, conversation, (committed) => {
+        receipt = committed
+    })
+    operation.chat.scriptstate = { $own: 'change' }
+    operation.commit(session)
+    expect(receipt!.follows(session, 0, conversation)).toBe(true)
+    session.append(message('external mutation', 'external'))
+    expect(receipt!.follows(session, 0, conversation)).toBe(false)
+    expect(conversation.message.at(-1)?.data).toBe('external mutation')
+    expect(session.activePinReasons).toEqual([])
+})
+
 test('prefetches one complete bounded session version into a detached operation chat', () => {
     const conversation = chat([
         message('zero', 'message-0'),

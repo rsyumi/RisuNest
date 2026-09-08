@@ -22,6 +22,7 @@ import {
 import { createConversationSummaryStubFromChat } from './conversationResidency'
 import { createSelectedConversationOperations } from '../selectedConversationOperations'
 import { readSelectedConversationLatestTail } from '../selectedConversationTail'
+import { captureGenerationConversationOperation } from '../process/generationConversationOperation'
 
 function makeChat(messageCount: number): Chat {
     return {
@@ -214,7 +215,83 @@ async function flushScheduledDemotion(): Promise<void> {
 }
 
 describe('selected conversation lifecycle', () => {
-    it('refreshes the exact lease-owned session only after publication replaces its object', async () => {
+    it('keeps generation and durable metadata through a real persisted conversation replacement', async () => {
+        let workingCopy = {
+            username: 'Synthetic',
+            characters: [makeCharacter(makeChat(3))],
+        } as unknown as Database
+        const store = new IndexedDbPersistentDataStore(
+            `metadata-publication-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(workingCopy)
+        const runtime = createPersistentDataRuntime({
+            store,
+            prepareDatabase: async (candidate) => candidate,
+            state: {
+                captureRoot: () => capturePersistentRoot(workingCopy),
+                captureSelectedCharacter: () => workingCopy.characters[0],
+                captureCharacter: (id) =>
+                    workingCopy.characters.find((character) => character.chaId === id) ?? null,
+                getSelectedCharacterId: () => 'char-a',
+                getSelectedConversationId: () => 'chat-a',
+                replaceDatabase: (next) => {
+                    workingCopy = next
+                },
+                publishCharacter: (next) => {
+                    workingCopy.characters[0] = next
+                },
+                publishConversation: (_id, chat) => {
+                    workingCopy.characters[0].chats[0] = chat
+                },
+                publishConversationReplacement: (result) => {
+                    const target = runtime.captureSelectedConversationTarget()!
+                    const session = runtime.getActiveConversationSession()!
+                    publishPersistentConversationReplacementToWorkingSet(workingCopy, result)
+                    runtime.refreshSelectedConversationAfterReplacement(target, session)
+                },
+                canUseWindowedSelectedConversation: () => false,
+                isConversationOperationActive: () => true,
+            },
+        })
+        await runtime.initializeActiveWorkingSet(workingCopy)
+        const lease = await runtime.acquireCompleteConversation('test-generation')
+        const conversation = workingCopy.characters[0].chats[0]
+        const output = captureGenerationConversationOperation({
+            session: lease.session,
+            getCurrentSession: () => runtime.getActiveConversationSession(),
+            chat: conversation,
+            getCurrentChat: () => workingCopy.characters[0].chats[0],
+            continueLast: true,
+        })
+        const replacement = structuredClone(conversation)
+        replacement.scriptstate = { $bridge: 'on' }
+        Object.assign(replacement.message[2], { __translation: 'saved-record' })
+        await runtime.replacePersistentConversation(
+            'char-a',
+            'chat-a',
+            'plugin-setChatToIndex',
+            replacement,
+        )
+        expect(runtime.getActiveConversationSession()).toBe(lease.session)
+        expect(output.commitData('continued response')).toBe(true)
+        await runtime.flushPendingData('continued-generation')
+        const durable = (await store.readConversation('char-a', 'chat-a'))!.value
+        expect(durable.scriptstate).toEqual({ $bridge: 'on' })
+        expect(durable.message[2]).toMatchObject({
+            data: 'continued response',
+            __translation: 'saved-record',
+        })
+        const source = runtime.getActiveConversationViewportSource()!
+        await source.ensureRange({ startIndex: 2, limit: 1, reason: 'viewport' })
+        expect(source.snapshot().rowAt(2)?.message.data).toBe('continued response')
+        output.release()
+        lease.release()
+        expect(lease.session.activePinReasons).toEqual([])
+    })
+    it('preserves the exact lease-owned session after persisted metadata publication', async () => {
         const harness = makeHarness(3)
         harness.setOperationActive(true)
         await flushScheduledDemotion()
@@ -231,16 +308,22 @@ describe('selected conversation lifecycle', () => {
 
         expect(oldSession.matchesConversation('char-a', replacement)).toBe(false)
         lease.release()
-        expect(harness.workingSet.refreshSelectedConversationAfterReplacement(
-            lease.target,
-            oldSession,
-        )).toBe(true)
+        expect(
+            harness.workingSet.refreshSelectedConversationAfterReplacement(
+                lease.target,
+                oldSession,
+            ),
+        ).toBe(true)
 
         const refreshed = harness.workingSet.activeConversationSession
-        expect(refreshed).not.toBe(oldSession)
-        expect(refreshed?.matchesConversation('char-a', replacement)).toBe(true)
+        expect(refreshed).toBe(oldSession)
+        expect(refreshed?.matchesConversation('char-a', harness.getResident().chats[0])).toBe(true)
+        expect(harness.getResident().chats[0].note).toBe('published replacement')
+        const source = harness.workingSet.activeConversationViewportSource!
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        expect(source.snapshot().rowAt(0)?.message.data).toBe('message-0')
         expect(refreshed?.storeRevision).toBe(8)
-        expect(oldSession.isActive).toBe(false)
+        expect(oldSession.isActive).toBe(true)
     })
 
     it('does not refresh when precommit failure or compensation leaves ownership unchanged', async () => {
@@ -1497,4 +1580,46 @@ describe('selected conversation lifecycle', () => {
         await runtime.flushPendingData('after-maximum-compatibility')
         expect((await store.readConversation('char-a', 'chat-a')).value.message).toHaveLength(3)
     })
+})
+
+it('saves a retained edit after a root-only save of unchanged messages', async () => {
+    const h = makeHarness(3)
+    h.setOperationActive(true)
+    const operations = createSelectedConversationOperations({
+        captureSelectedConversationTarget: () => h.workingSet.captureSelectedConversationTarget(),
+        acquireCompleteConversation: (reason, target) =>
+            h.workingSet.acquireCompleteConversation(reason, target),
+        captureCurrent: () => ({
+            character: h.getResident(),
+            conversation: h.getResident().chats[0],
+        }),
+        getCurrentSession: () => h.workingSet.activeConversationSession,
+        getCurrentViewportSource: () => h.workingSet.activeConversationViewportSource,
+    })
+    await h.workingSet.activeConversationViewportSource!.ensureRange({
+        startIndex: 0,
+        limit: 1,
+        reason: 'viewport',
+    })
+    const snapshot = h.workingSet.activeConversationViewportSource!.snapshot()
+    const row = snapshot.rowAt(0)!
+    const intent = operations.captureMessageEditIntent({
+        absoluteIndex: 0,
+        sourceToken: snapshot.sourceToken,
+        sourceVersion: snapshot.version,
+        rowKey: row.key,
+        message: row.message,
+    })!
+    expect(intent).not.toBeNull()
+    h.setCoordinatorRevision(8)
+    h.workingSet.advanceStoreRevision(8)
+    expect(h.workingSet.activeConversationSession!.version).toBe(0)
+    const acquired = await operations.acquireCompleteMessageTargetForIntent(intent, 'edit-message')
+    expect(acquired).not.toBeNull()
+    acquired!.target.session.edit(acquired!.target.locator, {
+        ...acquired!.target.message,
+        data: 'edited after save',
+    })
+    acquired!.release()
+    expect(h.getResident().chats[0].message[0].data).toBe('edited after save')
 })

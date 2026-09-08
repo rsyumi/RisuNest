@@ -364,8 +364,6 @@
     async function edit(){
         const retainedIntent = editIntent
         const retainedTarget = editTarget
-        editIntent = null
-        editTarget = null
         const acquired = await acquireEditMessage(
             retainedIntent,
             retainedTarget,
@@ -375,6 +373,8 @@
         try {
             const result = saveCapturedChatMessage(acquired.target, chatMessageContext, editDraft)
             if (result.saved) {
+                editIntent = null
+                editTarget = null
                 message = result.displayData
                 displaya(result.displayData)
             }
@@ -427,13 +427,13 @@
 
         const retainedIntent = partialEditIntent
         const retainedTarget = partialEditTarget
-        partialEditIntent = null
-        partialEditTarget = null
         const acquired = await acquireEditMessage(retainedIntent, retainedTarget, 'partial-edit-message')
         if (!acquired) return
         try {
             const result = saveCapturedChatMessage(acquired.target, chatMessageContext, e.detail.newData)
             if (result.saved) {
+                partialEditIntent = null
+                partialEditTarget = null
                 message = result.displayData
                 displaya(result.displayData)
             }

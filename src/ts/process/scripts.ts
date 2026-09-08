@@ -16,7 +16,7 @@ import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPla
 import { RegexExecutionTimeoutError, getSharedRegexWorkerClient, isRegexWorkerAvailable } from "./regexWorkerClient";
 import { tryExecuteNativeRegexBatch } from "./nativeRegexBatch";
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../runtimePerformanceProfile";
-import { createConversationOperationContext, type ConversationOperationContext } from "./conversationOperationContext";
+import { createConversationOperationContext, type ConversationOperationContext, type ConversationCommitObserver } from "./conversationOperationContext";
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
 import {
     ConversationSessionInactiveError,
@@ -34,6 +34,7 @@ import {
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 
 export interface ProcessScriptOptions {
+    onConversationCommit?: ConversationCommitObserver
     cache?: 'normal' | 'bypass'
     signal?: AbortSignal
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
@@ -66,8 +67,14 @@ export interface ProcessScriptCaptureContext {
     }
 }
 
-export async function processScript(char:character|groupChat, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}){
-    return (await processScriptFull(char, data, mode, -1, cbsConditions)).data
+export async function processScript(
+    char: character | groupChat,
+    data: string,
+    mode: ScriptMode,
+    cbsConditions: CbsConditions = {},
+    options: ProcessScriptOptions = {},
+) {
+    return (await processScriptFull(char, data, mode, -1, cbsConditions, options)).data
 }
 
 export function exportRegex(s?:customscript[]){
@@ -229,13 +236,14 @@ function requireScriptConversationOwner(owner: ScriptConversationOwner): void {
     if (
         owner.character &&
         db.characters.find((character) => character.chaId === owner.selectedCharacterId) !==
-            owner.character
+            owner.character &&
+        !owner.session?.matchesConversation(owner.selectedCharacterId, getCurrentChat())
     ) {
         throw new ConversationSessionInactiveError()
     }
     if (owner.session) {
         requireCurrentConversationSession(owner.session, peekActiveConversationSession())
-        if (owner.session.version !== owner.version) {
+        if (!owner.session.canContinueGenerationFrom(owner.version!)) {
             throw new ConversationSessionStaleError(owner.version!, owner.session.version)
         }
         if (owner.chat !== getCurrentChat()) throw new ConversationSessionInactiveError()
@@ -446,7 +454,14 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
     let db = captureContext?.parserContext.database ?? promptOperationScope?.database ?? getDatabase()
     let emoChanged = false
     if (!captureContext) {
-        data = await runLuaEditTrigger(char, mode, data, { index:chatID })
+        data = await runLuaEditTrigger(
+            char,
+            mode,
+            data,
+            { index: chatID },
+            undefined,
+            options.onConversationCommit,
+        )
         options.signal?.throwIfAborted()
     }
 
@@ -527,6 +542,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
             conversationOperation = createConversationOperationContext(
                 conversationOwner.session,
                 conversationOwner.chat,
+                options.onConversationCommit,
             )
         }
     } catch (error) {

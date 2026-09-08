@@ -31,6 +31,7 @@ import { withObjectUrl } from '../objectUrl';
 import {
     createConversationOperationContext,
     type ConversationOperationContext,
+    type ConversationCommitObserver,
 } from './conversationOperationContext';
 import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte';
 let luaFactory:LuaFactory
@@ -400,7 +401,8 @@ export async function runScripted(code:string, arg:{
                     return {
                         role: v.role,
                         data: v.data,
-                        time: v.time ?? 0
+                        chatId: v.chatId,
+                        time: v.time ?? 0,
                     }
                 }))
                 return data
@@ -436,11 +438,27 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 const realValue = JSON.parse(value)
-
+                const originals = new Map<string, Chat['message'][number] | null>()
+                for (const message of ScriptingEngineState.chat.message) {
+                    if (message.chatId)
+                        originals.set(
+                            message.chatId,
+                            originals.has(message.chatId) ? null : message,
+                        )
+                }
+                const counts = new Map<string, number>()
+                for (const message of realValue) {
+                    if (typeof message.chatId === 'string')
+                        counts.set(message.chatId, (counts.get(message.chatId) ?? 0) + 1)
+                }
                 ScriptingEngineState.chat.message = realValue.map((v) => {
+                    // A getFullChat/setFullChat round trip keeps identity and plugin metadata.
+                    // New or duplicated identities remain new messages, never another output target.
+                    const original = counts.get(v.chatId) === 1 ? originals.get(v.chatId) : null
                     return {
+                        ...original,
                         role: v.role,
-                        data: v.data
+                        data: v.data,
                     }
                 })
             })
@@ -1618,7 +1636,9 @@ ${code}
 `
 }
 
-function createCurrentConversationOperation(): {
+function createCurrentConversationOperation(
+    onCommitted?: ConversationCommitObserver,
+): {
     context: ConversationOperationContext
     sourceChat: Chat
 } | null {
@@ -1627,19 +1647,20 @@ function createCurrentConversationOperation(): {
     const sourceChat = getCurrentChat()
     if (session.materializeCompatibilityArray() !== sourceChat.message) return null
     return {
-        context: createConversationOperationContext(session, sourceChat),
+        context: createConversationOperationContext(session, sourceChat, onCommitted),
         sourceChat,
     }
 }
 
-export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
-    char: character|groupChat|simpleCharacterArgument,
+export async function runLuaEditTrigger<T extends string | OpenAIChat[]>(
+    char: character | groupChat | simpleCharacterArgument,
     mode: string,
     content: T,
     meta?: object,
     conversationOperation?: ConversationOperationContext,
-): Promise<T>{
-    switch(mode){
+    onConversationCommit?: ConversationCommitObserver,
+): Promise<T> {
+    switch (mode) {
         case 'editinput':
             mode = 'editInput'
             break
@@ -1658,20 +1679,25 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
     try {
         let data = content
 
-        const triggers = char.type === 'group' ? (getModuleTriggers()) : (char.triggerscript.map((v) => {
-            v.lowLevelAccess = false
-            return v
-        }).concat(getModuleTriggers()))
+        const triggers =
+            char.type === 'group'
+                ? getModuleTriggers()
+                : char.triggerscript
+                      .map((v) => {
+                          v.lowLevelAccess = false
+                          return v
+                      })
+                      .concat(getModuleTriggers())
         if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
             return content
         }
         if (!operationContext) {
-            ownedOperation = createCurrentConversationOperation()
+            ownedOperation = createCurrentConversationOperation(onConversationCommit)
             operationContext = ownedOperation?.context
         }
-    
-        for(let trigger of triggers){
-            if(trigger?.effect?.[0]?.type === 'triggerlua'){
+
+        for (let trigger of triggers) {
+            if (trigger?.effect?.[0]?.type === 'triggerlua') {
                 const runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
                     lowLevelAccess: false,
@@ -1683,9 +1709,8 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
                 data = runResult.res ?? data
             }
         }
-        
-    
-        return data   
+
+        return data
     } catch (error) {
         return content
     } finally {

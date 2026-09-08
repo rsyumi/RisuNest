@@ -7,7 +7,7 @@ import { beforeAll, expect, test, vi } from 'vitest'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { requestChatData } from './request/request'
 import { readImage } from '../globalApi.svelte'
-import { getCurrentCharacter, getDatabase } from '../storage/database.svelte'
+import { getCurrentCharacter, getCurrentChat, getDatabase } from '../storage/database.svelte'
 import { asBuffer } from '../util'
 import { writeInlayImage } from './files/inlays'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
@@ -16,6 +16,19 @@ import type { Chat, character } from '../storage/database.svelte'
 import { DBState } from '../stores.svelte'
 import { risuChatParser } from '../parser/parser.svelte'
 import type { LuaEngine } from 'wasmoon'
+import { appendDefaultChatInput } from '../../lib/ChatScreens/defaultChatInput'
+import {
+  captureConversationMutationTarget,
+  isConversationMutationTargetCurrent,
+} from '../conversationMutations'
+import { captureGenerationConversationOperation } from './generationConversationOperation'
+
+const continuationRuntime = vi.hoisted(() => ({
+  session: null as ActiveConversationSession | null,
+}))
+vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+  peekActiveConversationSession: () => continuationRuntime.session,
+}))
 
 const scriptingSelectionState = vi.hoisted(() => ({ index: 0 }))
 const createdLuaEngines = vi.hoisted(() => [] as LuaEngine[])
@@ -1499,3 +1512,92 @@ test('settles a resumed coroutine rejection without leaving an unhandled rejecti
     vi.mocked(requestChatData).mockReset()
   }
 }, 12_000)
+
+test.each(['editinput', 'editoutput'] as const)(
+  'continues after real Lua %s full-chat and variable edits',
+  async (mode) => {
+    const fixture = operationCharacterFixture(`continuation-${mode}`)
+    fixture.session.edit(fixture.session.locate(0), {
+      ...fixture.chat.message[0],
+      ...{ __translation: { value: 'retained' } },
+    })
+    fixture.char.customscript = []
+    fixture.char.triggerscript = [
+      {
+        type: 'output',
+        comment: 'synthetic',
+        conditions: [],
+        effect: [
+          {
+            type: 'triggerlua',
+            code: `
+      listenEdit('${mode === 'editinput' ? 'editInput' : 'editOutput'}', function(id, value, meta)
+        local messages = getFullChat(id)
+        messages[1].data = 'rewritten'
+        table.insert(messages, 1, {role = 'user', data = 'inserted'})
+        setFullChat(id, messages)
+        setChatVar(id, 'state', 'updated')
+        return value .. ' processed'
+      end)
+    `,
+          },
+        ],
+      },
+    ]
+    installOperationCharacterFixture(fixture)
+    vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+    vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+    continuationRuntime.session = fixture.session
+    const { runLuaEditTrigger } = await import('./scriptings')
+    try {
+      if (mode === 'editinput') {
+        const target = captureConversationMutationTarget(
+          fixture.char,
+          fixture.chat,
+          fixture.session,
+        )
+        await expect(
+          appendDefaultChatInput({
+            target,
+            runInputTrigger: async () => null,
+            processInput: (onCommitted) =>
+              runLuaEditTrigger(fixture.char, mode, 'input', {}, undefined, onCommitted),
+            isTargetCurrent: (current) =>
+              isConversationMutationTargetCurrent(
+                current,
+                fixture.char,
+                fixture.chat,
+                fixture.session,
+              ),
+            createMessage: (data) => ({ role: 'user', data }),
+          }),
+        ).resolves.toBe(true)
+        expect(fixture.chat.message.map((message) => message.data)).toEqual([
+          'inserted',
+          'rewritten',
+          'input processed',
+        ])
+      } else {
+        const output = captureGenerationConversationOperation({
+          session: fixture.session,
+          getCurrentSession: () => fixture.session,
+          chat: fixture.chat,
+          getCurrentChat: () => fixture.chat,
+          continueLast: true,
+        })
+        await runLuaEditTrigger(fixture.char, mode, 'output', {}, undefined, (commit) => {
+          output.acceptCommit(commit)
+        })
+        expect(output.snapshot()?.data).toBe('rewritten')
+        expect(output.absoluteIndex).toBe(1)
+        output.release()
+      }
+      expect(fixture.chat.scriptstate).toEqual({ $state: 'updated' })
+      expect(fixture.chat.message[1].chatId).toBe(`message-continuation-${mode}`)
+      expect(fixture.chat.message[1]).toMatchObject({ __translation: { value: 'retained' } })
+      expect(fixture.session.activePinReasons).toEqual([])
+    } finally {
+      continuationRuntime.session = null
+    }
+  },
+)

@@ -1126,7 +1126,16 @@ export function createPluginDatabaseAccess(
                 throw new Error(STALE_DATABASE_SET_ERROR)
             }
             if (initialProfile === 'maximum-compatibility') {
-                await dependencies.applyCompatibilityDatabase(dependencies.snapshot(preparedUpdate))
+                if (hasCharacterUpdate(preparedUpdate)) {
+                    await dependencies.applyCompatibilityDatabase(
+                        dependencies.snapshot(preparedUpdate),
+                    )
+                } else {
+                    dependencies.applyCompatibilityDatabaseLite(
+                        dependencies.snapshot(preparedUpdate),
+                    )
+                    await dependencies.flushPendingData('plugin-root-update')
+                }
                 return
             }
             if (hasCharacterUpdate(preparedUpdate)) {
@@ -1136,6 +1145,13 @@ export function createPluginDatabaseAccess(
             const storageMutations = pluginStorageMutations(preparedUpdate, allowedKeys)
             if (Object.keys(compatibilityUpdate).length === 0) {
                 await dependencies.mutatePluginStorage(storageMutations)
+                return
+            }
+            if (!hasCharacterUpdate(compatibilityUpdate)) {
+                dependencies.applyCompatibilityDatabaseLite(compatibilityUpdate)
+                if (storageMutations.length > 0)
+                    await dependencies.mutatePluginStorage(storageMutations)
+                await dependencies.flushPendingData('plugin-root-update')
                 return
             }
             const materialized = await dependencies.materializeDatabaseSnapshot(

@@ -7,6 +7,7 @@ import {
     isConversationMutationTargetCurrent,
 } from '../../ts/conversationMutations'
 import { appendDefaultChatInput } from './defaultChatInput'
+import { createConversationOperationContext } from '../../ts/process/conversationOperationContext'
 
 function createConversation(messages: Message[]): Chat {
     return {
@@ -36,6 +37,46 @@ function deferred<T>() {
 }
 
 describe('DefaultChatScreen input append helper', () => {
+    it.each([false, true])(
+        'keeps plugin metadata saved during input processing (followed by script: %s)',
+        async (followWithScript) => {
+            const conversation = createConversation([{ role: 'char', data: 'before' }])
+            const character = createCharacter(conversation)
+            const session = new ActiveConversationSession({
+                characterId: character.chaId,
+                conversationId: conversation.id,
+                conversation,
+                storeRevision: 1,
+            })
+            const target = captureConversationMutationTarget(character, conversation, session)
+            const result = await appendDefaultChatInput({
+                target,
+                runInputTrigger: async () => null,
+                processInput: async (onCommitted) => {
+                    const next = structuredClone(conversation)
+                    next.scriptstate = { $bridge: 'on' }
+                    expect(session.adoptPersistedMetadata(next, 2)).toBe(true)
+                    if (followWithScript) {
+                        const operation = createConversationOperationContext(
+                            session,
+                            conversation,
+                            onCommitted,
+                        )
+                        operation.chat.scriptstate.$script = 'after plugin'
+                        operation.commit(session)
+                    }
+                    return 'input'
+                },
+                isTargetCurrent: (current) =>
+                    isConversationMutationTargetCurrent(current, character, conversation, session),
+                createMessage: (data) => ({ role: 'user', data }),
+            })
+            expect(result).toBe(true)
+            expect(conversation.scriptstate).toMatchObject({ $bridge: 'on' })
+            if (followWithScript) expect(conversation.scriptstate.$script).toBe('after plugin')
+            expect(conversation.message.map((message) => message.data)).toEqual(['before', 'input'])
+        },
+    )
     it('does not restore a stale trigger tail after the same session changes', async () => {
         const conversation = createConversation([{ role: 'char', data: 'before' }])
         const character = createCharacter(conversation)

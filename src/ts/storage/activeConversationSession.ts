@@ -1075,6 +1075,7 @@ export class ActiveConversationSession {
     ) => void>()
     private locatorRegistry = new ConversationLocatorRegistry()
     private sessionVersion = 0
+    private generationContinuationStart = 0
     private persistedSessionVersion = 0
     private currentStoreRevision: DataRevision
     private transactionActive = false
@@ -1104,6 +1105,76 @@ export class ActiveConversationSession {
 
     get storeRevision(): DataRevision {
         return this.currentStoreRevision
+    }
+
+    /** Persisted metadata may advance edit locators without changing a request's input. */
+    canContinueGenerationFrom(version: number): boolean {
+        return (
+            this.active &&
+            version >= this.generationContinuationStart &&
+            version <= this.sessionVersion
+        )
+    }
+
+    get generationInvalidationVersion(): number {
+        return this.generationContinuationStart
+    }
+
+    adoptPersistedMetadata(replacement: Chat, revision: DataRevision): boolean {
+        this.assertActive()
+        if (
+            this.transactionActive ||
+            this.sessionVersion !== this.persistedSessionVersion ||
+            revision < this.currentStoreRevision ||
+            replacement.id !== this.conversationId ||
+            replacement.message.length !== this.conversation.message.length
+        )
+            return false
+        // These fields affect the prompt or identify its messages. Unknown plugin fields,
+        // timing and generation diagnostics are metadata, and must survive later writes.
+        const contentKeys = [
+            'role',
+            'data',
+            'saying',
+            'chatId',
+            'name',
+            'otherUser',
+            'disabled',
+            'isComment',
+        ] as const
+        if (
+            !replacement.message.every((message, index) =>
+                contentKeys.every((key) =>
+                    Object.is(message[key], this.conversation.message[index][key]),
+                ),
+            )
+        )
+            return false
+        const metadata = cloneConversationMetadata(replacement)
+        const messages = replacement.message
+        const version = this.sessionVersion + 1
+        if (
+            !this.compatibilityFallback &&
+            !this.residency.adoptPersistedMetadata(revision, version, messages)
+        )
+            return false
+        replaceConversationMetadata(this.conversation, metadata)
+        this.conversation.message = messages
+        this.locatorRegistry.clear()
+        this.sessionVersion = version
+        this.persistedSessionVersion = version
+        this.currentStoreRevision = revision
+        this.notifySubscribers({
+            characterId: this.characterId,
+            conversationId: this.conversationId,
+            sessionToken: this.locatorRegistry.sessionToken,
+            previousVersion: version - 1,
+            sessionVersion: version,
+            commands: ['update-metadata'],
+            mutations: [],
+            conversation: metadata,
+        })
+        return true
     }
 
     advanceStoreRevision(revision: DataRevision): boolean {
@@ -2078,6 +2149,7 @@ export class ActiveConversationSession {
             conversation: cloneConversationMetadata(this.conversation),
         }
         this.onMutation?.(event)
+        this.generationContinuationStart = this.sessionVersion
         if (this.compatibilityFallback) {
             this.compatibilityBaselineMessageCount = this.conversation.message.length
         } else {

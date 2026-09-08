@@ -402,21 +402,30 @@
             if(character.type === 'character'){
                 const appended = await appendDefaultChatInput({
                     target: mutationTarget,
-                    runInputTrigger: () => runTrigger(
-                        character,
-                        'input',
-                        { chat: mutationTarget.conversation },
-                    ),
-                    processInput: () => processScript(character, messageInput, 'editinput'),
-                    isTargetCurrent: () => {
+                    recaptureTarget: () =>
+                        requireConversationMutationTarget(context),
+                    runInputTrigger: (onConversationCommit) =>
+                        runTrigger(character, 'input', {
+                            chat: mutationTarget.conversation,
+                            onConversationCommit,
+                        }),
+                    processInput: (onConversationCommit) =>
+                        processScript(
+                            character,
+                            messageInput,
+                            'editinput',
+                            {},
+                            { onConversationCommit },
+                        ),
+                    isTargetCurrent: (target) => {
                         context.requireCurrent()
-                        return conversationTargetIsCurrent(mutationTarget)
+                        return conversationTargetIsCurrent(target)
                     },
                     createMessage: (data) => ({
                         role: 'user',
                         data,
                         time: Date.now(),
-                        name: $ConnectionOpenStore ? DBState.db.username : null
+                        name: $ConnectionOpenStore ? DBState.db.username : null,
                     }),
                 })
                 context.requireCurrent()

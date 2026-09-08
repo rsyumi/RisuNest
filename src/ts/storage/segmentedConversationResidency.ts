@@ -275,6 +275,32 @@ export class SegmentedConversationResidency {
         return true
     }
 
+    adoptPersistedMetadata(
+        revision: DataRevision,
+        version: number,
+        messages: readonly Message[],
+    ): boolean {
+        if (
+            revision < this.baseRevision ||
+            version !== this.currentSessionVersion + 1 ||
+            messages.length !== this.messageCount ||
+            this.dirtyRecords.length > 0 ||
+            this.pendingSaveAttempts.size > 0 ||
+            this.streamingOverlay !== null
+        )
+            return false
+        const entries = [...this.entries].map(([index, entry]) => {
+            const message = safeStructuredClone(messages[index])
+            return [index, { ...entry, message, byteSize: this.measure(message) }] as const
+        })
+        for (const [index, entry] of entries) this.entries.set(index, entry)
+        this.baseRevision = revision
+        this.currentSessionVersion = version
+        this.acknowledgedVersion = version
+        this.evictToBudget()
+        return true
+    }
+
     get residentBytes(): number {
         let bytes = 0
         const counted = new Set<Message>()

@@ -184,8 +184,12 @@ export function createSelectedConversationOperations(
             intent,
             reason,
         ): Promise<AcquiredCompleteMessageTarget | null> {
+            const selection = dependencies.captureSelectedConversationTarget()
+            if (!selection || !matchesSelection(intent.selection, selection)) {
+                throw new SelectedConversationPromotionStaleError()
+            }
             const acquired = await acquireCompleteMessageTarget(
-                intent.selection,
+                selection,
                 intent.absoluteIndex,
                 reason,
             )

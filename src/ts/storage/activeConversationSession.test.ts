@@ -54,6 +54,47 @@ function createSession(conversation = chat(), onMutation = vi.fn()) {
 }
 
 describe('ActiveConversationSession', () => {
+    it('adopts persisted metadata without allowing an old message edit to overwrite it', () => {
+        const { session, conversation, onMutation } = createSession()
+        const locator = session.locate(3)
+        const pin = session.acquirePin('transaction')
+        const replacement = structuredClone(conversation)
+        replacement.scriptstate = { $state: 'new' }
+        Object.assign(replacement.message[3], { __translation: 'record' })
+        expect(session.adoptPersistedMetadata(replacement, 8)).toBe(true)
+        expect(session.canContinueGenerationFrom(locator.sessionVersion)).toBe(true)
+        expect(session.ownsMessageLocator(locator)).toBe(false)
+        expect(session.readMessage(session.locate(3))).toMatchObject({
+            data: 'three',
+            __translation: 'record',
+        })
+        expect(conversation.scriptstate).toEqual({ $state: 'new' })
+        expect(onMutation).not.toHaveBeenCalled()
+        session.append(message('later', 'new turn'))
+        expect(session.canContinueGenerationFrom(locator.sessionVersion)).toBe(false)
+        pin.release()
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it.each(['data', 'chatId', 'role', 'disabled', 'isComment', 'name'] as const)(
+        'rejects persisted replacement changing message %s',
+        (field) => {
+            const { session, conversation } = createSession()
+            const replacement = structuredClone(conversation)
+            Object.assign(replacement.message[0], { [field]: 'different' })
+            expect(session.adoptPersistedMetadata(replacement, 8)).toBe(false)
+            expect(session.version).toBe(0)
+            expect(conversation.message[0].data).toBe('zero')
+        },
+    )
+
+    it('does not acknowledge pending local edits as a persisted metadata replacement', () => {
+        const { session, conversation } = createSession()
+        const replacement = structuredClone(conversation)
+        session.append(message('local', 'unsaved'))
+        expect(session.adoptPersistedMetadata(replacement, 8)).toBe(false)
+        expect(conversation.message.at(-1)?.data).toBe('unsaved')
+    })
     it('reads and resolves an owned message through a locator without exposing the backing array', () => {
         const { session } = createSession(chat([
             message('duplicate', 'first'),

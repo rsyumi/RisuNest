@@ -672,6 +672,16 @@ export class ActiveWorkingSet {
         }
         if (conversation === state.conversation) return false
 
+        if (
+            expectedSession.adoptPersistedMetadata(
+                conversation,
+                this.dependencies.coordinator.revision,
+            )
+        ) {
+            resident!.chats[resident!.chatPage ?? 0] = state.conversation
+            return true
+        }
+
         this.publishActiveConversationSession(
             target.characterId,
             conversation,

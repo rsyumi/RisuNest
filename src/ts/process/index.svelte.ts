@@ -1738,18 +1738,19 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const requestSourceMessages = requestSourceConversation.message
     const requestSourceSession = getActiveConversationSession()
     const requestSourceSessionVersion = requestSourceSession?.version
-    const isRequestSourceCurrent = () => get(selectedCharID) === requestSourceCharacterIndex
-        && DBState.db.characters[requestSourceCharacterIndex] === requestSourceCharacter
-        && requestSourceCharacter.chaId === requestSourceCharacterId
-        && requestSourceCharacter.chatPage === requestSourceChatPage
-        && requestSourceCharacter.chats[requestSourceChatPage] === requestSourceConversation
-        && requestSourceConversation.message === requestSourceMessages
-        && getActiveConversationSession() === requestSourceSession
-        && (requestSourceSession === null || (
-            requestSourceSession.isActive
-            && requestSourceSession.version === requestSourceSessionVersion
-            && requestSourceSession.materializeCompatibilityArray() === requestSourceMessages
-        ))
+    const isRequestSourceCurrent = () =>
+        get(selectedCharID) === requestSourceCharacterIndex &&
+        DBState.db.characters[requestSourceCharacterIndex]?.chaId === requestSourceCharacterId &&
+        DBState.db.characters[requestSourceCharacterIndex]?.chatPage === requestSourceChatPage &&
+        DBState.db.characters[requestSourceCharacterIndex]?.chats[requestSourceChatPage] ===
+            requestSourceConversation &&
+        getActiveConversationSession() === requestSourceSession &&
+        (requestSourceSession === null
+            ? requestSourceConversation.message === requestSourceMessages
+            : requestSourceSession.isActive &&
+              requestSourceSession.canContinueGenerationFrom(requestSourceSessionVersion!) &&
+              requestSourceSession.materializeCompatibilityArray() ===
+                  requestSourceConversation.message)
     const req = await requestChatData({
         formated: formated,
         biasString: biases,
@@ -1822,45 +1823,52 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         operation: {
             getCurrentSession: getActiveConversationSession,
             getTargetChat: () => DBState.db.characters[selectedChar]?.chats[selectedChat],
-            isOwnerCurrent: () => get(selectedCharID) === selectedChar
-                && DBState.db.characters[selectedChar] === requestSourceCharacter
-                && requestSourceCharacter.chatPage === selectedChat,
+            isOwnerCurrent: () =>
+                get(selectedCharID) === selectedChar &&
+                DBState.db.characters[selectedChar]?.chaId === requestSourceCharacterId &&
+                DBState.db.characters[selectedChar]?.chatPage === selectedChat,
             publishTargetChat: (chat) => {
-                requestSourceCharacter.chats[selectedChat] = chat
+                DBState.db.characters[selectedChar].chats[selectedChat] = chat
             },
             invalidateSession: invalidateActiveConversationSession,
             incrementReloadKeys: () => {
-                requestSourceCharacter.reloadKeys += 1
+                DBState.db.characters[selectedChar].reloadKeys += 1
             },
         },
         callbacks: {
             reformatContent,
-            processOutput: (data, messageIndex, processing) => processing
-                ? processScriptFull(
-                    nowChatroom,
-                    reformatContent(data),
-                    'editoutput',
-                    messageIndex,
-                    {},
-                    processing,
-                )
-                : processScriptFull(
-                    nowChatroom,
-                    reformatContent(data),
-                    'editoutput',
-                    messageIndex,
-                ),
+            processOutput: (data, messageIndex, processing) =>
+                processing
+                    ? processScriptFull(
+                          nowChatroom,
+                          reformatContent(data),
+                          'editoutput',
+                          messageIndex,
+                          {},
+                          processing,
+                      )
+                    : processScriptFull(
+                          nowChatroom,
+                          reformatContent(data),
+                          'editoutput',
+                          messageIndex,
+                      ),
             runCurrentChatParser: runCurrentChatFunction,
             runInlay: (data) => runInlayScreen(currentChar, data),
-            runOutputTrigger: (chat) => runTrigger(currentChar, 'output', { chat }),
-            runOutputListeners: (chat, messageIndex) => runChatOutputListeners(
-                currentChar,
-                chat,
-                selectedChar,
-                selectedChat,
-                messageIndex,
-                abortSignal,
-            ),
+            runOutputTrigger: (chat, onConversationCommit) =>
+                runTrigger(currentChar, 'output', {
+                    chat,
+                    onConversationCommit,
+                }),
+            runOutputListeners: (chat, messageIndex) =>
+                runChatOutputListeners(
+                    currentChar,
+                    chat,
+                    selectedChar,
+                    selectedChat,
+                    messageIndex,
+                    abortSignal,
+                ),
             speak: (data) => sayTTS(currentChar, data),
             addRerolls,
             trimIncompleteResponse: trimUntilPunctuation,

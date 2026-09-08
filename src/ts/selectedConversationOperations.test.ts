@@ -425,10 +425,7 @@ describe('selected conversation complete-operation gateway', () => {
             intent!,
             'stale-windowed-edit',
         )).rejects.toBeInstanceOf(SelectedConversationPromotionStaleError)
-        expect(harness.acquireCompleteConversation).toHaveBeenCalledWith(
-            'stale-windowed-edit',
-            original,
-        )
+        expect(harness.acquireCompleteConversation).not.toHaveBeenCalled()
     })
 
     it('captures immutable edit evidence and compares it structurally after promotion', async () => {

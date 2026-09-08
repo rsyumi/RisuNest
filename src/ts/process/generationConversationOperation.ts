@@ -1,4 +1,5 @@
 import { safeStructuredClone } from '../polyfill'
+import type { ConversationOperationCommit } from './conversationOperationContext'
 import type { Chat, Message } from '../storage/database.svelte'
 import type {
     ActiveConversationSession,
@@ -26,13 +27,17 @@ export interface GenerationConversationOperation {
     commitData(data: string): boolean
     commitMessage(message: Message): boolean
     refresh(): boolean
+    acceptCommit(commit: ConversationOperationCommit): boolean
     release(): void
 }
 
 function hasExactlyOneTarget(options: GenerationConversationOperationOptions): boolean {
-    return Number(options.append !== undefined)
-        + Number(options.continueLast === true)
-        + Number(options.messageId !== undefined) === 1
+    return (
+        Number(options.append !== undefined) +
+            Number(options.continueLast === true) +
+            Number(options.messageId !== undefined) ===
+        1
+    )
 }
 
 function canUseActiveSession(options: GenerationConversationOperationOptions): boolean {
@@ -117,10 +122,11 @@ function captureSessionOperation(
 
     let released = false
     let currentMessageId = session.readMessage(locator).chatId
-    const ownerIsCurrent = () => !released
-        && (options.isOwnerCurrent?.() ?? true)
-        && options.getCurrentSession() === session
-        && options.getCurrentChat() === options.chat
+    const ownerIsCurrent = () =>
+        !released &&
+        (options.isOwnerCurrent?.() ?? true) &&
+        options.getCurrentSession() === session &&
+        options.getCurrentChat() === options.chat
 
     const operation: GenerationConversationOperation = {
         get absoluteIndex() {
@@ -131,6 +137,14 @@ function captureSessionOperation(
         },
         usesFullArrayFallback: false,
         isOwned() {
+            if (
+                ownerIsCurrent() &&
+                session.canContinueGenerationFrom(locator.sessionVersion) &&
+                locator.sessionVersion !== session.version
+            ) {
+                // Metadata publication preserves positions and content but invalidates edit locators.
+                locator = session.locate(locator.absoluteIndex)
+            }
             return ownerIsCurrent() && session.ownsMessageLocator(locator)
         },
         snapshot() {
@@ -138,9 +152,7 @@ function captureSessionOperation(
         },
         commitData(data) {
             const current = operation.snapshot()
-            return current === null
-                ? false
-                : operation.commitMessage({ ...current, data })
+            return current === null ? false : operation.commitMessage({ ...current, data })
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
@@ -154,6 +166,11 @@ function captureSessionOperation(
             if (refreshed === null) return false
             locator = refreshed
             return true
+        },
+        acceptCommit(commit) {
+            return (
+                commit.follows(session, locator.sessionVersion, options.chat) && operation.refresh()
+            )
         },
         release() {
             if (released) return
@@ -188,9 +205,8 @@ function captureFullArrayFallback(
 
     let released = false
     let currentMessageId = target.chatId
-    const ownerIsCurrent = () => !released
-        && (options.isOwnerCurrent?.() ?? true)
-        && options.getCurrentChat() === chat
+    const ownerIsCurrent = () =>
+        !released && (options.isOwnerCurrent?.() ?? true) && options.getCurrentChat() === chat
     const operation: GenerationConversationOperation = {
         get absoluteIndex() {
             return absoluteIndex
@@ -199,6 +215,7 @@ function captureFullArrayFallback(
             return currentMessageId
         },
         usesFullArrayFallback: true,
+        acceptCommit: () => false,
         isOwned() {
             return ownerIsCurrent() && chat.message[absoluteIndex] === target
         },
@@ -207,9 +224,7 @@ function captureFullArrayFallback(
         },
         commitData(data) {
             const current = operation.snapshot()
-            return current === null
-                ? false
-                : operation.commitMessage({ ...current, data })
+            return current === null ? false : operation.commitMessage({ ...current, data })
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
@@ -272,6 +287,7 @@ function captureEmptyTailFallbackOperation(
         commitData: () => false,
         commitMessage: () => false,
         refresh: ownerIsCurrent,
+        acceptCommit: () => false,
         release() {
             if (released) return
             released = true
