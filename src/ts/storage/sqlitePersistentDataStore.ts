@@ -30,6 +30,7 @@ import {
     type ColdPayloadAuthorityState,
     type ColdPayloadMigrationInput,
     type PersistentDataStore,
+    type PersistentConversationMetadata,
     type PersistentRevisionLease,
     type PersistentRoot,
     type PluginStorageCatalog,
@@ -188,6 +189,16 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         conversationId: string,
     ): Promise<Versioned<Chat> | null> {
         return invokeStore('pds_read_conversation', { characterId, conversationId })
+    }
+
+    readConversationMetadata(
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<PersistentConversationMetadata> | null> {
+        return invokeStore('pds_read_conversation_metadata', {
+            characterId,
+            conversationId,
+        })
     }
 
     async readConversationWindow(
@@ -428,6 +439,14 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readConversation: async (characterId, conversationId) => {
                 assertActive()
                 return invokeStore('pds_read_conversation', {
+                    characterId,
+                    conversationId,
+                    lease,
+                })
+            },
+            readConversationMetadata: async (characterId, conversationId) => {
+                assertActive()
+                return invokeStore('pds_read_conversation_metadata', {
                     characterId,
                     conversationId,
                     lease,

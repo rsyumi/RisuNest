@@ -13,6 +13,7 @@ export function createConversationSummaryStub(summary: ConversationSummary): Cha
         localLore: [],
         message: [],
         lastDate: summary.recentAt,
+        ...(summary.fmIndex === undefined ? {} : { fmIndex: summary.fmIndex }),
     }
     Object.defineProperty(stub, conversationSummaryStub, {
         configurable: false,
@@ -28,18 +29,52 @@ export function createConversationSummaryStubFromChat(
     conversation: Chat,
     configuredIndex: number,
 ): Chat {
-    return createConversationSummaryStub({
+    return createConversationSummaryStub(
+        createConversationSummaryFromMetadata(
+            characterId,
+            conversation,
+            configuredIndex,
+            conversation.message.length,
+            conversation.lastDate ?? conversation.message.at(-1)?.time ?? 0,
+        ),
+    )
+}
+
+export function createConversationSummaryFromMetadata(
+    characterId: string,
+    conversation: Omit<Chat, 'message'>,
+    configuredIndex: number,
+    messageCount: number,
+    recentAtFallback: number,
+    retained?: ConversationSummary,
+): ConversationSummary {
+    return {
+        ...retained,
         id: conversation.id!,
         characterId,
         name: conversation.name,
         folderId: conversation.folderId,
         bindedPersona: conversation.bindedPersona,
-        configuredIndex,
-        recentAt: conversation.lastDate ?? conversation.message.at(-1)?.time ?? 0,
-        messageCount: conversation.message.length,
-    })
+        configuredIndex: retained?.configuredIndex ?? configuredIndex,
+        recentAt: conversation.lastDate ?? recentAtFallback,
+        messageCount,
+        ...((conversation.fmIndex ?? retained?.fmIndex) === undefined
+            ? {}
+            : { fmIndex: conversation.fmIndex ?? retained?.fmIndex }),
+    }
 }
 
 export function isConversationSummaryStub(conversation: Chat): boolean {
     return conversationSummaryStub in conversation
+}
+
+export function getConversationSummaryStub(
+    conversation: Chat,
+): ConversationSummary | null {
+    if (!isConversationSummaryStub(conversation)) return null
+    return (
+        conversation as Chat & {
+            readonly [conversationSummaryStub]: ConversationSummary
+        }
+    )[conversationSummaryStub]
 }

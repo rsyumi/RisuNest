@@ -24,6 +24,7 @@ import type {
     DataRevision,
     AssetRepositoryAuthorityState,
     AssetRepositoryMigrationInput,
+    PersistentConversationMetadata,
     PersistentDataStore,
     PersistentRevisionLease,
     PersistentRoot,
@@ -592,6 +593,24 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )
         const { revision, generation } = await this.readActive(transaction)
         return this.readConversationFromTransaction(
+            transaction,
+            revision,
+            generation,
+            characterId,
+            conversationId,
+        )
+    }
+
+    async readConversationMetadata(
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<PersistentConversationMetadata> | null> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'conversations'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readConversationMetadataFromTransaction(
             transaction,
             revision,
             generation,
@@ -1292,6 +1311,26 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 )
                 await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.readConversationFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                    characterId,
+                    conversationId,
+                )
+            },
+            readConversationMetadata: async (characterId, conversationId) => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'conversations'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(
+                    transaction,
+                    lease,
+                    generation,
+                    revision,
+                )
+                return this.readConversationMetadataFromTransaction(
                     transaction,
                     revision,
                     generation,
@@ -2013,6 +2052,47 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )
         await transactionDone(transaction)
         return { revision, value: { ...record.value.detail, message } }
+    }
+
+    private async readConversationMetadataFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<PersistentConversationMetadata> | null> {
+        const record = (await requestResult(
+            transaction
+                .objectStore('conversations')
+                .get(
+                    this.conversationKey(
+                        generation,
+                        characterId,
+                        conversationId,
+                    ),
+                ),
+        )) as StoredRecord<StoredConversation> | undefined
+        await transactionDone(transaction)
+        if (!record) return null
+        const totalMessages = record.value.summary.messageCount
+        if (!Number.isSafeInteger(totalMessages) || totalMessages < 0) {
+            throw new TypeError(
+                'Persistent conversation metadata message count must be a nonnegative safe integer',
+            )
+        }
+        const detail = record.value.detail as Omit<Chat, 'message'> & {
+            message?: unknown
+        }
+        const { message: _message, ...conversation } = detail
+        return {
+            revision,
+            value: {
+                characterId,
+                conversationId,
+                conversation,
+                totalMessages,
+            },
+        }
     }
 
     private async readConversationWindowFromTransaction(

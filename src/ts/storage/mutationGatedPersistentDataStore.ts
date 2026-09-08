@@ -40,6 +40,8 @@ export function createMutationGatedPersistentDataStore(
             store.queryConversations(input),
         readConversation: (characterId, conversationId) =>
             store.readConversation(characterId, conversationId),
+        readConversationMetadata: (characterId, conversationId) =>
+            store.readConversationMetadata(characterId, conversationId),
         readConversationWindow: (
             input: ConversationWindowQuery,
         ): Promise<Versioned<ConversationWindow> | null> => store.readConversationWindow(input),

@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { character, groupChat } from './database.svelte'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { Chat, character, groupChat } from './database.svelte'
+import type {
+    CharacterDetail,
+    PersistentDataStore,
+} from './persistentDataStore'
 import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
 import {
     captureRoot,
@@ -113,6 +116,7 @@ describe('SaveCoordinator', () => {
                 onPersisted,
                 projectedConversation,
                 readConversationWindow,
+                selected: () => selected,
                 replaceAuthority: (next: TestWindowedAuthority | null) => {
                     authority = next
                 },
@@ -193,6 +197,398 @@ describe('SaveCoordinator', () => {
                 projection,
                 authority,
             )).toBe(false)
+        })
+
+        it('retains and persists only the exact character detail and conversation metadata adopted during activation', async () => {
+            const database = makeDatabase()
+            const beforeCharacter = {
+                type: 'character',
+                chaId: 'char-a',
+                name: 'Alpha',
+                chatPage: 0,
+                lastInteraction: 10,
+            } as unknown as CharacterDetail
+            const afterCharacter = {
+                ...beforeCharacter,
+                chatPage: 1,
+                lastInteraction: 20,
+            } as CharacterDetail
+            const beforeConversation = {
+                id: 'two',
+                name: 'Two',
+                localLore: [],
+                note: 'before',
+            }
+            const afterConversation = {
+                ...beforeConversation,
+                note: 'after',
+                fmIndex: -1,
+            }
+            const selected = {
+                ...afterCharacter,
+                chats: [
+                    { id: 'one', name: 'One', localLore: [], note: '' },
+                    afterConversation,
+                ],
+            } as unknown as character
+            const sessionToken = 'activation-session' as any
+            let authority: TestWindowedAuthority = {
+                kind: 'windowed',
+                characterId: 'char-a',
+                conversationId: 'two',
+                sessionToken,
+                storeRevision: 2,
+                persistedSessionVersion: 0,
+                sessionVersion: 0,
+                totalMessages: 10_000,
+            }
+            const commit = vi
+                .fn()
+                .mockRejectedValueOnce(new Error('activation commit failed'))
+                .mockImplementation(async ({ expectedRevision }) => ({
+                    revision: expectedRevision + 1,
+                }))
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => selected,
+                captureSelectedConversationAuthority: () => authority,
+                replaceDatabase: () => undefined,
+                onWindowedSelectedConversationRevision: (revision) => {
+                    authority = { ...authority, storeRevision: revision }
+                },
+            })
+            coordinator.initialize(2, database)
+
+            expect(
+                coordinator.runSelectedConversationTransition(() =>
+                    coordinator.adoptWindowedSelectedConversation(
+                        2,
+                        coordinator.mutationGeneration,
+                        selected,
+                        authority,
+                        {
+                            character: {
+                                before: beforeCharacter,
+                                after: afterCharacter,
+                            },
+                            conversation: {
+                                before: beforeConversation,
+                                after: afterConversation,
+                            },
+                        },
+                    ),
+                ),
+            ).toBe(true)
+            expect(coordinator.hasPendingPersistenceWork).toBe(true)
+
+            await expect(
+                coordinator.flushPendingData('windowed-activation-failure'),
+            ).rejects.toThrow('activation commit failed')
+            expect(coordinator.hasPendingPersistenceWork).toBe(true)
+            await coordinator.flushPendingData('windowed-activation-retry')
+
+            expect(commit).toHaveBeenCalledTimes(2)
+            expect(commit.mock.calls[1][0]).toEqual({
+                expectedRevision: 2,
+                character: afterCharacter,
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId: 'char-a',
+                        conversationId: 'two',
+                        start: 0,
+                        deleteCount: 0,
+                        messages: [],
+                        conversation: afterConversation,
+                    },
+                ],
+            })
+            expect(commit.mock.calls[1][0]).toEqual(commit.mock.calls[0][0])
+            expect(commit.mock.calls[1][0]).not.toHaveProperty(
+                'replaceCharacter',
+            )
+
+            selected.chatPage = 0
+            coordinator.markPersistentDataDirty(1)
+            await expect(
+                coordinator.flushPendingData('unrecorded-page-change'),
+            ).rejects.toThrow(/compatibility/i)
+            expect(commit).toHaveBeenCalledTimes(2)
+        })
+
+        it('composes activation metadata before a later exact message event', async () => {
+            const database = makeDatabase()
+            const beforeCharacter = {
+                type: 'character',
+                chaId: 'char-a',
+                name: 'Alpha',
+                lastInteraction: 10,
+            } as unknown as CharacterDetail
+            const afterCharacter = {
+                ...beforeCharacter,
+                lastInteraction: 20,
+            } as CharacterDetail
+            const beforeConversation = {
+                id: 'two',
+                name: 'Two',
+                localLore: [],
+                note: 'legacy note',
+            }
+            const activatedConversation = {
+                ...beforeConversation,
+                note: 'normalized note',
+                fmIndex: -1,
+            }
+            const eventConversation = {
+                ...activatedConversation,
+                name: 'Edited after activation',
+                note: 'later exact note',
+            }
+            const selected = {
+                ...afterCharacter,
+                chats: [activatedConversation],
+            } as unknown as character
+            const sessionToken = 'activation-with-message-session' as any
+            let authority: TestWindowedAuthority = {
+                kind: 'windowed',
+                characterId: 'char-a',
+                conversationId: 'two',
+                sessionToken,
+                storeRevision: 2,
+                persistedSessionVersion: 0,
+                sessionVersion: 0,
+                totalMessages: 10_000,
+            }
+            const commit = vi.fn(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            }))
+            const store = {
+                ...makeStore(commit),
+                readConversationWindow: vi.fn(async () => ({
+                    revision: 2,
+                    value: {
+                        characterId: 'char-a',
+                        conversationId: 'two',
+                        messages: [{ role: 'user', data: 'persisted first' }],
+                        startIndex: 0,
+                        endIndex: 1,
+                        totalMessages: 10_000,
+                        hasMoreBefore: false,
+                        hasMoreAfter: true,
+                    },
+                })),
+            } as unknown as PersistentDataStore
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => selected,
+                captureSelectedConversationAuthority: () => authority,
+                replaceDatabase: () => undefined,
+                onConversationMutationPersisted: (event) => {
+                    authority = {
+                        ...authority,
+                        storeRevision: event.revision,
+                        persistedSessionVersion: event.sessionVersion,
+                    }
+                },
+                onWindowedSelectedConversationRevision: (revision) => {
+                    authority = { ...authority, storeRevision: revision }
+                },
+            })
+            coordinator.initialize(2, database)
+
+            expect(
+                coordinator.runSelectedConversationTransition(() =>
+                    coordinator.adoptWindowedSelectedConversation(
+                        2,
+                        coordinator.mutationGeneration,
+                        selected,
+                        authority,
+                        {
+                            character: {
+                                before: beforeCharacter,
+                                after: afterCharacter,
+                            },
+                            conversation: {
+                                before: beforeConversation,
+                                after: activatedConversation,
+                            },
+                        },
+                    ),
+                ),
+            ).toBe(true)
+
+            selected.chats[0] = eventConversation as Chat
+            authority = {
+                ...authority,
+                sessionVersion: 1,
+                totalMessages: 10_001,
+            }
+            coordinator.recordActiveConversationMutation({
+                characterId: 'char-a',
+                conversationId: 'two',
+                sessionToken,
+                previousVersion: 0,
+                sessionVersion: 1,
+                commands: ['replace-range'],
+                mutations: [
+                    {
+                        start: 10_000,
+                        deleteCount: 0,
+                        messages: [
+                            { role: 'char', data: 'appended after activation' },
+                        ],
+                        sessionVersion: 1,
+                    },
+                ],
+                conversation: eventConversation,
+            })
+
+            await coordinator.flushPendingData('activation-with-message-event')
+
+            expect(commit).toHaveBeenCalledOnce()
+            expect(commit.mock.calls[0][0]).toEqual({
+                expectedRevision: 2,
+                character: afterCharacter,
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId: 'char-a',
+                        conversationId: 'two',
+                        start: 0,
+                        deleteCount: 0,
+                        messages: [],
+                        conversation: activatedConversation,
+                    },
+                    {
+                        type: 'replace-range',
+                        characterId: 'char-a',
+                        conversationId: 'two',
+                        start: 10_000,
+                        deleteCount: 0,
+                        messages: [
+                            { role: 'char', data: 'appended after activation' },
+                        ],
+                        conversation: eventConversation,
+                    },
+                ],
+            })
+            expect(authority).toMatchObject({
+                storeRevision: 3,
+                persistedSessionVersion: 1,
+                sessionVersion: 1,
+                totalMessages: 10_001,
+            })
+            expect(coordinator.hasPendingPersistenceWork).toBe(false)
+        })
+
+        it('restores windowed baselines and activation evidence when adoption publication rolls back', () => {
+            const database = makeDatabase()
+            let selected = database.characters[0]
+            let authority: TestWindowedAuthority | null = null
+            const coordinator = new SaveCoordinator({
+                store: makeStore(),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => selected,
+                captureSelectedConversationAuthority: () => authority,
+                replaceDatabase: () => undefined,
+            })
+            coordinator.initialize(2, database)
+            const previous = selected
+            const next = {
+                type: 'character',
+                chaId: 'char-a',
+                name: 'Alpha normalized',
+                chats: [{ id: 'two', name: 'Two', localLore: [], note: '' }],
+            } as unknown as character
+            const nextAuthority: TestWindowedAuthority = {
+                kind: 'windowed',
+                characterId: 'char-a',
+                conversationId: 'two',
+                sessionToken: 'rolled-back-activation' as any,
+                storeRevision: 2,
+                persistedSessionVersion: 0,
+                sessionVersion: 0,
+                totalMessages: 10_000,
+            }
+
+            expect(() =>
+                coordinator.runSelectedConversationTransition(() => {
+                    selected = next
+                    authority = nextAuthority
+                    expect(
+                        coordinator.adoptWindowedSelectedConversation(
+                            2,
+                            coordinator.mutationGeneration,
+                            next,
+                            nextAuthority,
+                            {
+                                character: {
+                                    before: {
+                                        type: 'character',
+                                        chaId: 'char-a',
+                                        name: 'Alpha',
+                                    } as unknown as CharacterDetail,
+                                    after: {
+                                        type: 'character',
+                                        chaId: 'char-a',
+                                        name: 'Alpha normalized',
+                                    } as unknown as CharacterDetail,
+                                },
+                            },
+                        ),
+                    ).toBe(true)
+                    throw new Error('publication failed')
+                }),
+            ).toThrow('publication failed')
+
+            selected = previous
+            authority = null
+            expect(coordinator.hasPendingPersistenceWork).toBe(false)
+            expect(
+                coordinator.adoptHydratedCharacter(
+                    2,
+                    coordinator.mutationGeneration,
+                    previous,
+                ),
+            ).toBe(true)
+        })
+
+        it('keeps the previous windowed baseline usable when a transfer rolls back', async () => {
+            const harness = makeWindowedHarness()
+            const previousSelected = harness.selected()
+            const previousAuthority = harness.authority()!
+            const { character: tentative } = makeWindowedProjection()
+            const tentativeAuthority = {
+                ...previousAuthority,
+                sessionToken: 'tentative-transfer' as any,
+            }
+
+            expect(() =>
+                harness.coordinator.runSelectedConversationTransition(() => {
+                    harness.replaceSelected(tentative)
+                    harness.replaceAuthority(tentativeAuthority)
+                    expect(
+                        harness.coordinator.adoptWindowedSelectedConversation(
+                            2,
+                            harness.coordinator.mutationGeneration,
+                            tentative,
+                            tentativeAuthority,
+                        ),
+                    ).toBe(true)
+                    throw new Error('tentative publication failed')
+                }),
+            ).toThrow('tentative publication failed')
+
+            harness.replaceSelected(previousSelected)
+            harness.replaceAuthority(previousAuthority)
+            await expect(
+                harness.coordinator.flushPendingData(
+                    'rolled-back-windowed-transfer',
+                ),
+            ).resolves.toBeUndefined()
+            expect(harness.commit).not.toHaveBeenCalled()
         })
 
         it('commits absolute ranges from a 10k windowed projection without traversing projected messages', async () => {

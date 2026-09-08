@@ -1674,6 +1674,104 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             await expect(lease.queryPresets()).rejects.toBeInstanceOf(SnapshotReleasedError)
         })
 
+        it('reads detached conversation metadata at the exact current and leased revisions', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const original = database.characters
+                .find((character) => character.chaId === 'char-a')!
+                .chats.find((conversation) => conversation.id === 'conv-short')!
+            const originalMetadata = original as unknown as Record<
+                string,
+                unknown
+            >
+            originalMetadata.unknownMetadata = { nested: ['preserved'] }
+            delete originalMetadata.folderId
+            const imported = await store.replaceFromDatabase(database)
+            const lease = await store.acquireRevision(imported.revision)
+            const replacement = structuredClone(original)
+            replacement.name = 'Changed after lease'
+            replacement.message.push({
+                role: 'user',
+                data: 'later',
+                chatId: 'msg-later',
+            })
+            const changed = await store.commit({
+                expectedRevision: imported.revision,
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId: 'char-a',
+                        conversationId: 'conv-short',
+                        start: 0,
+                        deleteCount: original.message.length,
+                        messages: replacement.message,
+                        conversation: replacement,
+                    },
+                ],
+            })
+
+            const current = await store.readConversationMetadata(
+                'char-a',
+                'conv-short',
+            )
+            const pinned = await lease.readConversationMetadata(
+                'char-a',
+                'conv-short',
+            )
+            const {
+                message: _currentMessages,
+                ...expectedCurrentConversation
+            } = replacement
+            const { message: _pinnedMessages, ...expectedPinnedConversation } =
+                original
+            expect(current).toEqual({
+                revision: changed.revision,
+                value: {
+                    characterId: 'char-a',
+                    conversationId: 'conv-short',
+                    conversation: expectedCurrentConversation,
+                    totalMessages: 3,
+                },
+            })
+            expect(pinned).toEqual({
+                revision: imported.revision,
+                value: {
+                    characterId: 'char-a',
+                    conversationId: 'conv-short',
+                    conversation: expectedPinnedConversation,
+                    totalMessages: 2,
+                },
+            })
+            expect(Object.hasOwn(current!.value.conversation, 'message')).toBe(
+                false,
+            )
+            expect(Object.hasOwn(current!.value.conversation, 'folderId')).toBe(
+                false,
+            )
+            expect(
+                await store.readConversationMetadata('char-b', 'conv-short'),
+            ).toBeNull()
+            expect(
+                await store.readConversationMetadata('char-a', 'missing'),
+            ).toBeNull()
+
+            ;(
+                current!.value.conversation as unknown as Record<
+                    string,
+                    unknown
+                >
+            ).name = 'mutated result'
+            expect(
+                (await store.readConversationMetadata('char-a', 'conv-short'))!
+                    .value.conversation.name,
+            ).toBe('Changed after lease')
+
+            await lease.release()
+            await expect(
+                lease.readConversationMetadata('char-a', 'conv-short'),
+            ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        })
+
         it('keeps the acquired revision exact through active commits and staged replacement', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

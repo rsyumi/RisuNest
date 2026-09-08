@@ -739,6 +739,15 @@ pub(crate) struct ConversationPage {
     pub(crate) next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PersistentConversationMetadata {
+    pub(crate) character_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) conversation: Value,
+    pub(crate) total_messages: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum AnchorOccurrence {
@@ -1336,6 +1345,16 @@ impl PersistentStore {
     ) -> StoreResult<Option<Versioned<Value>>> {
         let (connection, target) = self.read_view(lease)?;
         query::read_conversation(connection, character_id, conversation_id, &target)
+    }
+
+    pub(crate) fn read_conversation_metadata(
+        &self,
+        character_id: &str,
+        conversation_id: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<PersistentConversationMetadata>>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::read_conversation_metadata(connection, character_id, conversation_id, &target)
     }
 
     pub(crate) fn read_conversation_window(

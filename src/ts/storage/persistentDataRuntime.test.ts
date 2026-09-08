@@ -185,6 +185,7 @@ function makeDatabaseLease(database: Database, revision: number): PersistentRevi
                 ? { revision, value: structuredClone(conversation) }
                 : null
         }),
+        readConversationMetadata: vi.fn(async () => null),
         readConversationWindow: vi.fn(async () => null),
         queryPluginStorage: vi.fn(async () => ({
             revision,

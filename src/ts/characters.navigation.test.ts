@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     activateCharacter: vi.fn(async (_id?: string, _options?: any) => true),
     deactivateActiveWorkingSet: vi.fn(async () => true),
     getPersistentNavigationGeneration: vi.fn(() => mocks.navigationGeneration),
+    fencePersistentNavigation: vi.fn(() => ++mocks.navigationGeneration),
     invalidatePersistentNavigation: vi.fn(() => {
         mocks.navigationGeneration++
     }),
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => ({
     changeChatTo: vi.fn(async (_idOrIndex?: string | number) => true),
     downloadFile: vi.fn(),
     findCharacterbyId: vi.fn(),
+    yieldToUi: vi.fn(async () => {}),
 }))
 
 vi.mock('uuid', () => ({
@@ -96,6 +98,7 @@ vi.mock('./process/index.svelte', async () => {
 })
 vi.mock('./characterCards', () => ({ importCharacter: vi.fn() }))
 vi.mock('./pngChunk', () => ({ PngChunk: {} }))
+vi.mock('./ui/yieldToUi', () => ({ yieldToUi: mocks.yieldToUi }))
 vi.mock('./process/coldstorage.svelte', () => ({ getColdStorageItem: mocks.getColdStorageItem }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     activateCharacter: mocks.activateCharacter,
@@ -103,6 +106,7 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     capturePersistentMutationToken: mocks.unexpectedNativeRuntimeAccess,
     commitCharacterAddition: mocks.commitCharacterAddition,
     deactivateActiveWorkingSet: mocks.deactivateActiveWorkingSet,
+    fencePersistentNavigation: mocks.fencePersistentNavigation,
     getPersistentNavigationGeneration: mocks.getPersistentNavigationGeneration,
     invalidatePersistentNavigation: mocks.invalidatePersistentNavigation,
     markPersistentDataDirty: mocks.markPersistentDataDirty,
@@ -137,6 +141,10 @@ import { createMetadataOnlySelectedConversation } from './storage/selectedConver
 import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
 import { doingChat } from './process/index.svelte'
 import { createConversationSummaryStub } from './storage/conversationResidency'
+import {
+    beginNavigationActivity,
+    navigationActivity,
+} from './ui/navigationActivity'
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -160,6 +168,7 @@ describe('runtime chat identity', () => {
         mocks.alertSelect.mockResolvedValue('0')
         mocks.alertAddCharacter.mockResolvedValue('createfromScratch')
         mocks.commitCharacterAddition.mockImplementation(async (request) => request.install())
+        mocks.yieldToUi.mockResolvedValue(undefined)
         mocks.mutatePersistentCharacterDetail.mockImplementation(async (id, _reason, mutate) => {
             const index = mocks.database.characters.findIndex((character) => character.chaId === id)
             if (index < 0) return false
@@ -226,7 +235,90 @@ describe('runtime chat identity', () => {
         const changed = await changeChar(0)
 
         expect(changed).toBe(true)
-        expect(mocks.activateCharacter).toHaveBeenCalledWith(first.chaId, undefined)
+        expect(mocks.activateCharacter).toHaveBeenCalledWith(first.chaId, {
+            normalize: expect.any(Function),
+        })
+    })
+
+    it('publishes character navigation before yielding to the UI', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        const paint = deferred<void>()
+        mocks.yieldToUi.mockReturnValueOnce(paint.promise)
+
+        const pending = changeChar(0)
+
+        expect(get(navigationActivity)?.kind).toBe('character')
+        expect(mocks.fencePersistentNavigation).toHaveBeenCalledOnce()
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+
+        paint.resolve()
+        await expect(pending).resolves.toBe(true)
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    it('clears character navigation when the screen reset fails', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+
+        await expect(
+            changeChar(0, {
+                reseter: () => {
+                    throw new Error('reset failed')
+                },
+            }),
+        ).resolves.toBe(false)
+        expect(get(navigationActivity)).toBeNull()
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+    })
+
+    it('normalizes navigation metadata without enumerating the selected chat body', async () => {
+        const character = createBlankChar()
+        const messages: any[] = []
+        Object.defineProperty(messages, '0', {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+                throw new Error('navigation enumerated the message body')
+            },
+        })
+        messages.length = 1
+        character.chats[0].message = messages
+        mocks.database.characters.push(character)
+        const { chats: _chats, ...detail } = character
+        mocks.readPersistentCharacterDetail.mockResolvedValue(detail)
+        mocks.activateCharacter.mockImplementationOnce(async (_id, options) => {
+            options.normalize(character)
+            return true
+        })
+
+        await expect(changeChar(0)).resolves.toBe(true)
+        expect(mocks.markPersistentDataDirty).not.toHaveBeenCalled()
+    })
+
+    it('keeps a newer conversation visible while its UI yield outlives an older character activation', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        const activation = deferred<boolean>()
+        const conversationPaint = deferred<void>()
+        mocks.activateCharacter.mockReturnValueOnce(activation.promise)
+
+        const older = changeChar(0)
+        await vi.waitFor(() =>
+            expect(mocks.activateCharacter).toHaveBeenCalledOnce(),
+        )
+        const newer = beginNavigationActivity('conversation')
+        const newerPending = conversationPaint.promise.finally(() =>
+            newer.finish(),
+        )
+        activation.resolve(true)
+
+        await expect(older).resolves.toBe(false)
+        expect(mocks.markPersistentDataDirty).not.toHaveBeenCalled()
+        expect(get(navigationActivity)?.kind).toBe('conversation')
+        conversationPaint.resolve()
+        await newerPending
+        expect(get(navigationActivity)).toBeNull()
     })
 
     it('commits a stable-ID character deletion through one authoritative replacement', async () => {
@@ -554,7 +646,9 @@ describe('runtime chat identity', () => {
             expect.any(Function),
         )
         expect(mocks.database.characters[1].name).toBe('Restored member')
-        expect(mocks.activateCharacter).toHaveBeenCalledWith('group-a', undefined)
+        expect(mocks.activateCharacter).toHaveBeenCalledWith('group-a', {
+            normalize: expect.any(Function),
+        })
     })
 
     it('assigns an ID before a new character first chat is inserted', () => {
@@ -745,7 +839,11 @@ describe('character activation retry', () => {
         })
 
         const older = changeChar(0)
-        await vi.waitFor(() => expect(mocks.activateCharacter).toHaveBeenCalledWith(first.chaId, undefined))
+        await vi.waitFor(() =>
+            expect(mocks.activateCharacter).toHaveBeenCalledWith(first.chaId, {
+                normalize: expect.any(Function),
+            }),
+        )
         await expect(changeChar(1)).resolves.toBe(true)
         firstActivation.resolve(false)
 

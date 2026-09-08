@@ -5,6 +5,10 @@ const state = vi.hoisted(() => ({
     isTauri: false,
     isTauriMobile: false,
     blobStore: null as any,
+    database: { characters: [] as any[] },
+    activateConversation: vi.fn(async (_id: string) => true),
+    fencePersistentNavigation: vi.fn(),
+    yieldToUi: vi.fn(async () => {}),
 }))
 
 vi.mock('./platform', () => ({
@@ -51,7 +55,7 @@ vi.mock('./stores.svelte', () => ({
     botMakerMode: { set: vi.fn() },
     selectedCharID: { set: vi.fn() },
     loadedStore: { set: vi.fn() },
-    DBState: { db: { characters: [] } },
+    DBState: { db: state.database },
     LoadingStatusState: {},
     selIdState: { selId: 0 },
     ReloadGUIPointer: { set: vi.fn() },
@@ -68,11 +72,13 @@ vi.mock('./alert', () => ({
     waitAlert: vi.fn(),
 }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
-    activateConversation: vi.fn(),
+    activateConversation: state.activateConversation,
+    fencePersistentNavigation: state.fencePersistentNavigation,
     configurePersistentDataRuntime: vi.fn(),
     markPersistentDataDirty: vi.fn(),
     replacePersistentDatabase: vi.fn(),
 }))
+vi.mock('./ui/yieldToUi', () => ({ yieldToUi: state.yieldToUi }))
 vi.mock('./storage/persistentSaveNotifications', () => ({
     createPersistentSaveObserverInstallation: () => ({ install: vi.fn() }),
     installPersistentSaveNotifications: vi.fn(),
@@ -119,6 +125,7 @@ vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: vi.fn
 vi.mock('@tauri-apps/plugin-http', () => ({ fetch: vi.fn() }))
 
 import {
+    changeChatTo,
     createThrottledSizeEstimator,
     downloadFile,
     forageStorage,
@@ -130,6 +137,8 @@ import {
 } from './globalApi.svelte'
 import { remove, writeFile } from '@tauri-apps/plugin-fs'
 import { save } from '@tauri-apps/plugin-dialog'
+import { navigationActivity } from './ui/navigationActivity'
+import { get } from 'svelte/store'
 
 function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime: string } }) {
     return {
@@ -159,10 +168,109 @@ beforeEach(() => {
     vi.clearAllMocks()
     state.isTauri = false
     state.isTauriMobile = false
+    state.database.characters.length = 0
+    state.activateConversation.mockResolvedValue(true)
+    state.yieldToUi.mockResolvedValue(undefined)
     setRuntimePerformanceProfile('normal')
     state.isTauri = false
     ;(forageStorage as any).isAccount = false
     vi.spyOn(console, 'error').mockImplementation(() => undefined)
+})
+
+describe('conversation navigation', () => {
+    beforeEach(() => {
+        state.database.characters.push({
+            chaId: 'character-a',
+            chats: [{ id: 'chat-a' }, { id: 'chat-b' }],
+        })
+    })
+
+    test('ignores an unknown chat without fencing the active navigation', async () => {
+        await expect(changeChatTo('missing-chat')).resolves.toBe(false)
+
+        expect(state.fencePersistentNavigation).not.toHaveBeenCalled()
+        expect(state.yieldToUi).not.toHaveBeenCalled()
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('publishes activity and yields before starting conversation activation', async () => {
+        const paint = deferred<void>()
+        state.yieldToUi.mockReturnValueOnce(paint.promise)
+
+        const pending = changeChatTo('chat-b')
+
+        expect(get(navigationActivity)?.kind).toBe('conversation')
+        expect(state.fencePersistentNavigation).toHaveBeenCalledOnce()
+        expect(state.activateConversation).not.toHaveBeenCalled()
+
+        paint.resolve()
+        await expect(pending).resolves.toBe(true)
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('does not activate a captured chat after character selection changes during the UI yield', async () => {
+        const paint = deferred<void>()
+        state.yieldToUi.mockReturnValueOnce(paint.promise)
+
+        const pending = changeChatTo('chat-b')
+        state.database.characters[0] = {
+            chaId: 'character-b',
+            chats: [{ id: 'chat-b' }],
+        }
+        paint.resolve()
+
+        await expect(pending).resolves.toBe(false)
+        expect(state.activateConversation).not.toHaveBeenCalled()
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('does not activate after the selected character loses its chat catalog during the UI yield', async () => {
+        const paint = deferred<void>()
+        state.yieldToUi.mockReturnValueOnce(paint.promise)
+
+        const pending = changeChatTo('chat-b')
+        state.database.characters[0].chats = undefined
+        paint.resolve()
+
+        await expect(pending).resolves.toBe(false)
+        expect(state.activateConversation).not.toHaveBeenCalled()
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('keeps newer conversation activity visible when an older activation finishes', async () => {
+        const firstActivation = deferred<boolean>()
+        const secondActivation = deferred<boolean>()
+        state.activateConversation.mockImplementation((id) =>
+            id === 'chat-a'
+                ? firstActivation.promise
+                : secondActivation.promise,
+        )
+
+        const older = changeChatTo('chat-a')
+        await vi.waitFor(() =>
+            expect(state.activateConversation).toHaveBeenCalledWith('chat-a'),
+        )
+        const newer = changeChatTo('chat-b')
+        await vi.waitFor(() =>
+            expect(state.activateConversation).toHaveBeenCalledWith('chat-b'),
+        )
+
+        firstActivation.resolve(true)
+        await expect(older).resolves.toBe(false)
+        expect(get(navigationActivity)?.kind).toBe('conversation')
+
+        secondActivation.resolve(true)
+        await expect(newer).resolves.toBe(true)
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('clears conversation activity when activation fails', async () => {
+        const failure = new Error('activation failed')
+        state.activateConversation.mockRejectedValueOnce(failure)
+
+        await expect(changeChatTo('chat-b')).rejects.toBe(failure)
+        expect(get(navigationActivity)).toBeNull()
+    })
 })
 
 afterEach(() => {

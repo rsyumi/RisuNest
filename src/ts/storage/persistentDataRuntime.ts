@@ -270,6 +270,7 @@ export interface PersistentDataRuntimeStateAdapter {
         conversation: Chat,
         nextCharacter?: CompleteCharacter,
     ): void
+    captureActivationRollback?(characterIds: readonly string[]): () => void
     shouldHydrateFullCharacter?(): boolean
     canReleaseConversation?(
         character: CompleteCharacter,
@@ -340,6 +341,7 @@ export interface PersistentDataRuntime {
         selectedCharacterId: string | null,
     ): ReadonlySet<string>
     getNavigationGeneration(): number
+    fenceNavigation(): number
     invalidateNavigation(): void
     replacePersistentDatabase(
         database: Database,
@@ -591,6 +593,7 @@ export function createPersistentDataRuntime(
             dependencies.state.publishCharacter(primary)
         }),
         publishConversation: dependencies.state.publishConversation,
+        captureActivationRollback: dependencies.state.captureActivationRollback,
         canActivateWorkingSet: dependencies.state.canActivateWorkingSet,
         canDeactivateWorkingSet: dependencies.state.canDeactivateWorkingSet,
         canDeactivateCharacter: dependencies.state.canDeactivateCharacter,
@@ -610,7 +613,15 @@ export function createPersistentDataRuntime(
         options?: CharacterActivationOptions,
     ): Promise<boolean> => {
         const prepare = options?.prepare
-        return workingSet.activateCharacter(id, prepare ? {
+        const normalize = options?.normalize
+        if (!prepare) {
+            return workingSet.activateCharacter(
+                id,
+                normalize ? { normalize } : undefined,
+            )
+        }
+        return workingSet.activateCharacter(id, {
+            normalize,
             async prepare() {
                 const prepared = await prepare()
                 if (!prepared) return null
@@ -619,7 +630,7 @@ export function createPersistentDataRuntime(
                     database: await dependencies.prepareDatabase(prepared.database),
                 }
             },
-        } : undefined)
+        })
     }
     const refreshCommittedWorkingSet = async (
         revision: DataRevision,
@@ -706,6 +717,7 @@ export function createPersistentDataRuntime(
         reconcileActiveCharacterIds: (database, selectedCharacterId) =>
             workingSet.reconcileActiveCharacterIds(database, selectedCharacterId),
         getNavigationGeneration: () => workingSet.navigationGenerationToken,
+        fenceNavigation: () => workingSet.fenceNavigation(),
         invalidateNavigation: () => workingSet.invalidateNavigation(),
         replacePersistentDatabase: (database, reason, options) => {
             if (

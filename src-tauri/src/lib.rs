@@ -759,6 +759,7 @@ pub fn run() {
             persistent_store::commands::pds_read_character,
             persistent_store::commands::pds_query_conversations,
             persistent_store::commands::pds_read_conversation,
+            persistent_store::commands::pds_read_conversation_metadata,
             persistent_store::commands::pds_read_conversation_window,
             persistent_store::commands::pds_query_plugin_storage,
             persistent_store::commands::pds_read_plugin_storage,

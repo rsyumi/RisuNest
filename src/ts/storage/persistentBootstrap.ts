@@ -14,6 +14,7 @@ import {
 } from './persistentDataStore'
 import { canonicalJson } from './saveCoordinator'
 import { removeCharacterIdFromOrder } from './characterOrderMutation'
+import { yieldToMainThread } from '../ui/yieldToUi'
 
 const BOOTSTRAP_CATALOG_PAGE_SIZE = 200
 const TRASH_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000
@@ -193,7 +194,8 @@ async function queryAllCharacterSummaries(
     revision: DataRevision,
 ): Promise<CharacterSummary[]> {
     const characters: CharacterSummary[] = []
-    for (const trash of [false, true]) {
+    const trashStates = [false, true] as const
+    for (const [trashIndex, trash] of trashStates.entries()) {
         let cursor: string | undefined
         do {
             const page = await store.queryCharacters({
@@ -205,6 +207,9 @@ async function queryAllCharacterSummaries(
             assertRevision(revision, page.revision)
             characters.push(...page.items)
             cursor = page.nextCursor
+            const hasAnotherPage =
+                cursor !== undefined || trashIndex < trashStates.length - 1
+            if (hasAnotherPage) await yieldToMainThread()
         } while (cursor !== undefined)
     }
     return characters

@@ -57,6 +57,7 @@ import { checkCharOrder as repairDatabaseCharacterOrder } from "./storage/databa
 import {
     activateConversation,
     configurePersistentDataRuntime,
+    fencePersistentNavigation,
     markPersistentDataDirty,
     replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
@@ -76,6 +77,8 @@ import { inferBlobMime } from "./storage/blobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
 import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
 import { AppendableBuffer } from "./appendableBuffer"
+import { beginNavigationActivity } from './ui/navigationActivity'
+import { yieldToUi } from './ui/yieldToUi'
 
 export { AppendableBuffer } from "./appendableBuffer"
 
@@ -1995,12 +1998,29 @@ export async function changeChatTo(IdOrIndex: string | number): Promise<boolean>
     const characterId = DBState.db.characters[selIdState.selId]?.chaId
     if(!characterId) return false
     const character = DBState.db.characters.find((value) => value.chaId === characterId)
+    const chats = Array.isArray(character?.chats) ? character.chats : []
     const chatId = typeof IdOrIndex === 'number'
-        ? character?.chats[IdOrIndex]?.id
+        ? chats[IdOrIndex]?.id
         : IdOrIndex
-    if(!chatId || !character?.chats.some((chat) => chat.id === chatId)) return false
+    if(!chatId || !chats.some((chat) => chat.id === chatId)) return false
 
-    return activateConversation(chatId)
+    fencePersistentNavigation()
+    const activity = beginNavigationActivity('conversation')
+    try {
+        await yieldToUi()
+        if (!activity.isCurrent()) return false
+        const currentCharacter = DBState.db.characters[selIdState.selId]
+        if (
+            currentCharacter?.chaId !== characterId ||
+            !Array.isArray(currentCharacter.chats) ||
+            !currentCharacter.chats.some((chat) => chat.id === chatId)
+        )
+            return false
+        const activated = await activateConversation(chatId)
+        return activity.isCurrent() ? activated : false
+    } finally {
+        activity.finish()
+    }
 }
 
 export function createChatCopyName(originalName: string,type:'Copy'|'Branch'): string {

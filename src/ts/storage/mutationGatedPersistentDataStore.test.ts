@@ -18,6 +18,7 @@ function makeStore() {
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),
         readConversation: vi.fn(),
+        readConversationMetadata: vi.fn(),
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(),
         readPluginStorage: vi.fn(),
@@ -90,10 +91,12 @@ describe('createMutationGatedPersistentDataStore', () => {
         await gated.readPreset('0')
         await gated.queryPluginStorage()
         await gated.readPluginStorage('plugin')
+        await gated.readConversationMetadata('char-a', 'conv-a')
         await gated.readAssetAliasesByKeys('asset', ['assets/batch.bin'])
 
         expect(gate.runWrite).not.toHaveBeenCalled()
         expect(store.readAssetAliasesByKeys).toHaveBeenCalledWith('asset', ['assets/batch.bin'])
+        expect(store.readConversationMetadata).toHaveBeenCalledWith('char-a', 'conv-a')
     })
 
     it('preserves ordinary write error identity', async () => {

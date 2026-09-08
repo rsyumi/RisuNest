@@ -134,6 +134,17 @@ export interface WindowedConversationPersistenceAuthority {
     totalMessages: number
 }
 
+export interface WindowedConversationActivationChange {
+    character?: {
+        before: CharacterDetail
+        after: CharacterDetail
+    }
+    conversation?: {
+        before: Omit<Chat, 'message'>
+        after: Omit<Chat, 'message'>
+    }
+}
+
 export class WindowedConversationRequiresCompatibilityError extends Error {
     constructor(reason: string) {
         super(`Windowed conversation requires complete compatibility: ${reason}`)
@@ -202,6 +213,11 @@ interface PendingConversationMutation {
     event: ActiveConversationMutationEvent
 }
 
+interface PendingWindowedActivationChange {
+    authority: WindowedConversationPersistenceAuthority
+    change: WindowedConversationActivationChange
+}
+
 export interface ConversationMutationPersistenceHandle {
     release(): void
 }
@@ -209,6 +225,8 @@ export interface ConversationMutationPersistenceHandle {
 interface ConversationMutationProjection {
     exactMutations: ConversationMutation[] | null
     coveredPending: PendingConversationMutation[]
+    character?: CharacterDetail
+    coveredActivation?: PendingWindowedActivationChange
 }
 
 function cloneOwnPropertiesExcept(
@@ -235,6 +253,85 @@ function captureWindowedCharacterShell(character: CompleteCharacter): WindowedCh
         ) as Omit<Chat, 'message'>
     )
     return { ...detail, chats } as WindowedCharacterShell
+}
+
+function prepareWindowedActivationChange(
+    currentShell: WindowedCharacterShell,
+    authority: WindowedConversationPersistenceAuthority,
+    change: WindowedConversationActivationChange,
+): {
+    persistedShell: WindowedCharacterShell
+    change: WindowedConversationActivationChange
+} | null {
+    if (!change.character && !change.conversation) return null
+    let persistedShell = safeStructuredClone(currentShell)
+    const detached: WindowedConversationActivationChange = {}
+
+    if (change.character) {
+        const before = change.character.before as CharacterDetail & {
+            chats?: unknown
+        }
+        const after = change.character.after as CharacterDetail & {
+            chats?: unknown
+        }
+        const currentDetail = cloneOwnPropertiesExcept(
+            currentShell as unknown as Record<string, unknown>,
+            'chats',
+        ) as CharacterDetail
+        if (
+            Object.hasOwn(before, 'chats') ||
+            Object.hasOwn(after, 'chats') ||
+            before.chaId !== authority.characterId ||
+            after.chaId !== authority.characterId ||
+            canonicalJson(after) !== canonicalJson(currentDetail) ||
+            canonicalJson(before) === canonicalJson(after)
+        )
+            return null
+        persistedShell = {
+            ...safeStructuredClone(before),
+            chats: persistedShell.chats,
+        } as WindowedCharacterShell
+        detached.character = {
+            before: safeStructuredClone(before),
+            after: safeStructuredClone(after),
+        }
+    }
+
+    if (change.conversation) {
+        const { before, after } = change.conversation
+        const beforeRecord = before as Omit<Chat, 'message'> & {
+            message?: unknown
+        }
+        const afterRecord = after as Omit<Chat, 'message'> & {
+            message?: unknown
+        }
+        const currentMatches = currentShell.chats.filter(
+            (conversation) => conversation.id === authority.conversationId,
+        )
+        const persistedMatches = persistedShell.chats.filter(
+            (conversation) => conversation.id === authority.conversationId,
+        )
+        if (
+            Object.hasOwn(beforeRecord, 'message') ||
+            Object.hasOwn(afterRecord, 'message') ||
+            before.id !== authority.conversationId ||
+            after.id !== authority.conversationId ||
+            currentMatches.length !== 1 ||
+            persistedMatches.length !== 1 ||
+            canonicalJson(after) !== canonicalJson(currentMatches[0]) ||
+            canonicalJson(before) === canonicalJson(after)
+        )
+            return null
+        persistedShell.chats[
+            persistedShell.chats.indexOf(persistedMatches[0])
+        ] = safeStructuredClone(before)
+        detached.conversation = {
+            before: safeStructuredClone(before),
+            after: safeStructuredClone(after),
+        }
+    }
+
+    return { persistedShell, change: detached }
 }
 
 function validWindowedAuthority(
@@ -439,6 +536,7 @@ export class SaveCoordinator {
     private characterBaseline: string | null = null
     private characterBaselineId: string | null = null
     private windowedCharacterBaseline: WindowedSelectedCharacterCapture | null = null
+    private pendingWindowedActivationChange: PendingWindowedActivationChange | null = null
     private dirtyGeneration = 0
     private pendingByteCount = 0
     private debounceHandle: unknown
@@ -512,7 +610,8 @@ export class SaveCoordinator {
             this.reservedCharacterAddition !== null ||
             this.pendingResidentCompensations.length > 0 ||
             this.pendingResidentConversationCompensations.length > 0 ||
-            this.pendingConversationMutations.length > 0
+            this.pendingConversationMutations.length > 0 ||
+            this.pendingWindowedActivationChange !== null
     }
 
     get isSelectedConversationTransitionActive(): boolean {
@@ -525,9 +624,27 @@ export class SaveCoordinator {
         if (this.hasPendingPersistenceWork) {
             throw new Error('Selected conversation authority transition has pending persistence')
         }
+        const saved = {
+            characterBaseline: this.characterBaseline,
+            characterBaselineId: this.characterBaselineId,
+            windowedCharacterBaseline: this.windowedCharacterBaseline
+                ? safeStructuredClone(this.windowedCharacterBaseline)
+                : null,
+            pendingWindowedActivationChange: this
+                .pendingWindowedActivationChange
+                ? safeStructuredClone(this.pendingWindowedActivationChange)
+                : null,
+        }
         this.selectedConversationTransitionActive = true
         try {
             return transition()
+        } catch (error) {
+            this.characterBaseline = saved.characterBaseline
+            this.characterBaselineId = saved.characterBaselineId
+            this.windowedCharacterBaseline = saved.windowedCharacterBaseline
+            this.pendingWindowedActivationChange =
+                saved.pendingWindowedActivationChange
+            throw error
         } finally {
             this.selectedConversationTransitionActive = false
         }
@@ -557,6 +674,7 @@ export class SaveCoordinator {
         this.pendingResidentCompensations = []
         this.pendingResidentConversationCompensations = []
         this.pendingConversationMutations = []
+        this.pendingWindowedActivationChange = null
         this.persistenceWasBusy = false
         this.lastBackgroundErrorMessage = null
         if (this.destructiveReplacementFence?.state === 'held') {
@@ -602,6 +720,7 @@ export class SaveCoordinator {
         this.characterBaseline = canonicalJson(character)
         this.characterBaselineId = character.chaId
         this.windowedCharacterBaseline = null
+        this.pendingWindowedActivationChange = null
         return true
     }
 
@@ -610,6 +729,7 @@ export class SaveCoordinator {
         mutationGeneration: number,
         character: CompleteCharacter,
         authority: WindowedConversationPersistenceAuthority,
+        activationChange?: WindowedConversationActivationChange,
     ): boolean {
         if (
             this.destructiveReplacementFence !== null ||
@@ -643,13 +763,29 @@ export class SaveCoordinator {
             matchingConversations.length !== 1 ||
             canonicalJson(shell) !== canonicalJson(currentShell)
         ) return false
+        let persistedShell = shell
+        let pendingActivation: PendingWindowedActivationChange | null = null
+        if (activationChange) {
+            const prepared = prepareWindowedActivationChange(
+                shell,
+                authority,
+                activationChange,
+            )
+            if (!prepared) return false
+            persistedShell = prepared.persistedShell
+            pendingActivation = {
+                authority: safeStructuredClone(authority),
+                change: prepared.change,
+            }
+        }
         this.windowedCharacterBaseline = {
-            shell,
-            shellCanonical: canonicalJson(shell),
+            shell: persistedShell,
+            shellCanonical: canonicalJson(persistedShell),
             authority: safeStructuredClone(authority),
         }
         this.characterBaseline = null
         this.characterBaselineId = null
+        this.pendingWindowedActivationChange = pendingActivation
         return true
     }
 
@@ -659,6 +795,7 @@ export class SaveCoordinator {
     ): boolean {
         const baseline = this.windowedCharacterBaseline
         const current = this.dependencies.captureSelectedConversationAuthority?.() ?? null
+        const pendingActivation = this.pendingWindowedActivationChange
         if (
             !baseline ||
             !current ||
@@ -673,9 +810,19 @@ export class SaveCoordinator {
             baseline.authority.persistedSessionVersion !== authority.persistedSessionVersion ||
             baseline.authority.sessionVersion !== authority.sessionVersion ||
             baseline.authority.totalMessages !== authority.totalMessages ||
-            baseline.authority.storeRevision > revision
+            baseline.authority.storeRevision > revision ||
+            (
+                pendingActivation !== null &&
+                !sameWindowedAuthority(pendingActivation.authority, baseline.authority)
+            )
         ) return false
         baseline.authority = safeStructuredClone(authority)
+        if (pendingActivation) {
+            pendingActivation.authority = {
+                ...safeStructuredClone(pendingActivation.authority),
+                storeRevision: revision,
+            }
+        }
         return true
     }
 
@@ -2133,6 +2280,9 @@ export class SaveCoordinator {
                 commit.replacePresets = captured.presets
             }
             if (windowedCapture) {
+                if (conversationProjection?.character) {
+                    commit.character = conversationProjection.character
+                }
                 if (recordedConversations) commit.conversations = recordedConversations
             } else if (detached) {
                 commit.replaceCharacter = detached.character
@@ -2248,6 +2398,13 @@ export class SaveCoordinator {
                         )
                     }
                     if (windowedCapture) {
+                        if (
+                            conversationProjection?.coveredActivation &&
+                            this.pendingWindowedActivationChange ===
+                                conversationProjection.coveredActivation
+                        ) {
+                            this.pendingWindowedActivationChange = null
+                        }
                         const persistedSessionVersion = persistedConversationMutations.at(-1)
                             ?.event.sessionVersion
                             ?? windowedCapture.authority.persistedSessionVersion
@@ -3051,6 +3208,7 @@ export class SaveCoordinator {
         this.characterBaseline = captured.characterCanonical
         this.characterBaselineId = captured.character?.chaId ?? null
         this.windowedCharacterBaseline = null
+        this.pendingWindowedActivationChange = null
     }
 
     private setWindowedCharacterBaseline(
@@ -3123,17 +3281,82 @@ export class SaveCoordinator {
                 'pending evidence belongs to another conversation or session',
             )
         }
+        let projectedShell = safeStructuredClone(baseline.shell)
+        const mutations: ConversationMutation[] = []
+        const activation = this.pendingWindowedActivationChange
+        let activationCharacter: CharacterDetail | undefined
+        if (activation) {
+            if (
+                !sameWindowedAuthority(activation.authority, baseline.authority)
+            ) {
+                throw new WindowedConversationRequiresCompatibilityError(
+                    'activation evidence belongs to another authority',
+                )
+            }
+            const characterChange = activation.change.character
+            if (characterChange) {
+                const projectedDetail = cloneOwnPropertiesExcept(
+                    projectedShell as unknown as Record<string, unknown>,
+                    'chats',
+                ) as CharacterDetail
+                if (
+                    canonicalJson(projectedDetail) !==
+                    canonicalJson(characterChange.before)
+                ) {
+                    throw new WindowedConversationRequiresCompatibilityError(
+                        'activation character evidence does not match the persisted baseline',
+                    )
+                }
+                projectedShell = {
+                    ...safeStructuredClone(characterChange.after),
+                    chats: projectedShell.chats,
+                } as WindowedCharacterShell
+                activationCharacter = safeStructuredClone(characterChange.after)
+            }
+            const conversationChange = activation.change.conversation
+            if (conversationChange) {
+                const matches = projectedShell.chats.filter(
+                    (conversation) =>
+                        conversation.id === authority.conversationId,
+                )
+                if (
+                    matches.length !== 1 ||
+                    canonicalJson(matches[0]) !==
+                        canonicalJson(conversationChange.before)
+                ) {
+                    throw new WindowedConversationRequiresCompatibilityError(
+                        'activation conversation evidence does not match the persisted baseline',
+                    )
+                }
+                projectedShell.chats[projectedShell.chats.indexOf(matches[0])] =
+                    safeStructuredClone(conversationChange.after)
+                mutations.push({
+                    type: 'replace-range',
+                    characterId: authority.characterId,
+                    conversationId: authority.conversationId,
+                    start: 0,
+                    deleteCount: 0,
+                    messages: [],
+                    conversation: safeStructuredClone(conversationChange.after),
+                })
+            }
+        }
         if (relevantPending.length === 0) {
             if (
                 authority.sessionVersion !== authority.persistedSessionVersion ||
                 authority.totalMessages !== baseline.authority.totalMessages ||
-                current.shellCanonical !== baseline.shellCanonical
+                current.shellCanonical !== canonicalJson(projectedShell)
             ) {
                 throw new WindowedConversationRequiresCompatibilityError(
                     'selected changes have no exact mutation evidence',
                 )
             }
-            return { exactMutations: null, coveredPending: [] }
+            return {
+                exactMutations: mutations.length > 0 ? mutations : null,
+                coveredPending: [],
+                character: activationCharacter,
+                coveredActivation: activation ?? undefined,
+            }
         }
 
         const persisted = await this.dependencies.store.readConversationWindow({
@@ -3157,7 +3380,6 @@ export class SaveCoordinator {
             )
         }
 
-        const projectedShell = safeStructuredClone(baseline.shell)
         const projectedMatches = projectedShell.chats.filter(
             (conversation) => conversation.id === authority.conversationId,
         )
@@ -3172,7 +3394,6 @@ export class SaveCoordinator {
 
         let expectedVersion = baseline.authority.persistedSessionVersion
         let messageCount = persisted.value.totalMessages
-        const mutations: ConversationMutation[] = []
         for (const pendingMutation of relevantPending) {
             const { event } = pendingMutation
             if (
@@ -3234,8 +3455,10 @@ export class SaveCoordinator {
             )
         }
         return {
-            exactMutations: mutations,
+            exactMutations: mutations.length > 0 ? mutations : null,
             coveredPending: [...relevantPending],
+            character: activationCharacter,
+            coveredActivation: activation ?? undefined,
         }
     }
 

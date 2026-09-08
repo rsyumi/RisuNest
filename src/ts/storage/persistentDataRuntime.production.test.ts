@@ -39,6 +39,86 @@ afterEach(() => {
 })
 
 describe('production persistent working-set publication', () => {
+    it('restores only affected activation entries, selection and residency', () => {
+        const selected = {
+            type: 'character',
+            chaId: 'char-a',
+            name: 'Selected',
+            chats: [
+                {
+                    id: 'chat-a',
+                    name: 'Chat',
+                    note: '',
+                    localLore: [],
+                    message: [],
+                },
+            ],
+            chatPage: 0,
+        }
+        const related = createCatalogCharacterStub({
+            id: 'char-b',
+            configuredIndex: 1,
+            conversationCount: 2,
+            name: 'Related',
+            type: 'character',
+            recentAt: 0,
+            trashed: false,
+        })
+        const unaffected = {
+            type: 'character',
+            chaId: 'char-c',
+            name: 'Unaffected',
+            chats: [],
+        }
+        setDatabaseLite({
+            botPresets: [],
+            plugins: [],
+            characters: [selected, related, unaffected],
+        } as unknown as Database)
+        selectedCharID.set(0)
+        const residentSelected = getDatabase().characters[0]
+        const residentRelated = getDatabase().characters[1]
+        workingSetResidency.markCharacterHydrated('char-a')
+        workingSetResidency.reconcileConversationResidency(residentSelected)
+        workingSetResidency.markCharacterReleased('char-b')
+        const restore = createProductionStateAdapter()
+            .captureActivationRollback!(['char-a', 'char-b'])
+
+        getDatabase().characters[0] = {
+            type: 'character',
+            chaId: 'char-a',
+            name: 'Tentative selected',
+            chats: [],
+        } as any
+        getDatabase().characters[1] = {
+            type: 'character',
+            chaId: 'char-b',
+            name: 'Tentative related',
+            chats: [],
+        } as any
+        getDatabase().characters[2].name = 'Concurrent unaffected edit'
+        selectedCharID.set(1)
+        workingSetResidency.markCharacterReleased('char-a')
+        workingSetResidency.markCharacterHydrated('char-b')
+
+        restore()
+
+        expect(getDatabase().characters[0]).toBe(residentSelected)
+        expect(getDatabase().characters[1]).toBe(residentRelated)
+        expect(getDatabase().characters[2].name).toBe(
+            'Concurrent unaffected edit',
+        )
+        expect(get(selectedCharID)).toBe(0)
+        expect(workingSetResidency.isCharacterReleased('char-a')).toBe(false)
+        expect(
+            workingSetResidency.canReleaseConversation(
+                residentSelected,
+                'chat-a',
+            ),
+        ).toBe(false)
+        expect(workingSetResidency.isCharacterReleased('char-b')).toBe(true)
+    })
+
     it('hydrates only the restored catalog member while preserving the selected group', () => {
         const group = {
             type: 'group',

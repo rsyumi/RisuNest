@@ -722,6 +722,43 @@ pub(super) fn read_conversation(
     }))
 }
 
+pub(super) fn read_conversation_metadata(
+    connection: &Connection,
+    character_id: &str,
+    conversation_id: &str,
+    target: &ReadTarget,
+) -> StoreResult<Option<Versioned<super::PersistentConversationMetadata>>> {
+    let row: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT detail, message_count FROM conversations WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+            params![target.generation, character_id, conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((detail, total_messages)) = row else {
+        return Ok(None);
+    };
+    if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(&total_messages) {
+        return Err(StoreError::Validation {
+            message: "conversation message count must be a nonnegative safe integer".to_owned(),
+        });
+    }
+    let mut conversation = into_object(
+        serde_json::from_str(&detail)?,
+        "Conversation detail must be an object",
+    )?;
+    conversation.remove("message");
+    Ok(Some(Versioned {
+        revision: target.revision,
+        value: super::PersistentConversationMetadata {
+            character_id: character_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            conversation: Value::Object(conversation),
+            total_messages,
+        },
+    }))
+}
+
 pub(super) fn read_conversation_window(
     connection: &Connection,
     query: &ConversationWindowQuery,

@@ -95,6 +95,7 @@ function makeHarness(messageCount = 10_000) {
         flushPendingData: vi.fn(async () => undefined),
         replacePersistentDatabase: vi.fn(async () => undefined),
         adoptHydratedCharacter: vi.fn(() => true),
+        markPersistentDataDirty: vi.fn(),
         adoptWindowedSelectedConversation: vi.fn(() => true),
         advanceWindowedSelectedConversationRevision: vi.fn(() => true),
         runSelectedConversationTransition: <T>(transition: () => T): T => {

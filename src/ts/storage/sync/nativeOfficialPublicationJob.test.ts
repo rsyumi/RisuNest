@@ -30,6 +30,7 @@ function pinnedLease(): NativePersistentRevisionLease {
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),
         readConversation: vi.fn(),
+        readConversationMetadata: vi.fn(),
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(),
         readPluginStorage: vi.fn(),

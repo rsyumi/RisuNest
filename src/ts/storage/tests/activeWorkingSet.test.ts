@@ -12,6 +12,7 @@ import { isCatalogCharacterStub } from '../workingSetCatalog'
 import { WorkingSetResidencyRegistry } from '../workingSetResidency'
 import type {
     ConversationPage,
+    PersistentConversationMetadata,
     PersistentDataStore,
     PersistentRevisionLease,
 } from '../persistentDataStore'
@@ -90,6 +91,7 @@ function makeLease(input: {
                 const chat = chats.find((candidate) => candidate.id === conversationId)
                 return chat ? { revision, value: structuredClone(chat) } : null
             }),
+        readConversationMetadata: vi.fn(async () => null),
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),
@@ -127,6 +129,7 @@ function makeHarness(
         flushPendingData: vi.fn(() => Promise.resolve()),
         replacePersistentDatabase: vi.fn(async () => undefined),
         adoptHydratedCharacter: vi.fn(() => true),
+        markPersistentDataDirty: vi.fn(),
         recordActiveConversationMutation: vi.fn(),
     }
     const store = {
@@ -209,7 +212,582 @@ function makeHarness(
     }
 }
 
+function makeWindowedHarness(input: {
+    characters: character[]
+    selectedCharacterId?: string | null
+    adoptionResult?: boolean
+}) {
+    const database = {
+        username: 'Windowed fixture',
+        characters: structuredClone(input.characters),
+    } as unknown as Database
+    const authoritative = structuredClone(input.characters)
+    let selectedCharacterId = input.selectedCharacterId ?? null
+    let storeRevision = 1
+    let windowedAllowed = true
+    const readConversation = vi.fn(async () => {
+        throw new Error(
+            'windowed activation performed a full conversation read',
+        )
+    })
+    const readConversationMetadata = vi.fn(
+        async (characterId: string, conversationId: string) => {
+            const owner = authoritative.find(
+                (candidate) => candidate.chaId === characterId,
+            )
+            const conversation = owner?.chats.find(
+                (candidate) => candidate.id === conversationId,
+            )
+            if (!conversation) return null
+            const { message, ...metadata } = structuredClone(conversation)
+            return {
+                revision: storeRevision,
+                value: {
+                    characterId,
+                    conversationId,
+                    conversation: metadata,
+                    totalMessages: message.length,
+                } satisfies PersistentConversationMetadata,
+            }
+        },
+    )
+    const store = {
+        readCharacter: vi.fn(async (id: string) => {
+            const owner = authoritative.find(
+                (candidate) => candidate.chaId === id,
+            )
+            if (!owner) return null
+            const { chats: _chats, ...detail } = owner
+            return { revision: storeRevision, value: detail }
+        }),
+        queryConversations: vi.fn(
+            async ({ characterId }: { characterId: string }) => {
+                const owner = authoritative.find(
+                    (candidate) => candidate.chaId === characterId,
+                )
+                return {
+                    revision: storeRevision,
+                    items: (owner?.chats ?? []).map(
+                        (conversation, configuredIndex) => ({
+                            id: conversation.id!,
+                            characterId,
+                            name: conversation.name,
+                            folderId: conversation.folderId,
+                            bindedPersona: conversation.bindedPersona,
+                            configuredIndex,
+                            recentAt: conversation.lastDate ?? 17,
+                            messageCount: conversation.message.length,
+                            fmIndex: conversation.fmIndex,
+                        }),
+                    ),
+                }
+            },
+        ),
+        readConversationMetadata,
+        readConversation,
+        readConversationWindow: vi.fn(
+            async ({
+                characterId,
+                conversationId,
+                startIndex = 0,
+                limit = 64,
+            }) => {
+                const owner = authoritative.find(
+                    (candidate) => candidate.chaId === characterId,
+                )
+                const conversation = owner?.chats.find(
+                    (candidate) => candidate.id === conversationId,
+                )
+                if (!conversation) return null
+                const messages = conversation.message.slice(
+                    startIndex,
+                    startIndex + limit,
+                )
+                return {
+                    revision: storeRevision,
+                    value: {
+                        characterId,
+                        conversationId,
+                        messages,
+                        startIndex,
+                        endIndex: startIndex + messages.length,
+                        totalMessages: conversation.message.length,
+                        hasMoreBefore: startIndex > 0,
+                        hasMoreAfter:
+                            startIndex + messages.length <
+                            conversation.message.length,
+                    },
+                }
+            },
+        ),
+    } as unknown as PersistentDataStore
+    let workingSet!: ActiveWorkingSet
+    const coordinator = {
+        revision: 1,
+        mutationGeneration: 0,
+        hasPendingPersistenceWork: false,
+        initialize: vi.fn(),
+        flushPendingData: vi.fn(async () => undefined),
+        replacePersistentDatabase: vi.fn(async () => undefined),
+        adoptHydratedCharacter: vi.fn(() => true),
+        runSelectedConversationTransition: vi.fn(<T>(transition: () => T) =>
+            transition(),
+        ),
+        adoptWindowedSelectedConversation: vi.fn(
+            () => input.adoptionResult ?? true,
+        ),
+        advanceWindowedSelectedConversationRevision: vi.fn(() => true),
+        markPersistentDataDirty: vi.fn(),
+        recordActiveConversationMutation: vi.fn(),
+    }
+    const publishCharacter = vi.fn((next: character | groupChat) => {
+        const index = database.characters.findIndex(
+            (candidate) => candidate.chaId === next.chaId,
+        )
+        if (index < 0) database.characters.push(next)
+        else database.characters[index] = next
+        selectedCharacterId = next.chaId
+    })
+    const publishConversation = vi.fn(
+        (
+            characterId: string,
+            conversation: Chat,
+            nextCharacter?: character | groupChat,
+        ) => {
+            const index = database.characters.findIndex(
+                (candidate) => candidate.chaId === characterId,
+            )
+            if (index < 0)
+                throw new Error('published conversation owner is missing')
+            if (nextCharacter) database.characters[index] = nextCharacter
+            else {
+                const owner = database.characters[index]
+                const conversationIndex = owner.chats.findIndex(
+                    (candidate) => candidate.id === conversation.id,
+                )
+                owner.chats[conversationIndex] = conversation
+                owner.chatPage = conversationIndex
+            }
+            selectedCharacterId = characterId
+        },
+    )
+    const captureActivationRollback = vi.fn(
+        (characterIds: readonly string[]) => {
+            const selectedBefore = selectedCharacterId
+            const entries = new Map(
+                characterIds.map((id) => [
+                    id,
+                    database.characters.find(
+                        (candidate) => candidate.chaId === id,
+                    ) ?? null,
+                ]),
+            )
+            return () => {
+                for (const [id, entry] of entries) {
+                    const index = database.characters.findIndex(
+                        (candidate) => candidate.chaId === id,
+                    )
+                    if (entry && index >= 0) database.characters[index] = entry
+                }
+                selectedCharacterId = selectedBefore
+            }
+        },
+    )
+    workingSet = new ActiveWorkingSet({
+        store,
+        coordinator:
+            coordinator as unknown as import('../activeWorkingSet.svelte').WorkingSetCoordinator,
+        getSelectedCharacterId: () => selectedCharacterId,
+        getResidentCharacter: (id) =>
+            database.characters.find((candidate) => candidate.chaId === id) ??
+            null,
+        publishCharacter,
+        publishCharacterSet: (primary) => publishCharacter(primary),
+        publishConversation,
+        captureActivationRollback,
+        canActivateWorkingSet: () => true,
+        canUseWindowedSelectedConversation: () => windowedAllowed,
+        isMaximumCompatibilityMode: () => false,
+        isConversationOperationActive: () => false,
+        shouldHydrateFullCharacter: () => false,
+        canReleaseConversation: () => true,
+        conversationViewportRowBudget: 32,
+    })
+    return {
+        workingSet,
+        database,
+        coordinator,
+        readConversation,
+        readConversationMetadata,
+        captureActivationRollback,
+        publishConversation,
+        setStoreRevision(revision: number) {
+            storeRevision = revision
+        },
+        setWindowedAllowed(allowed: boolean) {
+            windowedAllowed = allowed
+        },
+    }
+}
+
 describe('ActiveWorkingSet', () => {
+    it('directly activates a large selected conversation from metadata', async () => {
+        const conversation = {
+            ...makeChat('chat-large'),
+            note: 'preserved note',
+            fmIndex: 7,
+            message: Array.from({ length: 10_000 }, (_, index) => ({
+                role: 'user',
+                data: `message-${index}`,
+            })),
+        } as Chat
+        const target = makeCharacter('char-large', [conversation])
+        const harness = makeWindowedHarness({ characters: [target] })
+
+        await expect(
+            harness.workingSet.activateCharacter('char-large'),
+        ).resolves.toBe(true)
+
+        expect(harness.readConversation).not.toHaveBeenCalled()
+        expect(harness.readConversationMetadata).toHaveBeenCalledOnce()
+        expect(harness.workingSet.selectedConversationMode).toBe('windowed')
+        expect(harness.workingSet.activeConversationSession).toBeNull()
+        expect(
+            harness.workingSet.captureSelectedConversationAuthority(),
+        ).toMatchObject({
+            characterId: 'char-large',
+            conversationId: 'chat-large',
+            totalMessages: 10_000,
+        })
+        expect(
+            harness.workingSet.activeConversationViewportSource?.snapshot(),
+        ).toMatchObject({
+            totalMessages: 10_000,
+        })
+        expect(
+            harness.workingSet.activeConversationViewportSource
+                ?.snapshot()
+                .rowAt(0),
+        ).toBeUndefined()
+        const selected = harness.database.characters[0].chats[0]
+        expect(selected.note).toBe('preserved note')
+        expect(selected.fmIndex).toBe(7)
+        expect(() => selected.message).toThrow('metadata-only')
+    })
+
+    it('fences captured targets while retaining the selected viewport owner', async () => {
+        const target = makeCharacter('char-a', [
+            {
+                ...makeChat('chat-a'),
+                message: [{ role: 'user', data: 'persisted' }],
+            } as Chat,
+        ])
+        const harness = makeWindowedHarness({ characters: [target] })
+        await harness.workingSet.activateCharacter('char-a')
+        const staleTarget =
+            harness.workingSet.captureSelectedConversationTarget()!
+        const source = harness.workingSet.activeConversationViewportSource
+
+        const generation = harness.workingSet.fenceNavigation()
+        const currentTarget =
+            harness.workingSet.captureSelectedConversationTarget()!
+
+        expect(generation).toBe(staleTarget.navigationGeneration + 1)
+        expect(currentTarget.navigationGeneration).toBe(generation)
+        expect(currentTarget).not.toEqual(staleTarget)
+        expect(harness.workingSet.activeConversationViewportSource).toBe(source)
+        expect(
+            harness.workingSet.captureSelectedConversationAuthority(),
+        ).not.toBeNull()
+        await expect(
+            harness.workingSet.acquireCompleteConversation(
+                'stale',
+                staleTarget,
+            ),
+        ).rejects.toBeInstanceOf(Error)
+    })
+
+    it('switches windowed conversations without full reads and keeps repeat selection usable', async () => {
+        const chatA = {
+            ...makeChat('chat-a'),
+            message: [{ role: 'user', data: 'first' }],
+        } as Chat
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'second' }],
+        } as Chat
+        const target = makeCharacter('char-a', [chatA, chatB])
+        const harness = makeWindowedHarness({ characters: [target] })
+        await harness.workingSet.activateCharacter('char-a')
+        const previousSource =
+            harness.workingSet.activeConversationViewportSource!
+
+        await expect(
+            harness.workingSet.activateConversation('chat-b'),
+        ).resolves.toBe(true)
+        await expect(
+            harness.workingSet.activateConversation('chat-b'),
+        ).resolves.toBe(true)
+
+        expect(harness.readConversation).not.toHaveBeenCalled()
+        expect(harness.publishConversation).toHaveBeenCalledOnce()
+        expect(previousSource.snapshot().totalMessages).toBe(0)
+        expect(
+            harness.workingSet.captureSelectedConversationAuthority(),
+        ).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-b',
+            totalMessages: 1,
+        })
+        expect(harness.database.characters[0].chatPage).toBe(1)
+        expect(() => harness.database.characters[0].chats[1].message).toThrow(
+            'metadata-only',
+        )
+    })
+
+    it('keeps the previous windowed owner usable when destination adoption is rejected', async () => {
+        const characterA = makeCharacter('char-a', [
+            {
+                ...makeChat('chat-a'),
+                message: [{ role: 'user', data: 'first' }],
+            } as Chat,
+        ])
+        const characterB = makeCharacter('char-b', [
+            {
+                ...makeChat('chat-b'),
+                message: [{ role: 'char', data: 'second' }],
+            } as Chat,
+        ])
+        const harness = makeWindowedHarness({
+            characters: [characterA, characterB],
+        })
+        await harness.workingSet.activateCharacter('char-a')
+        const previousSource =
+            harness.workingSet.activeConversationViewportSource!
+        harness.coordinator.adoptWindowedSelectedConversation.mockReturnValueOnce(
+            false,
+        )
+
+        await expect(
+            harness.workingSet.activateCharacter('char-b'),
+        ).resolves.toBe(false)
+
+        expect(harness.workingSet.activeConversationViewportSource).toBe(
+            previousSource,
+        )
+        expect(previousSource.snapshot().totalMessages).toBe(1)
+        expect(
+            harness.workingSet.captureSelectedConversationTarget(),
+        ).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-a',
+        })
+        expect(harness.database.characters[0].chaId).toBe('char-a')
+        expect(harness.database.characters[1].chats[0].message).toEqual(
+            characterB.chats[0].message,
+        )
+    })
+
+    it('restores the post-flush owner when adoption rejects after its revision advances', async () => {
+        const characterA = makeCharacter('char-a', [
+            {
+                ...makeChat('chat-a'),
+                message: [{ role: 'user', data: 'first' }],
+            } as Chat,
+        ])
+        const characterB = makeCharacter('char-b', [
+            {
+                ...makeChat('chat-b'),
+                message: [{ role: 'char', data: 'second' }],
+            } as Chat,
+        ])
+        const harness = makeWindowedHarness({
+            characters: [characterA, characterB],
+        })
+        await harness.workingSet.activateCharacter('char-a')
+        const preFlushSource =
+            harness.workingSet.activeConversationViewportSource!
+        let postFlushSource = preFlushSource
+        harness.setStoreRevision(2)
+        harness.coordinator.flushPendingData.mockImplementationOnce(
+            async () => {
+                harness.coordinator.revision = 2
+                harness.workingSet.advanceStoreRevision(2)
+                postFlushSource =
+                    harness.workingSet.activeConversationViewportSource!
+            },
+        )
+        harness.coordinator.adoptWindowedSelectedConversation.mockReturnValueOnce(
+            false,
+        )
+
+        await expect(
+            harness.workingSet.activateCharacter('char-b'),
+        ).resolves.toBe(false)
+
+        expect(preFlushSource.snapshot().totalMessages).toBe(0)
+        expect(harness.workingSet.activeConversationViewportSource).toBe(
+            postFlushSource,
+        )
+        expect(postFlushSource.snapshot()).toMatchObject({
+            storeRevision: 2,
+            totalMessages: 1,
+        })
+        expect(
+            harness.workingSet.captureSelectedConversationTarget(),
+        ).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-a',
+            storeRevision: 2,
+        })
+    })
+
+    it('does not let a stale complete fallback replace a newer character navigation', async () => {
+        const characters = ['a', 'b', 'c'].map((suffix) =>
+            makeCharacter(`char-${suffix}`, [
+                {
+                    ...makeChat(`chat-${suffix}`),
+                    message: [{ role: 'user', data: suffix }],
+                } as Chat,
+            ]),
+        )
+        const harness = makeWindowedHarness({ characters })
+        await harness.workingSet.activateCharacter('char-a')
+        let newerNavigation: Promise<boolean> | null = null
+
+        const staleNavigation = harness.workingSet.activateCharacter('char-b', {
+            normalize(candidate) {
+                harness.setWindowedAllowed(false)
+                queueMicrotask(() => {
+                    harness.setWindowedAllowed(true)
+                    newerNavigation =
+                        harness.workingSet.activateCharacter('char-c')
+                })
+                return candidate
+            },
+        })
+
+        await expect(staleNavigation).resolves.toBe(false)
+        await vi.waitFor(() => expect(newerNavigation).not.toBeNull())
+        await expect(newerNavigation!).resolves.toBe(true)
+        expect(harness.readConversation).not.toHaveBeenCalled()
+        expect(
+            harness.workingSet.captureSelectedConversationTarget(),
+        ).toMatchObject({
+            characterId: 'char-c',
+            conversationId: 'chat-c',
+        })
+    })
+
+    it('discards delayed metadata when the mutation generation advances', async () => {
+        const chatA = {
+            ...makeChat('chat-a'),
+            message: [{ role: 'user', data: 'first' }],
+        } as Chat
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'second' }],
+        } as Chat
+        const harness = makeWindowedHarness({
+            characters: [makeCharacter('char-a', [chatA, chatB])],
+        })
+        await harness.workingSet.activateCharacter('char-a')
+        const pending = deferred<{
+            revision: number
+            value: PersistentConversationMetadata
+        } | null>()
+        harness.readConversationMetadata.mockImplementationOnce(
+            () => pending.promise,
+        )
+        const activation = harness.workingSet.activateConversation('chat-b')
+        await vi.waitFor(() =>
+            expect(harness.readConversationMetadata).toHaveBeenCalledTimes(2),
+        )
+        harness.coordinator.mutationGeneration = 1
+        const { message, ...conversation } = structuredClone(chatB)
+        pending.resolve({
+            revision: 1,
+            value: {
+                characterId: 'char-a',
+                conversationId: 'chat-b',
+                conversation,
+                totalMessages: message.length,
+            },
+        })
+
+        await expect(activation).resolves.toBe(false)
+        expect(
+            harness.workingSet.captureSelectedConversationTarget(),
+        ).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-a',
+        })
+    })
+
+    it('passes exact detached normalization evidence and schedules persistence after adoption', async () => {
+        const target = {
+            ...makeCharacter('char-a', [
+                {
+                    ...makeChat('chat-a'),
+                    note: 'before',
+                    message: [{ role: 'user', data: 'persisted' }],
+                } as Chat,
+            ]),
+            lastInteraction: 1,
+        } as character
+        const harness = makeWindowedHarness({ characters: [target] })
+
+        await expect(
+            harness.workingSet.activateCharacter('char-a', {
+                normalize(candidate) {
+                    candidate.lastInteraction = 2
+                    candidate.chats[0].note = 'after'
+                    return candidate
+                },
+            }),
+        ).resolves.toBe(true)
+
+        expect(
+            harness.coordinator.adoptWindowedSelectedConversation,
+        ).toHaveBeenCalledWith(
+            1,
+            0,
+            harness.database.characters[0],
+            expect.objectContaining({ conversationId: 'chat-a' }),
+            {
+                character: {
+                    before: expect.objectContaining({
+                        chaId: 'char-a',
+                        lastInteraction: 1,
+                    }),
+                    after: expect.objectContaining({
+                        chaId: 'char-a',
+                        lastInteraction: 2,
+                    }),
+                },
+                conversation: {
+                    before: expect.objectContaining({
+                        id: 'chat-a',
+                        note: 'before',
+                    }),
+                    after: expect.objectContaining({
+                        id: 'chat-a',
+                        note: 'after',
+                    }),
+                },
+            },
+        )
+        expect(
+            harness.coordinator.markPersistentDataDirty,
+        ).toHaveBeenCalledOnce()
+        expect(
+            harness.coordinator.markPersistentDataDirty.mock
+                .invocationCallOrder[0],
+        ).toBeGreaterThan(
+            harness.coordinator.runSelectedConversationTransition.mock
+                .invocationCallOrder[0],
+        )
+    })
     it('hydrates only the selected conversation body in the scalable working set', async () => {
         const chatA = {
             ...makeChat('chat-a'),
@@ -458,6 +1036,7 @@ describe('ActiveWorkingSet', () => {
                 flushPendingData: vi.fn(async () => undefined),
                 replacePersistentDatabase: vi.fn(async () => undefined),
                 adoptHydratedCharacter: vi.fn(() => true),
+                markPersistentDataDirty: vi.fn(),
             },
             getSelectedCharacterId: () => selectedCharacterId,
             publishCharacter: (character) => {
@@ -999,6 +1578,7 @@ describe('ActiveWorkingSet', () => {
                 events.push('baseline')
                 return true
             }),
+            markPersistentDataDirty: vi.fn(),
         }
         const workingSet = new ActiveWorkingSet({
             store: {
@@ -1048,6 +1628,7 @@ describe('ActiveWorkingSet', () => {
             flushPendingData: vi.fn(async () => undefined),
             replacePersistentDatabase: vi.fn(async () => undefined),
             adoptHydratedCharacter: vi.fn(() => true),
+            markPersistentDataDirty: vi.fn(),
             recordActiveConversationMutation: vi.fn(),
         }
         const workingSet = new ActiveWorkingSet({
@@ -1139,6 +1720,7 @@ describe('ActiveWorkingSet', () => {
             flushPendingData: vi.fn(async () => { throw new Error('commit failed') }),
             replacePersistentDatabase: vi.fn(async () => undefined),
             adoptHydratedCharacter: vi.fn(() => true),
+            markPersistentDataDirty: vi.fn(),
             recordActiveConversationMutation: vi.fn(),
         }
         const workingSet = new ActiveWorkingSet({
@@ -1191,6 +1773,7 @@ describe('ActiveWorkingSet', () => {
                 flushPendingData: vi.fn(async () => undefined),
                 replacePersistentDatabase: vi.fn(async () => undefined),
                 adoptHydratedCharacter: vi.fn(() => true),
+                markPersistentDataDirty: vi.fn(),
             },
             getSelectedCharacterId: () => 'char-a',
             getResidentCharacter: () => resident,
@@ -1658,6 +2241,7 @@ describe('ActiveWorkingSet', () => {
             flushPendingData: vi.fn(async () => undefined),
             replacePersistentDatabase: vi.fn(async () => undefined),
             adoptHydratedCharacter: vi.fn(() => true),
+            markPersistentDataDirty: vi.fn(),
         }
         const workingSet = new ActiveWorkingSet({
             store: reopened,
@@ -1730,6 +2314,7 @@ describe('ActiveWorkingSet', () => {
                 flushPendingData: vi.fn(async () => undefined),
                 replacePersistentDatabase: vi.fn(async () => undefined),
                 adoptHydratedCharacter: vi.fn(() => true),
+                markPersistentDataDirty: vi.fn(),
             },
             getSelectedCharacterId: () => 'char-b',
             publishCharacter,
@@ -1821,6 +2406,7 @@ describe('maximum compatibility working set installation', () => {
                     ? { revision, value: structuredClone(conversation) }
                     : null
             }),
+            readConversationMetadata: vi.fn(async () => null),
             readConversationWindow: vi.fn(async () => null),
             queryPluginStorage: vi.fn(async () => ({
                 revision,

@@ -1,26 +1,39 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
+import { safeStructuredClone } from '../polyfill'
 import {
     ActiveConversationSession,
+    createConversationSessionToken,
     type ActiveConversationMutationEvent,
 } from './activeConversationSession'
+import isEqual from 'lodash/isEqual'
 import type {
     CharacterDetail,
     ConversationSummary,
     DataRevision,
+    PersistentConversationMetadata,
     PersistentDataStore,
 } from './persistentDataStore'
 import {
+    createConversationSummaryFromMetadata,
     createConversationSummaryStub,
     createConversationSummaryStubFromChat,
+    getConversationSummaryStub,
 } from './conversationResidency'
-import type { PersistedConversationMutationEvent } from './saveCoordinator'
+import type {
+    PersistedConversationMutationEvent,
+    WindowedConversationActivationChange,
+} from './saveCoordinator'
 import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
 import {
     PersistentConversationViewportSource,
     SynchronousSessionConversationViewportSource,
     type ConversationViewportSource,
 } from '../conversationViewportSource'
-import { createMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
+import {
+    cloneConversationMetadata,
+    createMetadataOnlySelectedConversation,
+    isMetadataOnlySelectedConversation,
+} from './selectedConversationLifecycle'
 import { removeGroupMemberReferences } from './groupMembership'
 
 type CompleteCharacter = character | groupChat
@@ -42,11 +55,13 @@ export interface WorkingSetCoordinator {
         character: CompleteCharacter,
     ): boolean
     readonly hasPendingPersistenceWork?: boolean
+    markPersistentDataDirty(estimatedBytes: number): void
     adoptWindowedSelectedConversation?(
         revision: DataRevision,
         mutationGeneration: number,
         character: CompleteCharacter,
         authority: WindowedConversationPersistenceAuthority,
+        activationChange?: WindowedConversationActivationChange,
     ): boolean
     advanceWindowedSelectedConversationRevision?(
         revision: DataRevision,
@@ -58,6 +73,7 @@ export interface WorkingSetCoordinator {
 
 export interface CharacterActivationOptions {
     prepare?(): Promise<{ database: Database; reason: string } | null>
+    normalize?(character: CompleteCharacter): CompleteCharacter
 }
 
 export interface ActiveWorkingSetDependencies {
@@ -72,6 +88,7 @@ export interface ActiveWorkingSetDependencies {
         conversation: Chat,
         nextCharacter?: CompleteCharacter,
     ): void
+    captureActivationRollback?(characterIds: readonly string[]): () => void
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
     canDeactivateCharacter?(id: string): boolean
@@ -143,12 +160,88 @@ interface WindowedSelectedConversationState {
     conversationId: string
     conversation: Chat
     authority: WindowedConversationPersistenceAuthority
+    summary: ConversationSummary
     viewportSource: PersistentConversationViewportSource
 }
 
 type SelectedConversationState =
     | CompleteSelectedConversationState
     | WindowedSelectedConversationState
+
+interface WindowedCharacterHydration {
+    character: CompleteCharacter
+    persistedDetail: CharacterDetail
+    selectedMetadata: PersistentConversationMetadata
+    selectedSummary: ConversationSummary
+}
+
+type WindowedCharacterActivationResult = boolean | 'complete-fallback'
+type WindowedCharacterHydrationResult =
+    WindowedCharacterHydration | 'complete-fallback' | null
+
+function captureCharacterDetail(character: CompleteCharacter): CharacterDetail {
+    const detail = {} as CharacterDetail
+    for (const key of Object.keys(character) as Array<
+        keyof CompleteCharacter
+    >) {
+        if (key === 'chats') continue
+        Object.defineProperty(detail, key, {
+            configurable: true,
+            enumerable: true,
+            value: safeStructuredClone(character[key]),
+            writable: true,
+        })
+    }
+    return detail
+}
+
+function estimateActivationChangeBytes(
+    change: WindowedConversationActivationChange,
+): number {
+    const serialized = JSON.stringify(change)
+    return Math.max(
+        1,
+        Math.min(1_048_576, new TextEncoder().encode(serialized).byteLength),
+    )
+}
+
+function matchesPublishedCharacter(
+    expected: CompleteCharacter,
+    published: CompleteCharacter,
+    selectedConversationId: string,
+    includeSelectedMessages: boolean,
+): boolean {
+    if (
+        !isEqual(
+            captureCharacterDetail(expected),
+            captureCharacterDetail(published),
+        ) ||
+        expected.chats.length !== published.chats.length
+    )
+        return false
+    for (let index = 0; index < expected.chats.length; index++) {
+        const expectedConversation = expected.chats[index]
+        const publishedConversation = published.chats[index]
+        if (
+            !publishedConversation ||
+            !isEqual(
+                cloneConversationMetadata(expectedConversation),
+                cloneConversationMetadata(publishedConversation),
+            )
+        )
+            return false
+        if (
+            includeSelectedMessages &&
+            expectedConversation.id === selectedConversationId &&
+            !isEqual(
+                expectedConversation.message,
+                publishedConversation.message,
+            )
+        )
+            return false
+    }
+    return true
+}
 
 export type ActiveConversationViewportSourceListener = (
     source: ConversationViewportSource | null,
@@ -302,10 +395,20 @@ export class ActiveWorkingSet {
             shell: Chat
             nextCharacter: CompleteCharacter
             authority: WindowedConversationPersistenceAuthority
+            summary: ConversationSummary
             viewportSource: PersistentConversationViewportSource
             windowedState: WindowedSelectedConversationState
         }
         try {
+            const summary = createConversationSummaryFromMetadata(
+                state.characterId,
+                cloneConversationMetadata(state.conversation),
+                conversationIndex,
+                state.session.totalMessages,
+                state.conversation.lastDate ??
+                    state.conversation.message.at(-1)?.time ??
+                    0,
+            )
             const shell = createMetadataOnlySelectedConversation(state.conversation)
             const nextCharacter = {
                 ...resident,
@@ -334,6 +437,7 @@ export class ActiveWorkingSet {
                 shell,
                 nextCharacter,
                 authority,
+                summary,
                 viewportSource,
                 windowedState: {
                     kind: 'windowed',
@@ -343,6 +447,7 @@ export class ActiveWorkingSet {
                     conversationId: state.conversationId,
                     conversation: shell,
                     authority,
+                    summary,
                     viewportSource,
                 },
             }
@@ -351,7 +456,7 @@ export class ActiveWorkingSet {
         }
         const { shell, nextCharacter, authority, viewportSource, windowedState } = prepared
         try {
-            const adopted = transition.call(this.dependencies.coordinator, () => {
+            transition.call(this.dependencies.coordinator, () => {
                 this.selectedConversationState = windowedState
                 this.activeSession = null
                 this.dependencies.publishConversation(
@@ -359,14 +464,41 @@ export class ActiveWorkingSet {
                     shell,
                     nextCharacter,
                 )
-                return this.dependencies.coordinator.adoptWindowedSelectedConversation!(
+                const publishedCharacter =
+                    this.dependencies.getResidentCharacter?.(state.characterId)
+                const publishedConversation =
+                    publishedCharacter?.chats[publishedCharacter.chatPage ?? 0]
+                if (
+                    !publishedCharacter ||
+                    publishedCharacter.chaId !== state.characterId ||
+                    !matchesPublishedCharacter(
+                        nextCharacter,
+                        publishedCharacter,
+                        state.conversationId,
+                        false,
+                    ) ||
+                    !publishedConversation ||
+                    publishedConversation.id !== state.conversationId ||
+                    !isMetadataOnlySelectedConversation(publishedConversation)
+                ) {
+                    throw new Error(
+                        'Windowed selected conversation publication diverged',
+                    )
+                }
+                windowedState.conversation = publishedConversation
+                const adopted = this.dependencies.coordinator
+                    .adoptWindowedSelectedConversation!(
                     authority.storeRevision,
                     this.dependencies.coordinator.mutationGeneration,
-                    nextCharacter,
+                    publishedCharacter,
                     authority,
                 )
+                if (!adopted) {
+                    throw new Error(
+                        'Windowed selected conversation was not adopted',
+                    )
+                }
             })
-            if (!adopted) throw new Error('Windowed selected conversation was not adopted')
         } catch {
             this.selectedConversationState = state
             this.activeSession = state.session
@@ -496,6 +628,17 @@ export class ActiveWorkingSet {
         this.clearActiveConversationSession()
     }
 
+    fenceNavigation(): number {
+        this.navigationGeneration++
+        const state = this.selectedConversationState
+        if (state) {
+            state.navigationGeneration = this.navigationGeneration
+            state.stateToken = Symbol('fenced selected conversation')
+        }
+        this.promotionFlight = null
+        return this.navigationGeneration
+    }
+
     invalidateActiveConversationSession(): void {
         this.clearActiveConversationSession()
     }
@@ -582,6 +725,13 @@ export class ActiveWorkingSet {
         id: string,
         options: CharacterActivationOptions = {},
     ): Promise<boolean> {
+        if (this.canDirectlyActivateWindowed(options)) {
+            const expectedFallbackGeneration = this.navigationGeneration + 1
+            const direct = await this.activateWindowedCharacter(id, options)
+            if (direct !== 'complete-fallback') return direct
+            if (this.navigationGeneration !== expectedFallbackGeneration)
+                return false
+        }
         const preparation = this.prepareCompleteNavigation(
             `activate-character:${id}`,
         )
@@ -602,7 +752,7 @@ export class ActiveWorkingSet {
         options: CharacterActivationOptions = {},
     ): Promise<boolean> {
         if (this.dependencies.canActivateWorkingSet?.() === false) return false
-        const generation = ++this.navigationGeneration
+        const generation = this.fenceNavigation()
         const previousCharacterId = this.dependencies.getSelectedCharacterId()
         const previousActiveIds = this.activeIds.size > 0
             ? new Set(this.activeIds)
@@ -670,7 +820,7 @@ export class ActiveWorkingSet {
         const missingRelatedIds = new Set(
             relatedIds.filter((_memberId, index) => relatedValues[index] === undefined),
         )
-        const persistedCharacterValue = characterValue
+        const persistedCharacterValue = safeStructuredClone(characterValue)
         if (characterValue.type === 'group' && missingRelatedIds.size > 0) {
             const groupValue = characterValue
             characterValue = {
@@ -679,6 +829,11 @@ export class ActiveWorkingSet {
             }
             relatedIds = relatedIds.filter((memberId) => !missingRelatedIds.has(memberId))
         }
+        characterValue = this.normalizeCharacterCandidate(
+            characterValue,
+            options.normalize,
+            true,
+        )
         if (!this.isCurrent(generation, revision, mutationGeneration)) return false
         if (!this.dependencies.coordinator.adoptHydratedCharacter(
             revision,
@@ -707,14 +862,184 @@ export class ActiveWorkingSet {
                 this.dependencies.releaseInactiveCharacter?.(previousId)
             }
         }
+        if (!isEqual(persistedCharacterValue, characterValue)) {
+            this.dependencies.coordinator.markPersistentDataDirty(
+                Math.max(
+                    1,
+                    Math.min(
+                        1_048_576,
+                        new TextEncoder().encode(JSON.stringify(characterValue))
+                            .byteLength,
+                    ),
+                ),
+            )
+        }
         return true
     }
 
+    private async activateWindowedCharacter(
+        id: string,
+        options: CharacterActivationOptions,
+    ): Promise<WindowedCharacterActivationResult> {
+        if (!this.canDirectlyActivateWindowed(options))
+            return 'complete-fallback'
+        const generation = this.fenceNavigation()
+        const previousCharacterId = this.dependencies.getSelectedCharacterId()
+        const previousActiveIds =
+            this.activeIds.size > 0
+                ? new Set(this.activeIds)
+                : new Set(previousCharacterId ? [previousCharacterId] : [])
+        await this.dependencies.coordinator.flushPendingData(
+            'activate-character',
+        )
+        if (
+            generation !== this.navigationGeneration ||
+            this.dependencies.canActivateWorkingSet?.() === false
+        )
+            return false
+        if (!this.canDirectlyActivateWindowed(options))
+            return 'complete-fallback'
+        if (this.dependencies.getSelectedCharacterId() !== previousCharacterId)
+            return false
+        const previousState = this.selectedConversationState
+        const revision = this.dependencies.coordinator.revision
+        const mutationGeneration =
+            this.dependencies.coordinator.mutationGeneration
+        const hydrated = await this.hydrateWindowedCharacter(
+            id,
+            revision,
+            mutationGeneration,
+            generation,
+            options,
+        )
+        if (!hydrated) return false
+        if (hydrated === 'complete-fallback') return hydrated
+        if (this.dependencies.getSelectedCharacterId() !== previousCharacterId)
+            return false
+
+        let relatedIds =
+            hydrated.character.type === 'group'
+                ? [...new Set(hydrated.character.characters)].filter(
+                      (memberId) => memberId !== id,
+                  )
+                : []
+        const relatedValues: Array<CharacterDetail | null | undefined> = []
+        for (
+            let start = 0;
+            start < relatedIds.length;
+            start += RELATED_CHARACTER_HYDRATION_CONCURRENCY
+        ) {
+            const chunk = relatedIds.slice(
+                start,
+                start + RELATED_CHARACTER_HYDRATION_CONCURRENCY,
+            )
+            const values = await Promise.all(
+                chunk.map(async (memberId) => {
+                    try {
+                        return await this.hydrateCharacterDetail(
+                            memberId,
+                            revision,
+                            mutationGeneration,
+                            generation,
+                        )
+                    } catch (error) {
+                        if (error instanceof MissingCharacterError)
+                            return undefined
+                        throw error
+                    }
+                }),
+            )
+            relatedValues.push(...values)
+            if (!this.isCurrent(generation, revision, mutationGeneration))
+                return false
+            if (!this.canDirectlyActivateWindowed(options))
+                return 'complete-fallback'
+            if (values.some((value) => value === null)) return false
+        }
+        if (relatedValues.some((value) => value === undefined)) {
+            return 'complete-fallback'
+        }
+
+        const normalized = this.normalizeCharacterCandidate(
+            hydrated.character,
+            options.normalize,
+        )
+        if (
+            this.dependencies.getSelectedCharacterId() !==
+                previousCharacterId ||
+            !this.isCurrent(generation, revision, mutationGeneration)
+        )
+            return false
+        if (!this.canDirectlyActivateWindowed(options))
+            return 'complete-fallback'
+        const selectedConversation = normalized.chats[normalized.chatPage ?? 0]
+        if (
+            !selectedConversation ||
+            selectedConversation.id !==
+                hydrated.selectedMetadata.conversationId ||
+            !isMetadataOnlySelectedConversation(selectedConversation)
+        ) {
+            throw new Error(
+                'Windowed normalization changed selected conversation ownership',
+            )
+        }
+        const beforeDetail = hydrated.persistedDetail
+        const afterDetail = captureCharacterDetail(normalized)
+        const beforeMetadata = hydrated.selectedMetadata.conversation
+        const afterMetadata = cloneConversationMetadata(selectedConversation)
+        const activationChange: WindowedConversationActivationChange = {}
+        if (!isEqual(beforeDetail, afterDetail)) {
+            activationChange.character = {
+                before: beforeDetail,
+                after: afterDetail,
+            }
+        }
+        if (!isEqual(beforeMetadata, afterMetadata)) {
+            activationChange.conversation = {
+                before: beforeMetadata,
+                after: afterMetadata,
+            }
+        }
+        const activation =
+            activationChange.character || activationChange.conversation
+                ? activationChange
+                : undefined
+        const completeRelated = relatedValues.filter(
+            (value): value is CharacterDetail =>
+                value !== null && value !== undefined,
+        )
+        return this.publishWindowedSelection({
+            character: normalized,
+            metadata: hydrated.selectedMetadata,
+            summary: hydrated.selectedSummary,
+            revision,
+            mutationGeneration,
+            generation,
+            previousState,
+            previousActiveIds,
+            nextActiveIds: new Set([id, ...relatedIds]),
+            related: completeRelated,
+            publishAsConversation: false,
+            activation,
+        })
+    }
+
     activateConversation(id: string): Promise<boolean> {
+        const selectedState = this.selectedConversationState
+        if (
+            selectedState?.kind === 'windowed' &&
+            selectedState?.conversationId === id &&
+            selectedState.characterId ===
+                this.dependencies.getSelectedCharacterId()
+        )
+            return Promise.resolve(true)
+        if (this.canDirectlyActivateWindowed()) {
+            return this.startWindowedConversationActivation(id)
+        }
         const preparation = this.prepareCompleteNavigation(
             `activate-conversation:${id}`,
         )
-        if (!preparation) return this.startConversationActivation(id)
+        if (!preparation) return this.startCompleteConversationActivation(id)
         return this.activateConversationAfterPreparation(id, preparation)
     }
 
@@ -725,7 +1050,7 @@ export class ActiveWorkingSet {
         let lease: CompleteConversationLease | null = null
         try {
             lease = await preparation
-            return await this.startConversationActivation(id)
+            return await this.startCompleteConversationActivation(id)
         } catch (error) {
             if (error instanceof SelectedConversationPromotionStaleError) return false
             throw error
@@ -734,7 +1059,7 @@ export class ActiveWorkingSet {
         }
     }
 
-    private startConversationActivation(id: string): Promise<boolean> {
+    private startCompleteConversationActivation(id: string): Promise<boolean> {
         if (this.dependencies.canActivateWorkingSet?.() === false) return Promise.resolve(false)
         const characterId = this.dependencies.getSelectedCharacterId()
         if (!characterId) return Promise.reject(new Error('No character is selected'))
@@ -743,6 +1068,30 @@ export class ActiveWorkingSet {
         if (existing?.generation === this.navigationGeneration) return existing.promise
         const generation = ++this.navigationGeneration
         const pending = this.activateConversationOnce(characterId, id, generation).finally(() => {
+            if (this.conversationFlights.get(key)?.promise === pending) {
+                this.conversationFlights.delete(key)
+            }
+        })
+        this.conversationFlights.set(key, { generation, promise: pending })
+        return pending
+    }
+
+    private startWindowedConversationActivation(id: string): Promise<boolean> {
+        if (this.dependencies.canActivateWorkingSet?.() === false)
+            return Promise.resolve(false)
+        const characterId = this.dependencies.getSelectedCharacterId()
+        if (!characterId)
+            return Promise.reject(new Error('No character is selected'))
+        const key = `${characterId}\u0000${id}`
+        const existing = this.conversationFlights.get(key)
+        if (existing?.generation === this.navigationGeneration)
+            return existing.promise
+        const generation = this.fenceNavigation()
+        const pending = this.activateWindowedConversationOnce(
+            characterId,
+            id,
+            generation,
+        ).finally(() => {
             if (this.conversationFlights.get(key)?.promise === pending) {
                 this.conversationFlights.delete(key)
             }
@@ -822,6 +1171,546 @@ export class ActiveWorkingSet {
         return true
     }
 
+    private async activateWindowedConversationOnce(
+        characterId: string,
+        id: string,
+        generation: number,
+    ): Promise<boolean> {
+        const previousActiveIds = new Set(this.activeIds)
+        await this.dependencies.coordinator.flushPendingData(
+            'activate-conversation',
+        )
+        if (
+            characterId !== this.dependencies.getSelectedCharacterId() ||
+            !this.isCurrentWindowedActivation(generation)
+        )
+            return false
+        const previousState = this.selectedConversationState
+        const revision = this.dependencies.coordinator.revision
+        const mutationGeneration =
+            this.dependencies.coordinator.mutationGeneration
+        const versioned =
+            await this.dependencies.store.readConversationMetadata(
+                characterId,
+                id,
+            )
+        if (
+            characterId !== this.dependencies.getSelectedCharacterId() ||
+            !this.isCurrentWindowedActivation(
+                generation,
+                {},
+                revision,
+                mutationGeneration,
+            )
+        )
+            return false
+        if (!versioned)
+            throw new Error(
+                `Conversation ${id} was not found for ${characterId}`,
+            )
+        const resident = this.dependencies.getResidentCharacter?.(characterId)
+        if (!resident) return false
+        const conversationIndex = resident.chats.findIndex(
+            (candidate) => candidate.id === id,
+        )
+        if (conversationIndex < 0) {
+            throw new Error(
+                `Conversation ${id} was not present in the active character`,
+            )
+        }
+        const currentTarget = resident.chats[conversationIndex]
+        const retainedCatalogSummary = getConversationSummaryStub(currentTarget)
+        const metadata = this.requireValidConversationMetadata(
+            versioned,
+            characterId,
+            id,
+            revision,
+            retainedCatalogSummary ?? undefined,
+        )
+        const retainedSummary =
+            retainedCatalogSummary ??
+            (previousState?.kind === 'windowed' &&
+            previousState.conversation === currentTarget
+                ? createConversationSummaryFromMetadata(
+                      characterId,
+                      cloneConversationMetadata(currentTarget),
+                      conversationIndex,
+                      previousState.authority.totalMessages,
+                      previousState.summary.recentAt,
+                      previousState.summary,
+                  )
+                : createConversationSummaryFromMetadata(
+                      characterId,
+                      cloneConversationMetadata(currentTarget),
+                      conversationIndex,
+                      currentTarget.message.length,
+                      currentTarget.lastDate ??
+                          currentTarget.message.at(-1)?.time ??
+                          0,
+                  ))
+        const shell = createMetadataOnlySelectedConversation(
+            metadata.conversation,
+        )
+        const chats = [...resident.chats]
+        const previousIndex = resident.chatPage ?? 0
+        const previousConversation = chats[previousIndex]
+        if (
+            previousConversation &&
+            previousIndex !== conversationIndex &&
+            this.dependencies.canReleaseConversation?.(
+                resident,
+                previousConversation.id ?? '',
+                id,
+            ) === true
+        ) {
+            if (
+                previousState?.kind === 'windowed' &&
+                previousState.characterId === characterId &&
+                previousState.conversationId === previousConversation.id
+            ) {
+                chats[previousIndex] = createConversationSummaryStub(
+                    createConversationSummaryFromMetadata(
+                        characterId,
+                        cloneConversationMetadata(previousState.conversation),
+                        previousIndex,
+                        previousState.authority.totalMessages,
+                        previousState.summary.recentAt,
+                        previousState.summary,
+                    ),
+                )
+            } else {
+                chats[previousIndex] = createConversationSummaryStubFromChat(
+                    characterId,
+                    previousConversation,
+                    previousIndex,
+                )
+            }
+        }
+        chats[conversationIndex] = shell
+        const nextCharacter = {
+            ...resident,
+            chats,
+            chatPage: conversationIndex,
+        } as CompleteCharacter
+        const beforeDetail = captureCharacterDetail(resident)
+        const afterDetail = captureCharacterDetail(nextCharacter)
+        const activation: WindowedConversationActivationChange | undefined =
+            isEqual(beforeDetail, afterDetail)
+                ? undefined
+                : { character: { before: beforeDetail, after: afterDetail } }
+        return this.publishWindowedSelection({
+            character: nextCharacter,
+            metadata,
+            summary: retainedSummary,
+            revision,
+            mutationGeneration,
+            generation,
+            previousState,
+            previousActiveIds,
+            nextActiveIds: new Set(
+                previousActiveIds.size > 0 ? previousActiveIds : [characterId],
+            ),
+            related: [],
+            publishAsConversation: true,
+            activation,
+        })
+    }
+
+    private canDirectlyActivateWindowed(
+        options: CharacterActivationOptions = {},
+    ): boolean {
+        return (
+            options.prepare === undefined &&
+            this.dependencies.canActivateWorkingSet?.() !== false &&
+            this.dependencies.canUseWindowedSelectedConversation?.() === true &&
+            this.dependencies.isMaximumCompatibilityMode?.() !== true &&
+            this.dependencies.isConversationOperationActive?.() !== true &&
+            this.dependencies.coordinator.runSelectedConversationTransition !==
+                undefined &&
+            this.dependencies.coordinator.adoptWindowedSelectedConversation !==
+                undefined &&
+            this.dependencies.captureActivationRollback !== undefined
+        )
+    }
+
+    private isCurrentWindowedActivation(
+        generation: number,
+        options: CharacterActivationOptions = {},
+        revision?: DataRevision,
+        mutationGeneration?: number,
+    ): boolean {
+        return (
+            generation === this.navigationGeneration &&
+            this.canDirectlyActivateWindowed(options) &&
+            this.dependencies.canActivateWorkingSet?.() !== false &&
+            (revision === undefined ||
+                revision === this.dependencies.coordinator.revision) &&
+            (mutationGeneration === undefined ||
+                mutationGeneration ===
+                    this.dependencies.coordinator.mutationGeneration)
+        )
+    }
+
+    private normalizeCharacterCandidate(
+        character: CompleteCharacter,
+        normalize?: (character: CompleteCharacter) => CompleteCharacter,
+        allowFirstConversation = false,
+    ): CompleteCharacter {
+        if (!normalize) return character
+        const characterId = character.chaId
+        const conversations = [...character.chats]
+        const conversationIds = conversations.map(
+            (conversation) => conversation.id,
+        )
+        const metadataOnly = conversations.map(
+            isMetadataOnlySelectedConversation,
+        )
+        const messageOwners = conversations.map((conversation, index) =>
+            metadataOnly[index] ? null : conversation.message,
+        )
+        const normalized = normalize(character)
+        if (
+            !normalized ||
+            normalized.chaId !== characterId ||
+            !Array.isArray(normalized.chats)
+        ) {
+            throw new Error(
+                'Character normalization changed character ownership',
+            )
+        }
+        if (
+            allowFirstConversation &&
+            conversations.length === 0 &&
+            normalized.chats.length === 1
+        )
+            return normalized
+        if (normalized.chats.length !== conversations.length) {
+            throw new Error(
+                'Character normalization changed conversation membership',
+            )
+        }
+        for (let index = 0; index < conversations.length; index++) {
+            const before = conversations[index]
+            const after = normalized.chats[index]
+            if (!after || after.id !== conversationIds[index]) {
+                throw new Error(
+                    'Character normalization changed conversation order',
+                )
+            }
+            if (metadataOnly[index]) {
+                if (!isMetadataOnlySelectedConversation(after)) {
+                    throw new Error(
+                        'Character normalization replaced metadata-only ownership',
+                    )
+                }
+            } else if (after.message !== messageOwners[index]) {
+                throw new Error(
+                    'Character normalization changed message ownership',
+                )
+            }
+        }
+        return normalized
+    }
+
+    private requireValidConversationMetadata(
+        versioned: {
+            revision: DataRevision
+            value: PersistentConversationMetadata
+        },
+        characterId: string,
+        conversationId: string,
+        revision: DataRevision,
+        summary?: ConversationSummary,
+    ): PersistentConversationMetadata {
+        const value = versioned.value
+        if (
+            versioned.revision !== revision ||
+            value.characterId !== characterId ||
+            value.conversationId !== conversationId ||
+            value.conversation.id !== conversationId ||
+            Object.hasOwn(value.conversation, 'message') ||
+            !Number.isSafeInteger(value.totalMessages) ||
+            value.totalMessages < 0 ||
+            (summary !== undefined &&
+                summary.messageCount !== value.totalMessages)
+        ) {
+            throw new Error(
+                `Conversation ${conversationId} returned invalid metadata`,
+            )
+        }
+        return value
+    }
+
+    private async hydrateWindowedCharacter(
+        id: string,
+        revision: DataRevision,
+        mutationGeneration: number,
+        generation: number,
+        options: CharacterActivationOptions,
+    ): Promise<WindowedCharacterHydrationResult> {
+        const detail = await this.dependencies.store.readCharacter(id)
+        if (!this.isCurrent(generation, revision, mutationGeneration))
+            return null
+        if (!this.canDirectlyActivateWindowed(options))
+            return 'complete-fallback'
+        if (!detail)
+            throw new MissingCharacterError(`Character ${id} was not found`)
+        if (detail.revision !== revision) return null
+        if (detail.value.chaId !== id) {
+            throw new Error(
+                `Character ${id} returned mismatched ID ${detail.value.chaId}`,
+            )
+        }
+
+        const summaries: ConversationSummary[] = []
+        const seenConversationIds = new Set<string>()
+        let selectedSummary: ConversationSummary | undefined
+        let cursor: string | undefined
+        do {
+            const page = await this.dependencies.store.queryConversations({
+                characterId: id,
+                order: 'configured',
+                limit: 100,
+                cursor,
+            })
+            if (!this.isCurrent(generation, revision, mutationGeneration))
+                return null
+            if (!this.canDirectlyActivateWindowed(options))
+                return 'complete-fallback'
+            if (page.revision !== revision) return null
+            for (const summary of page.items) {
+                if (
+                    summary.characterId !== id ||
+                    !Number.isSafeInteger(summary.messageCount) ||
+                    summary.messageCount < 0 ||
+                    seenConversationIds.has(summary.id)
+                ) {
+                    throw new Error(
+                        `Conversation ${summary.id} returned invalid summary`,
+                    )
+                }
+                seenConversationIds.add(summary.id)
+                summaries.push(summary)
+                if (summary.configuredIndex === (detail.value.chatPage ?? 0)) {
+                    selectedSummary ??= summary
+                }
+            }
+            cursor = page.nextCursor
+        } while (cursor !== undefined)
+        if (summaries.length === 0) return 'complete-fallback'
+        selectedSummary ??= summaries[0]
+        const selectedIndex = summaries.indexOf(selectedSummary)
+        const metadataVersion =
+            await this.dependencies.store.readConversationMetadata(
+                id,
+                selectedSummary.id,
+            )
+        if (!this.isCurrent(generation, revision, mutationGeneration))
+            return null
+        if (!this.canDirectlyActivateWindowed(options))
+            return 'complete-fallback'
+        if (!metadataVersion) {
+            throw new Error(
+                `Conversation ${selectedSummary.id} was not found for ${id}`,
+            )
+        }
+        const selectedMetadata = this.requireValidConversationMetadata(
+            metadataVersion,
+            id,
+            selectedSummary.id,
+            revision,
+            selectedSummary,
+        )
+        const chats = summaries.map(createConversationSummaryStub)
+        chats[selectedIndex] = createMetadataOnlySelectedConversation(
+            selectedMetadata.conversation,
+        )
+        return {
+            character: {
+                ...safeStructuredClone(detail.value),
+                chats,
+                chatPage: selectedIndex,
+            } as CompleteCharacter,
+            persistedDetail: safeStructuredClone(detail.value),
+            selectedMetadata,
+            selectedSummary: safeStructuredClone(selectedSummary),
+        }
+    }
+
+    private publishWindowedSelection(input: {
+        character: CompleteCharacter
+        metadata: PersistentConversationMetadata
+        summary: ConversationSummary
+        revision: DataRevision
+        mutationGeneration: number
+        generation: number
+        previousState: SelectedConversationState | null
+        previousActiveIds: ReadonlySet<string>
+        nextActiveIds: Set<string>
+        related: CharacterDetail[]
+        publishAsConversation: boolean
+        activation?: WindowedConversationActivationChange
+    }): boolean {
+        if (
+            !this.isCurrentWindowedActivation(
+                input.generation,
+                {},
+                input.revision,
+                input.mutationGeneration,
+            )
+        )
+            return false
+        const conversation =
+            input.character.chats[input.character.chatPage ?? 0]
+        if (
+            !conversation ||
+            conversation.id !== input.metadata.conversationId ||
+            !isMetadataOnlySelectedConversation(conversation)
+        )
+            return false
+        const authority: WindowedConversationPersistenceAuthority = {
+            kind: 'windowed',
+            characterId: input.character.chaId,
+            conversationId: input.metadata.conversationId,
+            sessionToken: createConversationSessionToken(),
+            storeRevision: input.revision,
+            persistedSessionVersion: 0,
+            sessionVersion: 0,
+            totalMessages: input.metadata.totalMessages,
+        }
+        const rollbackIds = [
+            ...new Set([
+                ...input.previousActiveIds,
+                ...input.nextActiveIds,
+                input.character.chaId,
+                ...input.related.map((detail) => detail.chaId),
+            ]),
+        ]
+        const restorePublication =
+            this.dependencies.captureActivationRollback?.(rollbackIds)
+        const transition =
+            this.dependencies.coordinator.runSelectedConversationTransition
+        const adopt =
+            this.dependencies.coordinator.adoptWindowedSelectedConversation
+        if (!restorePublication || !transition || !adopt) return false
+        const viewportSource = new PersistentConversationViewportSource({
+            reader: this.dependencies.store,
+            characterId: authority.characterId,
+            conversationId: authority.conversationId,
+            revision: authority.storeRevision,
+            totalMessages: authority.totalMessages,
+            rowBudget: this.dependencies.conversationViewportRowBudget ?? 64,
+        })
+        const windowedState: WindowedSelectedConversationState = {
+            kind: 'windowed',
+            stateToken: Symbol('direct windowed selected conversation'),
+            navigationGeneration: input.generation,
+            characterId: authority.characterId,
+            conversationId: authority.conversationId,
+            conversation,
+            authority,
+            summary: safeStructuredClone(input.summary),
+            viewportSource,
+        }
+        try {
+            transition.call(this.dependencies.coordinator, () => {
+                this.selectedConversationState = windowedState
+                this.activeSession = null
+                if (input.publishAsConversation) {
+                    this.dependencies.publishConversation(
+                        input.character.chaId,
+                        conversation,
+                        input.character,
+                    )
+                } else if (input.related.length > 0) {
+                    this.dependencies.publishCharacterSet(
+                        input.character,
+                        input.related,
+                    )
+                } else {
+                    this.dependencies.publishCharacter(input.character)
+                }
+                const publishedCharacter =
+                    this.dependencies.getResidentCharacter?.(
+                        input.character.chaId,
+                    )
+                const publishedConversation =
+                    publishedCharacter?.chats[publishedCharacter.chatPage ?? 0]
+                if (
+                    !publishedCharacter ||
+                    publishedCharacter.chaId !== input.character.chaId ||
+                    !matchesPublishedCharacter(
+                        input.character,
+                        publishedCharacter,
+                        authority.conversationId,
+                        false,
+                    ) ||
+                    !publishedConversation ||
+                    publishedConversation.id !== authority.conversationId ||
+                    !isMetadataOnlySelectedConversation(publishedConversation)
+                ) {
+                    throw new Error(
+                        'Windowed selected conversation publication diverged',
+                    )
+                }
+                windowedState.conversation = publishedConversation
+                const adopted = adopt.call(
+                    this.dependencies.coordinator,
+                    input.revision,
+                    input.mutationGeneration,
+                    publishedCharacter,
+                    authority,
+                    input.activation,
+                )
+                if (!adopted) {
+                    throw new Error(
+                        'Windowed selected conversation was not adopted',
+                    )
+                }
+            })
+        } catch (error) {
+            this.selectedConversationState = input.previousState
+            this.activeSession =
+                input.previousState?.kind === 'complete'
+                    ? input.previousState.session
+                    : null
+            viewportSource.dispose()
+            try {
+                restorePublication()
+            } catch (rollbackError) {
+                input.previousState?.viewportSource.dispose()
+                if (input.previousState?.kind === 'complete') {
+                    input.previousState.session.invalidate()
+                }
+                this.selectedConversationState = null
+                this.activeSession = null
+                this.promotionFlight = null
+                this.notifyActiveConversationViewportSource()
+                throw rollbackError
+            }
+            return false
+        }
+
+        if (input.previousState && input.previousState !== windowedState) {
+            input.previousState.viewportSource.dispose()
+            if (input.previousState.kind === 'complete')
+                input.previousState.session.invalidate()
+        }
+        this.activeIds = input.nextActiveIds
+        for (const previousId of input.previousActiveIds) {
+            if (!input.nextActiveIds.has(previousId)) {
+                this.dependencies.releaseInactiveCharacter?.(previousId)
+            }
+        }
+        this.notifyActiveConversationViewportSource()
+        if (input.activation) {
+            this.dependencies.coordinator.markPersistentDataDirty(
+                estimateActivationChangeBytes(input.activation),
+            )
+        }
+        return true
+    }
+
     private publishActiveConversationSession(
         characterId: string,
         fallbackConversation: Chat,
@@ -860,13 +1749,37 @@ export class ActiveWorkingSet {
     }
 
     private async promoteWindowedConversation(
-        state: WindowedSelectedConversationState,
-        target: SelectedConversationTarget,
+        initialState: WindowedSelectedConversationState,
+        initialTarget: SelectedConversationTarget,
         reason: string,
     ): Promise<CompleteSelectedConversationState> {
         await this.dependencies.coordinator.flushPendingData(
             `complete-selected-conversation:${reason}`,
         )
+        let state = initialState
+        let target = initialTarget
+        if (this.selectedConversationState !== initialState) {
+            const current = this.selectedConversationState
+            if (
+                current?.kind !== 'windowed' ||
+                current.characterId !== initialState.characterId ||
+                current.conversationId !== initialState.conversationId ||
+                current.navigationGeneration !==
+                    initialTarget.navigationGeneration ||
+                current.authority.sessionToken !==
+                    initialState.authority.sessionToken ||
+                current.authority.sessionVersion !==
+                    initialState.authority.sessionVersion ||
+                current.authority.persistedSessionVersion !==
+                    initialState.authority.persistedSessionVersion
+            )
+                throw new SelectedConversationPromotionStaleError()
+            const currentTarget = this.captureSelectedConversationTarget()
+            if (!currentTarget)
+                throw new SelectedConversationPromotionStaleError()
+            state = current
+            target = currentTarget
+        }
         this.requireCurrentWindowedState(state, target)
         if (this.dependencies.coordinator.revision !== state.authority.storeRevision) {
             throw new SelectedConversationPromotionStaleError()
@@ -894,42 +1807,65 @@ export class ActiveWorkingSet {
             chats: resident.chats.map((candidate, index) =>
                 index === conversationIndex ? conversation : candidate),
         } as CompleteCharacter
-        const complete = this.createCompleteSelectedConversationState(
-            state.characterId,
-            conversation,
-            state.authority.storeRevision,
-            state.navigationGeneration,
-        )
         const transition = this.dependencies.coordinator.runSelectedConversationTransition
         if (!transition) {
-            complete.viewportSource.dispose()
-            complete.session.invalidate()
             throw new Error('Selected conversation transition is unavailable')
         }
-        let adopted = false
+        let complete: CompleteSelectedConversationState | null = null
         try {
-            adopted = transition.call(this.dependencies.coordinator, () => {
-                this.selectedConversationState = complete
-                this.activeSession = complete.session
+            transition.call(this.dependencies.coordinator, () => {
+                this.selectedConversationState = null
+                this.activeSession = null
                 this.dependencies.publishConversation(
                     state.characterId,
                     conversation,
                     nextCharacter,
                 )
-                return this.dependencies.coordinator.adoptHydratedCharacter(
+                const publishedCharacter =
+                    this.dependencies.getResidentCharacter?.(state.characterId)
+                const publishedConversation =
+                    publishedCharacter?.chats[publishedCharacter.chatPage ?? 0]
+                if (
+                    !publishedCharacter ||
+                    publishedCharacter.chaId !== state.characterId ||
+                    !matchesPublishedCharacter(
+                        nextCharacter,
+                        publishedCharacter,
+                        state.conversationId,
+                        true,
+                    ) ||
+                    !publishedConversation ||
+                    publishedConversation.id !== state.conversationId ||
+                    isMetadataOnlySelectedConversation(publishedConversation)
+                ) {
+                    throw new Error(
+                        'Complete selected conversation publication diverged',
+                    )
+                }
+                complete = this.createCompleteSelectedConversationState(
+                    state.characterId,
+                    publishedConversation,
+                    state.authority.storeRevision,
+                    state.navigationGeneration,
+                )
+                this.selectedConversationState = complete
+                this.activeSession = complete.session
+                const adopted = this.dependencies.coordinator.adoptHydratedCharacter(
                     state.authority.storeRevision,
                     this.dependencies.coordinator.mutationGeneration,
-                    nextCharacter,
+                    publishedCharacter,
                 )
+                if (!adopted) {
+                    throw new Error(
+                        'The complete selected conversation was not adopted',
+                    )
+                }
             })
-            if (!adopted) {
-                throw new Error('The complete selected conversation was not adopted')
-            }
         } catch (error) {
             this.selectedConversationState = state
             this.activeSession = null
-            complete.viewportSource.dispose()
-            complete.session.invalidate()
+            complete?.viewportSource.dispose()
+            complete?.session.invalidate()
             try {
                 this.dependencies.publishConversation(
                     state.characterId,
@@ -941,6 +1877,8 @@ export class ActiveWorkingSet {
             }
             throw error
         }
+        if (!complete)
+            throw new Error('Complete selected conversation was not published')
         state.viewportSource.dispose()
         this.notifyActiveConversationViewportSource()
         return complete

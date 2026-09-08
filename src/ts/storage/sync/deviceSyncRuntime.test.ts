@@ -33,6 +33,7 @@ function makeLease(database: Database, revision: number): PersistentRevisionLeas
         readCharacter: vi.fn(async () => null),
         queryConversations: vi.fn(async () => ({ revision, items: [] })),
         readConversation: vi.fn(async () => null),
+        readConversationMetadata: vi.fn(async () => null),
         readConversationWindow: vi.fn(async () => null),
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),

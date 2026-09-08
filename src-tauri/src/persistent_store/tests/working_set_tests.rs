@@ -2278,6 +2278,113 @@ fn replace_range_updates_conversation_detail_and_preserves_recent_at_without_it(
 }
 
 #[test]
+fn conversation_metadata_preserves_detail_without_decoding_messages_across_revisions() {
+    let (_directory, mut store, _) = open_fixture();
+    let lease = store.acquire_revision(1).expect("acquire metadata lease");
+    let revised_detail = json!({
+        "id": "conv-short",
+        "name": "Metadata only",
+        "note": "nested fields survive",
+        "localLore": [{ "key": "value", "nested": [1, { "ok": true }] }],
+        "custom": { "array": [null, false, "text"], "number": 42 },
+        "lastDate": 777
+    });
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: 2,
+            delete_count: 0,
+            messages: vec![message("metadata-append")],
+            conversation: Some(revised_detail.clone()),
+            configured_index: None,
+        },
+    );
+
+    let active = store
+        .read_conversation_metadata("char-a", "conv-short", None)
+        .expect("read active metadata")
+        .expect("active conversation exists");
+    assert_eq!(
+        serde_json::to_value(&active).expect("serialize active metadata"),
+        json!({
+            "revision": revision,
+            "value": {
+                "characterId": "char-a",
+                "conversationId": "conv-short",
+                "conversation": revised_detail,
+                "totalMessages": 3
+            }
+        })
+    );
+    assert!(active.value.conversation.get("message").is_none());
+
+    let pinned = store
+        .read_conversation_metadata("char-a", "conv-short", Some(&lease.lease))
+        .expect("read pinned metadata")
+        .expect("pinned conversation exists");
+    assert_eq!(pinned.revision, 1);
+    assert_eq!(pinned.value.conversation["name"], "Short chat");
+    assert!(pinned.value.conversation.get("message").is_none());
+    assert_eq!(pinned.value.total_messages, 2);
+
+    assert!(store
+        .read_conversation_metadata("char-a", "missing", None)
+        .expect("read missing conversation metadata")
+        .is_none());
+    assert!(store
+        .read_conversation_metadata("char-b", "conv-short", None)
+        .expect("read metadata with wrong owner")
+        .is_none());
+
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "UPDATE messages SET value = 'not-json' WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3 AND message_index = 0",
+            params![generation, "char-a", "conv-short"],
+        )
+        .expect("corrupt one message payload");
+    let metadata = store
+        .read_conversation_metadata("char-a", "conv-short", None)
+        .expect("metadata read ignores corrupt message payload")
+        .expect("conversation still exists");
+    assert_eq!(metadata.value.conversation, revised_detail);
+    assert_eq!(metadata.value.total_messages, 3);
+    assert!(store
+        .read_conversation("char-a", "conv-short", None)
+        .is_err());
+
+    store
+        .release_revision(&lease.lease)
+        .expect("release metadata lease");
+    assert!(matches!(
+        store.read_conversation_metadata("char-a", "conv-short", Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+}
+
+#[test]
+fn conversation_metadata_rejects_message_counts_outside_javascript_safe_range() {
+    let (_directory, store, _) = open_fixture();
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "UPDATE conversations SET message_count = ?1 WHERE generation = ?2 AND character_id = ?3 AND conversation_id = ?4",
+            params![JAVASCRIPT_MAX_SAFE_INTEGER + 1, generation, "char-a", "conv-short"],
+        )
+        .expect("write unsafe synthetic message count");
+
+    assert!(matches!(
+        store.read_conversation_metadata("char-a", "conv-short", None),
+        Err(StoreError::Validation { .. })
+    ));
+}
+
+#[test]
 fn summary_recent_at_falls_back_to_message_time_then_zero() {
     let (_directory, mut store, _) = open_fixture();
     let revision = commit(

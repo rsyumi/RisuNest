@@ -245,6 +245,66 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             selectedCharID.set(characterIndex)
             ReloadGUIPointer.set(Math.random())
         },
+        captureActivationRollback(characterIds) {
+            const database = getDatabase()
+            const ids = [...new Set(characterIds)]
+            const entries = ids.map((id) => {
+                const index = database.characters.findIndex(
+                    (character) => character.chaId === id,
+                )
+                return {
+                    id,
+                    index,
+                    value: index < 0 ? null : database.characters[index],
+                    released: workingSetResidency.isCharacterReleased(id),
+                }
+            })
+            const selected =
+                database.characters[get(selectedCharID)]?.chaId ?? null
+            let restored = false
+            return () => {
+                if (restored) return
+                restored = true
+                const current = getDatabase()
+                for (const entry of entries) {
+                    const currentIndex = current.characters.findIndex(
+                        (character) => character.chaId === entry.id,
+                    )
+                    if (entry.value === null) {
+                        if (currentIndex >= 0)
+                            current.characters.splice(currentIndex, 1)
+                        continue
+                    }
+                    if (currentIndex >= 0)
+                        current.characters[currentIndex] = entry.value
+                    else
+                        current.characters.splice(
+                            Math.min(entry.index, current.characters.length),
+                            0,
+                            entry.value,
+                        )
+                }
+                for (const entry of entries) {
+                    workingSetResidency.forgetCharacter(entry.id)
+                    if (entry.released || entry.value === null) {
+                        if (entry.released)
+                            workingSetResidency.markCharacterReleased(entry.id)
+                        continue
+                    }
+                    workingSetResidency.markCharacterHydrated(entry.id)
+                    workingSetResidency.reconcileConversationResidency(
+                        entry.value,
+                    )
+                }
+                selectedCharID.set(
+                    selected === null
+                        ? -1
+                        : current.characters.findIndex(
+                              (character) => character.chaId === selected,
+                          ),
+                )
+            }
+        },
         shouldHydrateFullCharacter() {
             return !workingSetResidency.allowsEviction
         },
@@ -415,6 +475,8 @@ export const reconcilePersistentActiveCharacterIds = (
 )
 export const getPersistentNavigationGeneration = (): number =>
     getPersistentDataRuntime().getNavigationGeneration()
+export const fencePersistentNavigation = (): number =>
+    getPersistentDataRuntime().fenceNavigation()
 export const invalidatePersistentNavigation = (): void =>
     getPersistentDataRuntime().invalidateNavigation()
 export const replacePersistentDatabase = (

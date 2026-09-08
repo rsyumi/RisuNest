@@ -7,16 +7,34 @@ export type MetadataOnlySelectedConversation = Chat & {
     readonly [metadataOnlySelectedConversation]: true
 }
 
-export function createMetadataOnlySelectedConversation(
-    conversation: Chat,
-): MetadataOnlySelectedConversation {
-    const shell = {} as MetadataOnlySelectedConversation
+export function cloneConversationMetadata(
+    conversation: Chat | Omit<Chat, 'message'>,
+): Omit<Chat, 'message'> {
+    const metadata = {} as Omit<Chat, 'message'>
     for (const key of Object.keys(conversation) as Array<keyof Chat>) {
         if (key === 'message') continue
-        Object.defineProperty(shell, key, {
+        Object.defineProperty(metadata, key, {
             configurable: true,
             enumerable: true,
             value: safeStructuredClone(conversation[key]),
+            writable: true,
+        })
+    }
+    return metadata
+}
+
+export function createMetadataOnlySelectedConversation(
+    conversation: Chat | Omit<Chat, 'message'>,
+): MetadataOnlySelectedConversation {
+    const shell = {} as MetadataOnlySelectedConversation
+    const metadata = cloneConversationMetadata(conversation)
+    for (const key of Object.keys(metadata) as Array<
+        keyof Omit<Chat, 'message'>
+    >) {
+        Object.defineProperty(shell, key, {
+            configurable: true,
+            enumerable: true,
+            value: metadata[key],
             writable: true,
         })
     }

@@ -72,6 +72,7 @@ describe('SqlitePersistentDataStore', () => {
         await store.readCharacter('char-a')
         await store.queryConversations(conversationQuery)
         await store.readConversation('char-a', 'conv-long')
+        await store.readConversationMetadata('char-a', 'conv-long')
         await store.readConversationWindow(windowQuery)
         await store.queryPluginStorage()
         await store.readPluginStorage('memory')
@@ -99,6 +100,10 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_query_conversations', { query: conversationQuery }],
             [
                 'pds_read_conversation',
+                { characterId: 'char-a', conversationId: 'conv-long' },
+            ],
+            [
+                'pds_read_conversation_metadata',
                 { characterId: 'char-a', conversationId: 'conv-long' },
             ],
             ['pds_read_conversation_window', { query: windowQuery }],
@@ -487,6 +492,7 @@ describe('SqlitePersistentDataStore', () => {
         await lease.readCharacter('char-a')
         await lease.queryConversations({ characterId: 'char-a', order: 'recent', limit: 10 })
         await lease.readConversation('char-a', 'conv-long')
+        await lease.readConversationMetadata('char-a', 'conv-long')
         await lease.readConversationWindow({
             characterId: 'char-a',
             conversationId: 'conv-long',
@@ -526,6 +532,10 @@ describe('SqlitePersistentDataStore', () => {
                 { characterId: 'char-a', conversationId: 'conv-long', lease: 'lease-7' },
             ],
             [
+                'pds_read_conversation_metadata',
+                { characterId: 'char-a', conversationId: 'conv-long', lease: 'lease-7' },
+            ],
+            [
                 'pds_read_conversation_window',
                 {
                     query: { characterId: 'char-a', conversationId: 'conv-long', limit: 10 },
@@ -553,7 +563,10 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_release_revision', { lease: 'lease-7' }],
         ])
         await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        expect(mocks.invoke).toHaveBeenCalledTimes(19)
+        await expect(lease.readConversationMetadata('char-a', 'conv-long')).rejects.toBeInstanceOf(
+            SnapshotReleasedError,
+        )
+        expect(mocks.invoke).toHaveBeenCalledTimes(20)
     })
 
     it('retains the native open report and warns when a snapshot restore was skipped', async () => {

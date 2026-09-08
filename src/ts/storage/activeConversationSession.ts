@@ -337,7 +337,7 @@ class ConversationLocatorRegistry {
     }
 }
 
-function createConversationSessionToken(): ConversationSessionToken {
+export function createConversationSessionToken(): ConversationSessionToken {
     nextConversationSessionToken += 1
     return `conversation-session-${nextConversationSessionToken}` as ConversationSessionToken
 }

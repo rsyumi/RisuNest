@@ -18,9 +18,8 @@ import {
     commitCharacterAddition,
     deactivateActiveWorkingSet,
     deletePersistentCharacterWithGroupReferences,
+    fencePersistentNavigation,
     getPersistentNavigationGeneration,
-    invalidatePersistentNavigation,
-    markPersistentDataDirty,
     mutatePersistentCharacterDetail,
     readPersistentCompleteCharacter,
     readPersistentConversation,
@@ -40,6 +39,8 @@ import {
     selectCharacterImageFile,
 } from './storage/characterImageFileRoute'
 import { importNativeJpegAsset } from './storage/nativeJpegAssetImport'
+import { beginNavigationActivity } from './ui/navigationActivity'
+import { yieldToUi } from './ui/yieldToUi'
 
 export async function commitDetachedCharacter(
     character: character | groupChat,
@@ -586,7 +587,7 @@ function formatTavernChat(chat:string, charName:string){
     return chat.replace(/<([Uu]ser)>|\{\{([Uu]ser)\}\}/g, getUserName()).replace(/((\{\{)|<)([Cc]har)(=.+)?((\}\})|>)/g, charName)
 }
 
-export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
+export function characterFormatUpdate(indexOrCharacter:number|character|groupChat, arg:{
     updateInteraction?:boolean,
 } = {}){
     let cha = typeof(indexOrCharacter) === 'number' ? getCharacterByIndex(indexOrCharacter) : indexOrCharacter
@@ -1039,12 +1040,15 @@ export async function changeChar(index: number, arg:{
     }
     const chaId = DBState.db.characters?.[index]?.chaId
     if(!chaId) return false
-    invalidatePersistentNavigation()
-    const restoreNavigationGeneration = getPersistentNavigationGeneration()
+    const restoreNavigationGeneration = fencePersistentNavigation()
+    const activity = beginNavigationActivity('character')
     const isRestoreCurrent = () =>
+        activity.isCurrent() &&
         getPersistentNavigationGeneration() === restoreNavigationGeneration
-    reseter();
     try {
+        reseter()
+        await yieldToUi()
+        if (!isRestoreCurrent()) return false
         const restoreColdCharacter = async (characterId: string) => {
             return restoreColdPersistentCharacter(
                 characterId,
@@ -1064,22 +1068,25 @@ export async function changeChar(index: number, arg:{
         }
         if (!isRestoreCurrent()) return false
         const expectedNavigationGeneration = restoreNavigationGeneration + 1
-        let activated = await activateCharacter(chaId, undefined)
+        const activationOptions = {
+            normalize: (candidate: character | groupChat) =>
+                characterFormatUpdate(candidate, {
+                    updateInteraction: true,
+                }),
+        }
+        let activated = await activateCharacter(chaId, activationOptions)
         if (!activated) {
             if (getPersistentNavigationGeneration() !== expectedNavigationGeneration) return false
-            activated = await activateCharacter(chaId, undefined)
+            activated = await activateCharacter(chaId, activationOptions)
         }
         if(!activated) return false
-        const selectedIndex = DBState.db.characters.findIndex((character) => character.chaId === chaId)
-        if(selectedIndex === -1) return false
-        const updated = characterFormatUpdate(selectedIndex, {
-            updateInteraction: true,
-        })
-        markPersistentDataDirty(new TextEncoder().encode(JSON.stringify(updated)).byteLength)
+        if (!activity.isCurrent()) return false
         return true
     } catch (error) {
         alertError(error)
         return false
+    } finally {
+        activity.finish()
     }
 }
 

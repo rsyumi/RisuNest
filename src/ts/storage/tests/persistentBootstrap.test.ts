@@ -1,5 +1,5 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { RevisionConflictError, type PersistentDataStore } from '../persistentDataStore'
@@ -11,6 +11,14 @@ import {
     projectCatalogWorkingSet,
 } from '../workingSetCatalog'
 import { fixtureDatabase } from './persistentDataFixtures'
+
+const scheduling = vi.hoisted(() => ({
+    yieldToMainThread: vi.fn(async () => undefined),
+}))
+
+vi.mock('../../ui/yieldToUi', () => ({
+    yieldToMainThread: scheduling.yieldToMainThread,
+}))
 
 function plugin(version: '2.1', enabled: boolean): Database['plugins'][number] {
     return { enabled, version } as Database['plugins'][number]
@@ -43,6 +51,7 @@ function createStore(input?: {
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),
         readConversation: vi.fn(),
+        readConversationMetadata: vi.fn(),
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),
@@ -72,6 +81,11 @@ function createStore(input?: {
 }
 
 describe('bootstrapPersistentDatabase', () => {
+    beforeEach(() => {
+        scheduling.yieldToMainThread.mockReset()
+        scheduling.yieldToMainThread.mockResolvedValue(undefined)
+    })
+
     it('starts a blank store from one prepared empty database', async () => {
         const store = createStore({ revision: 0, replacementRevision: 1 })
         const prepared = structuredClone(fixtureDatabase)
@@ -202,6 +216,67 @@ describe('bootstrapPersistentDatabase', () => {
         expect((await store.readPluginStorage('plugin-memory'))?.value).toEqual(
             persistent.pluginCustomStorage['plugin-memory'],
         )
+    })
+
+    it('yields between character catalog pages without delaying every summary', async () => {
+        const persistent = structuredClone(fixtureDatabase)
+        persistent.plugins = [plugin('2.1', false)]
+        persistent.botPresetsId = -1
+        const store = createStore({ revision: 7, database: persistent })
+        const events: string[] = []
+        scheduling.yieldToMainThread.mockImplementation(async () => {
+            events.push('yield')
+        })
+        vi.mocked(store.queryCharacters).mockImplementation(async (query) => {
+            events.push(
+                `${query.trash ? 'trash' : 'active'}:${query.cursor ?? 'first'}`,
+            )
+            if (!query.trash && query.cursor === undefined) {
+                return { revision: 7, items: [], nextCursor: 'active-page-2' }
+            }
+            return { revision: 7, items: [] }
+        })
+
+        await bootstrapPersistentDatabase({
+            store,
+            prepareDatabase: async (database) => structuredClone(database),
+            prepareRoot: async (root) => structuredClone(root),
+            projectScalableWorkingSet: () => structuredClone(fixtureDatabase),
+        })
+
+        expect(events).toEqual([
+            'active:first',
+            'yield',
+            'active:active-page-2',
+            'yield',
+            'trash:first',
+        ])
+        expect(scheduling.yieldToMainThread).toHaveBeenCalledTimes(2)
+    })
+
+    it('rejects a stale catalog page returned after a cooperative yield', async () => {
+        const persistent = structuredClone(fixtureDatabase)
+        persistent.plugins = [plugin('2.1', false)]
+        persistent.botPresetsId = -1
+        const store = createStore({ revision: 7, database: persistent })
+        vi.mocked(store.queryCharacters).mockImplementation(async (query) => {
+            if (!query.trash && query.cursor === undefined) {
+                return { revision: 7, items: [], nextCursor: 'active-page-2' }
+            }
+            return { revision: 8, items: [] }
+        })
+
+        await expect(
+            bootstrapPersistentDatabase({
+                store,
+                prepareDatabase: async (database) => structuredClone(database),
+                prepareRoot: async (root) => structuredClone(root),
+                projectScalableWorkingSet: () =>
+                    structuredClone(fixtureDatabase),
+            }),
+        ).rejects.toBeInstanceOf(RevisionConflictError)
+
+        expect(scheduling.yieldToMainThread).toHaveBeenCalledOnce()
     })
 
     it('canonicalizes an out-of-range scalable preset selection before hydration', async () => {

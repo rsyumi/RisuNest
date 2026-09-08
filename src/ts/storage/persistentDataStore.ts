@@ -9,6 +9,13 @@ export interface Versioned<T> {
 
 export type CharacterDetail = Omit<character, 'chats'> | Omit<groupChat, 'chats'>
 
+export interface PersistentConversationMetadata {
+    characterId: string
+    conversationId: string
+    conversation: Omit<Chat, 'message'>
+    totalMessages: number
+}
+
 export type PersistentRoot = Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'>
 
 export interface PluginStorageSummary {
@@ -463,6 +470,10 @@ export interface PersistentRevisionReader {
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
     readConversation(characterId: string, conversationId: string): Promise<Versioned<Chat> | null>
+    readConversationMetadata(
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<PersistentConversationMetadata> | null>
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
@@ -491,6 +502,10 @@ export interface PersistentDataStore {
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
     readConversation(characterId: string, conversationId: string): Promise<Versioned<Chat> | null>
+    readConversationMetadata(
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<PersistentConversationMetadata> | null>
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>

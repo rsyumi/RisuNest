@@ -188,6 +188,7 @@ function createReader(
                 ? { revision, value: clone(conversation) as Chat }
                 : null
         }),
+        readConversationMetadata: vi.fn(async () => null),
         readConversationWindow: async () => null,
         queryPluginStorage: vi.fn(async () => clone(pluginCatalog)),
         readPluginStorage: async (key) => Object.hasOwn(pluginCustomStorage, key)

@@ -744,6 +744,98 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         expect(pageRangeReads).toEqual([])
     })
 
+    it('reads conversation metadata without opening either message store', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `conversation-metadata-io-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(
+            databaseName,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(
+            structuredClone(fixtureDatabase),
+        )
+        const lease = await store.acquireRevision(imported.revision)
+        const rawDatabase = await openDatabase(indexedDB, databaseName)
+        const databasePrototype = Object.getPrototypeOf(
+            rawDatabase,
+        ) as IDBDatabase
+        rawDatabase.close()
+        const openedStores: string[][] = []
+        const originalTransaction = databasePrototype.transaction
+        const transactionSpy = vi
+            .spyOn(databasePrototype, 'transaction')
+            .mockImplementation(function (
+                this: IDBDatabase,
+                storeNames,
+                ...args
+            ) {
+                openedStores.push(
+                    typeof storeNames === 'string'
+                        ? [storeNames]
+                        : [...storeNames],
+                )
+                return originalTransaction.call(this, storeNames, ...args)
+            })
+
+        try {
+            await expect(
+                store.readConversationMetadata('char-a', 'conv-long'),
+            ).resolves.toMatchObject({
+                value: { totalMessages: 130 },
+            })
+            await expect(
+                lease.readConversationMetadata('char-a', 'conv-long'),
+            ).resolves.toMatchObject({
+                revision: imported.revision,
+                value: { totalMessages: 130 },
+            })
+        } finally {
+            transactionSpy.mockRestore()
+        }
+
+        expect(openedStores).toEqual([
+            ['meta', 'conversations'],
+            ['meta', 'conversations'],
+        ])
+        expect(openedStores.flat()).not.toContain('messagePages')
+        expect(openedStores.flat()).not.toContain('messageOccurrences')
+        await lease.release()
+    })
+
+    it('rejects an invalid persisted conversation metadata message count', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `conversation-metadata-count-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(
+            databaseName,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await writeRawRecords(indexedDB, databaseName, 'conversations', [
+            {
+                key: 'revision-0:conversation:char-a:conv-invalid',
+                generation: 'revision-0',
+                value: {
+                    summary: {
+                        id: 'conv-invalid',
+                        characterId: 'char-a',
+                        name: 'Invalid count',
+                        configuredIndex: 0,
+                        recentAt: 0,
+                        messageCount: -1,
+                    },
+                    detail: { id: 'conv-invalid', name: 'Invalid count' },
+                },
+            },
+        ])
+
+        await expect(
+            store.readConversationMetadata('char-a', 'conv-invalid'),
+        ).rejects.toThrow('nonnegative safe integer')
+    })
+
     it('backfills the occurrence index atomically when upgrading legacy message pages', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `message-occurrence-upgrade-${databaseSequence++}`
