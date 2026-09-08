@@ -151,30 +151,36 @@
     let presentedMessage = $derived(captureMessage ?? viewportRow?.message)
     let presentedChatId = $derived(
         captureContext
-            ? captureMessage?.chatId ?? ''
+            ? (captureMessage?.chatId ?? '')
             : viewportRow
-                ? viewportRow.message.chatId ?? ''
-                : DBState.db.characters?.[selIdState.selId]
-                    ?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]
-                    ?.message?.[idx]?.chatId ?? '',
+              ? (viewportRow.message.chatId ?? '')
+              : idx < 0
+                ? ''
+                : (DBState.db.characters?.[selIdState.selId]?.chats?.[
+                      DBState.db.characters?.[selIdState.selId]?.chatPage
+                  ]?.message?.[idx]?.chatId ?? ''),
     )
     let presentedTime = $derived(
         captureContext
             ? captureMessage?.time
             : viewportRow
-                ? viewportRow.message.time
-                : DBState.db.characters?.[selIdState.selId]
-                    ?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]
-                    ?.message?.[idx]?.time,
+              ? viewportRow.message.time
+              : idx < 0
+                ? undefined
+                : DBState.db.characters?.[selIdState.selId]?.chats?.[
+                      DBState.db.characters?.[selIdState.selId]?.chatPage
+                  ]?.message?.[idx]?.time,
     )
     let presentedRole = $derived(
         captureContext
-            ? captureMessage?.role ?? role
+            ? (captureMessage?.role ?? role)
             : viewportRow
-                ? viewportRow.message.role
-                : DBState.db.characters?.[selIdState.selId]
-                    ?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]
-                    ?.message?.[idx]?.role ?? role,
+              ? viewportRow.message.role
+              : idx < 0
+                ? role
+                : (DBState.db.characters?.[selIdState.selId]?.chats?.[
+                      DBState.db.characters?.[selIdState.selId]?.chatPage
+                  ]?.message?.[idx]?.role ?? role),
     )
 
     function parserContext() {
