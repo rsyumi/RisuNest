@@ -11,6 +11,9 @@
     import BackgroundDom from "./BackgroundDom.svelte";
     import SideBarArrow from "../UI/GUI/SideBarArrow.svelte";
     import ModuleChatMenu from "../Setting/Pages/Module/ModuleChatMenu.svelte";
+    import LoadingIndicator from '../UI/GUI/LoadingIndicator.svelte';
+    import { language } from '../../lang';
+    import { navigationActivity } from '../../ts/ui/navigationActivity';
     let openChatList = $state(false)
     let openModuleList = $state(false)
 
@@ -32,58 +35,71 @@
     });
 </script>
 
-{#if DBState.db.theme === 'waifu'}
-    <div class="grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
-        <SideBarArrow />
-        <BackgroundDom />
-        {#if $selectedCharID >= 0}
-            {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
-                <div class="h-full mr-10 flex justify-end halfw" style:width="{42 * (DBState.db.waifuWidth2 / 100)}rem">
-                    <TransitionImage classType="waifu" src={getEmotion(DBState.db, $CharEmotion, 'plain')}/>
-                </div>
-            {/if}
-        {/if}
-        <div class="h-full w-2xl" style:width="{42 * (DBState.db.waifuWidth / 100)}rem" class:halfwp={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}>
-            <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList bind:openModuleList/>
-        </div>
-    </div>
-{:else if DBState.db.theme === 'waifuMobile'}
-    <div class="grow h-full relative" style={bgImg.length < 4 ? wallPaper : bgImg}>
-        <SideBarArrow />
-        <BackgroundDom />
-        <div class="w-full absolute z-10 bottom-0 left-0"
-            class:per33={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
-            class:h-full={!($selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none')}
-        >
-            <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList bind:openModuleList/>
-        </div>
-        {#if $selectedCharID >= 0}
-            {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
-                <div class="h-full w-full absolute bottom-0 left-0 max-w-full">
-                    <TransitionImage classType="mobile" src={getEmotion(DBState.db, $CharEmotion, 'plain')}/>
-                </div>
-            {/if}
-        {/if}
-    </div>
-{:else}
-    <div class="grow h-full min-w-0 relative justify-center flex">
-        <SideBarArrow />
-        <BackgroundDom />
-        <div style={bgImg} class="h-full w-full" class:max-w-6xl={DBState.db.classicMaxWidth}>
+<div class="relative min-w-0 grow h-full" aria-busy={$navigationActivity !== null}>
+    <div class="relative z-0 min-w-0 h-full" inert={$navigationActivity !== null}>
+    {#if DBState.db.theme === 'waifu'}
+        <div class="grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
+            <SideBarArrow />
+            <BackgroundDom />
             {#if $selectedCharID >= 0}
-                {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none' && (DBState.db.characters[$selectedCharID].type === 'group' || (!DBState.db.characters[$selectedCharID].inlayViewScreen))}
-                    <ResizeBox />
+                {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
+                    <div class="h-full mr-10 flex justify-end halfw" style:width="{42 * (DBState.db.waifuWidth2 / 100)}rem">
+                        <TransitionImage classType="waifu" src={getEmotion(DBState.db, $CharEmotion, 'plain')}/>
+                    </div>
                 {/if}
             {/if}
-            <DefaultChatScreen customStyle={bgImg.length > 2 ? `${externalStyles}`: ''} bind:openChatList bind:openModuleList/>
+            <div class="h-full w-2xl" style:width="{42 * (DBState.db.waifuWidth / 100)}rem" class:halfwp={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}>
+                <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList bind:openModuleList/>
+            </div>
         </div>
+    {:else if DBState.db.theme === 'waifuMobile'}
+        <div class="grow h-full relative" style={bgImg.length < 4 ? wallPaper : bgImg}>
+            <SideBarArrow />
+            <BackgroundDom />
+            <div class="w-full absolute z-10 bottom-0 left-0"
+                class:per33={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
+                class:h-full={!($selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none')}
+            >
+                <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList bind:openModuleList/>
+            </div>
+            {#if $selectedCharID >= 0}
+                {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
+                    <div class="h-full w-full absolute bottom-0 left-0 max-w-full">
+                        <TransitionImage classType="mobile" src={getEmotion(DBState.db, $CharEmotion, 'plain')}/>
+                    </div>
+                {/if}
+            {/if}
+        </div>
+    {:else}
+        <div class="grow h-full min-w-0 relative justify-center flex">
+            <SideBarArrow />
+            <BackgroundDom />
+            <div style={bgImg} class="h-full w-full" class:max-w-6xl={DBState.db.classicMaxWidth}>
+                {#if $selectedCharID >= 0}
+                    {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none' && (DBState.db.characters[$selectedCharID].type === 'group' || (!DBState.db.characters[$selectedCharID].inlayViewScreen))}
+                        <ResizeBox />
+                    {/if}
+                {/if}
+                <DefaultChatScreen customStyle={bgImg.length > 2 ? `${externalStyles}`: ''} bind:openChatList bind:openModuleList/>
+            </div>
+        </div>
+    {/if}
     </div>
-{/if}
-{#if openChatList}
-    <ChatList close={() => {openChatList = false}}/>
-{:else if openModuleList}
-    <ModuleChatMenu close={() => {openModuleList = false}}/>
-{/if}
+    {#if $navigationActivity}
+        <div class="absolute inset-0 z-30 flex items-center justify-center bg-darkbg/70">
+            <LoadingIndicator label={language.loadingChatData} />
+        </div>
+    {/if}
+    {#if openChatList}
+        <div class="absolute inset-0 z-40">
+            <ChatList close={() => {openChatList = false}}/>
+        </div>
+    {:else if openModuleList}
+        <div class="absolute inset-0 z-40">
+            <ModuleChatMenu close={() => {openModuleList = false}}/>
+        </div>
+    {/if}
+</div>
 
 <style>
     .halfw{

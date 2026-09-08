@@ -5,10 +5,8 @@
     import ChatScreen from './lib/ChatScreens/ChatScreen.svelte';
     import AlertComp from './lib/Others/AlertComp.svelte';
     import RealmPopUp from './lib/UI/Realm/RealmPopUp.svelte';
-    import GridChars from './lib/Others/GridCatalog.svelte';
     import WelcomeRisu from './lib/Others/WelcomeRisu.svelte';
     import BookmarkList from './lib/Others/BookmarkList.svelte';
-    import Settings from './lib/Setting/Settings.svelte';
     import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { readModule } from './ts/process/modules';
@@ -16,12 +14,9 @@
     import { language } from './lang';
     import RealmFrame from './lib/UI/Realm/RealmFrame.svelte';
     import SavePopupIconComp from './lib/Others/SavePopupIcon.svelte';
-    import Botpreset from './lib/Setting/botpreset.svelte';
-    import ListedPersona from './lib/Setting/listedPersona.svelte';
     import MobileHeader from './lib/Mobile/MobileHeader.svelte';
     import MobileBody from './lib/Mobile/MobileBody.svelte';
     import MobileFooter from './lib/Mobile/MobileFooter.svelte';
-    import CustomGUISettingMenu from './lib/Setting/Pages/CustomGUISettingMenu.svelte';
     import { checkCharOrder } from './ts/globalApi.svelte';
     import { ArrowUpIcon, GlobeIcon, PlusIcon } from '@lucide/svelte';
     import { hypaV3ModalOpen, hypaV3ProgressStore } from "./ts/stores.svelte";
@@ -40,6 +35,33 @@
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
+    import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
+
+    let settingsPromise:
+        Promise<typeof import('./lib/Setting/Settings.svelte')> | undefined
+    let gridCharsPromise:
+        Promise<typeof import('./lib/Others/GridCatalog.svelte')> | undefined
+    let botpresetPromise:
+        Promise<typeof import('./lib/Setting/botpreset.svelte')> | undefined
+    let listedPersonaPromise:
+        Promise<typeof import('./lib/Setting/listedPersona.svelte')> | undefined
+    let customGUISettingMenuPromise:
+        | Promise<
+              typeof import('./lib/Setting/Pages/CustomGUISettingMenu.svelte')
+          >
+        | undefined
+
+    const loadSettings = () =>
+        (settingsPromise ??= import('./lib/Setting/Settings.svelte'))
+    const loadGridChars = () =>
+        (gridCharsPromise ??= import('./lib/Others/GridCatalog.svelte'))
+    const loadBotpreset = () =>
+        (botpresetPromise ??= import('./lib/Setting/botpreset.svelte'))
+    const loadListedPersona = () =>
+        (listedPersonaPromise ??= import('./lib/Setting/listedPersona.svelte'))
+    const loadCustomGUISettingMenu = () =>
+        (customGUISettingMenuPromise ??=
+            import('./lib/Setting/Pages/CustomGUISettingMenu.svelte'))
 
 
   
@@ -255,24 +277,67 @@
                 </div>
             </div>
         {:else}
-            <div class="w-full h-full flex justify-center items-center text-textcolor text-xl bg-gray-900 flex-col">
-                <div class="flex flex-row items-center">
-                    <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-textcolor" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
-                    </svg>
-                    <span>Loading...</span>
-                </div>
-
-                <span class="text-sm mt-2 text-textcolor2">{LoadingStatusState.text}</span>
+            <div
+                class="w-full h-full flex justify-center items-center text-textcolor text-xl bg-darkbg"
+            >
+                <LoadingIndicator
+                    label={language.loading}
+                    detail={LoadingStatusState.text}
+                />
             </div>
         {/if}
     {:else if $CustomGUISettingMenuStore}
-        <CustomGUISettingMenu />
+        {#await loadCustomGUISettingMenu()}
+            <div
+                class="w-full h-full flex items-center justify-center text-textcolor"
+            >
+                <LoadingIndicator label={language.loading} />
+            </div>
+        {:then module}
+            {@const CustomGUISettingMenu = module.default}
+            <CustomGUISettingMenu />
+        {:catch}
+            <div
+                class="w-full h-full flex flex-col gap-3 items-center justify-center text-textcolor"
+                role="alert"
+            >
+                <span>{language.error}</span>
+                <button
+                    class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 hover:bg-selected"
+                    onclick={() => {
+                        customGUISettingMenuPromise = undefined
+                        $CustomGUISettingMenuStore = false
+                    }}>{language.cancel}</button
+                >
+            </div>
+        {/await}
     {:else if !didFirstSetup}
         <WelcomeRisu />
     {:else if $settingsOpen}
-        <Settings />
+        {#await loadSettings()}
+            <div
+                class="w-full h-full flex items-center justify-center text-textcolor"
+            >
+                <LoadingIndicator label={language.loading} />
+            </div>
+        {:then module}
+            {@const Settings = module.default}
+            <Settings />
+        {:catch}
+            <div
+                class="w-full h-full flex flex-col gap-3 items-center justify-center text-textcolor"
+                role="alert"
+            >
+                <span>{language.error}</span>
+                <button
+                    class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 hover:bg-selected"
+                    onclick={() => {
+                        settingsPromise = undefined
+                        $settingsOpen = false
+                    }}>{language.cancel}</button
+                >
+            </div>
+        {/await}
     {:else if $MobileGUI}
         <div class="w-full h-full flex flex-col">
             <MobileHeader />
@@ -281,7 +346,34 @@
         </div>
     {:else}
         {#if gridOpen}
-            <GridChars endGrid={() => {gridOpen = false}} />
+            {#await loadGridChars()}
+                <div
+                    class="w-full h-full flex items-center justify-center text-textcolor"
+                >
+                    <LoadingIndicator label={language.loading} />
+                </div>
+            {:then module}
+                {@const GridChars = module.default}
+                <GridChars
+                    endGrid={() => {
+                        gridOpen = false
+                    }}
+                />
+            {:catch}
+                <div
+                    class="w-full h-full flex flex-col gap-3 items-center justify-center text-textcolor"
+                    role="alert"
+                >
+                    <span>{language.error}</span>
+                    <button
+                        class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 hover:bg-selected"
+                        onclick={() => {
+                            gridCharsPromise = undefined
+                            gridOpen = false
+                        }}>{language.cancel}</button
+                    >
+                </div>
+            {/await}
         {:else}
             {#if (!$DynamicGUI)}
                 <Sidebar openGrid={() => {gridOpen = true}} hidden={!$sideBarStore} />
@@ -307,10 +399,64 @@
         <RealmFrame />
     {/if}
     {#if $openPresetList}
-        <Botpreset close={() => {$openPresetList = false}} />
+        {#await loadBotpreset()}
+            <div
+                class="absolute inset-0 z-40 flex items-center justify-center bg-darkbg text-textcolor"
+            >
+                <LoadingIndicator label={language.loading} />
+            </div>
+        {:then module}
+            {@const Botpreset = module.default}
+            <Botpreset
+                close={() => {
+                    $openPresetList = false
+                }}
+            />
+        {:catch}
+            <div
+                class="absolute inset-0 z-40 flex flex-col gap-3 items-center justify-center bg-darkbg text-textcolor"
+                role="alert"
+            >
+                <span>{language.error}</span>
+                <button
+                    class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 hover:bg-selected"
+                    onclick={() => {
+                        botpresetPromise = undefined
+                        $openPresetList = false
+                    }}>{language.cancel}</button
+                >
+            </div>
+        {/await}
     {/if}
     {#if $openPersonaList}
-        <ListedPersona close={() => {$openPersonaList = false}} />
+        {#await loadListedPersona()}
+            <div
+                class="absolute inset-0 z-40 flex items-center justify-center bg-darkbg text-textcolor"
+            >
+                <LoadingIndicator label={language.loading} />
+            </div>
+        {:then module}
+            {@const ListedPersona = module.default}
+            <ListedPersona
+                close={() => {
+                    $openPersonaList = false
+                }}
+            />
+        {:catch}
+            <div
+                class="absolute inset-0 z-40 flex flex-col gap-3 items-center justify-center bg-darkbg text-textcolor"
+                role="alert"
+            >
+                <span>{language.error}</span>
+                <button
+                    class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 hover:bg-selected"
+                    onclick={() => {
+                        listedPersonaPromise = undefined
+                        $openPersonaList = false
+                    }}>{language.cancel}</button
+                >
+            </div>
+        {/await}
     {/if}
     {#if $bookmarkListOpen}
         <BookmarkList />

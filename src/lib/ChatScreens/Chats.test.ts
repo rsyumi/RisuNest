@@ -35,6 +35,25 @@ const imageMocks = vi.hoisted(() => ({
     }),
 }))
 
+const schedulingMocks = vi.hoisted(() => {
+    const pending: Array<() => void> = []
+    const state = { controlled: false }
+    return {
+        state,
+        pending,
+        yieldToMainThread: vi.fn(() => {
+            if (!state.controlled) return Promise.resolve()
+            return new Promise<void>((resolve) => pending.push(resolve))
+        }),
+        releaseNext() {
+            pending.shift()?.()
+        },
+        releaseAll() {
+            for (const resolve of pending.splice(0)) resolve()
+        },
+    }
+})
+
 class TestResizeObserver {
     static instances: TestResizeObserver[] = []
     readonly observed = new Set<Element>()
@@ -67,6 +86,7 @@ class TestResizeObserver {
 
 vi.mock('src/ts/characters', () => ({ getCharImage: imageMocks.getCharImage }))
 vi.mock('src/ts/globalApi.svelte', () => ({ chatFoldedStateMessageIndex: { index: -1 } }))
+vi.mock('src/ts/ui/yieldToUi', () => ({ yieldToMainThread: schedulingMocks.yieldToMainThread }))
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     return {
@@ -288,6 +308,9 @@ describe('Chats imperative mount lifecycle', () => {
         DBState.db.autoScrollToNewMessage = false
         DBState.db.alwaysScrollToNewMessage = false
         setRuntimePerformanceProfile('normal')
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        schedulingMocks.yieldToMainThread.mockClear()
         TestResizeObserver.instances = []
         vi.stubGlobal('ResizeObserver', TestResizeObserver)
         target = document.createElement('div')
@@ -297,6 +320,9 @@ describe('Chats imperative mount lifecycle', () => {
     afterEach(async () => {
         if (mounted) await unmount(mounted)
         mounted = undefined
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await Promise.resolve()
         document.body.replaceChildren()
         vi.unstubAllGlobals()
     })
@@ -326,6 +352,11 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.unmounts).toContain(oldestInstance)
         expect(probeElements(target).map((element) => element.dataset.message)).toEqual(
             appended.slice(1).reverse().map((message) => message.data),
+        )
+        await vi.waitFor(() =>
+            expect(
+                target.querySelectorAll('[data-chat-mount-pending]'),
+            ).toHaveLength(0),
         )
 
         const remainingInstances = probeElements(target).map((element) => Number(element.dataset.chatProbe))
@@ -542,6 +573,186 @@ describe('Chats imperative mount lifecycle', () => {
         }
 
         expect(chatMountProbe.mounts.length - chatMountProbe.unmounts.length).toBeLessThanOrEqual(65)
+    })
+
+    test('mounts at most four new rows before yielding and reserves queued row height', async () => {
+        schedulingMocks.state.controlled = true
+        const messages = Array.from({ length: 64 }, (_, index) =>
+            makeMessage(index),
+        )
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(4))
+        expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce()
+        const queuedRows = [
+            ...target.querySelectorAll<HTMLElement>('.chat-message-container'),
+        ].filter((element) => !element.querySelector('[data-chat-probe]'))
+        expect(queuedRows).toHaveLength(60)
+        expect(
+            queuedRows.every(
+                (element) =>
+                    element.style.minHeight === '256px' &&
+                    element.style.flexBasis === '256px',
+            ),
+        ).toBe(true)
+
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+    })
+
+    test('coalesces immediately resolved parser projections before mounting rows', async () => {
+        schedulingMocks.state.controlled = true
+        const messages = Array.from({ length: 8 }, (_, index) =>
+            makeMessage(index),
+        )
+        const currentCharacter = makeCharacter(messages)
+        const { source } = makeViewportSource(currentCharacter)
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) =>
+                boundedProjection(currentCharacter, row.absoluteIndex),
+            ),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+
+        await vi.waitFor(() =>
+            expect(resolver.resolve).toHaveBeenCalledTimes(8),
+        )
+        await Promise.resolve()
+        expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce()
+        expect(probeElements(target)).toHaveLength(0)
+
+        schedulingMocks.releaseNext()
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(4))
+    })
+
+    test('waits for a queued jump target to mount before resolving navigation', async () => {
+        schedulingMocks.state.controlled = true
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(4))
+
+        let settled = false
+        const jumping = (mounted as HarnessInstance)
+            .jumpTo(0)
+            .then((result) => {
+                settled = true
+                return result
+            })
+        await tick()
+        await Promise.resolve()
+        expect(settled).toBe(false)
+
+        schedulingMocks.releaseNext()
+        await expect(jumping).resolves.toBe(true)
+        expect(
+            probeElements(target).some(
+                (element) => element.dataset.message === 'message-0',
+            ),
+        ).toBe(true)
+    })
+
+    test('cancels queued rows when switching conversations', async () => {
+        schedulingMocks.state.controlled = true
+        const oldMessages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index, {
+                data: `old-message-${index}`,
+            }),
+        )
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: oldMessages,
+                initialCharacter: makeCharacter(oldMessages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(4))
+        const oldMountCount = chatMountProbe.mounts.length
+
+        const nextMessages = Array.from({ length: 20 }, (_, index) =>
+            makeMessage(index, {
+                data: `new-message-${index}`,
+            }),
+        )
+        const nextCharacter = makeCharacter(nextMessages)
+        nextCharacter.chaId = 'next-character-id'
+        nextCharacter.chats[0].id = 'next-chat-id'
+        ;(mounted as HarnessInstance).switchCharacter(
+            nextCharacter,
+            nextMessages,
+        )
+        await tick()
+
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).every((element) =>
+                    element.dataset.message?.startsWith('new-message-'),
+                ),
+            ).toBe(true),
+        )
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(20))
+        expect(
+            chatMountProbe.mounts.filter((entry) =>
+                entry.message.startsWith('old-message-'),
+            ),
+        ).toHaveLength(oldMountCount)
+    })
+
+    test('keeps an existing row mounted until its queued replacement runs', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) =>
+            makeMessage(index),
+        )
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+        const oldInstance = probeIdForMessage(target, 'message-0')
+
+        schedulingMocks.state.controlled = true
+        ReloadGUIPointer.update((value) => value + 1)
+        await tick()
+        await vi.waitFor(() =>
+            expect(
+                target.querySelector('[data-chat-mount-pending]'),
+            ).not.toBeNull(),
+        )
+        expect(probeIdForMessage(target, 'message-0')).toBe(oldInstance)
+
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await vi.waitFor(() =>
+            expect(probeIdForMessage(target, 'message-0')).not.toBe(
+                oldInstance,
+            ),
+        )
     })
 
     test('renders absolute session rows and mirrors UI pin lifetimes through the viewport source', async () => {
@@ -852,6 +1063,229 @@ describe('Chats imperative mount lifecycle', () => {
         expect(probeElements(target).every((element) => element.dataset.index !== undefined)).toBe(true)
     })
 
+    test('shows one pane loader until the first persistent window mounts', async () => {
+        const messages = [makeMessage(0), makeMessage(1)]
+        const windowRead = deferred<{
+            revision: number
+            value: {
+                characterId: string
+                conversationId: string
+                startIndex: number
+                endIndex: number
+                totalMessages: number
+                messages: Message[]
+                hasMoreBefore: boolean
+                hasMoreAfter: boolean
+            }
+        }>()
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow: vi.fn(() => windowRead.promise) },
+            characterId: 'character-id',
+            conversationId: 'chat-room-id',
+            revision: 1,
+            totalMessages: messages.length,
+            rowBudget: 64,
+        })
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: makeMetadataOnlyCharacter(),
+                initialViewportSource: source,
+            },
+        })
+
+        await vi.waitFor(() =>
+            expect(
+                target.querySelectorAll('[data-chat-initial-loading]'),
+            ).toHaveLength(1),
+        )
+        windowRead.resolve({
+            revision: 1,
+            value: {
+                characterId: 'character-id',
+                conversationId: 'chat-room-id',
+                startIndex: 0,
+                endIndex: messages.length,
+                totalMessages: messages.length,
+                messages,
+                hasMoreBefore: false,
+                hasMoreAfter: false,
+            },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+    })
+
+    test('does not show an initial row loader for an empty conversation', async () => {
+        const source = makePersistentViewportSource([])
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: makeMetadataOnlyCharacter(),
+                initialViewportSource: source,
+            },
+        })
+
+        await tick()
+        await Promise.resolve()
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+    })
+
+    test('shows a recoverable initial load error and retries the current window', async () => {
+        const messages = [makeMessage(0), makeMessage(1)]
+        const reader = vi
+            .fn()
+            .mockRejectedValueOnce(new Error('synthetic read failure'))
+            .mockResolvedValueOnce({
+                revision: 1,
+                value: {
+                    characterId: 'character-id',
+                    conversationId: 'chat-room-id',
+                    startIndex: 0,
+                    endIndex: messages.length,
+                    totalMessages: messages.length,
+                    messages,
+                    hasMoreBefore: false,
+                    hasMoreAfter: false,
+                },
+            })
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow: reader },
+            characterId: 'character-id',
+            conversationId: 'chat-room-id',
+            revision: 1,
+            totalMessages: messages.length,
+            rowBudget: 64,
+        })
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: makeMetadataOnlyCharacter(),
+                initialViewportSource: source,
+            },
+        })
+
+        await vi.waitFor(() =>
+            expect(
+                target.querySelector('[data-chat-load-error]'),
+            ).not.toBeNull(),
+        )
+        expect(target.querySelector('[role="status"]')).toBeNull()
+        expect(reader).toHaveBeenCalledOnce()
+
+        target
+            .querySelector<HTMLButtonElement>('[data-chat-load-retry]')!
+            .click()
+        await vi.waitFor(() =>
+            expect(probeElements(target)).toHaveLength(messages.length),
+        )
+        expect(reader).toHaveBeenCalledTimes(2)
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+        expect(target.querySelector('[data-chat-load-error]')).toBeNull()
+    })
+
+    test('keeps mounted rows visible while a later persistent window is loading', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
+        const earlierRead = deferred<{
+            revision: number
+            value: {
+                characterId: string
+                conversationId: string
+                startIndex: number
+                endIndex: number
+                totalMessages: number
+                messages: Message[]
+                hasMoreBefore: boolean
+                hasMoreAfter: boolean
+            }
+        }>()
+        let delayedRange: { startIndex: number; limit: number } | undefined
+        const source = new PersistentConversationViewportSource({
+            reader: {
+                readConversationWindow: vi.fn(async ({ startIndex, limit }) => {
+                    if (startIndex >= 136) {
+                        const endIndex = Math.min(
+                            messages.length,
+                            startIndex + limit,
+                        )
+                        return {
+                            revision: 1,
+                            value: {
+                                characterId: 'character-id',
+                                conversationId: 'chat-room-id',
+                                startIndex,
+                                endIndex,
+                                totalMessages: messages.length,
+                                messages: messages.slice(startIndex, endIndex),
+                                hasMoreBefore: startIndex > 0,
+                                hasMoreAfter: endIndex < messages.length,
+                            },
+                        }
+                    }
+                    delayedRange = { startIndex, limit }
+                    return earlierRead.promise
+                }),
+            },
+            characterId: 'character-id',
+            conversationId: 'chat-room-id',
+            revision: 1,
+            totalMessages: messages.length,
+            rowBudget: 64,
+        })
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: makeMetadataOnlyCharacter(),
+                initialViewportSource: source,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        const visibleMessages = probeElements(target).map(
+            (element) => element.dataset.message,
+        )
+        const scrollParent =
+            target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+        const gap = target.querySelector<HTMLElement>('[data-chat-gap]')!
+        gap.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 100, height: 100 }) as DOMRect
+
+        scrollParent.scrollTop = -100
+        scrollParent.dispatchEvent(new Event('scroll'))
+        await vi.waitFor(() => expect(delayedRange).toBeDefined())
+        expect(
+            probeElements(target).map((element) => element.dataset.message),
+        ).toEqual(visibleMessages)
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+
+        const { startIndex, limit } = delayedRange!
+        const endIndex = Math.min(messages.length, startIndex + limit)
+        earlierRead.resolve({
+            revision: 1,
+            value: {
+                characterId: 'character-id',
+                conversationId: 'chat-room-id',
+                startIndex,
+                endIndex,
+                totalMessages: messages.length,
+                messages: messages.slice(startIndex, endIndex),
+                hasMoreBefore: startIndex > 0,
+                hasMoreAfter: endIndex < messages.length,
+            },
+        })
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).some(
+                    (element) => element.dataset.message === 'message-135',
+                ),
+            ).toBe(true),
+        )
+    })
+
     test('does not mount a live parser before a source row projection is ready', async () => {
         const messages = [makeMessage(0)]
         const source = makePersistentViewportSource(messages)
@@ -879,6 +1313,49 @@ describe('Chats imperative mount lifecycle', () => {
             parserProjectionKind: 'bounded',
             projectedChatID: 0,
         })
+    })
+
+    test('keeps an unresolved retained row projection usable across a direct jump', async () => {
+        const messages = Array.from({ length: 100 }, (_, index) =>
+            makeMessage(index),
+        )
+        const currentCharacter = makeCharacter(messages)
+        const { source } = makeViewportSource(currentCharacter)
+        const projections = new Map<
+            number,
+            ReturnType<typeof deferred<LiveChatParserProjection>>
+        >()
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(({ row }) => {
+                const pending = deferred<LiveChatParserProjection>()
+                projections.set(row.absoluteIndex, pending)
+                return pending.promise
+            }),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(projections.has(50)).toBe(true))
+
+        const jumping = (mounted as HarnessInstance).jumpTo(35)
+        await vi.waitFor(() => expect(projections.has(35)).toBe(true))
+        projections.get(35)!.resolve(boundedProjection(currentCharacter, 35))
+        await expect(jumping).resolves.toBe(true)
+
+        projections.get(50)!.resolve(boundedProjection(currentCharacter, 50))
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).some(
+                    (element) => element.dataset.message === 'message-50',
+                ),
+            ).toBe(true),
+        )
     })
 
     test('releases stale and mounted complete projections exactly once', async () => {
@@ -1334,7 +1811,7 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(
             probeElements(target).some((element) => element.dataset.message === 'message-135'),
         ).toBe(true))
-        expect(probeElements(target)).toHaveLength(64)
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
 
         gaps = [...target.querySelectorAll<HTMLElement>('[data-chat-gap]')]
         expect(gaps).toHaveLength(2)
@@ -1350,7 +1827,7 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(
             probeElements(target).some((element) => element.dataset.message === 'message-191'),
         ).toBe(true))
-        expect(probeElements(target)).toHaveLength(64)
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
     })
 
     test('uses the low-spec mounted-message budget', async () => {
@@ -1631,8 +2108,7 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
 
         const jumping = (mounted as HarnessInstance).jumpTo(0)
-        await tick()
-        await Promise.resolve()
+        await vi.waitFor(() => expect(pendingFrames.size).toBeGreaterThan(0))
         await unmount(mounted)
         mounted = undefined
 

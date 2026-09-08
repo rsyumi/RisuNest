@@ -1,6 +1,6 @@
 <script lang="ts">
     import isEqual from "lodash/isEqual"
-    import { DBState } from 'src/ts/stores.svelte'
+    import { DBState, selIdState } from 'src/ts/stores.svelte'
     import { sleep } from "src/ts/util"
     import { alertError } from "../../ts/alert"
     import { addMetadataToElement, getDistance, ParseMarkdown, postTranslationParse, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
@@ -14,6 +14,7 @@
     import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { character as CharacterRecord, groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
+    import { yieldToMainThread } from 'src/ts/ui/yieldToUi'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -177,11 +178,70 @@
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
+    function trackLiveParseDependencies(
+        charArg: string | simpleCharacterArgument,
+    ) {
+        // Svelte tracks this derived parse job only until its first await. Keep these
+        // reads aligned with the synchronous live ParseMarkdown prefix when it changes.
+        void translated
+        void retranslate
+        void firstMessage
+        void role
+        void name
+        void parserProjection
+        void captureContext
+        void captureParserIndex
+        void isEqual(lastCharArg, charArg)
+        const settings = DBState.db
+        void settings.autoTranslate
+        void settings.autoTranslateCachedOnly
+        void settings.translatorType
+        void settings.translateBeforeHTMLFormatting
+        void settings.legacyTranslation
+        void settings.showTranslationLoading
+        if (charArg || parserProjection) {
+            void settings.assetWidth
+            void settings.hideAllImages
+            void settings.legacyMediaFindings
+            void settings.assetMaxDifference
+        }
+        if (typeof charArg === 'object' && charArg) {
+            trackAssetTuples(charArg.additionalAssets)
+            trackAssetTuples(charArg.emotionImages)
+        }
+        if (parserProjection?.context.moduleAssets) {
+            trackAssetTuples(parserProjection.context.moduleAssets)
+        } else if (charArg) {
+            const selectedCharacter = settings.characters?.[selIdState.selId]
+            void selectedCharacter?.type
+            void selectedCharacter?.chaId
+            void selectedCharacter?.additionalAssets
+            void selectedCharacter?.emotionImages
+            trackAssetTuples(getModuleAssets())
+        }
+    }
+
+    function trackAssetTuples(
+        assets: readonly (readonly unknown[])[] | undefined,
+    ) {
+        for (const asset of assets ?? []) {
+            void asset[0]
+            void asset[1]
+            void asset[2]
+        }
+    }
+
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
         const renderCharacter = parserProjection ? parserChara() : charArg
         const translationCharacter = (
             captureContext?.character ?? (parserProjection ? parserChara() : charArg)
         ) as string | simpleCharacterArgument
+        if (!captureContext && typeof charArg !== 'string') {
+            trackLiveParseDependencies(charArg)
+            await yieldToMainThread()
+            if (destroyed || job.disposed || activeParseJob !== job)
+                return lastParsed
+        }
         const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
             ParseMarkdown(value, renderCharacter, mode, chatID, getCbsCondition(), {
                 deferredInlays: job.deferredInlays,

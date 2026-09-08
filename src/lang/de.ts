@@ -1291,6 +1291,7 @@ export const languageGerman = {
     "automaticCachePoint": "Automatischer Cache-Punkt",
     "experimentalChatCompression": "Experimentelle Chat-Datenverarbeitung",
     "loadingChatData": "Lade Chat-Daten",
+    "chatDataLoadFailed": "Chat-Daten konnten nicht geladen werden.",
     "outputImageModal": "Ausgabebild-Modal",
     "playMessageOnTranslateEnd": "Audio bei Übersetzungsabschluss abspielen",
     "auxModelUnderModelSettings": "Separate Hilfsmodelle in Modelleinstellungen anzeigen",

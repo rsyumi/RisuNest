@@ -1276,6 +1276,7 @@ export const languageChineseTraditional = {
     "automaticCachePoint": "自動快取點",
     "experimentalChatCompression": "對話資料壓縮（實驗性功能）",
     "loadingChatData": "正在載入對話資料",
+    "chatDataLoadFailed": "無法載入對話資料。",
     "outputImageModal": "輸出圖片彈出視窗",
     "playMessageOnTranslateEnd": "翻譯完成後播放音訊",
     "auxModelUnderModelSettings": "在模型設定中顯示輔助模型個別設定",

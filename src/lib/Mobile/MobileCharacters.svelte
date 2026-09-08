@@ -5,6 +5,7 @@
     import { MobileSearch } from "src/ts/stores.svelte";
     import { MessageSquareIcon, PlusIcon } from "@lucide/svelte";
     import { getCatalogConversationCount } from "src/ts/storage/workingSetCatalog";
+    import { language } from "src/lang";
 
     interface Props {
         endGrid?: () => void;
@@ -15,6 +16,12 @@
     const agoFormatter = new Intl.RelativeTimeFormat(navigator.languages, { style: 'short' });
 
     let {endGrid = () => {}, search, hideTrash = false}: Props = $props();
+    let catalogRoot: HTMLDivElement | null = $state(null);
+    let loadMoreSentinel: HTMLDivElement | null = $state(null);
+    let visibleCount = $state(48);
+
+    const pageSize = 48;
+    const supportsAutomaticLoading = typeof IntersectionObserver !== 'undefined';
     let normalizedSearch = $derived(normalizeSearch(search ?? $MobileSearch));
 
     function normalizeSearch(value:string){
@@ -50,7 +57,7 @@
         return agoFormatter.format(-year, 'year');
     }
 
-    let visibleCharacters = $derived.by(() => {
+    let matchingCharacters = $derived.by(() => {
         const rows: Array<{
             chaId: string
             name: string
@@ -82,8 +89,60 @@
                 : right.interaction - left.interaction,
         )
     })
+    let visibleCharacters = $derived(matchingCharacters.slice(0, visibleCount))
+    let hasMore = $derived(visibleCount < matchingCharacters.length)
+
+    function revealNextPage() {
+        visibleCount = Math.min(
+            visibleCount + pageSize,
+            matchingCharacters.length,
+        )
+    }
+
+    $effect(() => {
+        normalizedSearch
+        hideTrash
+        visibleCount = pageSize
+    })
+
+    let loadMoreObserver: IntersectionObserver | null = null
+    $effect(() => {
+        visibleCount
+        if (
+            !supportsAutomaticLoading ||
+            !catalogRoot ||
+            !loadMoreSentinel ||
+            !hasMore
+        ) {
+            loadMoreObserver?.disconnect()
+            loadMoreObserver = null
+            return
+        }
+
+        loadMoreObserver?.disconnect()
+        loadMoreObserver = new IntersectionObserver(
+            (entries) => {
+                if (entries[0]?.isIntersecting) revealNextPage()
+            },
+            {
+                root: catalogRoot,
+                rootMargin: '240px 0px',
+                threshold: 0,
+            },
+        )
+        loadMoreObserver.observe(loadMoreSentinel)
+
+        return () => {
+            loadMoreObserver?.disconnect()
+            loadMoreObserver = null
+        }
+    })
 </script>
-<div class="flex flex-col items-center w-full overflow-y-auto h-full">
+
+<div
+    bind:this={catalogRoot}
+    class="flex flex-col items-center w-full overflow-y-auto h-full"
+>
     {#each visibleCharacters as char, index (char.chaId)}
         <button
             data-character-id={char.chaId}
@@ -105,6 +164,24 @@
             </div>
         </button>
     {/each}
+    {#if hasMore}
+        <div
+            bind:this={loadMoreSentinel}
+            data-load-more-sentinel
+            class="min-h-12 flex items-center justify-center"
+        >
+            {#if !supportsAutomaticLoading}
+                <button
+                    type="button"
+                    class="m-2 px-4 py-2 rounded-md border border-darkborderc hover:bg-selected"
+                    onclick={revealNextPage}
+                    aria-label={language.loadMore}
+                >
+                    {language.loadMore}
+                </button>
+            {/if}
+        </div>
+    {/if}
 </div>
 
 <button class="p-4 rounded-full absolute bottom-2 right-2 bg-borderc" onclick={() => {

@@ -1,6 +1,5 @@
 <script lang="ts">
     import { changeChar, getCharImage, removeChar } from "../../ts/characters";
-    import type { Database } from "../../ts/storage/database.svelte";
     import { mutatePersistentCharacterDetail } from "../../ts/storage/persistentDataRuntime.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import BarIcon from "../SideBars/BarIcon.svelte";
@@ -19,45 +18,112 @@
     let { endGrid = () => {} }: Props = $props();
     let search = $state('')
     let selected = $state(3)
+    let catalogRoot: HTMLDivElement | null = $state(null)
+    let loadMoreSentinel: HTMLDivElement | null = $state(null)
+    let visibleCount = $state(48)
 
-    function formatChars(search:string, db:Database, trash = false){
-        let charas:{
+    const pageSize = 48
+    const supportsAutomaticLoading = typeof IntersectionObserver !== 'undefined'
+
+    type CatalogCharacter = {
             image:string
             index:number
             type:string,
             name:string
             desc:string
             chaId:string
-        }[] = []
-
-        for(let i=0;i<db.characters.length;i++){
-            const c = db.characters[i]
-            if(c.trashTime && !trash){
-                continue
-            }
-            if(!c.trashTime && trash){
-                continue
-            }
-            if(c.name.replace(/ /g,"").toLocaleLowerCase().includes(search.toLocaleLowerCase().replace(/ /g,""))){
-                charas.push({
-                    image: c.image,
-                    index: i,
-                    type: c.type,
-                    name: c.name,
-                    desc: c.creatorNotes ?? 'No description',
-                    chaId: c.chaId
-                })
-            }
-        }
-        return charas
     }
 
-    let activeCharacters = $derived(formatChars(search, DBState.db))
-    let trashedCharacters = $derived(formatChars(search, DBState.db, true))
+    function normalizeSearch(value: string) {
+        return value.replace(/ /g, '').toLocaleLowerCase()
+    }
+
+    let normalizedSearch = $derived(normalizeSearch(search))
+    let charactersByTrashState = $derived.by(() => {
+        const active: CatalogCharacter[] = []
+        const trashed: CatalogCharacter[] = []
+
+        for (let index = 0; index < DBState.db.characters.length; index++) {
+            const character = DBState.db.characters[index]
+            if (!normalizeSearch(character.name).includes(normalizedSearch))
+                continue
+
+            const row = {
+                image: character.image,
+                index,
+                type: character.type,
+                name: character.name,
+                desc: character.creatorNotes ?? 'No description',
+                chaId: character.chaId,
+            }
+            if (character.trashTime) {
+                trashed.push(row)
+            } else {
+                active.push(row)
+            }
+        }
+
+        return { active, trashed }
+    })
+    let activeCharacters = $derived(charactersByTrashState.active)
+    let currentCharacters = $derived(
+        selected === 2 ? charactersByTrashState.trashed : activeCharacters,
+    )
+    let visibleCharacters = $derived(currentCharacters.slice(0, visibleCount))
+    let hasMore = $derived(visibleCount < currentCharacters.length)
+
+    function revealNextPage() {
+        visibleCount = Math.min(
+            visibleCount + pageSize,
+            currentCharacters.length,
+        )
+    }
+
+    $effect(() => {
+        normalizedSearch
+        selected
+        visibleCount = pageSize
+    })
+
+    let loadMoreObserver: IntersectionObserver | null = null
+    $effect(() => {
+        visibleCount
+        if (
+            !supportsAutomaticLoading ||
+            !catalogRoot ||
+            !loadMoreSentinel ||
+            !hasMore
+        ) {
+            loadMoreObserver?.disconnect()
+            loadMoreObserver = null
+            return
+        }
+
+        loadMoreObserver?.disconnect()
+        loadMoreObserver = new IntersectionObserver(
+            (entries) => {
+                if (entries[0]?.isIntersecting) revealNextPage()
+            },
+            {
+                root: catalogRoot,
+                rootMargin: '240px 0px',
+                threshold: 0,
+            },
+        )
+        loadMoreObserver.observe(loadMoreSentinel)
+
+        return () => {
+            loadMoreObserver?.disconnect()
+            loadMoreObserver = null
+        }
+    })
 </script>
 
 <div class="h-full w-full flex justify-center">
-    <div class="h-full p-6 bg-darkbg max-w-full w-2xl flex flex-col overflow-y-auto">
+    <div
+        bind:this={catalogRoot}
+        class="h-full p-6 bg-darkbg max-w-full w-2xl flex flex-col overflow-y-auto"
+    >
         <div class="mx-4 mb-6 flex flex-col">
             <div class="flex items-center gap-3 mb-2">
                 <button 
@@ -93,7 +159,7 @@
         {#if selected === 0}
             <div class="w-full flex justify-center">
                 <div class="flex flex-wrap gap-2 w-full justify-center">
-                    {#each activeCharacters as char (char.chaId)}
+                    {#each visibleCharacters as char (char.chaId)}
                         <div class="flex items-center text-textcolor">
                             {#if char.image}
                                 <BarIcon onClick={() => {changeChar(char.index)}} additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
@@ -111,12 +177,13 @@
                 </div>
             </div>
         {:else if selected === 1}
-            {#each activeCharacters as char (char.chaId)}
+            {#each visibleCharacters as char (char.chaId)}
+                {@const parsedDescription = parseMultilangString(char.desc)}
                 <div class="flex p-2 border border-darkborderc rounded-md mb-2">
                     <BarIcon onClick={() => {changeChar(char.index)}} additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
                     <div class="flex-1 flex flex-col ml-2">
                         <h4 class="text-textcolor font-bold text-lg mb-1">{char.name || "Unnamed"}</h4>
-                        <span class="text-textcolor2">{parseMultilangString(char.desc)['en'] || parseMultilangString(char.desc)['xx'] || 'No description'}</span>
+                        <span class="text-textcolor2">{parsedDescription['en'] || parsedDescription['xx'] || 'No description'}</span>
                         <div class="flex gap-2 justify-end">
                             <button class="hover:text-textcolor text-textcolor2" onclick={() => {
                                 changeChar(char.index)
@@ -134,12 +201,13 @@
             {/each}
         {:else if selected === 2}
             <span class="text-textcolor2 text-sm mb-2">{language.trashDesc}</span>
-            {#each trashedCharacters as char (char.chaId)}
+            {#each visibleCharacters as char (char.chaId)}
+                {@const parsedDescription = parseMultilangString(char.desc)}
                 <div class="flex p-2 border border-darkborderc rounded-md mb-2">
                     <BarIcon onClick={() => {changeChar(char.index)}} additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
                     <div class="flex-1 flex flex-col ml-2">
                         <h4 class="text-textcolor font-bold text-lg mb-1">{char.name || "Unnamed"}</h4>
-                        <span class="text-textcolor2">{parseMultilangString(char.desc)['en'] || parseMultilangString(char.desc)['xx'] || 'No description'}</span>
+                        <span class="text-textcolor2">{parsedDescription['en'] || parsedDescription['xx'] || 'No description'}</span>
                         <div class="flex gap-2 justify-end">
                             <button class="hover:text-textcolor text-textcolor2" onclick={async () => {
                                 await mutatePersistentCharacterDetail(
@@ -164,6 +232,24 @@
             {/each}
         {:else if selected === 3}
             <MobileCharacters endGrid={endGrid} search={search} hideTrash={true} />
+        {/if}
+        {#if selected !== 3 && hasMore}
+            <div
+                bind:this={loadMoreSentinel}
+                data-load-more-sentinel
+                class="min-h-12 flex items-center justify-center"
+            >
+                {#if !supportsAutomaticLoading}
+                    <button
+                        type="button"
+                        class="m-2 px-3 py-1 text-sm rounded-md border border-darkborderc text-textcolor2 hover:bg-selected focus:outline-hidden focus:ring-2 focus:ring-selected"
+                        onclick={revealNextPage}
+                        aria-label={language.loadMore}
+                    >
+                        {language.loadMore}
+                    </button>
+                {/if}
+            </div>
         {/if}
     </div>
 </div>

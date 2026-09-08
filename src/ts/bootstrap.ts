@@ -102,6 +102,7 @@ import {
     listenRecoveredAndroidScreenshotPublications,
 } from "./nativeScreenshotArchiveWriter";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
+import { yieldToUi } from './ui/yieldToUi'
 import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
@@ -623,6 +624,7 @@ export async function loadData() {
 
         stage = 'format-update'
         LoadingStatusState.text = 'Checking For Format Update...'
+        await yieldToUi()
         const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
         const coldStorageChanged = fullDatabaseResident ? await makeColdData() : false
         await publishOfficialRevisionIfChanged(
@@ -634,6 +636,7 @@ export async function loadData() {
         performance.mark('boot:cold-storage-ready')
         stage = 'plugins'
         LoadingStatusState.text = 'Loading Plugins...'
+        await yieldToUi()
         let pluginsLoaded = false
         try {
             await loadPlugins()
@@ -669,6 +672,7 @@ export async function loadData() {
         const database = getDatabase()
         stage = 'ui-state'
         LoadingStatusState.text = 'Updating States...'
+        await yieldToUi()
         updateColorScheme()
         updateTextThemeAndCSS()
         updateAnimationSpeed()
@@ -692,6 +696,7 @@ export async function loadData() {
         loadedStore.set(true)
         performance.mark('boot:interactive')
         selectedCharID.set(-1)
+        await yieldToUi()
         startObserveDom()
         registerModelDynamic()
         await saveDb()

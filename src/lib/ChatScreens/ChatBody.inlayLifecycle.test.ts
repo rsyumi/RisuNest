@@ -24,6 +24,25 @@ const liveRenderMocks = vi.hoisted(() => ({
     getFileSrc: vi.fn(async (source: string) => `asset://${source}`),
 }))
 
+const schedulingMocks = vi.hoisted(() => {
+    const pending: Array<() => void> = []
+    const state = { controlled: false }
+    return {
+        state,
+        pending,
+        yieldToMainThread: vi.fn(() => {
+            if (!state.controlled) return Promise.resolve()
+            return new Promise<void>((resolve) => pending.push(resolve))
+        }),
+        releaseNext() {
+            pending.shift()?.()
+        },
+        releaseAll() {
+            for (const resolve of pending.splice(0)) resolve()
+        },
+    }
+})
+
 vi.mock('src/ts/process/files/inlays', () => inlayMocks)
 vi.mock('src/ts/parser/parser.svelte', () => parserMocks)
 vi.mock('src/ts/stores.svelte', () => ({ DBState: chatState }))
@@ -36,6 +55,9 @@ vi.mock('src/ts/process/modules', () => ({ getModuleAssets: liveRenderMocks.getM
 vi.mock('src/ts/storage/database.svelte', () => ({ getCurrentCharacter: liveRenderMocks.getCurrentCharacter }))
 vi.mock('src/ts/globalApi.svelte', () => ({ getFileSrc: liveRenderMocks.getFileSrc }))
 vi.mock('src/ts/alert', () => ({ alertError: vi.fn() }))
+vi.mock('src/ts/ui/yieldToUi', () => ({
+    yieldToMainThread: schedulingMocks.yieldToMainThread,
+}))
 
 import {
     mountDeferredInlaySources,
@@ -144,6 +166,9 @@ describe('ChatBody deferred inlay lifecycle', () => {
         vi.clearAllMocks()
         vi.stubGlobal('IntersectionObserver', undefined)
         chatState.db = {}
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        schedulingMocks.yieldToMainThread.mockClear()
         target = document.createElement('div')
         document.body.append(target)
         createObjectURL = vi.fn((blob: Blob) => blob.size === 5 ? 'blob:first' : 'blob:second')
@@ -158,6 +183,9 @@ describe('ChatBody deferred inlay lifecycle', () => {
     afterEach(async () => {
         if (mounted) await unmount(mounted)
         mounted = undefined
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await Promise.resolve()
         document.body.replaceChildren()
         vi.unstubAllGlobals()
         vi.useRealTimers()
@@ -186,6 +214,140 @@ describe('ChatBody deferred inlay lifecycle', () => {
         mounted = undefined
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first')).toHaveLength(1)
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:second')).toHaveLength(1)
+    })
+
+    test('defers live parsing to a later main-thread task', async () => {
+        schedulingMocks.state.controlled = true
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await tick()
+        await Promise.resolve()
+
+        expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce()
+        expect(parserMocks.ParseMarkdown).not.toHaveBeenCalled()
+
+        schedulingMocks.releaseNext()
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce(),
+        )
+    })
+
+    test('does not parse a live job replaced while its main-thread yield is pending', async () => {
+        schedulingMocks.state.controlled = true
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await vi.waitFor(() =>
+            expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce(),
+        )
+
+        ;(mounted as { setMessage(value: string): void }).setMessage('second')
+        await tick()
+        await vi.waitFor(() =>
+            expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledTimes(2),
+        )
+
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce(),
+        )
+        expect(parserMocks.ParseMarkdown.mock.calls[0][0]).toBe('second')
+    })
+
+    test('keeps capture parsing on the immediate readiness path', async () => {
+        schedulingMocks.state.controlled = true
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { captureContext: minimalCaptureContext() },
+        })
+
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce(),
+        )
+        expect(schedulingMocks.yieldToMainThread).not.toHaveBeenCalled()
+    })
+
+    test('keeps translated state reactive when live parsing starts after a yield', async () => {
+        chatState.db = {
+            autoTranslate: false,
+            translatorType: 'mock',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            newImageHandlingBeta: false,
+        }
+        const { translateHTML } = await import('src/ts/translator/translator')
+        vi.mocked(translateHTML).mockResolvedValue('<span>translated</span>')
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce(),
+        )
+
+        schedulingMocks.yieldToMainThread.mockClear()
+        schedulingMocks.state.controlled = true
+        ;(mounted as { setTranslated(value: boolean): void }).setTranslated(
+            true,
+        )
+        await tick()
+        await vi.waitFor(() =>
+            expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce(),
+        )
+        expect(translateHTML).not.toHaveBeenCalled()
+
+        schedulingMocks.releaseNext()
+        await vi.waitFor(() => expect(translateHTML).toHaveBeenCalledOnce())
+    })
+
+    test('keeps live asset width reactive when parsing starts after a yield', async () => {
+        chatState.db = {
+            autoTranslate: false,
+            translatorType: 'mock',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            hideAllImages: false,
+            legacyMediaFindings: false,
+            assetMaxDifference: 0.5,
+            newImageHandlingBeta: false,
+        }
+        parserMocks.ParseMarkdown.mockImplementation(
+            async () =>
+                `<img data-asset-width style="max-width:${String(chatState.db.assetWidth)}rem">`,
+        )
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                reactiveAssetWidth: true,
+                initialAssetWidth: 2,
+                liveCharacter: {
+                    type: 'simple',
+                    chaId: 'live-character',
+                    customscript: [],
+                    additionalAssets: [],
+                    emotionImages: [],
+                } as any,
+            },
+        })
+        await vi.waitFor(() =>
+            expect(
+                target.querySelector<HTMLElement>('[data-asset-width]')?.style
+                    .maxWidth,
+            ).toBe('2rem'),
+        )
+
+        schedulingMocks.yieldToMainThread.mockClear()
+        schedulingMocks.state.controlled = true
+        ;(mounted as { setAssetWidth(value: number): void }).setAssetWidth(7)
+        await tick()
+        await vi.waitFor(() =>
+            expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce(),
+        )
+
+        schedulingMocks.releaseNext()
+        await vi.waitFor(() =>
+            expect(
+                target.querySelector<HTMLElement>('[data-asset-width]')?.style
+                    .maxWidth,
+            ).toBe('7rem'),
+        )
     })
 
     test('revokes an active mounted URL exactly once on destroy', async () => {

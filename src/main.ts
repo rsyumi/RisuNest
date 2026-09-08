@@ -1,5 +1,6 @@
 import "./ts/polyfill";
 import "core-js/actual"
+import "katex/dist/katex.min.css"
 import "./ts/storage/deviceSettingsStartup"
 import "./ts/storage/database.svelte"
 import App from "./App.svelte";
@@ -7,6 +8,7 @@ import { loadData } from "./ts/bootstrap";
 import { initHotkey } from "./ts/hotkey";
 import { preLoadCheck } from "./preload";
 import { mount } from "svelte";
+import { yieldToUi } from "./ts/ui/yieldToUi";
 
 if (import.meta.env.VITE_TOKENIZER_BENCHMARK === 'true') {
     void import('./ts/tokenizer/nativeTokenizerBenchmark').then(({ installNativeTokenizerBenchmarkSeam }) => {
@@ -23,8 +25,11 @@ preLoadCheck()
 let app = mount(App, {
     target: document.getElementById("app"),
 });
-loadData()
-initHotkey()
-document.getElementById('preloading').remove()
+document.getElementById('preloading')?.remove()
+
+void yieldToUi().then(() => {
+    loadData()
+    initHotkey()
+})
 
 export default app;

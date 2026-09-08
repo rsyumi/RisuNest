@@ -1291,6 +1291,7 @@ export const languageChinese = {
     "automaticCachePoint": "自动缓存点",
     "experimentalChatCompression": "实验性聊天数据处理",
     "loadingChatData": "加载聊天数据",
+    "chatDataLoadFailed": "无法加载聊天数据。",
     "outputImageModal": "输出图像模态框",
     "playMessageOnTranslateEnd": "翻译完成后播放音频",
     "auxModelUnderModelSettings": "在模型设置中显示辅助模型分离",

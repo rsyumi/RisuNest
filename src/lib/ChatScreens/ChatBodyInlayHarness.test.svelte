@@ -3,6 +3,8 @@
     import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import type { simpleCharacterArgument } from 'src/ts/parser/parser.svelte'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
+    import { DBState } from 'src/ts/stores.svelte'
+    import { untrack } from 'svelte'
 
     interface Props {
         initialTranslated?: boolean
@@ -13,6 +15,9 @@
         captureParserIndex?: number
         name?: string
         parserProjection?: BoundedLiveChatParserProjection
+        reactiveAssetWidth?: boolean
+        initialAssetWidth?: number
+        liveCharacter?: simpleCharacterArgument | null
     }
 
     let {
@@ -24,10 +29,21 @@
         captureParserIndex = idx,
         name = 'Frozen Character',
         parserProjection,
+        reactiveAssetWidth = false,
+        initialAssetWidth = -1,
+        liveCharacter = null,
     }: Props = $props()
     let message = $state('first')
     let raw = $state(false)
     let bodyRoot = $state<HTMLElement | null>(null)
+    let assetWidth = $state(untrack(() => initialAssetWidth))
+
+    if (untrack(() => reactiveAssetWidth)) {
+        Object.defineProperty(DBState.db, 'assetWidth', {
+            configurable: true,
+            get: () => assetWidth,
+        })
+    }
 
     export function setMessage(value: string) {
         message = value
@@ -35,6 +51,14 @@
 
     export function setRaw(value: boolean) {
         raw = value
+    }
+
+    export function setTranslated(value: boolean) {
+        translated = value
+    }
+
+    export function setAssetWidth(value: number) {
+        assetWidth = value
     }
 </script>
 
@@ -44,7 +68,8 @@
         {idx}
         {name}
         role="char"
-        character={captureContext?.character as simpleCharacterArgument | null}
+        character={(captureContext?.character as simpleCharacterArgument | null) ??
+            liveCharacter}
         bind:translated
         translating={false}
         retranslate={false}

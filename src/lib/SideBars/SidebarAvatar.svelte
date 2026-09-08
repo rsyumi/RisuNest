@@ -1,15 +1,18 @@
 <script lang="ts">
   import { tooltipRight } from "src/ts/gui/tooltip";
+  import { observeNearViewport } from "src/ts/ui/observeNearViewport";
+
+  type ImageSource = string | Promise<string> | (() => string | Promise<string>);
 
   interface Props {
     rounded: boolean;
-    src: string|Promise<string>;
+    src: ImageSource;
     name: string;
     size?: string;
     onClick?: any;
     bordered?: boolean;
     color?: string;
-    backgroundimg?: string|Promise<string>;
+    backgroundimg?: ImageSource;
     children?: import('svelte').Snippet;
     oncontextmenu?: (event: MouseEvent & {
         currentTarget: EventTarget & HTMLDivElement;
@@ -30,10 +33,33 @@
     oncontextmenu,
     chaId
   }: Props = $props();
+
+  let avatarElement: HTMLSpanElement | null = $state(null);
+  let sourceVisible = $state(false);
+  let resolvedSrc = $derived.by(() => {
+    if (typeof src !== 'function') return src;
+    if (!sourceVisible) return '';
+    return src();
+  });
+  let resolvedBackgroundImage = $derived.by(() => {
+    if (typeof backgroundimg !== 'function') return backgroundimg;
+    if (!sourceVisible) return '';
+    return backgroundimg();
+  });
+
+  $effect(() => {
+    const hasLazySource = typeof src === 'function' || typeof backgroundimg === 'function';
+    if (!hasLazySource || sourceVisible || !avatarElement) return;
+
+    return observeNearViewport(avatarElement, () => {
+      sourceVisible = true;
+    });
+  });
 </script>
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <span class="flex shrink-0 items-center justify-center avatar"
+      bind:this={avatarElement}
       class:border = {bordered}
       class:border-selected={bordered}
       class:rounded-md={bordered}
@@ -45,7 +71,7 @@
 >
   {#if src}
     {#if src === "slot"}
-      {#await backgroundimg}
+      {#await resolvedBackgroundImage}
       <div
         class="bg-skin-border sidebar-avatar rounded-md bg-top flex items-center justify-center {
           color === 'red' ? 'bg-red-700/50' :
@@ -107,7 +133,16 @@
       </div>
     {/await}
     {:else}
-      {#await src}
+      {#if typeof src === 'function' && !sourceVisible}
+        <div
+          class="bg-skin-border sidebar-avatar rounded-md bg-top"
+          style:width={size + "px"}
+          style:height={size + "px"}
+          style:minWidth={size + "px"}
+          class:rounded-md={!rounded} class:rounded-full={rounded}
+        ></div>
+      {:else}
+      {#await resolvedSrc}
         <div
           class="bg-skin-border sidebar-avatar rounded-md bg-top"
           style:width={size + "px"}
@@ -134,6 +169,7 @@
           class:rounded-md={!rounded} class:rounded-full={rounded}
         ></div>
       {/await}
+      {/if}
     {/if}
   {:else}
     <div

@@ -1291,6 +1291,7 @@ export const languageVietnamese = {
     "automaticCachePoint": "Điểm lưu trữ tự động",
     "experimentalChatCompression": "Xử lý dữ liệu trò chuyện thử nghiệm",
     "loadingChatData": "Đang tải dữ liệu trò chuyện",
+    "chatDataLoadFailed": "Không thể tải dữ liệu trò chuyện.",
     "outputImageModal": "Modal hình ảnh đầu ra",
     "playMessageOnTranslateEnd": "Phát âm thanh khi hoàn thành dịch",
     "auxModelUnderModelSettings": "Hiển thị tách biệt mô hình phụ trong cài đặt mô hình",

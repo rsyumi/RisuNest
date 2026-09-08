@@ -40,6 +40,9 @@
         LiveChatParserProjectionResolver,
     } from 'src/ts/selectedConversationLiveParserProjection'
     import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
+    import { yieldToMainThread } from 'src/ts/ui/yieldToUi'
+    import LoadingIndicator from 'src/lib/UI/GUI/LoadingIndicator.svelte'
+    import { language } from 'src/lang'
 
     let {
         messages,
@@ -81,6 +84,7 @@
     const VIEWPORT_OVERSCAN = 8
     const MEASURED_HEIGHT_CACHE_LIMIT = 256
     const PARSER_PROJECTION_RETRY_DELAY_MS = 250
+    const CHAT_MOUNT_BATCH_SIZE = 4
 
     type ChatInstance = {
         updateStreamingDisplay?: (state: {
@@ -114,7 +118,6 @@
     let sourceLoads = new Map<string, AbortController>()
     interface RowParserProjectionState {
         readonly controller: AbortController
-        readonly navigationGeneration: number
         readonly source: ConversationViewportSource
         readonly sourceToken: string
         readonly sourceVersion: number
@@ -128,6 +131,30 @@
         retryTimer: ReturnType<typeof setTimeout> | null
     }
     let rowParserProjections = new Map<string, RowParserProjectionState>()
+    interface PendingRowMount {
+        readonly key: string
+        readonly element: HTMLElement
+        readonly priority: number
+        readonly order: number
+        readonly isCurrent: () => boolean
+        readonly run: () => void
+        readonly parserProjectionState?: RowParserProjectionState
+    }
+    interface RowMountWaiter {
+        readonly navigationGeneration: number
+        readonly resolve: (mounted: boolean) => void
+    }
+    let pendingRowMounts = new Map<string, PendingRowMount>()
+    let rowMountWaiters = new Map<string, Set<RowMountWaiter>>()
+    let mountQueueOrder = 0
+    let mountQueueGeneration = 0
+    let mountDrainActive = false
+    let projectionReconcileQueued = false
+    let projectionReconcileGeneration = 0
+    let destroyed = false
+    let hasMountedUsableRow = false
+    let initialRowsLoading = $state(false)
+    let initialRowsLoadFailed = $state(false)
     let sourceHandoffRuntimeKeys = new Set<string>()
     let sourceUnsubscribe: (() => void) | null = null
     let activeViewportSource: ConversationViewportSource | null = null
@@ -136,6 +163,7 @@
     let lastMountedSourceTailKey: string | null = null
     let pendingSourceWasAtBottom: boolean | null = null
     let pendingSourceHandoffAnchor: ChatViewportAnchor | null = null
+    let pendingMissingRowsAnchor: ChatViewportAnchor | null = null
     let renderedConversationIdentity: string | null = null
     let viewportAnchor: ChatViewportAnchor | null = null
     let viewportResult: ChatViewportResult | null = null
@@ -304,7 +332,10 @@
     }
 
     function resetViewport(scope: string): void {
-        if (activeScope !== null) navigationGeneration += 1
+        if (activeScope !== null) {
+            navigationGeneration += 1
+            cancelStaleRowMountWaiters()
+        }
         clearScheduledWork()
         clearMountedRows()
         measuredHeights = new Map()
@@ -316,7 +347,11 @@
         pinReasons = new Map()
         playingMedia = new Map()
         sourceHandoffRuntimeKeys = new Set()
+        hasMountedUsableRow = false
+        initialRowsLoading = false
+        initialRowsLoadFailed = false
         viewportAnchor = null
+        pendingMissingRowsAnchor = null
         viewportResult = null
         identitySequence = null
         messageRenderKeys = []
@@ -481,6 +516,7 @@
     ): void {
         const source = activeViewportSource
         if (!source || !sourceSnapshot) return
+        if (initialRowsLoadFailed && !hasMountedUsableRow) return
         const startOffset = hasConversationStart() ? 1 : 0
         const missing = result.rows.flatMap((row) => {
             if (row.kind !== 'message' || row.index < startOffset) return []
@@ -502,10 +538,31 @@
                 limit: endIndex - startIndex,
                 reason: 'viewport',
                 signal: controller.signal,
-            }).catch(() => undefined).finally(() => {
+            }).catch(() => {
+                const currentSnapshot = currentSourceSnapshot()
+                if (
+                    controller.signal.aborted
+                    || source !== activeViewportSource
+                    || currentSnapshot?.sourceToken !== sourceSnapshot.sourceToken
+                    || currentSnapshot.version !== sourceSnapshot.version
+                    || hasMountedUsableRow
+                ) return
+                initialRowsLoading = false
+                initialRowsLoadFailed = true
+            }).finally(() => {
                 if (sourceLoads.get(loadKey) === controller) sourceLoads.delete(loadKey)
             })
         }
+    }
+
+    function retryInitialSourceRows(): void {
+        if (!activeViewportSource) return
+        initialRowsLoadFailed = false
+        initialRowsLoading = currentMessageCount() > 0
+        abortSourceLoads()
+        reconcileViewport({
+            anchor: pendingMissingRowsAnchor ?? viewportAnchor,
+        })
     }
 
     function abortSourceLoads(): void {
@@ -554,6 +611,7 @@
             }
         }
         navigationGeneration += 1
+        cancelStaleRowMountWaiters()
         abortSourceLoads()
         releaseSourcePins()
         sourceUnsubscribe?.()
@@ -647,6 +705,10 @@
         anchor?: ChatViewportAnchor | null
     } = {}): ChatViewportResult | null {
         if (!chatBody) return null
+        if (projectionReconcileQueued) {
+            projectionReconcileQueued = false
+            projectionReconcileGeneration += 1
+        }
         const scope = currentChatScope()
         renderedConversationIdentity = currentConversationHandoffIdentity()
         if (activeScope !== scope) resetViewport(scope)
@@ -658,7 +720,7 @@
             ? options.anchor
             : options.preserveAnchor === false
                 ? viewportAnchor
-                : pendingSourceHandoffAnchor ?? captureDomAnchor()
+                : pendingSourceHandoffAnchor ?? pendingMissingRowsAnchor ?? captureDomAnchor()
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
         const result = buildChatViewport({
@@ -675,7 +737,14 @@
         viewportResult = result
         syncSourcePins(result, currentChat, sourceSnapshot)
         requestMissingSourceRows(result, sourceSnapshot)
-        renderViewportRows(scope, result, currentChat, reloadPointerMap, sourceSnapshot)
+        renderViewportRows(
+            scope,
+            result,
+            currentChat,
+            reloadPointerMap,
+            sourceSnapshot,
+            result.anchor?.key,
+        )
         chatBody.dataset.chatPinOverflow = String(result.pinOverflow?.count ?? 0)
         chatBody.dataset.chatMeasuredHeightCount = String(measuredHeights.size)
         chatBody.dataset.chatKeyLookupScans = String(keyLookupScans)
@@ -690,6 +759,7 @@
         currentChat: character['chats'][number] | groupChat['chats'][number] | undefined,
         reloadPointerMap: Record<number, number>,
         sourceSnapshot: ConversationViewportSnapshot | null,
+        preferredMountKey?: string,
     ): void {
         const currentRenderKeys = new Set<string>()
         const orderedElements: HTMLElement[] = []
@@ -698,11 +768,28 @@
             ? currentChat.activeStreamingDisplayOptimizationMode ?? configuredPerformanceMode
             : configuredPerformanceMode
         const totalMessages = currentMessageCount(sourceSnapshot)
+        const startOffset = hasConversationStart() ? 1 : 0
+        if (totalMessages === 0) {
+            initialRowsLoading = false
+            initialRowsLoadFailed = false
+            pendingMissingRowsAnchor = null
+        } else if (!hasMountedUsableRow && !initialRowsLoadFailed)
+            initialRowsLoading = true
+        const hasMissingSourceRows =
+            sourceSnapshot !== null &&
+            result.messageRows.some(
+                (row) =>
+                    row.index >= startOffset &&
+                    sourceSnapshot.rowAt(row.index - startOffset) === undefined,
+            )
+        if (hasMissingSourceRows && hasMountedUsableRow) {
+            pendingMissingRowsAnchor = result.anchor
+            return
+        }
         const activeStreamingIndex = performanceMode !== 'off' && currentChat?.isStreaming
             ? totalMessages - 1
             : -1
         const globalReloadPointer = get(ReloadGUIPointer)
-        const startOffset = hasConversationStart() ? 1 : 0
 
         for (const row of [...result.rows].reverse()) {
             if (row.kind === 'gap') {
@@ -798,45 +885,119 @@
             )
             if (requiresRemount && !preserveMountedRuntime) {
                 const source = activeViewportSource
-                releaseRowRuntimeState(key, true)
-                unmountInstance(key)
-                element.replaceChildren()
-                const instance = mount(Chat, {
-                    target: element,
-                    props: {
-                        message: message.data,
-                        viewportRow,
-                        captureViewportTarget: viewportRow && source
-                            ? () => source.captureMessageTarget(viewportRow.key)
-                            : undefined,
-                        viewportSourceToken: viewportRow ? sourceSnapshot?.sourceToken : undefined,
-                        selectedConversationOperations,
-                        bookmarked,
-                        isLastMemory: false,
-                        idx: index,
-                        totalLength: totalMessages,
-                        img: (message.role === 'user' ? resolvedUserImage : resolvedCharacterImage) ?? '',
-                        onReroll,
-                        unReroll,
-                        rerollIcon: 'dynamic',
-                        character: simpleChar,
-                        largePortrait: messageLargePortrait,
-                        messageGenerationInfo: message.generationInfo,
-                        role: message.role,
-                        name: message.role === 'user' ? currentUsername : currentCharacter.name,
-                        isComment: message.isComment ?? false,
-                        disabled: message.disabled ?? false,
-                        isOptimizedStreamingMessage: activeStreamingMessage,
-                        streamingOptimizationMode: performanceMode,
-                        rawStreamingText: message.data,
-                        parserProjection,
+                const sourceToken = sourceSnapshot?.sourceToken
+                const sourceVersion = sourceSnapshot?.version
+                const sourceRowVersion = viewportRow?.sourceVersion
+                markRowMountPending(key, element)
+                pendingRowMounts.set(key, {
+                    key,
+                    element,
+                    priority:
+                        key === preferredMountKey
+                            ? 0
+                            : activeStreamingMessage
+                              ? 1
+                              : row.pinReasons.length > 0
+                                ? 2
+                                : 3,
+                    order: ++mountQueueOrder,
+                    parserProjectionState,
+                    isCurrent: () => {
+                        if (
+                            destroyed ||
+                            activeScope !== scope ||
+                            mountedElements.get(key) !== element ||
+                            !renderKeys.has(key)
+                        )
+                            return false
+                        if (
+                            parserProjectionState &&
+                            !isRowParserProjectionCurrent(
+                                key,
+                                parserProjectionState,
+                            )
+                        ) {
+                            return false
+                        }
+                        if (!sourceSnapshot)
+                            return activeViewportSource === null
+                        if (activeViewportSource !== source) return false
+                        const snapshot = currentSourceSnapshot()
+                        if (
+                            snapshot?.sourceToken !== sourceToken ||
+                            snapshot.version !== sourceVersion
+                        )
+                            return false
+                        const currentRow = snapshot.rowAt(index)
+                        return (
+                            currentRow?.key === viewportRow?.key &&
+                            currentRow.sourceVersion === sourceRowVersion
+                        )
+                    },
+                    run: () => {
+                        releaseRowRuntimeState(key, true)
+                        unmountInstance(key)
+                        element.replaceChildren()
+                        const instance = mount(Chat, {
+                            target: element,
+                            props: {
+                                message: message.data,
+                                viewportRow,
+                                captureViewportTarget:
+                                    viewportRow && source
+                                        ? () =>
+                                              source.captureMessageTarget(
+                                                  viewportRow.key,
+                                              )
+                                        : undefined,
+                                viewportSourceToken: viewportRow
+                                    ? sourceToken
+                                    : undefined,
+                                selectedConversationOperations,
+                                bookmarked,
+                                isLastMemory: false,
+                                idx: index,
+                                totalLength: totalMessages,
+                                img:
+                                    (message.role === 'user'
+                                        ? resolvedUserImage
+                                        : resolvedCharacterImage) ?? '',
+                                onReroll,
+                                unReroll,
+                                rerollIcon: 'dynamic',
+                                character: simpleChar,
+                                largePortrait: messageLargePortrait,
+                                messageGenerationInfo: message.generationInfo,
+                                role: message.role,
+                                name:
+                                    message.role === 'user'
+                                        ? currentUsername
+                                        : currentCharacter.name,
+                                isComment: message.isComment ?? false,
+                                disabled: message.disabled ?? false,
+                                isOptimizedStreamingMessage:
+                                    activeStreamingMessage,
+                                streamingOptimizationMode: performanceMode,
+                                rawStreamingText: message.data,
+                                parserProjection,
+                            },
+                        })
+                        mountInstances.set(key, instance)
+                        renderSignatures.set(key, renderSignature)
+                        if (parserProjectionState)
+                            parserProjectionState.needsRemount = false
+                        sourceHandoffRuntimeKeys.delete(key)
+                        clearQueuedRowHeight(element)
+                        hasMountedUsableRow = true
+                        initialRowsLoading = false
+                        initialRowsLoadFailed = false
+                        completePendingMissingRowsAnchor(key)
+                        settleRowMountWaiters(key, true)
                     },
                 })
-                mountInstances.set(key, instance)
-                renderSignatures.set(key, renderSignature)
-                if (parserProjectionState) parserProjectionState.needsRemount = false
-                sourceHandoffRuntimeKeys.delete(key)
             } else {
+                pendingRowMounts.delete(key)
+                clearQueuedRowHeight(element)
                 const instance = mountInstances.get(key)
                 if (sourceHandoff && viewportRow && activeViewportSource && sourceSnapshot) {
                     const source = activeViewportSource
@@ -879,6 +1040,27 @@
         }
         reconcileChatBodyChildren(orderedElements)
         renderKeys = currentRenderKeys
+        for (const key of [...pendingRowMounts.keys()]) {
+            if (!currentRenderKeys.has(key)) pendingRowMounts.delete(key)
+        }
+        startRowMountDrain()
+        if (
+            pendingMissingRowsAnchor &&
+            mountedElements.has(pendingMissingRowsAnchor.key)
+        ) {
+            completePendingMissingRowsAnchor(pendingMissingRowsAnchor.key)
+        }
+    }
+
+    function completePendingMissingRowsAnchor(key: string): void {
+        const loadedAnchor = pendingMissingRowsAnchor
+        if (!loadedAnchor || loadedAnchor.key !== key) return
+        viewportAnchor = loadedAnchor
+        correctDomAnchor(loadedAnchor)
+        scheduleFrame(() => {
+            if (pendingMissingRowsAnchor === loadedAnchor)
+                pendingMissingRowsAnchor = null
+        })
     }
 
     function reconcileChatBodyChildren(orderedElements: readonly HTMLElement[]): void {
@@ -895,6 +1077,126 @@
             }
             chatBody.insertBefore(element, cursor)
         }
+    }
+
+    function markRowMountPending(key: string, element: HTMLElement): void {
+        element.dataset.chatMountPending = 'true'
+        if (!mountInstances.has(key)) {
+            const height = measuredHeights.get(key) ?? ESTIMATED_MESSAGE_HEIGHT
+            element.style.minHeight = `${height}px`
+            element.style.flexBasis = `${height}px`
+        }
+    }
+
+    function clearQueuedRowHeight(element: HTMLElement): void {
+        element.style.removeProperty('min-height')
+        element.style.removeProperty('flex-basis')
+        delete element.dataset.chatMountPending
+    }
+
+    function nextPendingRowMount(): PendingRowMount | undefined {
+        let next: PendingRowMount | undefined
+        for (const request of pendingRowMounts.values()) {
+            if (
+                !next ||
+                request.priority < next.priority ||
+                (request.priority === next.priority &&
+                    request.order < next.order)
+            )
+                next = request
+        }
+        return next
+    }
+
+    function startRowMountDrain(): void {
+        if (mountDrainActive || pendingRowMounts.size === 0 || destroyed) return
+        const queueGeneration = mountQueueGeneration
+        mountDrainActive = true
+        void (async () => {
+            try {
+                while (
+                    !destroyed &&
+                    queueGeneration === mountQueueGeneration &&
+                    pendingRowMounts.size > 0
+                ) {
+                    let mountedThisTask = 0
+                    while (mountedThisTask < CHAT_MOUNT_BATCH_SIZE) {
+                        const request = nextPendingRowMount()
+                        if (!request) break
+                        pendingRowMounts.delete(request.key)
+                        if (!request.isCurrent()) continue
+                        try {
+                            request.run()
+                        } catch (error) {
+                            if (request.parserProjectionState) {
+                                handleRowParserProjectionFailure(
+                                    request.key,
+                                    request.parserProjectionState,
+                                )
+                            } else {
+                                console.error('Failed to mount chat row', error)
+                            }
+                        }
+                        mountedThisTask += 1
+                    }
+                    if (pendingRowMounts.size > 0) await yieldToMainThread()
+                }
+            } finally {
+                mountDrainActive = false
+                if (pendingRowMounts.size > 0 && !destroyed)
+                    startRowMountDrain()
+            }
+        })()
+    }
+
+    function waitForRowMount(
+        key: string,
+        generation: number,
+    ): Promise<boolean> {
+        if (mountInstances.has(key)) return Promise.resolve(true)
+        if (generation !== navigationGeneration || destroyed)
+            return Promise.resolve(false)
+        return new Promise<boolean>((resolve) => {
+            const waiters =
+                rowMountWaiters.get(key) ?? new Set<RowMountWaiter>()
+            waiters.add({ navigationGeneration: generation, resolve })
+            rowMountWaiters.set(key, waiters)
+        })
+    }
+
+    function settleRowMountWaiters(key: string, mounted: boolean): void {
+        const waiters = rowMountWaiters.get(key)
+        if (!waiters) return
+        rowMountWaiters.delete(key)
+        for (const waiter of waiters) {
+            waiter.resolve(
+                mounted &&
+                    waiter.navigationGeneration === navigationGeneration &&
+                    mountInstances.has(key),
+            )
+        }
+    }
+
+    function cancelStaleRowMountWaiters(): void {
+        for (const [key, waiters] of rowMountWaiters) {
+            for (const waiter of [...waiters]) {
+                if (
+                    waiter.navigationGeneration === navigationGeneration &&
+                    !destroyed
+                )
+                    continue
+                waiters.delete(waiter)
+                waiter.resolve(false)
+            }
+            if (waiters.size === 0) rowMountWaiters.delete(key)
+        }
+    }
+
+    function clearPendingRowMounts(): void {
+        mountQueueGeneration += 1
+        pendingRowMounts.clear()
+        for (const key of [...rowMountWaiters.keys()])
+            settleRowMountWaiters(key, false)
     }
 
     function remapMountedSourceRows(nextSnapshot: ConversationViewportSnapshot): void {
@@ -998,6 +1300,8 @@
     }
 
     function removeMountedRow(key: string): void {
+        pendingRowMounts.delete(key)
+        settleRowMountWaiters(key, false)
         releaseRowRuntimeState(key)
         unmountInstance(key)
         const element = mountedElements.get(key)
@@ -1060,7 +1364,6 @@
         const controller = new AbortController()
         const state: RowParserProjectionState = {
             controller,
-            navigationGeneration,
             source,
             sourceToken: sourceSnapshot.sourceToken,
             sourceVersion: sourceSnapshot.version,
@@ -1093,22 +1396,45 @@
                 return
             }
             state.projection = projection
-            reconcileViewport()
+            queueProjectionReconcile()
         }).catch(() => {
-            releaseResolvedRowParserProjection(state)
-            if (
-                !isRowParserProjectionCurrent(key, state)
-                || state.retryTimer !== null
-            ) return
-            state.failed = true
-            state.retryTimer = setTimeout(() => {
-                if (!isRowParserProjectionCurrent(key, state)) return
-                state.retryTimer = null
-                state.failed = false
-                state.needsRemount = mountInstances.has(key)
-                resolveRowParserProjection(key, state)
-            }, PARSER_PROJECTION_RETRY_DELAY_MS)
+            handleRowParserProjectionFailure(key, state)
         })
+    }
+
+    function queueProjectionReconcile(): void {
+        if (projectionReconcileQueued || destroyed) return
+        projectionReconcileQueued = true
+        const generation = projectionReconcileGeneration
+        void yieldToMainThread().then(() => {
+            if (
+                destroyed
+                || generation !== projectionReconcileGeneration
+                || !projectionReconcileQueued
+            ) return
+            projectionReconcileQueued = false
+            reconcileViewport()
+        })
+    }
+
+    function handleRowParserProjectionFailure(
+        key: string,
+        state: RowParserProjectionState,
+    ): void {
+        releaseResolvedRowParserProjection(state)
+        if (
+            !isRowParserProjectionCurrent(key, state) ||
+            state.retryTimer !== null
+        )
+            return
+        state.failed = true
+        state.retryTimer = setTimeout(() => {
+            if (!isRowParserProjectionCurrent(key, state)) return
+            state.retryTimer = null
+            state.failed = false
+            state.needsRemount = mountInstances.has(key)
+            resolveRowParserProjection(key, state)
+        }, PARSER_PROJECTION_RETRY_DELAY_MS)
     }
 
     function isRowParserProjectionCurrent(
@@ -1118,7 +1444,6 @@
         if (
             state.controller.signal.aborted
             || rowParserProjections.get(key) !== state
-            || navigationGeneration !== state.navigationGeneration
             || activeViewportSource !== state.source
         ) return false
         const snapshot = currentSourceSnapshot()
@@ -1224,6 +1549,9 @@
     }
 
     function clearScheduledWork(): void {
+        projectionReconcileGeneration += 1
+        projectionReconcileQueued = false
+        clearPendingRowMounts()
         if (typeof cancelAnimationFrame === 'function') {
             for (const frame of animationFrames) cancelAnimationFrame(frame)
         }
@@ -1361,6 +1689,7 @@
 
     async function waitForLayout(): Promise<void> {
         await tick()
+        if (destroyed) return
         await new Promise<void>((resolve) => {
             if (typeof requestAnimationFrame !== 'function') {
                 queueMicrotask(resolve)
@@ -1382,6 +1711,7 @@
         const totalMessages = currentMessageCount(sourceSnapshot)
         if (!Number.isInteger(index) || index < 0 || index >= totalMessages) return false
         const generation = ++navigationGeneration
+        cancelStaleRowMountWaiters()
         const scope = currentChatScope()
         if (source && sourceSnapshot) {
             const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
@@ -1415,6 +1745,7 @@
         if (!result?.jumpAccepted) return false
         const key = currentMessageKey(index)
         if (key === undefined) return false
+        if (!(await waitForRowMount(key, generation))) return false
         await waitForLayout()
         if (generation !== navigationGeneration || scope !== currentChatScope()) return false
         const element = mountedElements.get(key)
@@ -1525,7 +1856,9 @@
     })
 
     onDestroy(() => {
+        destroyed = true
         navigationGeneration += 1
+        cancelStaleRowMountWaiters()
         abortSourceLoads()
         releaseSourcePins()
         sourceUnsubscribe?.()
@@ -1546,4 +1879,29 @@
 
 </script>
 
+{#if initialRowsLoading || initialRowsLoadFailed}
+    <div
+        class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-bgcolor"
+        data-chat-initial-loading
+    >
+        {#if initialRowsLoadFailed}
+            <div
+                class="pointer-events-auto flex flex-col items-center gap-3 text-center"
+                data-chat-load-error
+                role="alert"
+            >
+                <span>{language.chatDataLoadFailed}</span>
+                <button
+                    class="rounded-lg border border-borderc px-3 py-1.5 hover:bg-darkbg"
+                    data-chat-load-retry
+                    onclick={retryInitialSourceRows}
+                >
+                    {language.hypaV3Modal.retry}
+                </button>
+            </div>
+        {:else}
+            <LoadingIndicator label={language.loadingChatData} />
+        {/if}
+    </div>
+{/if}
 <div class="flex flex-col-reverse" bind:this={chatBody}></div>

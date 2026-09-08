@@ -1291,6 +1291,7 @@ export const languageSpanish = {
     "automaticCachePoint": "Punto de Caché Automático",
     "experimentalChatCompression": "Manejo Experimental de Datos de Chat",
     "loadingChatData": "Cargando Datos de Chat",
+    "chatDataLoadFailed": "No se pudieron cargar los datos del chat.",
     "outputImageModal": "Modal de Imagen de Salida",
     "playMessageOnTranslateEnd": "Reproducir Audio al Completar Traducción",
     "auxModelUnderModelSettings": "Mostrar Modelos Auxiliares Separados en Configuración de Modelo",

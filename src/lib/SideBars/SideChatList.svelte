@@ -1,7 +1,7 @@
 <script lang="ts">
-    import { onDestroy, onMount } from "svelte";
+    import { tick } from "svelte";
     import { v4 } from "uuid";
-    import Sortable from 'sortablejs/modular/sortable.core.esm.js';
+    import type Sortable from 'sortablejs/modular/sortable.core.esm.js';
     import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon } from "@lucide/svelte";
 
     import type { Chat, ChatFolder, character, groupChat } from "src/ts/storage/database.svelte";
@@ -14,12 +14,13 @@
 
     import { addNewChat, duplicateChat, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
-    import { sleep, sortableOptions } from "src/ts/util";
+    import { sortableOptions } from "src/ts/util";
     import { createMultiuserRoom } from "src/ts/sync/multiuser";
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import Toggles from "./Toggles.svelte";
     import { changeChatTo } from "src/ts/globalApi.svelte";
+    import { indexSideChatListRows } from "./sideChatListRows";
 
     interface Props {
         chara: character|groupChat;
@@ -27,16 +28,45 @@
 
     let { chara = $bindable() }: Props = $props();
     let editMode = $state(false)
+    let indexedRows = $derived(
+        indexSideChatListRows(chara.chats, chara.chatFolders),
+    )
 
     let chatsStb: Sortable[] = []
-    let folderStb: Sortable = null
+    let folderStb: Sortable | null = null
 
     let folderEles: HTMLDivElement = $state()
     let listEle: HTMLDivElement = $state()
     let sorted = $state(0)
     let opened = 0
+    let sortableLoadId = 0
 
-    const createStb = () => {
+    const destroySortable = () => {
+        if (folderStb) {
+            try {
+                folderStb.destroy()
+            } catch {}
+            folderStb = null
+        }
+        for (const sortable of chatsStb) {
+            try {
+                sortable.destroy()
+            } catch {}
+        }
+        chatsStb = []
+    }
+
+    const createStb = async () => {
+        const loadId = ++sortableLoadId
+        destroySortable()
+        if (!editMode) return
+
+        await tick()
+        const { default: Sortable } =
+            await import('sortablejs/modular/sortable.core.esm.js')
+        if (!editMode || loadId !== sortableLoadId || !listEle || !folderEles)
+            return
+
         for (let chat of listEle.querySelectorAll('.risu-chat')) {
             chatsStb.push(new Sortable(chat, {
                 group: 'chats',
@@ -68,14 +98,9 @@
                     })
 
                     chara.chats = newChats
-                    if(selectedChatId) await changeChatTo(selectedChatId)
-
-                    try {
-                        this.destroy()
-                    } catch (e) {}
+                    destroySortable()
                     sorted += 1
-                    await sleep(1)
-                    createStb()
+                    if(selectedChatId) await changeChatTo(selectedChatId)
                 },
                 ...sortableOptions
             }))
@@ -108,31 +133,24 @@
                 
                 chara.chatFolders = newFolders
                 chara.chats = newChats
-                if(selectedChatId) await changeChatTo(selectedChatId)
-                try {
-                    folderStb.destroy()
-                } catch (e) {}
+                destroySortable()
                 sorted += 1
-                await sleep(1)
-                createStb()
+                if (selectedChatId) await changeChatTo(selectedChatId)
             },
             ...sortableOptions
         })
     }
 
-    onMount(createStb)
-
-    onDestroy(() => {
-        if (folderStb) {
-            try {
-                folderStb.destroy()
-            } catch (error) {}
+    $effect(() => {
+        editMode
+        sorted
+        chara.chatFolders.length
+        chara.chats.length
+        void createStb()
+        return () => {
+            sortableLoadId += 1
+            destroySortable()
         }
-        chatsStb.map(stb => {
-            try {
-                stb.destroy()
-            } catch (error) {}
-        })
     })
 </script>
 <div class="flex flex-col w-full h-[calc(100%-2rem)] max-h-[calc(100%-2rem)]">
@@ -145,7 +163,9 @@
         <!-- folder div -->
         <div class="flex flex-col" bind:this={folderEles}>
             <!-- chat folder -->
-            {#each chara.chatFolders as folder, i}
+            {#each indexedRows.folders as folderRow (folderRow.folder.id)}
+            {@const folder = folderRow.folder}
+            {@const i = folderRow.index}
             <div data-risu-chat-folder-idx={i}
                 class="flex flex-col mb-2 border-solid border-1 border-darkborderc cursor-pointer rounded-md">
                 <!-- folder header -->
@@ -222,16 +242,18 @@
                 </button>
                 <!-- chats in folder -->
                 <div class="risu-chat flex flex-col w-full text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md {folder.folded ? 'hidden' : ''}">
-                    {#if chara.chats.filter(chat => chat.folderId == chara.chatFolders[i].id).length == 0}
+                    {#if folderRow.chats.length === 0}
                     <span class="no-sort flex justify-center text-textcolor2">Empty</span>
                     <div></div>
                     {:else}
-                    {#each chara.chats.filter(chat => chat.folderId == chara.chatFolders[i].id) as chat}
-                    <button data-risu-chat-idx={chara.chats.indexOf(chat)} onclick={async () => {
+                    {#each folderRow.chats as chatRow (chatRow.chat.id)}
+                    {@const chat = chatRow.chat}
+                    {@const chatIndex = chatRow.index}
+                    <button data-risu-chat-idx={chatIndex} onclick={async () => {
                         if(!editMode){
                             await changeChatTo(chat.id)
                         }
-                    }} class="risu-chats flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"class:bg-selected={chara.chats.indexOf(chat) === chara.chatPage}>
+                    }} class="risu-chats flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"class:bg-selected={chatIndex === chara.chatPage}>
                         {#if editMode}
                             <TextInput bind:value={chat.name} className="grow min-w-0" padding={false}/>
                         {:else}
@@ -292,7 +314,7 @@
                                 }
                             }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={async (e) => {
                                 e.stopPropagation()
-                                exportChat(chara.chats.indexOf(chat))
+                                exportChat(chatIndex)
                             }}>
                                 <DownloadIcon size={18}/>
                             </div>
@@ -323,8 +345,9 @@
         </div>
         <!-- chat without folder div -->
         <div class="risu-chat flex flex-col">
-            {#each chara.chats as chat, i}
-            {#if chat.folderId == null}
+            {#each indexedRows.ungrouped as chatRow (chatRow.chat.id)}
+            {@const chat = chatRow.chat}
+            {@const i = chatRow.index}
             <button data-risu-chat-idx={i} onclick={async () => {
                 if(!editMode){
                     await changeChatTo(chat.id)
@@ -416,7 +439,6 @@
                     </div>
                 </div>
             </button>
-            {/if}
             {/each}
         </div>
     </div>
