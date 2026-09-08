@@ -159,7 +159,7 @@ async function main() {
             if (error.code !== 'ENOENT') throw error
         }
     }
-    let child, client
+    let child, client, launchEpoch
     const samples = []
     let fixture
     let seededStatistics,
@@ -216,6 +216,7 @@ async function main() {
         )
     const launch = async () => {
         const started = performance.now()
+        launchEpoch = performance.timeOrigin + started
         child = spawn(
             path.join(repository, 'src-tauri/target/release', original.mainBinaryName + '.exe'),
             [],
@@ -310,7 +311,26 @@ async function main() {
         }))()`),
         )
         const legacyAssetsAfter = (await readdir(path.join(profileRoot, 'assets'))).length
-        samples.push({ ...scenario, kind, warmup, launchToReadyMs, legacyAssetsAfter, ...sample })
+        const paintEpoch =
+            kind === 'restart'
+                ? await client.evaluate(`(() => {
+                const paint = performance.getEntriesByName('first-contentful-paint')[0];
+                return paint ? performance.timeOrigin + paint.startTime : null;
+            })()`)
+                : null
+        const launchToFirstPaintMs =
+            Number.isFinite(paintEpoch) && Number.isFinite(launchEpoch)
+                ? paintEpoch - launchEpoch
+                : null
+        samples.push({
+            ...scenario,
+            kind,
+            warmup,
+            launchToReadyMs,
+            launchToFirstPaintMs,
+            legacyAssetsAfter,
+            ...sample,
+        })
         await persist()
         if (
             warmup &&

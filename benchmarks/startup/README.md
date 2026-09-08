@@ -1,5 +1,7 @@
 # Synthetic startup measurements
 
+Requires Node.js 24 or newer for the built-in SQLite fixture writer.
+
 This harness builds an isolated Tauri release with agent-mode Realm blocking. It
 uses a separate application identifier and WebView directory, and redirects
 APPDATA and LOCALAPPDATA for child tools. Windows native Known Folder lookup can
@@ -76,6 +78,15 @@ overlap with a snapshot is not a direct measurement of native mutex ownership.
 Heap values are samples at operation boundaries, not an OS process peak.
 Resource timing counts visible image requests; blob/native IPC media has a
 separate counter. Neither count should be interpreted as all disk reads.
+
+The summary derives `maxImageRequests` from overlapping Resource Timing
+intervals. Custom-protocol images can bypass the fetch observer, so a zero
+native-fetch counter does not mean there were no media requests.
+
+`launchToFirstPaintMs` aligns Node's launch timestamp and WebView's first
+contentful paint using their same-host performance time origins. It is recorded
+for process restarts; reloads and older results without this observation remain
+unmeasured. The summary reports the number of measured values for each metric.
 
 `observe.mjs` instruments existing function bodies only in the benchmark build.
 It preserves real return values, promises, native opens and revisions. Ordinary

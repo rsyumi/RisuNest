@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { sanitizeMetrics, percentile } from './metrics.mjs'
+import { maxConcurrentResources, sanitizeMetrics, percentile } from './metrics.mjs'
 import { assertSyntheticProfile, seedExpression, syntheticPng } from './fixture.mjs'
 import { instrumentSource } from './observe.mjs'
 
@@ -51,6 +51,30 @@ test('nearest-rank P95 uses the nineteenth of twenty samples', () => {
         19,
     )
     assert.equal(percentile([], 95), null)
+})
+
+test('resource concurrency counts overlap without merging adjacent requests', () => {
+    assert.equal(
+        maxConcurrentResources([
+            { start: 0, ms: 10 },
+            { start: 5, ms: 10 },
+        ]),
+        2,
+    )
+    assert.equal(
+        maxConcurrentResources([
+            { start: 0, ms: 10 },
+            { start: 10, ms: 10 },
+        ]),
+        1,
+    )
+    assert.equal(
+        maxConcurrentResources([
+            { start: 0, ms: 0 },
+            { start: 1, ms: null },
+        ]),
+        0,
+    )
 })
 
 test('synthetic PNG samples have distinct contents and real image dimensions', () => {

@@ -116,3 +116,23 @@ export function percentile(values, percent) {
         .sort((a, b) => a - b)
     return sorted.length ? sorted[Math.ceil((sorted.length * percent) / 100) - 1] : null
 }
+
+export function maxConcurrentResources(resources) {
+    const events = resources
+        .flatMap(({ start, ms }) =>
+            Number.isFinite(start) && Number.isFinite(ms) && ms > 0
+                ? [
+                      { at: start, delta: 1 },
+                      { at: start + ms, delta: -1 },
+                  ]
+                : [],
+        )
+        .sort((a, b) => a.at - b.at || a.delta - b.delta)
+    let active = 0,
+        peak = 0
+    for (const event of events) {
+        active += event.delta
+        peak = Math.max(peak, active)
+    }
+    return peak
+}

@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises'
-import { percentile } from './metrics.mjs'
+import { maxConcurrentResources, percentile } from './metrics.mjs'
 
 const result = JSON.parse(await readFile(process.argv[2], 'utf8'))
 const groups = new Map()
@@ -81,6 +81,7 @@ for (const samples of groups.values()) {
             ),
         ),
         launchToReadyMs: distribution(samples.map((s) => s.launchToReadyMs)),
+        launchToFirstPaintMs: distribution(samples.map((s) => s.launchToFirstPaintMs)),
         openMs: distribution(samples.map((s) => openTotal(s, 'ms'))),
         openBytes: distribution(samples.map((s) => openTotal(s, 'bytes'))),
         preparationCanonicalCount: distribution(
@@ -136,6 +137,9 @@ for (const samples of groups.values()) {
             samples.map((s) => Math.max(0, ...s.longTasks.map((t) => t.ms))),
         ),
         mediaRequests: distribution(samples.map((s) => s.imageResources?.length)),
+        maxImageRequests: distribution(
+            samples.map((s) => maxConcurrentResources(s.imageResources ?? [])),
+        ),
         operations,
     })
 }
