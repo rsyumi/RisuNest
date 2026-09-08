@@ -573,7 +573,7 @@
 
     async function sendChatMainComplete(
         context: ConversationOperationContext,
-        continued:boolean = false,
+        continued: boolean = false,
     ) {
         const mutationTarget = requireConversationMutationTarget(context)
         const previousLength = mutationTarget.conversation.message.length
@@ -581,8 +581,8 @@
         abortController = new AbortController()
         try {
             await sendChat(-1, {
-                signal:abortController.signal,
-                continue:continued
+                signal: abortController.signal,
+                continue: continued,
             })
             context.requireCurrent()
             const refreshedTarget = requireConversationMutationTarget(context)
@@ -590,32 +590,44 @@
                 refreshedTarget &&
                 previousLength < refreshedTarget.conversation.message.length
             ) {
-                const tail = captureConversationRerollTail(refreshedTarget, previousLength)
+                const tail = captureConversationRerollTail(
+                    refreshedTarget,
+                    previousLength,
+                )
                 const refreshedHistory = rerollHistory
                     ? refreshConversationRerollHistory(
-                        rerollHistory,
-                        refreshedTarget,
-                        mutationTarget,
-                    )
+                          rerollHistory,
+                          refreshedTarget,
+                          mutationTarget,
+                      )
                     : null
                 rerollHistory = refreshedHistory
-                    ? appendConversationRerollHistory(refreshedHistory, refreshedTarget, tail)
+                    ? appendConversationRerollHistory(
+                          refreshedHistory,
+                          refreshedTarget,
+                          tail,
+                      )
                     : createConversationRerollHistory(
-                        refreshedTarget,
-                        tail,
-                        persistentRuntime.getNavigationGeneration(),
-                    )
+                          refreshedTarget,
+                          tail,
+                          persistentRuntime.getNavigationGeneration(),
+                      )
             } else if (refreshedTarget) {
-                refreshRerollHistoryAfterOwnedMutation(mutationTarget, refreshedTarget)
+                refreshRerollHistoryAfterOwnedMutation(
+                    mutationTarget,
+                    refreshedTarget,
+                )
             }
         } catch (error) {
+            if (error instanceof SelectedConversationPromotionStaleError) return
             console.error(error)
             alertError(error)
+        } finally {
+            $doingChat = false
         }
-        $doingChat = false
-        if(DBState.db.playMessage){
-            const audio = new Audio(sendSound);
-            audio.play().catch(() => {});
+        if (DBState.db.playMessage) {
+            const audio = new Audio(sendSound)
+            audio.play().catch(() => {})
         }
     }
 

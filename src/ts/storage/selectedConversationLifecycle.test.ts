@@ -20,6 +20,8 @@ import {
     type PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
+import { createSelectedConversationOperations } from '../selectedConversationOperations'
+import { readSelectedConversationLatestTail } from '../selectedConversationTail'
 
 function makeChat(messageCount: number): Chat {
     return {
@@ -944,56 +946,134 @@ describe('selected conversation lifecycle', () => {
         unsubscribeSource()
     })
 
-    it('advances complete ownership after an ordinary root commit and remains demotable', async () => {
-        const database = {
-            username: 'Complete revision fixture',
-            characters: [makeCharacter(makeChat(3))],
-        } as unknown as Database
-        let workingCopy = structuredClone(database)
-        const store = new IndexedDbPersistentDataStore(
-            `selected-complete-revision-${crypto.randomUUID()}`,
-            indexedDB,
-            IDBKeyRange,
-        )
-        await store.open()
-        const initial = await store.replaceFromDatabase(database)
-        const state: PersistentDataRuntimeStateAdapter = {
-            captureRoot: () => capturePersistentRoot(workingCopy),
-            captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
-            captureCharacter: (id) =>
-                workingCopy.characters.find((character) => character.chaId === id) ?? null,
-            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
-            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
-            replaceDatabase: (next) => {
-                workingCopy = next
-            },
-            publishCharacter: (next) => {
-                workingCopy.characters[0] = next
-            },
-            publishConversation: (_characterId, conversation, nextCharacter) => {
-                if (nextCharacter) workingCopy.characters[0] = nextCharacter
-                else workingCopy.characters[0].chats[0] = conversation
-            },
-            canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
-            isConversationOperationActive: () => false,
-        }
-        const runtime = createPersistentDataRuntime({
-            store,
-            state,
-            prepareDatabase: async (candidate) => candidate,
-        })
-        await runtime.initializeActiveWorkingSet(workingCopy)
-        workingCopy.username = 'Committed root edit'
-        runtime.markPersistentDataDirty(1)
+    it.each([
+        'before promotion',
+        'during operation',
+        'during tail read',
+    ] as const)(
+        'keeps an operation authoritative when saving %s and remains demotable',
+        async (saveTiming) => {
+            const database = {
+                username: 'Complete revision fixture',
+                characters: [makeCharacter(makeChat(3))],
+            } as unknown as Database
+            let workingCopy = structuredClone(database)
+            const store = new IndexedDbPersistentDataStore(
+                `selected-complete-revision-${crypto.randomUUID()}`,
+                indexedDB,
+                IDBKeyRange,
+            )
+            await store.open()
+            const initial = await store.replaceFromDatabase(database)
+            const state: PersistentDataRuntimeStateAdapter = {
+                captureRoot: () => capturePersistentRoot(workingCopy),
+                captureSelectedCharacter: () =>
+                    workingCopy.characters[0] ?? null,
+                captureCharacter: (id) =>
+                    workingCopy.characters.find(
+                        (character) => character.chaId === id,
+                    ) ?? null,
+                getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
+                getSelectedConversationId: () =>
+                    workingCopy.characters[0]?.chats[0]?.id,
+                replaceDatabase: (next) => {
+                    workingCopy = next
+                },
+                publishCharacter: (next) => {
+                    workingCopy.characters[0] = next
+                },
+                publishConversation: (
+                    _characterId,
+                    conversation,
+                    nextCharacter,
+                ) => {
+                    if (nextCharacter) workingCopy.characters[0] = nextCharacter
+                    else workingCopy.characters[0].chats[0] = conversation
+                },
+                canUseWindowedSelectedConversation: () => true,
+                isMaximumCompatibilityMode: () => false,
+                isConversationOperationActive: () => false,
+            }
+            const runtime = createPersistentDataRuntime({
+                store,
+                state,
+                prepareDatabase: async (candidate) => candidate,
+            })
+            await runtime.initializeActiveWorkingSet(workingCopy)
+            if (saveTiming !== 'during operation') {
+                await vi.waitFor(() => {
+                    expect(runtime.getSelectedConversationMode()).toBe(
+                        'windowed',
+                    )
+                })
+                workingCopy.username = 'Pending root edit'
+                runtime.markPersistentDataDirty(1)
+            }
+            if (saveTiming === 'during tail read') {
+                const readWindow = store.readConversationWindow.bind(store)
+                const read = vi
+                    .spyOn(store, 'readConversationWindow')
+                    .mockImplementationOnce(async (query) => {
+                        const result = await readWindow(query)
+                        await runtime.flushPendingData('tail-read-save')
+                        return result
+                    })
+                const tail = await readSelectedConversationLatestTail(
+                    runtime,
+                    3,
+                )
+                expect(tail.map((message) => message.data)).toEqual([
+                    'message-0',
+                    'message-1',
+                    'message-2',
+                ])
+                expect(read).toHaveBeenCalledTimes(2)
+                read.mockRestore()
+            }
+            const operations = createSelectedConversationOperations({
+                captureSelectedConversationTarget: () =>
+                    runtime.captureSelectedConversationTarget(),
+                acquireCompleteConversation: (reason, target) =>
+                    runtime.acquireCompleteConversation(reason, target),
+                captureCurrent: () => ({
+                    character: workingCopy.characters[0],
+                    conversation: workingCopy.characters[0].chats[0],
+                }),
+                getCurrentSession: () => runtime.getActiveConversationSession(),
+                getCurrentViewportSource: () =>
+                    runtime.getActiveConversationViewportSource(),
+            })
+            const result = await operations.withCompleteSelectedConversation(
+                'generation-save',
+                async (context) => {
+                    const before = context.requireCurrent()
+                    if (saveTiming === 'during operation') {
+                        workingCopy.username = 'Committed root edit'
+                        runtime.markPersistentDataDirty(1)
+                        await runtime.flushPendingData('complete-root-edit')
+                    }
+                    const after = context.requireCurrent()
+                    expect(after.session).toBe(before.session)
+                    expect(after.conversation).toBe(before.conversation)
+                    expect(after.selection.storeRevision).toBe(
+                        initial.revision + 1,
+                    )
+                    expect(runtime.getSelectedConversationMode()).toBe(
+                        'complete',
+                    )
+                    return true
+                },
+            )
+            expect(result).toBe(true)
 
-        await runtime.flushPendingData('complete-root-edit')
-
-        expect(runtime.captureSelectedConversationTarget()).toMatchObject({
-            storeRevision: initial.revision + 1,
-        })
-        expect(runtime.getSelectedConversationMode()).toBe('windowed')
-    })
+            expect(runtime.captureSelectedConversationTarget()).toMatchObject({
+                storeRevision: initial.revision + 1,
+            })
+            await vi.waitFor(() => {
+                expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            })
+        },
+    )
 
     it('keeps a windowed selected conversation authoritative across a root module append', async () => {
         const database = {

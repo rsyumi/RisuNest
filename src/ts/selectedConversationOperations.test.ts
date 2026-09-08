@@ -538,6 +538,69 @@ describe('selected conversation complete-operation gateway', () => {
         expect(harness.defaultLease.release).toHaveBeenCalledOnce()
     })
 
+    it('keeps the same complete session authoritative after a save during an operation', async () => {
+        const harness = makeHarness()
+        const operationStarted = deferred<void>()
+        const resumeOperation = deferred<void>()
+        const pending = harness.operations.withCompleteSelectedConversation(
+            'generation-save',
+            async (context) => {
+                const before = context.requireCurrent()
+                operationStarted.resolve()
+                await resumeOperation.promise
+                const after = context.requireCurrent()
+                expect(after.session).toBe(before.session)
+                expect(after.conversation).toBe(before.conversation)
+                return after.selection.storeRevision
+            },
+        )
+        await operationStarted.promise
+        harness.current.session.advanceStoreRevision(8)
+        harness.setSelection(
+            makeSelection('character-a', 'conversation-a', 1, 8),
+        )
+        resumeOperation.resolve()
+
+        await expect(pending).resolves.toBe(8)
+        expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it.each(['navigation', 'session', 'revision-mismatch'] as const)(
+        'rejects %s changes after an operation starts even with the same conversation IDs',
+        async (change) => {
+            const harness = makeHarness()
+            const operationStarted = deferred<void>()
+            const resumeOperation = deferred<void>()
+            const pending = harness.operations.withCompleteSelectedConversation(
+                'generation-stale-authority',
+                async (context) => {
+                    context.requireCurrent()
+                    operationStarted.resolve()
+                    await resumeOperation.promise
+                    context.requireCurrent().conversation.message[0].data =
+                        'stale mutation'
+                },
+            )
+            await operationStarted.promise
+            if (change === 'session') harness.setCurrent(makeCurrent())
+            harness.setSelection(
+                makeSelection(
+                    'character-a',
+                    'conversation-a',
+                    change === 'navigation' ? 2 : 1,
+                    change === 'revision-mismatch' ? 8 : 7,
+                ),
+            )
+            resumeOperation.resolve()
+
+            await expect(pending).rejects.toBeInstanceOf(
+                SelectedConversationPromotionStaleError,
+            )
+            expect(harness.current.conversation.message[0].data).toBe('zero')
+            expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+        },
+    )
+
     it('requires fresh authority before mutating after an async suspension', async () => {
         const harness = makeHarness()
         const operationStarted = deferred<void>()

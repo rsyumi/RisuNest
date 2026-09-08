@@ -251,18 +251,25 @@ function captureExactCompleteAuthority(
     const current = dependencies.captureCurrent()
     const session = dependencies.getCurrentSession()
     if (
-        recaptured === null
-        || current === null
-        || session === null
-        || !matchesSelection(captured, recaptured)
-        || !matchesSelection(captured, lease.target)
-        || lease.session !== session
-        || session.storeRevision !== recaptured.storeRevision
-        || current.character.chaId !== recaptured.characterId
-        || current.conversation.id !== recaptured.conversationId
-        || current.character.chats[current.character.chatPage] !== current.conversation
-        || !session.matchesConversation(recaptured.characterId, current.conversation)
-    ) throw new SelectedConversationPromotionStaleError()
+        recaptured === null ||
+        current === null ||
+        session === null ||
+        !matchesSelection(captured, recaptured) ||
+        !matchesSelection(captured, lease.target) ||
+        lease.session !== session ||
+        // Promotion can flush pending saves; later saves can advance the leased session.
+        // Validate the live revision against that session, not the captured revision.
+        session.storeRevision !== recaptured.storeRevision ||
+        current.character.chaId !== recaptured.characterId ||
+        current.conversation.id !== recaptured.conversationId ||
+        current.character.chats[current.character.chatPage] !==
+            current.conversation ||
+        !session.matchesConversation(
+            recaptured.characterId,
+            current.conversation,
+        )
+    )
+        throw new SelectedConversationPromotionStaleError()
     return {
         ...current,
         selection: recaptured,
@@ -274,10 +281,11 @@ function matchesSelection(
     left: SelectedConversationTarget,
     right: SelectedConversationTarget,
 ): boolean {
-    return left.characterId === right.characterId
-        && left.conversationId === right.conversationId
-        && left.navigationGeneration === right.navigationGeneration
-        && left.storeRevision === right.storeRevision
+    return (
+        left.characterId === right.characterId &&
+        left.conversationId === right.conversationId &&
+        left.navigationGeneration === right.navigationGeneration
+    )
 }
 
 function idempotentRelease(lease: CompleteConversationLease): () => void {

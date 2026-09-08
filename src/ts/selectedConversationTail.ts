@@ -26,13 +26,43 @@ export async function readSelectedConversationLatestTail(
     signal?: AbortSignal,
 ): Promise<Message[]> {
     if (!Number.isSafeInteger(limit) || limit <= 0) {
-        throw new RangeError('Selected conversation tail limit must be a positive safe integer')
+        throw new RangeError(
+            'Selected conversation tail limit must be a positive safe integer',
+        )
     }
     if (limit > MAX_SELECTED_CONVERSATION_TAIL) {
         throw new RangeError(
             `Selected conversation tail limit cannot exceed ${MAX_SELECTED_CONVERSATION_TAIL}`,
         )
     }
+    const target = runtime.captureSelectedConversationTarget()
+    try {
+        return await readExactSelectedConversationTail(runtime, limit, signal)
+    } catch (error) {
+        assertNotAborted(signal)
+        const currentTarget = runtime.captureSelectedConversationTarget()
+        if (
+            error instanceof SelectedConversationTailStaleError &&
+            target &&
+            currentTarget &&
+            currentTarget.storeRevision > target.storeRevision &&
+            currentTarget.characterId === target.characterId &&
+            currentTarget.conversationId === target.conversationId &&
+            currentTarget.navigationGeneration === target.navigationGeneration
+        ) {
+            // Saving can replace the windowed source and its state token. Start a
+            // fresh read once for the same selection, retaining exact snapshot checks.
+            return readExactSelectedConversationTail(runtime, limit, signal)
+        }
+        throw error
+    }
+}
+
+async function readExactSelectedConversationTail(
+    runtime: SelectedConversationTailRuntime,
+    limit: number,
+    signal?: AbortSignal,
+): Promise<Message[]> {
     assertNotAborted(signal)
     const target = runtime.captureSelectedConversationTarget()
     const source = runtime.getActiveConversationViewportSource()
@@ -64,10 +94,15 @@ export async function readSelectedConversationLatestTail(
         currentSnapshot.version !== snapshot.version ||
         currentSnapshot.storeRevision !== target.storeRevision ||
         currentSnapshot.totalMessages !== snapshot.totalMessages
-    ) throw new SelectedConversationTailStaleError()
+    )
+        throw new SelectedConversationTailStaleError()
 
     const messages: Message[] = []
-    for (let absoluteIndex = startIndex; absoluteIndex < snapshot.totalMessages; absoluteIndex++) {
+    for (
+        let absoluteIndex = startIndex;
+        absoluteIndex < snapshot.totalMessages;
+        absoluteIndex++
+    ) {
         const row = currentSnapshot.rowAt(absoluteIndex)
         if (!row || row.absoluteIndex !== absoluteIndex) {
             throw new SelectedConversationTailStaleError()

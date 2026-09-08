@@ -13,20 +13,27 @@ function message(index: number): Message {
 }
 
 function harness(totalMessages = 25) {
-    const messages = Array.from({ length: totalMessages }, (_, index) => message(index))
-    const readConversationWindow = vi.fn(async ({ startIndex = 0, limit = 128 }) => ({
-        revision: 7,
-        value: {
-            characterId: 'character-a',
-            conversationId: 'conversation-a',
-            messages: structuredClone(messages.slice(startIndex, startIndex + limit)),
-            startIndex,
-            endIndex: Math.min(totalMessages, startIndex + limit),
-            totalMessages,
-            hasMoreBefore: startIndex > 0,
-            hasMoreAfter: startIndex + limit < totalMessages,
-        },
-    }))
+    let revision = 7
+    const messages = Array.from({ length: totalMessages }, (_, index) =>
+        message(index),
+    )
+    const readConversationWindow = vi.fn(
+        async ({ startIndex = 0, limit = 128 }) => ({
+            revision,
+            value: {
+                characterId: 'character-a',
+                conversationId: 'conversation-a',
+                messages: structuredClone(
+                    messages.slice(startIndex, startIndex + limit),
+                ),
+                startIndex,
+                endIndex: Math.min(totalMessages, startIndex + limit),
+                totalMessages,
+                hasMoreBefore: startIndex > 0,
+                hasMoreAfter: startIndex + limit < totalMessages,
+            },
+        }),
+    )
     const source = new PersistentConversationViewportSource({
         reader: { readConversationWindow },
         characterId: 'character-a',
@@ -57,6 +64,17 @@ function harness(totalMessages = 25) {
         replaceSource(next: PersistentConversationViewportSource) {
             currentSource = next
         },
+        advanceRevision() {
+            revision += 1
+            currentTarget = { ...currentTarget!, storeRevision: revision }
+            currentSource.advanceRevision(revision, totalMessages)
+        },
+        navigateAwayAndBack() {
+            currentTarget = {
+                ...currentTarget!,
+                navigationGeneration: currentTarget!.navigationGeneration + 2,
+            }
+        },
     }
 }
 
@@ -64,7 +82,10 @@ describe('selected conversation latest tail', () => {
     it('reads at most ten messages from the exact selected viewport revision', async () => {
         const source = harness()
 
-        const tail = await readSelectedConversationLatestTail(source.runtime, 10)
+        const tail = await readSelectedConversationLatestTail(
+            source.runtime,
+            10,
+        )
 
         expect(tail.map((item) => item.data)).toEqual(
             Array.from({ length: 10 }, (_, index) => `message-${index + 15}`),
@@ -90,7 +111,8 @@ describe('selected conversation latest tail', () => {
                     characterId: 'character-a',
                     conversationId: 'conversation-a',
                     messages: Array.from({ length: limit }, (_, index) =>
-                        message(startIndex + index)),
+                        message(startIndex + index),
+                    ),
                     startIndex,
                     endIndex: startIndex + limit,
                     totalMessages: 25,
@@ -102,7 +124,99 @@ describe('selected conversation latest tail', () => {
 
         await expect(
             readSelectedConversationLatestTail(source.runtime, 10),
-        ).rejects.toThrow('Selected conversation changed while reading its tail')
+        ).rejects.toThrow(
+            'Selected conversation changed while reading its tail',
+        )
+    })
+
+    it('retries the latest tail once when a save advances the selected revision', async () => {
+        const source = harness()
+        const read = source.readConversationWindow.getMockImplementation()!
+        source.readConversationWindow.mockImplementationOnce(async (input) => {
+            const result = await read(input)
+            source.advanceRevision()
+            return result
+        })
+
+        const tail = await readSelectedConversationLatestTail(
+            source.runtime,
+            10,
+        )
+
+        expect(tail.map((item) => item.data)).toEqual(
+            Array.from({ length: 10 }, (_, index) => `message-${index + 15}`),
+        )
+        expect(source.readConversationWindow).toHaveBeenCalledTimes(2)
+    })
+
+    it('bounds retries when saves repeatedly invalidate the tail read', async () => {
+        const source = harness()
+        const read = source.readConversationWindow.getMockImplementation()!
+        source.readConversationWindow.mockImplementation(async (input) => {
+            const result = await read(input)
+            source.advanceRevision()
+            return result
+        })
+
+        await expect(
+            readSelectedConversationLatestTail(source.runtime, 10),
+        ).rejects.toThrow(
+            'Selected conversation changed while reading its tail',
+        )
+        expect(source.readConversationWindow).toHaveBeenCalledTimes(2)
+    })
+
+    it('does not retry a newer revision after navigating away and back', async () => {
+        const source = harness()
+        const read = source.readConversationWindow.getMockImplementation()!
+        source.readConversationWindow.mockImplementationOnce(async (input) => {
+            const result = await read(input)
+            source.advanceRevision()
+            source.navigateAwayAndBack()
+            return result
+        })
+
+        await expect(
+            readSelectedConversationLatestTail(source.runtime, 10),
+        ).rejects.toThrow(
+            'Selected conversation changed while reading its tail',
+        )
+        expect(source.readConversationWindow).toHaveBeenCalledOnce()
+    })
+
+    it('does not retry a revision change after cancellation', async () => {
+        const source = harness()
+        const controller = new AbortController()
+        const read = source.readConversationWindow.getMockImplementation()!
+        source.readConversationWindow.mockImplementationOnce(async (input) => {
+            const result = await read(input)
+            source.advanceRevision()
+            controller.abort()
+            return result
+        })
+
+        await expect(
+            readSelectedConversationLatestTail(
+                source.runtime,
+                10,
+                controller.signal,
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
+        expect(source.readConversationWindow).toHaveBeenCalledOnce()
+    })
+
+    it('preserves storage failures instead of retrying them after a save', async () => {
+        const source = harness()
+        const failure = new Error('Storage unavailable')
+        source.readConversationWindow.mockImplementationOnce(async () => {
+            source.advanceRevision()
+            throw failure
+        })
+
+        await expect(
+            readSelectedConversationLatestTail(source.runtime, 10),
+        ).rejects.toBe(failure)
+        expect(source.readConversationWindow).toHaveBeenCalledOnce()
     })
 
     it('rejects requests above the suggestion tail bound before reading', async () => {
@@ -120,7 +234,9 @@ describe('selected conversation latest tail', () => {
 
         await expect(
             readSelectedConversationLatestTail(source.runtime, 10),
-        ).rejects.toThrow('Selected conversation changed while reading its tail')
+        ).rejects.toThrow(
+            'Selected conversation changed while reading its tail',
+        )
         expect(source.readConversationWindow).not.toHaveBeenCalled()
     })
 })
