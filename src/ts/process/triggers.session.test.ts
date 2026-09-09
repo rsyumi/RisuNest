@@ -4,6 +4,7 @@ import type { Chat, character } from '../storage/database.svelte'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { processMultiCommand } from './command'
 import { createConversationOperationContext } from './conversationOperationContext'
+import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 
 const runtime = vi.hoisted(() => ({
     unexpectedNativeRuntimeAccess: () => {
@@ -75,6 +76,29 @@ function fixture() {
 beforeEach(() => {
     runtime.session = null
     selectedCharID.set(0)
+})
+
+test('keeps stored trigger permissions and parser identity stable during display', async () => {
+    const { chat, char, session } = fixture()
+    char.lowLevelAccess = true
+    char.triggerscript[0].type = 'display'
+    char.triggerscript[0].lowLevelAccess = false
+    char.triggerscript[0].effect = []
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+    const before = createChatParserDependencyStamp(char)
+
+    for (let index = 0; index < 3; index++) {
+        const result = await runTrigger(char, 'display', {
+            chat,
+            displayMode: true,
+            displayData: 'unchanged',
+        })
+        expect(result?.displayData).toBe('unchanged')
+        expect(char.triggerscript[0].lowLevelAccess).toBe(false)
+        expect(createChatParserDependencyStamp(char)).toBe(before)
+    }
+    expect(session.activePinReasons).toEqual([])
 })
 
 test('CAS-applies ordered trigger mutations and preserves an empty string value', async () => {

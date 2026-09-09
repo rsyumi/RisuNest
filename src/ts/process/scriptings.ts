@@ -1746,10 +1746,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
             char.type === 'group'
                 ? getModuleTriggers()
                 : char.triggerscript
-                      .map((v) => {
-                          v.lowLevelAccess = false
-                          return v
-                      })
+                      .map<triggerscript>((v) => ({ ...v, lowLevelAccess: false }))
                       .concat(getModuleTriggers())
         if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
             return content

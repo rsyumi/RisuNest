@@ -22,6 +22,7 @@ import {
   isConversationMutationTargetCurrent,
 } from '../conversationMutations'
 import { captureGenerationConversationOperation } from './generationConversationOperation'
+import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -1562,6 +1563,42 @@ test('preserves display text for a simple character without optional triggers', 
       'unchanged',
     ),
   ).resolves.toBe('unchanged')
+})
+
+test('keeps stored trigger permissions and parser identity stable during Lua display', async () => {
+  const fixture = operationCharacterFixture('display-trigger-identity')
+  fixture.char.lowLevelAccess = true
+  fixture.char.customscript = []
+  fixture.char.triggerscript = [
+    {
+      comment: 'synthetic display listener',
+      type: 'start',
+      conditions: [],
+      lowLevelAccess: true,
+      effect: [
+        {
+          type: 'triggerlua',
+          code: `listenEdit('editDisplay', function(id, value) return value .. ':rendered' end)`,
+        },
+      ],
+    },
+  ]
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  continuationRuntime.session = fixture.session
+  const { runLuaEditTrigger } = await import('./scriptings')
+  const before = createChatParserDependencyStamp(fixture.char)
+  try {
+    for (let index = 0; index < 3; index++) {
+      await expect(
+        runLuaEditTrigger(fixture.char, 'editdisplay', 'input'),
+      ).resolves.toBe('input:rendered')
+      expect(fixture.char.triggerscript[0].lowLevelAccess).toBe(true)
+      expect(createChatParserDependencyStamp(fixture.char)).toBe(before)
+    }
+  } finally {
+    continuationRuntime.session = null
+  }
 })
 
 test('settles a resumed coroutine rejection without leaving an unhandled rejection', async () => {

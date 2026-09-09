@@ -1148,10 +1148,10 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         historyend: '',
         promptend: ''
     }
-    const triggers = char.triggerscript.map((v) => {
-        v.lowLevelAccess = CharacterlowLevelAccess
-        return v
-    }).concat(moduleTriggers)
+    const triggers = char.triggerscript.map<triggerscript>((v) => ({
+        ...v,
+        lowLevelAccess: CharacterlowLevelAccess,
+    })).concat(moduleTriggers)
     const db = getDatabase()
     const defaultVariables = parseKeyValue(char.defaultVariables).concat(parseKeyValue(db.templateDefaultVariables))
     
