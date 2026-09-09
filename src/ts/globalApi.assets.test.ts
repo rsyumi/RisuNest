@@ -126,7 +126,6 @@ vi.mock('@tauri-apps/plugin-http', () => ({ fetch: vi.fn() }))
 
 import {
     changeChatTo,
-    createThrottledSizeEstimator,
     downloadFile,
     forageStorage,
     getFileSrc,
@@ -464,34 +463,6 @@ describe('getFileSrc browser asset route', () => {
 
         await getFileSrc('assets/profile.png')
         expect(state.blobStore.read).toHaveBeenCalledTimes(2)
-    })
-})
-
-describe('createThrottledSizeEstimator', () => {
-    test('measures at most once per refresh window and reuses the last estimate', () => {
-        vi.useFakeTimers()
-        let value = 'aaaa'
-        const read = vi.fn(() => value)
-        const estimate = createThrottledSizeEstimator(read)
-
-        expect(estimate()).toBe(JSON.stringify('aaaa').length)
-        expect(read).toHaveBeenCalledTimes(1)
-
-        value = 'a'.repeat(100)
-        expect(estimate()).toBe(JSON.stringify('aaaa').length)
-        expect(estimate()).toBe(JSON.stringify('aaaa').length)
-        expect(read).toHaveBeenCalledTimes(1)
-
-        vi.advanceTimersByTime(1000)
-        expect(read).toHaveBeenCalledTimes(2)
-        expect(estimate()).toBe(JSON.stringify('a'.repeat(100)).length)
-    })
-
-    test('reports zero for unserializable values instead of throwing', () => {
-        const cyclic: { self?: unknown } = {}
-        cyclic.self = cyclic
-        const estimate = createThrottledSizeEstimator(() => cyclic)
-        expect(estimate()).toBe(0)
     })
 })
 

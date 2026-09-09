@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
     SaveCoordinator,
+    captureRoot,
     deferred,
+    makeDatabase,
     makeStore,
 } from './saveCoordinator.testSupport'
 import type { PluginStorageMutation } from './persistentDataStore'
@@ -55,6 +57,56 @@ function apply(
 }
 
 describe('key-scoped plugin storage publication', () => {
+    it('does not repeatedly encode or parse a large unchanged string during explicit small writes', async () => {
+        const payload = 'x'.repeat(2 * 1_048_576)
+        const storage = { payload, counter: 0, nested: { count: 0 } }
+        const database = makeDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => storage,
+            captureSelectedCharacter: () => null,
+            replaceDatabase: () => undefined,
+            publishPluginStorageMutations: (mutations) => apply(storage, mutations),
+        })
+        coordinator.initialize(1)
+        const stringify = vi.spyOn(JSON, 'stringify')
+        const parse = vi.spyOn(JSON, 'parse')
+        try {
+            for (let counter = 1; counter <= 10; counter++) {
+                await coordinator.mutatePersistentPluginStorage('small-write', [
+                    { type: 'set', key: 'counter', value: counter },
+                ])
+            }
+            await coordinator.flushPendingData('unchanged')
+            expect(commit).toHaveBeenCalledTimes(10)
+            const largeEncodings = stringify.mock.calls.filter(
+                ([value]) =>
+                    value === payload ||
+                    (value && typeof value === 'object' && value.payload === payload),
+            ).length
+            const largeParses = parse.mock.calls.filter(
+                ([value]) => typeof value === 'string' && value.length >= payload.length,
+            ).length
+            expect(largeEncodings).toBe(0)
+            expect(largeParses).toBe(0)
+
+            // A same-turn raw object edit still participates in the next flush.
+            storage.nested.count = 1
+            await coordinator.flushPendingData('raw-nested-write')
+            expect(commit).toHaveBeenCalledTimes(11)
+            expect(commit.mock.calls[10][0].pluginStorage).toEqual([
+                { type: 'set', key: 'nested', value: { count: 1 } },
+            ])
+        } finally {
+            stringify.mockRestore()
+            parse.mockRestore()
+        }
+    })
+
     it('reads retained live storage through deferred persistence and release until eviction is allowed', async () => {
         setDatabaseLite({
             characters: [],

@@ -36,6 +36,132 @@ export function pluginStorageJson(storage: Database['pluginCustomStorage']): str
     return JSON.stringify(normalized)
 }
 
+export interface PluginStorageCapture {
+    /** Owned encoded entries, or null when callable hooks require whole-object JSON. */
+    readonly entries: readonly (readonly [key: string, json: string])[] | null
+    readonly json: string
+    /** A fresh detached value on every read, so callers cannot mutate the cache. */
+    readonly value: Database['pluginCustomStorage']
+}
+
+interface PluginStorageEncodedEntry {
+    readonly key: string
+    readonly primitive: unknown
+    readonly reusable: boolean
+    readonly keyJson: string
+    readonly json: string | undefined
+}
+
+function containsCallable(value: unknown): boolean {
+    if (typeof value === 'function') return true
+    if (!value || typeof value !== 'object') return false
+    return Object.keys(value).some((key) =>
+        containsCallable((value as Record<string, unknown>)[key]),
+    )
+}
+
+/**
+ * Reuse encoded immutable entries without assuming that plugin objects are
+ * reactive. Mutable values and getters are inspected on every capture.
+ */
+export class PluginStorageCaptureCache {
+    private entries = new Map<string, PluginStorageEncodedEntry>()
+    private encoded: readonly PluginStorageEncodedEntry[] | undefined
+    private latest: PluginStorageCapture | undefined
+
+    clear(): void {
+        this.entries = new Map()
+        this.encoded = undefined
+        this.latest = undefined
+    }
+
+    capture(storage: Database['pluginCustomStorage']): PluginStorageCapture {
+        const normalized: Record<string, unknown> = {}
+        const primitives = new Map<string, unknown>()
+        let hasCallable = false
+        // Match pluginStorageJson's read/normalization order before serialization.
+        for (const key of Object.keys(storage)) {
+            const value = storage[key]
+            if (value === undefined) continue
+            const reusable =
+                value === null || (typeof value !== 'object' && typeof value !== 'function')
+            if (reusable) primitives.set(key, value)
+            const canonical = reusable ? value : canonicalize(value)
+            if (!reusable && containsCallable(canonical)) hasCallable = true
+            defineOwnEnumerableProperty(normalized, key, canonical)
+        }
+
+        // Callable toJSON hooks can depend on their key, parent or sibling state.
+        // Preserve full-object JSON semantics for these non-data values.
+        if (hasCallable) {
+            const json = JSON.stringify(normalized)
+            this.entries = new Map()
+            this.encoded = undefined
+            if (this.latest?.entries === null && this.latest.json === json) return this.latest
+            this.latest = this.snapshot(() => json, null)
+            return this.latest
+        }
+
+        const nextEntries = new Map<string, PluginStorageEncodedEntry>()
+        const encoded: PluginStorageEncodedEntry[] = []
+        for (const key of Object.keys(normalized)) {
+            const previous = this.entries.get(key)
+            const reusable = primitives.has(key)
+            const primitive = primitives.get(key)
+            const entry =
+                reusable && previous?.reusable && Object.is(previous.primitive, primitive)
+                    ? previous
+                    : {
+                          key,
+                          primitive,
+                          reusable,
+                          keyJson: previous?.keyJson ?? JSON.stringify(key),
+                          json: JSON.stringify(normalized[key]),
+                      }
+            nextEntries.set(key, entry)
+            if (entry.json !== undefined) encoded.push(entry)
+        }
+        const unchanged =
+            this.latest !== undefined &&
+            encoded.length === this.encoded?.length &&
+            encoded.every(
+                (entry, index) =>
+                    entry.keyJson === this.encoded![index].keyJson &&
+                    entry.json === this.encoded![index].json,
+            )
+        this.entries = nextEntries
+        this.encoded = encoded
+        if (unchanged) return this.latest!
+
+        const bytes = encoded.map(({ keyJson, json }) => [keyJson, json] as const)
+        const entries = Object.freeze(
+            encoded.map(({ key, json }) => Object.freeze([key, json!] as const)),
+        )
+        this.latest = this.snapshot(
+            () => `{${bytes.map(([keyJson, json]) => `${keyJson}:${json}`).join(',')}}`,
+            entries,
+        )
+        return this.latest
+    }
+
+    private snapshot(
+        encode: () => string,
+        entries: PluginStorageCapture['entries'],
+    ): PluginStorageCapture {
+        let json: string | undefined
+        const read = () => (json ??= encode())
+        return Object.freeze({
+            entries,
+            get json() {
+                return read()
+            },
+            get value() {
+                return JSON.parse(read()) as Database['pluginCustomStorage']
+            },
+        })
+    }
+}
+
 function pluginStorageClone(
     storage: Database['pluginCustomStorage'],
 ): Database['pluginCustomStorage'] {
@@ -449,6 +575,20 @@ export class PluginStorageBaseline {
             else this.entries.set(mutation.key, canonicalJson(mutation.value))
         }
         this.serialized = undefined
+    }
+
+    matches(capture: PluginStorageCapture): boolean {
+        if (capture.entries === null) return this.json === capture.json
+        const keys = Object.keys(Object.fromEntries(this.entries))
+        if (keys.length !== capture.entries.length) return false
+        for (let index = 0; index < keys.length; index++) {
+            const [key, json] = capture.entries[index]
+            if (keys[index] !== key || this.entries.get(key) !== json) return false
+        }
+        // Share the owned strings after equality is established. Future captures
+        // of large immutable entries then compare the same string references.
+        for (const [key, json] of capture.entries) this.entries.set(key, json)
+        return true
     }
 
     get json(): string {

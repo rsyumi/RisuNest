@@ -31,6 +31,8 @@ import {
     applyPluginStorageMutations,
     orderPluginStorageKeys,
     PluginStorageBaseline,
+    PluginStorageCaptureCache,
+    type PluginStorageCapture,
     canonicalClone,
     canonicalDatabaseClone,
     canonicalJson,
@@ -174,6 +176,7 @@ interface CapturedState {
     rootCanonical: string
     pluginStorage: Database['pluginCustomStorage'] | null
     pluginStorageCanonical: string | null
+    pluginStorageCapture?: PluginStorageCapture | null
     presets: botPreset[] | null
     presetsCanonical: string | null
     character: CompleteCharacter | null
@@ -525,6 +528,7 @@ export class SaveCoordinator {
     private authorityEpoch = 0
     private rootBaseline: string | null = null
     private pluginStorageBaselineEntries: PluginStorageBaseline | null = null
+    private readonly pluginStorageCaptureCache = new PluginStorageCaptureCache()
     private get pluginStorageBaseline(): string | null {
         return this.pluginStorageBaselineEntries?.json ?? null
     }
@@ -653,6 +657,7 @@ export class SaveCoordinator {
     initialize(revision: DataRevision, database?: Database): void {
         this.cancelDebounce()
         this.cancelOfficialPublishRetry()
+        this.pluginStorageCaptureCache.clear()
         const captured = database ? this.captureDatabase(database) : this.capture()
         this.authorityEpoch++
         this.currentRevision = revision
@@ -2265,12 +2270,11 @@ export class SaveCoordinator {
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
             if (
-                captured.pluginStorage !== null &&
-                captured.pluginStorageCanonical !== this.pluginStorageBaseline
+                !this.pluginStorageMatchesBaseline(captured)
             ) {
                 commit.pluginStorage = diffPluginStorage(
                     this.pluginStorageBaseline,
-                    captured.pluginStorage,
+                    captured.pluginStorage!,
                 )
             }
             if (
@@ -2450,8 +2454,7 @@ export class SaveCoordinator {
             if (
                 generation === this.dirtyGeneration &&
                 current.rootCanonical === this.rootBaseline &&
-                (current.pluginStorageCanonical === null ||
-                    current.pluginStorageCanonical === this.pluginStorageBaseline) &&
+                this.pluginStorageMatchesBaseline(current) &&
                 (current.presetsCanonical === null ||
                     current.presetsCanonical === this.presetsBaseline) &&
                 this.selectedCaptureMatchesBaseline(current) &&
@@ -2912,8 +2915,7 @@ export class SaveCoordinator {
         const currentAddition = this.capturePendingAddition()
         const isClean = targetSettled &&
             current.rootCanonical === this.rootBaseline &&
-            (current.pluginStorageCanonical === null ||
-                current.pluginStorageCanonical === this.pluginStorageBaseline) &&
+            this.pluginStorageMatchesBaseline(current) &&
             (current.presetsCanonical === null ||
                 current.presetsCanonical === this.presetsBaseline) &&
             current.characterCanonical === this.characterBaseline &&
@@ -3717,9 +3719,10 @@ export class SaveCoordinator {
         const pluginStorageValue = this.dependencies.capturePluginStorage
             ? this.dependencies.capturePluginStorage()
             : legacyPluginStorage ?? null
-        const pluginStorageCanonical = pluginStorageValue === null
+        if (pluginStorageValue === null) this.pluginStorageCaptureCache.clear()
+        const pluginStorageCapture = pluginStorageValue === null
             ? null
-            : pluginStorageJson(pluginStorageValue)
+            : this.pluginStorageCaptureCache.capture(pluginStorageValue)
         const presetsValue = this.dependencies.capturePresets
             ? this.dependencies.capturePresets()
             : legacyPresets ?? []
@@ -3741,10 +3744,13 @@ export class SaveCoordinator {
             return {
                 root: JSON.parse(rootCanonical) as RootDatabase,
                 rootCanonical,
-                pluginStorage: pluginStorageCanonical === null
-                    ? null
-                    : JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage'],
-                pluginStorageCanonical,
+                get pluginStorage() {
+                    return pluginStorageCapture?.value ?? null
+                },
+                get pluginStorageCanonical() {
+                    return pluginStorageCapture?.json ?? null
+                },
+                pluginStorageCapture,
                 presets: presetsCanonical === null
                     ? null
                     : JSON.parse(presetsCanonical) as botPreset[],
@@ -3769,10 +3775,13 @@ export class SaveCoordinator {
         return {
             root: JSON.parse(rootCanonical) as RootDatabase,
             rootCanonical,
-            pluginStorage: pluginStorageCanonical === null
-                ? null
-                : JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage'],
-            pluginStorageCanonical,
+            get pluginStorage() {
+                return pluginStorageCapture?.value ?? null
+            },
+            get pluginStorageCanonical() {
+                return pluginStorageCapture?.json ?? null
+            },
+            pluginStorageCapture,
             presets: presetsCanonical === null
                 ? null
                 : JSON.parse(presetsCanonical) as botPreset[],
@@ -4224,15 +4233,24 @@ export class SaveCoordinator {
     private captureMatchesBaseline(): boolean {
         const captured = this.capture()
         return captured.rootCanonical === this.rootBaseline
-            && (
-                captured.pluginStorageCanonical === null
-                || captured.pluginStorageCanonical === this.pluginStorageBaseline
-            )
+            && this.pluginStorageMatchesBaseline(captured)
             && (
                 captured.presetsCanonical === null
                 || captured.presetsCanonical === this.presetsBaseline
             )
             && this.selectedCaptureMatchesBaseline(captured)
+    }
+
+    private pluginStorageMatchesBaseline(captured: CapturedState): boolean {
+        const snapshot = captured.pluginStorageCapture
+        if (snapshot === null) return true
+        if (snapshot !== undefined) {
+            return this.pluginStorageBaselineEntries?.matches(snapshot) ?? false
+        }
+        return (
+            captured.pluginStorageCanonical === null ||
+            captured.pluginStorageCanonical === this.pluginStorageBaseline
+        )
     }
 
     private captureMatchesCapturedState(expected: CapturedState): boolean {

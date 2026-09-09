@@ -25,7 +25,6 @@ import { characterURLImport, hubURL, realmHubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
 import { saveDbKei } from "./kei/backup";
-import { measurePendingDataSize } from './storage/pendingDataSize';
 import { decodeRisuSave } from "./storage/risuSave";
 import { AutoStorage } from "./storage/autoStorage";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -72,6 +71,7 @@ import {
     createPersistentSaveObserverInstallation,
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
+import { observePersistentSaveChanges } from './storage/persistentSaveObserver.svelte';
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
 import { inferBlobMime } from "./storage/blobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
@@ -424,41 +424,6 @@ export let saving = $state({
 
 const persistentSaveObserverInstallation = createPersistentSaveObserverInstallation()
 
-const SAVE_ESTIMATE_REFRESH_MS = 1000
-
-/** Reads every reactive leaf so the surrounding effect reruns on any change, without cloning. */
-function subscribeDeep(value: unknown): void {
-    if (value === null || typeof value !== 'object') return
-    if (Array.isArray(value)) {
-        for (let i = 0; i < value.length; i++) subscribeDeep(value[i])
-        return
-    }
-    for (const key in value as Record<string, unknown>) {
-        subscribeDeep((value as Record<string, unknown>)[key])
-    }
-}
-
-/**
- * Bound size hints at the immediate-flush threshold and reuse them between
- * refreshes, avoiding full JSON copies of large stores on every keystroke.
- */
-export function createThrottledSizeEstimator(read: () => unknown): () => number {
-    let lastEstimate = -1
-    let timer: ReturnType<typeof setTimeout> | undefined
-    return () => {
-        if (lastEstimate < 0) {
-            lastEstimate = measurePendingDataSize(read)
-        }
-        else if (timer === undefined) {
-            timer = setTimeout(() => {
-                timer = undefined
-                lastEstimate = measurePendingDataSize(read)
-            }, SAVE_ESTIMATE_REFRESH_MS)
-        }
-        return lastEstimate
-    }
-}
-
 export async function saveDb() {
     persistentSaveObserverInstallation.install(() => {
         const channel = window.BroadcastChannel ? new BroadcastChannel('risu-db') : null
@@ -475,27 +440,10 @@ export async function saveDb() {
             reportError: (error) => alertError(error instanceof Error ? error : String(error)),
             onSaveCommitted: saveDbKei,
         })
-        const disposeEffects = $effect.root(() => {
-            const estimateRootBytes = createThrottledSizeEstimator(() => {
-                const root: Record<string, unknown> = {}
-                for (const key in DBState.db) {
-                    if (key !== 'characters') root[key] = DBState.db[key]
-                }
-                return root
-            })
-            const estimateCharacterBytes = createThrottledSizeEstimator(
-                () => DBState.db.characters?.[selIdState.selId] ?? null,
-            )
-            $effect(() => {
-                for (const key in DBState.db) {
-                    if (key !== 'characters') subscribeDeep(DBState.db[key])
-                }
-                markPersistentDataDirty(estimateRootBytes())
-            })
-            $effect(() => {
-                subscribeDeep(DBState.db.characters?.[selIdState.selId] ?? null)
-                markPersistentDataDirty(estimateCharacterBytes())
-            })
+        const disposeEffects = observePersistentSaveChanges({
+            readDatabase: () => DBState.db,
+            readSelectedCharacter: () => DBState.db.characters?.[selIdState.selId] ?? null,
+            markDirty: markPersistentDataDirty,
         })
         return () => {
             disposeEffects()
