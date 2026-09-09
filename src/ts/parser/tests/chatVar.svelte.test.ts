@@ -2,8 +2,9 @@ import fc from 'fast-check'
 import { writable } from 'svelte/store'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { DBState } from '../../stores.svelte'
-import { getChatVar, getGlobalChatVar, setChatVar } from '../chatVar.svelte'
+import { getChatVar, getChatVarFromConversation, getGlobalChatVar, setChatVar } from '../chatVar.svelte'
 import { resetChatVariables } from './cbs/lib'
+import type { Chat, Database } from '../../storage/database.svelte'
 
 //#region module mocks
 
@@ -131,4 +132,23 @@ test('returns "null" for undefined variables', () => {
       expect(getGlobalChatVar(`toggle_${key}`)).toBe('null')
     })
   )
+})
+
+test('reads defaults without mutating a fresh reactive conversation', () => {
+  const chat = $state({ id: 'synthetic-chat' } as Chat)
+  const database = {
+    characters: [{ chaId: 'synthetic-character', defaultVariables: 'mode=1' }],
+    templateDefaultVariables: 'template=2',
+  } as Database
+  const values = $derived.by(() =>
+    ['mode', 'template', 'missing'].map((key) =>
+      getChatVarFromConversation(database, 'synthetic-character', chat, key)
+    )
+  )
+  const readValues = () => values
+
+  expect(readValues()).toEqual(['1', '2', 'null'])
+  expect(Object.hasOwn(chat, 'scriptstate')).toBe(false)
+  chat.scriptstate = { $mode: '0' }
+  expect(readValues()).toEqual(['0', '2', 'null'])
 })

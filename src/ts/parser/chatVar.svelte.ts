@@ -12,8 +12,8 @@ export function getChatVarFromConversation(
 ): string {
     const char = database.characters.find((candidate) => candidate.chaId === characterId)
     if (!char) return 'null'
-    chat.scriptstate ??= {}
-    const state = chat.scriptstate['$' + key]
+    // Display reads must not dirty a fresh or metadata-only conversation.
+    const state = chat.scriptstate?.['$' + key]
     if (state === undefined || state === null) {
         const defaultVariables = parseKeyValue(char.defaultVariables).concat(
             parseKeyValue(database.templateDefaultVariables),
