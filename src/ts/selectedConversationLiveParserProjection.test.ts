@@ -76,9 +76,22 @@ function harness(options: {
     messages?: Message[]
     unsafeDependencies?: SelectedConversationLiveParserProjectionDependencies['unsafeDependencies']
     onAcquire?: () => void
+    metadataOnly?: boolean
+    advanceRevisionDuringAcquire?: boolean
+    navigateDuringAcquire?: boolean
 } = {}) {
     const messages = options.messages ?? Array.from({ length: 8 }, (_, index) => message(index))
     let currentChat = conversation([])
+    let forbiddenHistoryReads = 0
+    if (options.metadataOnly) {
+        Object.defineProperty(currentChat, 'message', {
+            get() {
+                forbiddenHistoryReads += 1
+                throw new Error('Metadata-only history must not be read')
+            },
+            enumerable: false,
+        })
+    }
     let currentCharacter = owner(currentChat)
     let windowed = true
     let releases = 0
@@ -110,7 +123,7 @@ function harness(options: {
                     }
                 },
             } as any,
-            captureSelectedConversationTarget: () => target,
+            captureSelectedConversationTarget: () => ({ ...target }),
             captureSelectedConversationAuthority: () => windowed
                 ? {
                     kind: 'windowed',
@@ -125,15 +138,17 @@ function harness(options: {
                 : null,
             acquireCompleteConversation: vi.fn(async () => {
                 options.onAcquire?.()
+                if (options.advanceRevisionDuringAcquire) target.storeRevision += 1
+                if (options.navigateDuringAcquire) target.navigationGeneration += 1
                 windowed = false
                 currentChat = conversation(messages)
                 currentCharacter = owner(currentChat)
                 return {
                     reason: 'live-render',
-                    target,
+                    target: { ...target },
                     session: {
                         totalMessages: messages.length,
-                        storeRevision: 4,
+                        storeRevision: target.storeRevision,
                         isActive: true,
                         matchesConversation: (characterId: string, chat: Chat) => (
                             characterId === CHARACTER_ID && chat === currentChat
@@ -164,10 +179,133 @@ function harness(options: {
         releases: () => releases,
         boundedContextMessageCounts,
         completeContextMessageCounts,
+        forbiddenHistoryReads: () => forbiddenHistoryReads,
     }
 }
 
 describe('selected conversation live parser projection', () => {
+    test('keeps a plain greeting windowed without reading metadata-only history', async () => {
+        const testHarness = harness({ metadataOnly: true })
+        const lease = await testHarness.resolver.acquireConversationStart!({
+            greeting: 'Synthetic greeting',
+            totalMessages: 8,
+        })
+        expect(lease).toBeNull()
+        expect(testHarness.acquire).not.toHaveBeenCalled()
+        expect(testHarness.forbiddenHistoryReads()).toBe(0)
+    })
+
+    test('holds complete authority for a Lua greeting even when there are no message rows', async () => {
+        const testHarness = harness({
+            messages: [],
+            metadataOnly: true,
+            unsafeDependencies: () => ['lua'],
+        })
+        const lease = await testHarness.resolver.acquireConversationStart!({
+            greeting: 'Synthetic greeting',
+            totalMessages: 0,
+        })
+        expect(testHarness.acquire).toHaveBeenCalledTimes(1)
+        expect(testHarness.forbiddenHistoryReads()).toBe(0)
+        expect(testHarness.releases()).toBe(0)
+        expect(lease).not.toBeNull()
+        lease!.release()
+        lease!.release()
+        expect(testHarness.releases()).toBe(1)
+    })
+
+    test('accepts the same empty conversation retargeted after promotion flushes pending data', async () => {
+        const testHarness = harness({
+            messages: [],
+            unsafeDependencies: () => ['lua'],
+            advanceRevisionDuringAcquire: true,
+        })
+        const lease = await testHarness.resolver.acquireConversationStart!({
+            greeting: 'Synthetic greeting',
+            totalMessages: 0,
+        })
+        expect(lease).not.toBeNull()
+        expect(testHarness.releases()).toBe(0)
+        lease!.release()
+        expect(testHarness.releases()).toBe(1)
+    })
+
+    test('rejects a greeting retargeted by navigation even if character and chat IDs match', async () => {
+        const testHarness = harness({
+            messages: [],
+            unsafeDependencies: () => ['lua'],
+            advanceRevisionDuringAcquire: true,
+            navigateDuringAcquire: true,
+        })
+        await expect(
+            testHarness.resolver.acquireConversationStart!({
+                greeting: 'Synthetic greeting',
+                totalMessages: 0,
+            }),
+        ).rejects.toThrow('Chat parser history projection became stale')
+        expect(testHarness.releases()).toBe(1)
+    })
+
+    test.each(['{{history}}', '{{previouschatlog::0}}'])(
+        'provides complete authority for greeting history expressions: %s',
+        async (greeting) => {
+            const testHarness = harness({ metadataOnly: true })
+            const lease = await testHarness.resolver.acquireConversationStart!({
+                greeting,
+                totalMessages: 8,
+            })
+            expect(testHarness.acquire).toHaveBeenCalledTimes(1)
+            expect(testHarness.forbiddenHistoryReads()).toBe(0)
+            lease!.release()
+            expect(testHarness.releases()).toBe(1)
+        },
+    )
+
+    test('releases a greeting lease when the component is cancelled during promotion', async () => {
+        const controller = new AbortController()
+        const testHarness = harness({
+            unsafeDependencies: () => ['lua'],
+            onAcquire: () => controller.abort(),
+        })
+        await expect(
+            testHarness.resolver.acquireConversationStart!({
+                greeting: 'Synthetic greeting',
+                totalMessages: 8,
+                signal: controller.signal,
+            }),
+        ).rejects.toMatchObject({ name: 'AbortError' })
+        expect(testHarness.releases()).toBe(1)
+    })
+
+    test('releases a greeting lease when navigation supersedes its request', async () => {
+        let current = true
+        const testHarness = harness({
+            unsafeDependencies: () => ['lua'],
+            onAcquire: () => {
+                current = false
+            },
+        })
+        await expect(
+            testHarness.resolver.acquireConversationStart!({
+                greeting: 'Synthetic greeting',
+                totalMessages: 8,
+                isCurrent: () => current,
+            }),
+        ).rejects.toThrow('Chat parser history projection became stale')
+        expect(testHarness.releases()).toBe(1)
+    })
+
+    test('rejects a greeting whose message count changed while acquiring history', async () => {
+        const testHarness = harness({ unsafeDependencies: () => ['lua'] })
+        await expect(
+            testHarness.resolver.acquireConversationStart!({
+                greeting: 'Synthetic greeting',
+                totalMessages: 9,
+            }),
+        ).rejects.toThrow('Chat parser history projection became stale')
+        expect(testHarness.releases()).toBe(1)
+    })
+
     test('binds the production complete context to promoted shared authority without mutating the bounded seed', () => {
         const boundedCharacter = owner(conversation([]))
         const boundedSeed = context(boundedCharacter)

@@ -6,7 +6,10 @@ import {
     type ChatParserCompleteProjectionLease,
     type ChatParserCompleteProjectionReason,
 } from './chatParserHistoryProjection'
-import type { ChatParserUnsafeHistoryDependency } from './chatParserHistory'
+import {
+    classifyChatParserHistory,
+    type ChatParserUnsafeHistoryDependency,
+} from './chatParserHistory'
 import type { ConversationViewportRow } from './conversationViewportSource'
 import type { CurrentChatMessageTarget } from './chatMessageUi'
 import type { ProcessScriptCaptureContext } from './process/scripts'
@@ -45,6 +48,13 @@ export interface LiveChatParserProjectionRequest {
     readonly isCurrent?: () => boolean
 }
 
+export interface LiveChatParserConversationStartRequest {
+    readonly greeting: string
+    readonly totalMessages: number
+    readonly signal?: AbortSignal
+    readonly isCurrent?: () => boolean
+}
+
 export type BoundedLiveChatParserProjection = BoundedChatParserHistoryProjection
 
 export interface CompleteLiveChatParserProjection {
@@ -66,6 +76,9 @@ export type LiveChatParserProjection =
 
 export interface LiveChatParserProjectionResolver {
     resolve(input: LiveChatParserProjectionRequest): Promise<LiveChatParserProjection>
+    acquireConversationStart?(
+        input: LiveChatParserConversationStartRequest,
+    ): Promise<{ release(): void } | null>
 }
 
 type LiveParserRuntime = Pick<
@@ -112,6 +125,50 @@ export function createSelectedConversationLiveParserProjectionResolver(
     dependencies: SelectedConversationLiveParserProjectionDependencies,
 ): LiveChatParserProjectionResolver {
     return {
+        async acquireConversationStart(input) {
+            assertConversationStartCurrent(input)
+            const target = dependencies.runtime.captureSelectedConversationTarget()
+            if (!target) throw new ChatParserHistoryProjectionStaleError()
+            const current = captureExactCurrent(dependencies, target)
+            const classification = classifyChatParserHistory({
+                source: [input.greeting, dependencies.parserSource(current)],
+                indirections: dependencies.parserIndirections?.(current),
+                unsafeDependencies: dependencies.unsafeDependencies(current),
+            })
+            if (
+                !classification.requiresFullHistory &&
+                classification.absoluteMessageIndices.length === 0
+            )
+                return null
+
+            // A greeting is not a persisted message row, including in an empty
+            // conversation. Its live scripts still need the same owned history
+            // as ordinary rows, for the entire asynchronous component lifetime.
+            const lease = await dependencies.runtime.acquireCompleteConversation(
+                'live-chat-greeting',
+                target,
+            )
+            try {
+                assertConversationStartCurrent(input)
+                // Promotion can flush pending data and retarget the same
+                // conversation to a newer store revision. The acquired lease
+                // owns that revision; navigation must still match the request.
+                if (
+                    target.characterId !== lease.target.characterId ||
+                    target.conversationId !== lease.target.conversationId ||
+                    target.navigationGeneration !== lease.target.navigationGeneration
+                )
+                    throw new ChatParserHistoryProjectionStaleError()
+                captureExactCurrent(dependencies, lease.target, lease)
+                if (lease.session.totalMessages !== input.totalMessages) {
+                    throw new ChatParserHistoryProjectionStaleError()
+                }
+                return { release: idempotentRelease(lease) }
+            } catch (error) {
+                lease.release()
+                throw error
+            }
+        },
         async resolve(input): Promise<LiveChatParserProjection> {
             assertRequestCurrent(input)
             const target = dependencies.runtime.captureSelectedConversationTarget()
@@ -293,6 +350,16 @@ function assertRequestCurrent(input: LiveChatParserProjectionRequest): void {
         || input.row.absoluteIndex < 0
         || input.row.absoluteIndex >= input.totalMessages
     ) throw new RangeError('Live chat parser projection row is out of range')
+}
+
+function assertConversationStartCurrent(input: LiveChatParserConversationStartRequest): void {
+    if (input.signal?.aborted) {
+        throw new DOMException('Live greeting parser was cancelled', 'AbortError')
+    }
+    if (input.isCurrent?.() === false) throw new ChatParserHistoryProjectionStaleError()
+    if (!Number.isSafeInteger(input.totalMessages) || input.totalMessages < 0) {
+        throw new RangeError('Live greeting parser message count must be nonnegative')
+    }
 }
 
 function matchesSelection(

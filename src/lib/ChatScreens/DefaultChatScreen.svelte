@@ -1,6 +1,7 @@
 <script lang="ts">
 
     import Suggestion from './Suggestion.svelte';
+    import { createLiveChatParserIndirections, createLiveChatParserSource } from 'src/ts/liveDisplayParserLease';
     import { CameraIcon, DatabaseIcon, DicesIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, SparkleIcon } from "@lucide/svelte";
     import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, easyPanelStore, chatPanelStore } from "../../ts/stores.svelte";
     import { onDestroy } from 'svelte';
@@ -1017,34 +1018,12 @@
     function liveParserIndirections(
         current: CurrentChatMessageTarget,
     ): Readonly<Record<string, unknown>> {
-        const character = current.character.type === 'group' ? null : current.character
-        let authorNote = current.conversation.note ?? ''
-        if (!authorNote) {
-            for (const item of DBState.db.promptTemplate ?? []) {
-                if (item.type !== 'authornote' || !item.defaultText) continue
-                authorNote = item.defaultText
-                break
-            }
-        }
-        return {
-            personality: character?.personality ?? '',
-            charpersona: character?.personality ?? '',
-            description: character?.desc ?? '',
-            chardesc: character?.desc ?? '',
-            scenario: character?.scenario ?? '',
-            exampledialogue: character?.exampleMessage ?? '',
-            examplemessage: character?.exampleMessage ?? '',
-            persona: getPersonaPrompt(),
-            userpersona: getPersonaPrompt(),
-            mainprompt: DBState.db.mainPrompt ?? '',
-            systemprompt: DBState.db.mainPrompt ?? '',
-            jb: DBState.db.jailbreak ?? '',
-            jailbreak: DBState.db.jailbreak ?? '',
-            globalnote: DBState.db.globalNote ?? '',
-            systemnote: DBState.db.globalNote ?? '',
-            ujb: DBState.db.globalNote ?? '',
-            authornote: authorNote,
-        }
+        return createLiveChatParserIndirections(
+            DBState.db,
+            current.character,
+            current.conversation,
+            getPersonaPrompt(),
+        )
     }
 
     const liveParserProjectionResolver = createSelectedConversationLiveParserProjectionResolver({
@@ -1053,12 +1032,8 @@
         captureCurrent: captureCurrentParserConversation,
         createBoundedContextSeed: createBoundedLiveParserContext,
         createCompleteContext: createCompleteLiveParserContext,
-        parserSource: (current) => ({
-            guiHTML: DBState.db.theme === 'customHTML' ? DBState.db.guiHTML : '',
-            presetRegex: DBState.db.presetRegex ?? [],
-            characterRegex: current.character.customscript ?? [],
-            moduleRegex: getModuleRegexScripts(),
-        }),
+        parserSource: (current) =>
+            createLiveChatParserSource(DBState.db, current.character, getModuleRegexScripts()),
         parserIndirections: liveParserIndirections,
         unsafeDependencies: (current) => {
             const moduleTriggers = getModuleTriggers()
@@ -1498,6 +1473,7 @@
                 viewportSource={conversationViewportSource}
                 viewportNavigationGeneration={conversationViewportNavigationGeneration}
                 parserProjectionResolver={liveParserProjectionResolver}
+                acquireConversationStartParserLease={liveParserProjectionResolver.acquireConversationStart}
                 selectedConversationOperations={conversationViewportSource
                     ? selectedConversationOperations
                     : undefined}

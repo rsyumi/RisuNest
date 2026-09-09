@@ -12,6 +12,7 @@ vi.mock('./CreatorQuote.svelte', async () => ({
 }))
 
 import ChatConversationStart from './ChatConversationStart.svelte'
+import { chatMountProbe, resetChatMountProbe } from './chatMountProbe'
 
 function metadataOnlyCharacter(): character {
     const conversation = { id: 'chat-id', fmIndex: -1 } as character['chats'][number]
@@ -42,6 +43,7 @@ describe('ChatConversationStart', () => {
     let mounted: ReturnType<typeof mount> | undefined
 
     beforeEach(() => {
+        resetChatMountProbe()
         target = document.createElement('div')
         document.body.append(target)
     })
@@ -67,4 +69,39 @@ describe('ChatConversationStart', () => {
 
         expect(target.querySelector('.italic')).not.toBeNull()
     })
+
+    test('aborts the greeting Chat signal before releasing its complete lease', async () => {
+        let acquiredSignal: AbortSignal | undefined
+        const abortedAtRelease: boolean[] = []
+        const release = vi.fn(() =>
+            abortedAtRelease.push(acquiredSignal?.aborted ?? false),
+        )
+        mounted = mount(ChatConversationStart, {
+            target,
+            props: {
+                currentCharacter: metadataOnlyCharacter(),
+                resolvedImage: '',
+                showAiWarning: false,
+                totalMessages: 0,
+                onReroll: () => {},
+                unReroll: () => {},
+                onRemoveCreatorQuote: () => {},
+                acquireConversationStartParserLease: async ({ signal }) => {
+                    acquiredSignal = signal
+                    return { release }
+                },
+            },
+        })
+        await vi.waitFor(() => expect(chatMountProbe.mounts).toHaveLength(1))
+        const chatSignal = chatMountProbe.mounts[0].parserAbortSignal
+        expect(chatSignal).toBeDefined()
+        expect(chatSignal).toBe(acquiredSignal)
+        expect(chatSignal?.aborted).toBe(false)
+        await unmount(mounted)
+        mounted = undefined
+        expect(chatSignal?.aborted).toBe(true)
+        expect(release).toHaveBeenCalledOnce()
+        expect(abortedAtRelease).toEqual([true])
+    })
+
 })

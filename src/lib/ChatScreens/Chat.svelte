@@ -101,6 +101,7 @@
         selectedConversationOperations?: SelectedConversationOperations;
         bookmarked?: boolean;
         parserProjection?: BoundedLiveChatParserProjection;
+        parserAbortSignal?: AbortSignal;
     }
 
     let {
@@ -137,6 +138,7 @@
         selectedConversationOperations,
         bookmarked,
         parserProjection,
+        parserAbortSignal,
     }: Props = $props();
 
     let editDraft = $state(message)
@@ -488,20 +490,25 @@
     }
 
     async function getTranslationCacheKey(): Promise<string> {
-        if(DBState.db.translateBeforeHTMLFormatting){
+        if (DBState.db.translateBeforeHTMLFormatting) {
             return msgDisplay
         }
-        if(!DBState.db.legacyTranslation){
+        if (!DBState.db.legacyTranslation) {
             return await ParseMarkdown(
                 msgDisplay,
                 parserProjection ? parserChara() : character,
                 'pretranslate',
                 idx,
                 getCbsCondition(),
-                parserProjection ? {
-                    scriptContext: parserProjection.context,
-                    projectedChatID: parserProjection.projectedChatID,
-                } : undefined,
+                {
+                    signal: parserAbortSignal,
+                    ...(parserProjection
+                        ? {
+                              scriptContext: parserProjection.context,
+                              projectedChatID: parserProjection.projectedChatID,
+                          }
+                        : {}),
+                },
             )
         }
         return await ParseMarkdown(
@@ -510,10 +517,15 @@
             'notrim',
             idx,
             getCbsCondition(),
-            parserProjection ? {
-                scriptContext: parserProjection.context,
-                projectedChatID: parserProjection.projectedChatID,
-            } : undefined,
+            {
+                signal: parserAbortSignal,
+                ...(parserProjection
+                    ? {
+                          scriptContext: parserProjection.context,
+                          projectedChatID: parserProjection.projectedChatID,
+                      }
+                    : {}),
+            },
         )
     }
 
@@ -864,6 +876,7 @@
                     {onCaptureError}
                     {captureContext}
                     {captureParserIndex}
+                    {parserAbortSignal}
                     {parserProjection} />
             {/key}
         </span>
@@ -956,6 +969,7 @@
                         idx,
                         getCbsCondition(),
                         {
+                            signal: parserAbortSignal,
                             deferredInlays,
                             scriptContext: parserProjection?.context,
                             projectedChatID: parserProjection?.projectedChatID,

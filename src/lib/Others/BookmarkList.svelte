@@ -2,6 +2,7 @@
     import { onMount, onDestroy } from "svelte";
     import { XIcon, TrashIcon, PencilIcon, BookOpenCheckIcon, BookLockIcon, ArrowRightIcon } from "@lucide/svelte";
     import Chat from "../ChatScreens/Chat.svelte";
+    import LiveDisplayParserBoundary from "../ChatScreens/LiveDisplayParserBoundary.svelte";
     import { getCharImage } from "src/ts/characters";
     import { findCharacterbyId, getUserName, getUserIcon } from "src/ts/util";
     import { createSimpleCharacter, bookmarkListOpen, DBState, selectedCharID, ScrollToMessageStore } from "src/ts/stores.svelte";
@@ -22,6 +23,8 @@
 
     const close = () => $bookmarkListOpen = false;
     let chara = $derived(DBState.db.characters[$selectedCharID]);
+    const selectedCharacterId = $derived(chara?.chaId ?? "");
+    const selectedConversationId = $derived(chara?.chats[chara.chatPage]?.id ?? "");
     const simpleChar = $derived(createSimpleCharacter(chara));
 
     function captureCurrentChat() {
@@ -194,35 +197,48 @@
                             </div>
                         </div>
 
-                        {#if expandAll || expandedBookmarks.has(msg.chatId)}
+                        {#if (expandAll || expandedBookmarks.has(msg.chatId)) && msg.target.character.chaId === selectedCharacterId && msg.target.conversation.id === selectedConversationId}
                             <div class="p-1 border-t border-darkborderc">
-                                {#if chara.type === 'group'}
-                                    <Chat
-                                        idx={msg.originalIndex}
-                                        message={msg.data}
-                                        name={msg.speaker?.name}
-                                        img={getCharImage(msg.speaker?.image, 'css')}
-                                        role={msg.role}
-                                        messageGenerationInfo={msg.generationInfo}
-                                        rerollIcon={false}
-                                        largePortrait={msg.speaker?.largePortrait}
-                                        character={msg.saying}
-                                        isLastMemory={false}
-                                    />
-                                {:else}
-                                    <Chat
-                                        idx={msg.originalIndex}
-                                        message={msg.data}
-                                        name={msg.role === 'user' ? getUserName() : chara.name}
-                                        img={msg.role === 'user' ? getCharImage(getUserIcon(), 'css') : getCharImage(chara.image, 'css')}
-                                        role={msg.role}
-                                        messageGenerationInfo={msg.generationInfo}
-                                        rerollIcon={false}
-                                        largePortrait={chara.largePortrait}
-                                        character={simpleChar}
-                                        isLastMemory={false}
-                                    />
-                                {/if}
+                                {#key selectedCharacterId + "/" + selectedConversationId + "/" + msg.chatId}
+                                    <LiveDisplayParserBoundary
+                                        source={msg.data}
+                                        character={chara.type === "group" ? (msg.speaker ?? msg.saying) : chara}
+                                    >
+                                        {#snippet children(signal)}
+                                            {#if chara.type === "group"}
+                                                <Chat
+                                                    parserAbortSignal={signal}
+                                                    idx={msg.originalIndex}
+                                                    message={msg.data}
+                                                    name={msg.speaker?.name}
+                                                    img={getCharImage(msg.speaker?.image, "css")}
+                                                    role={msg.role}
+                                                    messageGenerationInfo={msg.generationInfo}
+                                                    rerollIcon={false}
+                                                    largePortrait={msg.speaker?.largePortrait}
+                                                    character={msg.saying}
+                                                    isLastMemory={false}
+                                                />
+                                            {:else}
+                                                <Chat
+                                                    parserAbortSignal={signal}
+                                                    idx={msg.originalIndex}
+                                                    message={msg.data}
+                                                    name={msg.role === "user" ? getUserName() : chara.name}
+                                                    img={msg.role === "user"
+                                                        ? getCharImage(getUserIcon(), "css")
+                                                        : getCharImage(chara.image, "css")}
+                                                    role={msg.role}
+                                                    messageGenerationInfo={msg.generationInfo}
+                                                    rerollIcon={false}
+                                                    largePortrait={chara.largePortrait}
+                                                    character={simpleChar}
+                                                    isLastMemory={false}
+                                                />
+                                            {/if}
+                                        {/snippet}
+                                    </LiveDisplayParserBoundary>
+                                {/key}
                             </div>
                         {/if}
                     </div>
