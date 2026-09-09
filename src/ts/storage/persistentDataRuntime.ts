@@ -5,6 +5,7 @@ import {
     ActiveWorkingSet,
     type ActiveConversationViewportSourceListener,
     type CharacterActivationOptions,
+    type ConversationPublicationOptions,
     type CompleteConversationLease,
     type SelectedConversationTarget,
 } from './activeWorkingSet.svelte'
@@ -269,6 +270,7 @@ export interface PersistentDataRuntimeStateAdapter {
         characterId: string,
         conversation: Chat,
         nextCharacter?: CompleteCharacter,
+        options?: ConversationPublicationOptions,
     ): void
     captureActivationRollback?(characterIds: readonly string[]): () => void
     shouldHydrateFullCharacter?(): boolean

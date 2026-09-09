@@ -76,6 +76,11 @@ export interface CharacterActivationOptions {
     normalize?(character: CompleteCharacter): CompleteCharacter
 }
 
+export interface ConversationPublicationOptions {
+    /** Promotion and eviction preserve the selected conversation's content. */
+    representationOnly?: boolean
+}
+
 export interface ActiveWorkingSetDependencies {
     store: PersistentDataStore
     coordinator: WorkingSetCoordinator
@@ -87,6 +92,7 @@ export interface ActiveWorkingSetDependencies {
         characterId: string,
         conversation: Chat,
         nextCharacter?: CompleteCharacter,
+        options?: ConversationPublicationOptions,
     ): void
     captureActivationRollback?(characterIds: readonly string[]): () => void
     canActivateWorkingSet?(): boolean
@@ -463,6 +469,7 @@ export class ActiveWorkingSet {
                     state.characterId,
                     shell,
                     nextCharacter,
+                    { representationOnly: true },
                 )
                 const publishedCharacter =
                     this.dependencies.getResidentCharacter?.(state.characterId)
@@ -507,6 +514,7 @@ export class ActiveWorkingSet {
                     state.characterId,
                     state.conversation,
                     resident,
+                    { representationOnly: true },
                 )
             } catch {
                 this.selectedConversationState = windowedState
@@ -1830,6 +1838,7 @@ export class ActiveWorkingSet {
                     state.characterId,
                     conversation,
                     nextCharacter,
+                    { representationOnly: true },
                 )
                 const publishedCharacter =
                     this.dependencies.getResidentCharacter?.(state.characterId)
@@ -1881,6 +1890,7 @@ export class ActiveWorkingSet {
                     state.characterId,
                     state.conversation,
                     resident,
+                    { representationOnly: true },
                 )
             } catch {
                 this.clearActiveConversationSession()

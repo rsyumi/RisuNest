@@ -5,6 +5,7 @@ import type { ActiveConversationSession } from './activeConversationSession'
 import type {
     ActiveConversationViewportSourceListener,
     CompleteConversationLease,
+    ConversationPublicationOptions,
     SelectedConversationTarget,
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
@@ -235,7 +236,12 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             database.characters[primaryIndex] = primary
             selectedCharID.set(primaryIndex)
         },
-        publishConversation(characterId, conversation: Chat, nextCharacter?: CompleteCharacter) {
+        publishConversation(
+            characterId,
+            conversation: Chat,
+            nextCharacter?: CompleteCharacter,
+            options?: ConversationPublicationOptions,
+        ) {
             const database = getDatabase()
             const characterIndex = database.characters.findIndex(
                 (candidate) => candidate.chaId === characterId,
@@ -251,7 +257,10 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             database.characters[characterIndex] = character
             workingSetResidency.reconcileConversationResidency(character)
             selectedCharID.set(characterIndex)
-            ReloadGUIPointer.set(Math.random())
+            // The viewport source publishes representation changes itself. A
+            // global reload here resets parser caches and images during each
+            // compatibility promotion and eviction of the same conversation.
+            if (!options?.representationOnly) ReloadGUIPointer.set(Math.random())
         },
         captureActivationRollback(characterIds) {
             const database = getDatabase()

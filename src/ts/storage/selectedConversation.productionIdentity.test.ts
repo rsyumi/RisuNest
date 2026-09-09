@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { get } from 'svelte/store'
 
 vi.mock('../parser/parser.svelte', () => ({
     assetRegex: /$^/,
@@ -8,7 +9,7 @@ vi.mock('../parser/parser.svelte', () => ({
     risuChatParser: (value: string) => value,
 }))
 
-import { selectedCharID } from '../stores.svelte'
+import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import {
     ActiveWorkingSet,
     type WorkingSetCoordinator,
@@ -29,6 +30,39 @@ afterEach(() => {
 })
 
 describe('selected conversation production publication identity', () => {
+    it('still refreshes the global UI when selecting a different conversation', () => {
+        const first = {
+            id: 'synthetic-first',
+            message: [{ role: 'user', data: 'Synthetic first message' }],
+        } as Chat
+        const second = {
+            id: 'synthetic-second',
+            message: [{ role: 'char', data: 'Synthetic second message' }],
+        } as Chat
+        setDatabaseLite({
+            characters: [{
+                type: 'character',
+                chaId: 'synthetic-character',
+                chatPage: 0,
+                chats: [first, second],
+            }],
+            botPresets: [],
+            plugins: [],
+        } as unknown as Database)
+        selectedCharID.set(0)
+        const reload = vi.spyOn(ReloadGUIPointer, 'set')
+        try {
+            createProductionStateAdapter().publishConversation(
+                'synthetic-character',
+                second,
+            )
+            expect(getDatabase().characters[0].chatPage).toBe(1)
+            expect(reload).toHaveBeenCalledOnce()
+        } finally {
+            reload.mockRestore()
+        }
+    })
+
     it('promotes a directly activated metadata shell through the live Svelte database', async () => {
         const conversation: Chat = {
             id: 'synthetic-conversation',
@@ -111,6 +145,7 @@ describe('selected conversation production publication identity', () => {
         expect(await workingSet.activateCharacter(detail.chaId)).toBe(true)
         expect(workingSet.selectedConversationMode).toBe('windowed')
         expect(readConversation).not.toHaveBeenCalled()
+        const reloadBeforePromotion = get(ReloadGUIPointer)
 
         const lease = await workingSet.acquireCompleteConversation(
             'synthetic-production-edit',
@@ -119,6 +154,7 @@ describe('selected conversation production publication identity', () => {
         expect(getDatabase().characters[0].chats[0].message).toEqual(message)
         expect(lease.session.totalMessages).toBe(message.length)
         expect(readConversation).toHaveBeenCalledOnce()
+        expect(get(ReloadGUIPointer)).toBe(reloadBeforePromotion)
         const source = workingSet.activeConversationViewportSource!
         const key = source.snapshot().keyAt(0)!
         expect(source.captureMessageTarget(key)).toMatchObject({
@@ -130,6 +166,7 @@ describe('selected conversation production publication identity', () => {
         await vi.waitFor(() =>
             expect(workingSet.selectedConversationMode).toBe('windowed'),
         )
+        expect(get(ReloadGUIPointer)).toBe(reloadBeforePromotion)
         expect(source.captureMessageTarget(key)).toBeNull()
 
         const nextLease = await workingSet.acquireCompleteConversation(
