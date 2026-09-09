@@ -480,6 +480,7 @@ fn retain_source_postcommit_fixture(
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"committed": "shared"})),
             replace_presets: None,
             character: None,
@@ -692,6 +693,7 @@ fn public_conflict_fixture() -> (
     local_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Local")),
             replace_presets: None,
             character: None,
@@ -709,6 +711,7 @@ fn public_conflict_fixture() -> (
     remote_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Remote")),
             replace_presets: None,
             character: None,
@@ -1758,6 +1761,7 @@ fn disjoint_target_fixture_with_plugin_records(
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"side": "local"})),
             replace_presets: None,
             character: None,
@@ -2709,6 +2713,7 @@ fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"side": "shared"})),
             replace_presets: None,
             character: None,
@@ -2782,6 +2787,7 @@ fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(json!({"side": "local-after-receipt"})),
             replace_presets: None,
             character: None,
@@ -2832,6 +2838,7 @@ fn receipt_before_ack_crash_preserves_a_descendant_edit_on_reopen() {
     reopened
         .commit(&WorkingSetCommit {
             expected_revision: 2,
+            root_mutations: None,
             root: Some(json!({"side": "another-local-edit"})),
             replace_presets: None,
             character: None,
@@ -3418,6 +3425,7 @@ fn source_content_identical_no_op_recovers_original_receipt_after_descendant_edi
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"preserved": "source-no-op-descendant"})),
             replace_presets: None,
             character: None,
@@ -3672,6 +3680,7 @@ fn source_unavailable_preserves_local_committed_operation() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"preserved": "offline-descendant"})),
             replace_presets: None,
             character: None,
@@ -4001,6 +4010,7 @@ fn remote_generation_rejection_after_local_drift_retains_the_operation_and_job()
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"shared": "local-commit"})),
             replace_presets: None,
             character: None,
@@ -4052,6 +4062,7 @@ fn remote_generation_rejection_after_local_drift_retains_the_operation_and_job()
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(json!({"advanced": true})),
             replace_presets: None,
             character: None,
@@ -4169,6 +4180,7 @@ fn acknowledge_abandons_local_commit_and_allows_a_new_authenticated_target() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"committed": true})),
             replace_presets: None,
             character: None,
@@ -4915,6 +4927,7 @@ fn target_prepared_status_and_acknowledgement_preserve_current_local_data() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"preserved": "after target activation"})),
             replace_presets: None,
             character: None,
@@ -5230,6 +5243,7 @@ fn reject_conflict_is_durable_and_mutates_neither_side() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Local")),
             replace_presets: None,
             character: None,
@@ -5247,6 +5261,7 @@ fn reject_conflict_is_durable_and_mutates_neither_side() {
     remote_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Remote")),
             replace_presets: None,
             character: None,
@@ -5367,6 +5382,7 @@ fn reject_conflict_is_durable_and_mutates_neither_side() {
     wrong_source_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Wrong source at the same revision")),
             replace_presets: None,
             character: None,
@@ -5885,6 +5901,7 @@ fn local_winner_backs_up_remote_before_replacement_and_retains_receipt() {
     local_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Local")),
             replace_presets: None,
             character: None,
@@ -5900,6 +5917,7 @@ fn local_winner_backs_up_remote_before_replacement_and_retains_receipt() {
     remote_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(lossless_root("Remote")),
             replace_presets: None,
             character: None,
@@ -6874,6 +6892,7 @@ fn target_exact_seal_race_retains_prepared_and_preserves_the_descendant() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 2,
+            root_mutations: None,
             root: Some(json!({"preserved": "racing descendant"})),
             replace_presets: None,
             character: None,
@@ -7062,6 +7081,7 @@ fn disjoint_merge_commits_shared_a_and_retains_peer_state_at_c() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"side": "local"})),
             replace_presets: None,
             character: None,
@@ -7207,6 +7227,7 @@ fn remote_apply_response_loss_reissues_shared_a_without_redownload() {
     local_store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"side": "local"})),
             replace_presets: None,
             character: None,
@@ -7222,6 +7243,7 @@ fn remote_apply_response_loss_reissues_shared_a_without_redownload() {
     remote_store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -7632,6 +7654,7 @@ fn source_prepared_precommit_descendant_is_abandoned_without_losing_the_edit() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"preserved": "source-local-edit"})),
             replace_presets: None,
             character: None,
@@ -7783,6 +7806,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
     remote_store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -7896,6 +7920,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
     retry_remote_store
         .commit(&WorkingSetCommit {
             expected_revision: 2,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -8324,6 +8349,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
     source_store
         .commit(&WorkingSetCommit {
             expected_revision: expected.committed_revision,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -8442,6 +8468,7 @@ fn source_activation_crash_reopens_with_the_exact_prepared_receipt() {
     target_store
         .commit(&WorkingSetCommit {
             expected_revision: target_revision,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -8759,6 +8786,7 @@ fn retained_bidirectional_completion_completes_against_a_restarted_registered_so
     source_store
         .commit(&WorkingSetCommit {
             expected_revision: revision,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -8783,6 +8811,7 @@ fn retained_bidirectional_completion_completes_against_a_restarted_registered_so
     target_store
         .commit(&WorkingSetCommit {
             expected_revision: revision,
+            root_mutations: None,
             root: None,
             replace_presets: None,
             character: None,
@@ -9683,6 +9712,7 @@ fn acknowledge_after_restart_aborts_source_precommit_descendant_without_losing_e
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"preserved": "local-descendant"})),
             replace_presets: None,
             character: None,
@@ -9865,6 +9895,7 @@ fn status_promotes_source_postcommit_with_a_later_local_descendant() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(json!({"preserved": "postcommit-descendant"})),
             replace_presets: None,
             character: None,
@@ -10309,6 +10340,7 @@ fn acknowledge_abandons_only_an_unsealed_awaiting_conflict_job_and_preserves_dat
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({"preserved": true})),
             replace_presets: None,
             character: None,
@@ -10372,6 +10404,7 @@ fn deferred_v1_source_precommit_descendant_requires_explicit_revoke_to_abandon()
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 0,
+                root_mutations: None,
                 root: Some(json!({"preserved": "deferred-source-descendant"})),
                 replace_presets: None,
                 character: None,
@@ -10809,6 +10842,7 @@ fn bidirectional_network_transfer_does_not_hold_the_managed_store_mutex() {
     setup
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({ "side": "local" })),
             replace_presets: None,
             character: None,

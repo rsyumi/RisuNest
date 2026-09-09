@@ -1,3 +1,4 @@
+import type { PersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
 import { removeGroupMemberReferences } from './groupMembership'
@@ -241,6 +242,7 @@ export function publishPersistentCharacterMutationToWorkingSet(
 }
 
 export interface PersistentDataRuntimeStateAdapter {
+    canonicalCapture?: PersistenceCanonicalCapture
     captureRoot(): RootDatabase
     capturePluginStorage?(): Database['pluginCustomStorage'] | null
     publishPluginStorageWorkingSet?(storage: Database['pluginCustomStorage']): void
@@ -529,6 +531,7 @@ export function createPersistentDataRuntime(
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
     const coordinator = new SaveCoordinator({
+        canonicalCapture: dependencies.state.canonicalCapture,
         store: dependencies.store,
         captureRoot: dependencies.state.captureRoot,
         capturePluginStorage: dependencies.state.capturePluginStorage,

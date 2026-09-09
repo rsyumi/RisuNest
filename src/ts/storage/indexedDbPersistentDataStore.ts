@@ -1,4 +1,5 @@
 import isEqual from 'lodash/isEqual'
+import { applyRootMutations } from './rootMutation'
 import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     AssetAlias,
@@ -980,6 +981,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const active = await this.readActive(transaction)
             if (active.revision !== input.expectedRevision) {
                 throw new RevisionConflictError(input.expectedRevision, active.revision)
+            }
+            if (input.rootMutations !== undefined) {
+                if (input.root !== undefined)
+                    throw new TypeError('Root and rootMutations are mutually exclusive')
+                const record = await requestResult<StoredRecord<PersistentRoot> | undefined>(
+                    transaction.objectStore('root').get(active.generation),
+                )
+                if (!record) throw new TypeError('Missing persistent root')
+                const { rootMutations, ...rest } = input
+                input = { ...rest, root: applyRootMutations(record.value, rootMutations) }
             }
             if (input.replaceCharacter) {
                 this.validateCharacterInput(input.replaceCharacter, 'Selected character replacement')

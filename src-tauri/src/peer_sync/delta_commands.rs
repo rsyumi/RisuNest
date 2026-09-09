@@ -2642,6 +2642,7 @@ mod tests {
         source_store
             .commit(&WorkingSetCommit {
                 expected_revision: 0,
+                root_mutations: None,
                 root: Some(json!({"side":"base"})),
                 replace_presets: None,
                 character: None,
@@ -2663,6 +2664,7 @@ mod tests {
         target_store
             .commit(&WorkingSetCommit {
                 expected_revision: 0,
+                root_mutations: None,
                 root: Some(json!({"side":"base"})),
                 replace_presets: None,
                 character: None,
@@ -2693,6 +2695,7 @@ mod tests {
         source_store
             .commit(&WorkingSetCommit {
                 expected_revision: 1,
+                root_mutations: None,
                 root: Some(json!({"side":"remote"})),
                 replace_presets: None,
                 character: None,
@@ -3007,6 +3010,7 @@ mod tests {
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 0,
+                root_mutations: None,
                 root: Some(json!({"side":"local"})),
                 replace_presets: None,
                 character: None,

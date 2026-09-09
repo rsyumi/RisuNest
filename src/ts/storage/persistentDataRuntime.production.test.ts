@@ -30,6 +30,7 @@ import {
     projectCompleteScalableWorkingSet,
 } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
+import { SaveCoordinator } from './saveCoordinator'
 
 afterEach(() => {
     configurePersistentDataRuntime({ projectWorkingSet: undefined })
@@ -39,6 +40,56 @@ afterEach(() => {
 })
 
 describe('production persistent working-set publication', () => {
+    it('uses canonical captures for immediate production edits and emits a small delta', async () => {
+        setDatabaseLite({
+            username: 'Before',
+            customBackground: 'x'.repeat(6 * 1024 * 1024),
+            botPresets: [],
+            plugins: [],
+            characters: [
+                {
+                    type: 'character',
+                    chaId: 'synthetic-large',
+                    name: 'Synthetic',
+                    chatPage: 0,
+                    chats: [
+                        {
+                            id: 'synthetic-chat',
+                            message: [{ role: 'char', data: 'x'.repeat(2 * 1024 * 1024) }],
+                        },
+                    ],
+                },
+            ],
+            pluginCustomStorage: {},
+        } as unknown as Database)
+        selectedCharID.set(0)
+        const adapter = createProductionStateAdapter()
+        expect(adapter.canonicalCapture).toBeDefined()
+        const commit = vi.fn(async () => ({ revision: 2 }))
+        const coordinator = new SaveCoordinator({
+            ...adapter,
+            captureRoot: () => {
+                throw new Error('Must use the production canonical capture')
+            },
+            store: { commit } as unknown as PersistentDataStore,
+        })
+        coordinator.initialize(1)
+        getDatabase().username = 'Immediately changed'
+        coordinator.markPersistentDataDirty(1)
+        const parse = vi.spyOn(JSON, 'parse')
+        try {
+            await coordinator.flushPendingData('immediate-production-mutation')
+            expect(parse.mock.calls.some(([value]) => value.length > 1024 * 1024)).toBe(false)
+        } finally {
+            parse.mockRestore()
+        }
+        expect(commit).toHaveBeenCalledExactlyOnceWith({
+            expectedRevision: 1,
+            rootMutations: [{ type: 'set', key: 'username', value: 'Immediately changed' }],
+        })
+        expect(JSON.stringify(commit.mock.calls[0]).length).toBeLessThan(256)
+    })
+
     it('restores only affected activation entries, selection and residency', () => {
         const selected = {
             type: 'character',

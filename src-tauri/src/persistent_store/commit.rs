@@ -233,6 +233,30 @@ pub(super) fn activate_cold_payload_migration(
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 
+pub(super) fn apply_root_mutations(
+    mut root: Value,
+    mutations: &[super::RootMutation],
+) -> StoreResult<Value> {
+    let value = root.as_object_mut().ok_or_else(|| validation("Persistent root must be an object"))?;
+    let mut keys = HashSet::new();
+    for mutation in mutations {
+        let key = match mutation {
+            super::RootMutation::Set { key, .. } | super::RootMutation::Delete { key } => key,
+        };
+        if matches!(key.as_str(), "characters" | "botPresets" | "pluginCustomStorage") {
+            return Err(validation("Invalid persistent root mutation key"));
+        }
+        if !keys.insert(key) {
+            return Err(validation("Duplicate persistent root mutation key"));
+        }
+        match mutation {
+            super::RootMutation::Set { key, value: next } => { value.insert(key.clone(), next.clone()); }
+            super::RootMutation::Delete { key } => { value.shift_remove(key); }
+        }
+    }
+    Ok(root)
+}
+
 pub(super) fn commit(
     connection: &mut Connection,
     cas: Option<&PayloadCas>,

@@ -2135,6 +2135,7 @@ fn p5_deferred_response_loss_recognizes_only_the_exact_committed_result() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(root),
             replace_presets: None,
             character: None,
@@ -3461,6 +3462,7 @@ fn changed_pull_applies_every_record_family_with_durable_cas_payloads() {
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root_mutations: None,
             root: Some(next_root),
             replace_presets: None,
             character: None,

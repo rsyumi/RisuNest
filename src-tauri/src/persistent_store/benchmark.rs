@@ -611,6 +611,7 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 2,
+                root_mutations: None,
                 root: None,
                 replace_presets: None,
                 character: None,
@@ -889,6 +890,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                 &mut store,
                 WorkingSetCommit {
                     expected_revision: revision,
+                    root_mutations: None,
                     root: None,
                     replace_presets: None,
                     character: None,
@@ -913,6 +915,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                 &mut store,
                 WorkingSetCommit {
                     expected_revision: revision,
+                    root_mutations: None,
                     root: Some(root),
                     replace_presets: None,
                     character: None,
@@ -932,6 +935,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                 &mut store,
                 WorkingSetCommit {
                     expected_revision: revision,
+                    root_mutations: None,
                     root: None,
                     replace_presets: None,
                     character: None,

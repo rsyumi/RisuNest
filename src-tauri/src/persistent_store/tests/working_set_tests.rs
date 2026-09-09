@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn root_mutations_preserve_unchanged_fields_and_leased_revision() {
+    let (_directory, mut store, _) = open_fixture();
+    let before = store.read_root(None).unwrap();
+    let lease = store.acquire_revision(before.revision).unwrap();
+    let input: WorkingSetCommit = serde_json::from_value(json!({
+        "expectedRevision": before.revision,
+        "rootMutations": [
+            { "type": "set", "key": "username", "value": "Changed" },
+            { "type": "set", "key": "__proto__", "value": {"nested": [1]} },
+            { "type": "set", "key": "nullable", "value": null },
+            { "type": "delete", "key": "missing" }
+        ]
+    })).unwrap();
+    let revision = store.commit(&input).unwrap().revision;
+    let mut expected = before.value.clone();
+    expected["username"] = json!("Changed");
+    expected["__proto__"] = json!({"nested": [1]});
+    expected["nullable"] = Value::Null;
+    assert_eq!(store.read_root(None).unwrap().value, expected);
+    assert_eq!(store.read_root(Some(&lease.lease)).unwrap().value, before.value);
+    assert!(matches!(store.commit(&input), Err(StoreError::RevisionConflict { .. })));
+    assert_eq!(store.read_root(None).unwrap().revision, revision);
+    store.release_revision(&lease.lease).unwrap();
+}
+
+#[test]
+fn invalid_root_mutations_do_not_change_state() {
+    let (_directory, mut store, _) = open_fixture();
+    let before = store.read_root(None).unwrap();
+    for changes in [
+        json!({"root": {}, "rootMutations": []}),
+        json!({"rootMutations": [{"type":"delete", "key":"characters"}]}),
+        json!({"rootMutations": [{"type":"delete", "key":"botPresets"}]}),
+        json!({"rootMutations": [{"type":"delete", "key":"pluginCustomStorage"}]}),
+        json!({"rootMutations": [
+            {"type":"set", "key":"username", "value":"Temporary"},
+            {"type":"delete", "key":"username"}
+        ]})
+    ] {
+        let mut value = changes;
+        value["expectedRevision"] = json!(before.revision);
+        let input: WorkingSetCommit = serde_json::from_value(value).unwrap();
+        assert!(matches!(store.commit(&input), Err(StoreError::Validation { .. })));
+        let after = store.read_root(None).unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.value, before.value);
+    }
+}
+
+#[test]
 fn preset_catalog_reads_and_materializes_in_configured_order() {
     let (_directory, mut store, database) = open_fixture();
 

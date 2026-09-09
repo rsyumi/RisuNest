@@ -265,7 +265,7 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('root')
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 2,
-            root: { username: 'Root changed' },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Root changed' }],
         })
         expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
 
@@ -293,7 +293,7 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('combined')
         expect(commit.mock.calls[2][0]).toMatchObject({
             expectedRevision: 4,
-            root: { username: 'Combined root' },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Combined root' }],
             replaceCharacter: { name: 'Combined character' },
         })
     })
@@ -1298,7 +1298,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 4,
-            root: { username: 'Root changed' },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Root changed' }],
             replaceCharacter: { chaId: 'char-a', name: 'Selected changed' },
             addCharacter: { chaId: 'char-added', name: 'Added' },
         })
@@ -1877,7 +1877,9 @@ describe('SaveCoordinator', () => {
         await flushing
 
         expect(commit.mock.calls.map((call) => call[0].expectedRevision)).toEqual([1, 2, 3])
-        expect(commit.mock.calls.map((call) => call[0].root.username)).toEqual(['one', 'two', 'three'])
+        expect(commit.mock.calls.map((call) => call[0].rootMutations)).toEqual(
+            ['one', 'two', 'three'].map((value) => [{ type: 'set', key: 'username', value }]),
+        )
     })
 
     it.each([
@@ -2447,29 +2449,31 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 7,
-            root: { username: 'Edited root' },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Edited root' }],
             pluginStorage: [{ type: 'set', key: '__proto__', value: 0 }],
-            replacePresets: [
-                { name: 'Adopted preset', mainPrompt: 'After preset edit' },
-            ],
-            conversations: [{
-                type: 'replace-range',
-                characterId: 'char-a',
-                conversationId: 'chat-a',
-                start: 0,
-                deleteCount: 1,
-                messages: [{
-                    chatId: 'message-a',
-                    role: 'char',
-                    data: 'After message edit',
-                }],
-                conversation: {
-                    id: 'chat-a',
-                    name: 'Selected chat',
-                    note: '',
-                    localLore: [],
+            replacePresets: [{ name: 'Adopted preset', mainPrompt: 'After preset edit' }],
+            conversations: [
+                {
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'chat-a',
+                    start: 0,
+                    deleteCount: 1,
+                    messages: [
+                        {
+                            chatId: 'message-a',
+                            role: 'char',
+                            data: 'After message edit',
+                        },
+                    ],
+                    conversation: {
+                        id: 'chat-a',
+                        name: 'Selected chat',
+                        note: '',
+                        localLore: [],
+                    },
                 },
-            }],
+            ],
         })
     })
 
@@ -3268,7 +3272,7 @@ describe('SaveCoordinator', () => {
             expect(commit).toHaveBeenCalledTimes(2)
             expect(commit.mock.calls[1][0]).toMatchObject({
                 expectedRevision: 3,
-                root: { username: 'Edit two' },
+                rootMutations: [{ type: 'set', key: 'username', value: 'Edit two' }],
             })
         } finally {
             vi.useRealTimers()
@@ -3299,7 +3303,9 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('deselected')
 
         expect(commit).toHaveBeenCalledTimes(1)
-        expect(commit.mock.calls[0][0]).toMatchObject({ root: { username: 'Deselected' } })
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            rootMutations: [{ type: 'set', key: 'username', value: 'Deselected' }],
+        })
         expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
         expect(coordinator.pendingBytes).toBe(0)
     })
@@ -3426,7 +3432,10 @@ describe('SaveCoordinator', () => {
         expect(coordinator.pendingBytes).toBe(9)
         await coordinator.flushPendingData('after-failure')
         expect(commit).toHaveBeenCalledWith(
-            expect.objectContaining({ expectedRevision: 7, root: { username: 'Still dirty' } }),
+            expect.objectContaining({
+                expectedRevision: 7,
+                rootMutations: [{ type: 'set', key: 'username', value: 'Still dirty' }],
+            }),
         )
     })
 

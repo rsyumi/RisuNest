@@ -427,9 +427,14 @@ export type ConversationMutation =
           conversationId: string
       }
 
+export type RootMutation =
+    { type: 'set'; key: string; value: unknown } | { type: 'delete'; key: string }
+
 export interface WorkingSetCommit {
     expectedRevision: DataRevision
     root?: PersistentRoot
+    /** Mutually exclusive with a complete root replacement. */
+    rootMutations?: RootMutation[]
     replacePresets?: botPreset[]
     character?: CharacterDetail
     characterDetails?: CharacterDetail[]
