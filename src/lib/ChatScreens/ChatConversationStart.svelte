@@ -104,6 +104,12 @@
 </script>
 
 <div data-chat-conversation-start-content>
+    {#if !currentCharacter.removedQuotes && (currentCharacter.creatorNotes?.length ?? 0) >= 2}
+        <CreatorQuote
+            quote={currentCharacter.creatorNotes}
+            onRemove={onRemoveCreatorQuote}
+        />
+    {/if}
     {#if parserLoadFailed}
         <div
             class="flex items-center justify-center gap-3 p-3"
@@ -154,11 +160,5 @@
         >
             {language.aiGenerationWarning}
         </div>
-    {/if}
-    {#if !currentCharacter.removedQuotes && (currentCharacter.creatorNotes?.length ?? 0) >= 2}
-        <CreatorQuote
-            quote={currentCharacter.creatorNotes}
-            onRemove={onRemoveCreatorQuote}
-        />
     {/if}
 </div>
