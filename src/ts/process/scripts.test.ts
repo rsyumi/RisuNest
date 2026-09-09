@@ -3,6 +3,7 @@ import type { Chat, character, customscript } from '../storage/database.svelte'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import {
     ActiveConversationSession,
+    cloneConversationMetadata,
     ConversationSessionStaleError,
 } from '../storage/activeConversationSession'
 
@@ -82,7 +83,11 @@ vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('src/ts/util', () => ({ selectSingleFile: vi.fn() }))
 vi.mock('src/ts/parser/parser.svelte', () => ({
     assetRegex: /$^/g,
-    risuChatParser: (data: string) => {
+    risuChatParser: (data: string, options?: { setChatVar?: (key: string, value: string) => void }) => {
+        if (data === '{{setvar::scratch::regex}}') {
+            options?.setChatVar?.('scratch', 'regex')
+            return 'written'
+        }
         if(data === 'phase1-cbs-pattern'){
             mocks.state.cbsPatternCalls++
             if(mocks.state.cbsPatternCalls === 1){
@@ -1088,5 +1093,242 @@ describe('history-sensitive regex conversation operations', () => {
         )).toBe(true)
         expect(session.activePinReasons).toEqual([])
         errorLog.mockRestore()
+    })
+})
+
+
+describe('live display script ordering', () => {
+    function fixture() {
+        resetScriptCache()
+        for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
+        const chat = {
+            id: 'display-order',
+            message: [{ role: 'char', data: 'x', chatId: 'row' }],
+        } as Chat
+        const char = makeCharacter([
+            { ...makeScript('x', '{{getvar::scratch}}'), type: 'editdisplay' },
+        ])
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 1,
+        })
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.state.selectedCharIndex = 0
+        mocks.database.dynamicAssets = false
+        vi.mocked(getCurrentCharacter).mockReturnValue(char)
+        scriptingsMocks.runLuaEditTrigger.mockImplementation(
+            async (_char, _mode, value) => {
+                session.applyOperation({
+                    expectedVersion: session.version,
+                    expectedMetadata: cloneConversationMetadata(chat),
+                    metadata: {
+                        ...cloneConversationMetadata(chat),
+                        scriptstate: { $scratch: value },
+                    },
+                    origin: 'display',
+                })
+                return value
+            },
+        )
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        const plugin = vi.fn(async (value: string) => {
+            if (value === 'first') await gate
+            return value
+        })
+        mocks.pluginV2.editdisplay.add(plugin)
+        const run = (value: string, signal?: AbortSignal) =>
+            processScriptFull(
+                char,
+                value,
+                'editdisplay',
+                0,
+                {},
+                { cache: 'bypass', regexWorker: false, signal },
+            )
+        const cleanup = () => {
+            release()
+            scriptingsMocks.runLuaEditTrigger.mockImplementation(
+                async (_char, _mode, value) => value,
+            )
+            mocks.pluginV2.editdisplay.clear()
+        }
+        return { chat, char, session, run, plugin, release, cleanup }
+    }
+
+    it('finishes plugins and regex before the next row changes Lua variables', async () => {
+        const f = fixture()
+        try {
+            const first = f.run('first')
+            await vi.waitFor(() => expect(f.plugin).toHaveBeenCalledOnce())
+            const second = f.run('second')
+            const results = Promise.allSettled([first, second])
+            await new Promise((resolve) => setTimeout(resolve, 0))
+            f.release()
+            expect(await results).toEqual([
+                {
+                    status: 'fulfilled',
+                    value: { data: 'first', emoChanged: false },
+                },
+                {
+                    status: 'fulfilled',
+                    value: { data: 'second', emoChanged: false },
+                },
+            ])
+            expect(f.chat.scriptstate).toEqual({ $scratch: 'second' })
+            expect(f.session.activePinReasons).toEqual([])
+        } finally {
+            f.cleanup()
+        }
+    })
+
+    it('skips a cancelled waiting row before it runs Lua or plugins', async () => {
+        const f = fixture()
+        try {
+            const first = f.run('first')
+            await vi.waitFor(() => expect(f.plugin).toHaveBeenCalledOnce())
+            const controller = new AbortController()
+            const second = f.run('cancelled', controller.signal)
+            const results = Promise.allSettled([first, second])
+            controller.abort()
+            f.release()
+            const completed = await results
+            expect(completed[0].status).toBe('fulfilled')
+            expect(completed[1]).toMatchObject({
+                status: 'rejected',
+                reason: { name: 'AbortError' },
+            })
+            expect(f.chat.scriptstate).toEqual({ $scratch: 'first' })
+            expect(f.plugin).toHaveBeenCalledOnce()
+            expect(f.session.activePinReasons).toEqual([])
+        } finally {
+            f.cleanup()
+        }
+    })
+    it('rejects waiting work after an external edit and releases the queue for a fresh render', async () => {
+        const f = fixture()
+        try {
+            const first = f.run('first')
+            await vi.waitFor(() => expect(f.plugin).toHaveBeenCalledOnce())
+            const second = f.run('obsolete')
+            const results = Promise.allSettled([first, second])
+            f.session.edit(f.session.locate(0), {
+                ...f.chat.message[0],
+                data: 'external edit',
+            })
+            f.release()
+            const completed = await results
+            expect(completed).toEqual([
+                {
+                    status: 'rejected',
+                    reason: expect.any(ConversationSessionStaleError),
+                },
+                {
+                    status: 'rejected',
+                    reason: expect.any(ConversationSessionStaleError),
+                },
+            ])
+            expect(f.plugin).toHaveBeenCalledOnce()
+            expect(f.chat.scriptstate).toEqual({ $scratch: 'first' })
+            expect((await f.run('fresh')).data).toBe('fresh')
+            expect(f.chat.message[0].data).toBe('external edit')
+            expect(f.session.activePinReasons).toEqual([])
+        } finally {
+            f.cleanup()
+        }
+    })
+
+    it('does not run waiting work after navigation', async () => {
+        const f = fixture()
+        try {
+            const first = f.run('first')
+            await vi.waitFor(() => expect(f.plugin).toHaveBeenCalledOnce())
+            const second = f.run('wrong conversation')
+            const results = Promise.allSettled([first, second])
+            mocks.state.session = null
+            mocks.state.currentChat = null
+            f.release()
+            const completed = await results
+            expect(
+                completed.every((result) => result.status === 'rejected'),
+            ).toBe(true)
+            expect(f.plugin).toHaveBeenCalledOnce()
+            expect(f.chat.scriptstate).toEqual({ $scratch: 'first' })
+            expect(f.session.activePinReasons).toEqual([])
+        } finally {
+            f.cleanup()
+        }
+    })
+
+    it('keeps frozen parsing independent from a busy live display pipeline', async () => {
+        const f = fixture()
+        try {
+            const first = f.run('first')
+            await vi.waitFor(() => expect(f.plugin).toHaveBeenCalledOnce())
+            const isolated = await processScriptFull(
+                makeCharacter([]),
+                'isolated',
+                'editdisplay',
+                0,
+                {},
+                {
+                    cache: 'bypass',
+                    regexWorker: false,
+                    captureContext: {
+                        presetRegex: [],
+                        moduleRegexScripts: [],
+                        moduleAssets: [],
+                        dynamicAssets: false,
+                        dynamicAssetsEditDisplay: false,
+                        parserContext: {
+                            database: mocks.database,
+                            character: f.char,
+                            selectedCharID: 0,
+                            modules: [],
+                            moduleLorebooks: [],
+                            chatVariables: {},
+                            globalChatVariables: {},
+                        },
+                    } as never,
+                },
+            )
+            expect(isolated.data).toBe('isolated')
+            expect(f.plugin).toHaveBeenCalledOnce()
+            f.release()
+            expect((await first).data).toBe('first')
+        } finally {
+            f.cleanup()
+        }
+    })
+    it('persists regex display variables without invalidating the same display again', async () => {
+        const f = fixture()
+        try {
+            f.char.customscript = [
+                {
+                    ...makeScript('^input$', '{{setvar::scratch::regex}}'),
+                    type: 'editdisplay',
+                },
+            ]
+            const events = vi.fn()
+            f.session.subscribe(events)
+            expect((await f.run('input')).data).toBe('written')
+            expect(f.chat.scriptstate).toEqual({ $scratch: 'regex' })
+            expect(events).toHaveBeenCalledTimes(2)
+            expect(
+                events.mock.calls.every(
+                    ([event]) => event.displayVariableUpdate === true,
+                ),
+            ).toBe(true)
+        } finally {
+            f.cleanup()
+        }
     })
 })

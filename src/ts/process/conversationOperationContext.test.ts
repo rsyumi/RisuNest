@@ -30,6 +30,55 @@ function createSession(conversation: Chat) {
     })
 }
 
+test.each([
+    'scriptstate',
+    'GLGlobalVariables',
+    'message',
+    'name',
+    'mixed',
+    'external',
+] as const)(
+    'marks only display variable writes as non-invalidating (%s)',
+    (kind) => {
+        const conversation = chat([message('before', 'message')])
+        const session = createSession(conversation)
+        const onMutation = vi.fn()
+        session.subscribe(onMutation)
+        const operation = createConversationOperationContext(
+            session,
+            conversation,
+        )
+        if (kind === 'message') operation.chat.message[0].data = 'after'
+        else if (kind === 'name') operation.chat.name = 'renamed'
+        else if (kind === 'GLGlobalVariables')
+            operation.chat.GLGlobalVariables = { global: 'changed' }
+        else operation.chat.scriptstate = { $scratch: 'changed' }
+        if (kind === 'mixed') operation.chat.name = 'also renamed'
+        operation.commit(
+            session,
+            kind === 'external' ? {} : { origin: 'display' },
+        )
+        expect(onMutation).toHaveBeenCalledOnce()
+        const event = onMutation.mock.calls[0][0]
+        expect(event.displayVariableUpdate === true).toBe(
+            kind === 'scriptstate' || kind === 'GLGlobalVariables',
+        )
+        expect(event.conversation).toEqual(
+            expect.objectContaining(
+                kind === 'message'
+                    ? {}
+                    : kind === 'name'
+                      ? { name: 'renamed' }
+                      : kind === 'GLGlobalVariables'
+                        ? { GLGlobalVariables: { global: 'changed' } }
+                        : { scriptstate: { $scratch: 'changed' } },
+            ),
+        )
+        expect(session.version).toBe(1)
+        expect(session.activePinReasons).toEqual([])
+    },
+)
+
 test('does not reuse a commit receipt after an external mutation', () => {
     const conversation = chat([message('before', 'message')])
     const session = createSession(conversation)

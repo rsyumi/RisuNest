@@ -342,6 +342,7 @@ export class ConversationOperationContext {
 
     commit(
         currentSession: ActiveConversationSession | null,
+        options: { origin?: 'display' } = {},
     ): ConversationMutationBatch {
         try {
             requireCurrentConversationSession(this.session, currentSession)
@@ -361,6 +362,7 @@ export class ConversationOperationContext {
                     mutation.type === 'update-metadata',
             )
             this.session.applyOperation({
+                ...options,
                 expectedVersion: this.baseVersion,
                 expectedMetadata: this.originalMetadata,
                 metadata: metadata?.metadata ?? this.originalMetadata,

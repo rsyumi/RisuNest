@@ -6,6 +6,7 @@ import {
     type ConversationViewportSource,
 } from './conversationViewportSource'
 import { ActiveConversationSession } from './storage/activeConversationSession'
+import { createConversationOperationContext } from './process/conversationOperationContext'
 import type { Chat, Message, character } from './storage/database.svelte'
 import type {
     ConversationWindowQuery,
@@ -76,6 +77,66 @@ function harness(messages: Message[]) {
 }
 
 describe('SynchronousSessionConversationViewportSource', () => {
+    it('keeps rows readable across display variable commits and invalidates the next external edit', async () => {
+        const { conversation, session, source } = harness([
+            message('first', 'first'),
+            message('second', 'second'),
+        ])
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        const before = source.snapshot()
+        const listener = vi.fn()
+        const mutations = vi.fn()
+        source.subscribe(listener)
+        session.subscribe(mutations)
+        const pendingRange = source.ensureRange({
+            startIndex: 1,
+            limit: 1,
+            reason: 'viewport',
+        })
+        for (let index = 0; index < 3; index++) {
+            const operation = createConversationOperationContext(
+                session,
+                conversation,
+            )
+            operation.chat.scriptstate = { $scratch: String(index) }
+            operation.commit(session, { origin: 'display' })
+        }
+        expect(session.version).toBe(3)
+        expect(mutations).toHaveBeenCalledTimes(3)
+        expect(conversation.scriptstate).toEqual({ $scratch: '2' })
+        expect(listener).not.toHaveBeenCalled()
+        expect(source.snapshot().version).toBe(before.version)
+        expect(source.snapshot().rowAt(0)).toBe(before.rowAt(0))
+        await pendingRange
+        expect(source.snapshot().rowAt(1)?.message.data).toBe('second')
+        // New loads and click targets must use the advanced session authority.
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        const target = source.captureMessageTarget(before.keyAt(0)!)!
+        expect(target.kind).toBe('session')
+        session.edit(session.locate(0), message('first', 'edited'))
+        expect(source.snapshot().version).toBe(4)
+        expect(source.snapshot().keyAt(0)).toBe(before.keyAt(0))
+        expect(source.snapshot().keyAt(1)).toBe(before.keyAt(1))
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        expect(source.snapshot().rowAt(0)?.message.data).toBe('edited')
+    })
+
+    it('still invalidates rows for externally changed variables', async () => {
+        const { conversation, session, source } = harness([
+            message('first', 'first'),
+        ])
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        const listener = vi.fn()
+        source.subscribe(listener)
+        const operation = createConversationOperationContext(session, conversation)
+        operation.chat.scriptstate = { $button: 'clicked' }
+        operation.commit(session)
+        expect(listener).toHaveBeenCalledOnce()
+        expect(source.snapshot().version).toBe(1)
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+    })
+
     it('exposes absolute totals and only publishes rows from ensured ranges', async () => {
         const messages = Array.from({ length: 10_000 }, (_, index) =>
             message(`message-${index}`, `data-${index}`),

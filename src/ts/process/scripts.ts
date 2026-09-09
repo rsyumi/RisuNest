@@ -1,4 +1,5 @@
 import { get } from "svelte/store";
+import { Mutex } from '../mutex';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { type Chat, type character, type customscript, type Database, type groupChat, type loreBook, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
 import { downloadFile } from "../globalApi.svelte";
@@ -447,7 +448,94 @@ export function createPromptScriptOperationScope(
     )
 }
 
-export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
+const liveDisplayScriptMutexes = new WeakMap<ActiveConversationSession, Mutex>()
+
+export async function processScriptFull(
+    char: character | groupChat | simpleCharacterArgument,
+    data: string,
+    mode: ScriptMode,
+    chatID = -1,
+    cbsConditions: CbsConditions = {},
+    options: ProcessScriptOptions = {},
+) {
+    options.signal?.throwIfAborted()
+    if (
+        mode !== 'editdisplay' ||
+        options.captureContext ||
+        options.promptOperationScope
+    ) {
+        return processScriptFullImpl(
+            char,
+            data,
+            mode,
+            chatID,
+            cbsConditions,
+            options,
+        )
+    }
+    const owner = captureScriptConversationOwner(char)
+    const session = owner.session
+    if (!session || !owner.chat) {
+        return processScriptFullImpl(
+            char,
+            data,
+            mode,
+            chatID,
+            cbsConditions,
+            options,
+        )
+    }
+    let mutex = liveDisplayScriptMutexes.get(session)
+    if (!mutex) {
+        mutex = new Mutex()
+        liveDisplayScriptMutexes.set(session, mutex)
+    }
+    let invalidated = false
+    const unsubscribe = session.subscribe((event) => {
+        if (
+            !event ||
+            (!event.displayVariableUpdate &&
+                !session.canContinueGenerationFrom(event.previousVersion))
+        ) {
+            invalidated = true
+        }
+    })
+    try {
+        // Protect the whole live script pipeline. A Lua-only lock still lets the
+        // next row change variables while this row awaits plugins or regex work.
+        return await mutex.runExclusive(async () => {
+            options.signal?.throwIfAborted()
+            requireCurrentConversationSession(
+                session,
+                peekActiveConversationSession(),
+            )
+            if (invalidated) {
+                throw new ConversationSessionStaleError(
+                    owner.version!,
+                    session.version,
+                )
+            }
+            // Earlier display-owned variable commits are expected while waiting.
+            // Navigation and external edits still invalidate the captured owner.
+            requireScriptConversationOwner({
+                ...owner,
+                version: session.version,
+            })
+            return processScriptFullImpl(
+                char,
+                data,
+                mode,
+                chatID,
+                cbsConditions,
+                options,
+            )
+        })
+    } finally {
+        unsubscribe()
+    }
+}
+
+async function processScriptFullImpl(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     options.signal?.throwIfAborted()
     const captureContext = options.captureContext
     const promptOperationScope = captureContext ? undefined : options.promptOperationScope
@@ -599,7 +687,9 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
     const finish = <T>(result: T): T => {
         options.signal?.throwIfAborted()
         if (conversationOperation && ownsConversationOperation) {
-            conversationOperation.commit(peekActiveConversationSession())
+            conversationOperation.commit(peekActiveConversationSession(), {
+                origin: mode === 'editdisplay' ? 'display' : undefined,
+            })
             conversationOperationCommitted = true
         }
         else if (conversationAccess === 'read-only' && conversationOwner) {
@@ -892,7 +982,9 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                 ownsConversationOperation &&
                 conversationOperation?.hasPendingMutations()
             ) {
-                conversationOperation.commit(peekActiveConversationSession())
+                conversationOperation.commit(peekActiveConversationSession(), {
+                    origin: mode === 'editdisplay' ? 'display' : undefined,
+                })
                 conversationOperationCommitted = true
             } else if (conversationAccess === 'read-only' && conversationOwner) {
                 requireScriptConversationOwner(conversationOwner)

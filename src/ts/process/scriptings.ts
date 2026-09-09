@@ -1775,7 +1775,9 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         return content
     } finally {
         if (ownedOperation) {
-            ownedOperation.context.commit(peekActiveConversationSession())
+            ownedOperation.context.commit(peekActiveConversationSession(), {
+                origin: mode === 'editDisplay' ? 'display' : undefined,
+            })
         }
     }
 }

@@ -32,6 +32,7 @@ export interface ConversationViewportRow {
 
 export interface ConversationViewportSnapshot {
     readonly sourceToken: string
+    /** Render-input revision; display-owned variable writes do not advance it. */
     readonly version: number
     readonly storeRevision: DataRevision
     readonly totalMessages: number
@@ -112,6 +113,7 @@ implements ConversationViewportSource {
     private keyIndices = new Map<ConversationViewportKey, number>()
     private rows = new Map<number, ConversationViewportRow>()
     private currentVersion: number
+    private lastSessionVersion: number
     private nextInsertedKey = 0
     private disposed = false
 
@@ -119,6 +121,7 @@ implements ConversationViewportSource {
         this.session = options.session
         this.captureCurrent = options.captureCurrent
         this.currentVersion = this.session.version
+        this.lastSessionVersion = this.session.version
         this.keys = this.createInitialKeys()
         this.rebuildKeyIndices()
         this.unsubscribeSession = this.session.subscribe((event) => {
@@ -145,6 +148,7 @@ implements ConversationViewportSource {
         this.assertUsable()
         if (input.signal?.aborted) return
         const sourceVersion = this.currentVersion
+        const sessionVersion = this.session.version
         const window = this.session.readRange(input.startIndex, input.limit)
         void input.reason
 
@@ -153,7 +157,7 @@ implements ConversationViewportSource {
             input.signal?.aborted ||
             this.disposed ||
             sourceVersion !== this.currentVersion ||
-            window.sessionVersion !== this.currentVersion ||
+            window.sessionVersion !== sessionVersion ||
             !this.session.isActive
         ) return
 
@@ -253,7 +257,18 @@ implements ConversationViewportSource {
             this.dispose()
             return
         }
+        // Lua display listeners may store per-row scratch variables. Restarting
+        // all rows for those writes creates a render -> write -> abort loop.
+        // Keep render rows valid, while session locators and persistence advance.
+        if (
+            event.displayVariableUpdate &&
+            event.previousVersion === this.lastSessionVersion
+        ) {
+            this.lastSessionVersion = event.sessionVersion
+            return
+        }
         this.reconcileKeys(event)
+        this.lastSessionVersion = this.session.version
         this.currentVersion = this.session.version
         this.rows = new Map()
         this.rebuildKeyIndices()
@@ -267,7 +282,7 @@ implements ConversationViewportSource {
     }
 
     private reconcileKeys(event: ActiveConversationMutationEvent): void {
-        if (event.previousVersion !== this.currentVersion) {
+        if (event.previousVersion !== this.lastSessionVersion) {
             this.keys = this.createInitialKeys()
             return
         }

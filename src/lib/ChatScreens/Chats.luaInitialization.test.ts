@@ -7,9 +7,13 @@ import { pathToFileURL } from 'node:url'
 import { mount, tick, unmount } from 'svelte'
 import type { character, Message } from 'src/ts/storage/database.svelte'
 import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
+import { SynchronousSessionConversationViewportSource } from 'src/ts/conversationViewportSource'
+import type { LiveChatParserProjectionResolver } from 'src/ts/selectedConversationLiveParserProjection'
+import ChatsHarness from './ChatsHarness.test.svelte'
 const scriptingState = vi.hoisted(() => ({
     database: { characters: [] as character[], templateDefaultVariables: '' },
     parses: 0,
+    parseBudget: Infinity,
     metadataReads: 0,
     session: null as ActiveConversationSession | null,
 }))
@@ -33,6 +37,7 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
     ParseMarkdown: async (value: string, character: character) => {
         const { runLuaEditTrigger } = await import('src/ts/process/scriptings')
         scriptingState.parses++
+        if (scriptingState.parses > scriptingState.parseBudget) return 'SYNTHETIC_PARSE_BUDGET_EXCEEDED'
         return runLuaEditTrigger(character, 'editdisplay', value)
     },
     trimMarkdown: (value: string) => value,
@@ -201,6 +206,112 @@ afterAll(() => {
     vi.unstubAllGlobals()
     delete (document as unknown as { currentScript?: unknown }).currentScript
 })
+
+test.each([false, true])(
+    'refreshes existing Lua bodies in place when their complete history changes (per-row writes: %s)',
+    async (perRowWrites) => {
+        const character = makeCharacter(
+            Array.from({ length: 3 }, (_, index) => ({
+                role: 'char',
+                data: `synthetic ${index}`,
+                chatId: `history-${index}`,
+            })),
+        )
+        if (perRowWrites) {
+            character.triggerscript[0].effect = [
+                {
+                    type: 'triggerlua',
+                    code: luaCode.replace(
+                        "    local previous = getState(id, 'synthetic_initialized')",
+                        "    setState(id, 'synthetic_rendered_row', value)\n    local previous = getState(id, 'synthetic_initialized')",
+                    ),
+                },
+            ]
+        }
+        scriptingState.parses = 0
+        scriptingState.parseBudget = 40
+        const conversation = character.chats[0]
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id!,
+            conversation,
+            storeRevision: 1,
+        })
+        scriptingState.database = {
+            characters: [character],
+            templateDefaultVariables: '',
+        }
+        scriptingState.session = session
+        const source = new SynchronousSessionConversationViewportSource({
+            session,
+            captureCurrent: () => ({ character, conversation }),
+        })
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: async ({ row, totalMessages }) => ({
+                kind: 'complete',
+                characterId: character.chaId,
+                conversationId: conversation.id!,
+                revision: session.version,
+                totalMessages,
+                chatID: row.absoluteIndex,
+                projectedChatID: row.absoluteIndex,
+                historyOffset: 0,
+                reasons: ['projection-budget'],
+                release: () => {},
+            }),
+        }
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        const mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: character,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+        try {
+            const bodies = () =>
+                [...target.querySelectorAll('[data-lua-body]')].filter(
+                    (node) => Number(node.getAttribute('data-index')) >= 0,
+                )
+            await vi.waitFor(() => {
+                expect(bodies()).toHaveLength(3)
+                expect(
+                    bodies().every((node) =>
+                        node.textContent?.includes('SYNTHETIC_LUA_OK 3'),
+                    ),
+                ).toBe(true)
+            })
+            const initialParses = scriptingState.parses
+            await new Promise((resolve) => setTimeout(resolve, 50))
+            expect(scriptingState.parses).toBe(initialParses)
+            const previousBodies = bodies()
+            session.append({
+                role: 'char',
+                data: 'new tail',
+                chatId: 'history-3',
+            })
+            await vi.waitFor(() => {
+                expect(bodies()).toHaveLength(4)
+                expect(
+                    bodies().every((node) =>
+                        node.textContent?.includes('SYNTHETIC_LUA_OK 4'),
+                    ),
+                ).toBe(true)
+            })
+            expect(
+                previousBodies.every((node) => bodies().includes(node)),
+            ).toBe(true)
+        } finally {
+            await unmount(mounted)
+            source.dispose()
+            scriptingState.parseBudget = Infinity
+            target.remove()
+            scriptingState.session = null
+        }
+    },
+)
 
 test.each([0, 12])(
     'waits for a complete lease before a Lua greeting (%i history rows)',

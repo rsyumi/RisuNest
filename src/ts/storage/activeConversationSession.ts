@@ -97,6 +97,8 @@ export interface ActiveConversationBackwardScan {
 }
 
 export interface ActiveConversationMutationEvent {
+    /** Display-listener variable writes persist without recursively invalidating that display. */
+    displayVariableUpdate?: boolean
     characterId: string
     conversationId: string
     sessionToken: ConversationSessionToken
@@ -143,6 +145,7 @@ export interface ActiveConversationOperationRange {
 }
 
 export interface ActiveConversationOperationCommit {
+    origin?: 'display'
     expectedVersion: number
     expectedMetadata: ConversationMetadata
     metadata: ConversationMetadata
@@ -1685,13 +1688,32 @@ export class ActiveConversationSession {
                 this.notifyMutation(
                     previousVersion,
                     commands,
-                    mutationRanges.length > 0 ? mutationRanges : [{
-                        start: nextMessages.length,
-                        deleteCount: 0,
-                        messages: [],
-                        sessionVersion: this.sessionVersion,
-                    }],
+                    mutationRanges.length > 0
+                        ? mutationRanges
+                        : [
+                              {
+                                  start: nextMessages.length,
+                                  deleteCount: 0,
+                                  messages: [],
+                                  sessionVersion: this.sessionVersion,
+                              },
+                          ],
+                    commit.origin === 'display' &&
+                        ranges.length === 0 &&
+                        conversationMetadataEqual(
+                            {
+                                ...previousMetadata,
+                                scriptstate: undefined,
+                                GLGlobalVariables: undefined,
+                            },
+                            {
+                                ...commit.metadata,
+                                scriptstate: undefined,
+                                GLGlobalVariables: undefined,
+                            },
+                        ),
                 )
+
                 previousLocatorRegistry.clear()
             } catch (error) {
                 this.conversation.message = previousMessages
@@ -2130,6 +2152,7 @@ export class ActiveConversationSession {
         previousVersion: number,
         commands: readonly ActiveConversationCommandName[],
         mutations: readonly ActiveConversationMutationRange[] = [],
+        displayVariableUpdate = false,
     ): void {
         let detachedMutations = safeStructuredClone(mutations)
         if (!this.compatibilityFallback && !this.canApplyResidentMutations(detachedMutations)) {
@@ -2139,6 +2162,7 @@ export class ActiveConversationSession {
             detachedMutations = this.createCompatibilityFallbackMutations(previousVersion)
         }
         const event: ActiveConversationMutationEvent = {
+            ...(displayVariableUpdate ? { displayVariableUpdate: true } : {}),
             characterId: this.characterId,
             conversationId: this.conversationId,
             sessionToken: this.locatorRegistry.sessionToken,
