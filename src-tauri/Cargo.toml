@@ -84,6 +84,9 @@ reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
+# Trust internal HTTPS endpoints whose CA is installed in the Windows store.
+# Keep the default public roots and certificate/hostname verification enabled.
+tauri-plugin-http = { version = "2.5.9", features = ["rustls-tls-native-roots"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
