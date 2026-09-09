@@ -525,14 +525,17 @@ export function getModuleTriggers() {
     const modules = getModules()
     let triggers: triggerscript[] = []
     for (const module of modules) {
-        if(!module){
+        if (!module) {
             continue
         }
         if (module.trigger) {
-            triggers = triggers.concat(module.trigger.map((t) => {
-                t.lowLevelAccess = module.lowLevelAccess
-                return t
-            }))
+            // Render-time callers must not mutate the stored reactive triggers.
+            triggers = triggers.concat(
+                module.trigger.map((t) => ({
+                    ...t,
+                    lowLevelAccess: module.lowLevelAccess,
+                })),
+            )
         }
     }
     return triggers
