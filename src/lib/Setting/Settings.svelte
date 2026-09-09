@@ -165,16 +165,6 @@
                             <span>{language.risuNest.sync.menuTitle}</span>
                         </button>
                     {/if}
-                    {#each additionalSettingsMenu as menu}
-                        <button class="flex gap-2 items-center hover:text-textcolor text-textcolor2"
-                            onclick={() => {
-                                menu.callback()
-                        }}>
-                            <PluginDefinedIcon ico={menu} />
-                            <span>{menu.name}</span>
-                        </button>
-                    {/each}
-
                     {#if DBState.db.enableRisuaiProTools}
                         <button class="flex gap-2 items-center hover:text-textcolor"
                             class:text-textcolor={$SettingsMenuIndex === 16}
@@ -195,6 +185,22 @@
                             <span>{language.easyPanel}</span>
                         </button>
                     {/if}
+                    {#if additionalSettingsMenu.length > 0}
+                        <div class="border-t border-selected mt-2 pt-2">
+                            <span class="text-textcolor2 text-xs ml-1">{language.plugin}</span>
+                        </div>
+                    {/if}
+                    {#each additionalSettingsMenu as menu}
+                        <button
+                            class="flex gap-2 items-center hover:text-textcolor text-textcolor2"
+                            onclick={() => {
+                                menu.callback()
+                            }}
+                        >
+                            <PluginDefinedIcon ico={menu} className="w-5 h-5 shrink-0" />
+                            <span>{menu.name}</span>
+                        </button>
+                    {/each}
                 {/if}
                 {#if window.innerWidth < 700 && !$MobileGUI}
                     <button class="absolute top-2 right-2 hover:text-green-500 text-textcolor" onclick={() => {
