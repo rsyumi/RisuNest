@@ -34,6 +34,7 @@ import {
     type ConversationCommitObserver,
 } from './conversationOperationContext';
 import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte';
+import type { ActiveConversationSession } from '../storage/activeConversationSession';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -89,6 +90,7 @@ function clearScriptingEngineInvocationState(state: ScriptingEngineState) {
 }
 
 let ScriptingEngines = new Map<string, ScriptingEngineState>()
+const luaDisplayOperationMutexes = new WeakMap<ActiveConversationSession, Mutex>()
 let luaFactoryPromise: Promise<void> | null = null;
 let scriptingEngineRecency = 0
 
@@ -1674,6 +1676,67 @@ export async function runLuaEditTrigger<T extends string | OpenAIChat[]>(
             return content
     }
 
+    if (mode === 'editDisplay' && !conversationOperation) {
+        const hasLuaTrigger = (trigger: triggerscript) =>
+            trigger?.effect?.[0]?.type === 'triggerlua'
+        if (
+            !(char.type !== 'group' && char.triggerscript?.some(hasLuaTrigger)) &&
+            !getModuleTriggers().some(hasLuaTrigger)
+        ) {
+            return content
+        }
+        const session = peekActiveConversationSession()
+        const sourceChat = getCurrentChat()
+        if (
+            session?.isActive &&
+            sourceChat &&
+            session.materializeCompatibilityArray() === sourceChat.message
+        ) {
+            let mutex = luaDisplayOperationMutexes.get(session)
+            if (!mutex) {
+                mutex = new Mutex()
+                luaDisplayOperationMutexes.set(session, mutex)
+            }
+            // Display listeners can write variables. Capture their operation after the
+            // preceding display commits, so concurrent rows do not share a stale baseline.
+            return mutex.runExclusive(async () => {
+                if (
+                    peekActiveConversationSession() !== session ||
+                    !session.isActive ||
+                    getCurrentChat() !== sourceChat ||
+                    session.materializeCompatibilityArray() !== sourceChat.message
+                ) {
+                    return content
+                }
+                return runLuaEditTriggerBatch(
+                    char,
+                    mode,
+                    content,
+                    meta,
+                    undefined,
+                    onConversationCommit,
+                )
+            })
+        }
+    }
+    return runLuaEditTriggerBatch(
+        char,
+        mode,
+        content,
+        meta,
+        conversationOperation,
+        onConversationCommit,
+    )
+}
+
+async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
+    char: character | groupChat | simpleCharacterArgument,
+    mode: string,
+    content: T,
+    meta?: object,
+    conversationOperation?: ConversationOperationContext,
+    onConversationCommit?: ConversationCommitObserver,
+): Promise<T> {
     let ownedOperation: ReturnType<typeof createCurrentConversationOperation> = null
     let operationContext = conversationOperation
     try {

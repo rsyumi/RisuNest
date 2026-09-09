@@ -1433,6 +1433,137 @@ test('creates production Lua engines with the handler deadline', async () => {
   })
 })
 
+test('resumes a Lua listener after an LLM wait longer than its CPU deadline', async () => {
+  let now = Date.now()
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockImplementationOnce(async () => {
+    await Promise.resolve()
+    now += 5_000
+    return { type: 'success', result: 'synthetic delayed response' } as never
+  })
+
+  try {
+    const result = await runScripted(
+      `
+      listenEdit('editInput', function(id, value, meta)
+        local response = LLM(id, {{ role = 'user', content = 'fixture' }})
+        local total = 0
+        for i = 1, 10000 do total = total + i end
+        return response.result .. ':' .. total
+      end)
+    `,
+      {
+        char: { chaId: 'delayed-listener-cpu-deadline' } as never,
+        chat: { message: [] } as never,
+        lowLevelAccess: true,
+        mode: 'editInput',
+      },
+    )
+
+    expect(result.res).toBe('synthetic delayed response:50005000')
+    expect(errors).not.toHaveBeenCalled()
+  } finally {
+    clock.mockRestore()
+    errors.mockRestore()
+    vi.mocked(requestChatData).mockReset()
+  }
+})
+
+test('renders concurrent Lua display listeners that update chat variables', async () => {
+  const fixture = operationCharacterFixture('concurrent-display-variables')
+  fixture.chat.scriptstate = { $__renders: '0' }
+  fixture.char.triggerscript = [
+    {
+      type: 'start',
+      conditions: [],
+      effect: [
+        {
+          type: 'triggerlua',
+          code: `
+        listenEdit('editDisplay', function(id, value)
+          local renders = getState(id, 'renders') + 1
+          setState(id, 'renders', renders)
+          return value .. ':' .. renders
+        end)
+      `,
+        },
+      ],
+    },
+  ] as never
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  continuationRuntime.session = fixture.session
+  const { runLuaEditTrigger } = await import('./scriptings')
+
+  try {
+    const results = await Promise.allSettled([
+      runLuaEditTrigger(fixture.char, 'editdisplay', 'first'),
+      runLuaEditTrigger(fixture.char, 'editdisplay', 'second'),
+    ])
+    expect(results).toEqual([
+      { status: 'fulfilled', value: 'first:1' },
+      { status: 'fulfilled', value: 'second:2' },
+    ])
+    expect(fixture.chat.scriptstate.$__renders).toBe('2')
+  } finally {
+    continuationRuntime.session = null
+  }
+})
+
+test('does not run queued Lua display listeners after conversation navigation', async () => {
+  const fixture = operationCharacterFixture('queued-display-original')
+  const replacement = operationCharacterFixture('queued-display-replacement')
+  fixture.char.triggerscript = [
+    {
+      type: 'start',
+      conditions: [],
+      effect: [
+        {
+          type: 'triggerlua',
+          code: `
+        listenEdit('editDisplay', function(id, value)
+          setState(id, 'unexpected', true)
+          return value .. ':changed'
+        end)
+      `,
+        },
+      ],
+    },
+  ] as never
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  continuationRuntime.session = fixture.session
+  const { runLuaEditTrigger } = await import('./scriptings')
+
+  try {
+    const pending = runLuaEditTrigger(fixture.char, 'editdisplay', 'original')
+    installOperationCharacterFixture(replacement)
+    vi.mocked(getCurrentChat).mockReturnValue(replacement.chat)
+    continuationRuntime.session = replacement.session
+
+    await expect(pending).resolves.toBe('original')
+    expect(fixture.chat.scriptstate).toBeUndefined()
+    expect(replacement.chat.scriptstate).toBeUndefined()
+    expect(fixture.session.activePinReasons).toEqual([])
+    expect(replacement.session.activePinReasons).toEqual([])
+  } finally {
+    continuationRuntime.session = null
+  }
+})
+
+test('preserves display text for a simple character without optional triggers', async () => {
+  const { runLuaEditTrigger } = await import('./scriptings')
+  await expect(
+    runLuaEditTrigger(
+      { type: 'simple', customscript: [], chaId: 'simple-no-triggers' },
+      'editdisplay',
+      'unchanged',
+    ),
+  ).resolves.toBe('unchanged')
+})
+
 test('settles a resumed coroutine rejection without leaving an unhandled rejection', async () => {
   if (process.env.RISUNEST_A4_COROUTINE_CHILD !== 'true') {
     const child = spawn(process.execPath, [
