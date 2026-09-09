@@ -681,6 +681,7 @@ export interface simpleCharacterArgument{
 }
 
 export interface ParseMarkdownRenderContext {
+    signal?: AbortSignal
     deferredInlays?: DeferredInlayMarkerRegistry
     moduleAssets?: readonly (readonly string[])[]
     assetWidth?: number
@@ -726,6 +727,7 @@ export async function ParseMarkdown(
     cbsConditions:CbsConditions = {},
     renderContext:ParseMarkdownRenderContext = {},
 ) {
+    renderContext.signal?.throwIfAborted()
     let firstParsed = ''
     const additionalAssetMode = (mode === 'back') ? 'back' : 'normal'
     let char = (typeof(charArg) === 'string') ? (findCharacterbyId(charArg)) : (charArg)
@@ -734,6 +736,7 @@ export async function ParseMarkdown(
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
         }, renderContext)
+        renderContext.signal?.throwIfAborted()
         firstParsed = data
     }
 
@@ -742,22 +745,27 @@ export async function ParseMarkdown(
             captureContext: renderContext.scriptContext,
             cache: renderContext.scriptContext ? 'bypass' : 'normal',
             projectedChatID: renderContext.projectedChatID,
+            signal: renderContext.signal,
         })).data
     }
 
+    renderContext.signal?.throwIfAborted()
     if(firstParsed !== data && char && char.type !== 'group'){
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
         }, renderContext)
+        renderContext.signal?.throwIfAborted()
     }
 
     data = await parseInlayAssets(data ?? '', renderContext.deferredInlays, renderContext.hideAllImages)
+    renderContext.signal?.throwIfAborted()
 
     data = parseThoughtsAndTools(data)
 
     data = encodeStyle(data)
     if(mode === 'normal' || mode === 'notrim'){
         data = await renderHighlightableMarkdown(data, renderContext.markdownSettings)
+        renderContext.signal?.throwIfAborted()
 
         if(mode === 'notrim'){
             return data

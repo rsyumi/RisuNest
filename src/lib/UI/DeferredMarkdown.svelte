@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onDestroy, tick } from 'svelte'
     import { ParseMarkdown } from 'src/ts/parser/parser.svelte'
+    import { language } from 'src/lang'
     import {
         DeferredInlayMarkerRegistry,
         mountDeferredInlaySources,
@@ -16,6 +17,7 @@
         mode?: MarkdownMode
         chatID?: number
         conditions?: MarkdownConditions
+        signal?: AbortSignal
     }
 
     let {
@@ -24,6 +26,7 @@
         mode = 'normal',
         chatID = -1,
         conditions = {},
+        signal,
     }: Props = $props()
     let root = $state<HTMLElement>()
     let releaseObjectUrls = () => {}
@@ -34,7 +37,11 @@
         const registry = new DeferredInlayMarkerRegistry()
         return {
             registry,
-            promise: ParseMarkdown(data, character, mode, chatID, conditions, { deferredInlays: registry }),
+            signal,
+            promise: ParseMarkdown(data, character, mode, chatID, conditions, {
+                deferredInlays: registry,
+                signal,
+            }),
         }
     }
 
@@ -66,6 +73,7 @@
         // rejection escape leaks it and reports an unhandled rejection.
         void mountSources(job).catch((error) => {
             job.registry.clear()
+            if (job.signal?.aborted) return
             console.error('Deferred markdown render failed', error)
         })
     })
@@ -80,5 +88,9 @@
 <span style="display:contents" bind:this={root}>
     {#await parseJob.promise then html}
         {@html html}
+    {:catch}
+        {#if !parseJob.signal?.aborted}
+            <span role="alert">{language.chatDataLoadFailed}</span>
+        {/if}
     {/await}
 </span>

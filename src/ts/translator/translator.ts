@@ -278,7 +278,9 @@ export async function translateHTML(
     chatID:number,
     regenerate = false,
     captureContext?: TranslateHTMLContext,
+    signal?: AbortSignal,
 ): Promise<string> {
+    signal?.throwIfAborted()
     if (!html) {
         return html
     }
@@ -316,6 +318,7 @@ export async function translateHTML(
         const tr = db.translator || 'en'
         const from = db.translatorInputLanguage
         const r = await translateLLM(html, {to: tr, from: from, regenerate}, captureContext)
+        signal?.throwIfAborted()
         if(db.playMessageOnTranslateEnd){
             const audio = new Audio(sendSound);
             audio.play().catch(() => {});
@@ -332,7 +335,9 @@ export async function translateHTML(
             bergamotTranslate = bergamotTranslator.bergamotTranslate
         }
  
-        return applyEdittransRegex(await bergamotTranslate(html, from, to, true), charArg, alwaysExistChar, chatID, captureContext)
+        const translated = await bergamotTranslate(html, from, to, true)
+        signal?.throwIfAborted()
+        return applyEdittransRegex(translated, charArg, alwaysExistChar, chatID, captureContext)
     }
     const dom = new DOMParser().parseFromString(html, 'text/html');
     console.log(html)
@@ -412,6 +417,7 @@ export async function translateHTML(
             }
 
             const translatedChunks = await Promise.all(translatedChunksPromises);
+            signal?.throwIfAborted()
             let translated = translatedChunks.join("\n\n");
             if (!reprocessDisplayScript) {
                 node.textContent = translated;
@@ -428,6 +434,7 @@ export async function translateHTML(
                     captureContext: captureContext?.scriptContext,
                     projectedChatID: captureContext?.projectedChatID,
                     cache: captureContext ? 'bypass' : 'normal',
+                    signal,
                 },
             );
             // If the translation is the same, don't replace the node
@@ -518,6 +525,7 @@ export async function translateHTML(
     await translateTranslationChunks(true, 0)
 
     await Promise.all(promises)
+    signal?.throwIfAborted()
     // Serialize the DOM back to HTML
     const serializer = new XMLSerializer();
     let translatedHTML = serializer.serializeToString(dom);

@@ -52,6 +52,7 @@ const { ParseMarkdown, risuChatParser, trimMarkdown } = await import('../../pars
 const { processScriptFull } = await import('../../../process/scripts')
 const { createChatScreenshotJob, snapshotChatScreenshotCharacter } = await import('../../../chatScreenshotRange')
 const { clearLLMCache, setLLMCache, translate, translateHTML } = await import('../../../translator/translator')
+const { runLuaEditTrigger } = await import('../../../process/scriptings')
 
 function makeCharacter(name: string, messages = [
     { role: 'user' as const, data: `${name} previous` },
@@ -96,6 +97,41 @@ function makeDatabase(character: character, prefix: string): Database {
 beforeEach(() => {
     live.database = makeDatabase(makeCharacter('Live'), 'Live')
     live.modules = [{ id: 'live', name: 'Live', namespace: 'live-module' }]
+})
+
+test('does not rerun live display Lua after an obsolete translation finishes', async () => {
+    live.database = {
+        ...makeDatabase(makeCharacter('Translation owner'), 'Translation owner'),
+        translatorType: 'bergamot',
+        translator: 'ko',
+        aiModel: 'gpt',
+        htmlTranslation: false,
+        combineTranslation: true,
+    } as Database
+    let finishTranslation!: (value: string) => void
+    bergamotTranslate.mockImplementationOnce(
+        () =>
+            new Promise((resolve) => {
+                finishTranslation = resolve
+            }),
+    )
+    vi.mocked(runLuaEditTrigger).mockClear()
+    const controller = new AbortController()
+    const pending = translateHTML(
+        '<p>synthetic delayed translation fixture</p>',
+        false,
+        live.database.characters[0],
+        0,
+        false,
+        undefined,
+        controller.signal,
+    )
+    await vi.waitFor(() => expect(finishTranslation).toBeTypeOf('function'))
+    finishTranslation('synthetic translated fixture')
+    live.database = makeDatabase(makeCharacter('Replacement owner'), 'Replacement owner')
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(runLuaEditTrigger).not.toHaveBeenCalled()
 })
 
 test('uses frozen CBS values after the live database, persona, variables, and modules change', () => {

@@ -712,6 +712,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
                     parserContext: expect.objectContaining({ historyOffset: 4 }),
                 }),
             }),
+            expect.any(AbortSignal),
         )
     })
 

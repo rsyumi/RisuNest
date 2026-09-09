@@ -43,10 +43,11 @@ vi.mock(import('../process/modules'), () => ({
 }))
 
 vi.mock(import('../process/scripts'), () => ({
-    processScriptFull: (_char: unknown, data: string) => Promise.resolve({ data, emoChanged: false }),
+    processScriptFull: vi.fn((_char: unknown, data: string) => Promise.resolve({ data, emoChanged: false })),
 } as unknown as typeof import('../process/scripts')))
 
 import { ParseMarkdown, resetAssetsCache, type simpleCharacterArgument } from './parser.svelte'
+import { processScriptFull } from '../process/scripts'
 
 const character: simpleCharacterArgument = {
     type: 'simple',
@@ -60,6 +61,36 @@ const character: simpleCharacterArgument = {
 }
 
 describe('parser asset resolution parity', () => {
+    it('does not run live scripts when navigation aborts after assets resolve', async () => {
+        const controller = new AbortController()
+        let resolveAsset!: (value: string) => void
+        parserMocks.getFileSrc.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    resolveAsset = resolve
+                }),
+        )
+        vi.mocked(processScriptFull).mockClear()
+        const pending = ParseMarkdown(
+            '{{raw::portrait}}',
+            {
+                ...character,
+                chaId: 'navigation-abort-character',
+                additionalAssets: [['Portrait', 'navigation-abort.png', 'png']],
+            },
+            'back',
+            -1,
+            {},
+            { signal: controller.signal },
+        )
+        await vi.waitFor(() => expect(resolveAsset).toBeTypeOf('function'))
+        // Navigation publishes before the queued asset continuation gets its turn.
+        resolveAsset('resolved:navigation-abort.png')
+        controller.abort()
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        expect(processScriptFull).not.toHaveBeenCalled()
+    })
+
     it('keeps exact, fuzzy, module, emotion, and missing parser results', async () => {
         const result = await ParseMarkdown(
             '{{raw::PORTRAIT}}|{{path::happy_face}}|{{raw::THEME}}|{{emotion::SMILE}}|{{raw::missing}}',

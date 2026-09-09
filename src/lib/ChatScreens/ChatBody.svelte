@@ -36,6 +36,7 @@
         captureContext?: FrozenChatScreenshotRenderContext
         captureParserIndex?: number
         parserProjection?: BoundedLiveChatParserProjection
+        parserAbortSignal?: AbortSignal
     }
 
     let {
@@ -58,6 +59,7 @@
         captureContext,
         captureParserIndex = idx,
         parserProjection,
+        parserAbortSignal,
     }: Props =  $props()
 
     // svelte-ignore non_reactive_update
@@ -68,6 +70,8 @@
     let destroyed = false
 
     interface ChatBodyParseJob {
+        controller: AbortController
+        removeExternalAbortListener(): void
         promise: Promise<string>
         deferredInlays: DeferredInlayMarkerRegistry
         disposed: boolean
@@ -232,6 +236,7 @@
     }
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
+        job.controller.signal.throwIfAborted()
         const renderCharacter = parserProjection ? parserChara() : charArg
         const translationCharacter = (
             captureContext?.character ?? (parserProjection ? parserChara() : charArg)
@@ -244,6 +249,7 @@
         }
         const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
             ParseMarkdown(value, renderCharacter, mode, chatID, getCbsCondition(), {
+                signal: job.controller.signal,
                 deferredInlays: job.deferredInlays,
                 moduleAssets: captureContext?.moduleAssets ?? parserProjection?.context.moduleAssets,
                 assetWidth: captureContext?.settings.assetWidth,
@@ -322,6 +328,7 @@
                         chatID,
                         retranslate,
                         parserTranslationContext(),
+                        job.controller.signal,
                     )
                     translating = false
                     const marked = await parseForRender(data, mode)
@@ -339,6 +346,7 @@
                         chatID,
                         retranslate,
                         parserTranslationContext(),
+                        job.controller.signal,
                     ), captureMarkdownSettings())
                     translating = false
                     lastParsedQueue = translated
@@ -355,6 +363,7 @@
                         chatID,
                         retranslate,
                         parserTranslationContext(),
+                        job.controller.signal,
                     )
                     translating = false
                     lastParsedQueue = translated
@@ -375,6 +384,7 @@
                 return marked
             }   
         } catch (error) {
+            if (job.controller.signal.aborted) throw error
             //retry
             if(tries > 2){
                 if(captureContext) throw error
@@ -476,7 +486,14 @@
     }
 
     function startParsing(requestedRevision: number):ChatBodyParseJob {
+        const controller = new AbortController()
+        const externalSignal = parserAbortSignal
+        const abort = () => controller.abort(externalSignal?.reason)
+        if (externalSignal?.aborted) abort()
+        else externalSignal?.addEventListener('abort', abort, { once: true })
         const job:ChatBodyParseJob = {
+            controller,
+            removeExternalAbortListener: () => externalSignal?.removeEventListener('abort', abort),
             promise: Promise.resolve(''),
             deferredInlays: new DeferredInlayMarkerRegistry(),
             disposed: false,
@@ -495,6 +512,8 @@
     function disposeParseJob(job:ChatBodyParseJob|null) {
         if (!job || job.disposed) return
         job.disposed = true
+        job.controller.abort()
+        job.removeExternalAbortListener()
         job.releaseObjectUrls()
         job.releaseObjectUrls = () => {}
         job.deferredInlays.clear()
