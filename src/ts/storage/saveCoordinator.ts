@@ -1395,6 +1395,56 @@ export class SaveCoordinator {
         })
     }
 
+    mutateConversationPersonaBinding(
+        characterId: string,
+        conversationId: string,
+        personaId: string,
+        publish: () => void,
+    ): Promise<void> {
+        this.assertInitialized()
+        this.assertPersistentMutationAllowed()
+        return this.enqueue(async () => {
+            await this.flushIterations('persona-binding', true)
+            const metadata = await this.dependencies.store.readConversationMetadata(
+                characterId,
+                conversationId,
+            )
+            if (!metadata) throw new Error('Persona binding conversation is unavailable')
+            this.assertReadRevision(this.revision, metadata.revision)
+            const committed = await this.dependencies.store.commit({
+                expectedRevision: this.revision,
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId,
+                        conversationId,
+                        start: metadata.value.totalMessages,
+                        deleteCount: 0,
+                        messages: [],
+                        conversation: { ...metadata.value.conversation, bindedPersona: personaId },
+                    },
+                ],
+            })
+            this.currentRevision = committed.revision
+            // Advance only this field in the baseline; concurrent unrelated edits remain dirty.
+            if (this.windowedCharacterBaseline?.authority.characterId === characterId) {
+                const baseline = this.windowedCharacterBaseline
+                const conversation = baseline.shell.chats.find((chat) => chat.id === conversationId)
+                if (conversation) conversation.bindedPersona = personaId
+                baseline.shellCanonical = canonicalJson(baseline.shell)
+            } else if (this.characterBaselineId === characterId && this.characterBaseline) {
+                const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+                const conversation = baseline.chats.find((chat) => chat.id === conversationId)
+                if (conversation) conversation.bindedPersona = personaId
+                this.characterBaseline = canonicalJson(baseline)
+            }
+            publish()
+            this.dependencies.onStorageOnlyRevision?.(committed.revision)
+            this.dependencies.onLocalRevision?.(committed.revision)
+            await this.finishExplicitCommit(committed.revision)
+        })
+    }
+
     mutatePersistentCharacterDetail(
         characterId: string,
         reason: string,

@@ -7,10 +7,13 @@
 
 
     interface Props {
-        close?: any;
+        close?: () => void
+        bindingMode?: boolean
+        selectedId?: string
+        onSelect?: (index: number) => void | Promise<void>
     }
 
-    let { close = () => {} }: Props = $props();
+    let { close = () => {}, bindingMode = false, selectedId, onSelect }: Props = $props()
 
 </script>
 
@@ -19,16 +22,20 @@
         <div class="flex items-center text-textcolor mb-4">
             <h2 class="mt-0 mb-0 font-bold">{language.persona}</h2>
             <div class="grow flex justify-end">
-                <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer items-center" onclick={close}>
+                <button title={language.cancel} class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer items-center" onclick={close}>
                     <XIcon size={24}/>
                 </button>
             </div>
         </div>
+        {#if bindingMode}
+            <button class="p-2 text-left hover:bg-selected" class:bg-selected={!selectedId} onclick={() => {onSelect?.(-1); close()}}>{language.inheritPersona}</button>
+        {/if}
         {#each DBState.db.personas as persona, i}
             <button onclick={() => {
-                changeUserPersona(i)
+                if (bindingMode) onSelect?.(i)
+                else changeUserPersona(i)
                 close()
-            }} class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc p-2 cursor-pointer" class:bg-selected={i === DBState.db.selectedPersona}>
+            }} class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc p-2 cursor-pointer" class:bg-selected={bindingMode ? !!persona.id && persona.id === selectedId : i === DBState.db.selectedPersona}>
                 <span class="overflow-x-auto whitespace-nowrap w-full text-left">
                     <span class="font-medium">{persona.name}</span>
                     {#if persona.note}

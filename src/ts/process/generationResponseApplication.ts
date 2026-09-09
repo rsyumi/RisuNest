@@ -1,3 +1,4 @@
+import { precomputedResponseVariants } from '../responseVariants'
 import type { ActiveConversationSession } from '../storage/activeConversationSession'
 import type {
     Chat,
@@ -467,6 +468,12 @@ export async function applyGenerationResponse(
             }
 
             if (multilineRerolls.length > 1) {
+                const message = outputTarget?.snapshot()
+                if (
+                    message &&
+                    !outputTarget!.commitMessage(precomputedResponseVariants(message, multilineRerolls))
+                )
+                    return null
                 options.callbacks.addRerolls(options.generationId, multilineRerolls)
             }
 

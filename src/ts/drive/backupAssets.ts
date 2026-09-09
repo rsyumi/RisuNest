@@ -367,7 +367,10 @@ export function createPinnedBackupReferenceAccumulator(
                 ? currentCharacterName ?? record.summary.characterId
                 : record.summary.characterId
             addColdKey(record.summary.characterId, characterName, key ?? undefined)
-            if (mode === 'full') addInlayReferences(record.value, inlayKeys)
+            if (mode === 'full') {
+                addInlayReferences(record.value, inlayKeys)
+                for (const key of collectExactPluginStorageAssetReferences(record.value)) rootAssets.add(key)
+            }
         },
         visitPluginStorage(value) {
             if (mode !== 'full') return
@@ -379,6 +382,7 @@ export function createPinnedBackupReferenceAccumulator(
         visitColdPayload(value) {
             if (mode !== 'full') return
             addInlayReferences(value, inlayKeys)
+            for (const key of collectExactPluginStorageAssetReferences(value)) rootAssets.add(key)
             if (
                 value
                 && typeof value === 'object'

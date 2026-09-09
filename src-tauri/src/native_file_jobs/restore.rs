@@ -1,3 +1,5 @@
+#[path = "pocket_features.rs"]
+pub(super) mod pocket_features;
 use super::{
     ImportCounts, JobControl, JobDetail, JobPhase, JobProgress, JobResultSummary, JobStage,
     NativeJobError, OpenedJobSource, StageUnit,
@@ -556,6 +558,9 @@ fn stage_legacy_database<R: Read>(
         Some(Value::Array(characters)) => characters,
         _ => return Err(invalid("legacy MessagePack characters must be an array")),
     };
+    for (index, character) in characters.iter_mut().enumerate() {
+        pocket_features::character(character, &format!("character:{index}")).map_err(invalid)?;
+    }
     assign_legacy_chat_ids(&mut characters)?;
     let presets = match root.shift_remove("botPresets") {
         Some(Value::Array(presets)) => presets,
@@ -605,6 +610,7 @@ fn stage_legacy_database<R: Read>(
     job.set_phase(JobPhase::StagingDatabase)
         .map_err(|error| job_error(job, error))?;
     reader.report_stage_items(JobStage::FinalizingStaging, 0, None)?;
+    pocket_features::root(&root).map_err(invalid)?;
     sink.put_root(staging_id, &Value::Object(root))
         .map_err(store_error)?;
     sink.put_presets(staging_id, &presets)
@@ -902,7 +908,7 @@ fn parse_and_stage<R: Read>(
         if encoded_length > reader.total.saturating_sub(reader.completed) {
             return Err(truncated(format!("truncated block body for {name}")));
         }
-        let (value, decoded_bytes) =
+        let (mut value, decoded_bytes) =
             read_block_value(reader, &name, compression, encoded_length, limits, job)?;
 
         match block_type {
@@ -940,6 +946,8 @@ fn parse_and_stage<R: Read>(
                     character_batch_bytes = 0;
                 }
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
+                pocket_features::character(&mut value, &format!("character:{character_count}"))
+                    .map_err(invalid)?;
                 character_batch.push(value);
                 character_count += 1;
                 reader.counts.characters = character_count;
@@ -1052,6 +1060,7 @@ fn parse_and_stage<R: Read>(
         plugin_storage.ok_or_else(|| invalid("missing required block pluginStorage"))?,
     );
     let presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
+    pocket_features::root(&root).map_err(invalid)?;
     sink.put_root(staging_id, &Value::Object(root))
         .map_err(store_error)?;
     sink.put_presets(staging_id, &presets)

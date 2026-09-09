@@ -957,7 +957,7 @@ export interface Database{
     usePlainFetch:boolean
     hypaMemory:boolean
     hypav2:boolean
-    memoryAlgorithmType:string // To enable new memory module/algorithms 
+    memoryAlgorithmType:string // To enable new memory module/algorithms
     proxyRequestModel:string
     ooba:OobaSettings
     ainconfig: AINsettings
@@ -1078,6 +1078,9 @@ export interface Database{
     dynamicAssets:boolean
     dynamicAssetsEditDisplay:boolean
     customPromptTemplateToggle:string
+    disableToggleBinding?: boolean
+    defaultToggleValues?: Record<string, string>
+    togglePresets?: { name: string; values: Record<string, string>; promptPresetName?: string; id?: string }[]
     globalChatVariables:{[key:string]:string}
     templateDefaultVariables:string
     hypaAllocatedTokens:number
@@ -1854,6 +1857,8 @@ export interface Chat{
     scriptstate?:{[key:string]:string|number|boolean}
     modules?:string[]
     id?:string
+    rerollRecovery?: import('../responseVariants').RerollRecovery
+    savedToggleValues?: Record<string, string>
     bindedPersona?:string
     fmIndex?:number
     hypaV3Data?:SerializableHypaV3Data
@@ -1873,6 +1878,7 @@ export interface ChatFolder{
 }
 
 export interface Message{
+    responseVariants?: import('../responseVariants').ResponseVariantSet
     role: 'user'|'char'
     data: string
     saying?: string

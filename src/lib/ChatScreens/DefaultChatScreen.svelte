@@ -1,4 +1,6 @@
 <script lang="ts">
+    import { v4 } from 'uuid'
+    import { alertConfirm } from 'src/ts/alert'
 
     import Suggestion from './Suggestion.svelte';
     import { createLiveChatParserIndirections, createLiveChatParserSource } from 'src/ts/liveDisplayParserLease';
@@ -7,7 +9,7 @@
     import { onDestroy } from 'svelte';
     import { type Chat as ChatRecord, type Database, type character, type groupChat, type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
-    import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
+    import { chatProcessStage, doingChat, sendChat, notifyGenerationCompletion } from "../../ts/process/index.svelte";
     import { getPersonaPrompt, parseKeyValue, sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
@@ -19,8 +21,9 @@
     import AssetInput from './AssetInput.svelte';
     import { aiLawApplies, chatFoldedState, chatFoldedStateMessageIndex, downloadFile, LocalWriter } from 'src/ts/globalApi.svelte';
     import { runTrigger } from 'src/ts/process/triggers';
-    import { PreUnreroll, Prereroll } from 'src/ts/process/prereroll';
-    import { processMultiCommand } from 'src/ts/process/command';
+    import { generateResponseCandidate, moveResponseCandidate } from 'src/ts/durableReroll'
+    import { responseRange } from 'src/ts/responseVariants'
+    import { processMultiCommand } from 'src/ts/process/command'
     import { postChatFile } from 'src/ts/process/files/multisend';
     import InlayFilePreview from './InlayFilePreview.svelte';
     import { ConnectionOpenStore } from 'src/ts/sync/multiuser';
@@ -34,29 +37,18 @@
         appendConversationMessage,
         captureConversationMutationTarget,
         isConversationMutationTargetCurrent,
-        refreshConversationMutationTarget,
         type ConversationMutationTarget,
     } from '../../ts/conversationMutations';
     import { appendDefaultChatInput } from './defaultChatInput';
-    import {
-        appendConversationRerollHistory,
-        captureConversationRerollTail,
-        createConversationRerollHistory,
-        isConversationRerollHistoryCurrent,
-        moveConversationRerollHistory,
-        refreshConversationRerollHistory,
-        replaceConversationRerollLastData,
-        truncateConversationForReroll,
-        type ConversationRerollHistory,
-    } from '../../ts/conversationReroll';
+
     import {
         LatestChatScrollRequestGuard,
         navigateCapturedChatMessage,
         type CapturedChatMessageTarget,
-    } from '../../ts/chatMessageUi';
+    } from '../../ts/chatMessageUi'
     import type { ChatViewportHandle } from '../../ts/chatViewport';
-    import { handleDefaultChatUnreroll } from './defaultChatReroll';
-    import ChatScreenshotDialog from './ChatScreenshotDialog.svelte';
+
+    import ChatScreenshotDialog from './ChatScreenshotDialog.svelte'
     import ChatScreenshotCaptureSurface from './ChatScreenshotCaptureSurface.svelte';
     import {
         snapshotChatScreenshotCharacter,
@@ -114,10 +106,10 @@
     let messageInputTranslate:string = $state('')
     let openMenu = $state(false)
     let autoMode = $state(false)
-    let rerollHistory:ConversationRerollHistory|null = null
+    let rerollBusy = $state(false)
     let doingChatInputTranslate = false
-    let toggleStickers:boolean = $state(false)
-    let fileInput:string[] = $state([])
+    let toggleStickers: boolean = $state(false)
+    let fileInput: string[] = $state([])
     let showNewMessageButton = $state(false)
     let chatsInstance: ChatViewportHandle | undefined = $state()
     let isScrollingToMessage = $state(false)
@@ -239,44 +231,6 @@
         )
     }
 
-    function refreshCurrentConversationTarget(
-        target: ConversationMutationTarget,
-    ): ConversationMutationTarget | null {
-        const character = DBState.db.characters[$selectedCharID]
-        return refreshConversationMutationTarget(
-            target,
-            character,
-            character?.chats[character.chatPage],
-            getActiveConversationSession(),
-        )
-    }
-
-    function getCurrentRerollHistory(
-        target: ConversationMutationTarget,
-    ): ConversationRerollHistory | null {
-        if (!rerollHistory) return null
-        if (!isConversationRerollHistoryCurrent(
-            rerollHistory,
-            target,
-            persistentRuntime.getNavigationGeneration(),
-        )) {
-            rerollHistory = null
-            return null
-        }
-        return rerollHistory
-    }
-
-    function refreshRerollHistoryAfterOwnedMutation(
-        previousTarget: ConversationMutationTarget,
-        target: ConversationMutationTarget,
-    ): void {
-        if (!rerollHistory) return
-        rerollHistory = refreshConversationRerollHistory(
-            rerollHistory,
-            target,
-            previousTarget,
-        )
-    }
     let screenshotDialogOpen = $state(false)
     let screenshotTotalTurns = $state(0)
     let screenshotRunning = $state(false)
@@ -444,7 +398,6 @@
         }
         messageInput = ''
         messageInputTranslate = ''
-        rerollHistory = null
         mutationTarget = requireConversationMutationTarget(context)
         await sleep(10)
         context.requireCurrent()
@@ -456,119 +409,86 @@
     }
 
     async function reroll() {
-        if($doingChat){
-            return
+        if ($doingChat || rerollBusy) return
+        rerollBusy = true
+        abortController = new AbortController()
+        try {
+            await runSelectedConversationOperation('reroll-response', async (context) => {
+                const { character, conversation } = context.requireCurrent()
+                const navigation = persistentRuntime.getNavigationGeneration()
+                const owner = () => DBState.db.characters.find((item) => item.chaId === character.chaId)
+                const current = () => owner()?.chats.find((chat) => chat.id === conversation.id)
+                const isCurrent = () => {
+                    const selected = DBState.db.characters[$selectedCharID]
+                    return navigation === persistentRuntime.getNavigationGeneration() &&
+                        selected?.chaId === character.chaId && selected.chats[selected.chatPage]?.id === conversation.id
+                }
+                const completed = await generateResponseCandidate({
+                    chat: conversation,
+                    currentChat: current,
+                    session: () => {
+                        const session = getActiveConversationSession()
+                        return session?.matchesConversation(character.chaId, current()) ? session : null
+                    },
+                    isCurrent,
+                    createId: v4,
+                    flush: () => persistentRuntime.flushPendingData('reroll-candidate'),
+                    generate: () => sendChat(-1, { signal: abortController!.signal }),
+                    aborted: () => abortController!.signal.aborted,
+                })
+                if (completed) {
+                    await persistentRuntime.acknowledgeGenerationCompletion()
+                    await notifyGenerationCompletion(current()?.message.at(-1)?.data ?? '')
+                    if (DBState.db.playMessage) new Audio(sendSound).play().catch(() => {})
+                }
+            })
+        } catch (error) {
+            alertError(error)
+        } finally {
+            rerollBusy = false
+            $doingChat = false
         }
-        return runSelectedConversationOperation(
-            'reroll-response',
-            (context) => rerollComplete(context),
-        )
     }
 
-    async function rerollComplete(context: ConversationOperationContext) {
-        const mutationTarget = requireConversationMutationTarget(context)
-        let history = getCurrentRerollHistory(mutationTarget)
-        const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
-        if(genId){
-            const r = Prereroll(genId)
-            if(r){
-                replaceConversationRerollLastData(mutationTarget, r, 'reroll')
-                const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
-                if (refreshedTarget) {
-                    refreshRerollHistoryAfterOwnedMutation(
-                        mutationTarget,
-                        refreshedTarget,
-                    )
-                }
-                else rerollHistory = null
+    async function nextReroll() {
+        if ($doingChat || rerollBusy) return
+        let generate = false
+        await runSelectedConversationOperation('next-response-candidate', async (context) => {
+            const { conversation, session } = context.requireCurrent()
+            if (moveResponseCandidate(conversation, session, 1, v4)) {
+                await persistentRuntime.flushPendingData('select-response-candidate')
                 return
             }
-        }
-        if(history?.forward){
-            rerollHistory = moveConversationRerollHistory(
-                history,
-                mutationTarget,
-                'reroll',
-            )
-            return
-        }
-        if(!history){
-            const messages = mutationTarget.conversation.message
-            const tail = messages.length > 0
-                ? captureConversationRerollTail(mutationTarget, messages.length - 1)
-                : [undefined as Message]
-            history = createConversationRerollHistory(
-                mutationTarget,
-                tail,
-                persistentRuntime.getNavigationGeneration(),
-            )
-            rerollHistory = history
-        }
-        if (!truncateConversationForReroll(mutationTarget)) return
-        const truncatedTarget = refreshCurrentConversationTarget(mutationTarget)
-        if (!truncatedTarget) {
-            rerollHistory = null
-            return
-        }
-        rerollHistory = refreshConversationRerollHistory(
-            history,
-            truncatedTarget,
-            mutationTarget,
-        )
-        if (!rerollHistory) return
-        openMenu = false
-        await sendChatMainComplete(context)
-        context.requireCurrent()
+            if (!responseRange(conversation.message)) return
+            const version = session?.version
+            const selected = JSON.stringify(conversation.message.at(-1))
+            const confirmed = await alertConfirm(language.confirmNewResponseCandidate)
+            context.requireCurrent()
+            generate =
+                confirmed &&
+                session?.version === version &&
+                JSON.stringify(conversation.message.at(-1)) === selected
+        })
+        if (generate) await reroll()
     }
 
     async function unReroll() {
-        if($doingChat){
-            return
-        }
-        return runSelectedConversationOperation(
-            'unreroll-response',
-            (context) => unRerollComplete(context),
-        )
-    }
-
-    function unRerollComplete(context: ConversationOperationContext) {
-        const mutationTarget = requireConversationMutationTarget(context)
-        const history = getCurrentRerollHistory(mutationTarget)
-        const result = handleDefaultChatUnreroll({
-            target: mutationTarget,
-            history,
-            preUnreroll: PreUnreroll,
-        })
-        if (result.type === 'precomputed') {
-            const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
-            if (refreshedTarget) {
-                refreshRerollHistoryAfterOwnedMutation(
-                    mutationTarget,
-                    refreshedTarget,
-                )
+        if ($doingChat || rerollBusy) return
+        await runSelectedConversationOperation('previous-response-candidate', async (context) => {
+            const { conversation, session } = context.requireCurrent()
+            if (moveResponseCandidate(conversation, session, -1, v4)) {
+                await persistentRuntime.flushPendingData('select-response-candidate')
             }
-            else rerollHistory = null
-            return
-        }
-        if (result.type === 'history') rerollHistory = result.history
+        })
     }
 
-    async function writeSelectedConversationSuggestions(
-        suggestions: readonly string[],
-    ): Promise<boolean> {
-        const result = await runSelectedConversationOperation(
-            'write-auto-suggestions',
-            (context) => {
-                const authority = context.requireCurrent()
-                writeConversationSuggestions(
-                    authority.conversation,
-                    authority.session,
-                    suggestions,
-                )
-                context.requireCurrent()
-                return true
-            },
-        )
+    async function writeSelectedConversationSuggestions(suggestions: readonly string[]): Promise<boolean> {
+        const result = await runSelectedConversationOperation('write-auto-suggestions', (context) => {
+            const authority = context.requireCurrent()
+            writeConversationSuggestions(authority.conversation, authority.session, suggestions)
+            context.requireCurrent()
+            return true
+        })
         return result === true
     }
 
@@ -585,8 +505,7 @@
         context: ConversationOperationContext,
         continued: boolean = false,
     ) {
-        const mutationTarget = requireConversationMutationTarget(context)
-        const previousLength = mutationTarget.conversation.message.length
+        requireConversationMutationTarget(context)
         messageInput = ''
         abortController = new AbortController()
         try {
@@ -594,40 +513,6 @@
                 signal: abortController.signal,
                 continue: continued,
             })
-            context.requireCurrent()
-            const refreshedTarget = requireConversationMutationTarget(context)
-            if (
-                refreshedTarget &&
-                previousLength < refreshedTarget.conversation.message.length
-            ) {
-                const tail = captureConversationRerollTail(
-                    refreshedTarget,
-                    previousLength,
-                )
-                const refreshedHistory = rerollHistory
-                    ? refreshConversationRerollHistory(
-                          rerollHistory,
-                          refreshedTarget,
-                          mutationTarget,
-                      )
-                    : null
-                rerollHistory = refreshedHistory
-                    ? appendConversationRerollHistory(
-                          refreshedHistory,
-                          refreshedTarget,
-                          tail,
-                      )
-                    : createConversationRerollHistory(
-                          refreshedTarget,
-                          tail,
-                          persistentRuntime.getNavigationGeneration(),
-                      )
-            } else if (refreshedTarget) {
-                refreshRerollHistoryAfterOwnedMutation(
-                    mutationTarget,
-                    refreshedTarget,
-                )
-            }
         } catch (error) {
             if (error instanceof SelectedConversationPromotionStaleError) return
             console.error(error)
@@ -1478,6 +1363,7 @@
                     ? selectedConversationOperations
                     : undefined}
                 onReroll={reroll}
+                onNextReroll={nextReroll}
                 unReroll={unReroll}
                 onFirstMessageReroll={() => {
                     const character = DBState.db.characters[$selectedCharID]

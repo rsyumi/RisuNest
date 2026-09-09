@@ -1,3 +1,4 @@
+import { trackRerollOutput } from '../responseVariants'
 import { safeStructuredClone } from '../polyfill'
 import type { ConversationOperationCommit } from './conversationOperationContext'
 import type { Chat, Message } from '../storage/database.svelte'
@@ -102,6 +103,7 @@ function captureSessionOperation(
     let locator: MessageLocator
     try {
         if (options.append !== undefined) {
+            trackRerollOutput(options.chat, options.append)
             locator = session.append(options.append)
         } else if (options.continueLast) {
             if (session.totalMessages === 0) {
@@ -156,6 +158,7 @@ function captureSessionOperation(
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
+            trackRerollOutput(options.chat, message)
             locator = session.edit(locator, message)
             currentMessageId = message.chatId
             return true
@@ -190,6 +193,7 @@ function captureFullArrayFallback(
     if (options.append !== undefined) {
         target = safeStructuredClone(options.append)
         absoluteIndex = chat.message.length
+        trackRerollOutput(chat, target)
         chat.message.push(target)
         target = chat.message[absoluteIndex]
         options.onFallbackMutation?.()
@@ -228,6 +232,7 @@ function captureFullArrayFallback(
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
+            trackRerollOutput(chat, message)
             chat.message[absoluteIndex] = safeStructuredClone(message)
             target = chat.message[absoluteIndex]
             currentMessageId = target.chatId

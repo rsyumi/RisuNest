@@ -1,3 +1,4 @@
+import { defaultChatToggleBinding } from './toggleBindings'
 import { get, writable } from "svelte/store";
 import { saveImage, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex } from "./storage/database.svelte";
 import { alertAddCharacter, alertConfirm, alertError, alertNormal, alertSelect, alertStore, alertToast, alertWait } from "./alert";
@@ -68,6 +69,7 @@ export async function createNewGroup(): Promise<string> {
         name: "",
         firstMessage: "",
         chats: [{
+            ...defaultChatToggleBinding(DBState.db),
             message: [],
             note: '',
             name: 'Chat 1',
@@ -733,6 +735,7 @@ export function createBlankChar():character{
         desc: '',
         notes: '',
         chats: [{
+            ...defaultChatToggleBinding(DBState.db),
             message: [],
             note: '',
             name: 'Chat 1',
@@ -1093,6 +1096,7 @@ export async function changeChar(index: number, arg:{
 export async function addNewChat(character: character | groupChat): Promise<boolean> {
     const chats = character.chats
     const newChat: Chat = {
+        ...defaultChatToggleBinding(DBState.db),
         message: [],
         note: '',
         name: `New Chat ${chats.length + 1}`,

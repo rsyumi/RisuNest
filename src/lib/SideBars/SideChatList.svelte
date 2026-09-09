@@ -18,6 +18,7 @@
     import { createMultiuserRoom } from "src/ts/sync/multiuser";
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
+    import { bindPersona, saveChatBinding } from 'src/ts/chatBindings.svelte'
     import Toggles from "./Toggles.svelte";
     import { changeChatTo } from "src/ts/globalApi.svelte";
     import { indexSideChatListRows } from "./sideChatListRows";
@@ -275,18 +276,16 @@
                                         if(chat.bindedPersona){
                                             const confirm = await alertConfirm(language.doYouWantToUnbindCurrentPersona)
                                             if(confirm){
-                                                chat.bindedPersona = ''
+                                                await bindPersona(chat, -1)
+                                                await saveChatBinding()
                                                 alertNormal(language.personaUnbindedSuccess)
                                             }
                                         }
                                         else{
                                             const confirm = await alertConfirm(language.doYouWantToBindCurrentPersona)
                                             if(confirm){
-                                                if(!DBState.db.personas[DBState.db.selectedPersona].id){
-                                                    DBState.db.personas[DBState.db.selectedPersona].id = v4()
-                                                }
-                                                chat.bindedPersona = DBState.db.personas[DBState.db.selectedPersona].id
-                                                console.log(DBState.db.personas[DBState.db.selectedPersona])
+                                                await bindPersona(chat, DBState.db.selectedPersona)
+                                                await saveChatBinding()
                                                 alertNormal(language.personaBindedSuccess)
                                             }
                                         }
@@ -377,18 +376,16 @@
                                 if(chat.bindedPersona){
                                     const confirm = await alertConfirm(language.doYouWantToUnbindCurrentPersona)
                                     if(confirm){
-                                        chat.bindedPersona = ''
+                                        await bindPersona(chat, -1)
+                                                await saveChatBinding()
                                         alertNormal(language.personaUnbindedSuccess)
                                     }
                                 }
                                 else{
                                     const confirm = await alertConfirm(language.doYouWantToBindCurrentPersona)
                                     if(confirm){
-                                        if(!DBState.db.personas[DBState.db.selectedPersona].id){
-                                            DBState.db.personas[DBState.db.selectedPersona].id = v4()
-                                        }
-                                        chat.bindedPersona = DBState.db.personas[DBState.db.selectedPersona].id
-                                        console.log(DBState.db.personas[DBState.db.selectedPersona])
+                                        await bindPersona(chat, DBState.db.selectedPersona)
+                                                await saveChatBinding()
                                         alertNormal(language.personaBindedSuccess)
                                     }
                                 }

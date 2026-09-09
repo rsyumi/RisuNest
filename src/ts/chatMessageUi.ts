@@ -1,3 +1,4 @@
+import { responseEditReplacement } from './responseVariants'
 import {
     requireCurrentConversationSession,
     type ActiveConversationSession,
@@ -494,10 +495,17 @@ function editCapturedMessage(
     const current = resolveChatMessageTarget(target, context)
     if (!current) return false
     const updated = update(current.message)
+    const replacement = responseEditReplacement(current.conversation.message, current.absoluteIndex, updated)
     if (current.session) {
-        current.session.edit(current.locator, updated)
+        if (replacement.length === 1) current.session.edit(current.locator, replacement[0])
+        else
+            current.session.replaceRange(
+                current.session.positionAt(current.absoluteIndex),
+                replacement.length,
+                replacement,
+            )
     } else {
-        Object.assign(current.message, updated)
+        current.conversation.message.splice(current.absoluteIndex, replacement.length, ...replacement)
     }
     return true
 }

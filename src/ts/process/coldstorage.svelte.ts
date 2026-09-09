@@ -383,6 +383,9 @@ export async function preLoadChat(characterIndex:number, chatIndex:number){
         }
         else if(coldData?.message){
             replacement.message = coldData.message
+            if (Object.hasOwn(coldData, 'savedToggleValues'))
+                replacement.savedToggleValues = coldData.savedToggleValues
+            if (Object.hasOwn(coldData, 'bindedPersona')) replacement.bindedPersona = coldData.bindedPersona
             replacement.hypaV2Data = coldData.hypaV2Data
             replacement.hypaV3Data = coldData.hypaV3Data
             replacement.scriptstate = coldData.scriptstate

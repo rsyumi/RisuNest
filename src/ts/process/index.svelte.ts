@@ -160,8 +160,22 @@ function hasMismatchedActiveConversationSession(): boolean {
 }
 
 interface GenerationCompletionLifecycle {
+    responseCompleted: boolean
+    reroll: boolean
     responseApplied: boolean
     acknowledgementAttempted: boolean
+}
+
+export async function notifyGenerationCompletion(result: string): Promise<void> {
+    if (DBState.db.notification) {
+        try {
+            if (await Notification.requestPermission() === 'granted') {
+                const notification = new Notification('RisuNest', { body: result })
+                notification.onclick = () => window.focus()
+            }
+        } catch {}
+    }
+    void peerSync()
 }
 
 export async function sendChat(chatProcessIndex = -1,arg:{
@@ -177,6 +191,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if (!reservation?.isCurrent()) return false
     let completeLease: CompleteConversationLease | null = null
     const lifecycle: GenerationCompletionLifecycle = {
+        responseCompleted: false,
+        reroll: !!DBState.db.characters[get(selectedCharID)]?.chats[
+            DBState.db.characters[get(selectedCharID)]?.chatPage
+        ]?.rerollRecovery,
         responseApplied: false,
         acknowledgementAttempted: false,
     }
@@ -198,9 +216,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         const result = await sendChatInternal(chatProcessIndex, arg, lifecycle, reservation)
         generationReturned = true
         return result
-    }
-    finally {
-        if(lifecycle.responseApplied && !lifecycle.acknowledgementAttempted){
+    } catch (error) {
+        if (lifecycle.reroll && lifecycle.responseCompleted && !arg.signal?.aborted) {
+            alertError(error)
+            return true
+        }
+        throw error
+    } finally {
+        if (!lifecycle.reroll && lifecycle.responseApplied && !lifecycle.acknowledgementAttempted) {
             lifecycle.acknowledgementAttempted = true
             try {
                 await acknowledgeGenerationCompletion()
@@ -1785,25 +1808,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     let resendChat = false
 
     async function completeGeneration(): Promise<true> {
+        if (lifecycle.reroll) return true
         await acknowledgeCompletedGeneration()
-        if(DBState.db.notification){
-            try {
-                const permission = await Notification.requestPermission()
-                if(permission === 'granted'){
-                    const noti = new Notification('RisuNest', {
-                        body: result
-                    })
-                    noti.onclick = () => {
-                        window.focus()
-                    }
-                }
-            } catch {}
-        }
-        void peerSync()
+        await notifyGenerationCompletion(result)
         return true
     }
 
     async function acknowledgeCompletedGeneration(): Promise<void> {
+        if (lifecycle.reroll) return
         lifecycle.acknowledgementAttempted = true
         await acknowledgeGenerationCompletion()
     }
@@ -1869,7 +1881,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                     messageIndex,
                     abortSignal,
                 ),
-            speak: (data) => sayTTS(currentChar, data),
+            speak: async (data) => {
+                try {
+                    await sayTTS(currentChar, data)
+                } catch (error) {
+                    if (!lifecycle.reroll) throw error
+                    alertError(error)
+                }
+            },
             addRerolls,
             trimIncompleteResponse: trimUntilPunctuation,
             markResponseApplied: () => {
@@ -1879,6 +1898,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         },
     })
     if (!responseApplication) return false
+    lifecycle.responseCompleted = true
     result = responseApplication.result
     emoChanged = responseApplication.emoChanged
     resendChat = responseApplication.resendChat

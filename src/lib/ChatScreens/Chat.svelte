@@ -1,4 +1,7 @@
 <script lang="ts">
+    import ResponseCandidateControls from './ResponseCandidateControls.svelte'
+    import { activeRerollConversations } from 'src/ts/durableReroll'
+    import { doingChat } from 'src/ts/process/index.svelte'
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
@@ -69,40 +72,41 @@
         release(): void
     }
     interface Props {
-        message?: string;
-        name?: string;
-        largePortrait?: boolean;
-        isLastMemory: boolean;
-        img?: string|Promise<string>;
-        idx?: number;
-        messageGenerationInfo?: MessageGenerationInfo|null;
-        rerollIcon?: boolean|'dynamic';
-        role?: string;
-        totalLength?: number;
-        onReroll?: () => void;
-        unReroll?: () => void;
-        character?: simpleCharacterArgument|string|null;
-        firstMessage?: boolean;
-        altGreeting?: boolean;
-        currentPage?: number;
-        totalPages?: number;
-        isComment?: boolean;
-        disabled?: boolean | 'allBefore';
-        isOptimizedStreamingMessage?: boolean;
-        streamingOptimizationMode?: StreamingDisplayOptimizationMode;
-        rawStreamingText?: string;
-        onCaptureSettled?: (generation: number) => void;
-        onCaptureError?: (generation: number, error: unknown) => void;
-        captureContext?: FrozenChatScreenshotRenderContext;
-        captureMessage?: DeepReadonly<Message>;
-        captureParserIndex?: number;
-        viewportRow?: ConversationViewportRow;
-        viewportSourceToken?: string;
-        captureViewportTarget?: () => CapturedChatMessageTarget | null;
-        selectedConversationOperations?: SelectedConversationOperations;
-        bookmarked?: boolean;
-        parserProjection?: BoundedLiveChatParserProjection;
-        parserAbortSignal?: AbortSignal;
+        message?: string
+        name?: string
+        largePortrait?: boolean
+        isLastMemory: boolean
+        img?: string | Promise<string>
+        idx?: number
+        messageGenerationInfo?: MessageGenerationInfo | null
+        rerollIcon?: boolean | 'dynamic'
+        role?: string
+        totalLength?: number
+        onReroll?: () => void
+        onNextReroll?: () => void
+        unReroll?: () => void
+        character?: simpleCharacterArgument | string | null
+        firstMessage?: boolean
+        altGreeting?: boolean
+        currentPage?: number
+        totalPages?: number
+        isComment?: boolean
+        disabled?: boolean | 'allBefore'
+        isOptimizedStreamingMessage?: boolean
+        streamingOptimizationMode?: StreamingDisplayOptimizationMode
+        rawStreamingText?: string
+        onCaptureSettled?: (generation: number) => void
+        onCaptureError?: (generation: number, error: unknown) => void
+        captureContext?: FrozenChatScreenshotRenderContext
+        captureMessage?: DeepReadonly<Message>
+        captureParserIndex?: number
+        viewportRow?: ConversationViewportRow
+        viewportSourceToken?: string
+        captureViewportTarget?: () => CapturedChatMessageTarget | null
+        selectedConversationOperations?: SelectedConversationOperations
+        bookmarked?: boolean
+        parserProjection?: BoundedLiveChatParserProjection
+        parserAbortSignal?: AbortSignal
     }
 
     let {
@@ -117,6 +121,7 @@
         role = null,
         totalLength = 0,
         onReroll = () => {},
+        onNextReroll = onReroll,
         unReroll = () => {},
         character = null,
         firstMessage = false,
@@ -140,7 +145,7 @@
         bookmarked,
         parserProjection,
         parserAbortSignal,
-    }: Props = $props();
+    }: Props = $props()
 
     let editDraft = $state(message)
     let captureSettings = $derived(captureContext?.settings)
@@ -225,6 +230,11 @@
     let translationViewControlsDisabled = $derived(editMode || editTranslationMode || loadingTranslationEdit)
     let originalEditControlDisabled = $derived(editTranslationMode || loadingTranslationEdit)
     let translationEditControlDisabled = $derived(editMode || loadingTranslationEdit)
+
+    export function updateCandidatePosition(page: number, total: number) {
+        currentPage = page
+        totalPages = total
+    }
 
     export function updateStreamingDisplay(state: {
         isOptimizedStreamingMessage: boolean
@@ -1283,21 +1293,7 @@
 
 {#snippet rerolls()}
     {#if rerollIcon || altGreeting}
-        {#if DBState.db.swipe || altGreeting}
-            <button class="flex items-center hover:text-blue-500 transition-colors button-icon-unreroll" class:dyna-icon={rerollIcon === 'dynamic'} onclick={unReroll}>
-                <ArrowLeft size={22}/>
-            </button>
-            {#if firstMessage && DBState.db.swipe && DBState.db.showFirstMessagePages}
-                <span class="flex items-center text-xs text-textcolor2">{currentPage}/{totalPages}</span>
-            {/if}
-            <button class="flex items-center hover:text-blue-500 transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic'} onclick={onReroll}>
-                <ArrowRight size={22}/>
-            </button>
-        {:else}
-            <button class="flex items-center hover:text-blue-500 transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic'} onclick={onReroll}>
-                <RefreshCcwIcon size={20}/>
-            </button>
-        {/if}
+        <ResponseCandidateControls {currentPage} {totalPages} greeting={altGreeting} showPages={!firstMessage || DBState.db.showFirstMessagePages} dynamic={rerollIcon === 'dynamic'} busy={$doingChat || $activeRerollConversations.length > 0} previous={unReroll} next={altGreeting ? onReroll : onNextReroll} generate={onReroll} />
     {/if}
 {/snippet}
 

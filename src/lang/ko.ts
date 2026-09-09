@@ -1,4 +1,33 @@
 export const languageKorean = {
+    previousResponseCandidate: '이전 응답',
+    nextResponseCandidate: '다음 응답',
+
+    axModelMemory: '메모리',
+    axModelTranslate: '번역',
+    axModelEmotion: '감정',
+    axModelOther: '기타',
+
+    globalSettings: '전역 설정',
+    pluginModelUnavailable: '선택한 플러그인 모델을 사용할 수 없습니다.',
+    noPluginModels: '등록된 플러그인 모델이 없습니다.',
+    inheritPersona: '기본 페르소나 사용',
+    missingBoundPersona: '페르소나를 찾을 수 없음, 기본값 사용 중',
+    toggleBinding: '토글 바인딩',
+    bindToggles: '현재 전역 토글 값을 이 채팅에 고정',
+    unbindToggles: '토글 고정 해제',
+    saveToggleChanges: '토글 변경 저장',
+    toggleBindingOptions: '토글 바인딩 설정',
+    toggleBindingDisabled: '저장값 유지 중, 자동 적용 꺼짐',
+    togglesBound: '토글 값이 이 채팅에 고정됨',
+    localTogglePriority: '채팅 로컬 값이 우선 적용됩니다.',
+    disableToggleBinding: '토글 바인딩 사용 안 함',
+    saveDefaultToggles: '현재 값을 새 채팅 기본값으로 저장',
+    clearDefaultToggles: '새 채팅 토글 기본값 해제',
+    togglePresets: '토글 프리셋',
+    responseCandidates: '응답 후보',
+    newResponseCandidate: '새 응답 후보 생성',
+    confirmNewResponseCandidate: '마지막 응답입니다. 새 응답을 생성해 후보에 추가할까요?',
+
     "formating": {
         "main": "메인 프롬프트",
         "jailbreak": "탈옥 프롬프트",

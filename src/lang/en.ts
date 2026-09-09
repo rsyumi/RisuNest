@@ -1,4 +1,34 @@
 export const languageEnglish = {
+    previousResponseCandidate: 'Previous response',
+    nextResponseCandidate: 'Next response',
+
+    axModelMemory: 'Memory',
+    axModelTranslate: 'Translation',
+    axModelEmotion: 'Emotion',
+    axModelOther: 'Other',
+
+    globalSettings: 'Global settings',
+    pluginModelUnavailable: 'The selected plugin model is unavailable.',
+    noPluginModels: 'No plugin models registered.',
+    inheritPersona: 'Use default persona',
+    missingBoundPersona: 'Persona unavailable, using default',
+    toggleBinding: 'Toggle binding',
+    bindToggles: 'Pin global toggle values to this chat',
+    unbindToggles: 'Unpin toggle values',
+    saveToggleChanges: 'Save toggle changes',
+    toggleBindingOptions: 'Toggle binding options',
+    toggleBindingDisabled: 'Saved values retained, binding disabled',
+    togglesBound: 'Toggle values pinned to this chat',
+    localTogglePriority: 'Chat local overrides take priority.',
+    disableToggleBinding: 'Disable toggle binding',
+    saveDefaultToggles: 'Use current values for new chats',
+    clearDefaultToggles: 'Clear new chat toggle defaults',
+    togglePresets: 'Toggle presets',
+    responseCandidates: 'Response candidates',
+    newResponseCandidate: 'Generate a new response candidate',
+    confirmNewResponseCandidate:
+        'This is the last response. Generate a new response and add it to the candidates?',
+
     formating: {
         main: "Main Prompt",
         jailbreak: "Jailbreak Prompt",

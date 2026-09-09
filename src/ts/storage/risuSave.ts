@@ -1,3 +1,4 @@
+import { normalizePocketFeatures } from '../drive/pocketRisuFeatures'
 import { Packr, Unpackr, decode } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
 import { getDatabase, presetTemplate, type Database } from "./database.svelte";
@@ -30,11 +31,10 @@ const disableRemoteSaving = () => {
     }
 }
 const checkedRemoteExistence = new Set<string>();
-const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]); 
+const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]);
 const magicCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8]);
 const magicStreamCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 9]);
 export const magicRisuSaveHeader = new TextEncoder().encode("RISUSAVE\0");
-
 
 async function checkCompressionStreams(){
     if(!CompressionStream){
@@ -622,12 +622,16 @@ export class RisuSaveDecoder {
             db.botPresets = [presetTemplate]
             db.botPresetsId = 0
         }
-        console.log('Decoded RisuSave data', db);
-        return db;
+
+        return db
     }
 }
 
-export async function decodeRisuSave(data:Uint8Array){
+export async function decodeRisuSave(data: Uint8Array) {
+    return normalizePocketFeatures(await decodeRisuSaveRaw(data))
+}
+
+async function decodeRisuSaveRaw(data: Uint8Array) {
     try {
         const header = checkHeader(data)
         switch(header){

@@ -1,3 +1,4 @@
+import { normalizePocketColdPayload } from '../drive/pocketRisuFeatures'
 import { safeStructuredClone } from "../polyfill"
 import type { Database, character, groupChat } from "../storage/database.svelte"
 import { compress, decompress } from 'fflate'
@@ -52,7 +53,7 @@ export async function decodeColdStoragePayload(data: Uint8Array): Promise<unknow
     if (!isColdStorageBackupData(value)) {
         throw new TypeError('Cold storage payload has an unsupported value')
     }
-    return value
+    return normalizePocketColdPayload(value)
 }
 
 function replaceData(

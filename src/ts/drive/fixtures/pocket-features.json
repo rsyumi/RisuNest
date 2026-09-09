@@ -1,0 +1,299 @@
+[
+    {
+        "input": {
+            "role": "char",
+            "data": "two",
+            "chatId": "message",
+            "swipes": ["one", "two", "two"],
+            "swipeId": 1,
+            "time": 123,
+            "generationInfo": {
+                "generationId": "gen"
+            }
+        },
+        "expected": {
+            "role": "char",
+            "data": "two",
+            "chatId": "message",
+            "swipes": ["one", "two", "two"],
+            "swipeId": 1,
+            "time": 123,
+            "generationInfo": {
+                "generationId": "gen"
+            },
+            "responseVariants": {
+                "groupId": "message",
+                "selectedId": "message:1",
+                "candidates": [
+                    {
+                        "id": "message:0",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "one",
+                                "chatId": "message"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "message:1",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "two",
+                                "chatId": "message",
+                                "time": 123,
+                                "generationInfo": {
+                                    "generationId": "gen"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "id": "message:2",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "two",
+                                "chatId": "message"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "current",
+            "swipes": ["one", "two"],
+            "swipeId": 1
+        },
+        "expected": {
+            "role": "char",
+            "data": "current",
+            "swipes": ["one", "two"],
+            "swipeId": 1,
+            "chatId": "fallback",
+            "responseVariants": {
+                "groupId": "fallback",
+                "selectedId": "fallback:2",
+                "candidates": [
+                    {
+                        "id": "fallback:0",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "one"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "fallback:1",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "two"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "fallback:2",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "current"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "pocketRisuImportWarnings": ["swipe-body-mismatch"]
+        }
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "two",
+            "swipes": ["one", "two"],
+            "swipeId": 9
+        },
+        "expected": {
+            "role": "char",
+            "data": "two",
+            "swipes": ["one", "two"],
+            "swipeId": 9,
+            "chatId": "fallback",
+            "responseVariants": {
+                "groupId": "fallback",
+                "selectedId": "fallback:1",
+                "candidates": [
+                    {
+                        "id": "fallback:0",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "one"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "fallback:1",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "two"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "pocketRisuImportWarnings": ["invalid-swipe-index"]
+        }
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "same",
+            "swipes": ["same", "same"],
+            "swipeId": -1
+        },
+        "expected": {
+            "role": "char",
+            "data": "same",
+            "swipes": ["same", "same"],
+            "swipeId": -1,
+            "chatId": "fallback",
+            "responseVariants": {
+                "groupId": "fallback",
+                "selectedId": "fallback:2",
+                "candidates": [
+                    {
+                        "id": "fallback:0",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "same"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "fallback:1",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "same"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "fallback:2",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "same"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "pocketRisuImportWarnings": ["invalid-swipe-index"]
+        }
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "",
+            "swipes": ["", "other"],
+            "swipeId": 0
+        },
+        "expected": {
+            "role": "char",
+            "data": "",
+            "swipes": ["", "other"],
+            "swipeId": 0,
+            "chatId": "fallback",
+            "responseVariants": {
+                "groupId": "fallback",
+                "selectedId": "fallback:0",
+                "candidates": [
+                    {
+                        "id": "fallback:0",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": ""
+                            }
+                        ]
+                    },
+                    {
+                        "id": "fallback:1",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "other"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "current",
+            "swipes": []
+        },
+        "expected": {
+            "role": "char",
+            "data": "current",
+            "swipes": [],
+            "chatId": "fallback",
+            "responseVariants": {
+                "groupId": "fallback",
+                "selectedId": "fallback:0",
+                "candidates": [
+                    {
+                        "id": "fallback:0",
+                        "messages": [
+                            {
+                                "role": "char",
+                                "data": "current"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "pocketRisuImportWarnings": ["invalid-swipe-index"]
+        }
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "ok",
+            "swipes": ["ok", 4],
+            "swipeId": 0
+        },
+        "invalid": true
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "ok",
+            "swipes": ["ok"],
+            "swipeId": "0"
+        },
+        "invalid": true
+    },
+    {
+        "input": {
+            "role": "char",
+            "data": "ok",
+            "swipes": ["ok"],
+            "swipeId": 0.5
+        },
+        "invalid": true
+    }
+]

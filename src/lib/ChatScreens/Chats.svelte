@@ -53,6 +53,7 @@
         messages,
         currentCharacter,
         onReroll,
+        onNextReroll = onReroll,
         unReroll,
         onFirstMessageReroll = () => {},
         unFirstMessageReroll = () => {},
@@ -71,6 +72,7 @@
         messages?: Message[]
         currentCharacter: character | groupChat
         onReroll: () => void
+        onNextReroll?: () => void
         unReroll: () => void
         onFirstMessageReroll?: () => void
         unFirstMessageReroll?: () => void
@@ -97,15 +99,12 @@
     const CHAT_MOUNT_BATCH_SIZE = 4
 
     type ChatInstance = {
+        updateCandidatePosition?: (page: number, total: number) => void
         refreshMessageDisplay?: (state: ChatDisplayRefresh) => void
         hasActiveEditor?: () => boolean
-        refreshParserProjection?: (
-            projection?: BoundedLiveChatParserProjection,
-        ) => void
+        refreshParserProjection?: (projection?: BoundedLiveChatParserProjection) => void
         refreshConversationStartParser?: () => void
-        updateConversationStartPresentation?: (state: {
-            resolvedImage: string
-        }) => void
+        updateConversationStartPresentation?: (state: { resolvedImage: string }) => void
         updateStreamingDisplay?: (state: {
             isOptimizedStreamingMessage: boolean
             streamingOptimizationMode: StreamingDisplayOptimizationMode
@@ -114,9 +113,7 @@
         updateViewportBinding?: (state: {
             viewportRow: ConversationViewportRow
             viewportSourceToken: string
-            captureViewportTarget: () => ReturnType<
-                ConversationViewportSource['captureMessageTarget']
-            >
+            captureViewportTarget: () => ReturnType<ConversationViewportSource['captureMessageTarget']>
             parserProjection?: BoundedLiveChatParserProjection
             totalMessages: number
         }) => void
@@ -895,6 +892,15 @@
         const activeStreamingIndex = performanceMode !== 'off' && currentChat?.isStreaming
             ? totalMessages - 1
             : -1
+        let rerollIndex = totalMessages - 1
+        while (rerollIndex >= 0) {
+            const last = sourceSnapshot?.rowAt(rerollIndex)?.message ?? messages?.[rerollIndex]
+            if (!last || (!last.isComment && !last.disabled)) {
+                if (last?.role !== 'char') rerollIndex = -1
+                break
+            }
+            rerollIndex--
+        }
         const globalReloadPointer = get(ReloadGUIPointer)
 
         for (const row of [...result.rows].reverse()) {
@@ -1027,10 +1033,7 @@
                         if (!sourceSnapshot) return activeViewportSource === null
                         if (activeViewportSource !== source) return false
                         const snapshot = currentSourceSnapshot()
-                        if (
-                            snapshot?.sourceToken !== sourceToken ||
-                            snapshot.version !== sourceVersion
-                        )
+                        if (snapshot?.sourceToken !== sourceToken || snapshot.version !== sourceVersion)
                             return false
                         const currentRow = snapshot.rowAt(index)
                         return (
@@ -1046,24 +1049,20 @@
                                     message: message.data,
                                     totalMessages,
                                     parserProjection,
-                                    parserAbortSignal:
-                                        parserProjectionState?.controller.signal,
+                                    parserAbortSignal: parserProjectionState?.controller.signal,
                                     viewportBinding:
                                         viewportRow && source && sourceToken
                                             ? {
                                                   viewportRow,
                                                   viewportSourceToken: sourceToken,
                                                   captureViewportTarget: () =>
-                                                      source.captureMessageTarget(
-                                                          viewportRow.key,
-                                                      ),
+                                                      source.captureMessageTarget(viewportRow.key),
                                               }
                                             : undefined,
                                 }),
                             )
                             renderSignatures.set(key, renderSignature)
-                            if (parserProjectionState)
-                                parserProjectionState.needsRemount = false
+                            if (parserProjectionState) parserProjectionState.needsRemount = false
                             clearQueuedRowHeight(element)
                             settleRowMountWaiters(key, true)
                             return
@@ -1087,20 +1086,23 @@
                                 idx: index,
                                 totalLength: totalMessages,
                                 img:
-                                    (message.role === 'user'
-                                        ? resolvedUserImage
-                                        : resolvedCharacterImage) ?? '',
+                                    (message.role === 'user' ? resolvedUserImage : resolvedCharacterImage) ??
+                                    '',
                                 onReroll,
+                                onNextReroll,
+                                currentPage: message.responseVariants
+                                    ? message.responseVariants.candidates.findIndex(
+                                          (candidate) => candidate.id === message.responseVariants.selectedId,
+                                      ) + 1
+                                    : 1,
+                                totalPages: message.responseVariants?.candidates.length ?? 1,
                                 unReroll,
                                 rerollIcon: 'dynamic',
                                 character: simpleChar,
                                 largePortrait: messageLargePortrait,
                                 messageGenerationInfo: message.generationInfo,
                                 role: message.role,
-                                name:
-                                    message.role === 'user'
-                                        ? currentUsername
-                                        : currentCharacter.name,
+                                name: message.role === 'user' ? currentUsername : currentCharacter.name,
                                 isComment: message.isComment ?? false,
                                 disabled: message.disabled ?? false,
                                 isOptimizedStreamingMessage: activeStreamingMessage,
@@ -1129,22 +1131,24 @@
                 pendingRowMounts.delete(key)
                 clearQueuedRowHeight(element)
                 const instance = mountInstances.get(key)
-                if (
-                    sourceHandoff &&
-                    viewportRow &&
-                    activeViewportSource &&
-                    sourceSnapshot
-                ) {
+                if (sourceHandoff && viewportRow && activeViewportSource && sourceSnapshot) {
                     const source = activeViewportSource
                     instance?.updateViewportBinding?.({
                         viewportRow,
                         viewportSourceToken: sourceSnapshot.sourceToken,
-                        captureViewportTarget: () =>
-                            source.captureMessageTarget(viewportRow.key),
+                        captureViewportTarget: () => source.captureMessageTarget(viewportRow.key),
                         parserProjection,
                         totalMessages,
                     })
                 }
+                instance?.updateCandidatePosition?.(
+                    message.responseVariants
+                        ? message.responseVariants.candidates.findIndex(
+                              (candidate) => candidate.id === message.responseVariants.selectedId,
+                          ) + 1
+                        : 1,
+                    message.responseVariants?.candidates.length ?? 1,
+                )
                 instance?.updateStreamingDisplay?.({
                     isOptimizedStreamingMessage: activeStreamingMessage,
                     streamingOptimizationMode: performanceMode,
@@ -1169,6 +1173,7 @@
 
             const latest = index === totalMessages - 1
             element.classList.toggle('is-latest-chat-row', latest)
+            element.classList.toggle('is-reroll-chat-row', index === rerollIndex)
             element.classList.toggle(
                 'is-settled-history',
                 !latest && !activeStreamingMessage && row.pinReasons.length === 0,

@@ -516,7 +516,7 @@ body {
   display: none;
 }
 
-.chat-message-container.is-latest-chat-row .dyna-icon {
+.chat-message-container.is-reroll-chat-row .dyna-icon {
   display: block;
 }
 

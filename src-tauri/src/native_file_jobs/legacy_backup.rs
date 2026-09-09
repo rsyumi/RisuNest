@@ -1438,7 +1438,10 @@ impl<'de> Visitor<'de> for ColdRootVisitor {
     where
         A: SeqAccess<'de>,
     {
-        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        while let Some(mut value) = sequence.next_element::<Value>()? {
+            super::restore::pocket_features::message(&mut value, "cold")
+                .map_err(serde::de::Error::custom)?;
+        }
         Ok(true)
     }
 
@@ -1449,9 +1452,76 @@ impl<'de> Visitor<'de> for ColdRootVisitor {
         let mut compatible = false;
         while let Some(key) = map.next_key::<String>()? {
             compatible |= matches!(key.as_str(), "character" | "message");
-            map.next_value::<IgnoredAny>()?;
+            match key.as_str() {
+                "message" => {
+                    map.next_value_seed(ColdFeatureSeed("messages"))?;
+                }
+                "character" => {
+                    map.next_value_seed(ColdFeatureSeed("character"))?;
+                }
+                "savedToggleValues" | "bindedPersona" => {
+                    let value = map.next_value::<Value>()?;
+                    let mut chat = serde_json::json!({key: value});
+                    super::restore::pocket_features::chat(&mut chat, "cold")
+                        .map_err(serde::de::Error::custom)?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
         }
         Ok(compatible)
+    }
+}
+
+// Validate feature fields while retaining the bounded streaming cold-payload path.
+struct ColdFeatureSeed(&'static str);
+impl<'de> serde::de::DeserializeSeed<'de> for ColdFeatureSeed {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+impl<'de> Visitor<'de> for ColdFeatureSeed {
+    type Value = ();
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a cold feature container")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+        if self.0 == "messages" {
+            while let Some(mut value) = sequence.next_element::<Value>()? {
+                super::restore::pocket_features::message(&mut value, "cold")
+                    .map_err(serde::de::Error::custom)?;
+            }
+        } else {
+            while sequence
+                .next_element_seed(ColdFeatureSeed("chat"))?
+                .is_some()
+            {}
+        }
+        Ok(())
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "chats" if self.0 == "character" => {
+                    map.next_value_seed(ColdFeatureSeed("chats"))?;
+                }
+                "message" if self.0 == "chat" => {
+                    map.next_value_seed(ColdFeatureSeed("messages"))?;
+                }
+                "savedToggleValues" | "bindedPersona" if self.0 == "chat" => {
+                    let value = map.next_value::<Value>()?;
+                    let mut chat = serde_json::json!({key: value});
+                    super::restore::pocket_features::chat(&mut chat, "cold")
+                        .map_err(serde::de::Error::custom)?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
