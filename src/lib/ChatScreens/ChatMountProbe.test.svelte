@@ -12,6 +12,7 @@
         rawStreamingText,
         bookmarked = false,
         parserProjection,
+        parserAbortSignal,
     }: {
         message: string
         idx: number
@@ -20,6 +21,7 @@
         rawStreamingText: string
         bookmarked?: boolean
         parserProjection?: BoundedLiveChatParserProjection
+        parserAbortSignal?: AbortSignal
     } = $props()
 
     const instanceId = chatMountProbe.nextInstanceId++
@@ -55,6 +57,7 @@
             bookmarked,
             parserProjectionKind: parserProjection?.kind,
             projectedChatID: parserProjection?.projectedChatID,
+            parserAbortSignal,
         })
     })
 

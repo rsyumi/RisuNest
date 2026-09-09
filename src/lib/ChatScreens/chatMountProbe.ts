@@ -7,6 +7,7 @@ export interface ChatProbeMount {
     bookmarked?: boolean
     parserProjectionKind?: 'bounded'
     projectedChatID?: number
+    parserAbortSignal?: AbortSignal
 }
 
 export interface ChatProbeStreamingUpdate {

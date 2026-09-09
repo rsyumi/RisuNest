@@ -38,11 +38,14 @@
         BoundedLiveChatParserProjection,
         LiveChatParserProjection,
         LiveChatParserProjectionResolver,
+        LiveChatParserConversationStartRequest,
     } from 'src/ts/selectedConversationLiveParserProjection'
     import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
     import { yieldToMainThread } from 'src/ts/ui/yieldToUi'
     import LoadingIndicator from 'src/lib/UI/GUI/LoadingIndicator.svelte'
     import { language } from 'src/lang'
+    import cloneDeep from 'lodash/cloneDeep'
+    import isEqual from 'lodash/isEqual'
 
     let {
         messages,
@@ -59,6 +62,7 @@
         viewportSource = null,
         viewportNavigationGeneration = 0,
         parserProjectionResolver,
+        acquireConversationStartParserLease,
         selectedConversationOperations,
         hasNewUnreadMessage = $bindable(false),
     }: {
@@ -76,6 +80,9 @@
         viewportSource?: ConversationViewportSource | null
         viewportNavigationGeneration?: number
         parserProjectionResolver?: LiveChatParserProjectionResolver
+        acquireConversationStartParserLease?: (
+            request: LiveChatParserConversationStartRequest,
+        ) => Promise<{ release(): void } | null>
         selectedConversationOperations?: SelectedConversationOperations
         hasNewUnreadMessage?: boolean
     } = $props()
@@ -84,9 +91,13 @@
     const VIEWPORT_OVERSCAN = 8
     const MEASURED_HEIGHT_CACHE_LIMIT = 256
     const PARSER_PROJECTION_RETRY_DELAY_MS = 250
+    const PARSER_PROJECTION_MAX_ATTEMPTS = 3
     const CHAT_MOUNT_BATCH_SIZE = 4
 
     type ChatInstance = {
+        updateConversationStartPresentation?: (state: {
+            resolvedImage: string
+        }) => void
         updateStreamingDisplay?: (state: {
             isOptimizedStreamingMessage: boolean
             streamingOptimizationMode: StreamingDisplayOptimizationMode
@@ -128,6 +139,7 @@
         needsRemount: boolean
         preserveMountedRuntime: boolean
         failed: boolean
+        failureCount: number
         retryTimer: ReturnType<typeof setTimeout> | null
     }
     let rowParserProjections = new Map<string, RowParserProjectionState>()
@@ -155,6 +167,9 @@
     let hasMountedUsableRow = false
     let initialRowsLoading = $state(false)
     let initialRowsLoadFailed = $state(false)
+    let parserProjectionLoadFailed = $state(false)
+    let initialLatestFollow = false
+    let initialLatestMessageCount: number | null = null
     let sourceHandoffRuntimeKeys = new Set<string>()
     let sourceUnsubscribe: (() => void) | null = null
     let activeViewportSource: ConversationViewportSource | null = null
@@ -183,6 +198,14 @@
     let highlightTimer: ReturnType<typeof setTimeout> | null = null
     let autoScrollTimer: ReturnType<typeof setTimeout> | null = null
     let navigationGeneration = 0
+    let positionGeneration = 0
+    let pendingJump: {
+        generation: number
+        conversationIdentity: string
+        index: number
+        sourceSnapshot: ConversationViewportSnapshot | null
+        message: Readonly<Message> | null
+    } | null = null
     let suppressScroll = false
     const identityRegistry = new ChatRenderIdentityRegistry()
     const ownerSessionIds = new WeakMap<object, number>()
@@ -331,13 +354,18 @@
             : messageRenderKeys[absoluteIndex]
     }
 
-    function resetViewport(scope: string): void {
+    function resetViewport(scope: string, resetScroll: boolean): void {
         if (activeScope !== null) {
             navigationGeneration += 1
             cancelStaleRowMountWaiters()
         }
         clearScheduledWork()
         clearMountedRows()
+        if (resetScroll) {
+            initialLatestFollow = true
+            initialLatestMessageCount = null
+            keepInitialLatestPosition()
+        }
         measuredHeights = new Map()
         measuredHeightIndices = new Map()
         measuredHeightIndexByKey = new Map()
@@ -350,6 +378,7 @@
         hasMountedUsableRow = false
         initialRowsLoading = false
         initialRowsLoadFailed = false
+        parserProjectionLoadFailed = false
         viewportAnchor = null
         pendingMissingRowsAnchor = null
         viewportResult = null
@@ -558,7 +587,10 @@
     function retryInitialSourceRows(): void {
         if (!activeViewportSource) return
         initialRowsLoadFailed = false
-        initialRowsLoading = currentMessageCount() > 0
+        initialRowsLoading = !hasMountedUsableRow && currentMessageCount() > 0
+        for (const [key, state] of rowParserProjections) {
+            if (state.failed) releaseRowParserProjection(key)
+        }
         abortSourceLoads()
         reconcileViewport({
             anchor: pendingMissingRowsAnchor ?? viewportAnchor,
@@ -584,6 +616,27 @@
             previousSnapshot !== null &&
             previousAnchor !== null
         )
+        const jump = currentPendingJump()
+        const nextJumpKey = jump ? nextSnapshot?.keyAt(jump.index) : undefined
+        const nextJumpTarget =
+            nextJumpKey !== undefined ? source?.captureMessageTarget(nextJumpKey) : null
+        // A completed history lease may replace the source while a jump mounts
+        // its rows. Continue only when the active session proves the same target.
+        const preserveJump =
+            preserveHandoff &&
+            jump !== null &&
+            jump.message !== null &&
+            jump.sourceSnapshot !== null &&
+            previousSnapshot?.sourceToken === jump.sourceSnapshot.sourceToken &&
+            previousSnapshot?.version === jump.sourceSnapshot.version &&
+            nextSnapshot?.totalMessages === jump.sourceSnapshot.totalMessages &&
+            nextSnapshot?.storeRevision === jump.sourceSnapshot.storeRevision &&
+            nextJumpTarget?.kind === 'session' &&
+            nextJumpTarget.absoluteIndex === jump.index &&
+            nextJumpTarget.character === currentCharacter &&
+            nextJumpTarget.conversation ===
+                currentCharacter.chats[currentCharacter.chatPage] &&
+            isEqual(nextJumpTarget.message, jump.message)
         const handoffWasAtBottom = preserveHandoff
             ? pendingSourceWasAtBottom ?? checkIfAtBottom()
             : null
@@ -611,6 +664,10 @@
             }
         }
         navigationGeneration += 1
+        if (preserveJump) {
+            jump.generation = navigationGeneration
+            jump.sourceSnapshot = nextSnapshot
+        }
         cancelStaleRowMountWaiters()
         abortSourceLoads()
         releaseSourcePins()
@@ -684,16 +741,22 @@
     }
 
     function correctDomAnchor(anchor: ChatViewportAnchor | null): void {
+        if (initialLatestFollow || currentPendingJump()) return
         if (!anchor || !scrollContainer) return
         const element = mountedElements.get(anchor.key)
         if (!element) return
-        const currentOffset = element.getBoundingClientRect().top
-            - scrollContainer.getBoundingClientRect().top
+        const currentOffset =
+            element.getBoundingClientRect().top -
+            scrollContainer.getBoundingClientRect().top
         const delta = currentOffset - anchor.relativeOffset
-        if (Math.abs(delta) < 0.5 || typeof scrollContainer.scrollBy !== 'function') return
+        if (Math.abs(delta) < 0.5 || typeof scrollContainer.scrollBy !== 'function')
+            return
         suppressScroll = true
+        const correctionGeneration = positionGeneration
         scrollContainer.scrollBy({ top: delta, behavior: 'instant' })
+        lastScrollTop = scrollContainer.scrollTop
         scheduleFrame(() => {
+            if (correctionGeneration !== positionGeneration) return
             suppressScroll = false
             if (scrollContainer) lastScrollTop = scrollContainer.scrollTop
         })
@@ -710,17 +773,45 @@
             projectionReconcileGeneration += 1
         }
         const scope = currentChatScope()
-        renderedConversationIdentity = currentConversationHandoffIdentity()
-        if (activeScope !== scope) resetViewport(scope)
+        const conversationIdentity = currentConversationHandoffIdentity()
+        if (activeScope !== scope) {
+            resetViewport(scope, renderedConversationIdentity !== conversationIdentity)
+        }
+        renderedConversationIdentity = conversationIdentity
         const reloadPointerMap = get(ReloadChatPointer)
         const sourceSnapshot = currentSourceSnapshot()
+        const jump = currentPendingJump()
+        const jumpRow = jump && !jump.message ? sourceSnapshot?.rowAt(jump.index) : null
+        if (jump && jumpRow && sourceSnapshot) {
+            // Loading this window can mount a history-dependent greeting and
+            // synchronously publish another source before ensureRange returns.
+            jump.sourceSnapshot = sourceSnapshot
+            jump.message = cloneDeep(jumpRow.message)
+        }
+        const jumpTarget =
+            options.jumpTarget ??
+            (jump ? jump.index + (hasConversationStart() ? 1 : 0) : undefined)
+        const messageCount = currentMessageCount(sourceSnapshot)
+        if (
+            options.jumpTarget !== undefined ||
+            (initialLatestMessageCount !== null &&
+                messageCount !== initialLatestMessageCount)
+        )
+            initialLatestFollow = false
+        if (initialLatestFollow) initialLatestMessageCount = messageCount
         syncIdentityRegistration(scope, reloadPointerMap)
         const keySource = viewportKeySource(scope, sourceSnapshot)
-        const preservedAnchor = options.anchor !== undefined
-            ? options.anchor
-            : options.preserveAnchor === false
-                ? viewportAnchor
-                : pendingSourceHandoffAnchor ?? pendingMissingRowsAnchor ?? captureDomAnchor()
+        const preservedAnchor =
+            initialLatestFollow || jump
+                ? null
+                : options.anchor !== undefined
+                  ? options.anchor
+                  : options.preserveAnchor === false
+                    ? viewportAnchor
+                    : (pendingSourceHandoffAnchor ??
+                      pendingMissingRowsAnchor ??
+                      viewportAnchor ??
+                      captureDomAnchor())
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
         const result = buildChatViewport({
@@ -730,7 +821,7 @@
             estimatedMessageHeight: ESTIMATED_MESSAGE_HEIGHT,
             measuredHeightsByIndex: measuredHeightIndices,
             anchor: preservedAnchor,
-            jumpTarget: options.jumpTarget,
+            jumpTarget,
             pins: currentPins(currentChat, sourceSnapshot),
         })
         viewportAnchor = result.anchor
@@ -749,6 +840,7 @@
         chatBody.dataset.chatMeasuredHeightCount = String(measuredHeights.size)
         chatBody.dataset.chatKeyLookupScans = String(keyLookupScans)
         correctDomAnchor(preservedAnchor)
+        keepInitialLatestPosition()
         hasRenderedChat = true
         return result
     }
@@ -984,8 +1076,10 @@
                         })
                         mountInstances.set(key, instance)
                         renderSignatures.set(key, renderSignature)
-                        if (parserProjectionState)
+                        if (parserProjectionState) {
                             parserProjectionState.needsRemount = false
+                            parserProjectionState.failureCount = 0
+                        }
                         sourceHandoffRuntimeKeys.delete(key)
                         clearQueuedRowHeight(element)
                         hasMountedUsableRow = true
@@ -1154,6 +1248,12 @@
         generation: number,
     ): Promise<boolean> {
         if (mountInstances.has(key)) return Promise.resolve(true)
+        const projection = rowParserProjections.get(key)
+        if (
+            projection?.failed &&
+            projection.failureCount >= PARSER_PROJECTION_MAX_ATTEMPTS
+        )
+            return Promise.resolve(false)
         if (generation !== navigationGeneration || destroyed)
             return Promise.resolve(false)
         return new Promise<boolean>((resolve) => {
@@ -1269,11 +1369,20 @@
             character.creatorNotes,
             character.removedQuotes,
             character.largePortrait,
-            resolvedCharacterImage,
             showAiWarning,
             totalMessages,
+            parserCharacterStamp,
+            get(ReloadGUIPointer),
         ])
-        if (element.dataset.chatConversationStartSignature === signature && mountInstances.has(key)) return
+        if (
+            element.dataset.chatConversationStartSignature === signature &&
+            mountInstances.has(key)
+        ) {
+            mountInstances.get(key)?.updateConversationStartPresentation?.({
+                resolvedImage: resolvedCharacterImage ?? '',
+            })
+            return
+        }
         unmountInstance(key)
         element.replaceChildren()
         const instance = mount(ChatConversationStart, {
@@ -1286,6 +1395,8 @@
                 onReroll: onFirstMessageReroll,
                 unReroll: unFirstMessageReroll,
                 onRemoveCreatorQuote,
+                acquireConversationStartParserLease,
+                selectedConversationOperations,
             },
         })
         mountInstances.set(key, instance)
@@ -1374,6 +1485,7 @@
             needsRemount: mountInstances.has(key),
             preserveMountedRuntime,
             failed: false,
+            failureCount: 0,
             retryTimer: null,
         }
         rowParserProjections.set(key, state)
@@ -1428,6 +1540,16 @@
         )
             return
         state.failed = true
+        state.failureCount += 1
+        if (state.failureCount >= PARSER_PROJECTION_MAX_ATTEMPTS) {
+            parserProjectionLoadFailed = true
+            if (!hasMountedUsableRow) {
+                initialRowsLoading = false
+                initialRowsLoadFailed = true
+            }
+            settleRowMountWaiters(key, false)
+            return
+        }
         state.retryTimer = setTimeout(() => {
             if (!isRowParserProjectionCurrent(key, state)) return
             state.retryTimer = null
@@ -1465,6 +1587,11 @@
         state.controller.abort()
         if (state.retryTimer !== null) clearTimeout(state.retryTimer)
         releaseResolvedRowParserProjection(state)
+        parserProjectionLoadFailed = [...rowParserProjections.values()].some(
+            (projection) =>
+                projection.failed &&
+                projection.failureCount >= PARSER_PROJECTION_MAX_ATTEMPTS,
+        )
     }
 
     function releaseResolvedRowParserProjection(state: RowParserProjectionState): void {
@@ -1556,6 +1683,7 @@
             for (const frame of animationFrames) cancelAnimationFrame(frame)
         }
         animationFrames.clear()
+        suppressScroll = false
         const pendingLayoutResolves = [...layoutFrameResolvers.values()]
         layoutFrameResolvers.clear()
         for (const resolve of pendingLayoutResolves) resolve()
@@ -1612,12 +1740,17 @@
     }
 
     function handleResize(entries: ResizeObserverEntry[]): void {
-        const anchor = captureDomAnchor()
+        const resizeNavigationGeneration = navigationGeneration
+        const resizePositionGeneration = positionGeneration
+        const anchor = initialLatestFollow
+            ? null
+            : (viewportAnchor ?? captureDomAnchor())
         let changed = false
         for (const entry of entries) {
             const element = entry.target as HTMLElement
             const key = element.dataset.chatRenderKey
-            const height = element.getBoundingClientRect().height || entry.contentRect.height
+            const height =
+                element.getBoundingClientRect().height || entry.contentRect.height
             if (!key || !Number.isFinite(height) || height <= 0) continue
             const index = Number(element.dataset.chatViewportIndex)
             if (!Number.isInteger(index) || index < 0) continue
@@ -1633,34 +1766,107 @@
             changed = true
         }
         if (!changed) return
+        keepInitialLatestPosition()
         pruneMeasuredHeights()
         viewportAnchor = anchor
         if (scheduledReconcileFrame !== null) return
         scheduledReconcileFrame = scheduleFrame(() => {
             scheduledReconcileFrame = null
-            reconcileViewport({ anchor })
+            if (resizeNavigationGeneration !== navigationGeneration) return
+            reconcileViewport({
+                anchor:
+                    resizePositionGeneration !== positionGeneration
+                        ? (viewportAnchor ?? captureDomAnchor())
+                        : anchor,
+            })
         })
+    }
+
+    function keepInitialLatestPosition(): void {
+        if (!initialLatestFollow || !scrollContainer) return
+        if (scrollContainer.scrollTop !== 0) scrollContainer.scrollTop = 0
+        lastScrollTop = 0
+    }
+
+    function handleUserScrollIntent(event: Event): void {
+        if (event.type === 'wheel' && (event as WheelEvent).deltaY === 0) return
+        if (event.type === 'pointerdown' && event.target !== scrollContainer) return
+        if (event.type === 'keydown') {
+            const keyboard = event as KeyboardEvent
+            if (
+                ![
+                    'ArrowUp',
+                    'ArrowDown',
+                    'PageUp',
+                    'PageDown',
+                    'Home',
+                    'End',
+                    ' ',
+                    'Tab',
+                ].includes(keyboard.key)
+            )
+                return
+            if (
+                keyboard.key !== 'Tab' &&
+                event.target instanceof Element &&
+                event.target.closest(
+                    'input, textarea, [contenteditable]:not([contenteditable="false"])',
+                )
+            )
+                return
+        }
+        positionGeneration += 1
+        initialLatestFollow = false
+        if (currentPendingJump()) {
+            pendingJump = null
+            navigationGeneration += 1
+            cancelStaleRowMountWaiters()
+        }
+        suppressScroll = false
+        pendingSourceHandoffAnchor = null
+        pendingMissingRowsAnchor = null
+        pendingSourceWasAtBottom = null
+        if (autoScrollTimer && !DBState.db.alwaysScrollToNewMessage) {
+            clearTimeout(autoScrollTimer)
+            autoScrollTimer = null
+        }
+        viewportAnchor = captureDomAnchor()
     }
 
     function handleScroll(): void {
         if (!scrollContainer || suppressScroll || !viewportResult) return
+        // Layout and browser scroll anchoring also emit scroll events. Only input
+        // or an explicit jump transfers initial positioning to a history anchor.
+        if (initialLatestFollow) {
+            keepInitialLatestPosition()
+            return
+        }
+        if (currentPendingJump()) return
         const currentTop = scrollContainer.scrollTop
         const movingOlder = currentTop < lastScrollTop
         const movingNewer = currentTop > lastScrollTop
         lastScrollTop = currentTop
         if (!movingOlder && !movingNewer) return
+        positionGeneration += 1
+        pendingSourceHandoffAnchor = null
+        pendingMissingRowsAnchor = null
+        pendingSourceWasAtBottom = null
+        viewportAnchor = captureDomAnchor()
         const containerRect = scrollContainer.getBoundingClientRect()
         const gaps = [...chatBody.querySelectorAll<HTMLElement>('[data-chat-gap]')]
         const visibleGap = gaps.find((gap) => {
             const rect = gap.getBoundingClientRect()
-            return rect.bottom >= containerRect.top && rect.top <= containerRect.bottom
+            return (
+                rect.bottom >= containerRect.top && rect.top <= containerRect.bottom
+            )
         })
         if (!visibleGap) return
         const start = Number(visibleGap.dataset.chatGapStart)
         const end = Number(visibleGap.dataset.chatGapEnd)
         const target = movingOlder ? end - 1 : start
         const keySource = viewportKeySource(currentChatScope())
-        if (!Number.isInteger(target) || target < 0 || target >= keySource.length) return
+        if (!Number.isInteger(target) || target < 0 || target >= keySource.length)
+            return
         const key = keySource.keyAt(target)
         if (key === undefined) return
         viewportAnchor = {
@@ -1705,70 +1911,169 @@
         })
     }
 
-    export async function jumpTo(index: number, options: ChatViewportJumpOptions = {}): Promise<boolean> {
-        const source = activeViewportSource
-        const sourceSnapshot = currentSourceSnapshot()
-        const totalMessages = currentMessageCount(sourceSnapshot)
-        if (!Number.isInteger(index) || index < 0 || index >= totalMessages) return false
-        const generation = ++navigationGeneration
-        cancelStaleRowMountWaiters()
-        const scope = currentChatScope()
-        if (source && sourceSnapshot) {
-            const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
-            const startIndex = Math.max(0, index - Math.min(VIEWPORT_OVERSCAN, budget - 1))
-            const controller = new AbortController()
-            const loadKey = `jump:${generation}`
-            sourceLoads.set(loadKey, controller)
-            try {
-                await source.ensureRange({
-                    startIndex,
-                    limit: Math.min(budget, totalMessages - startIndex),
-                    reason: 'jump',
-                    signal: controller.signal,
-                })
-            } catch {
-                return false
-            } finally {
-                if (sourceLoads.get(loadKey) === controller) sourceLoads.delete(loadKey)
-            }
-            const currentSnapshot = currentSourceSnapshot()
-            if (
-                controller.signal.aborted ||
-                generation !== navigationGeneration ||
-                source !== activeViewportSource ||
-                currentSnapshot?.sourceToken !== sourceSnapshot.sourceToken ||
-                currentSnapshot.version !== sourceSnapshot.version
-            ) return false
-        }
-        const startOffset = hasConversationStart() ? 1 : 0
-        const result = reconcileViewport({ jumpTarget: index + startOffset, preserveAnchor: false })
-        if (!result?.jumpAccepted) return false
-        const key = currentMessageKey(index)
-        if (key === undefined) return false
-        if (!(await waitForRowMount(key, generation))) return false
-        await waitForLayout()
-        if (generation !== navigationGeneration || scope !== currentChatScope()) return false
-        const element = mountedElements.get(key)
-        if (!element) return false
-        suppressScroll = true
-        element.scrollIntoView?.({ behavior: 'instant', block: options.align ?? 'start' })
-        if (options.highlight) {
-            if (highlightTimer) clearTimeout(highlightTimer)
-            element.classList.add('ring-2', 'ring-blue-500')
-            highlightTimer = setTimeout(() => {
-                element.classList.remove('ring-2', 'ring-blue-500')
-                highlightTimer = null
-            }, 2000)
-        }
-        viewportAnchor = {
-            key,
-            indexHint: index + startOffset,
-            relativeOffset: element.getBoundingClientRect().top
-                - (scrollContainer?.getBoundingClientRect().top ?? 0),
-        }
+    function currentPendingJump() {
+        return pendingJump?.generation === navigationGeneration &&
+            pendingJump.conversationIdentity ===
+                currentConversationHandoffIdentity()
+            ? pendingJump
+            : null
+    }
+
+    function isPendingJumpSourceCurrent(
+        jump: NonNullable<typeof pendingJump>,
+    ): boolean {
+        if (!jump.sourceSnapshot) return true
+        const snapshot = currentSourceSnapshot()
+        return (
+            snapshot?.sourceToken === jump.sourceSnapshot.sourceToken &&
+            snapshot.version === jump.sourceSnapshot.version &&
+            snapshot.totalMessages === jump.sourceSnapshot.totalMessages &&
+            snapshot.storeRevision === jump.sourceSnapshot.storeRevision
+        )
+    }
+
+    export async function jumpTo(
+        index: number,
+        options: ChatViewportJumpOptions = {},
+    ): Promise<boolean> {
+        const totalMessages = currentMessageCount()
+        if (!Number.isInteger(index) || index < 0 || index >= totalMessages)
+            return false
+        initialLatestFollow = false
+        navigationGeneration += 1
+        positionGeneration += 1
         suppressScroll = false
-        if (scrollContainer) lastScrollTop = scrollContainer.scrollTop
-        return true
+        pendingSourceHandoffAnchor = null
+        pendingMissingRowsAnchor = null
+        pendingSourceWasAtBottom = null
+        if (autoScrollTimer) clearTimeout(autoScrollTimer)
+        autoScrollTimer = null
+        const jump = {
+            generation: navigationGeneration,
+            conversationIdentity: currentConversationHandoffIdentity(),
+            index,
+            sourceSnapshot: null as ConversationViewportSnapshot | null,
+            message: null as Readonly<Message> | null,
+        }
+        pendingJump = jump
+        cancelStaleRowMountWaiters()
+        try {
+            while (currentPendingJump() === jump) {
+                const generation = jump.generation
+                const scope = currentChatScope()
+                const source = activeViewportSource
+                const sourceSnapshot = currentSourceSnapshot()
+                if (!isPendingJumpSourceCurrent(jump)) return false
+                if (source && sourceSnapshot) {
+                    const budget =
+                        getRuntimePerformanceBudgets().chatMountedMessageBudget
+                    const startIndex = Math.max(
+                        0,
+                        index - Math.min(VIEWPORT_OVERSCAN, budget - 1),
+                    )
+                    const controller = new AbortController()
+                    const loadKey = `jump:${generation}`
+                    sourceLoads.set(loadKey, controller)
+                    try {
+                        await source.ensureRange({
+                            startIndex,
+                            limit: Math.min(budget, totalMessages - startIndex),
+                            reason: 'jump',
+                            signal: controller.signal,
+                        })
+                        await tick()
+                    } catch {
+                        if (
+                            currentPendingJump() === jump &&
+                            generation !== jump.generation
+                        )
+                            continue
+                        return false
+                    } finally {
+                        if (sourceLoads.get(loadKey) === controller)
+                            sourceLoads.delete(loadKey)
+                    }
+                    if (
+                        currentPendingJump() === jump &&
+                        generation !== jump.generation
+                    )
+                        continue
+                    const currentSnapshot = currentSourceSnapshot()
+                    if (
+                        controller.signal.aborted ||
+                        generation !== navigationGeneration ||
+                        source !== activeViewportSource ||
+                        currentSnapshot?.sourceToken !==
+                            sourceSnapshot.sourceToken ||
+                        currentSnapshot.version !== sourceSnapshot.version
+                    )
+                        return false
+                    const row = currentSnapshot.rowAt(index)
+                    if (!row) return false
+                    if (jump.message && !isEqual(jump.message, row.message))
+                        return false
+                    jump.sourceSnapshot = currentSnapshot
+                    jump.message = cloneDeep(row.message)
+                }
+                const startOffset = hasConversationStart() ? 1 : 0
+                const key = currentMessageKey(index)
+                if (key === undefined) return false
+                const result = reconcileViewport({
+                    jumpTarget: index + startOffset,
+                    preserveAnchor: false,
+                })
+                if (!result?.jumpAccepted) return false
+                const rowMounted = await waitForRowMount(key, generation)
+                if (currentPendingJump() === jump && generation !== jump.generation)
+                    continue
+                if (!rowMounted) return false
+                await waitForLayout()
+                if (currentPendingJump() === jump && generation !== jump.generation)
+                    continue
+                if (
+                    generation !== navigationGeneration ||
+                    scope !== currentChatScope()
+                )
+                    return false
+                if (!isPendingJumpSourceCurrent(jump)) return false
+                if (
+                    jump.message &&
+                    !isEqual(
+                        currentSourceSnapshot()?.rowAt(index)?.message,
+                        jump.message,
+                    )
+                )
+                    return false
+                const element = mountedElements.get(key)
+                if (!element) return false
+                suppressScroll = true
+                element.scrollIntoView?.({
+                    behavior: 'instant',
+                    block: options.align ?? 'start',
+                })
+                if (options.highlight) {
+                    if (highlightTimer) clearTimeout(highlightTimer)
+                    element.classList.add('ring-2', 'ring-blue-500')
+                    highlightTimer = setTimeout(() => {
+                        element.classList.remove('ring-2', 'ring-blue-500')
+                        highlightTimer = null
+                    }, 2000)
+                }
+                viewportAnchor = {
+                    key,
+                    indexHint: index + startOffset,
+                    relativeOffset:
+                        element.getBoundingClientRect().top -
+                        (scrollContainer?.getBoundingClientRect().top ?? 0),
+                }
+                suppressScroll = false
+                if (scrollContainer) lastScrollTop = scrollContainer.scrollTop
+                return true
+            }
+            return false
+        } finally {
+            if (pendingJump === jump) pendingJump = null
+        }
     }
 
     export async function jumpToLatestMessage(): Promise<void> {
@@ -1840,6 +2145,14 @@
         chatBody.addEventListener('pause', handleMediaStop, true)
         chatBody.addEventListener('ended', handleMediaStop, true)
         scrollContainer?.addEventListener('scroll', handleScroll)
+        scrollContainer?.addEventListener('wheel', handleUserScrollIntent, {
+            passive: true,
+        })
+        scrollContainer?.addEventListener('touchmove', handleUserScrollIntent, {
+            passive: true,
+        })
+        scrollContainer?.addEventListener('pointerdown', handleUserScrollIntent)
+        scrollContainer?.addEventListener('keydown', handleUserScrollIntent)
         const unsubscribeProfile = subscribeRuntimePerformanceProfile(() => reconcileViewport())
         return () => {
             unsubscribeProfile()
@@ -1849,6 +2162,10 @@
             chatBody.removeEventListener('pause', handleMediaStop, true)
             chatBody.removeEventListener('ended', handleMediaStop, true)
             scrollContainer?.removeEventListener('scroll', handleScroll)
+            scrollContainer?.removeEventListener('wheel', handleUserScrollIntent)
+            scrollContainer?.removeEventListener('touchmove', handleUserScrollIntent)
+            scrollContainer?.removeEventListener('pointerdown', handleUserScrollIntent)
+            scrollContainer?.removeEventListener('keydown', handleUserScrollIntent)
             resizeObserver?.disconnect()
             resizeObserver = null
             scrollContainer = null
@@ -1902,6 +2219,21 @@
         {:else}
             <LoadingIndicator label={language.loadingChatData} />
         {/if}
+    </div>
+{:else if parserProjectionLoadFailed}
+    <div
+        class="absolute bottom-2 left-2 right-2 z-10 flex items-center justify-center gap-3 rounded-lg border border-borderc bg-bgcolor p-3 text-center"
+        data-chat-load-error
+        role="alert"
+    >
+        <span>{language.chatDataLoadFailed}</span>
+        <button
+            class="rounded-lg border border-borderc px-3 py-1.5 hover:bg-darkbg"
+            data-chat-load-retry
+            onclick={retryInitialSourceRows}
+        >
+            {language.hypaV3Modal.retry}
+        </button>
     </div>
 {/if}
 <div class="flex flex-col-reverse" bind:this={chatBody}></div>

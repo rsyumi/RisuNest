@@ -1254,6 +1254,7 @@ describe('Chats imperative mount lifecycle', () => {
         gap.getBoundingClientRect = () =>
             ({ top: 0, bottom: 100, height: 100 }) as DOMRect
 
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
         scrollParent.scrollTop = -100
         scrollParent.dispatchEvent(new Event('scroll'))
         await vi.waitFor(() => expect(delayedRange).toBeDefined())
@@ -1446,6 +1447,81 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.mounts.find((entry) => entry.index === 0)).toMatchObject({
             parserProjectionKind: 'bounded',
         })
+    })
+
+    test('stops retrying a permanent initial parser projection failure and lets the user retry', async () => {
+        const messages = [makeMessage(0)]
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        const resolve = vi
+            .fn()
+            .mockRejectedValue(new Error('persistent projection failure'))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: { resolve },
+            },
+        })
+
+        await vi.waitFor(() =>
+            expect(target.querySelector('[data-chat-load-error]')).not.toBeNull(),
+        )
+        expect(resolve).toHaveBeenCalledTimes(3)
+        expect(probeElements(target)).toHaveLength(0)
+        await expect((mounted as HarnessInstance).jumpTo(0)).resolves.toBe(false)
+        await new Promise((done) => setTimeout(done, 300))
+        expect(resolve).toHaveBeenCalledTimes(3)
+
+        resolve.mockResolvedValue(boundedProjection(currentCharacter, 0))
+        target.querySelector<HTMLButtonElement>('[data-chat-load-retry]')!.click()
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        expect(resolve).toHaveBeenCalledTimes(4)
+        expect(target.querySelector('[data-chat-load-error]')).toBeNull()
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+    })
+
+    test('keeps rendered history visible while a later parser failure waits for manual retry', async () => {
+        const messages = [makeMessage(0)]
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        let failLatest = true
+        const resolve = vi.fn(async ({ row }) => {
+            if (row.absoluteIndex === 1 && failLatest)
+                throw new Error('persistent later projection failure')
+            return boundedProjection(currentCharacter, row.absoluteIndex)
+        })
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: { resolve },
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        session.append(makeMessage(1))
+
+        await vi.waitFor(() =>
+            expect(target.querySelector('[data-chat-load-error]')).not.toBeNull(),
+        )
+        expect(probeElements(target).map((row) => row.dataset.message)).toEqual([
+            'message-0',
+        ])
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+        const latestAttempts = () =>
+            resolve.mock.calls.filter(([input]) => input.row.absoluteIndex === 1)
+                .length
+        expect(latestAttempts()).toBe(3)
+        await new Promise((done) => setTimeout(done, 300))
+        expect(latestAttempts()).toBe(3)
+
+        failLatest = false
+        target.querySelector<HTMLButtonElement>('[data-chat-load-retry]')!.click()
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        expect(latestAttempts()).toBe(4)
+        expect(target.querySelector('[data-chat-load-error]')).toBeNull()
     })
 
     test('refreshes mounted bookmark presentation after a source metadata mutation', async () => {
@@ -1771,6 +1847,70 @@ describe('Chats imperative mount lifecycle', () => {
         expect((mounted as HarnessInstance).hasUnreadMessage()).toBe(false)
     })
 
+    test.each(['wheel', 'jump'] as const)(
+        'cancels a scheduled response auto-scroll after later %s navigation',
+        async (navigation) => {
+            const messages = Array.from({ length: 8 }, (_, index) =>
+                makeMessage(index),
+            )
+            const currentCharacter = makeCharacter(messages)
+            const { source } = makeViewportSource(currentCharacter)
+            mounted = mount(ChatsHarness, {
+                target,
+                props: {
+                    initialCharacter: currentCharacter,
+                    initialViewportSource: source,
+                },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+            const scrollParent =
+                target.querySelector<HTMLElement>('.scroll-parent')!
+            scrollParent.getBoundingClientRect = () =>
+                ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+            target.querySelector<HTMLElement>(
+                '[data-chat-index="7"]',
+            )!.getBoundingClientRect = () =>
+                ({ top: 450, bottom: 500, height: 50 }) as DOMRect
+            const scrollIntoView = vi.spyOn(HTMLElement.prototype, 'scrollIntoView')
+            DBState.db.autoScrollToNewMessage = true
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+            try {
+                const schedule = vi.spyOn(globalThis, 'setTimeout')
+                const replacement = makeCharacter([
+                    ...messages,
+                    makeMessage(8, { role: 'char' }),
+                ])
+                ;(mounted as HarnessInstance).switchCharacterAndSource(
+                    replacement,
+                    makeViewportSource(replacement).source,
+                )
+                await vi.waitFor(() =>
+                    expect(probeElements(target)).toHaveLength(9),
+                )
+                expect(schedule).toHaveBeenCalledWith(expect.any(Function), 700)
+                if (navigation === 'wheel') {
+                    scrollParent.dispatchEvent(
+                        new WheelEvent('wheel', { deltaY: -200 }),
+                    )
+                    scrollParent.scrollTop = -200
+                    scrollParent.dispatchEvent(new Event('scroll'))
+                } else {
+                    await expect(
+                        (mounted as HarnessInstance).jumpTo(0),
+                    ).resolves.toBe(true)
+                }
+                scrollIntoView.mockClear()
+                await vi.advanceTimersByTimeAsync(750)
+                expect(scrollIntoView).not.toHaveBeenCalled()
+                if (navigation === 'wheel')
+                    expect(scrollParent.scrollTop).toBe(-200)
+            } finally {
+                vi.useRealTimers()
+                scrollIntoView.mockRestore()
+            }
+        },
+    )
+
     test('bounds retained height corrections while visiting a long conversation', async () => {
         const messages = Array.from({ length: 2_000 }, (_, index) => makeMessage(index))
         mounted = mount(ChatsHarness, {
@@ -1806,6 +1946,7 @@ describe('Chats imperative mount lifecycle', () => {
         expect(gaps).toHaveLength(1)
         gaps[0].getBoundingClientRect = () => ({ top: 0, bottom: 100, height: 100 } as DOMRect)
 
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
         scrollParent.scrollTop = -100
         scrollParent.dispatchEvent(new Event('scroll'))
         await vi.waitFor(() => expect(
@@ -1828,6 +1969,342 @@ describe('Chats imperative mount lifecycle', () => {
             probeElements(target).some((element) => element.dataset.message === 'message-191'),
         ).toBe(true))
         await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+    })
+
+    test.each([
+        'layout',
+        'handoff',
+        'wheel',
+        'keyboard',
+        'touch',
+        'scrollbar',
+        'jump',
+        'text-tab',
+        'text-arrow',
+    ])(
+        'keeps the initial latest message visible through delayed layout until %s navigation',
+        async (intent) => {
+            const frames = new Map<number, FrameRequestCallback>()
+            let nextFrame = 1
+            vi.stubGlobal(
+                'requestAnimationFrame',
+                (callback: FrameRequestCallback) => {
+                    const id = nextFrame++
+                    frames.set(id, callback)
+                    return id
+                },
+            )
+            vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+            const messages = Array.from({ length: 128 }, (_, index) =>
+                makeMessage(index),
+            )
+            const currentCharacter = makeCharacter(messages)
+            const { source } = makeViewportSource(currentCharacter)
+            mounted = mount(ChatsHarness, {
+                target,
+                props: {
+                    initialMessages: messages,
+                    initialCharacter: currentCharacter,
+                    initialViewportSource: source,
+                },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+            const scrollParent =
+                target.querySelector<HTMLElement>('.scroll-parent')!
+            scrollParent.getBoundingClientRect = () =>
+                ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+            scrollParent.scrollBy = vi
+                .fn()
+                .mockImplementation(({ top = 0 }: ScrollToOptions) => {
+                    scrollParent.scrollTop += top
+                })
+            let latestHeight = 300
+            for (const row of target.querySelectorAll<HTMLElement>(
+                '[data-chat-index]',
+            )) {
+                const index = Number(row.dataset.chatIndex)
+                row.getBoundingClientRect = () =>
+                    ({
+                        top:
+                            500 -
+                            latestHeight -
+                            (127 - index) * 200 -
+                            scrollParent.scrollTop,
+                        bottom: 500 - (127 - index) * 200 - scrollParent.scrollTop,
+                        height: index === 127 ? latestHeight : 300,
+                    }) as DOMRect
+            }
+            for (const gap of target.querySelectorAll<HTMLElement>(
+                '[data-chat-gap]',
+            )) {
+                gap.getBoundingClientRect = () =>
+                    ({ top: -10_000, bottom: -9_000, height: 1_000 }) as DOMRect
+            }
+            const latest = target.querySelector<HTMLElement>(
+                '[data-chat-index="127"]',
+            )!
+            const observer = TestResizeObserver.instances[0]
+            observer.emit(latest, 300)
+            if (intent === 'wheel')
+                scrollParent.dispatchEvent(
+                    new WheelEvent('wheel', { deltaY: -100 }),
+                )
+            if (intent === 'keyboard')
+                scrollParent.dispatchEvent(
+                    new KeyboardEvent('keydown', { key: 'PageUp' }),
+                )
+            if (intent === 'touch')
+                scrollParent.dispatchEvent(new Event('touchmove'))
+            if (intent === 'scrollbar')
+                scrollParent.dispatchEvent(new PointerEvent('pointerdown'))
+            if (intent === 'text-tab' || intent === 'text-arrow') {
+                const editor = document.createElement('textarea')
+                latest.appendChild(editor)
+                editor.dispatchEvent(
+                    new KeyboardEvent('keydown', {
+                        key: intent === 'text-tab' ? 'Tab' : 'ArrowUp',
+                        bubbles: true,
+                    }),
+                )
+            }
+            if (intent === 'handoff') {
+                const replacementCharacter = makeCharacter(
+                    structuredClone(messages),
+                )
+                const { source: replacementSource } =
+                    makeViewportSource(replacementCharacter)
+                source.dispose()
+                ;(mounted as HarnessInstance).switchCharacterAndSource(
+                    replacementCharacter,
+                    replacementSource,
+                )
+                await tick()
+            }
+            const jump =
+                intent === 'jump'
+                    ? (mounted as HarnessInstance).jumpTo(100)
+                    : undefined
+            // WebView scroll anchoring and genuine input both dispatch scroll events.
+            // Only the explicit input above transfers ownership away from initial layout.
+            scrollParent.scrollTop = -1_981
+            scrollParent.dispatchEvent(new Event('scroll'))
+            for (let step = 0; step < 4; step++) {
+                await tick()
+                for (const [id, callback] of [...frames]) {
+                    frames.delete(id)
+                    callback(performance.now())
+                }
+            }
+            await tick()
+            if (jump) {
+                let completed: boolean | undefined
+                void jump.then((result) => {
+                    completed = result
+                })
+                await vi.waitFor(async () => {
+                    await tick()
+                    for (const [id, callback] of [...frames]) {
+                        frames.delete(id)
+                        callback(performance.now())
+                    }
+                    expect(completed).toBe(true)
+                })
+            }
+            if (
+                intent === 'layout' ||
+                intent === 'handoff' ||
+                intent === 'text-arrow'
+            ) {
+                expect(scrollParent.scrollTop).toBe(0)
+                expect(latest.getBoundingClientRect().top).toBeLessThan(500)
+                scrollParent.scrollTop = -159
+                latestHeight = 600
+                observer.emit(latest, 600)
+                for (const [id, callback] of [...frames]) {
+                    frames.delete(id)
+                    callback(performance.now())
+                }
+                expect(scrollParent.scrollTop).toBe(0)
+            } else {
+                expect(scrollParent.scrollTop).toBe(-1_981)
+            }
+        },
+    )
+
+    test('updates the greeting avatar without releasing its parser admission', async () => {
+        const messages = [makeMessage(0)]
+        const release = vi.fn()
+        const acquireGreeting = vi.fn(async () => ({ release }))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+                acquireConversationStartParserLease: acquireGreeting,
+            },
+        })
+        await vi.waitFor(() =>
+            expect(conversationStartProbe(target)?.dataset.image).toBe(
+                'normal:character.png',
+            ),
+        )
+        const greeting = conversationStartProbe(target)
+        ;(mounted as HarnessInstance).setImage('new-avatar.png')
+        await vi.waitFor(() =>
+            expect(conversationStartProbe(target)?.dataset.image).toBe(
+                'normal:new-avatar.png',
+            ),
+        )
+        expect(conversationStartProbe(target)).toBe(greeting)
+        expect(acquireGreeting).toHaveBeenCalledOnce()
+        expect(release).not.toHaveBeenCalled()
+    })
+
+    test('rechecks greeting admission when in-place parser scripts or global modules reload', async () => {
+        const messages = [makeMessage(0)]
+        const currentCharacter = makeCharacter(messages)
+        currentCharacter.customscript = [
+            { type: 'editdisplay', in: 'synthetic', out: 'plain' } as any,
+        ]
+        const acquireGreeting = vi.fn(async () => null)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                acquireConversationStartParserLease: acquireGreeting,
+            },
+        })
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledOnce())
+        ;(mounted as HarnessInstance).mutateScriptOutput('{{history}}')
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledTimes(2))
+        ReloadGUIPointer.update((revision) => revision + 1)
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledTimes(3))
+    })
+
+    test('starts a different conversation at the latest message instead of retaining reverse-flex scroll offset', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
+        const initialCharacter = makeCharacter(messages)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter,
+                initialViewportSource: makePersistentViewportSource(messages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.scrollTop = -332
+        const replacementCharacter = makeCharacter(messages)
+        replacementCharacter.chaId = 'replacement-owner'
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            makePersistentViewportSource(messages),
+        )
+
+        await vi.waitFor(() => expect(scrollParent.scrollTop).toBe(0))
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        expect(
+            probeElements(target).some(
+                (row) => row.dataset.message === 'message-199',
+            ),
+        ).toBe(true)
+        expect(conversationStartProbe(target)).toBeNull()
+    })
+
+    test('resumes scrolling after a conversation switch cancels an anchor correction', async () => {
+        const pendingFrames = new Map<number, FrameRequestCallback>()
+        let nextFrame = 1
+        vi.stubGlobal(
+            'requestAnimationFrame',
+            vi.fn((callback: FrameRequestCallback) => {
+                const frame = nextFrame++
+                pendingFrames.set(frame, callback)
+                return frame
+            }),
+        )
+        vi.stubGlobal(
+            'cancelAnimationFrame',
+            vi.fn((frame: number) => pendingFrames.delete(frame)),
+        )
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+        scrollParent.scrollBy = vi.fn()
+        const wrappers = [
+            ...target.querySelectorAll<HTMLElement>('[data-chat-render-key]'),
+        ]
+        const anchor = wrappers.find(
+            (element) => element.dataset.chatIndex === '190',
+        )!
+        let anchorTop = 100
+        for (const wrapper of wrappers) {
+            wrapper.getBoundingClientRect = () =>
+                ({
+                    top: wrapper === anchor ? anchorTop : 1_000,
+                    bottom: wrapper === anchor ? anchorTop + 100 : 1_100,
+                    height: 100,
+                }) as DOMRect
+        }
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
+        TestResizeObserver.instances[0].emit(anchor, 100)
+        anchorTop = 150
+        for (const [frame, callback] of [...pendingFrames]) {
+            pendingFrames.delete(frame)
+            callback(0)
+        }
+        expect(scrollParent.scrollBy).toHaveBeenCalledWith({
+            top: 50,
+            behavior: 'instant',
+        })
+        expect(pendingFrames.size).toBeGreaterThan(0)
+
+        const replacementMessages = messages.map((message, index) => ({
+            ...message,
+            data: `replacement-${index}`,
+        }))
+        const replacementCharacter = makeCharacter(replacementMessages)
+        replacementCharacter.chaId = 'replacement-owner'
+        ;(mounted as HarnessInstance).switchCharacter(
+            replacementCharacter,
+            replacementMessages,
+        )
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).some(
+                    (element) => element.dataset.message === 'replacement-199',
+                ),
+            ).toBe(true),
+        )
+        expect(pendingFrames.size).toBe(0)
+
+        const gap = target.querySelector<HTMLElement>('[data-chat-gap]')!
+        gap.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 100, height: 100 }) as DOMRect
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
+        scrollParent.scrollTop = -100
+        scrollParent.dispatchEvent(new Event('scroll'))
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).some(
+                    (element) => element.dataset.message === 'replacement-135',
+                ),
+            ).toBe(true),
+        )
     })
 
     test('uses the low-spec mounted-message budget', async () => {
@@ -1992,39 +2469,60 @@ describe('Chats imperative mount lifecycle', () => {
     })
 
     test('corrects the stable-key anchor after a measured height change', async () => {
-        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
         mounted = mount(ChatsHarness, {
             target,
-            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
         })
         await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
         await (mounted as HarnessInstance).jumpTo(100)
 
         const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
-        const wrappers = [...target.querySelectorAll<HTMLElement>('[data-chat-render-key]')]
-        const anchor = wrappers.find((element) => element.dataset.chatIndex === '100')!
+        const wrappers = [
+            ...target.querySelectorAll<HTMLElement>('[data-chat-render-key]'),
+        ]
+        const anchor = wrappers.find(
+            (element) => element.dataset.chatIndex === '100',
+        )!
         let anchorTop = 120
-        scrollParent.getBoundingClientRect = () => ({
-            top: 0,
-            bottom: 500,
-            height: 500,
-        } as DOMRect)
+        scrollParent.getBoundingClientRect = () =>
+            ({
+                top: 0,
+                bottom: 500,
+                height: 500,
+            }) as DOMRect
         scrollParent.scrollBy = vi.fn()
         for (const wrapper of wrappers) {
-            wrapper.getBoundingClientRect = () => ({
-                top: wrapper === anchor ? anchorTop : 1_000,
-                bottom: wrapper === anchor ? anchorTop + 100 : 1_100,
-                height: 100,
-            } as DOMRect)
+            wrapper.getBoundingClientRect = () =>
+                ({
+                    top: wrapper === anchor ? anchorTop : 1_000,
+                    bottom: wrapper === anchor ? anchorTop + 100 : 1_100,
+                    height: 100,
+                }) as DOMRect
         }
 
+        // Record the reading position after installing this synthetic layout.
+        for (const gap of target.querySelectorAll<HTMLElement>('[data-chat-gap]')) {
+            gap.getBoundingClientRect = () =>
+                ({ top: -1_000, bottom: -900, height: 100 }) as DOMRect
+        }
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -1 }))
+        scrollParent.scrollTop = -1
+        scrollParent.dispatchEvent(new Event('scroll'))
         TestResizeObserver.instances[0].emit(anchor, 100)
         anchorTop = 170
 
-        await vi.waitFor(() => expect(scrollParent.scrollBy).toHaveBeenCalledWith({
-            top: 50,
-            behavior: 'instant',
-        }))
+        await vi.waitFor(() =>
+            expect(scrollParent.scrollBy).toHaveBeenCalledWith({
+                top: 50,
+                behavior: 'instant',
+            }),
+        )
     })
 
     test('forgets deleted row heights before the same message ID is reused', async () => {
@@ -2154,5 +2652,364 @@ describe('Chats imperative mount lifecycle', () => {
             callback(0)
         }
         await expect(jumping).resolves.toBe(false)
+    })
+
+    test.each([
+        ['edit', 'parser'],
+        ['append', 'parser'],
+        ['edit', 'layout'],
+        ['append', 'layout'],
+    ] as const)(
+        'rejects a jump when %s changes the source while its target %s is pending',
+        async (change, stage) => {
+            const messages = Array.from({ length: 200 }, (_, index) =>
+                makeMessage(index),
+            )
+            const currentCharacter = makeCharacter(messages)
+            const { session, source } = makeViewportSource(currentCharacter)
+            const pending = deferred<LiveChatParserProjection>()
+            const resolver: LiveChatParserProjectionResolver = {
+                resolve: vi.fn(({ row }) =>
+                    row.absoluteIndex === 100 && row.sourceVersion === 0
+                        ? pending.promise
+                        : Promise.resolve(
+                              boundedProjection(
+                                  currentCharacter,
+                                  row.absoluteIndex,
+                              ),
+                          ),
+                ),
+            }
+            mounted = mount(ChatsHarness, {
+                target,
+                props: {
+                    initialCharacter: currentCharacter,
+                    initialViewportSource: source,
+                    parserProjectionResolver: resolver,
+                },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+            const frames = new Map<number, FrameRequestCallback>()
+            let nextFrame = 0
+            if (stage === 'layout') {
+                vi.stubGlobal(
+                    'requestAnimationFrame',
+                    (callback: FrameRequestCallback) => {
+                        frames.set(++nextFrame, callback)
+                        return nextFrame
+                    },
+                )
+                vi.stubGlobal('cancelAnimationFrame', (id: number) =>
+                    frames.delete(id),
+                )
+            }
+            const align = vi.spyOn(HTMLElement.prototype, 'scrollIntoView')
+            try {
+                const jumping = (mounted as HarnessInstance).jumpTo(100)
+                await vi.waitFor(() =>
+                    expect(resolver.resolve).toHaveBeenCalledWith(
+                        expect.objectContaining({
+                            row: expect.objectContaining({
+                                absoluteIndex: 100,
+                                sourceVersion: 0,
+                            }),
+                        }),
+                    ),
+                )
+                if (stage === 'layout') {
+                    pending.resolve(boundedProjection(currentCharacter, 100))
+                    await vi.waitFor(() => {
+                        expect(
+                            target.querySelector(
+                                '[data-chat-probe][data-index="100"]',
+                            ),
+                        ).not.toBeNull()
+                        expect(frames.size).toBeGreaterThan(0)
+                    })
+                }
+                if (change === 'edit')
+                    session.edit(
+                        session.locate(100),
+                        makeMessage(100, { data: 'changed while mounting' }),
+                    )
+                else session.append(makeMessage(200))
+                pending.resolve(boundedProjection(currentCharacter, 100))
+                for (const [id, callback] of [...frames]) {
+                    frames.delete(id)
+                    callback(performance.now())
+                }
+                await expect(jumping).resolves.toBe(false)
+                expect(align).not.toHaveBeenCalled()
+            } finally {
+                pending.resolve(boundedProjection(currentCharacter, 100))
+                align.mockRestore()
+            }
+        },
+    )
+
+    test('allows continued scrolling when a failed jump supersedes a pending anchor correction', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
+        const currentCharacter = makeCharacter(messages)
+        const { source } = makeViewportSource(currentCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+        scrollParent.scrollBy = vi
+            .fn()
+            .mockImplementation(({ top = 0 }: ScrollToOptions) => {
+                scrollParent.scrollTop += top
+            })
+        const anchor = target.querySelector<HTMLElement>('[data-chat-index="190"]')!
+        let anchorTop = 120
+        for (const row of target.querySelectorAll<HTMLElement>(
+            '[data-chat-index]',
+        )) {
+            row.getBoundingClientRect = () =>
+                ({
+                    top: row === anchor ? anchorTop : 1_000,
+                    bottom: row === anchor ? anchorTop + 100 : 1_100,
+                    height: 100,
+                }) as DOMRect
+        }
+        for (const gap of target.querySelectorAll<HTMLElement>('[data-chat-gap]')) {
+            gap.getBoundingClientRect = () =>
+                ({ top: -1_000, bottom: -900, height: 100 }) as DOMRect
+        }
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -1 }))
+        scrollParent.scrollTop = -1
+        scrollParent.dispatchEvent(new Event('scroll'))
+        const pendingFrames = new Map<number, FrameRequestCallback>()
+        let nextFrame = 0
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            pendingFrames.set(++nextFrame, callback)
+            return nextFrame
+        })
+        vi.stubGlobal('cancelAnimationFrame', (frame: number) =>
+            pendingFrames.delete(frame),
+        )
+        anchorTop = 170
+        TestResizeObserver.instances[0].emit(anchor, 100)
+        for (const [frame, callback] of [...pendingFrames]) {
+            pendingFrames.delete(frame)
+            callback(0)
+        }
+        expect(scrollParent.scrollBy).toHaveBeenCalledWith({
+            top: 50,
+            behavior: 'instant',
+        })
+        expect(pendingFrames.size).toBeGreaterThan(0)
+        vi.spyOn(source, 'ensureRange').mockRejectedValueOnce(
+            new Error('synthetic jump load failure'),
+        )
+        await expect((mounted as HarnessInstance).jumpTo(0)).resolves.toBe(false)
+        for (const [frame, callback] of [...pendingFrames]) {
+            pendingFrames.delete(frame)
+            callback(0)
+        }
+
+        const gap = target.querySelector<HTMLElement>('[data-chat-gap]')!
+        gap.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 100, height: 100 }) as DOMRect
+        scrollParent.scrollTop = -200
+        scrollParent.dispatchEvent(new Event('scroll'))
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).some(
+                    (element) => element.dataset.message === 'message-135',
+                ),
+            ).toBe(true),
+        )
+    })
+
+    test.each([
+        [0, 'complete'],
+        [100, 'complete'],
+        [0, 'jump'],
+        [100, 'jump'],
+        [0, 'wheel'],
+        [100, 'wheel'],
+    ] as const)(
+        'retains delayed jump target %i through competing layout until %s navigation',
+        async (index, completion) => {
+            const messages = Array.from({ length: 240 }, (_, messageIndex) =>
+                makeMessage(messageIndex),
+            )
+            const currentCharacter = makeCharacter(messages)
+            const { source } = makeViewportSource(currentCharacter)
+            const pending = deferred<LiveChatParserProjection>()
+            const resolver: LiveChatParserProjectionResolver = {
+                resolve: vi.fn(({ row }) =>
+                    row.absoluteIndex === index
+                        ? pending.promise
+                        : Promise.resolve(
+                              boundedProjection(
+                                  currentCharacter,
+                                  row.absoluteIndex,
+                              ),
+                          ),
+                ),
+            }
+            mounted = mount(ChatsHarness, {
+                target,
+                props: {
+                    initialCharacter: currentCharacter,
+                    initialViewportSource: source,
+                    parserProjectionResolver: resolver,
+                },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+            const scrollParent =
+                target.querySelector<HTMLElement>('.scroll-parent')!
+            scrollParent.getBoundingClientRect = () =>
+                ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+            const originalRect = HTMLElement.prototype.getBoundingClientRect
+            const rectSpy = vi
+                .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+                .mockImplementation(function (this: HTMLElement) {
+                    if (this.dataset.chatViewportIndex === undefined)
+                        return originalRect.call(this)
+                    const top =
+                        this.dataset.chatIndex !== undefined &&
+                        Number(this.dataset.chatIndex) === index + 30
+                            ? 120
+                            : 1_000
+                    return { top, bottom: top + 100, height: 100 } as DOMRect
+                })
+            try {
+                let result: boolean | undefined
+                const jumping = (mounted as HarnessInstance)
+                    .jumpTo(index)
+                    .then((value) => {
+                        result = value
+                        return value
+                    })
+                await vi.waitFor(() =>
+                    expect(resolver.resolve).toHaveBeenCalledWith(
+                        expect.objectContaining({
+                            row: expect.objectContaining({ absoluteIndex: index }),
+                        }),
+                    ),
+                )
+                await vi.waitFor(() =>
+                    expect(
+                        probeElements(target).some(
+                            (element) =>
+                                element.dataset.message === `message-${index + 30}`,
+                        ),
+                    ).toBe(true),
+                )
+                const competitor = target.querySelector<HTMLElement>(
+                    `[data-chat-index="${index + 30}"]`,
+                )!
+                TestResizeObserver.instances[0].emit(competitor, 100)
+                await new Promise<void>((resolve) =>
+                    requestAnimationFrame(() => resolve()),
+                )
+                await tick()
+                expect(result).toBeUndefined()
+                expect(
+                    target.querySelector(`[data-chat-index="${index}"]`),
+                ).not.toBeNull()
+
+                if (completion === 'jump') {
+                    await expect(
+                        (mounted as HarnessInstance).jumpTo(239),
+                    ).resolves.toBe(true)
+                } else if (completion === 'wheel') {
+                    scrollParent.dispatchEvent(
+                        new WheelEvent('wheel', { deltaY: -200 }),
+                    )
+                    scrollParent.scrollTop = -200
+                    scrollParent.dispatchEvent(new Event('scroll'))
+                }
+                pending.resolve(boundedProjection(currentCharacter, index))
+                await vi.waitFor(() =>
+                    expect(result).toBe(completion === 'complete'),
+                )
+                await expect(jumping).resolves.toBe(completion === 'complete')
+                if (completion === 'complete') {
+                    expect(
+                        probeElements(target).some(
+                            (element) =>
+                                element.dataset.message === `message-${index}`,
+                        ),
+                    ).toBe(true)
+                }
+            } finally {
+                pending.resolve(boundedProjection(currentCharacter, index))
+                rectSpy.mockRestore()
+            }
+        },
+    )
+
+    test('preserves the user-visible keyed row offset when delayed content growth precedes resize delivery', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) =>
+            makeMessage(index),
+        )
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () =>
+            ({ top: 0, bottom: 500, height: 500 }) as DOMRect
+        scrollParent.scrollBy = vi
+            .fn()
+            .mockImplementation(({ top = 0 }: ScrollToOptions) => {
+                scrollParent.scrollTop += top
+            })
+        const anchor = target.querySelector<HTMLElement>('[data-chat-index="190"]')!
+        const anchorKey = anchor.dataset.chatRenderKey
+        const growingRow = target.querySelector<HTMLElement>(
+            '[data-chat-index="199"]',
+        )!
+        let growth = 0
+        for (const row of target.querySelectorAll<HTMLElement>(
+            '[data-chat-index]',
+        )) {
+            row.getBoundingClientRect = () => {
+                const top =
+                    -100 +
+                    (Number(row.dataset.chatIndex) - 190) * 400 -
+                    growth -
+                    scrollParent.scrollTop
+                const height = row === growingRow ? 400 + growth : 400
+                return { top, bottom: top + height, height } as DOMRect
+            }
+        }
+        for (const gap of target.querySelectorAll<HTMLElement>('[data-chat-gap]')) {
+            gap.getBoundingClientRect = () =>
+                ({ top: -10_000, bottom: -9_000, height: 1_000 }) as DOMRect
+        }
+        scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -200 }))
+        scrollParent.scrollTop = -200
+        scrollParent.dispatchEvent(new Event('scroll'))
+        const readerOffset = anchor.getBoundingClientRect().top
+        expect(readerOffset).toBe(100)
+
+        // ResizeObserver runs after layout has already moved the content.
+        growth = 80
+        expect(anchor.getBoundingClientRect().top).toBe(20)
+        TestResizeObserver.instances[0].emit(growingRow, 480)
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+        await tick()
+        expect(target.querySelector(`[data-chat-render-key="${anchorKey}"]`)).toBe(
+            anchor,
+        )
+        expect(anchor.getBoundingClientRect().top).toBe(readerOffset)
     })
 })
