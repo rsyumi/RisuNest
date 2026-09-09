@@ -34,27 +34,6 @@ export const risuNestSettingsItems: SettingItem[] = [
         bindKey: 'streamingDeferDisplayProcessing',
         classes: 'mt-4',
     },
-    {
-        id: 'risunest.streaming.outputProcessing',
-        type: 'segmented',
-        labelKey: 'risuNest.streaming.outputMode',
-        helpKey: 'risuNest.streaming.outputModeHelp',
-        bindKey: 'streamingDisplayOptimizationMode',
-        classes: 'mt-4',
-        options: {
-            segmentOptions: [
-                { value: 'off', labelKey: 'streamingDisplayOptimizationOff' },
-                {
-                    value: 'balanced',
-                    labelKey: 'streamingDisplayOptimizationBalanced',
-                },
-                {
-                    value: 'strong',
-                    labelKey: 'streamingDisplayOptimizationStrong',
-                },
-            ],
-        },
-    },
     { id: 'risunest.inlay.header', type: 'header', labelKey: 'risuNest.inlay.title', classes: 'mt-6', options: { level: 'h2' } },
     {
         id: 'risunest.inlay.format',

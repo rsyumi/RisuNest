@@ -6,6 +6,7 @@ Platform priorities: Android and Windows first; macOS, iOS, and Linux second. Ev
 
 ## Fork Scope
 
+- Keep upstream RisuAI features and options in their original settings locations. The RisuNest settings tab is reserved for RisuNest-added features and options; never move upstream controls into it.
 - Provider-specific request formatting, SSE decoders, and response parsers follow upstream RisuAI. Do not refactor them locally except for correctness fixes; merge-conflict cost outweighs the benefit.
 - Optimization targets are the provider-independent paths: regex scripts, lorebook, Lua, stream postprocessing, rendering, storage, and sync.
 - Prefer narrow platform adapters and compatibility seams that minimize conflicts with upstream RisuAI.

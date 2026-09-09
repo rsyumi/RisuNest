@@ -37,7 +37,6 @@ describe('streaming display optimization setting', () => {
                 [
                     'streamingThoughtMode',
                     'streamingDeferDisplayProcessing',
-                    'streamingDisplayOptimizationMode',
                 ].includes(item.bindKey ?? ''),
             ),
         ).toBe(false)
@@ -52,12 +51,25 @@ describe('streaming display optimization setting', () => {
         expect(ids).not.toContain('adv.chatLoadAdditional')
     })
 
-    it('is visible without enabling experimental settings', () => {
-        const setting = risuNestSettingsItems.find(
-            (item) => item.id === 'risunest.streaming.outputProcessing',
+    it('keeps the upstream output control in Advanced settings without duplication', () => {
+        const setting = advancedSettingsItems.find(
+            (item) => item.id === 'adv.streamingDisplayOpt',
         )
 
-        expect(setting).toBeDefined()
+        expect(setting).toMatchObject({
+            type: 'segmented',
+            bindKey: 'streamingDisplayOptimizationMode',
+            labelKey: 'streamingDisplayOptimizationMode',
+            helpKey: 'streamingDisplayOptimizationMode',
+        })
+        expect(
+            setting?.options?.segmentOptions?.map((option) => option.value),
+        ).toEqual(['off', 'balanced', 'strong'])
+        expect(
+            risuNestSettingsItems.some(
+                (item) => item.bindKey === 'streamingDisplayOptimizationMode',
+            ),
+        ).toBe(false)
         expect(setting?.condition).toBeUndefined()
         expect(setting?.showExperimental).toBeUndefined()
     })
