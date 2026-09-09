@@ -8,6 +8,8 @@ import { sendChat } from "./index.svelte";
 import { loadLoreBookV3PromptFromCompatibilitySnapshot } from "./lorebook.svelte";
 import { runTrigger } from "./triggers";
 import { getActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
+import type { ConversationOperationContext } from './conversationOperationContext'
+import { ConversationSessionInactiveError } from '../storage/activeConversationSession'
 import {
     appendConversationComment,
     appendConversationMessage,
@@ -19,7 +21,7 @@ import {
     retainConversationDeleteSlice,
 } from '../conversationMutations'
 
-export async function processMultiCommand(command:string) {
+export async function processMultiCommand(command:string, conversationOperation?: ConversationOperationContext) {
     let pipe = ''
     const splited:string[] = []
     let lastIndex = 0
@@ -37,7 +39,7 @@ export async function processMultiCommand(command:string) {
     splited.push(command.slice(lastIndex))
     console.log(splited)
     for(let i = 0; i<splited.length; i++){
-        const result = await processCommand(splited[i].trim(), pipe)
+        const result = await processCommand(splited[i].trim(), pipe, conversationOperation)
         console.log(pipe)
         if(result === false){
             return false
@@ -50,7 +52,7 @@ export async function processMultiCommand(command:string) {
 }
 
 
-async function processCommand(command:string, pipe:string):Promise<false | string>{
+async function processCommand(command:string, pipe:string, conversationOperation?: ConversationOperationContext):Promise<false | string>{
     const db = getDatabase()
     const selectedCharacterIndex = get(selectedCharID)
     const currentChar = db.characters[selectedCharacterIndex]
@@ -255,12 +257,19 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             if(currentChar.type === 'group'){
                 return;
             }
+            if (conversationOperation && (
+                currentChar.chaId !== conversationOperation.characterId ||
+                getCurrentChat()?.id !== conversationOperation.conversationId
+            )) {
+                throw new ConversationSessionInactiveError()
+            }
             const triggerResult = await runTrigger(currentChar, 'manual', {
-                chat: getCurrentChat(),
-                manualName: arg
+                chat: conversationOperation?.chat ?? getCurrentChat(),
+                manualName: arg,
+                conversationOperation,
             });
 
-            if(triggerResult){
+            if(triggerResult && !conversationOperation){
                setCurrentChat(triggerResult.chat);
             }
             return

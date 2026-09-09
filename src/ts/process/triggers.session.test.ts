@@ -124,6 +124,80 @@ test('CAS-applies ordered trigger mutations and preserves an empty string value'
     expect(session.activePinReasons).toEqual([])
 })
 
+test('serializes overlapping manual trigger commits and recursive calls', async () => {
+    const { chat, char, session } = fixture()
+    char.triggerscript = [
+        {
+            comment: 'outer',
+            type: 'manual',
+            conditions: [],
+            effect: [{ type: 'runtrigger', value: 'inner' }],
+        },
+        {
+            comment: 'inner',
+            type: 'manual',
+            conditions: [],
+            effect: [{ type: 'impersonate', role: 'char', value: 'tail' }],
+        },
+    ] as never
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+    const results = await Promise.allSettled([
+        runTrigger(char, 'manual', { chat, manualName: 'outer' }),
+        runTrigger(char, 'manual', { chat, manualName: 'outer' }),
+    ])
+    expect(results.map((result) => result.status)).toEqual([
+        'fulfilled',
+        'fulfilled',
+    ])
+    expect(chat.message.map((entry) => entry.data)).toEqual([
+        'zero',
+        'one',
+        'tail',
+        'tail',
+    ])
+    expect(session.activePinReasons).toEqual([])
+})
+
+test.each(['command', 'v2Command'] as const)(
+    'passes the owned operation to %s effects',
+    async (type) => {
+        const { chat, char, session } = fixture()
+        char.triggerscript[0].effect = [
+            { type, value: '/trigger inner', valueType: 'value' },
+        ] as never
+        char.triggerscript.push({
+            comment: 'inner',
+            type: 'manual',
+            conditions: [],
+            effect: [{ type: 'impersonate', role: 'char', value: 'nested' }],
+        })
+        runtime.session = session
+        DBState.db = {
+            characters: [char],
+            templateDefaultVariables: '',
+        } as never
+        vi.mocked(processMultiCommand).mockImplementationOnce(
+            async (_command, operation) => {
+                expect(operation).toBeDefined()
+                await runTrigger(char, 'manual', {
+                    chat: operation!.chat,
+                    manualName: 'inner',
+                    conversationOperation: operation,
+                })
+                return ''
+            },
+        )
+        await runTrigger(char, 'manual', { chat, manualName: 'ordered' })
+        expect(chat.message.map((entry) => entry.data)).toEqual([
+            'zero',
+            'one',
+            'nested',
+        ])
+        expect(session.activePinReasons).toEqual([])
+    },
+)
+
 test('CAS-applies Trigger chat variables and note metadata', async () => {
     const { chat, char, session } = fixture()
     char.triggerscript[0].effect = [

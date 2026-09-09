@@ -22,6 +22,7 @@ import {
     type ConversationCommitObserver,
 } from "./conversationOperationContext";
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
+import { runSerializedUserTrigger } from './conversationUserTrigger';
 
 
 export interface triggerscript{
@@ -1097,8 +1098,8 @@ function resolveTriggerCharacterOwner(source: character): {
     return { character: owner as character, index }
 }
 
-export async function runTrigger(char:character,mode:triggerMode, arg:{
-    chat: Chat,
+interface RunTriggerArguments {
+    chat: Chat
     recursiveCount?: number
     additonalSysPrompt?: additonalSysPrompt
     stopSending?: boolean
@@ -1109,7 +1110,22 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     tempVars?: Record<string, string>
     conversationOperation?: ConversationOperationContext
     onConversationCommit?: ConversationCommitObserver
-}){
+}
+
+export async function runTrigger(
+    char: character,
+    mode: triggerMode,
+    arg: RunTriggerArguments,
+) {
+    if (mode === 'manual' && !arg.displayMode && !arg.conversationOperation) {
+        return runSerializedUserTrigger(char.chaId, arg.chat, () =>
+            runTriggerImpl(char, mode, arg),
+        )
+    }
+    return runTriggerImpl(char, mode, arg)
+}
+
+async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTriggerArguments) {
     arg.recursiveCount ??= 0
     const moduleTriggers = getModuleTriggers()
     if (char.triggerscript.length === 0 && moduleTriggers.length === 0) {
@@ -1480,7 +1496,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'command':{
                     const effectValue = risuChatParser(effect.value,{chara:char})
-                    await processMultiCommand(effectValue)
+                    await processMultiCommand(effectValue, conversationOperation ?? undefined)
                     break
                 }
                 case 'stop':
@@ -1954,7 +1970,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'v2Command':{
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
-                    await processMultiCommand(value)
+                    await processMultiCommand(value, conversationOperation ?? undefined)
                     break
                 }
                 case 'v2SendAIprompt':{

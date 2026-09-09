@@ -23,6 +23,7 @@ import {
 } from '../conversationMutations'
 import { captureGenerationConversationOperation } from './generationConversationOperation'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
+import { alertConfirm, alertNormal } from '../alert'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -56,6 +57,7 @@ vi.mock('../util', () => ({
   getPersonaPrompt: vi.fn(),
   getUserIcon: vi.fn(),
   getUserName: vi.fn(),
+  parseKeyValue: vi.fn(() => []),
 }))
 
 vi.mock('../storage/database.svelte', () => ({
@@ -68,7 +70,21 @@ vi.mock('../storage/database.svelte', () => ({
 vi.mock('../stores.svelte', () => ({
   DBState: { db: {} },
   ReloadChatPointer: { update: vi.fn() },
-  ReloadGUIPointer: { update: vi.fn() },
+  ReloadGUIPointer: {
+    subscribe: (run: (value: number) => void) => {
+      run(0)
+      return () => {}
+    },
+    set: vi.fn(),
+    update: vi.fn(),
+  },
+  CurrentTriggerIdStore: {
+    subscribe: (run: (value: null) => void) => {
+      run(null)
+      return () => {}
+    },
+    set: vi.fn(),
+  },
   selectedCharID: {
     subscribe: (run: (value: number) => void) => (
       run(scriptingSelectionState.index),
@@ -87,6 +103,7 @@ vi.mock('./lorebook.svelte', () => ({ loadLoreBookV3PromptFromCompatibilitySnaps
 vi.mock('./memory/hypamemory', () => ({ HypaProcesser: vi.fn() }))
 vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
+vi.mock('./command', () => ({ processMultiCommand: vi.fn() }))
 vi.mock('./luaRuntime', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./luaRuntime')>()
   return {
@@ -1471,6 +1488,157 @@ test('resumes a Lua listener after an LLM wait longer than its CPU deadline', as
     vi.mocked(requestChatData).mockReset()
   }
 })
+
+test('commits overlapping Lua button updates in click order', async () => {
+  const fixture = operationCharacterFixture('ordered-buttons')
+  fixture.chat.scriptstate = { $counter: '0' }
+  fixture.char.triggerscript = [
+    {
+      type: 'start',
+      conditions: [],
+      effect: [
+        {
+          type: 'triggerlua',
+          code: `
+      function onButtonClick(id, data)
+        setChatVar(id, 'counter', tostring(tonumber(getChatVar(id, 'counter')) + 1))
+        addChat(id, 'char', data)
+      end
+    `,
+        },
+      ],
+    },
+  ] as never
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const { runLuaButtonTrigger } = await import('./scriptings')
+  try {
+    const results = await Promise.allSettled([
+      runLuaButtonTrigger(fixture.char, 'first'),
+      runLuaButtonTrigger(fixture.char, 'second'),
+      runLuaButtonTrigger(fixture.char, 'third'),
+    ])
+    expect(results.map((result) => result.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+      'fulfilled',
+    ])
+    expect(fixture.chat.scriptstate.$counter).toBe('3')
+    expect(fixture.chat.message.map((entry) => entry.data)).toEqual([
+      'message',
+      'first',
+      'second',
+      'third',
+    ])
+    expect(fixture.session.activePinReasons).toEqual([])
+  } finally {
+    continuationRuntime.session = null
+  }
+})
+
+test.each(['complete', 'navigate', 'external-edit'] as const)(
+  'orders buttons and manual triggers across an awaited confirmation (%s)',
+  async (outcome) => {
+    const fixture = operationCharacterFixture(`awaited-buttons-${outcome}`)
+    fixture.chat.scriptstate = { $counter: '0' }
+    fixture.char.triggerscript = [
+      {
+        type: 'start',
+        conditions: [],
+        effect: [
+          {
+            type: 'triggerlua',
+            code: `
+        onButtonClick = async(function(id, data)
+          if data == 'first' then alertConfirm(id, 'synthetic confirmation'):await() end
+          if data ~= 'first' then alertNormal(id, 'synthetic button effect') end
+          setChatVar(id, 'counter', tostring(tonumber(getChatVar(id, 'counter')) + 1))
+          addChat(id, 'char', data)
+        end)
+        function manualAction(id)
+          alertNormal(id, 'synthetic manual effect')
+          setChatVar(id, 'counter', tostring(tonumber(getChatVar(id, 'counter')) + 1))
+          addChat(id, 'char', 'manual')
+        end
+      `,
+          },
+        ],
+      },
+    ] as never
+    installOperationCharacterFixture(fixture)
+    vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+    vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+    continuationRuntime.session = fixture.session
+    let confirm!: (value: boolean) => void
+    vi.mocked(alertNormal).mockClear()
+    vi.mocked(alertConfirm).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          confirm = resolve
+        }),
+    )
+    const { runLuaButtonTrigger } = await import('./scriptings')
+    const { runTrigger } = await import('./triggers')
+    try {
+      const first = runLuaButtonTrigger(fixture.char, 'first')
+      await vi.waitFor(() => expect(confirm).toBeTypeOf('function'))
+      const manual = runTrigger(fixture.char, 'manual', {
+        chat: fixture.chat,
+        manualName: 'manualAction',
+      })
+      const last = runLuaButtonTrigger(fixture.char, 'last')
+      const results = Promise.allSettled([first, manual, last])
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(fixture.chat.scriptstate.$counter).toBe('0')
+      expect(fixture.chat.message).toHaveLength(1)
+      expect(alertNormal).not.toHaveBeenCalled()
+      if (outcome === 'navigate') {
+        continuationRuntime.session = null
+      } else if (outcome === 'external-edit') {
+        fixture.session.edit(fixture.session.locate(0), {
+          ...fixture.chat.message[0],
+          data: 'external',
+        })
+      }
+      confirm(true)
+      const settled = await results
+      if (outcome === 'navigate') {
+        expect(settled.map((result) => result.status)).toEqual([
+          'rejected',
+          'rejected',
+          'rejected',
+        ])
+        expect(fixture.chat.scriptstate.$counter).toBe('0')
+        expect(fixture.chat.message.map((entry) => entry.data)).toEqual([
+          'message',
+        ])
+        expect(alertNormal).not.toHaveBeenCalled()
+      } else {
+        expect(settled.map((result) => result.status)).toEqual([
+          outcome === 'complete' ? 'fulfilled' : 'rejected',
+          'fulfilled',
+          'fulfilled',
+        ])
+        expect(fixture.chat.scriptstate.$counter).toBe(
+          outcome === 'complete' ? '3' : '2',
+        )
+        expect(alertNormal).toHaveBeenCalledTimes(2)
+        expect(fixture.chat.message.map((entry) => entry.data)).toEqual(
+          outcome === 'complete'
+            ? ['message', 'first', 'manual', 'last']
+            : ['external', 'manual', 'last'],
+        )
+      }
+      expect(fixture.session.activePinReasons).toEqual([])
+    } finally {
+      confirm?.(true)
+      continuationRuntime.session = null
+      vi.mocked(alertConfirm).mockReset()
+    }
+  },
+)
 
 test('renders concurrent Lua display listeners that update chat variables', async () => {
   const fixture = operationCharacterFixture('concurrent-display-variables')

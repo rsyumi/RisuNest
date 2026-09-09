@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import type { Chat, Database } from '../storage/database.svelte'
+import { setCurrentChat } from '../storage/database.svelte'
+import { createConversationOperationContext } from './conversationOperationContext'
+import { runTrigger } from './triggers'
 
 const mocks = vi.hoisted(() => ({
     database: null as Database | null,
@@ -104,6 +107,57 @@ describe('processMultiCommand conversation mutations', () => {
 
         expect(conversation.message.map((message) => message.data)).toEqual(['before', 'hello'])
         expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({ commands: ['append'] }))
+    })
+
+    it('passes the parent operation through a nested trigger command', async () => {
+        const character = mocks.database!.characters[0]
+        const chat = character.chats[0]
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 1,
+        })
+        mocks.session = session
+        const operation = createConversationOperationContext(session, chat)
+        vi.mocked(setCurrentChat).mockClear()
+        vi.mocked(runTrigger).mockResolvedValueOnce({
+            chat: operation.chat,
+        } as never)
+        try {
+            await processMultiCommand('/trigger inner', operation)
+            expect(runTrigger).toHaveBeenLastCalledWith(character, 'manual', {
+                chat: operation.chat,
+                manualName: 'inner',
+                conversationOperation: operation,
+            })
+            expect(setCurrentChat).not.toHaveBeenCalled()
+        } finally {
+            operation.release()
+        }
+    })
+
+    it('rejects a nested trigger command after selecting another conversation', async () => {
+        const character = mocks.database!.characters[0]
+        const chat = character.chats[0]
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 1,
+        })
+        const operation = createConversationOperationContext(session, chat)
+        mocks.database!.characters.push(createCharacter('replacement', 'untouched'))
+        mocks.selectedCharacterIndex = 1
+        vi.mocked(runTrigger).mockClear()
+        try {
+            await expect(
+                processMultiCommand('/trigger inner', operation),
+            ).rejects.toThrow(/inactive/i)
+            expect(runTrigger).not.toHaveBeenCalled()
+        } finally {
+            operation.release()
+        }
     })
 
     it('stops fallback multisend when navigation changes during generation', async () => {

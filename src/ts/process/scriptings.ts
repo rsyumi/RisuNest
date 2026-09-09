@@ -35,6 +35,7 @@ import {
 } from './conversationOperationContext';
 import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte';
 import type { ActiveConversationSession } from '../storage/activeConversationSession';
+import { runSerializedUserTrigger } from './conversationUserTrigger';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -1783,6 +1784,19 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
 }
 
 export async function runLuaButtonTrigger(
+    char: character | groupChat | simpleCharacterArgument,
+    data: string,
+    conversationOperation?: ConversationOperationContext,
+): Promise<any> {
+    if (conversationOperation) {
+        return runLuaButtonTriggerBatch(char, data, conversationOperation)
+    }
+    return runSerializedUserTrigger(char.chaId, getCurrentChat(), () =>
+        runLuaButtonTriggerBatch(char, data),
+    )
+}
+
+async function runLuaButtonTriggerBatch(
     char: character|groupChat|simpleCharacterArgument,
     data: string,
     conversationOperation?: ConversationOperationContext,
