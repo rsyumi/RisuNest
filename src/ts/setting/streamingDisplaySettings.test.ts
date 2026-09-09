@@ -7,8 +7,45 @@ import { languageKorean } from '../../lang/ko'
 import { languageVietnamese } from '../../lang/vi'
 import { languageChineseTraditional } from '../../lang/zh-Hant'
 import { advancedSettingsItems } from './advancedSettingsData'
+import { risuNestSettingsItems } from './risuNestSettingsData'
 
 describe('streaming display optimization setting', () => {
+    it('offers independent thought and effect controls only in RisuNest settings', () => {
+        const thought = risuNestSettingsItems.find(
+            (item) => item.id === 'risunest.streaming.thoughtMode',
+        )
+        const effects = risuNestSettingsItems.find(
+            (item) => item.id === 'risunest.streaming.deferEffects',
+        )
+        expect(thought).toMatchObject({
+            type: 'segmented',
+            bindKey: 'streamingThoughtMode',
+        })
+        expect(
+            thought?.options?.segmentOptions?.map((option) => option.value),
+        ).toEqual(['recent', 'collapsed', 'off'])
+        expect(effects).toMatchObject({
+            type: 'check',
+            bindKey: 'streamingDeferDisplayProcessing',
+        })
+        for (const item of [thought, effects]) {
+            expect(item?.condition).toBeUndefined()
+            expect(item?.showExperimental).toBeUndefined()
+        }
+        expect(
+            advancedSettingsItems.some((item) =>
+                [
+                    'streamingThoughtMode',
+                    'streamingDeferDisplayProcessing',
+                    'streamingDisplayOptimizationMode',
+                ].includes(item.bindKey ?? ''),
+            ),
+        ).toBe(false)
+        for (const locale of [languageEnglish, languageKorean]) {
+            expect(locale.risuNest.streaming.thoughtModeHelp).toMatch(/Lua/)
+            expect(locale.risuNest.streaming.deferEffectsHelp).toMatch(/Lua/)
+        }
+    })
     it('does not expose legacy monotonically growing chat page controls', () => {
         const ids = advancedSettingsItems.map((item) => item.id)
         expect(ids).not.toContain('adv.chatLoadInitial')
@@ -16,7 +53,9 @@ describe('streaming display optimization setting', () => {
     })
 
     it('is visible without enabling experimental settings', () => {
-        const setting = advancedSettingsItems.find((item) => item.id === 'adv.streamingDisplayOpt')
+        const setting = risuNestSettingsItems.find(
+            (item) => item.id === 'risunest.streaming.outputProcessing',
+        )
 
         expect(setting).toBeDefined()
         expect(setting?.condition).toBeUndefined()

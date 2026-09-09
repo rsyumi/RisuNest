@@ -314,6 +314,146 @@ describe('Chat frozen capture presentation', () => {
         document.body.replaceChildren()
     })
 
+    test.each(['off', 'balanced', 'strong'] as const)(
+        'bypasses the initial CBS parser for the %s thought preview and resumes it on completion',
+        async (mode) => {
+            live.db.streamingDeferDisplayProcessing = true
+            const original = '<Thoughts>FULL ORIGINAL THOUGHT</Thoughts>Answer'
+            mounted = mount(Chat, {
+                target,
+                props: {
+                    message: original,
+                    rawStreamingText: original,
+                    role: 'char',
+                    idx: -1,
+                    name: 'Synthetic',
+                    isLastMemory: false,
+                    isOptimizedStreamingMessage: true,
+                    streamingOptimizationMode: mode,
+                },
+            })
+            await tick()
+            expect(
+                target.querySelector('[data-chat-body-probe]')?.textContent,
+            ).toBe('FULL ORIGINAL THOUGHT')
+            expect(parserCalls).toHaveLength(0)
+            ;(mounted as ReturnType<typeof Chat>).updateStreamingDisplay({
+                isOptimizedStreamingMessage: false,
+                streamingOptimizationMode: mode,
+                rawStreamingText: original,
+            })
+            await tick()
+            expect(
+                target.querySelector('[data-chat-body-probe]')?.textContent,
+            ).toBe(original)
+            expect(parserCalls.length).toBeGreaterThan(0)
+        },
+    )
+
+    test.each(['off', 'balanced', 'strong'] as const)(
+        'keeps full capture rendering even when %s streaming preview props are supplied',
+        async (mode) => {
+            live.db.streamingDeferDisplayProcessing = true
+            const original = '<Thoughts>Full capture reasoning</Thoughts>Answer'
+            mounted = mount(Chat, {
+                target,
+                props: {
+                    message: original,
+                    rawStreamingText: original,
+                    role: 'char',
+                    idx: -1,
+                    name: 'Synthetic',
+                    isLastMemory: false,
+                    isOptimizedStreamingMessage: true,
+                    streamingOptimizationMode: mode,
+                    captureContext: context() as any,
+                },
+            })
+            await tick()
+            expect(
+                target.querySelector('[data-chat-body-probe]')?.textContent,
+            ).toBe(original)
+            expect(
+                target
+                    .querySelector('[data-chat-body-probe]')
+                    ?.getAttribute('data-thought-preview'),
+            ).toBe('false')
+        },
+    )
+
+    test.each(['recent', 'collapsed', 'off'] as const)(
+        'keeps CBS enabled independently of the %s thought view',
+        async (mode) => {
+            live.db.streamingThoughtMode = mode
+            const original = '<Thoughts>Reasoning</Thoughts>Answer'
+            mounted = mount(Chat, {
+                target,
+                props: {
+                    message: original,
+                    rawStreamingText: original,
+                    role: 'char',
+                    idx: -1,
+                    name: 'Synthetic',
+                    isLastMemory: false,
+                    isOptimizedStreamingMessage: true,
+                    streamingOptimizationMode: 'strong',
+                },
+            })
+            await tick()
+            const probe = target.querySelector('[data-chat-body-probe]')
+            expect(probe?.textContent).toBe(original)
+            expect(probe?.getAttribute('data-thought-mode')).toBe(mode)
+            expect(probe?.getAttribute('data-raw-preview')).toBe('false')
+            expect(parserCalls.length).toBeGreaterThan(0)
+        },
+    )
+
+    test('can defer display effects without any dedicated thought handling', async () => {
+        live.db.streamingThoughtMode = 'off'
+        live.db.streamingDeferDisplayProcessing = true
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: '**Plain answer**',
+                rawStreamingText: '**Plain answer**',
+                role: 'char',
+                idx: -1,
+                name: 'Synthetic',
+                isLastMemory: false,
+                isOptimizedStreamingMessage: true,
+                streamingOptimizationMode: 'off',
+            },
+        })
+        await tick()
+        const probe = target.querySelector('[data-chat-body-probe]')
+        expect(probe?.getAttribute('data-thought-mode')).toBe('off')
+        expect(probe?.getAttribute('data-raw-preview')).toBe('true')
+        expect(parserCalls).toHaveLength(0)
+    })
+
+    test('keeps the existing live rendering when compact thoughts are disabled', async () => {
+        live.db.streamingThoughtMode = 'off'
+        const original = '<Thoughts>Reasoning</Thoughts>Answer'
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: original,
+                rawStreamingText: original,
+                role: 'char',
+                idx: -1,
+                name: 'Synthetic',
+                isLastMemory: false,
+                isOptimizedStreamingMessage: true,
+                streamingOptimizationMode: 'balanced',
+            },
+        })
+        await tick()
+        expect(target.querySelector('[data-chat-body-probe]')?.textContent).toBe(
+            original,
+        )
+        expect(parserCalls.length).toBeGreaterThan(0)
+    })
+
     test.each(['cardboard', 'mobilechat', 'customHTML'])(
         'renders a greeting without reading metadata-only history (%s)',
         async (theme) => {

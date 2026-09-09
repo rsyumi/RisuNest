@@ -22,6 +22,7 @@
     import { HideIconStore, ReloadGUIPointer, selIdState } from "../../ts/stores.svelte"
     import AutoresizeArea from "../UI/GUI/TextAreaResizable.svelte"
     import ChatBody from './ChatBody.svelte'
+    import { getStreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
     import PopupButton from "../UI/PopupButton.svelte";
     import PartialEditController from './PartialEditController.svelte';
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
@@ -612,10 +613,28 @@
 
     let blankMessage = $derived((message === '{{none}}' || message === '{{blank}}' || message === '') && idx === -1 || isComment)
     let displayMessage = $derived(isOptimizedStreamingMessage ? rawStreamingText : message)
-    let renderRawStreaming = $derived(isOptimizedStreamingMessage && streamingOptimizationMode === 'strong')
+    let streamingThoughtMode = $derived(
+        !captureContext && isOptimizedStreamingMessage
+            ? (DBState.db.streamingThoughtMode ?? 'recent')
+            : 'off',
+    )
+    let renderRawStreaming = $derived(
+        !captureContext &&
+            isOptimizedStreamingMessage &&
+            (DBState.db.streamingDeferDisplayProcessing ?? false),
+    )
+    let thoughtPreview = $derived(
+        renderRawStreaming && streamingThoughtMode !== 'off'
+            ? getStreamingThoughtPreview(rawStreamingText)
+            : null,
+    )
+
+    export function hasStreamingPreview(): boolean {
+        return renderRawStreaming || streamingThoughtMode !== 'off'
+    }
 
     function updateDisplayedMessage(){
-        if(renderRawStreaming){
+        if(renderRawStreaming || thoughtPreview){
             return
         }
         displaya(displayMessage)
@@ -906,6 +925,9 @@
                     bind:translating={translating}
                     bind:retranslate={retranslate}
                     {renderRawStreaming}
+                    {thoughtPreview}
+                    {streamingThoughtMode}
+                    deferStreamingDisplay={renderRawStreaming}
                     {rawStreamingText}
                     {onCaptureSettled}
                     {onCaptureError}
@@ -978,7 +1000,7 @@
 {#snippet majorIconButtonsBody(showNames:boolean)}
     {#if DBState.db.useChatCopy && !blankMessage}
     <button class="flex items-center hover:text-blue-500 transition-colors button-icon-copy" onclick={async ()=>{
-        const copyText = renderRawStreaming
+        const copyText = renderRawStreaming || thoughtPreview
             ? risuChatParser(rawStreamingText, {
                 chara: name,
                 chatID: idx,

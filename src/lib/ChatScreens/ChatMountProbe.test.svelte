@@ -32,6 +32,11 @@
     }
     let displayedStreamingText = $state('')
     let refreshCount = $state(0)
+    let optimizedStreaming = $state(true)
+
+    export function hasStreamingPreview() {
+        return optimizedStreaming && displayedStreamingText.includes('<Thoughts>')
+    }
 
     export function updateStreamingDisplay(state: {
         isOptimizedStreamingMessage: boolean
@@ -39,6 +44,7 @@
         rawStreamingText: string
     }) {
         displayedStreamingText = state.rawStreamingText
+        optimizedStreaming = state.isOptimizedStreamingMessage
         chatMountProbe.streamingUpdates.push({
             instanceId,
             rawStreamingText: state.rawStreamingText,

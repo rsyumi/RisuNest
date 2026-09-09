@@ -15,6 +15,9 @@
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { character as CharacterRecord, groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
     import { yieldToMainThread } from 'src/ts/ui/yieldToUi'
+    import StreamingThoughtPreviewView from './StreamingThoughtPreview.svelte'
+    import type { StreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
+    import type { StreamingThoughtMode } from '../../ts/storage/database.svelte'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -32,6 +35,9 @@
         modelShortName: string
         renderRawStreaming?: boolean
         rawStreamingText?: string
+        thoughtPreview?: StreamingThoughtPreview | null
+        streamingThoughtMode?: StreamingThoughtMode
+        deferStreamingDisplay?: boolean
         onCaptureSettled?: (generation: number) => void
         onCaptureError?: (generation: number, error: unknown) => void
         captureContext?: FrozenChatScreenshotRenderContext
@@ -56,6 +62,9 @@
         modelShortName = '',
         renderRawStreaming = false,
         rawStreamingText = '',
+        thoughtPreview = null,
+        streamingThoughtMode = 'off',
+        deferStreamingDisplay = false,
         onCaptureSettled,
         onCaptureError,
         captureContext,
@@ -91,6 +100,14 @@
     let displayedParseJob: ChatBodyParseJob|null = null
     let displayedHtml = $state('')
     let displayEpoch = $state(0)
+    type PendingPreview = {
+        thought: StreamingThoughtPreview | null
+        source: string
+        mode: StreamingThoughtMode
+    }
+    let pendingPreview = $state<PendingPreview | null>(null)
+    let currentThoughtPreview = $derived(captureContext ? null : thoughtPreview)
+
     let parseGeneration = 0
     let lastRenderedRevision: number | null = null
 
@@ -194,7 +211,20 @@
         }
     }
 
-    let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
+    let shouldRenderRawStreaming = $derived(
+        !captureContext &&
+            renderRawStreaming &&
+            (deferStreamingDisplay || (!translated && !retranslate)),
+    )
+    let displayedPreview = $derived<PendingPreview | null>(
+        currentThoughtPreview || shouldRenderRawStreaming
+            ? {
+                  thought: currentThoughtPreview,
+                  source: rawStreamingText,
+                  mode: streamingThoughtMode,
+              }
+            : pendingPreview,
+    )
 
     function trackLiveParseDependencies(
         charArg: string | simpleCharacterArgument,
@@ -250,6 +280,7 @@
     }
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
+        const thoughtMode = captureContext ? 'off' : streamingThoughtMode
         job.controller.signal.throwIfAborted()
         const renderCharacter = parserProjection ? parserChara() : charArg
         const translationCharacter = (
@@ -263,6 +294,7 @@
         }
         const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
             ParseMarkdown(value, renderCharacter, mode, chatID, getCbsCondition(), {
+                streamingThoughtMode: thoughtMode,
                 signal: job.controller.signal,
                 deferredInlays: job.deferredInlays,
                 moduleAssets: captureContext?.moduleAssets ?? parserProjection?.context.moduleAssets,
@@ -544,7 +576,9 @@
 
     let markParsingResult = $derived.by(() => {
         void reloadRevision
-        return shouldRenderRawStreaming ? null : startParsing(renderRevision)
+        return currentThoughtPreview || shouldRenderRawStreaming
+            ? null
+            : startParsing(renderRevision)
     })
 
     async function syncObjectUrls(job: ChatBodyParseJob) {
@@ -563,6 +597,12 @@
             // Keep the current DOM and its media leases until the replacement is ready.
             const html = job.finalizeMarkup(parsed)
             const previousDisplay = displayedParseJob
+            const openThoughts = Array.from(
+                renderRoot?.querySelectorAll<HTMLDetailsElement>(
+                    'details[data-risu-streaming-thought]',
+                ) ?? [],
+            ).map((element) => element.open)
+
             const retainMarkup =
                 html === displayedHtml && previousDisplay?.settledNotified
             if (retainMarkup) {
@@ -574,6 +614,7 @@
             }
             displayedParseJob = job
             displayedHtml = html
+            pendingPreview = null
             await tick()
             if (previousDisplay !== job) disposeParseJob(previousDisplay)
             if (destroyed || job.disposed || job !== markParsingResult) {
@@ -581,6 +622,14 @@
                 return
             }
             lastRenderedRevision = job.requestedRevision
+            renderRoot
+                ?.querySelectorAll<HTMLDetailsElement>(
+                    'details[data-risu-streaming-thought]',
+                )
+                .forEach((element, index) => {
+                    if (openThoughts[index]) element.open = true
+                })
+
             let releaseObjectUrls = () => {}
             if (retainMarkup) {
                 releaseObjectUrls = job.releaseObjectUrls
@@ -637,7 +686,13 @@
             } else disposeParseJob(activeParseJob)
             activeParseJob = result
         }
-        if(shouldRenderRawStreaming){
+        if(currentThoughtPreview || shouldRenderRawStreaming){
+            pendingPreview = {
+                thought: currentThoughtPreview,
+                source: rawStreamingText,
+                mode: streamingThoughtMode,
+            }
+
             disposeParseJob(activeParseJob)
             activeParseJob = null
             disposeParseJob(displayedParseJob)
@@ -650,8 +705,12 @@
     })
 </script>
 
-{#if shouldRenderRawStreaming}
-    <span class="whitespace-pre-wrap">{rawStreamingText}</span>
+{#if displayedPreview}
+    {#if displayedPreview.thought}
+        <StreamingThoughtPreviewView preview={displayedPreview.thought} mode={displayedPreview.mode} source={displayedPreview.source} />
+    {:else}
+        <span class="whitespace-pre-wrap">{displayedPreview.source}</span>
+    {/if}
 {:else}
     <span style="display:contents" bind:this={renderRoot}>
         {#key displayEpoch}

@@ -1757,6 +1757,21 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        streaming: {
+            outputMode: 'Streaming output processing',
+            outputModeHelp:
+                'Exact compatibility applies output processing to every provider update. Balanced processes the latest update about every 0.125 seconds after the first update. Strong defers output processing until normal completion. The selected mode is pinned until the current generation ends. Balanced and Strong can change how often stateful regex, Lua and plugins run. Also enable display processing deferral above to skip display effects while streaming.',
+            title: 'Streaming',
+            thoughtMode: 'Thoughts while streaming',
+            recent: 'Recent lines',
+            collapsed: 'Collapsed',
+            off: 'No special handling',
+            thoughtModeHelp:
+                'Recent lines shows only the latest four lines of reasoning. Collapsed creates a closed thought block that you can expand. No special handling keeps the existing display behavior. This applies only while streaming. With display processing enabled, regex, Lua and plugins receive the full original text before this view is applied.',
+            deferEffects: 'Defer display processing while streaming',
+            deferEffectsHelp:
+                'Show lightweight text while streaming, deferring display regex, Lua, plugins, CBS, translation and formatting for the response. This works independently of the thought view. After streaming, apply normal display processing to the full original, including rules that remove thoughts. Stateful display hooks run fewer times. Output processing and saved text follow the Streaming output processing setting below.',
+        },
         startup: {
             storage: 'Opening storage',
             data: 'Preparing chat data',

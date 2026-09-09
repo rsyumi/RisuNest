@@ -5,6 +5,9 @@
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import { DBState } from 'src/ts/stores.svelte'
     import { untrack } from 'svelte'
+    import { getStreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
+
+    import type { StreamingThoughtMode } from '../../ts/storage/database.svelte'
 
     interface Props {
         initialTranslated?: boolean
@@ -19,6 +22,10 @@
         reactiveAssetWidth?: boolean
         initialAssetWidth?: number
         liveCharacter?: simpleCharacterArgument | null
+        initialMessage?: string
+        initialThoughtPreview?: boolean
+        streamingThoughtMode?: StreamingThoughtMode
+        deferStreamingDisplay?: boolean
     }
 
     let {
@@ -34,14 +41,27 @@
         reactiveAssetWidth = false,
         initialAssetWidth = -1,
         liveCharacter = null,
+        initialMessage = 'first',
+        initialThoughtPreview = false,
+        streamingThoughtMode = 'off',
+        deferStreamingDisplay = false,
     }: Props = $props()
-    let message = $state('first')
+    let message = $state(untrack(() => initialMessage))
+    let previewThoughts = $state(untrack(() => initialThoughtPreview))
+    export function setThoughtPreview(value: boolean) {
+        previewThoughts = value
+    }
+    export function setThoughtMode(value: StreamingThoughtMode) {
+        streamingThoughtMode = value
+    }
     let reloadRevision = $state(0)
     export function reload() {
         reloadRevision += 1
     }
 
-    export function setParserProjection(value: BoundedLiveChatParserProjection) {
+    export function setParserProjection(
+        value: BoundedLiveChatParserProjection,
+    ) {
         parserProjection = value
     }
 
@@ -91,7 +111,12 @@
         retranslate={false}
         modelShortName=""
         renderRawStreaming={raw}
-        rawStreamingText="streaming"
+        rawStreamingText={previewThoughts ? message : 'streaming'}
+        {streamingThoughtMode}
+        {deferStreamingDisplay}
+        thoughtPreview={previewThoughts
+            ? getStreamingThoughtPreview(message)
+            : null}
         {bodyRoot}
         {onCaptureSettled}
         {onCaptureError}

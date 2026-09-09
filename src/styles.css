@@ -563,3 +563,36 @@ body {
 annotation {
   display: none;
 }
+
+/* Shared by the live parser and the deferred streaming preview. */
+.x-risu-streaming-thought-preview {
+  display: block;
+  margin: 0.5em 0;
+  padding: 0.5em 0.75em;
+  border: 1px solid var(--risu-theme-darkborderc);
+  border-radius: 0.5rem;
+  background: var(--risu-theme-darkbg);
+  color: var(--risu-theme-textcolor2);
+}
+.x-risu-streaming-thought-label {
+  display: block;
+  margin-bottom: 0.25em;
+  font-size: 0.75rem;
+}
+.x-risu-streaming-thought-window {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  max-height: 5.6em;
+  min-height: 1.4em;
+  overflow: hidden;
+  line-height: 1.4;
+}
+.x-risu-streaming-thought-window[data-truncated='true'] {
+  mask-image: linear-gradient(to bottom, transparent, black 0.7em);
+}
+.x-risu-streaming-thought-text {
+  flex: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
