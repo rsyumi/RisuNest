@@ -10,6 +10,7 @@ import { ActiveConversationSession } from 'src/ts/storage/activeConversationSess
 import { SynchronousSessionConversationViewportSource } from 'src/ts/conversationViewportSource'
 import type { LiveChatParserProjectionResolver } from 'src/ts/selectedConversationLiveParserProjection'
 import ChatsHarness from './ChatsHarness.test.svelte'
+import { consumeStreamingDisplayStream } from 'src/ts/process/streamingDisplayStream'
 const scriptingState = vi.hoisted(() => ({
     database: { characters: [] as character[], templateDefaultVariables: '' },
     parses: 0,
@@ -312,6 +313,96 @@ test.each([false, true])(
         }
     },
 )
+
+test('renders balanced stream snapshots through the real ChatBody and Lua before EOF without replacing the body', async () => {
+    const character = makeCharacter([{ role: 'char', data: '', chatId: 'stream-output' }])
+    character.chats[0].isStreaming = true
+    const conversation = character.chats[0]
+    const session = new ActiveConversationSession({
+        characterId: character.chaId,
+        conversationId: conversation.id!,
+        conversation,
+        storeRevision: 1,
+    })
+    scriptingState.database = { characters: [character], templateDefaultVariables: '' }
+    scriptingState.session = session
+    scriptingState.parses = 0
+    scriptingState.parseBudget = 20
+    const source = new SynchronousSessionConversationViewportSource({
+        session,
+        captureCurrent: () => ({ character, conversation }),
+    })
+    const resolver: LiveChatParserProjectionResolver = {
+        resolve: async ({ row, totalMessages }) => ({
+            kind: 'complete',
+            characterId: character.chaId,
+            conversationId: conversation.id!,
+            revision: session.version,
+            totalMessages,
+            chatID: row.absoluteIndex,
+            projectedChatID: row.absoluteIndex,
+            historyOffset: 0,
+            reasons: ['projection-budget'],
+            release: () => {},
+        }),
+    }
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+    const mounted = mount(ChatsHarness, {
+        target,
+        props: {
+            initialCharacter: character,
+            initialViewportSource: source,
+            parserProjectionResolver: resolver,
+        },
+    })
+    const abort = new AbortController()
+    let streamController!: ReadableStreamDefaultController<string>
+    const stream = new ReadableStream<string>({
+        start(controller) {
+            streamController = controller
+        },
+    })
+    const consume = consumeStreamingDisplayStream({
+        mode: 'balanced',
+        reader: stream.getReader(),
+        abortSignal: abort.signal,
+        getSnapshot: (value) => value,
+        isOwned: () => session.isActive,
+        processSemantic: async ({ value }, context) => {
+            if (context.canCommit())
+                session.edit(session.locate(0), {
+                    role: 'char',
+                    data: value,
+                    chatId: 'stream-output',
+                })
+        },
+        processPreview: async () => {
+            throw new Error('balanced must use semantic processing')
+        },
+    })
+    try {
+        const body = () => target.querySelector('[data-lua-body][data-index="0"]')
+        await vi.waitFor(() => expect(body()?.textContent).toContain('SYNTHETIC_LUA_OK 1'))
+        const initialBody = body()
+        for (const value of ['first streamed words', 'first streamed words plus more']) {
+            streamController.enqueue(value)
+            await vi.waitFor(() => expect(body()?.textContent).toBe(`${value}\nSYNTHETIC_LUA_OK 1`))
+            expect(body()).toBe(initialBody)
+        }
+        streamController.close()
+        expect((await consume).completed).toBe(true)
+        expect(scriptingState.parses).toBeLessThanOrEqual(6)
+    } finally {
+        abort.abort()
+        await consume
+        await unmount(mounted)
+        source.dispose()
+        scriptingState.parseBudget = Infinity
+        scriptingState.session = null
+        target.remove()
+    }
+})
 
 test.each([0, 12])(
     'waits for a complete lease before a Lua greeting (%i history rows)',

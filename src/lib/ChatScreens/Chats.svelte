@@ -1150,6 +1150,21 @@
                     streamingOptimizationMode: performanceMode,
                     rawStreamingText: message.data,
                 })
+                if (activeStreamingMessage && parserProjectionState?.needsRemount) {
+                    // The row survives streaming revisions, but its previous parser
+                    // lease was aborted. Publish the replacement context and signal
+                    // together so the retained body can render the new text.
+                    untrack(() =>
+                        instance?.refreshMessageDisplay?.({
+                            message: message.data,
+                            totalMessages,
+                            parserProjection,
+                            parserAbortSignal: parserProjectionState.controller.signal,
+                        }),
+                    )
+                    renderSignatures.set(key, renderSignature)
+                    parserProjectionState.needsRemount = false
+                }
             }
 
             const latest = index === totalMessages - 1

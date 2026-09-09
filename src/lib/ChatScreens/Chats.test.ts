@@ -2280,6 +2280,48 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.unmounts).toHaveLength(priorUnmounts)
     })
 
+    test.each(['balanced', 'strong'] as const)(
+        'refreshes the retained %s streaming row with a live parser signal on every session update',
+        async (mode) => {
+            const messages = [makeMessage(0, { data: '' })]
+            const currentCharacter = makeCharacter(messages, true)
+            currentCharacter.chats[0].activeStreamingDisplayOptimizationMode = mode
+            const { session, source } = makeViewportSource(currentCharacter)
+            const resolver: LiveChatParserProjectionResolver = {
+                resolve: vi.fn(async ({ row }) =>
+                    boundedProjection(currentCharacter, row.absoluteIndex),
+                ),
+            }
+            mounted = mount(ChatsHarness, {
+                target,
+                props: {
+                    initialCharacter: currentCharacter,
+                    initialViewportSource: source,
+                    parserProjectionResolver: resolver,
+                },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+            const node = probeElements(target)[0]
+            let previousSignal = chatMountProbe.mounts.find(
+                (entry) => entry.index === 0,
+            )!.parserAbortSignal!
+            for (const data of ['first chunk', 'first chunk second chunk']) {
+                session.edit(session.locate(0), { ...messages[0], data })
+                await vi.waitFor(() => expect(node.dataset.streamingText).toBe(data))
+                const update = chatMountProbe.displayUpdates.at(-1)
+                expect(previousSignal.aborted).toBe(true)
+                expect(update?.message).toBe(data)
+                expect(update?.signal).toBeDefined()
+                expect(update?.signal?.aborted).toBe(false)
+                previousSignal = update!.signal!
+                expect(probeElements(target)[0]).toBe(node)
+            }
+            ;(mounted as HarnessInstance).setStreaming(false)
+            await vi.waitFor(() => expect(probeElements(target)[0]).not.toBe(node))
+            expect(probeElements(target)[0].dataset.message).toBe('first chunk second chunk')
+        },
+    )
+
     test('restarts queued source refreshes with the newest tail and cancels older parser jobs', async () => {
         const messages = Array.from({ length: 12 }, (_, index) =>
             makeMessage(index),

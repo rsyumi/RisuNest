@@ -267,11 +267,12 @@ implements ConversationViewportSource {
             this.lastSessionVersion = event.sessionVersion
             return
         }
+        const previousKeys = this.keys
         this.reconcileKeys(event)
         this.lastSessionVersion = this.session.version
         this.currentVersion = this.session.version
         this.rows = new Map()
-        this.rebuildKeyIndices()
+        if (this.keys !== previousKeys) this.rebuildKeyIndices()
         this.notifyListeners()
     }
 
@@ -286,6 +287,19 @@ implements ConversationViewportSource {
             this.keys = this.createInitialKeys()
             return
         }
+
+        // Streaming replaces text without moving rows. Keep the immutable key
+        // array and index map instead of copying/reindexing the entire history.
+        if (
+            this.keys.length === this.session.totalMessages &&
+            event.mutations.every(
+                (mutation) =>
+                    mutation.deleteCount === mutation.messages.length &&
+                    mutation.start >= 0 &&
+                    mutation.start + mutation.deleteCount <= this.keys.length,
+            )
+        )
+            return
 
         const nextKeys = [...this.keys]
         for (const mutation of event.mutations) {
