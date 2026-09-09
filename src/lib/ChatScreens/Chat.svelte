@@ -41,6 +41,7 @@
     import type { DeepReadonly, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import { safeStructuredClone } from 'src/ts/polyfill'
     import type { ConversationViewportRow } from 'src/ts/conversationViewportSource'
+    import type { ChatDisplayRefresh } from 'src/ts/chatDisplayRefresh'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { groupChat as GroupChatRecord } from 'src/ts/storage/database.svelte'
     import type {
@@ -256,6 +257,40 @@
             partialEditIntent = captureViewportEditIntent()
             partialEditTarget = partialEditIntent ? null : captureCurrentMessage()
         }
+        updateDisplayedMessage()
+    }
+
+    export function refreshParserProjection(
+        projection?: BoundedLiveChatParserProjection,
+    ) {
+        parserProjection = projection
+    }
+
+    export function hasActiveEditor(): boolean {
+        return (
+            editMode ||
+            editTranslationMode ||
+            loadingTranslationEdit ||
+            partialEditIntent !== null ||
+            partialEditTarget !== null
+        )
+    }
+
+    export function refreshMessageDisplay(state: ChatDisplayRefresh): void {
+        message = state.message
+        totalLength = state.totalMessages
+        parserProjection = state.parserProjection
+        parserAbortSignal = state.parserAbortSignal
+        if (state.viewportBinding) {
+            updateViewportBinding({
+                ...state.viewportBinding,
+                parserProjection: state.parserProjection,
+                totalMessages: state.totalMessages,
+            })
+        }
+        // Complete-history renders have no bounded projection object to change.
+        // They still need to re-evaluate scripts when any message changes.
+        chatBodyRevision += 1
         updateDisplayedMessage()
     }
 
@@ -593,7 +628,7 @@
     const unsubscribers:Unsubscriber[] = []
 
     onMount(()=>{
-        if (!captureContext) {
+        if (!captureContext && !viewportRow) {
             unsubscribers.push(ReloadGUIPointer.subscribe(() => {
                 updateDisplayedMessage()
             }))
@@ -838,7 +873,7 @@
             {language.noMessage}
         </div>
     {:else}
-        {@const chatReloadPointer = captureContext ? 0 : $ReloadGUIPointer + ($ReloadChatPointer[idx] ?? 0)}
+        {@const chatReloadPointer = captureContext || viewportRow ? 0 : $ReloadGUIPointer + ($ReloadChatPointer[idx] ?? 0)}
         {@const totalLengthPointer = (idx > totalLength - 6) ? totalLength : 0}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -854,8 +889,8 @@
             style:font-size="{0.875 * (captureZoomSize / 100)}rem"
             style:line-height="{captureLineHeight * (captureZoomSize / 100)}rem"
         >
-            {#key `${totalLengthPointer}|${chatReloadPointer}`}
                 <ChatBody
+                    reloadRevision={`${totalLengthPointer}|${chatReloadPointer}`}
                     {character}
                     {firstMessage}
                     {idx}
@@ -878,7 +913,6 @@
                     {captureParserIndex}
                     {parserAbortSignal}
                     {parserProjection} />
-            {/key}
         </span>
         {#if !captureContext && idx >= 0 && !editMode && !editTranslationMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
             <PartialEditController

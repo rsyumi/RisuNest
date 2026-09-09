@@ -3,6 +3,7 @@
     import type { StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
     import { chatMountProbe } from './chatMountProbe'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
+    import type { ChatDisplayRefresh } from 'src/ts/chatDisplayRefresh'
 
     let {
         message,
@@ -30,6 +31,7 @@
         throw new Error('chat mount probe failure')
     }
     let displayedStreamingText = $state('')
+    let refreshCount = $state(0)
 
     export function updateStreamingDisplay(state: {
         isOptimizedStreamingMessage: boolean
@@ -45,6 +47,25 @@
     }
 
     export function updateViewportBinding() {}
+    export function refreshMessageDisplay(state: ChatDisplayRefresh) {
+        message = state.message
+        parserProjection = state.parserProjection
+        parserAbortSignal = state.parserAbortSignal
+        refreshCount = untrack(() => refreshCount) + 1
+        chatMountProbe.displayUpdates.push({
+            instanceId,
+            index: idx,
+            message,
+            signal: parserAbortSignal,
+        })
+    }
+
+    export function refreshParserProjection(
+        projection?: BoundedLiveChatParserProjection,
+    ) {
+        parserProjection = projection
+        refreshCount = untrack(() => refreshCount) + 1
+    }
 
     onMount(() => {
         displayedStreamingText = rawStreamingText
@@ -73,4 +94,5 @@
     data-image={img}
     data-streaming-text={displayedStreamingText}
     data-bookmarked={bookmarked}
+    data-refresh-count={refreshCount}
 ></div>

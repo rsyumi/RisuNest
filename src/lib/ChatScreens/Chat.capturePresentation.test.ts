@@ -2,7 +2,8 @@
 
 import { writable } from 'svelte/store'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { mount, unmount } from 'svelte'
+import { mount, tick, unmount } from 'svelte'
+import { ReloadChatPointer, ReloadGUIPointer } from 'src/ts/stores.svelte'
 import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
 import type { character, Chat as ChatRecord, Message } from 'src/ts/storage/database.svelte'
 import type { ConversationViewportKey } from 'src/ts/conversationViewportSource'
@@ -508,6 +509,37 @@ describe('Chat frozen capture presentation', () => {
         })
 
         await vi.waitFor(() => expect(target.querySelector('[data-chat-body-probe]')?.textContent).toBe('Viewport body'))
+        const body = target.querySelector('[data-chat-body-probe]')
+        ReloadGUIPointer.update((value) => value + 1)
+        await tick()
+        expect(target.querySelector('[data-chat-body-probe]')).toBe(body)
+        ReloadChatPointer.update((value) => ({ ...value, 3: (value[3] ?? 0) + 1 }))
+        await tick()
+        expect(target.querySelector('[data-chat-body-probe]')).toBe(body)
+        ;(
+            mounted as {
+                refreshMessageDisplay(
+                    state: import('src/ts/chatDisplayRefresh').ChatDisplayRefresh,
+                ): void
+            }
+        ).refreshMessageDisplay({
+            message: 'Updated viewport body',
+            totalMessages: 10,
+            parserAbortSignal: new AbortController().signal,
+            viewportBinding: {
+                viewportRow: {
+                    key: 'viewport-key' as any,
+                    absoluteIndex: 3,
+                    message: { ...message, data: 'Updated viewport body' },
+                    sourceVersion: 2,
+                },
+                viewportSourceToken: 'updated-source',
+                captureViewportTarget: () => null,
+            },
+        })
+        await vi.waitFor(() => expect(body?.textContent).toBe('Updated viewport body'))
+        expect(target.querySelector('[data-chat-body-probe]')).toBe(body)
+
         expect(target.querySelector('[data-chat-id="viewport-message"]')).not.toBeNull()
         expect(target.querySelector('.text-xs')?.textContent?.trim()).not.toBe('')
         expect(indexReads).not.toHaveBeenCalled()
@@ -674,7 +706,9 @@ describe('Chat frozen capture presentation', () => {
             expect(button).not.toBeNull()
             return button!
         })
+        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
         editButton.click()
+        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(true)
         expect(harness.captureMessageEditIntent).toHaveBeenCalledOnce()
         expect(harness.acquireCompleteMessageTargetForIntent).not.toHaveBeenCalled()
 
@@ -685,6 +719,8 @@ describe('Chat frozen capture presentation', () => {
         })
         editor.value = 'Saved after promotion'
         editor.dispatchEvent(new Event('input', { bubbles: true }))
+        editButton.focus()
+        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(true)
         editButton.click()
 
         await vi.waitFor(() => {
@@ -695,6 +731,7 @@ describe('Chat frozen capture presentation', () => {
             )
             expect(harness.release).toHaveBeenCalledOnce()
         })
+        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
     })
 
     test('promotes and releases a windowed message operation before removing its row', async () => {

@@ -15,6 +15,7 @@
         captureParserIndex?: number
         name?: string
         parserProjection?: BoundedLiveChatParserProjection
+        parserAbortSignal?: AbortSignal
         reactiveAssetWidth?: boolean
         initialAssetWidth?: number
         liveCharacter?: simpleCharacterArgument | null
@@ -29,11 +30,25 @@
         captureParserIndex = idx,
         name = 'Frozen Character',
         parserProjection,
+        parserAbortSignal,
         reactiveAssetWidth = false,
         initialAssetWidth = -1,
         liveCharacter = null,
     }: Props = $props()
     let message = $state('first')
+    let reloadRevision = $state(0)
+    export function reload() {
+        reloadRevision += 1
+    }
+
+    export function setParserProjection(value: BoundedLiveChatParserProjection) {
+        parserProjection = value
+    }
+
+    export function setParserAbortSignal(value: AbortSignal) {
+        parserAbortSignal = value
+    }
+
     let raw = $state(false)
     let bodyRoot = $state<HTMLElement | null>(null)
     let assetWidth = $state(untrack(() => initialAssetWidth))
@@ -65,6 +80,7 @@
 <div bind:this={bodyRoot}>
     <ChatBody
         msgDisplay={message}
+        reloadRevision={String(reloadRevision)}
         {idx}
         {name}
         role="char"
@@ -82,5 +98,6 @@
         {captureContext}
         {captureParserIndex}
         {parserProjection}
+        {parserAbortSignal}
     />
 </div>

@@ -70,6 +70,47 @@ describe('ChatConversationStart', () => {
         expect(target.querySelector('.italic')).not.toBeNull()
     })
 
+    test('keeps the greeting mounted while a reload prepares its replacement parser lease', async () => {
+        const release = vi.fn()
+        let finishReload!: (value: null) => void
+        const acquire = vi
+            .fn()
+            .mockResolvedValueOnce({ release })
+            .mockImplementationOnce(
+                () =>
+                    new Promise((resolve) => {
+                        finishReload = resolve
+                    }),
+            )
+        mounted = mount(ChatConversationStart, {
+            target,
+            props: {
+                currentCharacter: metadataOnlyCharacter(),
+                resolvedImage: '',
+                showAiWarning: false,
+                totalMessages: 0,
+                onReroll: () => {},
+                unReroll: () => {},
+                onRemoveCreatorQuote: () => {},
+                acquireConversationStartParserLease: acquire,
+            },
+        })
+        await vi.waitFor(() => expect(chatMountProbe.mounts).toHaveLength(1))
+        const greeting = target.querySelector('[data-chat-probe]')
+        ;(
+            mounted as { refreshConversationStartParser(): void }
+        ).refreshConversationStartParser()
+        await vi.waitFor(() => expect(acquire).toHaveBeenCalledTimes(2))
+        expect(release).toHaveBeenCalledOnce()
+        expect(chatMountProbe.mounts[0].parserAbortSignal?.aborted).toBe(true)
+        expect(target.querySelector('[data-chat-probe]')).toBe(greeting)
+        expect(chatMountProbe.unmounts).toHaveLength(0)
+        finishReload(null)
+        await Promise.resolve()
+        expect(target.querySelector('[data-chat-probe]')).toBe(greeting)
+        expect(chatMountProbe.mounts).toHaveLength(1)
+    })
+
     test('aborts the greeting Chat signal before releasing its complete lease', async () => {
         let acquiredSignal: AbortSignal | undefined
         const abortedAtRelease: boolean[] = []

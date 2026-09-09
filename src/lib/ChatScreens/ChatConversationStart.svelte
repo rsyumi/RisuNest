@@ -46,6 +46,7 @@
     let parserLoadFailed = $state(false)
     let parserLease: { release(): void } | null = null
     let parserController = $state<AbortController | null>(null)
+    let preparingController: AbortController | null = null
     let parserRequestGeneration = 0
     let destroyed = false
 
@@ -56,16 +57,15 @@
     }
 
     async function prepareParser(): Promise<void> {
+        preparingController?.abort()
         parserController?.abort()
         parserLease?.release()
         parserLease = null
         const generation = ++parserRequestGeneration
         const controller = new AbortController()
-        parserController = controller
+        preparingController = controller
         parserLoadFailed = false
-        parserReady = false
-        const isCurrent = () =>
-            !destroyed && generation === parserRequestGeneration
+        const isCurrent = () => !destroyed && generation === parserRequestGeneration
         try {
             const lease =
                 (await acquireConversationStartParserLease?.({
@@ -79,16 +79,22 @@
                 return
             }
             parserLease = lease
+            parserController = controller
             parserReady = true
         } catch {
             if (isCurrent()) parserLoadFailed = true
         }
     }
 
+    export function refreshConversationStartParser(): void {
+        void prepareParser()
+    }
+
     onMount(() => {
         void prepareParser()
         return () => {
             destroyed = true
+            preparingController?.abort()
             parserRequestGeneration += 1
             parserController?.abort()
             parserLease?.release()

@@ -418,3 +418,24 @@ export function areChatRenderSignaturesEqual(
         && sameParserCharacter(left.parserCharacter, right.parserCharacter)
         && left.parserCharacterStamp === right.parserCharacterStamp
 }
+
+/** The caller must keep the same row and conversation owner. */
+export function canRefreshChatRenderInPlace(
+    left: ChatRenderSignature | undefined,
+    right: ChatRenderSignature,
+): boolean {
+    return (
+        left !== undefined &&
+        (left.content === null) === (right.content === null) &&
+        areChatRenderSignaturesEqual(
+            {
+                ...left,
+                content: right.content,
+                liveTailLengthRevision: right.liveTailLengthRevision,
+                reloadPointer: right.reloadPointer,
+                globalReloadPointer: right.globalReloadPointer,
+            },
+            right,
+        )
+    )
+}

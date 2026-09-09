@@ -12,11 +12,13 @@
 
 {#if backgroundHTML || $moduleBackgroundEmbedding}
     {#if selIdState.selId > -1}
-        {#key $ReloadGUIPointer}
+        {#key currentChar?.chaId}
             <div class="absolute top-0 left-0 w-full h-full">
                 <LiveDisplayParserBoundary
                     source={(backgroundHTML || '') + '\n' + ($moduleBackgroundEmbedding || '')}
                     character={currentChar}
+                    refreshRevision={$ReloadGUIPointer}
+                    preservePendingContent
                 >
                     {#snippet children(signal)}
                         <DeferredMarkdown
@@ -27,6 +29,7 @@
                             character={currentChar}
                             mode="back"
                             {signal}
+                            preservePendingContent
                         />
                     {/snippet}
                 </LiveDisplayParserBoundary>

@@ -3,6 +3,7 @@ import type { Message } from './storage/database.svelte'
 import { buildChatViewport } from './chatViewport'
 import {
     areChatRenderSignaturesEqual,
+    canRefreshChatRenderInPlace,
     ChatRenderIdentityRegistry,
     createChatParserDependencyStamp,
     createChatRenderSignature,
@@ -47,6 +48,52 @@ const sameSignature = (
 ) => areChatRenderSignaturesEqual(left, right)
 
 describe('ChatRenderIdentityRegistry', () => {
+    it('allows content and history refreshes while retaining presentation and identity boundaries', () => {
+        const before = signatureFor(message('id', 'before'))
+        expect(canRefreshChatRenderInPlace(before, before)).toBe(true)
+        expect(
+            canRefreshChatRenderInPlace(
+                before,
+                signatureFor(message('id', 'after')),
+            ),
+        ).toBe(true)
+        expect(
+            canRefreshChatRenderInPlace(
+                before,
+                signatureFor(message('id', 'after'), { totalLength: 4 }),
+            ),
+        ).toBe(true)
+        expect(
+            canRefreshChatRenderInPlace(
+                before,
+                signatureFor({ ...message('id'), role: 'user' }),
+            ),
+        ).toBe(false)
+        expect(
+            canRefreshChatRenderInPlace(
+                before,
+                signatureFor(message('id'), { index: 2 }),
+            ),
+        ).toBe(false)
+        expect(
+            canRefreshChatRenderInPlace(
+                before,
+                signatureFor(message('id'), { resolvedImage: 'changed' }),
+            ),
+        ).toBe(false)
+        expect(
+            canRefreshChatRenderInPlace(
+                before,
+                signatureFor(message('id'), {
+                    parserCharacter: {
+                        ...defaultParserCharacter,
+                        virtualscript: 'changed',
+                    },
+                }),
+            ),
+        ).toBe(false)
+    })
+
     it('keeps an id-less identity when a chat ID is assigned later', () => {
         const registry = new ChatRenderIdentityRegistry()
         const original = message(undefined, 'first')

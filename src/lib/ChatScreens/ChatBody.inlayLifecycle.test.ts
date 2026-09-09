@@ -164,6 +164,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
     beforeEach(() => {
         vi.clearAllMocks()
+        parserMocks.trimMarkdown.mockImplementation((value: string) => value)
         vi.stubGlobal('IntersectionObserver', undefined)
         chatState.db = {}
         schedulingMocks.state.controlled = false
@@ -214,6 +215,197 @@ describe('ChatBody deferred inlay lifecycle', () => {
         mounted = undefined
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first')).toHaveLength(1)
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:second')).toHaveLength(1)
+    })
+
+    test('keeps the displayed image and its URL until a reload replacement is ready', async () => {
+        inlayMocks.getInlayAssetBlob.mockImplementation(async (id: string) => ({
+            data: new Blob([id]),
+            type: 'image',
+            name: `${id}.png`,
+        }))
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await vi.waitFor(() =>
+            expect(target.querySelector('img')?.getAttribute('src')).toBe(
+                'blob:first',
+            ),
+        )
+        const image = target.querySelector('img')
+        const gate = deferred<void>()
+        parserMocks.ParseMarkdown.mockImplementationOnce(
+            async (_message: string, ...args: unknown[]) => {
+                await gate.promise
+                return renderDeferredInlaySourceMarkup(
+                    'second',
+                    imageSource,
+                    (args[4] as any).deferredInlays,
+                )
+            },
+        )
+        ;(mounted as { reload(): void }).reload()
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2),
+        )
+        expect(target.querySelector('img')).toBe(image)
+        expect(image?.getAttribute('src')).toBe('blob:first')
+        expect(revokeObjectURL).not.toHaveBeenCalled()
+        gate.resolve()
+        await vi.waitFor(() =>
+            expect(target.querySelector('img')?.getAttribute('src')).toBe(
+                'blob:second',
+            ),
+        )
+        expect(
+            revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first'),
+        ).toHaveLength(1)
+    })
+
+    test('keeps identical HTML nodes and inlay leases across a settled reload', async () => {
+        const settled = vi.fn()
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['first']),
+            type: 'image',
+            name: 'first.png',
+        })
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { onCaptureSettled: settled },
+        })
+        await vi.waitFor(() => expect(settled).toHaveBeenCalledOnce())
+        const image = target.querySelector('img')
+        ;(mounted as { reload(): void }).reload()
+        await vi.waitFor(() => expect(settled).toHaveBeenCalledTimes(2))
+        expect(target.querySelector('img')).toBe(image)
+        expect(image?.getAttribute('src')).toBe('blob:first')
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledOnce()
+        expect(revokeObjectURL).not.toHaveBeenCalled()
+        await unmount(mounted)
+        mounted = undefined
+        expect(
+            revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first'),
+        ).toHaveLength(1)
+    })
+
+    test('retains displayed HTML through superseded parses and ignores their late results', async () => {
+        parserMocks.ParseMarkdown.mockResolvedValueOnce('<button>initial</button>')
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await vi.waitFor(() =>
+            expect(target.querySelector('button')?.textContent).toBe('initial'),
+        )
+        const button = target.querySelector('button')
+        const stale = deferred<string>()
+        const latest = deferred<string>()
+        parserMocks.ParseMarkdown.mockReturnValueOnce(
+            stale.promise,
+        ).mockReturnValueOnce(latest.promise)
+        ;(mounted as { reload(): void }).reload()
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2),
+        )
+        ;(mounted as { reload(): void }).reload()
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(3),
+        )
+        expect(target.querySelector('button')).toBe(button)
+        latest.resolve('<button>latest</button>')
+        await vi.waitFor(() =>
+            expect(target.querySelector('button')?.textContent).toBe('latest'),
+        )
+        stale.resolve('<button>obsolete</button>')
+        await tick()
+        await Promise.resolve()
+        expect(target.querySelector('button')?.textContent).toBe('latest')
+    })
+
+    test('publishes variable-dependent CSS together with its HTML, even for identical encoded markup', async () => {
+        const makeProjection = (color: string) =>
+            ({
+                context: {
+                    ...minimalCaptureContext(),
+                    parserContext: {
+                        ...minimalCaptureContext().parserContext,
+                        chatVariables: { color },
+                    },
+                },
+                projectedChatID: 0,
+            }) as any
+        const markup =
+            '<risu-style>encoded CSS with variable</risu-style><button>panel</button>'
+        // CSS variables are decoded by trimMarkdown after the async display parser.
+        parserMocks.trimMarkdown.mockImplementation(((
+            value: string,
+            context: any,
+        ) =>
+            value.replace(
+                '<risu-style>encoded CSS with variable</risu-style>',
+                `<style>button { color: ${context.parserContext.chatVariables.color} }</style>`,
+            )) as any)
+        parserMocks.ParseMarkdown.mockResolvedValue(markup)
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { parserProjection: makeProjection('red') },
+        })
+        await vi.waitFor(() =>
+            expect(target.querySelector('style')?.textContent).toContain('red'),
+        )
+        const oldStyle = target.querySelector('style')
+        const oldButton = target.querySelector('button')
+        const pending = deferred<string>()
+        parserMocks.ParseMarkdown.mockReturnValueOnce(pending.promise)
+        ;(mounted as { setParserProjection(value: any): void }).setParserProjection(
+            makeProjection('blue'),
+        )
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2),
+        )
+        expect(target.querySelector('style')).toBe(oldStyle)
+        expect(target.querySelector('button')).toBe(oldButton)
+        expect(oldStyle?.textContent).toContain('red')
+        pending.resolve(markup)
+        await vi.waitFor(() =>
+            expect(target.querySelector('style')?.textContent).toContain('blue'),
+        )
+        expect(target.querySelector('button')?.textContent).toBe('panel')
+    })
+
+    test('retains the displayed markup when its projection is aborted before a replacement is admitted', async () => {
+        const controller = new AbortController()
+        const markup =
+            '<style>button { color: red }</style><button>old panel</button>'
+        parserMocks.ParseMarkdown.mockResolvedValueOnce(markup)
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { parserAbortSignal: controller.signal },
+        })
+        await vi.waitFor(() =>
+            expect(target.querySelector('button')?.textContent).toBe('old panel'),
+        )
+        const button = target.querySelector('button')
+        const style = target.querySelector('style')
+        const pending = deferred<string>()
+        parserMocks.ParseMarkdown.mockReturnValueOnce(pending.promise)
+        ;(mounted as { setMessage(value: string): void }).setMessage('superseded')
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2),
+        )
+        controller.abort()
+        pending.resolve('<button>obsolete panel</button>')
+        await tick()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(target.querySelector('button')).toBe(button)
+        expect(target.querySelector('style')).toBe(style)
+        parserMocks.ParseMarkdown.mockResolvedValueOnce(
+            '<style>button { color: blue }</style><button>latest panel</button>',
+        )
+        ;(
+            mounted as { setParserAbortSignal(value: AbortSignal): void }
+        ).setParserAbortSignal(new AbortController().signal)
+        ;(mounted as { setMessage(value: string): void }).setMessage('latest')
+        await vi.waitFor(() =>
+            expect(target.querySelector('button')?.textContent).toBe(
+                'latest panel',
+            ),
+        )
+        expect(target.querySelector('style')?.textContent).toContain('blue')
     })
 
     test('defers live parsing to a later main-thread task', async () => {

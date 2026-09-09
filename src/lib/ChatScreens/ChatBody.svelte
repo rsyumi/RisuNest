@@ -27,6 +27,7 @@
         translating: boolean
         retranslate: boolean
         renderRevision?: number
+        reloadRevision?: string
         bodyRoot?: HTMLElement|null
         modelShortName: string
         renderRawStreaming?: boolean
@@ -50,6 +51,7 @@
         translating = $bindable(false),
         retranslate = $bindable(false),
         renderRevision = 0,
+        reloadRevision = '',
         bodyRoot,
         modelShortName = '',
         renderRawStreaming = false,
@@ -73,6 +75,7 @@
         controller: AbortController
         removeExternalAbortListener(): void
         promise: Promise<string>
+        finalizeMarkup(value: string): string
         deferredInlays: DeferredInlayMarkerRegistry
         disposed: boolean
         generation: number
@@ -85,6 +88,9 @@
     }
 
     let activeParseJob: ChatBodyParseJob|null = null
+    let displayedParseJob: ChatBodyParseJob|null = null
+    let displayedHtml = $state('')
+    let displayEpoch = $state(0)
     let parseGeneration = 0
     let lastRenderedRevision: number | null = null
 
@@ -144,26 +150,34 @@
         }
     }
 
-    function finalizeParsedMarkup(value: string) {
+    function createMarkupFinalizer() {
         const settings = captureContext?.settings ?? DBState.db
         const scriptContext = parserScriptContext()
         const projectedChatID = captureContext
             ? captureParserIndex
             : parserProjection?.projectedChatID
-        const trimmed = scriptContext
-            ? trimMarkdown(value, {
-                hideAllImages: settings.hideAllImages,
-                returnCSSError: settings.returnCSSError,
-                parserContext: scriptContext.parserContext,
-                chatID: idx,
-                projectedChatID,
-                cbsConditions: getCbsCondition(),
-            })
-            : trimMarkdown(value)
-        return captureContext
-            ? addMetadataToElement(trimmed, modelShortName, captureContext.settings.aiLawApplies ?? false)
-            : addMetadataToElement(trimmed, modelShortName)
+        const renderContext = {
+            hideAllImages: settings.hideAllImages,
+            returnCSSError: settings.returnCSSError,
+            parserContext: scriptContext?.parserContext,
+            chatID: idx,
+            projectedChatID,
+            cbsConditions: getCbsCondition(),
+        }
+        const model = modelShortName
+        const frozenLawApplies = captureContext
+            ? (captureContext.settings.aiLawApplies ?? false)
+            : undefined
+        // CSS decoding must use this job's context and publish with its HTML.
+        // Re-evaluating it in the template restyles the old DOM during a refresh.
+        return (value: string) =>
+            addMetadataToElement(
+                trimMarkdown(value, renderContext),
+                model,
+                frozenLawApplies,
+            )
     }
+
     function getCbsCondition(){
         try{
             const cbsConditions:CbsConditions = {
@@ -314,6 +328,12 @@
                 const settings = captureContext?.settings ?? DBState.db
                 if (settings.showTranslationLoading && !job.preservePendingContent) {
                     lastParsed = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
+                    const pendingMarkup = lastParsed
+                    queueMicrotask(() => {
+                        if (!destroyed && !job.disposed && activeParseJob === job && !displayedParseJob) {
+                            displayedHtml = job.finalizeMarkup(pendingMarkup)
+                        }
+                    })
                 }
 
                 let transResult
@@ -398,7 +418,9 @@
         }
         finally{
             //since trimMarkdown is fast, we don't need to cache it
-            lastParsed = lastParsedQueue
+            if (!job.disposed && !job.controller.signal.aborted && activeParseJob === job) {
+                lastParsed = lastParsedQueue
+            }
         }
     }
 
@@ -495,11 +517,12 @@
             controller,
             removeExternalAbortListener: () => externalSignal?.removeEventListener('abort', abort),
             promise: Promise.resolve(''),
+            finalizeMarkup: createMarkupFinalizer(),
             deferredInlays: new DeferredInlayMarkerRegistry(),
             disposed: false,
             generation: ++parseGeneration,
             requestedRevision,
-            preservePendingContent: lastRenderedRevision !== null && requestedRevision !== lastRenderedRevision,
+            preservePendingContent: lastRenderedRevision !== null,
             settledNotified: false,
             errorNotified: false,
             transitional: false,
@@ -519,29 +542,57 @@
         job.deferredInlays.clear()
     }
 
-    let markParsingResult = $derived.by(() => shouldRenderRawStreaming ? null : startParsing(renderRevision))
+    let markParsingResult = $derived.by(() => {
+        void reloadRevision
+        return shouldRenderRawStreaming ? null : startParsing(renderRevision)
+    })
 
     async function syncObjectUrls(job: ChatBodyParseJob) {
         try {
-            await job.promise
+            const parsed = await job.promise
             if (job.transitional) return
-            if (destroyed || job.disposed || job !== markParsingResult) {
-                disposeParseJob(job)
+            if (
+                destroyed ||
+                job.disposed ||
+                job.controller.signal.aborted ||
+                job !== markParsingResult
+            ) {
+                if (job !== displayedParseJob) disposeParseJob(job)
                 return
             }
+            // Keep the current DOM and its media leases until the replacement is ready.
+            const html = job.finalizeMarkup(parsed)
+            const previousDisplay = displayedParseJob
+            const retainMarkup =
+                html === displayedHtml && previousDisplay?.settledNotified
+            if (retainMarkup) {
+                job.releaseObjectUrls = previousDisplay.releaseObjectUrls
+                previousDisplay.releaseObjectUrls = () => {}
+                job.deferredInlays.clear()
+            } else if (html === displayedHtml) {
+                displayEpoch += 1
+            }
+            displayedParseJob = job
+            displayedHtml = html
             await tick()
+            if (previousDisplay !== job) disposeParseJob(previousDisplay)
             if (destroyed || job.disposed || job !== markParsingResult) {
-                disposeParseJob(job)
+                if (job !== displayedParseJob) disposeParseJob(job)
                 return
             }
             lastRenderedRevision = job.requestedRevision
             let releaseObjectUrls = () => {}
-            if (renderRoot) {
+            if (retainMarkup) {
+                releaseObjectUrls = job.releaseObjectUrls
+            } else if (renderRoot) {
                 releaseObjectUrls = onCaptureSettled
-                    ? await resolveDeferredInlaySources(renderRoot, job.deferredInlays, { rejectOnError: true })
+                    ? await resolveDeferredInlaySources(
+                          renderRoot,
+                          job.deferredInlays,
+                          { rejectOnError: true },
+                      )
                     : mountDeferredInlaySources(renderRoot, job.deferredInlays)
-            }
-            else disposeParseJob(job)
+            } else disposeParseJob(job)
             if (destroyed || job.disposed || job !== activeParseJob) {
                 releaseObjectUrls()
                 return
@@ -549,12 +600,23 @@
             job.releaseObjectUrls = releaseObjectUrls
             await checkImg(job)
             await tick()
-            if (destroyed || job.disposed || job !== activeParseJob || job.settledNotified) return
+            if (
+                destroyed ||
+                job.disposed ||
+                job !== activeParseJob ||
+                job.settledNotified
+            )
+                return
             job.settledNotified = true
             onCaptureSettled?.(job.generation)
-        }
-        catch (error) {
-            if (destroyed || job.disposed || job !== activeParseJob || job.errorNotified) return
+        } catch (error) {
+            if (
+                destroyed ||
+                job.disposed ||
+                job !== activeParseJob ||
+                job.errorNotified
+            )
+                return
             job.errorNotified = true
             onCaptureError?.(job.generation, error)
         }
@@ -563,17 +625,24 @@
     onDestroy(() => {
         destroyed = true
         disposeParseJob(activeParseJob)
+        disposeParseJob(displayedParseJob)
     })
 
     $effect(() => {
         const result = markParsingResult
         if (activeParseJob !== result) {
-            disposeParseJob(activeParseJob)
+            if (activeParseJob === displayedParseJob) {
+                activeParseJob?.controller.abort()
+                activeParseJob?.removeExternalAbortListener()
+            } else disposeParseJob(activeParseJob)
             activeParseJob = result
         }
         if(shouldRenderRawStreaming){
             disposeParseJob(activeParseJob)
             activeParseJob = null
+            disposeParseJob(displayedParseJob)
+            displayedParseJob = null
+            displayedHtml = ''
             return
         }
         if (!result) return
@@ -585,12 +654,8 @@
     <span class="whitespace-pre-wrap">{rawStreamingText}</span>
 {:else}
     <span style="display:contents" bind:this={renderRoot}>
-        {#await markParsingResult?.promise}
-            {@html finalizeParsedMarkup(lastParsed)}
-        {:then parsed}
-            {@html finalizeParsedMarkup(parsed ?? '')}
-        {:catch}
-            {@html finalizeParsedMarkup(lastParsed)}
-        {/await}
+        {#key displayEpoch}
+            {@html displayedHtml}
+        {/key}
     </span>
 {/if}

@@ -1,13 +1,15 @@
 <script lang="ts">
     import type { character, groupChat, Message, StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
-    import { mount, onDestroy, onMount, tick, unmount } from 'svelte'
+    import { mount, onDestroy, onMount, tick, unmount, untrack } from 'svelte'
     import { get } from 'svelte/store'
     import Chat from './Chat.svelte'
+    import type { ChatDisplayRefresh } from 'src/ts/chatDisplayRefresh'
     import ChatConversationStart from './ChatConversationStart.svelte'
     import { getCharImage } from 'src/ts/characters'
     import { createSimpleCharacter, DBState, selectedCharID, ReloadChatPointer, ReloadGUIPointer } from 'src/ts/stores.svelte'
     import {
         areChatRenderSignaturesEqual,
+        canRefreshChatRenderInPlace,
         ChatRenderIdentityRegistry,
         type ChatRenderIdentitySequence,
         createChatParserDependencyStamp,
@@ -95,6 +97,12 @@
     const CHAT_MOUNT_BATCH_SIZE = 4
 
     type ChatInstance = {
+        refreshMessageDisplay?: (state: ChatDisplayRefresh) => void
+        hasActiveEditor?: () => boolean
+        refreshParserProjection?: (
+            projection?: BoundedLiveChatParserProjection,
+        ) => void
+        refreshConversationStartParser?: () => void
         updateConversationStartPresentation?: (state: {
             resolvedImage: string
         }) => void
@@ -106,7 +114,9 @@
         updateViewportBinding?: (state: {
             viewportRow: ConversationViewportRow
             viewportSourceToken: string
-            captureViewportTarget: () => ReturnType<ConversationViewportSource['captureMessageTarget']>
+            captureViewportTarget: () => ReturnType<
+                ConversationViewportSource['captureMessageTarget']
+            >
             parserProjection?: BoundedLiveChatParserProjection
             totalMessages: number
         }) => void
@@ -216,6 +226,7 @@
     let resolvedUserImage = $state<string | null>(null)
     let imagesReady = $state(false)
     let imageResolutionGeneration = 0
+    let imageOwner: string | undefined
     let hasRenderedChat = false
     let simpleChar = $derived(createSimpleCharacter(currentCharacter))
     let parserCharacter = $derived(simpleChar ? {
@@ -234,8 +245,11 @@
         void $ReloadGUIPointer
         const generation = ++imageResolutionGeneration
         imagesReady = false
-        resolvedCharacterImage = null
-        resolvedUserImage = null
+        if (imageOwner !== currentCharacter.chaId) {
+            imageOwner = currentCharacter.chaId
+            resolvedCharacterImage = null
+            resolvedUserImage = null
+        }
         void Promise.allSettled([
             getCharImage(characterImageSource, 'css'),
             getCharImage(userImageSource, 'css'),
@@ -963,18 +977,20 @@
                 }
             }
             const sourceHandoff = sourceHandoffRuntimeKeys.has(key)
-            const requiresRemount = sourceHandoff
-                || parserProjectionState?.needsRemount === true
-                || !areChatRenderSignaturesEqual(previousSignature, renderSignature)
-            const preserveMountedRuntime = (
-                sourceHandoff
-                || parserProjectionState?.preserveMountedRuntime === true
-            )
-                && mountInstances.has(key) && (
-                activeStreamingMessage
-                || pinReasons.get(key)?.has('editor') === true
-                || pinReasons.get(key)?.has('playing-media') === true
-            )
+            const requiresRemount =
+                sourceHandoff ||
+                parserProjectionState?.needsRemount === true ||
+                !areChatRenderSignaturesEqual(previousSignature, renderSignature)
+            const refreshMountedDisplay =
+                !sourceHandoff &&
+                canRefreshChatRenderInPlace(previousSignature, renderSignature) &&
+                typeof mountInstances.get(key)?.refreshMessageDisplay === 'function'
+            const preserveMountedRuntime =
+                (sourceHandoff || parserProjectionState?.preserveMountedRuntime === true) &&
+                mountInstances.has(key) &&
+                (activeStreamingMessage ||
+                    hasFocusedEditor(key) ||
+                    pinReasons.get(key)?.has('playing-media') === true)
             if (requiresRemount && !preserveMountedRuntime) {
                 const source = activeViewportSource
                 const sourceToken = sourceSnapshot?.sourceToken
@@ -985,14 +1001,14 @@
                     key,
                     element,
                     priority:
-                        key === preferredMountKey
+                        index === totalMessages - 1
                             ? 0
-                            : activeStreamingMessage
+                            : key === preferredMountKey || activeStreamingMessage
                               ? 1
                               : row.pinReasons.length > 0
                                 ? 2
                                 : 3,
-                    order: ++mountQueueOrder,
+                    order: refreshMountedDisplay ? -index : ++mountQueueOrder,
                     parserProjectionState,
                     isCurrent: () => {
                         if (
@@ -1004,15 +1020,11 @@
                             return false
                         if (
                             parserProjectionState &&
-                            !isRowParserProjectionCurrent(
-                                key,
-                                parserProjectionState,
-                            )
+                            !isRowParserProjectionCurrent(key, parserProjectionState)
                         ) {
                             return false
                         }
-                        if (!sourceSnapshot)
-                            return activeViewportSource === null
+                        if (!sourceSnapshot) return activeViewportSource === null
                         if (activeViewportSource !== source) return false
                         const snapshot = currentSourceSnapshot()
                         if (
@@ -1027,6 +1039,35 @@
                         )
                     },
                     run: () => {
+                        if (refreshMountedDisplay) {
+                            const instance = mountInstances.get(key)
+                            untrack(() =>
+                                instance?.refreshMessageDisplay?.({
+                                    message: message.data,
+                                    totalMessages,
+                                    parserProjection,
+                                    parserAbortSignal:
+                                        parserProjectionState?.controller.signal,
+                                    viewportBinding:
+                                        viewportRow && source && sourceToken
+                                            ? {
+                                                  viewportRow,
+                                                  viewportSourceToken: sourceToken,
+                                                  captureViewportTarget: () =>
+                                                      source.captureMessageTarget(
+                                                          viewportRow.key,
+                                                      ),
+                                              }
+                                            : undefined,
+                                }),
+                            )
+                            renderSignatures.set(key, renderSignature)
+                            if (parserProjectionState)
+                                parserProjectionState.needsRemount = false
+                            clearQueuedRowHeight(element)
+                            settleRowMountWaiters(key, true)
+                            return
+                        }
                         releaseRowRuntimeState(key, true)
                         unmountInstance(key)
                         element.replaceChildren()
@@ -1037,14 +1078,9 @@
                                 viewportRow,
                                 captureViewportTarget:
                                     viewportRow && source
-                                        ? () =>
-                                              source.captureMessageTarget(
-                                                  viewportRow.key,
-                                              )
+                                        ? () => source.captureMessageTarget(viewportRow.key)
                                         : undefined,
-                                viewportSourceToken: viewportRow
-                                    ? sourceToken
-                                    : undefined,
+                                viewportSourceToken: viewportRow ? sourceToken : undefined,
                                 selectedConversationOperations,
                                 bookmarked,
                                 isLastMemory: false,
@@ -1067,11 +1103,11 @@
                                         : currentCharacter.name,
                                 isComment: message.isComment ?? false,
                                 disabled: message.disabled ?? false,
-                                isOptimizedStreamingMessage:
-                                    activeStreamingMessage,
+                                isOptimizedStreamingMessage: activeStreamingMessage,
                                 streamingOptimizationMode: performanceMode,
                                 rawStreamingText: message.data,
                                 parserProjection,
+                                parserAbortSignal: parserProjectionState?.controller.signal,
                             },
                         })
                         mountInstances.set(key, instance)
@@ -1093,12 +1129,18 @@
                 pendingRowMounts.delete(key)
                 clearQueuedRowHeight(element)
                 const instance = mountInstances.get(key)
-                if (sourceHandoff && viewportRow && activeViewportSource && sourceSnapshot) {
+                if (
+                    sourceHandoff &&
+                    viewportRow &&
+                    activeViewportSource &&
+                    sourceSnapshot
+                ) {
                     const source = activeViewportSource
                     instance?.updateViewportBinding?.({
                         viewportRow,
                         viewportSourceToken: sourceSnapshot.sourceToken,
-                        captureViewportTarget: () => source.captureMessageTarget(viewportRow.key),
+                        captureViewportTarget: () =>
+                            source.captureMessageTarget(viewportRow.key),
                         parserProjection,
                         totalMessages,
                     })
@@ -1109,6 +1151,7 @@
                     rawStreamingText: message.data,
                 })
             }
+
             const latest = index === totalMessages - 1
             element.classList.toggle('is-latest-chat-row', latest)
             element.classList.toggle(
@@ -1374,6 +1417,18 @@
             parserCharacterStamp,
             get(ReloadGUIPointer),
         ])
+        const previousSignature = element.dataset.chatConversationStartSignature
+        if (previousSignature && previousSignature !== signature && mountInstances.has(key)) {
+            const previousInputs = JSON.parse(previousSignature)
+            const nextInputs = JSON.parse(signature)
+            // Recheck history admission on reload without discarding the greeting.
+            previousInputs[11] = nextInputs[11]
+            if (JSON.stringify(previousInputs) === signature) {
+                element.dataset.chatConversationStartSignature = signature
+                untrack(() => mountInstances.get(key)?.refreshConversationStartParser?.())
+                return
+            }
+        }
         if (
             element.dataset.chatConversationStartSignature === signature &&
             mountInstances.has(key)
@@ -1429,7 +1484,9 @@
         if (!preserveParserProjection) releaseRowParserProjection(key)
         const media = playingMedia.get(key)
         playingMedia.delete(key)
-        pinReasons.delete(key)
+        // A remount can remove the focused control before focusout runs. Mirror
+        // its released UI pin to the source even when no later input arrives.
+        if (pinReasons.delete(key)) queueProjectionReconcile()
         for (const target of media ?? []) {
             if (!(target instanceof HTMLMediaElement)) continue
             try {
@@ -1627,7 +1684,41 @@
         return target.closest<HTMLElement>('[data-chat-render-key]')?.dataset.chatRenderKey ?? null
     }
 
+    function hasFocusedEditor(key: string): boolean {
+        if (!pinReasons.get(key)?.has('editor')) return false
+        if (untrack(() => mountInstances.get(key)?.hasActiveEditor?.())) return true
+        const focused = document.activeElement
+        if (
+            !(focused instanceof HTMLElement) ||
+            !mountedElements.get(key)?.contains(focused)
+        )
+            return false
+        if (focused instanceof HTMLTextAreaElement) return true
+        if (focused instanceof HTMLInputElement) {
+            return ![
+                'button',
+                'submit',
+                'reset',
+                'checkbox',
+                'radio',
+                'file',
+                'image',
+                'range',
+                'color',
+                'hidden',
+            ].includes(focused.type)
+        }
+        const editable = focused
+            .closest('[contenteditable]')
+            ?.getAttribute('contenteditable')
+        return (
+            editable === '' || editable === 'true' || editable === 'plaintext-only'
+        )
+    }
+
     function handleFocusIn(event: FocusEvent): void {
+        // All focused controls keep their row resident. Only an actual editor
+        // may postpone a changed message; a bot button must display its result.
         const key = rowKeyFromEvent(event)
         if (key) addPin(key, 'editor')
     }

@@ -737,7 +737,7 @@ describe('Chats imperative mount lifecycle', () => {
         const oldInstance = probeIdForMessage(target, 'message-0')
 
         schedulingMocks.state.controlled = true
-        ReloadGUIPointer.update((value) => value + 1)
+        ;(mounted as HarnessInstance).replaceParserDependencies()
         await tick()
         await vi.waitFor(() =>
             expect(
@@ -801,6 +801,64 @@ describe('Chats imperative mount lifecycle', () => {
         expect(session.pinCount('streaming')).toBe(0)
     })
 
+    test.each(['button', 'checkbox', 'link'])(
+        'applies a bot message change while its %s still has focus',
+        async (kind) => {
+            const messages = Array.from({ length: 8 }, (_, index) =>
+                makeMessage(index),
+            )
+            const currentCharacter = makeCharacter(messages)
+            const { session, source } = makeViewportSource(currentCharacter)
+            const resolver: LiveChatParserProjectionResolver = {
+                resolve: vi.fn(async ({ row }) =>
+                    boundedProjection(currentCharacter, row.absoluteIndex),
+                ),
+            }
+            mounted = mount(ChatsHarness, {
+                target,
+                props: {
+                    initialMessages: messages,
+                    initialCharacter: currentCharacter,
+                    initialViewportSource: source,
+                    parserProjectionResolver: resolver,
+                },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+            const row = probeElements(target).find(
+                (element) => element.dataset.message === 'message-7',
+            )!
+            const control = document.createElement(
+                kind === 'checkbox' ? 'input' : kind === 'link' ? 'a' : 'button',
+            )
+            if (control instanceof HTMLInputElement) control.type = 'checkbox'
+            if (control instanceof HTMLAnchorElement) control.href = '#synthetic'
+            row.append(control)
+            control.focus()
+            expect(document.activeElement).toBe(control)
+            // Keep the focused row resident, but do not freeze it as an unsaved editor.
+            expect(session.pinCount('editor')).toBe(1)
+            session.edit(session.locate(7), {
+                ...messages[7],
+                data: 'updated bot UI',
+            })
+            await vi.waitFor(() =>
+                expect(
+                    probeElements(target).some(
+                        (element) => element.dataset.message === 'updated bot UI',
+                    ),
+                ).toBe(true),
+            )
+            expect(
+                probeElements(target).some(
+                    (element) => element.dataset.message === 'message-7',
+                ),
+            ).toBe(false)
+            expect(document.activeElement).toBe(control)
+            control.blur()
+            await vi.waitFor(() => expect(session.pinCount('editor')).toBe(0))
+        },
+    )
+
     test('preserves focused editors and playing media while source parser projections refresh', async () => {
         const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
         const currentCharacter = makeCharacter(messages)
@@ -857,9 +915,11 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(session.pinCount('editor')).toBe(0))
         expect(session.pinCount('playing-media')).toBe(0)
         await vi.waitFor(() => {
-            expect(probeIdForMessage(target, 'message-0')).not.toBe(editorInstance)
-            expect(probeIdForMessage(target, 'message-1')).not.toBe(mediaInstance)
+            expect(chatMountProbe.displayUpdates.some(update => update.instanceId === editorInstance)).toBe(true)
+            expect(chatMountProbe.displayUpdates.some(update => update.instanceId === mediaInstance)).toBe(true)
         })
+        expect(probeIdForMessage(target, 'message-0')).toBe(editorInstance)
+        expect(probeIdForMessage(target, 'message-1')).toBe(mediaInstance)
     })
 
     test('preserves pinned row runtime across a transient parser projection retry', async () => {
@@ -2160,6 +2220,154 @@ describe('Chats imperative mount lifecycle', () => {
         expect(release).not.toHaveBeenCalled()
     })
 
+    test('refreshes every row after a message edit without removing the displayed components', async () => {
+        const messages = Array.from({ length: 12 }, (_, index) =>
+            makeMessage(index),
+        )
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) =>
+                boundedProjection(currentCharacter, row.absoluteIndex),
+            ),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(12))
+        const nodes = [...probeElements(target)]
+        const priorUnmounts = chatMountProbe.unmounts.length
+        session.edit(session.locate(11), {
+            ...messages[11],
+            data: 'new last message',
+        })
+        await vi.waitFor(() =>
+            expect(chatMountProbe.displayUpdates).toHaveLength(12),
+        )
+        expect(chatMountProbe.displayUpdates[0].index).toBe(11)
+        expect(
+            new Set(chatMountProbe.displayUpdates.map((update) => update.index))
+                .size,
+        ).toBe(12)
+        expect(probeElements(target)).toEqual(nodes)
+        expect(chatMountProbe.unmounts).toHaveLength(priorUnmounts)
+        expect(
+            probeElements(target).some(
+                (node) => node.dataset.message === 'new last message',
+            ),
+        ).toBe(true)
+
+        chatMountProbe.displayUpdates = []
+        session.edit(session.locate(2), {
+            ...messages[2],
+            data: 'edited older message',
+        })
+        await vi.waitFor(() =>
+            expect(chatMountProbe.displayUpdates).toHaveLength(12),
+        )
+        expect(probeElements(target)).toEqual(nodes)
+        expect(
+            probeElements(target).some(
+                (node) => node.dataset.message === 'edited older message',
+            ),
+        ).toBe(true)
+        expect(chatMountProbe.unmounts).toHaveLength(priorUnmounts)
+    })
+
+    test('restarts queued source refreshes with the newest tail and cancels older parser jobs', async () => {
+        const messages = Array.from({ length: 12 }, (_, index) =>
+            makeMessage(index),
+        )
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) =>
+                boundedProjection(currentCharacter, row.absoluteIndex),
+            ),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(12))
+        const nodes = [...probeElements(target)]
+        schedulingMocks.state.controlled = true
+        session.edit(session.locate(11), {
+            ...messages[11],
+            data: 'superseded tail',
+        })
+        await vi.waitFor(() =>
+            expect(schedulingMocks.pending.length).toBeGreaterThan(0),
+        )
+        schedulingMocks.releaseNext()
+        await vi.waitFor(() =>
+            expect(chatMountProbe.displayUpdates).toHaveLength(4),
+        )
+        expect(chatMountProbe.displayUpdates.map((update) => update.index)).toEqual(
+            [11, 10, 9, 8],
+        )
+        const previousSignals = chatMountProbe.displayUpdates.map(
+            (update) => update.signal,
+        )
+        session.edit(session.locate(11), { ...messages[11], data: 'latest tail' })
+        await vi.waitFor(() =>
+            expect(previousSignals.every((signal) => signal?.aborted)).toBe(true),
+        )
+        schedulingMocks.state.controlled = false
+        schedulingMocks.releaseAll()
+        await vi.waitFor(() =>
+            expect(chatMountProbe.displayUpdates).toHaveLength(16),
+        )
+        const next = chatMountProbe.displayUpdates.slice(4)
+        expect(next.map((update) => update.index)).toEqual([
+            11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+        ])
+        expect(next[0].message).toBe('latest tail')
+        expect(next.every((update) => !update.signal?.aborted)).toBe(true)
+        expect(probeElements(target)).toEqual(nodes)
+    })
+
+    test('refreshes unchanged messages and greeting without unmounting on a global display reload', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
+        const acquireGreeting = vi.fn(async () => null)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+                acquireConversationStartParserLease: acquireGreeting,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledOnce())
+        const previousRows = [...probeElements(target)]
+        const previousGreeting = conversationStartProbe(target)
+        const unmounts = chatMountProbe.unmounts.length
+        ReloadGUIPointer.update((value) => value + 1)
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() =>
+            expect(
+                probeElements(target).every(
+                    (row) => Number(row.dataset.refreshCount) > 0,
+                ),
+            ).toBe(true),
+        )
+        expect(probeElements(target)).toEqual(previousRows)
+        expect(conversationStartProbe(target)).toBe(previousGreeting)
+        expect(chatMountProbe.unmounts).toHaveLength(unmounts)
+    })
+
     test('rechecks greeting admission when in-place parser scripts or global modules reload', async () => {
         const messages = [makeMessage(0)]
         const currentCharacter = makeCharacter(messages)
@@ -2437,7 +2645,7 @@ describe('Chats imperative mount lifecycle', () => {
         message.append(media)
         media.dispatchEvent(new Event('play'))
 
-        ReloadGUIPointer.update((value) => value + 1)
+        ;(mounted as HarnessInstance).replaceParserDependencies()
         await vi.waitFor(() => expect(probeIdForMessage(target, 'message-0')).not.toBe(originalInstance))
         expect(media.isConnected).toBe(false)
         expect(chatMountProbe.unmounts).toContain(originalInstance)
