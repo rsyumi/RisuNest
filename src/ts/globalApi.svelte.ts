@@ -390,6 +390,7 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
         ext: fileExtension,
     })
     tauriAssetUrlCache.delete(form)
+    pendingTauriAssetUrls.delete(form)
     pendingBrowserAssetReads.delete(form)
     if (browserAssetDataUrlCache.get(form) !== undefined) {
         browserAssetDataUrlCache.set(form, buildAssetDataUrl(inferBlobMime('', fileExtension), data))

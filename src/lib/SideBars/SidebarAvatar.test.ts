@@ -190,6 +190,53 @@ describe('SidebarAvatar lazy sources', () => {
         )
     })
 
+    it('loads character and folder images again after the settings screen remounts the sidebar', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const characterSource = vi.fn(() => Promise.resolve('/character.png'))
+        const folderSource = vi.fn(() => Promise.resolve('/folder.png'))
+        const firstCharacter = renderAvatar({ src: characterSource })
+        const hiddenCharacter = renderAvatar({ src: () => '/hidden.png' })
+        await tick()
+
+        const firstObserver = TestIntersectionObserver.instances[0]
+        firstObserver.setVisible(
+            firstCharacter.target.querySelector('.avatar')!,
+        )
+        await tick()
+        expect(
+            firstCharacter.target.querySelector('img')?.getAttribute('src'),
+        ).toBe('/character.png')
+
+        firstCharacter.component.$destroy()
+        hiddenCharacter.component.$destroy()
+        mounted.splice(0, 2)
+        expect(firstObserver.observed.size).toBe(0)
+
+        const remountedCharacter = renderAvatar({ src: characterSource })
+        const remountedFolder = renderAvatar({
+            src: 'slot',
+            backgroundimg: folderSource,
+        })
+        await tick()
+        const nextObserver = TestIntersectionObserver.instances.at(-1)!
+        expect(nextObserver).not.toBe(firstObserver)
+        nextObserver.setVisible(
+            remountedCharacter.target.querySelector('.avatar')!,
+            remountedFolder.target.querySelector('.avatar')!,
+        )
+        await tick()
+
+        expect(characterSource).toHaveBeenCalledTimes(2)
+        expect(folderSource).toHaveBeenCalledTimes(1)
+        expect(
+            remountedCharacter.target.querySelector('img')?.getAttribute('src'),
+        ).toBe('/character.png')
+        expect(
+            remountedFolder.target.querySelector<HTMLElement>('.sidebar-avatar')
+                ?.style.backgroundImage,
+        ).toContain('/folder.png')
+    })
+
     it('loads immediately without IntersectionObserver and keeps fallback content on rejection', async () => {
         vi.stubGlobal('IntersectionObserver', undefined)
         const normalSource = vi.fn(() =>

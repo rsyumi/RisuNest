@@ -354,6 +354,38 @@ describe('getFileSrc tauri asset route', () => {
         ])
     })
 
+    test('does not reuse an in-flight native URL after overwriting the asset', async () => {
+        state.isTauri = true
+        const stale = deferred<string | null>()
+        const started = deferred<void>()
+        state.blobStore = createFakeBlobStore({
+            'assets/overwritten-avatar.png': {
+                data: new Uint8Array([7]),
+                mime: 'image/png',
+            },
+        })
+        state.blobStore.resolveUrl = vi
+            .fn()
+            .mockImplementationOnce(() => {
+                started.resolve()
+                return stale.promise
+            })
+            .mockResolvedValueOnce('asset:///data/assets/fresh-avatar.png')
+
+        const beforeSave = getFileSrc('assets/overwritten-avatar.png')
+        await started.promise
+        await saveAsset(new Uint8Array([8]), 'overwritten-avatar', 'avatar.png')
+
+        stale.resolve('asset:///data/assets/stale-avatar.png')
+        await expect(beforeSave).resolves.toBe(
+            'asset:///data/assets/stale-avatar.png',
+        )
+        await expect(getFileSrc('assets/overwritten-avatar.png')).resolves.toBe(
+            'asset:///data/assets/fresh-avatar.png',
+        )
+        expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(2)
+    })
+
     test('retries a native URL lookup after an in-flight rejection', async () => {
         state.isTauri = true
         state.blobStore = createFakeBlobStore({
