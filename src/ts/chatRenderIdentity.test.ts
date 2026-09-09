@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Message } from './storage/database.svelte'
 import { buildChatViewport } from './chatViewport'
 import {
@@ -275,6 +275,62 @@ describe('ChatRenderIdentityRegistry', () => {
 })
 
 describe('createChatRenderSignature', () => {
+    it('reuses immutable large script fingerprints while detecting same-length in-place edits', () => {
+        const source = 'synthetic-lua-dependency:'.repeat(1024)
+        const character = {
+            ...defaultParserCharacter,
+            triggerscript: [{ effect: [{ type: 'triggerlua', code: source }] }],
+        }
+        const initial = createChatParserDependencyStamp(character)
+        const multiply = vi.spyOn(Math, 'imul')
+        try {
+            expect(createChatParserDependencyStamp(character)).toBe(initial)
+            expect(multiply.mock.calls.length).toBeLessThan(2_000)
+
+            multiply.mockClear()
+            character.triggerscript[0].effect[0].code = `${source.slice(0, -1)}!`
+            const updated = createChatParserDependencyStamp(character)
+            expect(updated).not.toBe(initial)
+            expect(multiply.mock.calls.length).toBeGreaterThan(source.length)
+
+            multiply.mockClear()
+            expect(createChatParserDependencyStamp(character)).toBe(updated)
+            expect(multiply.mock.calls.length).toBeLessThan(2_000)
+        } finally {
+            multiply.mockRestore()
+        }
+    })
+
+    it('evicts retained large script strings by total size without changing their stamps', () => {
+        const character = {
+            ...defaultParserCharacter,
+            customscript: [{ out: 'synthetic-cache-size-probe:'.repeat(256) }],
+        }
+        const initial = createChatParserDependencyStamp(character)
+        for (let index = 0; index < 3; index++) {
+            createChatParserDependencyStamp({
+                ...defaultParserCharacter,
+                customscript: [
+                    {
+                        out: `synthetic-large-cache-entry-${index}:`.padEnd(
+                            800_000,
+                            'x',
+                        ),
+                    },
+                ],
+            })
+        }
+        const multiply = vi.spyOn(Math, 'imul')
+        try {
+            expect(createChatParserDependencyStamp(character)).toBe(initial)
+            expect(multiply.mock.calls.length).toBeGreaterThan(
+                character.customscript[0].out.length,
+            )
+        } finally {
+            multiply.mockRestore()
+        }
+    })
+
     it('separates stable identity from content and explicit render dependencies', () => {
         const original = message('message-1')
         const base = signatureFor(original)

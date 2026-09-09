@@ -247,6 +247,44 @@ export interface ChatRenderSignature {
     parserCharacterStamp: string | null
 }
 
+const PARSER_STRING_CACHE_MIN_LENGTH = 256
+const PARSER_STRING_CACHE_MAX_ENTRIES = 256
+const PARSER_STRING_CACHE_MAX_CODE_UNITS = 2 * 1024 * 1024
+const parserStringStampCache = new Map<string, string>()
+let parserStringStampCacheCodeUnits = 0
+
+function largeParserStringStamp(value: string): string {
+    const cached = parserStringStampCache.get(value)
+    if (cached !== undefined) {
+        parserStringStampCache.delete(value)
+        parserStringStampCache.set(value, cached)
+        return cached
+    }
+
+    let first = 0x811c9dc5
+    let second = 0x9e3779b9
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index)
+        first = Math.imul(first ^ code, 0x01000193)
+        second = Math.imul(second ^ code, 0x85ebca6b)
+    }
+    const stamp = `${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0).toString(16).padStart(8, '0')}`
+    if (value.length <= PARSER_STRING_CACHE_MAX_CODE_UNITS) {
+        while (
+            parserStringStampCache.size >= PARSER_STRING_CACHE_MAX_ENTRIES ||
+            parserStringStampCacheCodeUnits + value.length >
+                PARSER_STRING_CACHE_MAX_CODE_UNITS
+        ) {
+            const oldest = parserStringStampCache.keys().next().value!
+            parserStringStampCache.delete(oldest)
+            parserStringStampCacheCodeUnits -= oldest.length
+        }
+        parserStringStampCache.set(value, stamp)
+        parserStringStampCacheCodeUnits += value.length
+    }
+    return stamp
+}
+
 export function createChatParserDependencyStamp(character: ChatParserCharacterDependencies | null): string | null {
     if (!character) return null
 
@@ -269,7 +307,15 @@ export function createChatParserDependencyStamp(character: ChatParserCharacterDe
         if (valueType !== 'object') {
             const text = String(value)
             write(`${valueType}:${text.length}:`)
-            write(text)
+            // Only immutable string leaves are cached. Keep visiting reactive
+            // containers and reading their fields so in-place edits invalidate
+            // the Svelte derived stamp without rescanning unchanged Lua/regex text.
+            if (valueType === 'string' && text.length >= PARSER_STRING_CACHE_MIN_LENGTH) {
+                write('hashed:')
+                write(largeParserStringStamp(text))
+            } else {
+                write(text)
+            }
             write(';')
             return
         }
