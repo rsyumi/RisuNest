@@ -16,12 +16,24 @@ export function captureChatBindingTarget() {
     const conversation = character?.chats[character.chatPage]
     if (!conversation || isConversationSummaryStub(conversation)) return null
     const navigation = getPersistentNavigationGeneration()
+    const currentConversation = () =>
+        DBState.db.characters
+            .find((item) => item.chaId === character.chaId)
+            ?.chats.find((chat) => chat.id === conversation.id)
     return {
-        conversation,
-        isCurrent: () =>
-            navigation === getPersistentNavigationGeneration() &&
-            DBState.db.characters[get(selectedCharID)]?.chaId === character.chaId &&
-            character.chats[character.chatPage]?.id === conversation.id,
+        get conversation() {
+            return currentConversation() ?? conversation
+        },
+        isCurrent: () => {
+            const selected = DBState.db.characters[get(selectedCharID)]
+            const current = selected?.chats[selected.chatPage]
+            return (
+                navigation === getPersistentNavigationGeneration() &&
+                selected?.chaId === character.chaId &&
+                current?.id === conversation.id &&
+                !isConversationSummaryStub(current)
+            )
+        },
     }
 }
 

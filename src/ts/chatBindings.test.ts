@@ -55,6 +55,21 @@ it('invalidates the captured picker target even after A to B to A navigation', (
     state.navigation += 2
     expect(target.isCurrent()).toBe(false)
 })
+it('binds the latest metadata when hydration replaces the same selected conversation', async () => {
+    const target = captureChatBindingTarget()!
+    const original = target.conversation
+    const replacement = createMetadataOnlySelectedConversation({
+        id: 'chat',
+        name: 'Synthetic',
+        note: '',
+        localLore: [],
+    })
+    state.db.characters[0] = { ...state.db.characters[0], chats: [replacement] }
+    expect(target.isCurrent()).toBe(true)
+    await bindPersona(target.conversation, 1)
+    expect(replacement.bindedPersona).toBe('bound')
+    expect(original.bindedPersona).toBeUndefined()
+})
 it('retains an imported persona ID and assigns a missing local ID only once', async () => {
     const chat: Chat = state.db.characters[0].chats[0]
     state.db.personas[1].id = undefined
