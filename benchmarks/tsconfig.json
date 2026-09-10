@@ -1,5 +1,11 @@
 {
   "extends": "../tsconfig.json",
-  "include": ["./harnessConfig.ts", "./tokenizer/*.ts", "../src/**/*.d.ts"],
+  "include": [
+    "./harnessConfig.ts",
+    "./tokenizer/*.ts",
+    "./streaming/**/*.ts",
+    "./streaming/**/*.svelte",
+    "../src/**/*.d.ts"
+  ],
   "exclude": ["**/dist/**"]
 }

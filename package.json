@@ -46,6 +46,8 @@
     "electron": "node electron/dist/electron",
     "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js",
     "benchmark:tokenizer:build:agent": "vite build --mode agent --config benchmarks/tokenizer/vite.config.ts",
+    "benchmark:streaming:build:agent": "vite build --mode agent --config benchmarks/streaming/vite.config.ts",
+    "benchmark:streaming:android:agent": "tauri android build --debug --apk --target x86_64 --ci --config benchmarks/streaming/tauri.conf.json",
     "check:production-bundle": "node tests/productionBundle.mjs",
     "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json"
   },

@@ -22,6 +22,6 @@ pnpm check:production-bundle production
 The check deliberately sets the two removed harness flags to prove that they
 cannot enable verification code in a product build. Public assets are not copied.
 
-The standalone tokenizer harness lives under `benchmarks/tokenizer/` and consumes
-product code. `pnpm check:benchmark-harnesses` checks its TypeScript and Svelte.
-Its build commands and platform constraints are in its README.
+Standalone tokenizer and streaming harnesses live under `benchmarks/` and consume
+product code. `pnpm check:benchmark-harnesses` checks their TypeScript and Svelte.
+Their build commands and platform constraints are in the respective READMEs.
