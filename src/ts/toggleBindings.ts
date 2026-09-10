@@ -10,6 +10,24 @@ export function snapshotToggleValues(variables: ToggleValues): ToggleValues {
     )
 }
 
+/** Only the listed toggle keys that currently hold a value, in list order. */
+export function pickToggleValues(variables: ToggleValues, keys: readonly string[]): ToggleValues {
+    const values: ToggleValues = {}
+    for (const key of keys) {
+        const value = variables[key]
+        if (key.startsWith('toggle_') && typeof value === 'string') values[key] = value
+    }
+    return values
+}
+
+/** Keeps the `toggle_` string entries of an untrusted record; null when it is not a record. */
+export function sanitizeToggleValues(value: unknown): ToggleValues | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    return snapshotToggleValues(
+        Object.fromEntries(Object.entries(value).filter(([, item]) => typeof item === 'string')),
+    )
+}
+
 export function applyToggleValues(
     variables: ToggleValues,
     saved: ToggleValues,
@@ -23,10 +41,14 @@ export function applyToggleValues(
     Object.assign(variables, snapshotToggleValues(saved))
 }
 
+export function toggleValueChanged(current: string | undefined, saved: string | undefined): boolean {
+    return (current ?? '') !== (saved ?? '')
+}
+
 export function countToggleChanges(variables: ToggleValues, saved: ToggleValues): number {
     const current = snapshotToggleValues(variables)
-    return [...new Set([...Object.keys(current), ...Object.keys(saved)])].filter(
-        (key) => (current[key] ?? '') !== (saved[key] ?? ''),
+    return [...new Set([...Object.keys(current), ...Object.keys(saved)])].filter((key) =>
+        toggleValueChanged(current[key], saved[key]),
     ).length
 }
 

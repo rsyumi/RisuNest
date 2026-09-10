@@ -28,7 +28,7 @@
             </div>
         </div>
         {#if bindingMode}
-            <button class="p-2 text-left hover:bg-selected" class:bg-selected={!selectedId} onclick={() => {onSelect?.(-1); close()}}>{language.inheritPersona}</button>
+            <button class="p-2 text-left hover:bg-selected" class:bg-selected={!selectedId} onclick={() => {onSelect?.(-1); close()}}>{language.inheritPersona} ({DBState.db.username || DBState.db.personas[DBState.db.selectedPersona]?.name || ''})</button>
         {/if}
         {#each DBState.db.personas as persona, i}
             <button onclick={() => {

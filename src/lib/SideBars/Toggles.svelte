@@ -16,6 +16,7 @@
     import ToggleBind from './ToggleBind.svelte'
     import CustomSideBar from "./CustomSidebar.svelte";
     import { getGlobalChatVar, isLocallyHandledGlobalChatVar, removeLocallyHandledGlobalChatVar, setGlobalChatVar } from "src/ts/parser/chatVar.svelte";
+    import { toggleValueChanged } from 'src/ts/toggleBindings'
     import { PinIcon } from "@lucide/svelte";
 
     interface Props {
@@ -94,6 +95,18 @@
         }, [])
     })
 
+    // Values that differ from the chat's toggle binding are tinted so the user can see what the
+    // save button would write. Nothing is tinted while binding is temporarily disabled.
+    let savedToggles = $derived.by(() => {
+        if (DBState.db.disableToggleBinding) return undefined
+        const character = DBState.db.characters[$selectedCharID]
+        return character?.chats[character.chatPage]?.savedToggleValues
+    })
+    const isToggleDirty = (key: string | undefined) =>
+        savedToggles !== undefined &&
+        toggleValueChanged(DBState.db.globalChatVariables[`toggle_${key}`], savedToggles[`toggle_${key}`])
+    const dirtyClass = (key: string | undefined) => (isToggleDirty(key) ? 'bg-draculared/15' : '')
+
     const getGlobalChatVarNH = (key: string) => {
         const value = getGlobalChatVar(key)
         if (value === 'null') {
@@ -131,7 +144,7 @@
                 </Accordion>
             </div>
         {:else if toggle.type === 'select'}
-            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1">
+            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1 transition-colors {dirtyClass(toggle.key)}">
                 <span class="min-w-0 break-words">{@render getToggleDisplayName(toggle)}</span>
                 <SelectInput
                     className="w-32 shrink-0"
@@ -146,7 +159,7 @@
                 </SelectInput>
             </div>
         {:else if toggle.type === 'text'}
-            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1">
+            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1 transition-colors {dirtyClass(toggle.key)}">
                 <span class="min-w-0 break-words">{@render getToggleDisplayName(toggle)}</span>
                 <TextInput
                     className="w-32 shrink-0"
@@ -157,7 +170,7 @@
                 />
             </div>
         {:else if toggle.type === 'textarea'}
-            <div class="w-full flex gap-2 mt-2 items-start justify-between min-h-10 rounded-md px-1">
+            <div class="w-full flex gap-2 mt-2 items-start justify-between min-h-10 rounded-md px-1 transition-colors {dirtyClass(toggle.key)}">
                 <span class="min-w-0 break-words mt-1.5">{@render getToggleDisplayName(toggle)}</span>
                 <TextAreaInput
                     className="w-32 shrink-0"
@@ -191,6 +204,7 @@
             <SwitchInput
                 check={getGlobalChatVarNH(`toggle_${toggle.key}`) === '1'}
                 name={toggle.value}
+                highlight={isToggleDirty(toggle.key)}
                 onChange={(checked) => {
                     setGlobalChatVar(`toggle_${toggle.key}`, checked ? '1' : '0')
                 }}
@@ -201,7 +215,7 @@
     {/each}
 {/snippet}
 
-<div class="flex flex-col gap-2 w-full mt-2">
+<div class="flex flex-col gap-4 w-full mt-3">
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
     <ToggleBind />

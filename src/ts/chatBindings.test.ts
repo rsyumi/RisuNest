@@ -2,19 +2,32 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { writable } from 'svelte/store'
 import type { Chat } from './storage/database.svelte'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
-const state = vi.hoisted(() => ({ db: null as any, navigation: 0 }))
+const state = vi.hoisted(() => ({
+    db: null as any,
+    navigation: 0,
+    bindings: [] as { characterId: string; conversationId: string; patch: unknown }[],
+}))
 vi.mock('./stores.svelte', () => ({ DBState: state, selectedCharID: writable(0) }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => null,
     getPersistentNavigationGeneration: () => state.navigation,
     flushPendingData: async () => {},
-    getPersistentDataRuntime: () => {
-        throw new Error('No full conversation access')
-    },
+    getPersistentDataRuntime: () => ({
+        mutateConversationBinding: async (
+            characterId: string,
+            conversationId: string,
+            patch: unknown,
+            publish: () => void,
+        ) => {
+            state.bindings.push({ characterId, conversationId, patch })
+            publish()
+        },
+    }),
 }))
 import { bindPersona, captureChatBindingTarget, updateChatBinding } from './chatBindings.svelte'
 beforeEach(() => {
     state.navigation = 0
+    state.bindings = []
     state.db = {
         selectedPersona: 0,
         username: 'Global persona',
@@ -38,17 +51,23 @@ beforeEach(() => {
         ],
     }
 })
-it('updates persona and toggle metadata without reading message bodies or changing the global persona', async () => {
+it('commits persona and toggle metadata through the coordinator without reading message bodies or changing the global persona', async () => {
     const target = captureChatBindingTarget()!
     expect(() => target.conversation.message).toThrow('metadata-only')
     await bindPersona(target.conversation, 1)
-    updateChatBinding(target.conversation, { savedToggleValues: {} })
+    await updateChatBinding(target.conversation, { savedToggleValues: {} })
     expect(target.conversation.bindedPersona).toBe('bound')
     expect(target.conversation.savedToggleValues).toEqual({})
+    expect(state.bindings).toEqual([
+        { characterId: 'character', conversationId: 'chat', patch: { bindedPersona: 'bound' } },
+        { characterId: 'character', conversationId: 'chat', patch: { savedToggleValues: {} } },
+    ])
     expect(state.db.selectedPersona).toBe(0)
     expect(state.db.username).toBe('Global persona')
     await bindPersona(target.conversation, -1)
     expect(target.conversation.bindedPersona).toBe('')
+    await updateChatBinding(target.conversation, { savedToggleValues: undefined })
+    expect('savedToggleValues' in target.conversation).toBe(false)
 })
 it('invalidates the captured picker target even after A to B to A navigation', () => {
     const target = captureChatBindingTarget()!

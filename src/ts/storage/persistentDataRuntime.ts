@@ -362,10 +362,10 @@ export interface PersistentDataRuntime {
         input: import('./saveCoordinator').PersistentRootModuleAppend,
         signal?: AbortSignal,
     ): Promise<void>
-    mutateConversationPersonaBinding(
+    mutateConversationBinding(
         characterId: string,
         conversationId: string,
-        personaId: string,
+        patch: import('./conversationBinding').ConversationBindingPatch,
         publish: () => void,
     ): Promise<void>
     mutatePersistentCharacterDetail(
@@ -753,8 +753,8 @@ export function createPersistentDataRuntime(
             coordinator.mutatePersistentPresets(reason, mutate),
         appendPersistentRootModule: (reason, input, signal) =>
             coordinator.appendPersistentRootModule(reason, input, signal),
-        mutateConversationPersonaBinding: (characterId, conversationId, personaId, publish) =>
-            coordinator.mutateConversationPersonaBinding(characterId, conversationId, personaId, publish),
+        mutateConversationBinding: (characterId, conversationId, patch, publish) =>
+            coordinator.mutateConversationBinding(characterId, conversationId, patch, publish),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
         deletePersistentCharacterWithGroupReferences: (characterId, reason) =>

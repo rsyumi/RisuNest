@@ -5,6 +5,10 @@ import type { Chat } from './storage/database.svelte'
 import { cloneConversationMetadata } from './storage/selectedConversationLifecycle'
 import { isConversationSummaryStub } from './storage/conversationResidency'
 import {
+    applyConversationBindingPatch,
+    type ConversationBindingPatch,
+} from './storage/conversationBinding'
+import {
     getPersistentDataRuntime,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
@@ -37,47 +41,49 @@ export function captureChatBindingTarget() {
     }
 }
 
-export function updateChatBinding(
+/**
+ * Persists persona or toggle bindings of a conversation. A complete selected conversation goes
+ * through its session; anything else (a summary stub or the windowed selected shell) is committed
+ * as metadata by the save coordinator, which also advances the baseline so the in-memory record
+ * stays clean without reading message bodies.
+ */
+export async function updateChatBinding(
     conversation: Chat,
-    patch: Partial<Pick<Chat, 'bindedPersona' | 'savedToggleValues'>>,
-): void {
+    patch: ConversationBindingPatch,
+): Promise<void> {
+    const owner = DBState.db.characters.find((character) => character.chats.includes(conversation))
     const session = getActiveConversationSession()
-    const character = DBState.db.characters[get(selectedCharID)]
-    if (character && session?.matchesConversation(character.chaId, conversation)) {
+    if (owner && session?.matchesConversation(owner.chaId, conversation)) {
         const expectedMetadata = cloneConversationMetadata(conversation)
         session.applyOperation({
             expectedVersion: session.version,
             expectedMetadata,
             metadata: { ...expectedMetadata, ...patch },
         })
-    } else {
-        // Selected metadata-only shells are observed without accessing messages.
-        Object.assign(conversation, patch)
+        return
     }
+    if (!owner || !conversation.id) {
+        applyConversationBindingPatch(conversation, patch)
+        return
+    }
+    await getPersistentDataRuntime().mutateConversationBinding(
+        owner.chaId,
+        conversation.id,
+        patch,
+        () => {
+            const current = DBState.db.characters
+                .find((character) => character.chaId === owner.chaId)
+                ?.chats.find((chat) => chat.id === conversation.id)
+            if (current) applyConversationBindingPatch(current, patch)
+        },
+    )
 }
 
 export async function bindPersona(conversation: Chat, index: number): Promise<void> {
     const persona = index < 0 ? undefined : DBState.db.personas[index]
     if (index >= 0 && !persona) throw new Error('Persona is no longer available')
     if (persona) persona.id ||= v4()
-    const personaId = persona?.id ?? ''
-    if (isConversationSummaryStub(conversation)) {
-        const owner = DBState.db.characters.find((character) => character.chats.includes(conversation))
-        if (!owner || !conversation.id) return
-        const previous = conversation.bindedPersona
-        await getPersistentDataRuntime().mutateConversationPersonaBinding(
-            owner.chaId,
-            conversation.id,
-            personaId,
-            () => {
-                const current = DBState.db.characters
-                    .find((character) => character.chaId === owner.chaId)
-                    ?.chats.find((chat) => chat.id === conversation.id)
-                if (current && current.bindedPersona === previous)
-                    updateChatBinding(current, { bindedPersona: personaId })
-            },
-        )
-    } else updateChatBinding(conversation, { bindedPersona: personaId })
+    await updateChatBinding(conversation, { bindedPersona: persona?.id ?? '' })
 }
 
 export async function saveChatBinding(): Promise<void> {

@@ -5,15 +5,21 @@
         check?: boolean
         name: string
         disabled?: boolean
+        /** Tints the row, used for toggles whose value differs from the chat binding. */
+        highlight?: boolean
         onChange?: (checked: boolean) => void
         children?: Snippet
     }
 
-    let { check = $bindable(), name, disabled = false, onChange, children }: Props = $props()
+    let { check = $bindable(), name, disabled = false, highlight = false, onChange, children }: Props = $props()
     const id = $props.id()
 </script>
 
-<div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1">
+<div
+    class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1 transition-colors {highlight
+        ? 'bg-draculared/15'
+        : ''}"
+>
     <div class="min-w-0 break-words">
         <label for={id} class="cursor-pointer">{name}</label>
         {@render children?.()}

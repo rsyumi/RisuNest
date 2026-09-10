@@ -98,3 +98,18 @@ it('supports initially unset built-in switches and writes their bound values', a
     expect(DBState.db.jailbreakToggle).toBe(true)
     expect(DBState.db.characters[0].supaMemory).toBe(true)
 })
+
+it('tints toggles whose value differs from the chat binding unless binding is disabled', async () => {
+    const row = () => customSwitch().closest('div.w-full')!
+    expect(row().classList.contains('bg-draculared/15')).toBe(false)
+    chat().savedToggleValues = { toggle_example: '1' }
+    await tick()
+    expect(row().classList.contains('bg-draculared/15')).toBe(true)
+    DBState.db.globalChatVariables.toggle_example = '1'
+    await tick()
+    expect(row().classList.contains('bg-draculared/15')).toBe(false)
+    DBState.db.globalChatVariables.toggle_example = '0'
+    DBState.db.disableToggleBinding = true
+    await tick()
+    expect(row().classList.contains('bg-draculared/15')).toBe(false)
+})

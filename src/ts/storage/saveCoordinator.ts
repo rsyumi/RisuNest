@@ -23,6 +23,7 @@ import {
 import { removeGroupMemberReferences } from './groupMembership'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
+import { applyConversationBindingPatch, type ConversationBindingPatch } from './conversationBinding'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
     ActiveConversationMutationEvent,
@@ -1385,21 +1386,26 @@ export class SaveCoordinator {
         })
     }
 
-    mutateConversationPersonaBinding(
+    /**
+     * Commits persona or toggle bindings of a conversation that has no active session (a summary
+     * stub or the windowed selected shell) using metadata only, then lets the caller publish the
+     * same change to the in-memory record so the shell matches its baseline.
+     */
+    mutateConversationBinding(
         characterId: string,
         conversationId: string,
-        personaId: string,
+        patch: ConversationBindingPatch,
         publish: () => void,
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         return this.enqueue(async () => {
-            await this.flushIterations('persona-binding', true)
+            await this.flushIterations('chat-binding', true)
             const metadata = await this.dependencies.store.readConversationMetadata(
                 characterId,
                 conversationId,
             )
-            if (!metadata) throw new Error('Persona binding conversation is unavailable')
+            if (!metadata) throw new Error('Binding conversation is unavailable')
             this.assertReadRevision(this.revision, metadata.revision)
             const committed = await this.dependencies.store.commit({
                 expectedRevision: this.revision,
@@ -1411,21 +1417,24 @@ export class SaveCoordinator {
                         start: metadata.value.totalMessages,
                         deleteCount: 0,
                         messages: [],
-                        conversation: { ...metadata.value.conversation, bindedPersona: personaId },
+                        conversation: applyConversationBindingPatch(
+                            { ...metadata.value.conversation },
+                            patch,
+                        ),
                     },
                 ],
             })
             this.currentRevision = committed.revision
-            // Advance only this field in the baseline; concurrent unrelated edits remain dirty.
+            // Advance only these fields in the baseline; concurrent unrelated edits remain dirty.
             if (this.windowedCharacterBaseline?.authority.characterId === characterId) {
                 const baseline = this.windowedCharacterBaseline
                 const conversation = baseline.shell.chats.find((chat) => chat.id === conversationId)
-                if (conversation) conversation.bindedPersona = personaId
+                if (conversation) applyConversationBindingPatch(conversation, patch)
                 baseline.shellCanonical = canonicalJson(baseline.shell)
             } else if (this.characterBaselineId === characterId && this.characterBaseline) {
                 const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
                 const conversation = baseline.chats.find((chat) => chat.id === conversationId)
-                if (conversation) conversation.bindedPersona = personaId
+                if (conversation) applyConversationBindingPatch(conversation, patch)
                 this.characterBaseline = canonicalJson(baseline)
             }
             publish()

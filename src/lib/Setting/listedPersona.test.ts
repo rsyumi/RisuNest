@@ -10,6 +10,7 @@ vi.mock('src/ts/stores.svelte', () => ({
                 { id: 'b', name: 'Persona B' },
             ],
             selectedPersona: 0,
+            username: 'Persona A',
         },
     },
 }))
@@ -41,9 +42,10 @@ it('offers inheritance only in chat binding mode', async () => {
         target: document.body,
         props: { bindingMode: true, onSelect: mocks.select, close: mocks.close },
     })
-    const button = [...document.querySelectorAll('button')].find(
-        (button) => button.textContent === languageEnglish.inheritPersona,
+    const button = [...document.querySelectorAll('button')].find((button) =>
+        button.textContent?.startsWith(languageEnglish.inheritPersona),
     )!
+    expect(button.textContent).toBe(`${languageEnglish.inheritPersona} (Persona A)`)
     button.click()
     await tick()
     expect(mocks.select).toHaveBeenCalledWith(-1)
