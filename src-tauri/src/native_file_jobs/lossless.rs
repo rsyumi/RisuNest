@@ -4,8 +4,7 @@ use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCa
 use crate::asset_repository::PayloadCas;
 use crate::local_backup::CancellationProbe;
 use crate::lossless_backup::{
-    create_and_verify_lossless_backup_v1_durable_report,
-    restore_verified_lossless_package_v1_durable_controlled,
+    create_source_preserving_backup, restore_verified_lossless_package_v1_durable_controlled,
     verify_lossless_package_v1_for_production, LosslessError, LosslessErrorCode,
 };
 use crate::persistent_store::export::destination::{
@@ -47,7 +46,7 @@ pub(crate) fn create_official_snapshot_recovery(
         now_millis(),
     )
     .map_err(io_store_error)?;
-    let created = create_and_verify_lossless_backup_v1_durable_report(
+    let created = create_source_preserving_backup(
         &recovery_source,
         owned_directory,
         &cas,
@@ -214,7 +213,7 @@ pub(crate) fn export_lossless_backup(
     )
     .map_err(io_store_error)?;
     let source = owned_directory.join(ARCHIVE_FILE);
-    let created = create_and_verify_lossless_backup_v1_durable_report(
+    let created = create_source_preserving_backup(
         &source,
         owned_directory,
         &cas,
@@ -287,7 +286,7 @@ pub(crate) fn export_lossless_backup(
             source_sha256: published.sha256,
             character_count: created.character_count,
             preset_count: created.preset_count,
-            warning_codes: Vec::new(),
+            warning_codes: created.warning_codes,
             handoff_path,
             recovery_path: None,
             publication: None,
@@ -477,6 +476,7 @@ fn lossless_input_error(error: LosslessError) -> NativeJobError {
     let code = match error.code {
         LosslessErrorCode::Cancelled => "cancelled",
         LosslessErrorCode::RevisionConflict => "revision-conflict",
+        LosslessErrorCode::RepairRequired => "source-preserved-repair-required",
         LosslessErrorCode::Io => "invalid-source",
         LosslessErrorCode::Store => "store-error",
         _ => "invalid-input",
@@ -488,6 +488,7 @@ fn lossless_operation_error(error: LosslessError) -> NativeJobError {
     let code = match error.code {
         LosslessErrorCode::Cancelled => "cancelled",
         LosslessErrorCode::RevisionConflict => "revision-conflict",
+        LosslessErrorCode::RepairRequired => "source-preserved-repair-required",
         LosslessErrorCode::HashMismatch | LosslessErrorCode::LengthMismatch => "hash-mismatch",
         LosslessErrorCode::Io | LosslessErrorCode::Store => "store-error",
         _ => "invalid-input",

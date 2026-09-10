@@ -1,4 +1,6 @@
 use crate::trust_boundary::{is_link_like, is_lower_hex_256};
+#[path = "lossless_preservation.rs"]
+mod preservation;
 use crate::{
     asset_repository::{
         job_pins::{CasObjectRole, DurableCasJob},
@@ -7,9 +9,8 @@ use crate::{
     },
     local_backup::CancellationProbe,
     lossless_f0::{
-        legacy_canonical_database_sha256_v1, rebuild_f0_v1, validate_f0_v1, F0Error, F0ErrorCode,
-        F0ExpectedMissing, F0PayloadDescriptor, F0PayloadKind, F0Reference, F0ReferenceStatus,
-        F0Validation,
+        rebuild_f0_v1, validate_f0_v1, F0Error, F0ErrorCode, F0ExpectedMissing,
+        F0PayloadDescriptor, F0PayloadKind, F0Reference, F0ReferenceStatus, F0Validation,
     },
     native_file_jobs::{
         restore::{self as block_restore, ReplacementSink, RestoreControl},
@@ -21,6 +22,7 @@ use crate::{
         RevisionResult, StagingResult, StoreError, StoreResult,
     },
 };
+pub(crate) use preservation::create_source_preserving_backup;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -54,6 +56,7 @@ pub(crate) enum PayloadKind {
     Cold,
     OwnerManifest,
     OwnerPayload,
+    PreservedObject,
 }
 
 impl PayloadKind {
@@ -63,7 +66,7 @@ impl PayloadKind {
             Self::Asset => Some("asset"),
             Self::Inlay => Some("inlay"),
             Self::Cold => Some("cold"),
-            Self::OwnerManifest | Self::OwnerPayload => None,
+            Self::OwnerManifest | Self::OwnerPayload | Self::PreservedObject => None,
         }
     }
 }
@@ -178,6 +181,7 @@ pub(crate) struct CreatedLosslessBackup {
     pub(crate) archive_sha256: String,
     pub(crate) character_count: u64,
     pub(crate) preset_count: u64,
+    pub(crate) warning_codes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -600,6 +604,7 @@ pub(crate) enum LosslessErrorCode {
     MissingReference,
     UnexpectedReference,
     BackupIncomplete,
+    RepairRequired,
     HashMismatch,
     LengthMismatch,
     TruncatedInput,
@@ -855,7 +860,8 @@ fn read_lossless_package_v1_inner(
     check_cancelled(cancellation)?;
     let mut source = CountingReader::new(reader);
     let manifest = read_manifest(&mut source, cancellation)?;
-    let durable_roles = match durable_job.as_ref() {
+    let preserving = preservation::is_preservation(&manifest);
+    let durable_roles = match durable_job.as_ref().filter(|_| !preserving) {
         Some(_) => {
             require_lossless_v2_authorities(&manifest)?;
             Some(durable_object_roles(&manifest, job_owner_manifest_hashes)?)
@@ -865,7 +871,10 @@ fn read_lossless_package_v1_inner(
     let staging_directory = prepare_staging_directory(job_staging_root)?;
     let mut entries = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
-        let staged = if entry.kind == PayloadKind::Database {
+        let staged = if matches!(
+            entry.kind,
+            PayloadKind::Database | PayloadKind::PreservedObject
+        ) {
             stage_database_entry(&mut source, entry, &staging_directory, cancellation)?
         } else if let Some(job) = durable_job.as_deref_mut() {
             match durable_roles
@@ -889,6 +898,9 @@ fn read_lossless_package_v1_inner(
             LosslessErrorCode::TrailingData,
             "lossless package has trailing data",
         ));
+    }
+    if preserving {
+        preservation::validate_database(&manifest, &entries)?;
     }
     Ok(LosslessReadReport {
         manifest,
@@ -978,7 +990,9 @@ pub(crate) fn verify_lossless_package_v1_for_production(
     cancellation: &dyn CancellationProbe,
 ) -> Result<VerifiedLosslessBackup, LosslessError> {
     let verified = verify_lossless_package_v1(reader, cancellation)?;
-    require_lossless_v2_authorities(&verified.manifest)?;
+    if !preservation::is_preservation(&verified.manifest) {
+        require_lossless_v2_authorities(&verified.manifest)?;
+    }
     Ok(verified)
 }
 
@@ -1078,7 +1092,9 @@ pub(crate) fn restore_verified_lossless_package_v1_durable_controlled(
     before_commit_attempt: &dyn Fn(),
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessRestoreReport, LosslessError> {
-    require_lossless_v2_authorities(&verified.manifest)?;
+    if !preservation::is_preservation(&verified.manifest) {
+        require_lossless_v2_authorities(&verified.manifest)?;
+    }
     restore_lossless_package_v1_inner(
         reader,
         job_staging_root,
@@ -1112,6 +1128,21 @@ fn restore_lossless_package_v1_inner(
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessRestoreReport, LosslessError> {
     let mut early_lease = None;
+    if let Some(expected) =
+        expected_verified.filter(|verified| preservation::is_preservation(&verified.manifest))
+    {
+        let incoming = read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?;
+        if incoming.manifest != expected.manifest
+            || incoming.archive_bytes != expected.archive_bytes
+            || incoming.archive_sha256 != expected.archive_sha256
+        {
+            return Err(LosslessError::new(
+                LosslessErrorCode::HashMismatch,
+                "source archive changed after preverification",
+            ));
+        }
+        return Err(preservation::repair_required());
+    }
     let job_owner_manifest_hashes = if durable_job.is_some() {
         let lease = store
             .acquire_revision(expected_revision)
@@ -1176,6 +1207,9 @@ fn restore_lossless_package_v1_inner(
                     "lossless package changed after preverification",
                 ));
             }
+        }
+        if preservation::is_preservation(&incoming.manifest) {
+            return Err(preservation::repair_required());
         }
         let authorities = if durable_job.is_some() {
             let (asset, cold) = require_lossless_v2_authorities(&incoming.manifest)?;
@@ -1271,7 +1305,22 @@ fn restore_lossless_package_v1_inner(
             require_v2,
             None,
             cancellation,
-        )?;
+        )
+        .or_else(|error| {
+            if require_v2 && preservation::can_preserve(&error) {
+                preservation::capture(
+                    pre_replacement_backup,
+                    job_staging_root,
+                    cas,
+                    store,
+                    &lease,
+                    expected_revision,
+                    cancellation,
+                )
+            } else {
+                Err(error)
+            }
+        })?;
         Ok((backup, character_count, preset_count))
     })();
     let released = store.release_revision(&lease).map_err(store_error);
@@ -1333,6 +1382,18 @@ fn restore_lossless_package_v1_inner(
         Ok(revision) => revision.revision,
         Err(error) => return abort_restore(store, &staging_id, error),
     };
+    let mut warnings = incoming.manifest.warnings;
+    if backup
+        .warning_codes
+        .iter()
+        .any(|code| code == "source-preserved-repair-required")
+    {
+        warnings.push(LosslessWarning {
+            code: "recovery-source-preserved".into(),
+            message: "The previous library was preserved in a source archive that requires repair before activation.".into(),
+            metadata: serde_json::json!({}),
+        });
+    }
     Ok(LosslessRestoreReport {
         revision,
         source_bytes: incoming.archive_bytes,
@@ -1340,7 +1401,7 @@ fn restore_lossless_package_v1_inner(
         character_count,
         preset_count,
         backup_bytes: backup.archive_bytes,
-        warnings: incoming.manifest.warnings,
+        warnings,
     })
 }
 
@@ -1360,7 +1421,7 @@ fn stage_block_database(
     let sink = DirectStagingSink {
         store: Mutex::new(store),
     };
-    block_restore::stage_block_risu_save(path, staging_id, &control, &sink)
+    block_restore::stage_preserved_block_risu_save(path, staging_id, &control, &sink)
         .map_err(block_database_error)
 }
 
@@ -1391,13 +1452,15 @@ fn validate_staged_f0(
         .map(|reference| F0ExpectedMissing {
             target_kind: reference.target_kind.clone(),
             target_key: reference.target_key.clone(),
+            character_id: reference
+                .metadata
+                .get("characterId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
         .collect::<Vec<_>>();
     let validation = validate_f0_v1(database, &payloads, &expected_missing).map_err(f0_error)?;
-    if validation.canonical_database_sha256 != manifest.compatibility.canonical_database_sha256
-        && legacy_canonical_database_sha256_v1(database).map_err(f0_error)?
-            != manifest.compatibility.canonical_database_sha256
-    {
+    if validation.canonical_database_sha256 != manifest.compatibility.canonical_database_sha256 {
         return Err(LosslessError::new(
             LosslessErrorCode::HashMismatch,
             "lossless package canonical database hash differs from decoded database",
@@ -1630,7 +1693,10 @@ fn f0_payload_kind(kind: PayloadKind) -> Result<F0PayloadKind, LosslessError> {
         PayloadKind::Asset => Ok(F0PayloadKind::Asset),
         PayloadKind::Inlay => Ok(F0PayloadKind::Inlay),
         PayloadKind::Cold => Ok(F0PayloadKind::Cold),
-        PayloadKind::Database | PayloadKind::OwnerManifest | PayloadKind::OwnerPayload => {
+        PayloadKind::Database
+        | PayloadKind::OwnerManifest
+        | PayloadKind::OwnerPayload
+        | PayloadKind::PreservedObject => {
             Err(invalid_manifest("entry cannot be used as an F0 payload"))
         }
     }
@@ -1711,6 +1777,15 @@ fn create_and_verify_pre_replacement_backup(
     cancellation: &dyn CancellationProbe,
 ) -> Result<CreatedLosslessBackup, LosslessError> {
     check_cancelled(cancellation)?;
+    if store
+        .has_unrepresentable_source_records(lease)
+        .map_err(store_error)?
+    {
+        return Err(LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            "source database contains records that cannot be represented by the application export",
+        ));
+    }
     let database = store.materialize_lease(lease).map_err(store_error)?;
     let assets = store.list_asset_aliases(Some(lease)).map_err(store_error)?;
     let owner_heads = store
@@ -1763,17 +1838,57 @@ fn create_and_verify_pre_replacement_backup(
             cancellation,
         )?;
         let diagnostic = rebuild_f0_v1(&database, &payloads, &[]).map_err(f0_error)?;
-        if diagnostic
-            .references
-            .iter()
-            .any(|reference| reference.status == F0ReferenceStatus::UnexpectedMissing)
-        {
+        if diagnostic.references.iter().any(|reference| {
+            reference.status == F0ReferenceStatus::UnexpectedMissing
+                && match reference.target_kind.as_str() {
+                    "asset" | "inlay" => !matches!(
+                        &asset_repository_authority.value,
+                        AssetRepositoryAuthorityState::V2 { .. }
+                    ),
+                    "cold" => !matches!(
+                        &cold_payload_authority.value,
+                        ColdPayloadAuthorityState::V2 { .. }
+                    ),
+                    _ => false,
+                }
+        }) {
             return Err(LosslessError::new(
                 LosslessErrorCode::BackupIncomplete,
                 "pre-replacement payload absence is not proved across legacy and alias stores",
             ));
         }
-        let validation = validate_f0_v1(&database, &payloads, &[]).map_err(f0_error)?;
+        // The pinned database proves internal reference absence. For v2 payloads,
+        // the complete alias inventory is authoritative: native readers return
+        // missing when no alias exists, without consulting a legacy store.
+        // pinned_backup_entries already verified every registered alias/object,
+        // so an omitted, unreadable or damaged registered payload cannot reach
+        // this path. Preserve existing missing references without rewriting data.
+        let expected_missing = diagnostic
+            .references
+            .iter()
+            .filter(|reference| reference.status == F0ReferenceStatus::UnexpectedMissing)
+            .map(|reference| F0ExpectedMissing {
+                target_kind: reference.target_kind.clone(),
+                target_key: reference.target_key.clone(),
+                character_id: reference
+                    .metadata
+                    .get("characterId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect::<Vec<_>>();
+        let validation =
+            validate_f0_v1(&database, &payloads, &expected_missing).map_err(f0_error)?;
+        let warnings = if expected_missing.is_empty() {
+            Vec::new()
+        } else {
+            vec![LosslessWarning {
+                code: "expected-missing-reference".to_owned(),
+                message: "Existing missing references were preserved from the source database."
+                    .to_owned(),
+                metadata: serde_json::json!({ "referenceCount": expected_missing.len() }),
+            }]
+        };
         let compatibility = LosslessCompatibility {
             oracle_version: FORMAT_VERSION,
             canonical_database_sha256: validation.canonical_database_sha256.clone(),
@@ -1804,7 +1919,7 @@ fn create_and_verify_pre_replacement_backup(
             &entries,
             compatibility,
             references,
-            Vec::new(),
+            warnings,
             extensions,
             cancellation,
         )?;
@@ -1834,6 +1949,12 @@ fn create_and_verify_pre_replacement_backup(
             archive_sha256: verified.archive_sha256,
             character_count: exported.character_count,
             preset_count: exported.preset_count,
+            warning_codes: written
+                .manifest
+                .warnings
+                .iter()
+                .map(|warning| warning.code.clone())
+                .collect(),
         })
     })();
     let cleanup = store
@@ -2345,6 +2466,7 @@ fn backup_logical_path(kind: PayloadKind, logical_key: &str) -> String {
         PayloadKind::Cold => "cold",
         PayloadKind::OwnerManifest => "owner-manifests",
         PayloadKind::OwnerPayload => unreachable!("handled above"),
+        PayloadKind::PreservedObject => "preserved",
     };
     format!("{namespace}/{}", hex::encode(logical_key.as_bytes()))
 }
@@ -2674,6 +2796,7 @@ fn read_manifest(
 }
 
 fn validate_manifest(manifest: &LosslessManifest) -> Result<(), LosslessError> {
+    preservation::validate_manifest(manifest)?;
     if manifest.version != FORMAT_VERSION {
         return Err(LosslessError::new(
             LosslessErrorCode::UnsupportedVersion,
@@ -2727,7 +2850,12 @@ fn validate_manifest(manifest: &LosslessManifest) -> Result<(), LosslessError> {
         }
         if entry.kind == PayloadKind::Database {
             database_count += 1;
-            if entry.logical_path != DATABASE_PATH || entry.logical_key.is_some() {
+            let database_path = if preservation::is_preservation(manifest) {
+                preservation::DATABASE_PATH
+            } else {
+                DATABASE_PATH
+            };
+            if entry.logical_path != database_path || entry.logical_key.is_some() {
                 return Err(invalid_manifest(
                     "lossless package database entry must be root database.risudat",
                 ));
@@ -3341,6 +3469,7 @@ mod tests {
         owner_manifest_codec::encode_owner_manifest,
     };
     use crate::local_backup::NeverCancelled;
+    use crate::lossless_f0::legacy_canonical_database_sha256_v1;
     use crate::peer_sync::{
         prepare_lossless_clone_session, CloneActivation, CloneObjectKind, CloneTargetAdapter,
         LosslessCloneTargetAdapter, PeerSyncError, CLONE_LOSSLESS_DATABASE_FORMAT,
@@ -3618,14 +3747,19 @@ mod tests {
             F0ExpectedMissing {
                 target_kind: "persona".to_owned(),
                 target_key: "#undefined".to_owned(),
+                character_id: None,
             },
             F0ExpectedMissing {
                 target_kind: "asset".to_owned(),
                 target_key: "fixture.png".to_owned(),
+                character_id: None,
             },
             F0ExpectedMissing {
                 target_kind: "conversation".to_owned(),
                 target_key: "#undefined".to_owned(),
+                character_id: expected["characters"][0]["chaId"]
+                    .as_str()
+                    .map(str::to_owned),
             },
         ];
         let source_validation = validate_f0_v1(&expected, &[], &expected_missing)
@@ -3686,7 +3820,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_f0_verification_accepts_a_legacy_iteration_order_database_hash() {
+    fn staged_f0_verification_rejects_a_superseded_risunest_database_hash() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("repository")).unwrap();
         let cas = PayloadCas::new(directory.path().join("repository")).unwrap();
@@ -3714,7 +3848,12 @@ mod tests {
             extensions: json!({}),
         };
 
-        validate_staged_f0(&manifest, &[], &database, &cas).unwrap();
+        assert_eq!(
+            validate_staged_f0(&manifest, &[], &database, &cas)
+                .unwrap_err()
+                .code,
+            LosslessErrorCode::HashMismatch
+        );
     }
 
     #[test]
@@ -3948,6 +4087,522 @@ mod tests {
     }
 
     #[test]
+    fn peer_source_with_no_saved_presets_prepares_and_restores() {
+        assert_peer_source_preserves_missing_references(false, false, false);
+    }
+
+    #[test]
+    fn peer_source_preserves_missing_internal_references_without_losing_payloads() {
+        assert_peer_source_preserves_missing_references(true, false, false);
+    }
+
+    #[test]
+    fn peer_source_preserves_missing_v2_payload_references_and_available_bytes() {
+        assert_peer_source_preserves_missing_references(false, true, false);
+    }
+
+    #[test]
+    fn peer_source_preserves_swipes_without_import_conversion() {
+        assert_peer_source_preserves_missing_references(false, true, true);
+    }
+
+    fn assert_peer_source_preserves_missing_references(
+        extra_missing: bool,
+        missing_payloads: bool,
+        preserve_swipes: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let repository = directory.path().join("source");
+        let mut store = PersistentStore::open(&repository).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Source", b"source");
+        let mut root = store.read_root(None).unwrap().value;
+        if extra_missing {
+            root["enabledModules"] = json!(["deleted-module"]);
+            // Upstream personas may have no ID; retain the original database shape.
+            root["personas"][0].as_object_mut().unwrap().remove("id");
+        }
+        let replace_character = if missing_payloads {
+            root["customBackground"] = json!("absent-asset");
+            let mut character = store.materialize(None).unwrap()["characters"][0].clone();
+            character["coldStoragedChats"] = json!(["absent-cold"]);
+            character["chats"] = json!([{
+                "id": "conversation",
+                "name": "Synthetic conversation",
+                "message": [{
+                    "role": "user",
+                    "data": "{{inlay::absent-inlay}} {{inlayed::absent-inlay}} {{inlay::shared}}"
+                }]
+            }]);
+            if preserve_swipes {
+                let message = &mut character["chats"][0]["message"][0];
+                message["swipes"] = json!([message["data"].clone()]);
+                message["swipeId"] = json!(0);
+            }
+            Some(character)
+        } else {
+            None
+        };
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root_mutations: None,
+                root: Some(root),
+                replace_presets: if missing_payloads { None } else { Some(vec![]) },
+                character: None,
+                character_details: None,
+                replace_character,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let original = store.materialize(None).unwrap();
+
+        crate::peer_sync::prepare_lossless_clone_session(
+            &mut store,
+            &cas,
+            2,
+            &directory.path().join("preparation"),
+            &directory.path().join("session"),
+            &NeverCancelled,
+        )
+        .expect("peer sync must preserve references already missing from the source");
+
+        let output = directory.path().join("source.lossless");
+        create_and_verify_lossless_backup_v1_report(
+            &output,
+            &staging,
+            &cas,
+            &mut store,
+            2,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let verified =
+            verify_lossless_package_v1(&mut File::open(&output).unwrap(), &NeverCancelled).unwrap();
+        let missing_kinds = if missing_payloads {
+            vec!["asset", "inlay", "cold"]
+        } else if extra_missing {
+            vec!["preset", "persona", "module"]
+        } else {
+            vec!["preset"]
+        };
+        for kind in missing_kinds {
+            assert!(verified.manifest.references.iter().any(|reference| {
+                reference.target_kind == kind
+                    && reference.status == ReferenceStatus::ExpectedMissing
+            }));
+        }
+        assert!(verified
+            .manifest
+            .warnings
+            .iter()
+            .any(|warning| { warning.code == "expected-missing-reference" }));
+        assert!(verified.manifest.references.iter().any(|reference| {
+            reference.target_kind == "asset" && reference.status == ReferenceStatus::Present
+        }));
+
+        let target_root = directory.path().join("target");
+        let mut target = PersistentStore::open(&target_root).unwrap();
+        let target_cas = PayloadCas::new(&target_root).unwrap();
+        seed_active_store(&mut target, &target_cas, "Target", b"target");
+        restore_lossless_package_v1(
+            &mut File::open(&output).unwrap(),
+            &staging,
+            &target_cas,
+            &mut target,
+            1,
+            &directory.path().join("target-before.lossless"),
+            &NeverCancelled,
+        )
+        .unwrap();
+        assert_eq!(target.materialize(None).unwrap(), original);
+        assert_eq!(store.materialize(None).unwrap(), original);
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(
+            target.list_asset_aliases(None).unwrap().value,
+            store.list_asset_aliases(None).unwrap().value
+        );
+        assert_eq!(
+            target.list_cold_aliases(None).unwrap().value,
+            store.list_cold_aliases(None).unwrap().value
+        );
+    }
+
+    #[test]
+    fn source_preservation_keeps_missing_corrupt_and_unparseable_storage() {
+        use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome};
+        for defect in [
+            "missing",
+            "corrupt",
+            "invalid-json",
+            "opaque-cold",
+            "orphan",
+            "invalid-alias",
+            "shadowed-fields",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let repository = directory.path().join("source");
+            let staging = directory.path().join("staging");
+            fs::create_dir(&staging).unwrap();
+            let mut source = PersistentStore::open(&repository).unwrap();
+            let cas = PayloadCas::new(&repository).unwrap();
+            seed_active_store(&mut source, &cas, "Synthetic", b"synthetic");
+            let asset = source
+                .read_asset_alias("asset", "shared", None)
+                .unwrap()
+                .unwrap()
+                .value;
+            let asset_path = cas
+                .object_path(asset.object_hash.as_deref().unwrap())
+                .unwrap()
+                .unwrap();
+            match defect {
+                "missing" => fs::remove_file(&asset_path).unwrap(),
+                "corrupt" => fs::write(&asset_path, b"damaged synthetic bytes").unwrap(),
+                "invalid-json" => {
+                    let sql =
+                        rusqlite::Connection::open(repository.join("persistent/persistent.db"))
+                            .unwrap();
+                    sql.execute("UPDATE root SET value='not valid json'", [])
+                        .unwrap();
+                }
+                "opaque-cold" => {
+                    let cold = cas
+                        .prepare_bytes(b"not a compressed JSON document")
+                        .unwrap();
+                    let sql =
+                        rusqlite::Connection::open(repository.join("persistent/persistent.db"))
+                            .unwrap();
+                    sql.execute(
+                        "UPDATE cold_aliases SET object_hash=?1, size=?2",
+                        rusqlite::params![cold.content_hash, cold.byte_size as i64],
+                    )
+                    .unwrap();
+                }
+                "orphan" => {
+                    let sql =
+                        rusqlite::Connection::open(repository.join("persistent/persistent.db"))
+                            .unwrap();
+                    sql.execute("INSERT INTO messages (generation, character_id, conversation_id, message_index, message_id, value)
+                        SELECT generation, 'orphan-character', 'orphan-chat', 0, NULL, ?1 FROM root LIMIT 1",
+                        [r#"{"role":"user","data":"synthetic orphan"}"#]).unwrap();
+                }
+                "invalid-alias" => {
+                    let sql =
+                        rusqlite::Connection::open(repository.join("persistent/persistent.db"))
+                            .unwrap();
+                    sql.execute(
+                        "UPDATE asset_aliases SET logical_key=?1 WHERE kind='asset'",
+                        ["a".repeat(MAX_PATH_BYTES)],
+                    )
+                    .unwrap();
+                }
+                "shadowed-fields" => {
+                    let sql =
+                        rusqlite::Connection::open(repository.join("persistent/persistent.db"))
+                            .unwrap();
+                    sql.execute("UPDATE root SET value=json_set(value, '$.characters', 'synthetic shadowed root')", []).unwrap();
+                    sql.execute("UPDATE characters SET detail=json_set(detail, '$.chats', 'synthetic shadowed character')", []).unwrap();
+                    sql.execute("INSERT INTO conversations (generation, character_id, conversation_id, configured_index, recent_at, name, message_count, detail)
+                        SELECT generation, character_id, 'chat', 0, 0, 'Chat', 0, ?1 FROM characters LIMIT 1",
+                        [r#"{"id":"chat","name":"Chat","message":"synthetic shadowed conversation"}"#]).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let output = directory.path().join("preserved.risulossless");
+            let mut job = DurableCasJob::begin(
+                &repository,
+                &format!("preserve-{defect}"),
+                CasJobKind::OfficialPublicationOrExportPreparation,
+                1,
+            )
+            .unwrap();
+            let report = create_source_preserving_backup(
+                &output,
+                &staging,
+                &cas,
+                &mut source,
+                1,
+                &mut job,
+                2,
+                &NeverCancelled,
+            )
+            .unwrap();
+            assert_eq!(
+                report.warning_codes,
+                vec!["source-preserved-repair-required"]
+            );
+            job.release(CasReleaseOutcome::Committed).unwrap();
+            let destination = directory.path().join("destination");
+            fs::create_dir(&destination).unwrap();
+            let target_cas = PayloadCas::new(&destination).unwrap();
+            let read = read_lossless_package_v1(
+                &mut File::open(&output).unwrap(),
+                &staging,
+                &target_cas,
+                &NeverCancelled,
+            )
+            .unwrap();
+            assert!(preservation::is_preservation(&read.manifest));
+            assert!(read
+                .entries
+                .iter()
+                .all(|entry| entry.immutable_object.is_none()));
+            let database = read
+                .entries
+                .iter()
+                .find(|entry| entry.kind == PayloadKind::Database)
+                .unwrap();
+            let snapshot =
+                rusqlite::Connection::open(database.staged_path.as_deref().unwrap()).unwrap();
+            let preserved_hash: String = snapshot
+                .query_row(
+                    "SELECT object_hash FROM asset_aliases WHERE kind='asset' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(preserved_hash, asset.object_hash.unwrap());
+            let key = format!(
+                "assets-v2/objects/{}/{}",
+                &preserved_hash[..2],
+                &preserved_hash[2..]
+            );
+            let object = read
+                .entries
+                .iter()
+                .find(|entry| entry.logical_key.as_deref() == Some(&key));
+            if defect == "missing" {
+                assert!(object.is_none());
+            }
+            if defect == "corrupt" {
+                assert_eq!(
+                    fs::read(object.unwrap().staged_path.as_deref().unwrap()).unwrap(),
+                    b"damaged synthetic bytes"
+                );
+                assert_ne!(object.unwrap().sha256, preserved_hash);
+            }
+            if defect == "invalid-json" {
+                let root: String = snapshot
+                    .query_row("SELECT value FROM root LIMIT 1", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(root, "not valid json");
+            }
+            if defect == "invalid-alias" {
+                let key: String = snapshot
+                    .query_row(
+                        "SELECT logical_key FROM asset_aliases WHERE kind='asset' LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(key, "a".repeat(MAX_PATH_BYTES));
+            }
+            if defect == "shadowed-fields" {
+                for (query, expected) in [
+                    (
+                        "SELECT json_extract(value, '$.characters') FROM root LIMIT 1",
+                        "synthetic shadowed root",
+                    ),
+                    (
+                        "SELECT json_extract(detail, '$.chats') FROM characters LIMIT 1",
+                        "synthetic shadowed character",
+                    ),
+                    (
+                        "SELECT json_extract(detail, '$.message') FROM conversations LIMIT 1",
+                        "synthetic shadowed conversation",
+                    ),
+                ] {
+                    let value: String = snapshot.query_row(query, [], |row| row.get(0)).unwrap();
+                    assert_eq!(value, expected);
+                }
+            }
+            if defect == "orphan" {
+                let value: String = snapshot
+                    .query_row(
+                        "SELECT value FROM messages WHERE character_id='orphan-character'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(value, r#"{"role":"user","data":"synthetic orphan"}"#);
+            }
+            drop(snapshot);
+            drop(read);
+            let mut target = PersistentStore::open(&destination).unwrap();
+            seed_active_store(&mut target, &target_cas, "Unchanged", b"target");
+            let original = target.materialize(None).unwrap();
+            let error = restore_lossless_package_v1(
+                &mut File::open(&output).unwrap(),
+                &staging,
+                &target_cas,
+                &mut target,
+                1,
+                &directory.path().join("before.lossless"),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, LosslessErrorCode::RepairRequired);
+            assert_eq!(target.revision().unwrap(), 1);
+            assert_eq!(target.materialize(None).unwrap(), original);
+            assert!(output.is_file());
+            if defect == "missing" {
+                let verified = verify_lossless_package_v1_for_production(
+                    &mut File::open(&output).unwrap(),
+                    &NeverCancelled,
+                )
+                .unwrap();
+                let mut durable = DurableCasJob::begin(
+                    &destination,
+                    "preserved-import",
+                    CasJobKind::LosslessImport,
+                    1,
+                )
+                .unwrap();
+                let error = restore_verified_lossless_package_v1_durable_controlled(
+                    &mut File::open(&output).unwrap(),
+                    &verified,
+                    &staging,
+                    &target_cas,
+                    &mut target,
+                    1,
+                    &directory.path().join("before.lossless"),
+                    None,
+                    &mut durable,
+                    2,
+                    &|| panic!("preserved source must not reach activation"),
+                    &|| panic!("preserved source must not reach commit"),
+                    &NeverCancelled,
+                )
+                .unwrap_err();
+                assert_eq!(error.code, LosslessErrorCode::RepairRequired);
+                durable.release(CasReleaseOutcome::Aborted).unwrap();
+                assert_eq!(target.materialize(None).unwrap(), original);
+                let mut downgraded = verified.manifest.clone();
+                downgraded
+                    .extensions
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sourcePreservation");
+                assert!(validate_manifest(&downgraded).is_err());
+                let mut traversal = verified.manifest.clone();
+                let entry = traversal
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.kind == PayloadKind::PreservedObject)
+                    .unwrap();
+                entry.logical_key = Some("assets/../../persistent/persistent.db".into());
+                entry.logical_path = format!(
+                    "preserved/{}",
+                    hex::encode(entry.logical_key.as_deref().unwrap())
+                );
+                assert!(validate_manifest(&traversal).is_err());
+                let mut mixed = verified.manifest.clone();
+                mixed.entries[1].kind = PayloadKind::Asset;
+                assert!(validate_manifest(&mixed).is_err());
+                let bytes = fs::read(&output).unwrap();
+                assert!(read_lossless_package_v1(
+                    &mut Cursor::new(&bytes[..bytes.len() - 1]),
+                    &staging,
+                    &target_cas,
+                    &NeverCancelled
+                )
+                .is_err());
+                let cancelled = CheckCountingCancellation {
+                    calls: AtomicUsize::new(0),
+                    cancel_at: Some(8),
+                };
+                assert_eq!(
+                    read_lossless_package_v1(
+                        &mut Cursor::new(&bytes),
+                        &staging,
+                        &target_cas,
+                        &cancelled
+                    )
+                    .unwrap_err()
+                    .code,
+                    LosslessErrorCode::Cancelled
+                );
+            }
+            let mut damaged = fs::read(&output).unwrap();
+            let last = damaged.len() - 1;
+            damaged[last] ^= 1;
+            assert_eq!(
+                verify_lossless_package_v1(&mut Cursor::new(damaged), &NeverCancelled)
+                    .unwrap_err()
+                    .code,
+                LosslessErrorCode::HashMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn missing_payload_absence_requires_the_authority_of_each_namespace() {
+        for (asset_v2, cold_v2) in [(false, false), (true, false), (false, true), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path().join("staging");
+            fs::create_dir(&staging).unwrap();
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let pending = store.replace_begin().unwrap().staging_id;
+            put_f0_database(&mut store, &pending, "Synthetic source");
+            if asset_v2 {
+                store
+                    .replace_put_asset_repository_authority(
+                        &pending,
+                        &AssetRepositoryAuthorityState::V2 {
+                            migration_id: "test-assets".to_owned(),
+                            compatibility_hash: "ab".repeat(32),
+                        },
+                    )
+                    .unwrap();
+            }
+            if cold_v2 {
+                store
+                    .replace_put_cold_payload_authority(
+                        &pending,
+                        &ColdPayloadAuthorityState::V2 {
+                            migration_id: "test-cold".to_owned(),
+                            compatibility_hash: "cd".repeat(32),
+                        },
+                    )
+                    .unwrap();
+            }
+            store.replace_commit(&pending, Some(0)).unwrap();
+            let output = directory.path().join("backup.lossless");
+            let result = create_and_verify_lossless_backup_v1_report(
+                &output,
+                &staging,
+                &cas,
+                &mut store,
+                1,
+                &NeverCancelled,
+            );
+            if asset_v2 && cold_v2 {
+                result.unwrap();
+                let verified =
+                    verify_lossless_package_v1(&mut File::open(&output).unwrap(), &NeverCancelled)
+                        .unwrap();
+                assert!(verified.manifest.references.iter().any(|reference| {
+                    reference.target_kind == "inlay"
+                        && reference.status == ReferenceStatus::ExpectedMissing
+                }));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, LosslessErrorCode::BackupIncomplete);
+                assert!(!output.exists());
+            }
+            assert_eq!(store.revision().unwrap(), 1);
+        }
+    }
+
+    #[test]
     fn managed_export_report_matches_the_exact_package_bytes_and_counts() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("source-staging");
@@ -4080,6 +4735,114 @@ mod tests {
     }
 
     #[test]
+    fn durable_restore_preserves_damaged_previous_source_before_activating_healthy_data() {
+        for defect in ["missing", "invalid-json"] {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path().join("job-staging");
+            fs::create_dir(&staging).unwrap();
+            let incoming = production_package(directory.path(), "Healthy", b"healthy");
+            let verified =
+                verify_lossless_package_v1(&mut Cursor::new(&incoming), &NeverCancelled).unwrap();
+            let recovery = directory.path().join("pre-replacement.lossless");
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            seed_active_store(&mut store, &cas, "Damaged", b"damaged");
+            if defect == "missing" {
+                let alias = store
+                    .read_asset_alias("asset", "shared", None)
+                    .unwrap()
+                    .unwrap()
+                    .value;
+                fs::remove_file(
+                    cas.object_path(alias.object_hash.as_deref().unwrap())
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+            } else {
+                let sql =
+                    rusqlite::Connection::open(directory.path().join("persistent/persistent.db"))
+                        .unwrap();
+                sql.execute("UPDATE root SET value='synthetic invalid JSON'", [])
+                    .unwrap();
+            }
+            let mut durable = DurableCasJob::begin(
+                directory.path(),
+                "preserve-before-restore",
+                CasJobKind::LosslessImport,
+                1,
+            )
+            .unwrap();
+            let report = restore_verified_lossless_package_v1_durable_controlled(
+                &mut Cursor::new(&incoming),
+                &verified,
+                &staging,
+                &cas,
+                &mut store,
+                1,
+                &recovery,
+                None,
+                &mut durable,
+                2,
+                &|| {
+                    let preserved = read_lossless_package_v1(
+                        &mut File::open(&recovery).unwrap(),
+                        &staging,
+                        &cas,
+                        &NeverCancelled,
+                    )
+                    .unwrap();
+                    assert!(preservation::is_preservation(&preserved.manifest));
+                    assert!(preserved
+                        .entries
+                        .iter()
+                        .all(|entry| entry.immutable_object.is_none()));
+                    Ok(())
+                },
+                &|| {},
+                &NeverCancelled,
+            )
+            .unwrap();
+            assert_eq!(report.revision, 2);
+            assert_eq!(store.materialize(None).unwrap()["username"], "Healthy");
+            assert!(report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "recovery-source-preserved"));
+            durable.release(CasReleaseOutcome::Committed).unwrap();
+            // The raw archive stays separate. A subsequent normal backup must
+            // not repackage the previous damaged data or its recovery archive.
+            let next = directory.path().join("next.lossless");
+            let mut export = DurableCasJob::begin(
+                directory.path(),
+                "healthy-followup",
+                CasJobKind::OfficialPublicationOrExportPreparation,
+                3,
+            )
+            .unwrap();
+            let next_report = create_source_preserving_backup(
+                &next,
+                &staging,
+                &cas,
+                &mut store,
+                2,
+                &mut export,
+                4,
+                &NeverCancelled,
+            )
+            .unwrap();
+            assert!(!next_report
+                .warning_codes
+                .contains(&"source-preserved-repair-required".to_owned()));
+            let next_verified =
+                verify_lossless_package_v1(&mut File::open(&next).unwrap(), &NeverCancelled)
+                    .unwrap();
+            assert!(!preservation::is_preservation(&next_verified.manifest));
+            export.release(CasReleaseOutcome::Committed).unwrap();
+        }
+    }
+
+    #[test]
     fn durable_restore_promotes_only_the_preverified_package_and_seals_before_finalize() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("job-staging");
@@ -4135,7 +4898,9 @@ mod tests {
                             {
                                 expected_manifests.insert(entry.sha256.clone());
                             }
-                            PayloadKind::Database | PayloadKind::OwnerManifest => {}
+                            PayloadKind::Database
+                            | PayloadKind::OwnerManifest
+                            | PayloadKind::PreservedObject => {}
                         }
                     }
                 }

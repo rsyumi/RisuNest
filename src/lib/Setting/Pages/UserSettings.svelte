@@ -60,6 +60,10 @@
             alertError(language.risuSaveRevisionConflict)
             return
         }
+        if(error instanceof NativeFileJobError && error.code === 'source-preserved-repair-required') {
+            alertError(language.risuNest.backup.sourceRepairRequired)
+            return
+        }
         alertError(partialDestinationMayRemain
             ? `${language.risuNest.backup.actionFailed} ${language.screenshotPartialDestinationMayRemain}`
             : language.risuNest.backup.actionFailed)
@@ -71,12 +75,17 @@
                 ? await restoreLocalBackupFromSystemPicker()
                 : await exportLocalBackupFromSystemPicker()
             if(!result || result.mode === 'legacy') return
-            alertNormal(
-                result.warningCodes.includes('cleanup-failed')
-                    ? language.risuSaveCleanupWarning
+            const message = result.warningCodes.includes('source-preserved-repair-required')
+                ? language.risuNest.backup.sourcePreserved
+                : result.warningCodes.includes('recovery-source-preserved')
+                    ? language.risuNest.backup.recoverySourcePreserved
                     : kind === 'import'
                         ? language.risuNest.backup.localBackupRestored
-                        : language.risuNest.backup.localBackupSaved,
+                        : language.risuNest.backup.localBackupSaved
+            alertNormal(
+                result.warningCodes.includes('cleanup-failed')
+                    ? `${message} ${language.risuSaveCleanupWarning}`
+                    : message,
             )
         } catch(error) {
             showRisuSaveError(error)

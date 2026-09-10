@@ -32,6 +32,7 @@ pub(crate) struct F0PayloadDescriptor {
 pub(crate) struct F0ExpectedMissing {
     pub(crate) target_kind: String,
     pub(crate) target_key: String,
+    pub(crate) character_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,7 +135,7 @@ struct Owner<'a> {
 
 struct ReferenceIndexes {
     present: TargetIndex,
-    expected_missing: TargetIndex,
+    expected_missing: HashSet<(String, String, Option<String>)>,
     conversations_by_character: HashMap<String, HashSet<String>>,
     folders_by_character: HashMap<String, HashSet<String>>,
 }
@@ -158,9 +159,20 @@ impl ReferenceIndexes {
             }
             validate_payload_descriptor(payload)?;
         }
-        let mut expected_missing_set = TargetIndex::new();
+        let mut expected_missing_set = HashSet::new();
         for reference in expected_missing {
-            if !is_target_kind(&reference.target_kind) || reference.target_key.is_empty() {
+            let scoped = matches!(reference.target_kind.as_str(), "conversation" | "folder");
+            if !is_target_kind(&reference.target_kind)
+                || reference.target_key.is_empty()
+                || if scoped {
+                    !reference
+                        .character_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty())
+                } else {
+                    reference.character_id.is_some()
+                }
+            {
                 return Err(F0Error {
                     code: F0ErrorCode::InvalidInventory,
                     message: format!(
@@ -169,11 +181,11 @@ impl ReferenceIndexes {
                     ),
                 });
             }
-            insert_target(
-                &mut expected_missing_set,
-                &reference.target_kind,
-                &reference.target_key,
-            );
+            expected_missing_set.insert((
+                reference.target_kind.clone(),
+                reference.target_key.clone(),
+                reference.character_id.clone(),
+            ));
         }
         let mut conversations_by_character = HashMap::new();
         let mut folders_by_character = HashMap::new();
@@ -223,28 +235,29 @@ impl ReferenceIndexes {
                 insert_target(&mut present, "folder", id);
             }
         }
-        for (kind, keys) in &expected_missing_set {
-            for key in keys {
-                let is_present = if kind == "conversation" {
-                    conversations_by_character
-                        .values()
-                        .any(|values| values.contains(key))
-                } else if kind == "folder" {
-                    folders_by_character
-                        .values()
-                        .any(|values| values.contains(key))
-                        || contains_target(&present, kind, key)
-                } else {
-                    contains_target(&present, kind, key)
-                };
-                if is_present {
-                    return Err(F0Error {
-                        code: F0ErrorCode::InvalidInventory,
-                        message: format!(
-                            "F0 expected-missing target is present in the inventory: {kind}:{key}"
-                        ),
-                    });
-                }
+        for (kind, key, character_id) in &expected_missing_set {
+            let is_present = if kind == "conversation" {
+                conversations_by_character
+                    .get(
+                        character_id
+                            .as_deref()
+                            .expect("validated conversation scope"),
+                    )
+                    .is_some_and(|values| values.contains(key))
+            } else if kind == "folder" {
+                folders_by_character
+                    .get(character_id.as_deref().expect("validated folder scope"))
+                    .is_some_and(|values| values.contains(key))
+            } else {
+                contains_target(&present, kind, key)
+            };
+            if is_present {
+                return Err(F0Error {
+                    code: F0ErrorCode::InvalidInventory,
+                    message: format!(
+                        "F0 expected-missing target is present in the inventory: {kind}:{key}"
+                    ),
+                });
             }
         }
         Ok(Self {
@@ -290,7 +303,14 @@ impl ReferenceIndexes {
         };
         if present {
             F0ReferenceStatus::Present
-        } else if contains_target(&self.expected_missing, kind, key) {
+        } else if self.expected_missing.contains(&(
+            kind.to_owned(),
+            key.to_owned(),
+            matches!(kind, "conversation" | "folder")
+                .then_some(character_id)
+                .flatten()
+                .map(str::to_owned),
+        )) {
             F0ReferenceStatus::ExpectedMissing
         } else {
             F0ReferenceStatus::UnexpectedMissing
@@ -1339,6 +1359,7 @@ fn canonical_sha256(value: &Value) -> Result<String, F0Error> {
     canonical_sha256_with_order(value, ObjectKeyOrder::Sorted)
 }
 
+#[cfg(test)]
 pub(crate) fn legacy_canonical_database_sha256_v1(value: &Value) -> Result<String, F0Error> {
     canonical_sha256_with_order(value, ObjectKeyOrder::Iteration)
 }
@@ -1984,10 +2005,12 @@ mod tests {
             F0ExpectedMissing {
                 target_kind: "cold".to_owned(),
                 target_key: "cold-character".to_owned(),
+                character_id: None,
             },
             F0ExpectedMissing {
                 target_kind: "cold".to_owned(),
                 target_key: "cold-chat".to_owned(),
+                character_id: None,
             },
         ];
 
@@ -2086,6 +2109,7 @@ mod tests {
         let policy = [F0ExpectedMissing {
             target_kind: "asset".to_owned(),
             target_key: "missing".to_owned(),
+            character_id: None,
         }];
         let accepted = validate_f0_v1(&database, &[], &policy).unwrap();
         assert_eq!(
@@ -2105,6 +2129,44 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(conflict.code, F0ErrorCode::InvalidInventory);
+    }
+
+    #[test]
+    fn expected_missing_folders_use_the_referencing_character_scope() {
+        let mut database = json!({
+            "botPresets": [{"name":"preset"}], "botPresetsId":0,
+            "personas":[{"id":"persona"}], "selectedPersona":0,
+            "characters":[
+                {"chaId":"a", "chatPage":0, "chats":[{"id":"chat", "folderId":"folder", "message":[]}]},
+                {"chaId":"b", "chats":[], "chatFolders":[{"id":"folder"}]}
+            ]
+        });
+        let missing = [F0ExpectedMissing {
+            target_kind: "folder".into(),
+            target_key: "folder".into(),
+            character_id: Some("a".into()),
+        }];
+        let graph = validate_f0_v1(&database, &[], &missing).unwrap();
+        assert!(graph.references.iter().any(|reference| {
+            reference.target_kind == "folder"
+                && reference.status == F0ReferenceStatus::ExpectedMissing
+        }));
+        let wrong_scope = [F0ExpectedMissing {
+            character_id: Some("b".into()),
+            ..missing[0].clone()
+        }];
+        assert_eq!(
+            validate_f0_v1(&database, &[], &wrong_scope)
+                .unwrap_err()
+                .code,
+            F0ErrorCode::InvalidInventory
+        );
+        database["characters"][0]["chatFolders"] = json!([{"id":"folder"}]);
+        assert_eq!(
+            validate_f0_v1(&database, &[], &missing).unwrap_err().code,
+            F0ErrorCode::InvalidInventory
+        );
+        assert!(validate_f0_v1(&database, &[], &[]).is_ok());
     }
 
     #[test]

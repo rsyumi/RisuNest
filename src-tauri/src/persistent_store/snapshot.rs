@@ -894,8 +894,12 @@ fn scan_json_column<P: rusqlite::Params>(
     let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
         let encoded: String = row.get(0)?;
-        let value: serde_json::Value = serde_json::from_str(&encoded)?;
-        observe_json_value(&value, None, roots);
+        match serde_json::from_str(&encoded) {
+            Ok(value) => observe_json_value(&value, None, roots),
+            // The snapshot contains this exact record. If its references cannot
+            // be decoded, retain objects instead of discarding the raw backup.
+            Err(_) => roots.retain_all_objects = true,
+        }
     }
     Ok(())
 }

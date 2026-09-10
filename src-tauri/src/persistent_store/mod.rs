@@ -16,6 +16,7 @@ mod logical_index;
 pub(crate) use logical_index::PRODUCT_LOGICAL_LIBRARY_ID;
 mod logical_schema;
 mod owner_projection;
+mod preservation;
 mod query;
 mod schema;
 mod snapshot;

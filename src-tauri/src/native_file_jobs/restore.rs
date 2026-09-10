@@ -415,32 +415,32 @@ fn read_risu_save_format<R: Read>(
     }
 }
 
-pub(crate) fn stage_block_risu_save(
+/// RisuNest backups already contain the stored representation. External-import
+/// conversions must not alter it before the lossless equality check or restore.
+pub(crate) fn stage_preserved_block_risu_save(
     source: &Path,
     staging_id: &str,
     control: &dyn RestoreControl,
     sink: &dyn ReplacementSink,
-) -> Result<(), NativeJobError> {
-    stage_block_risu_save_with_limits(source, staging_id, control, sink, RestoreLimits::default())
-}
-
-fn stage_block_risu_save_with_limits(
-    source: &Path,
-    staging_id: &str,
-    control: &dyn RestoreControl,
-    sink: &dyn ReplacementSink,
-    limits: RestoreLimits,
 ) -> Result<(), NativeJobError> {
     let source = super::open_regular_file_no_follow(source)?;
-    stage_block_risu_save_reader(source, staging_id, control, sink, limits)
+    stage_block_risu_save_reader_with_mode(
+        source,
+        staging_id,
+        control,
+        sink,
+        RestoreLimits::default(),
+        true,
+    )
 }
 
-fn stage_block_risu_save_reader(
+fn stage_block_risu_save_reader_with_mode(
     source: OpenedJobSource,
     staging_id: &str,
     control: &dyn RestoreControl,
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
+    preserve_source: bool,
 ) -> Result<(), NativeJobError> {
     let OpenedJobSource { file, total_bytes } = source;
     if total_bytes < RISU_SAVE_HEADER.len() as u64 {
@@ -455,7 +455,14 @@ fn stage_block_risu_save_reader(
     if header != RISU_SAVE_HEADER {
         return Err(invalid("invalid block RisuSave header"));
     }
-    parse_and_stage(&mut reader, staging_id, control, sink, limits)?;
+    parse_and_stage_with_mode(
+        &mut reader,
+        staging_id,
+        control,
+        sink,
+        limits,
+        preserve_source,
+    )?;
     reader.require_eof()?;
     Ok(())
 }
@@ -869,6 +876,17 @@ fn parse_and_stage<R: Read>(
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
 ) -> Result<ParsedCounts, NativeJobError> {
+    parse_and_stage_with_mode(reader, staging_id, job, sink, limits, false)
+}
+
+fn parse_and_stage_with_mode<R: Read>(
+    reader: &mut TrackedReader<'_, R>,
+    staging_id: &str,
+    job: &dyn RestoreControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+    preserve_source: bool,
+) -> Result<ParsedCounts, NativeJobError> {
     let mut loaded = HashSet::new();
     let mut directory = None;
     let mut root = None;
@@ -946,8 +964,10 @@ fn parse_and_stage<R: Read>(
                     character_batch_bytes = 0;
                 }
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
-                pocket_features::character(&mut value, &format!("character:{character_count}"))
-                    .map_err(invalid)?;
+                if !preserve_source {
+                    pocket_features::character(&mut value, &format!("character:{character_count}"))
+                        .map_err(invalid)?;
+                }
                 character_batch.push(value);
                 character_count += 1;
                 reader.counts.characters = character_count;
@@ -1060,7 +1080,9 @@ fn parse_and_stage<R: Read>(
         plugin_storage.ok_or_else(|| invalid("missing required block pluginStorage"))?,
     );
     let presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
-    pocket_features::root(&root).map_err(invalid)?;
+    if !preserve_source {
+        pocket_features::root(&root).map_err(invalid)?;
+    }
     sink.put_root(staging_id, &Value::Object(root))
         .map_err(store_error)?;
     sink.put_presets(staging_id, &presets)
@@ -1794,6 +1816,40 @@ mod tests {
 
         use sha2::Digest as _;
         hex::encode(sha2::Sha256::digest(encode(value)))
+    }
+
+    #[test]
+    fn external_block_import_still_converts_pocket_swipes() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("external-swipes.risudat");
+        let mut blocks = valid_blocks();
+        blocks[6] = block(
+            2,
+            true,
+            "char-1",
+            &json!({
+                "type":"character", "chaId":"char-1", "name":"Imported",
+                "chats":[{"id":"chat-1", "name":"Chat", "message":[{
+                    "role":"char", "data":"second", "chatId":"message-1",
+                    "swipes":["first", "second"], "swipeId":1
+                }]}]
+            }),
+        );
+        fs::write(&source, save_bytes(blocks)).unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
+        let restored = sink.store.lock().unwrap().materialize(None).unwrap();
+        let message = &restored["characters"][0]["chats"][0]["message"][0];
+        assert_eq!(message["data"], "second");
+        assert_eq!(
+            message["responseVariants"]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(message["swipes"], json!(["first", "second"]));
     }
 
     #[test]

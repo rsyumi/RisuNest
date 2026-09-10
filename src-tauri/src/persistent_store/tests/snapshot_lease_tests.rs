@@ -63,6 +63,28 @@ fn snapshots_create_list_and_restore_on_reopen() {
 }
 
 #[test]
+fn source_preservation_snapshot_keeps_invalid_json_and_retains_objects() {
+    let (_directory, store, _) = open_fixture();
+    store
+        .connection
+        .execute("UPDATE root SET value='synthetic invalid JSON'", [])
+        .unwrap();
+    assert!(store.materialize(None).is_err());
+    let snapshot = store.snapshot_create("preserve-invalid-json").unwrap();
+    let connection = rusqlite::Connection::open(&snapshot.path).unwrap();
+    let value: String = connection
+        .query_row("SELECT value FROM root LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "synthetic invalid JSON");
+    let sidecar = crate::asset_repository::migration_gc::read_snapshot_asset_root_sidecar(
+        std::path::Path::new(&snapshot.path),
+    )
+    .unwrap();
+    assert!(sidecar.roots.retain_all_objects);
+    assert!(store.materialize(None).is_err());
+}
+
+#[test]
 fn snapshot_delete_requires_a_listed_top_level_snapshot_and_removes_its_sidecar() {
     let (directory, store, _) = open_fixture();
     let created = store
