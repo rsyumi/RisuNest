@@ -9,6 +9,11 @@ import {
 import { changeLanguage } from "../../src/lang";
 import { updateColorScheme } from "../../src/ts/gui/colorscheme";
 import { runStreamingSuite } from "./suite";
+import {
+  runPersistenceSpike,
+  runPersistenceSuite,
+  checkPersistenceReload,
+} from "./persistence";
 
 export function startStreamingSmoke() {
   const character = {
@@ -95,7 +100,13 @@ export function startStreamingSmoke() {
   Object.assign(window, {
     __streamingSmoke: {
       ...api,
-      run: (profile = "smoke") => runStreamingSuite(api, profile),
+      checkPersistenceReload,
+      run: (profile = "smoke") =>
+        profile === "persistence-spike"
+          ? runPersistenceSpike()
+          : profile === "persistence"
+            ? runPersistenceSuite(api)
+            : runStreamingSuite(api, profile),
     },
   });
 }

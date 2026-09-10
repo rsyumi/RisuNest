@@ -23,7 +23,13 @@ function fixture(large = true): CommitEnvelope {
     }
 }
 function harness(
-    options: { windows?: boolean; unsupported?: boolean; fail?: string; ack?: number } = {},
+    options: {
+        windows?: boolean
+        android?: boolean
+        unsupported?: boolean
+        fail?: string
+        ack?: number
+    } = {},
 ) {
     let listener: Parameters<SharedWebview['addEventListener']>[1] | undefined
     const webview: SharedWebview = {
@@ -38,6 +44,9 @@ function harness(
     const buffer = new ArrayBuffer(3)
     const invoke = vi.fn(async (command: string, args: any) => {
         if (options.fail === command) throw new Error('native failed')
+        if (command === 'pds_commit_android_open') return { capacity: 32 * 1024 }
+        if (command === 'pds_commit_android_chunk')
+            return args.offset + new TextEncoder().encode(args.chunk).length
         if (command === 'pds_commit_shared_open') {
             if (options.unsupported) return null
             listener!({
@@ -55,6 +64,7 @@ function harness(
     const encode = vi.fn(async () => bytes)
     const transport = new NativeCommitTransport({
         windows: () => options.windows ?? true,
+        android: () => options.android ?? false,
         invoke,
         encode,
         shared: () => webview,
@@ -91,7 +101,7 @@ describe('native commit transport', () => {
         expect(isLargeCommit(fixture())).toBe(true)
         expect(isLargeCommit(Array.from({ length: 10_000 }, () => 1))).toBe(true)
     })
-    it('keeps Android and small requests on ordinary invoke without encoding', async () => {
+    it('keeps other platforms and small requests on ordinary invoke without encoding', async () => {
         for (const [windows, input] of [
             [false, fixture()],
             [true, fixture(false)],
@@ -101,6 +111,36 @@ describe('native commit transport', () => {
             expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', input)
             expect(h.encode).not.toHaveBeenCalled()
         }
+    })
+    it('routes large Android commits through the Worker and strings, retaining small JSON saves', async () => {
+        const h = harness({ windows: false, android: true })
+        await h.transport.commit(fixture(false))
+        expect(h.encode).not.toHaveBeenCalled()
+        h.invoke.mockClear()
+        h.encode.mockResolvedValueOnce(new TextEncoder().encode('{"한글":"🐿️"}'))
+        await h.transport.commit(fixture())
+        expect(h.invoke.mock.calls.map(([command]) => command)).toEqual([
+            'pds_commit_android_open',
+            'pds_commit_android_chunk',
+            'pds_commit_android_finish',
+            'pds_commit_android_cancel',
+        ])
+        expect(h.webview.addEventListener).not.toHaveBeenCalled()
+    })
+    it('retains JSON saves above the Android assembly limit, without raw number arrays', async () => {
+        const h = harness({ windows: false, android: true })
+        h.encode.mockResolvedValueOnce(new Uint8Array(64 * 1024 * 1024 + 1))
+        await h.transport.commit(fixture())
+        expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture())
+    })
+    it('preserves Android clone fallback, errors and queue recovery', async () => {
+        const h = harness({ windows: false, android: true, fail: 'pds_commit_android_finish' })
+        h.encode.mockRejectedValueOnce(new DOMException('Cannot clone', 'DataCloneError'))
+        await h.transport.commit(fixture())
+        h.encode.mockResolvedValueOnce(new TextEncoder().encode('{}'))
+        await expect(h.transport.commit(fixture())).rejects.toThrow('native failed')
+        await h.transport.commit(fixture(false))
+        expect(h.invoke.mock.calls.filter(([cmd]) => cmd === 'pds_commit')).toHaveLength(2)
     })
     it('copies every byte once in ordered acknowledged chunks and releases both sides', async () => {
         const h = harness()

@@ -2,7 +2,8 @@
 
 This probe mounts the production `Chat` and `ChatBody` with synthetic display
 snapshots. It exercises the real CBS, editdisplay regex, Markdown and sanitizer
-paths. It does not start application bootstrap or open a persistent database.
+paths. It does not start application bootstrap. The default display profiles
+do not open a persistent database; the explicit `persistence` profile below does.
 The probe has its own HTML and TypeScript entry, built through its own Vite
 configuration in agent mode. It imports production components directly; the
 normal app has no reference to this harness. Frontend output goes to
@@ -64,3 +65,39 @@ generation ownership, output processing, persistent saves, virtualized history,
 touch/fling scrolling, real plugins, translation and real-device performance
 require separate integration runs. Timing here includes display processing
 and DOM observation, not a measured pixel-presentation timestamp.
+
+## Android persistence profiles
+
+Run `--profile=persistence-spike` to compare a tiny native return command with
+JSON, Uint8Array (Android serializes this as a JSON number array), and bounded
+string payloads. Inputs are synthetic ASCII or Korean/emoji with escaping at
+0/256KiB/1MiB/6MiB. Size accounting is outside measured intervals. `wireBytes`
+counts the serialized payload, excluding Tauri envelope metadata. This is an
+IPC feasibility probe, not a durable-save benchmark.
+
+Run `--profile=persistence --output=benchmarks/streaming/persistence-result.local.json`
+to exercise the production Worker encoder and Android commit adapter against
+ordinary JSON commits. **This replaces the native store with a tracked synthetic
+fixture on the dedicated AVD.** It must never run on another device/profile.
+The runner retains the AVD, package, agent entry and offline safety checks.
+
+The suite performs two repetitions with reversed mode order for root mutations,
+nested plugin storage, and a conversation message, with both alphabets and all
+four sizes. Each commit is read back for exact source and revision equality.
+During the measured save, accepted synthetic display snapshots are published at
+a requested 30Hz. Worker startup/structured clone and native durable processing
+are included in elapsed/frame metrics. Readback and byte accounting are outside
+those intervals. Counts and timings are emitted, never the source values.
+
+It also rejects overlapping producers, invalid/stale chunks, incomplete commits
+and stale revisions, then verifies successful retry, page reload cleanup and
+force-stop/restart durability. The assembly limit is 64MiB and each string carries
+at most 32KiB of UTF-8; a larger save uses the existing JSON path before opening
+a transfer. This is bounded message passing, not shared memory or zero-copy.
+
+`jsHeapBytes` is a post-save browser heap sample when available, otherwise null.
+It is not total native memory or peak allocation, and no GC duration is inferred.
+Frame gaps are rAF intervals, not platform presentation times. These debug
+emulator measurements do not establish real-device performance, provider
+integration, background generation behavior, touch/fling correctness, or fixes
+for the separate large expanded-Thought renderer stall.

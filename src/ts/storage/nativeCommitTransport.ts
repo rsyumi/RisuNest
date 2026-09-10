@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 import { platform } from '@tauri-apps/plugin-os'
 import type { AssetAlias, WorkingSetCommit } from './persistentDataStore'
+import {
+    ANDROID_LARGE_COMMIT_SIZE,
+    MAX_ANDROID_COMMIT_BYTES,
+    sendAndroidCommit,
+} from './androidCommitTransport'
 
 export interface CommitEnvelope {
     commit: WorkingSetCommit
@@ -11,7 +16,7 @@ export const MAX_SHARED_COMMIT_BYTES = 64 * 1024 * 1024
 const PROBE_VISITS = 4096
 
 /** A bounded routing hint, not another full JSON serialization on the UI thread. */
-export function isLargeCommit(value: unknown): boolean {
+export function isLargeCommit(value: unknown, threshold = LARGE_COMMIT_BYTES): boolean {
     let visits = 0
     let size = 0
     const pending = [value]
@@ -28,7 +33,7 @@ export function isLargeCommit(value: unknown): boolean {
                 pending.push((item as Record<string, unknown>)[key])
             }
         } else size += 8
-        if (size >= LARGE_COMMIT_BYTES) return true
+        if (size >= threshold) return true
     }
     return false
 }
@@ -44,6 +49,7 @@ export interface SharedWebview {
 }
 export interface CommitTransportDependencies {
     windows(): boolean
+    android?(): boolean
     invoke<T>(command: string, args?: Record<string, unknown> | Uint8Array): Promise<T>
     encode(input: CommitEnvelope): Promise<Uint8Array>
     shared(): SharedWebview | undefined
@@ -61,7 +67,12 @@ export class NativeCommitTransport {
 
     private async send(input: CommitEnvelope): Promise<{ revision: number }> {
         const deps = this.dependencies
-        if (!deps.windows() || !isLargeCommit(input)) return deps.invoke('pds_commit', { ...input })
+        const android = deps.android?.() ?? false
+        if (
+            (!android && !deps.windows()) ||
+            !isLargeCommit(input, android ? ANDROID_LARGE_COMMIT_SIZE : LARGE_COMMIT_BYTES)
+        )
+            return deps.invoke('pds_commit', { ...input })
         let bytes: Uint8Array
         try {
             bytes = await deps.encode(input)
@@ -71,6 +82,12 @@ export class NativeCommitTransport {
                 return deps.invoke('pds_commit', { ...input })
             }
             throw error
+        }
+        if (android) {
+            // Keep the existing large-save contract beyond the bounded assembly budget.
+            if (bytes.byteLength > MAX_ANDROID_COMMIT_BYTES)
+                return deps.invoke('pds_commit', { ...input })
+            return sendAndroidCommit(bytes, deps.invoke)
         }
         const webview = deps.shared()
         if (!webview || bytes.byteLength > MAX_SHARED_COMMIT_BYTES)
@@ -122,7 +139,7 @@ export class NativeCommitTransport {
                 throw new Error('Invalid persistence shared buffer')
             }
             const shared = new Uint8Array(buffer)
-            for (let offset = 0; offset < bytes.byteLength;) {
+            for (let offset = 0; offset < bytes.byteLength; ) {
                 const length = Math.min(shared.length, bytes.byteLength - offset)
                 shared.set(bytes.subarray(offset, offset + length))
                 const ack = await deps.invoke<number>('pds_commit_shared_chunk', {
@@ -153,7 +170,7 @@ export class NativeCommitTransport {
 
 let encoder: Worker | undefined
 let encoderIdle: ReturnType<typeof setTimeout> | undefined
-function encode(input: CommitEnvelope): Promise<Uint8Array> {
+export function encodeNativeCommit(input: CommitEnvelope): Promise<Uint8Array> {
     if (encoderIdle) clearTimeout(encoderIdle)
     encoder ??= new Worker(new URL('./nativeCommitEncoder.worker.ts', import.meta.url), {
         type: 'module',
@@ -189,10 +206,13 @@ function encode(input: CommitEnvelope): Promise<Uint8Array> {
 }
 
 export const nativeCommitTransport = new NativeCommitTransport({
+    android: () =>
+        Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
+        platform() === 'android',
     windows: () =>
         Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
         platform() === 'windows',
     invoke,
-    encode,
+    encode: encodeNativeCommit,
     shared: () => (window as Window & { chrome?: { webview?: SharedWebview } }).chrome?.webview,
 })

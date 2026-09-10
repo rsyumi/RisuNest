@@ -73,7 +73,7 @@ async function connect(onProgress) {
     if (
       message.method === "Runtime.bindingCalled" &&
       message.params.name === "__streamingSmokeProgress" &&
-      /^(recent|collapsed|off|split|cadence)[a-z0-9-]{0,60}$/.test(
+      /^(recent|collapsed|off|split|cadence|persistence)[a-z0-9-]{0,90}$/.test(
         message.params.payload,
       )
     ) {
@@ -137,7 +137,10 @@ async function connect(onProgress) {
 async function main() {
   assert.ok(adb, "--adb path required");
   const profile = options.profile ?? "smoke";
-  assert.ok(["smoke", "stress"].includes(profile), "Unknown profile");
+  assert.ok(
+    ["smoke", "stress", "persistence-spike", "persistence"].includes(profile),
+    "Unknown profile",
+  );
   assert.equal(
     run(serial, ["emu", "avd", "name"]).stdout.split("\n")[0].trim(),
     avd,
@@ -192,7 +195,7 @@ async function main() {
     const result = await client
       .evaluate(
         `window.__streamingSmoke.run(${JSON.stringify(profile)})`,
-        60000,
+        profile === "persistence" ? 300000 : 60000,
       )
       .catch(() => ({
         passed: false,
@@ -200,6 +203,66 @@ async function main() {
         assertion: "evaluation-failed-or-timeout",
         cases: [],
       }));
+    if (profile === "persistence" && result.passed) {
+      try {
+        await client.evaluate("delete window.__streamingSmoke");
+        await client.call("Page.reload");
+        const deadline = Date.now() + 30000;
+        while (
+          !(await client.evaluate(
+            "!!window.__streamingSmoke?.checkPersistenceReload",
+          ))
+        ) {
+          assert.ok(Date.now() < deadline, "Reloaded fixture unavailable");
+          await delay(250);
+        }
+        result.reload = await client.evaluate(
+          "window.__streamingSmoke.checkPersistenceReload()",
+        );
+        result.passed = result.reload.passed;
+        client.close();
+        run(serial, ["shell", "am", "force-stop", packageName]);
+        run(serial, [
+          "shell",
+          "am",
+          "start",
+          "-n",
+          `${packageName}/.MainActivity`,
+        ]);
+        await delay(3000);
+        const restartedPid = run(serial, [
+          "shell",
+          "pidof",
+          packageName,
+        ]).stdout.trim();
+        assert.match(restartedPid, /^\d+$/);
+        run(serial, [
+          "forward",
+          `tcp:${port}`,
+          `localabstract:webview_devtools_remote_${restartedPid}`,
+        ]);
+        client = await connect(() => {});
+        const restartDeadline = Date.now() + 30000;
+        while (
+          !(await client.evaluate(
+            "!!window.__streamingSmoke?.checkPersistenceReload",
+          ))
+        ) {
+          assert.ok(
+            Date.now() < restartDeadline,
+            "Restarted fixture unavailable",
+          );
+          await delay(250);
+        }
+        result.restart = await client.evaluate(
+          "window.__streamingSmoke.checkPersistenceReload()",
+        );
+        result.passed = result.restart.passed;
+      } catch {
+        result.passed = false;
+        result.assertion = "reload-or-restart-failed";
+      }
+    }
     const report = {
       timestamp: new Date().toISOString(),
       synthetic: true,
