@@ -44,7 +44,10 @@
     "runserver": "node server/node/server.cjs",
     "sync": "node electron/sync",
     "electron": "node electron/dist/electron",
-    "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js"
+    "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js",
+    "benchmark:tokenizer:build:agent": "vite build --mode agent --config benchmarks/tokenizer/vite.config.ts",
+    "check:production-bundle": "node tests/productionBundle.mjs",
+    "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json"
   },
   "dependencies": {
     "@adobe/css-tools": "4.4.4",

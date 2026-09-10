@@ -36,11 +36,11 @@ This output is a JavaScript oracle baseline only. `nativeCandidateMeasured` is a
 Run the release benchmark from the repository root with the shared Roadmap 14 Cargo target:
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\.worktrees\_cargo-target-r14'
+$env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\src-tauri\target'
 pnpm benchmark:tokenizer:tauri -- --output "$env:CARGO_TARGET_DIR\k2-tokenizer-windows.json"
 ```
 
-The runner builds an isolated release Tauri app with `VITE_TOKENIZER_BENCHMARK=true`. That flag installs a narrow WebView-only benchmark seam. The seam proves the JavaScript implementation against the checked-in corpus, executes the same corpus through the real `tokenize_batch` IPC command, and times both implementations inside the same release WebView.
+The runner builds an isolated release Tauri app using `benchmarks/tokenizer/vite.config.ts` in agent mode. Its external entry loads the normal application and installs the WebView-only benchmark interface; product source never imports the harness. The isolated Tauri configuration consumes `benchmarks/tokenizer/dist`, leaving the normal `dist` unchanged. The seam proves the JavaScript implementation against the checked-in corpus, executes the same corpus through the real `tokenize_batch` IPC command, and times both implementations inside the same release WebView.
 
 Each implementation receives one untimed warm-up for every fixture and mode. Count results are `number[]` on both paths. ID results are `Uint32Array[]` on both paths, and the native IPC array conversion is included in its measured interval. The Node CDP driver is not timed. WebView garbage collection and heap samples bracket each implementation separately.
 
@@ -51,6 +51,6 @@ The runner does not access live RisuRealm or live account services.
 Measure the Rust core without IPC separately:
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\.worktrees\_cargo-target-r14'
+$env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\src-tauri\target'
 pnpm benchmark:tokenizer:core
 ```

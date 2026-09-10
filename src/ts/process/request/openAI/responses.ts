@@ -709,17 +709,6 @@ function getResponsesTranStream(arg:RequestDataArgumentExtended):TransformStream
     })
 }
 
-export const __testResponsesAPI = {
-    buildResponsesBody,
-    buildResponsesHeaders,
-    extractResponsesText,
-    extractResponsesFunctionCalls,
-    getResponsesRequestURL,
-    getResponsesTranStream,
-    sanitizeResponsesContinuationItem,
-    toExternalResponsesBody
-}
-
 function wrapResponsesToolStream(stream:ReadableStream<StreamResponseChunk>, body:any, headers:Record<string,string>, requestURL:string, arg:RequestDataArgumentExtended, networkOptions:LocalNetworkRequestOptions):ReadableStream<StreamResponseChunk>{
     return new ReadableStream<StreamResponseChunk>({
         async start(controller) {

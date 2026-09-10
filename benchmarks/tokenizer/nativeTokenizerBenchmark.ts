@@ -1,13 +1,13 @@
 import { Tiktoken } from '@dqbd/tiktoken'
 import cl100kBase from '@dqbd/tiktoken/encoders/cl100k_base.json'
-import o200kBase from '../../etc/o200k_base.json'
-import corpus from '../../../benchmarks/tokenizer/native-tokenizer-corpus.json'
+import o200kBase from '../../src/etc/o200k_base.json'
+import corpus from './native-tokenizer-corpus.json'
 import {
     invokeNativeTokenizerBatch,
     resolveNativeTokenizerRoute,
     type NativeTokenizeMode,
     type NativeTokenizerId,
-} from './nativeTokenizer'
+} from '../../src/ts/tokenizer/nativeTokenizer'
 
 type BenchmarkImplementation = 'javascript' | 'native'
 type BenchmarkInvoke = (command: string, args: Record<string, unknown>) => Promise<unknown>

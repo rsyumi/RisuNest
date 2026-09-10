@@ -47,4 +47,18 @@ describe('application startup performance profile', () => {
         expect(startup.cacheBudget).toBe(8 * 1024 * 1024)
     })
 
+    it('starts the normal app even when obsolete harness flags are set', async () => {
+        vi.stubEnv('MODE', 'agent')
+        vi.stubEnv('VITE_TOKENIZER_BENCHMARK', 'true')
+        vi.stubEnv('VITE_STREAMING_SMOKE', 'true')
+        const { mount } = await import('svelte')
+        vi.mocked(mount).mockClear()
+
+        await import('./main')
+
+        expect(mount).toHaveBeenCalledTimes(1)
+        expect(document.getElementById('preloading')).toBeNull()
+        expect(window).not.toHaveProperty('__streamingSmoke')
+        expect(window).not.toHaveProperty('__RISUNEST_TOKENIZER_BENCHMARK__')
+    })
 })

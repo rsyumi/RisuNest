@@ -1,5 +1,6 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 import { defineConfig } from 'vitest/config'
+import { responsesInternalsPlugin } from './tests/support/responsesInternals'
 
 const exclude = [
   '**/node_modules/**',
@@ -13,7 +14,7 @@ const exclude = [
 ]
 
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [responsesInternalsPlugin(), svelte()],
   resolve: {
     alias: {
       src: '/src',

@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.json",
+  "include": ["./harnessConfig.ts", "./tokenizer/*.ts", "../src/**/*.d.ts"],
+  "exclude": ["**/dist/**"]
+}

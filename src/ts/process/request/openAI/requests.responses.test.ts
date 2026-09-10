@@ -3,7 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer } from 'src/ts/model/types'
 import { fetchNative } from 'src/ts/globalApi.svelte'
 import { callTool } from '../../mcp/mcp'
-import { __testResponsesAPI, requestOpenAI, requestOpenAIResponseAPI } from './requests'
+import { requestOpenAI, requestOpenAIResponseAPI } from './requests'
+import * as responses from './responses'
+import type { ResponsesInternals } from '../../../../../tests/support/responsesInternals'
+
+// These exports exist only in Vitest's instrumented copy of the module.
+const __testResponsesAPI = (responses as typeof responses & { __testResponsesAPI: ResponsesInternals })
+    .__testResponsesAPI
 
 const mocks = vi.hoisted(() => ({
     isNodeServer: true,

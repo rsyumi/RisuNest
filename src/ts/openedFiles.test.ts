@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
     readFile: vi.fn(async (_path: string) => new Uint8Array([1])),
@@ -17,15 +17,18 @@ vi.mock('@tauri-apps/api/event', () => ({
     },
 }))
 vi.mock('./alert', () => ({ alertError: mocks.alertError }))
-vi.mock('src/ts/platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriDesktop: true }))
+vi.mock('src/ts/platform', () => ({
+    isTauri: true,
+    isTauriAndroid: false,
+    isTauriDesktop: true,
+}))
 
-import {
-    OPENED_FILES_EVENT,
-    OPENED_FILES_TAKE_COMMAND,
-    consumeOpenedFiles,
-    registerOpenedFileListeners,
-    resetOpenedFileListenersForTest,
-} from './openedFiles'
+let api: typeof import('./openedFiles')
+let consumeOpenedFiles: typeof api.consumeOpenedFiles
+let registerOpenedFileListeners: typeof api.registerOpenedFileListeners
+let OPENED_FILES_EVENT: typeof api.OPENED_FILES_EVENT
+let OPENED_FILES_TAKE_COMMAND: typeof api.OPENED_FILES_TAKE_COMMAND
+const domListeners: Array<[string, EventListenerOrEventListenerObject]> = []
 
 function importerSpy() {
     const imported: string[] = []
@@ -42,8 +45,15 @@ async function flush() {
 }
 
 describe('opened file delivery', () => {
-    beforeEach(() => {
-        resetOpenedFileListenersForTest()
+    beforeEach(async () => {
+        vi.resetModules()
+        api = await import('./openedFiles')
+        ;({ consumeOpenedFiles, registerOpenedFileListeners, OPENED_FILES_EVENT, OPENED_FILES_TAKE_COMMAND } = api)
+        const addEventListener = window.addEventListener.bind(window)
+        vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
+            if (type === OPENED_FILES_EVENT) domListeners.push([type, listener])
+            addEventListener(type, listener, options)
+        })
         mocks.readFile.mockClear()
         mocks.readFile.mockImplementation(async (_path: string) => new Uint8Array([1]))
         mocks.invoke.mockClear()
@@ -52,6 +62,12 @@ describe('opened file delivery', () => {
         mocks.alertError.mockClear()
         mocks.listeners.length = 0
         delete (window as Window & { tauriOpenedFiles?: unknown }).tauriOpenedFiles
+    })
+
+    afterEach(async () => {
+        await flush()
+        for (const [type, listener] of domListeners.splice(0)) window.removeEventListener(type, listener)
+        vi.restoreAllMocks()
     })
 
     it('reads and imports every file in order', async () => {

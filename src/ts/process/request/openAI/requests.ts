@@ -17,7 +17,7 @@ import { applyAdditionalParameters, applyParameters, getAdditionalParameters } f
 import type { Contents, OpenAIChatExtra, OpenAIChatFull, ToolCall } from './types'
 
 import { getLocalNetworkRequestOptions, type LocalNetworkRequestOptions } from './shared'
-export { requestOpenAIResponseAPI, __testResponsesAPI } from './responses'
+export { requestOpenAIResponseAPI } from './responses'
 function isOfficialOpenAIURL(url: string): boolean {
     try {
         return new URL(url).hostname === 'api.openai.com'

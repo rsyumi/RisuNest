@@ -1,8 +1,8 @@
-import { readFile } from "@tauri-apps/plugin-fs"
-import { invoke } from "@tauri-apps/api/core"
-import { listen } from "@tauri-apps/api/event"
-import { alertError } from "./alert"
-import { isTauriDesktop } from "src/ts/platform"
+import { readFile } from '@tauri-apps/plugin-fs'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { alertError } from './alert'
+import { isTauriDesktop } from 'src/ts/platform'
 
 /**
  * Name shared by the DOM event Android dispatches on a warm start and by the Tauri event the
@@ -18,7 +18,6 @@ export type OpenedFileImporter = (name: string, data: Uint8Array) => Promise<voi
 
 let openedFileImporter: OpenedFileImporter | null = null
 let domListener: ((event: Event) => void) | null = null
-let unlistenNative: (() => void) | null = null
 let queue: Promise<void> = Promise.resolve()
 
 /**
@@ -77,27 +76,16 @@ export function registerOpenedFileListeners(importFile: OpenedFileImporter): voi
     if (isTauriDesktop) {
         void listen(OPENED_FILES_EVENT, () => {
             void drainDesktopOpenedFiles()
-        }).then((unlisten) => {
-            unlistenNative = unlisten
-            // Subscribe before draining so a launch during setup cannot lose its notification.
-            void drainDesktopOpenedFiles()
-        }).catch((error) => {
-            console.warn('Failed to subscribe to opened files:', error)
-            void drainDesktopOpenedFiles()
         })
+            .then(() => {
+                // Subscribe before draining so a launch during setup cannot lose its notification.
+                void drainDesktopOpenedFiles()
+            })
+            .catch((error) => {
+                console.warn('Failed to subscribe to opened files:', error)
+                void drainDesktopOpenedFiles()
+            })
     }
-}
-
-/** Test seam: forgets the registered importer and detaches the listeners. */
-export function resetOpenedFileListenersForTest(): void {
-    openedFileImporter = null
-    if (domListener) {
-        window.removeEventListener(OPENED_FILES_EVENT, domListener)
-        domListener = null
-    }
-    unlistenNative?.()
-    unlistenNative = null
-    queue = Promise.resolve()
 }
 
 function takeInjectedOpenedFiles(): string[] {

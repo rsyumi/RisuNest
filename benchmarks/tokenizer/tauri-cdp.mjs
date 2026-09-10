@@ -64,7 +64,7 @@ export function buildShortSegments(count) {
     )
 }
 
-export function buildBenchmarkConfig(original, port, runId) {
+export function buildBenchmarkConfig(original, port, runId, repositoryRoot = process.cwd()) {
     const safeRunId = runId.replaceAll(/[^a-zA-Z0-9]/g, '')
     const browserArguments = [
         `--remote-debugging-port=${port}`,
@@ -82,6 +82,11 @@ export function buildBenchmarkConfig(original, port, runId) {
     }))
     return {
         ...structuredClone(original),
+        build: {
+            ...original.build,
+            beforeBuildCommand: 'pnpm benchmark:tokenizer:build:agent',
+            frontendDist: path.resolve(repositoryRoot, 'benchmarks/tokenizer/dist'),
+        },
         identifier: `RisuNest.tokenizerbenchmark.${safeRunId}`,
         bundle: { ...original.bundle, active: false },
         plugins: {
@@ -481,13 +486,12 @@ async function runBenchmark(options) {
         const baseConfig = JSON.parse(
             await readFile(path.join(repositoryRoot, 'src-tauri', 'tauri.conf.json'), 'utf8'),
         )
-        const benchmarkConfig = buildBenchmarkConfig(baseConfig, port, runId)
+        const benchmarkConfig = buildBenchmarkConfig(baseConfig, port, runId, repositoryRoot)
         const configPath = path.join(temporaryRoot, 'tauri.tokenizer-benchmark.json')
         await writeFile(configPath, JSON.stringify(benchmarkConfig), 'utf8')
         const environment = {
             ...process.env,
             VITE_RISU_LEGAL_CONFIGURED: 'TRUE',
-            VITE_TOKENIZER_BENCHMARK: 'true',
             APPDATA: isolatedRoaming,
             LOCALAPPDATA: isolatedLocal,
         }
@@ -528,7 +532,7 @@ async function runBenchmark(options) {
         await page.connect(options.timeoutMs)
         await page.call('Runtime.enable')
         await page.call('Network.enable')
-        // RisuRealm만 브라우저 레벨에서 끊는다. 측정 번들은 프로덕션과 동일하다.
+        // Agent-mode endpoint blocking applies from boot; CDP keeps a second block.
         await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
         await page.call('HeapProfiler.enable')
         await waitForInvoke(page, options.timeoutMs)
