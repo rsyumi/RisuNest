@@ -2,6 +2,10 @@ import { invoke } from '@tauri-apps/api/core'
 import { platform } from '@tauri-apps/plugin-os'
 import type { AssetAlias, WorkingSetCommit } from './persistentDataStore'
 import {
+    getAndroidBinaryCommitBridge,
+    type AndroidBinaryCommitBridge,
+} from './androidBinaryCommitBridge'
+import {
     ANDROID_LARGE_COMMIT_SIZE,
     MAX_ANDROID_COMMIT_BYTES,
     sendAndroidCommit,
@@ -50,6 +54,7 @@ export interface SharedWebview {
 export interface CommitTransportDependencies {
     windows(): boolean
     android?(): boolean
+    androidBinary?(): AndroidBinaryCommitBridge | null
     invoke<T>(command: string, args?: Record<string, unknown> | Uint8Array): Promise<T>
     encode(input: CommitEnvelope): Promise<Uint8Array>
     shared(): SharedWebview | undefined
@@ -87,7 +92,11 @@ export class NativeCommitTransport {
             // Keep the existing large-save contract beyond the bounded assembly budget.
             if (bytes.byteLength > MAX_ANDROID_COMMIT_BYTES)
                 return deps.invoke('pds_commit', { ...input })
-            return sendAndroidCommit(bytes, deps.invoke)
+            return sendAndroidCommit(
+                bytes,
+                deps.invoke,
+                deps.androidBinary ? deps.androidBinary() : getAndroidBinaryCommitBridge(),
+            )
         }
         const webview = deps.shared()
         if (!webview || bytes.byteLength > MAX_SHARED_COMMIT_BYTES)

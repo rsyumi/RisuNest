@@ -81,6 +81,17 @@ ordinary JSON commits. **This replaces the native store with a tracked synthetic
 fixture on the dedicated AVD.** It must never run on another device/profile.
 The runner retains the AVD, package, agent entry and offline safety checks.
 
+Use `--device=api35` for the additional isolated `risunest_buffer_api35_synthetic`
+AVD on `emulator-5556`. The default remains `risunest_vm_retest` on `emulator-5554`.
+The runner rejects unknown names instead of accepting arbitrary devices. Check
+sustained ADB responses before each run, and measure the VMs sequentially.
+`--fresh-install=true` clears this package's synthetic app data after validating
+the fixed AVD identity and installing the selected APK. Use only when explicitly
+starting from a fresh fixture; normal runs retain data for durability checks.
+
+The suite compares JSON, forced 32KiB strings, and the production automatic
+transport (256KiB ArrayBuffer on supported WebViews, strings otherwise). It
+records native listener availability and actual binary packet counts/sizes.
 The suite performs two repetitions with reversed mode order for root mutations,
 nested plugin storage, and a conversation message, with both alphabets and all
 four sizes. Each commit is read back for exact source and revision equality.
@@ -92,8 +103,12 @@ those intervals. Counts and timings are emitted, never the source values.
 It also rejects overlapping producers, invalid/stale chunks, incomplete commits
 and stale revisions, then verifies successful retry, page reload cleanup and
 force-stop/restart durability. The assembly limit is 64MiB and each string carries
-at most 32KiB of UTF-8; a larger save uses the existing JSON path before opening
+at most 32KiB of UTF-8 (binary packets carry at most 256KiB); a larger save uses the existing JSON path before opening
 a transfer. This is bounded message passing, not shared memory or zero-copy.
+On supported providers, the protocol checks also cover invalid binary offsets,
+string/binary mode mismatch, incomplete finish, post-cancel packets, and cleanup
+of a partial binary transfer on reload. Errors after open never trigger replay
+through another transport.
 
 `jsHeapBytes` is a post-save browser heap sample when available, otherwise null.
 It is not total native memory or peak allocation, and no GC duration is inferred.

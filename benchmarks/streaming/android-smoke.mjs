@@ -10,8 +10,15 @@ const options = Object.fromEntries(
   process.argv.slice(2).map((arg) => arg.replace(/^--/, "").split("=")),
 );
 const adb = options.adb;
-const serial = "emulator-5554";
-const avd = "risunest_vm_retest";
+assert.ok(
+  !options.device || options.device === "api35",
+  "Unknown synthetic device",
+);
+const serial = options.device === "api35" ? "emulator-5556" : "emulator-5554";
+const avd =
+  options.device === "api35"
+    ? "risunest_buffer_api35_synthetic"
+    : "risunest_vm_retest";
 const packageName = "io.github.rsyumi.risunest";
 const port = 19367;
 const apk = path.resolve(
@@ -152,6 +159,13 @@ async function main() {
   console.log(JSON.stringify({ phase: "offline-install", avd }));
   await cutDeviceNetwork(serial, { run, sleep: delay });
   run(serial, ["install", "-r", apk]);
+  if (options["fresh-install"] === "true") {
+    // Both serial and synthetic AVD identity were checked above. Never clear another profile.
+    assert.match(
+      run(serial, ["shell", "pm", "clear", packageName]).stdout,
+      /Success/,
+    );
+  }
   let client;
   try {
     run(serial, ["shell", "am", "force-stop", packageName]);
@@ -186,6 +200,7 @@ async function main() {
             userAgent: navigator.userAgent, devicePixelRatio, width: innerWidth, height: innerHeight,
             visible: document.visibilityState === 'visible',
             hardwareConcurrency: navigator.hardwareConcurrency,
+            binaryCommitSupported: typeof window.RisuNestCommit?.postMessage === 'function',
             longTaskSupported: PerformanceObserver.supportedEntryTypes.includes('longtask')
         })`);
     assert.equal(environment.visible, true);

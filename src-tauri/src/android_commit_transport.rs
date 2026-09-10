@@ -1,12 +1,13 @@
-//! Bounded strings over Android's JSON/JNI bridge. No partial payload changes the store.
+//! Bounded strings or ArrayBuffer packets. No partial payload changes the store.
 use crate::persistent_store::{
     commands::with_store_mut, AssetAlias, RevisionResult, StoreError, StoreResult, WorkingSetCommit,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 const CAPACITY: usize = 32 * 1024;
+const BINARY_CAPACITY: usize = 256 * 1024;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn invalid(message: &str) -> StoreError {
@@ -34,6 +35,7 @@ fn decode(bytes: &[u8]) -> StoreResult<Envelope> {
 struct Transfer {
     id: String,
     total: usize,
+    binary: bool,
     bytes: Vec<u8>,
 }
 
@@ -43,8 +45,21 @@ struct Pool {
     finishing: Option<String>,
 }
 impl Pool {
-    fn open(&mut self, id: String, total: usize) -> StoreResult<()> {
-        if uuid::Uuid::parse_str(&id).is_err() || total == 0 || total > MAX_BYTES {
+    fn append_packet(&mut self, packet: &[u8]) -> StoreResult<usize> {
+        if packet.len() <= 40 || packet.len() > 40 + BINARY_CAPACITY {
+            return Err(invalid("invalid Android binary packet size"));
+        }
+        let id = std::str::from_utf8(&packet[..36]).map_err(|_| invalid("invalid binary ID"))?;
+        let offset = u32::from_le_bytes(packet[36..40].try_into().unwrap()) as usize;
+        self.append_bytes(id, offset, &packet[40..], true)
+    }
+    fn open(&mut self, id: String, total: usize, binary: bool) -> StoreResult<()> {
+        if uuid::Uuid::parse_str(&id)
+            .map(|uuid| uuid.to_string() != id)
+            .unwrap_or(true)
+            || total == 0
+            || total > MAX_BYTES
+        {
             return Err(invalid("invalid Android commit size or ID"));
         }
         if self.transfer.is_some() || self.finishing.is_some() {
@@ -54,24 +69,39 @@ impl Pool {
         bytes
             .try_reserve_exact(total)
             .map_err(|_| invalid("Android commit allocation failed"))?;
-        self.transfer = Some(Transfer { id, total, bytes });
+        self.transfer = Some(Transfer {
+            id,
+            total,
+            binary,
+            bytes,
+        });
         Ok(())
     }
 
     fn append(&mut self, id: &str, offset: usize, chunk: &str) -> StoreResult<usize> {
+        self.append_bytes(id, offset, chunk.as_bytes(), false)
+    }
+    fn append_bytes(
+        &mut self,
+        id: &str,
+        offset: usize,
+        chunk: &[u8],
+        binary: bool,
+    ) -> StoreResult<usize> {
         let transfer = self
             .transfer
             .as_mut()
             .ok_or_else(|| invalid("no active Android commit"))?;
-        if transfer.id != id
+        if transfer.binary != binary
+            || transfer.id != id
             || offset != transfer.bytes.len()
             || chunk.is_empty()
-            || chunk.len() > CAPACITY
+            || chunk.len() > if binary { BINARY_CAPACITY } else { CAPACITY }
             || chunk.len() > transfer.total - transfer.bytes.len()
         {
             return Err(invalid("invalid Android commit chunk"));
         }
-        transfer.bytes.extend_from_slice(chunk.as_bytes());
+        transfer.bytes.extend_from_slice(chunk);
         Ok(transfer.bytes.len())
     }
 
@@ -107,8 +137,43 @@ impl Pool {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct AndroidCommitState(Mutex<Pool>);
+#[derive(Clone, Default)]
+pub(crate) struct AndroidCommitState(Arc<Mutex<Pool>>);
+
+// Tauri commands and the native WebView listener share the same allocation budget.
+#[cfg(target_os = "android")]
+pub(crate) fn native_state() -> &'static AndroidCommitState {
+    static STATE: std::sync::OnceLock<AndroidCommitState> = std::sync::OnceLock::new();
+    STATE.get_or_init(AndroidCommitState::default)
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_rsyumi_risunest_AndroidCommitNative_append(
+    env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    packet: jni::objects::JByteArray,
+) -> jni::sys::jint {
+    let result = (|| {
+        let length = env.get_array_length(&packet).ok()? as usize;
+        if length <= 40 || length > 40 + BINARY_CAPACITY {
+            return None;
+        }
+        // Bounded owned packet; no Java pointer survives this call.
+        let bytes = env.convert_byte_array(&packet).ok()?;
+        native_state().lock().ok()?.append_packet(&bytes).ok()
+    })();
+    result.map(|offset| offset as i32).unwrap_or(-1)
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_rsyumi_risunest_AndroidCommitNative_reset(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) {
+    native_state().reset();
+}
 impl AndroidCommitState {
     fn lock(&self) -> StoreResult<MutexGuard<'_, Pool>> {
         self.0
@@ -133,10 +198,13 @@ pub(crate) fn pds_commit_android_open(
     state: State<'_, AndroidCommitState>,
     id: String,
     total_bytes: usize,
+    binary: bool,
 ) -> StoreResult<Opened> {
     guard(&window)?;
-    state.lock()?.open(id, total_bytes)?;
-    Ok(Opened { capacity: CAPACITY })
+    state.lock()?.open(id, total_bytes, binary)?;
+    Ok(Opened {
+        capacity: if binary { BINARY_CAPACITY } else { CAPACITY },
+    })
 }
 
 #[tauri::command(async)]
@@ -205,16 +273,62 @@ mod tests {
         uuid::Uuid::new_v4().to_string()
     }
 
+    fn packet(id: &str, offset: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut packet = id.as_bytes().to_vec();
+        packet.extend_from_slice(&offset.to_le_bytes());
+        packet.extend_from_slice(bytes);
+        packet
+    }
+
+    #[test]
+    fn binary_packets_preserve_bytes_and_enforce_mode_bounds_owner_and_order() {
+        let mut pool = Pool::default();
+        let token = id();
+        let bytes = "a".repeat(BINARY_CAPACITY - 1) + &"🐿️한글".repeat(100);
+        pool.open(token.clone(), bytes.len(), true).unwrap();
+        assert!(pool.append(&token, 0, "a").is_err());
+        for bad in [
+            vec![],
+            vec![0; 40],
+            vec![0; 41],
+            packet(&token, 0, &vec![0; BINARY_CAPACITY + 1]),
+            packet(&id(), 0, b"a"),
+            packet(&token, 1, b"a"),
+        ] {
+            assert!(pool.append_packet(&bad).is_err());
+        }
+        for (i, chunk) in bytes.as_bytes().chunks(BINARY_CAPACITY).enumerate() {
+            let offset = (i * BINARY_CAPACITY) as u32;
+            assert_eq!(
+                pool.append_packet(&packet(&token, offset, chunk)).unwrap(),
+                offset as usize + chunk.len()
+            );
+            assert!(pool.append_packet(&packet(&token, offset, chunk)).is_err());
+        }
+        assert_eq!(pool.take(&token).unwrap(), bytes.as_bytes());
+        pool.reset();
+        assert!(pool.open(id(), 1, true).is_err());
+        pool.complete(&token);
+        pool.open(token.clone(), 1, false).unwrap();
+        assert!(pool.append_packet(&packet(&token, 0, b"a")).is_err());
+        pool.reset();
+        pool.open(token.clone(), 2, true).unwrap();
+        pool.append_packet(&packet(&token, 0, b"a")).unwrap();
+        assert!(pool.take(&token).is_err());
+        pool.cancel(&token);
+        assert!(pool.append_packet(&packet(&token, 1, b"b")).is_err());
+    }
+
     #[test]
     fn rejects_bad_sizes_ids_ranges_replays_and_overlapping_producers() {
         let mut pool = Pool::default();
         for total in [0, MAX_BYTES + 1, usize::MAX] {
-            assert!(pool.open(id(), total).is_err());
+            assert!(pool.open(id(), total, false).is_err());
         }
-        assert!(pool.open("bad".into(), 1).is_err());
+        assert!(pool.open("bad".into(), 1, false).is_err());
         let token = id();
-        pool.open(token.clone(), 6).unwrap();
-        assert!(pool.open(id(), 1).is_err());
+        pool.open(token.clone(), 6, false).unwrap();
+        assert!(pool.open(id(), 1, false).is_err());
         for (key, offset, chunk) in [
             ("stale", 0, "a"),
             (&*token, 1, "a"),
@@ -233,30 +347,35 @@ mod tests {
         assert!(pool.take(&token).is_err());
         pool.cancel(&token);
         pool.reset();
-        assert!(pool.open(id(), 1).is_err()); // finish still owns the budget
+        assert!(pool.open(id(), 1, false).is_err()); // finish still owns the budget
         pool.complete("stale");
-        assert!(pool.open(id(), 1).is_err());
+        assert!(pool.open(id(), 1, false).is_err());
         pool.complete(&token);
-        pool.open(id(), 1).unwrap();
+        pool.open(id(), 1, false).unwrap();
     }
 
     #[test]
     fn cancel_and_navigation_release_partial_payloads_only() {
         let mut pool = Pool::default();
         let token = id();
-        pool.open(token.clone(), 3).unwrap();
+        pool.open(token.clone(), 3, false).unwrap();
         pool.append(&token, 0, "a").unwrap();
         pool.cancel("stale");
-        assert!(pool.open(id(), 1).is_err());
+        assert!(pool.open(id(), 1, false).is_err());
         pool.cancel(&token);
-        pool.open(id(), 3).unwrap();
+        pool.open(id(), 3, false).unwrap();
         pool.reset();
         assert!(pool.append(&token, 1, "bc").is_err());
-        pool.open(id(), 1).unwrap();
+        pool.open(id(), 1, false).unwrap();
     }
 
     #[test]
     fn assembled_commit_keeps_exact_data_atomicity_revision_fence_and_snapshot() {
+        check_durable_commit(false);
+        check_durable_commit(true);
+    }
+
+    fn check_durable_commit(binary: bool) {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let stage = store.replace_begin().unwrap();
@@ -272,15 +391,25 @@ mod tests {
         .unwrap();
         let mut pool = Pool::default();
         let token = id();
-        pool.open(token.clone(), data.len()).unwrap();
+        pool.open(token.clone(), data.len(), binary).unwrap();
         let data = String::from_utf8(data).unwrap();
         let mut offset = 0;
         while offset < data.len() {
-            let mut end = (offset + CAPACITY).min(data.len());
-            while !data.is_char_boundary(end) {
+            let mut end =
+                (offset + if binary { BINARY_CAPACITY } else { CAPACITY }).min(data.len());
+            while !binary && !data.is_char_boundary(end) {
                 end -= 1;
             }
-            offset = pool.append(&token, offset, &data[offset..end]).unwrap();
+            offset = if binary {
+                pool.append_packet(&packet(
+                    &token,
+                    offset as u32,
+                    &data.as_bytes()[offset..end],
+                ))
+                .unwrap()
+            } else {
+                pool.append(&token, offset, &data[offset..end]).unwrap()
+            };
             assert_eq!(store.read_root(None).unwrap(), original);
         }
         let envelope = decode(&pool.take(&token).unwrap()).unwrap();

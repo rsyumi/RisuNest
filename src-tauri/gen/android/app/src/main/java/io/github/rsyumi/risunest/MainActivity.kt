@@ -461,6 +461,7 @@ private val postNotificationsRequestedInProcess = AtomicBoolean(false)
 class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
+  private var commitBridge: AndroidCommitBridge? = null
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
   private val exitFlushGate = ExitFlushGate()
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
@@ -572,6 +573,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun recoverRenderer(webView: WebView, didCrash: Boolean): Boolean {
+    commitBridge?.close()
+    commitBridge = null
     Log.e(TAG, "Android WebView renderer exited, didCrash=$didCrash")
     return rendererRecoveryCoordinator.recover(
       removeFromParent = { (webView.parent as? ViewGroup)?.removeView(webView) },
@@ -595,6 +598,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     lifecycleWebView = webView
+    commitBridge?.close()
+    commitBridge = AndroidCommitBridge.attach(webView)
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
     webView.addJavascriptInterface(PeerCloneBridge(), PEER_CLONE_BRIDGE_NAME)
     webView.addJavascriptInterface(GenerationKeepAliveBridge(), GENERATION_KEEP_ALIVE_BRIDGE_NAME)
@@ -694,6 +699,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun onDestroy() {
+    commitBridge?.close()
+    commitBridge = null
     safSourceCancellations.values.forEach { it.set(true) }
     safDestinationCancellations.values.forEach { it.set(true) }
     pendingSafDestination = null

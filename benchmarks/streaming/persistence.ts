@@ -9,6 +9,11 @@ import {
   type CommitEnvelope,
 } from "../../src/ts/storage/nativeCommitTransport";
 import { ANDROID_COMMIT_CHUNK_BYTES } from "../../src/ts/storage/androidCommitTransport";
+import {
+  ANDROID_BINARY_CHUNK_BYTES,
+  binaryCommitSender,
+  getAndroidBinaryCommitBridge,
+} from "../../src/ts/storage/androidBinaryCommitBridge";
 import syntheticDatabase from "../../src-tauri/fixtures/persistent-fixture.json";
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -150,8 +155,8 @@ export async function runPersistenceSuite(api: {
           );
           for (let repeat = 0; repeat < 2; repeat++) {
             for (const mode of repeat % 2
-              ? ["optimized", "json"]
-              : ["json", "optimized"]) {
+              ? ["optimized", "strings", "json"]
+              : ["json", "strings", "optimized"]) {
               progress(
                 `persistence-${scope}-${multilingual ? "unicode" : "ascii"}-${size}-${repeat}-${mode}`,
               );
@@ -198,6 +203,32 @@ export async function runPersistenceSuite(api: {
               const submits: number[] = [];
               const commands: Record<string, number> = {};
               const chunks: number[] = [];
+              let binaryChunks = 0;
+              let binaryMaxBytes = 0;
+              const binary =
+                mode === "optimized"
+                  ? getAndroidBinaryCommitBridge()
+                  : undefined;
+              const measuredBinary = binary
+                ? {
+                    get onmessage() {
+                      return binary.onmessage;
+                    },
+                    set onmessage(listener) {
+                      binary.onmessage = listener;
+                    },
+                    postMessage(packet: ArrayBuffer) {
+                      binaryChunks++;
+                      binaryMaxBytes = Math.max(
+                        binaryMaxBytes,
+                        packet.byteLength - 40,
+                      );
+                      const t = performance.now();
+                      binary.postMessage(packet);
+                      submits.push(performance.now() - t);
+                    },
+                  }
+                : null;
               const measuredInvoke = <T>(
                 command: string,
                 args?: InvokeArgs,
@@ -214,6 +245,7 @@ export async function runPersistenceSuite(api: {
               const transport = new NativeCommitTransport({
                 windows: () => false,
                 android: () => true,
+                androidBinary: () => measuredBinary,
                 invoke: measuredInvoke,
                 encode: encodeNativeCommit,
                 shared: () => undefined,
@@ -308,7 +340,13 @@ export async function runPersistenceSuite(api: {
                 commands,
                 chunkMaxUtf16: chunks.length ? Math.max(...chunks) : null,
                 chunkByteLimit:
-                  mode === "optimized" ? ANDROID_COMMIT_CHUNK_BYTES : null,
+                  mode === "json"
+                    ? null
+                    : binary
+                      ? ANDROID_BINARY_CHUNK_BYTES
+                      : ANDROID_COMMIT_CHUNK_BYTES,
+                binaryChunks,
+                binaryMaxBytes,
                 longTasks: supported ? longTasks : null,
                 exact: true,
                 jsHeapBytes:
@@ -322,7 +360,11 @@ export async function runPersistenceSuite(api: {
     progress("persistence-protocol");
     const before = await invoke<any>("pds_read_root");
     const id = crypto.randomUUID();
-    await invoke("pds_commit_android_open", { id, totalBytes: 2 });
+    await invoke("pds_commit_android_open", {
+      id,
+      totalBytes: 2,
+      binary: false,
+    });
     const reject = async (command: string, args: Record<string, unknown>) => {
       let failed = false;
       try {
@@ -335,6 +377,7 @@ export async function runPersistenceSuite(api: {
     await reject("pds_commit_android_open", {
       id: crypto.randomUUID(),
       totalBytes: 2,
+      binary: false,
     });
     await reject("pds_commit_android_chunk", { id, offset: 1, chunk: "{}" });
     await reject("pds_commit_android_chunk", {
@@ -345,6 +388,43 @@ export async function runPersistenceSuite(api: {
     await reject("pds_commit_android_finish", { id });
     await invoke("pds_commit_android_cancel", { id });
     await reject("pds_commit_android_finish", { id });
+    const bridge = getAndroidBinaryCommitBridge();
+    if (bridge) {
+      const binaryId = crypto.randomUUID();
+      await invoke("pds_commit_android_open", {
+        id: binaryId,
+        totalBytes: 2,
+        binary: true,
+      });
+      const sender = binaryCommitSender(bridge, binaryId);
+      try {
+        let rejected = false;
+        try {
+          await sender.append(1, new Uint8Array([123]));
+        } catch {
+          rejected = true;
+        }
+        check(rejected, "binary-offset-rejected");
+        await reject("pds_commit_android_chunk", {
+          id: binaryId,
+          offset: 0,
+          chunk: "{}",
+        });
+        await sender.append(0, new Uint8Array([123]));
+        await reject("pds_commit_android_finish", { id: binaryId });
+        await invoke("pds_commit_android_cancel", { id: binaryId });
+        rejected = false;
+        try {
+          await sender.append(1, new Uint8Array([125]));
+        } catch {
+          rejected = true;
+        }
+        check(rejected, "binary-cancelled-rejected");
+      } finally {
+        sender.close();
+        await invoke("pds_commit_android_cancel", { id: binaryId });
+      }
+    }
     const stale: CommitEnvelope = {
       commit: {
         expectedRevision: revision - 1,
@@ -388,12 +468,24 @@ export async function runPersistenceSuite(api: {
     );
     // The runner reloads this page and confirms a stale partial producer was released.
     const interrupted = crypto.randomUUID();
-    await invoke("pds_commit_android_open", { id: interrupted, totalBytes: 3 });
-    await invoke("pds_commit_android_chunk", {
+    await invoke("pds_commit_android_open", {
       id: interrupted,
-      offset: 0,
-      chunk: "a",
+      totalBytes: 3,
+      binary: Boolean(bridge),
     });
+    if (bridge) {
+      const sender = binaryCommitSender(bridge, interrupted);
+      try {
+        await sender.append(0, new Uint8Array([97]));
+      } finally {
+        sender.close();
+      }
+    } else
+      await invoke("pds_commit_android_chunk", {
+        id: interrupted,
+        offset: 0,
+        chunk: "a",
+      });
     cases.push({
       id: "protocol-and-final-save",
       exact: true,
@@ -419,7 +511,11 @@ export async function checkPersistenceReload() {
     "reload-durable-source",
   );
   const id = crypto.randomUUID();
-  await invoke("pds_commit_android_open", { id, totalBytes: 1 });
+  await invoke("pds_commit_android_open", {
+    id,
+    totalBytes: 1,
+    binary: Boolean(getAndroidBinaryCommitBridge()),
+  });
   await invoke("pds_commit_android_cancel", { id });
   return { passed: true, id: "reload-releases-partial-and-retains-save" };
 }

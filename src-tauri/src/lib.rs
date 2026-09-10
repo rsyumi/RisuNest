@@ -528,7 +528,7 @@ pub fn run() {
     #[cfg(target_os = "android")]
     {
         builder = builder
-            .manage(android_commit_transport::AndroidCommitState::default())
+            .manage(android_commit_transport::native_state().clone())
             .on_page_load(|webview, payload| {
                 if webview.label() == "main"
                     && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
