@@ -73,6 +73,14 @@ pub(super) fn commit_asset_alias(
                     logical,
                     alias,
                 )?;
+                if alias.kind == "asset" {
+                    super::logical_index::refresh_alias_backed_owners(
+                        transaction,
+                        cas,
+                        logical,
+                        &[&alias.key],
+                    )?;
+                }
             }
             Ok(())
         },
@@ -81,7 +89,7 @@ pub(super) fn commit_asset_alias(
 
 pub(super) fn delete_asset_alias(
     connection: &mut Connection,
-    maintain_logical_index: bool,
+    cas: Option<&PayloadCas>,
     kind: &str,
     key: &str,
     expected_revision: i64,
@@ -90,7 +98,7 @@ pub(super) fn delete_asset_alias(
     incremental_commit(
         connection,
         expected_revision,
-        maintain_logical_index,
+        cas.is_some(),
         |_, _| Ok(()),
         |transaction, generation, logical, ()| {
             transaction.execute(
@@ -104,6 +112,14 @@ pub(super) fn delete_asset_alias(
                     kind,
                     key,
                 )?;
+                if kind == "asset" {
+                    super::logical_index::refresh_alias_backed_owners(
+                        transaction,
+                        cas.expect("logical index has CAS"),
+                        logical,
+                        &[key],
+                    )?;
+                }
             }
             Ok(())
         },
@@ -237,21 +253,30 @@ pub(super) fn apply_root_mutations(
     mut root: Value,
     mutations: &[super::RootMutation],
 ) -> StoreResult<Value> {
-    let value = root.as_object_mut().ok_or_else(|| validation("Persistent root must be an object"))?;
+    let value = root
+        .as_object_mut()
+        .ok_or_else(|| validation("Persistent root must be an object"))?;
     let mut keys = HashSet::new();
     for mutation in mutations {
         let key = match mutation {
             super::RootMutation::Set { key, .. } | super::RootMutation::Delete { key } => key,
         };
-        if matches!(key.as_str(), "characters" | "botPresets" | "pluginCustomStorage") {
+        if matches!(
+            key.as_str(),
+            "characters" | "botPresets" | "pluginCustomStorage"
+        ) {
             return Err(validation("Invalid persistent root mutation key"));
         }
         if !keys.insert(key) {
             return Err(validation("Duplicate persistent root mutation key"));
         }
         match mutation {
-            super::RootMutation::Set { key, value: next } => { value.insert(key.clone(), next.clone()); }
-            super::RootMutation::Delete { key } => { value.shift_remove(key); }
+            super::RootMutation::Set { key, value: next } => {
+                value.insert(key.clone(), next.clone());
+            }
+            super::RootMutation::Delete { key } => {
+                value.shift_remove(key);
+            }
         }
     }
     Ok(root)
@@ -290,13 +315,15 @@ pub(super) fn commit(
                 )?;
             }
             validate_owner_heads_for_commit(input)?;
-            if cas.is_some() {
+            let retained = retained_commit_owner_heads(transaction, active, input)?;
+            let conversations = if cas.is_some() {
                 prior_character_conversations(transaction, active, input)
             } else {
                 Ok(BTreeMap::new())
-            }
+            }?;
+            Ok((conversations, retained))
         },
-        |transaction, generation, logical, prior_character_conversations| {
+        |transaction, generation, logical, (prior_character_conversations, retained)| {
             if let Some(root) = &input.root {
                 put_root(transaction, generation, root)?;
             }
@@ -343,7 +370,7 @@ pub(super) fn commit(
             for alias in asset_aliases {
                 put_asset_alias(transaction, generation, alias)?;
             }
-            replace_changed_owner_heads(transaction, generation, input)?;
+            replace_changed_owner_heads(transaction, generation, input, &retained)?;
             if let Some(logical) = logical {
                 let cas = cas.ok_or_else(|| StoreError::Validation {
                     message: "active logical index requires a payload CAS".to_owned(),
@@ -363,6 +390,19 @@ pub(super) fn commit(
                         cas,
                         logical,
                         alias,
+                    )?;
+                }
+                if asset_aliases.iter().any(|alias| alias.kind == "asset") {
+                    let keys = asset_aliases
+                        .iter()
+                        .filter(|alias| alias.kind == "asset")
+                        .map(|alias| alias.key.as_str())
+                        .collect::<Vec<_>>();
+                    super::logical_index::refresh_alias_backed_owners(
+                        transaction,
+                        cas,
+                        logical,
+                        &keys,
                     )?;
                 }
             }
@@ -479,10 +519,138 @@ fn validate_owner_heads_for_commit(input: &WorkingSetCommit) -> StoreResult<()> 
     Ok(())
 }
 
+fn retained_commit_owner_heads(
+    connection: &Connection,
+    generation: &str,
+    input: &WorkingSetCommit,
+) -> StoreResult<Vec<AssetOwnerHead>> {
+    if input.root.is_none()
+        && input.character.is_none()
+        && input.character_details.is_none()
+        && input.replace_character.is_none()
+        && input.add_character.is_none()
+    {
+        return Ok(Vec::new());
+    }
+    let old_root = if input.root.is_some() {
+        replacement_root(connection, generation)?
+    } else {
+        serde_json::json!({})
+    };
+    let character_ids = input
+        .character
+        .iter()
+        .chain(input.character_details.iter().flatten())
+        .chain(input.replace_character.iter())
+        .chain(input.add_character.iter())
+        .filter_map(|value| value.get("chaId").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let mut retained = Vec::new();
+    for mut head in selected_replacement_owner_heads(
+        connection,
+        generation,
+        Some(input.root.is_some()),
+        &character_ids,
+    )? {
+        let original_owner = head.owner.clone();
+        match &head.owner {
+            AssetOwnerLocator::CharacterAdditionalAssets { character_id } => {
+                if input.delete_character_id.as_ref() == Some(character_id) {
+                    continue;
+                }
+            }
+            AssetOwnerLocator::RootModuleAssets { index } => {
+                let Some(root) = &input.root else {
+                    continue;
+                };
+                let Some(index) = retained_module_index(&old_root, root, "modules", *index, false)
+                else {
+                    continue;
+                };
+                head.owner = AssetOwnerLocator::RootModuleAssets { index };
+            }
+            AssetOwnerLocator::PersonaEmbeddedModuleAssets { index } => {
+                let Some(root) = &input.root else {
+                    continue;
+                };
+                let Some(index) = retained_module_index(&old_root, root, "personas", *index, true)
+                else {
+                    continue;
+                };
+                head.owner = AssetOwnerLocator::PersonaEmbeddedModuleAssets { index };
+            }
+        }
+        let Ok(entries) = owner_entries(input, &head.owner) else {
+            continue;
+        };
+        let new_tuple = Some(match entries {
+            Some(entries) => ReplacementOwnerTuple::Present(entries.clone()),
+            None => ReplacementOwnerTuple::Absent,
+        });
+        if replacement_owner_tuple(connection, generation, &old_root, &original_owner)? == new_tuple
+        {
+            retained.push(head);
+        }
+    }
+    Ok(retained)
+}
+
+fn retained_module_index(
+    old: &Value,
+    new: &Value,
+    property: &str,
+    index: i64,
+    embedded: bool,
+) -> Option<i64> {
+    let old = old.get(property)?.as_array()?;
+    let new = new.get(property)?.as_array()?;
+    let source = old.get(usize::try_from(index).ok()?)?;
+    fn module(value: &Value, embedded: bool) -> Option<&Value> {
+        if embedded {
+            value.get("embeddedModule")
+        } else {
+            Some(value)
+        }
+    }
+    let source_module = module(source, embedded)?;
+    let id = source_module
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    if let Some(id) = id {
+        let matches_id = |value: &&Value| {
+            module(value, embedded)
+                .and_then(|m| m.get("id"))
+                .and_then(Value::as_str)
+                == Some(id)
+        };
+        if old.iter().filter(matches_id).count() == 1 && new.iter().filter(matches_id).count() == 1
+        {
+            return new
+                .iter()
+                .position(|value| matches_id(&value))
+                .map(|index| index as i64);
+        }
+    }
+    // Duplicate or missing IDs still have occurrence identity. Exact parent
+    // matches can move, but ambiguous duplicates must not borrow another head.
+    if new.get(index as usize) == Some(source) {
+        return Some(index);
+    }
+    let matches = new
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| *value == source)
+        .collect::<Vec<_>>();
+    (matches.len() == 1 && old.iter().filter(|value| *value == source).count() == 1)
+        .then(|| matches[0].0 as i64)
+}
+
 fn replace_changed_owner_heads(
     transaction: &Transaction<'_>,
     generation: &str,
     input: &WorkingSetCommit,
+    retained: &[AssetOwnerHead],
 ) -> StoreResult<()> {
     if input.root.is_some() {
         transaction.execute(
@@ -516,7 +684,10 @@ fn replace_changed_owner_heads(
             params![generation, character_id],
         )?;
     }
-    for head in input.asset_owner_heads.as_deref().unwrap_or_default() {
+    for head in retained
+        .iter()
+        .chain(input.asset_owner_heads.as_deref().unwrap_or_default())
+    {
         put_asset_owner_head(transaction, generation, head)?;
     }
     Ok(())
@@ -1086,21 +1257,39 @@ fn replacement_owner_heads(
     connection: &Connection,
     generation: &str,
 ) -> StoreResult<Vec<AssetOwnerHead>> {
+    selected_replacement_owner_heads(connection, generation, None, &[])
+}
+
+fn selected_replacement_owner_heads(
+    connection: &Connection,
+    generation: &str,
+    include_root: Option<bool>,
+    character_ids: &[&str],
+) -> StoreResult<Vec<AssetOwnerHead>> {
     let rows = {
         let mut statement = connection.prepare(
             "SELECT owner_kind, owner_locator, present, manifest_hash, entry_count
-             FROM asset_owner_heads WHERE generation = ?1
+             FROM asset_owner_heads WHERE generation = ?1 AND (
+                ?2 IS NULL OR (?2 = 1 AND owner_kind IN ('root-module-assets', 'persona-embedded-module-assets'))
+                OR (owner_kind = 'character-additional-assets' AND owner_locator IN (SELECT value FROM json_each(?3))))
              ORDER BY owner_kind ASC, owner_locator ASC",
         )?;
-        let rows = statement.query_map([generation], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
+        let rows = statement.query_map(
+            params![
+                generation,
+                include_root,
+                serde_json::to_string(character_ids)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     rows.into_iter()

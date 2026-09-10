@@ -98,6 +98,131 @@ fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[test]
+fn sparse_owner_heads_roundtrip_to_target_and_survive_resync() {
+    let (_source_directory, mut source_store, source_cas) = open_fixture();
+    let request = |generation: &str| LogicalIndexBuildRequest {
+        library_id: "library".to_owned(),
+        generation_id: generation.to_owned(),
+        generation_sequence: "0".to_owned(),
+        parent_generation_id: None,
+        lease: None,
+    };
+    let base = source_store
+        .rebuild_logical_index(&source_cas, request("remote-0"))
+        .unwrap();
+    let root = json!({"modules":[
+        {"id":"absent"}, {"id":"empty","assets":[]},
+        {"id":"full","assets":[["a","assets/a","BIN",{"preserve":true}]]}
+    ], "personas":[{"embeddedModule":{"assets":[]}}]});
+    let character = json!({"chaId":"char","name":"Synthetic", "chats":[], "additionalAssets":[["missing","assets/missing","bin"]]});
+    let mut commit: WorkingSetCommit =
+        serde_json::from_value(json!({"expectedRevision":0,"root":root,"addCharacter":character}))
+            .unwrap();
+    source_store.commit(&commit).unwrap();
+    let remote = source_store
+        .seal_active_logical_generation(&source_cas)
+        .unwrap();
+    let mut source = MapSource {
+        objects: remote
+            .manifest
+            .objects
+            .iter()
+            .map(|object| {
+                (
+                    object.hash.clone(),
+                    source_store
+                        .reconstruct_logical_object(
+                            &source_cas,
+                            "library",
+                            &remote.manifest.generation,
+                            &object.hash,
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect(),
+        content_gets: 0,
+    };
+    let (directory, mut store, cas) = open_fixture();
+    let local = store
+        .rebuild_logical_index(&cas, request("local-0"))
+        .unwrap();
+    cas.prepare_bytes(&base.manifest_bytes).unwrap();
+    store.connection.execute("INSERT INTO logical_peer_common_bases (peer_id, library_id, generation_id, manifest_hash, generation_sequence, updated_at) VALUES ('peer','library','remote-0',?1,'0',0)", [&base.manifest_hash]).unwrap();
+    let plan = ReadyLogicalDeltaPlan {
+        expected_local_revision: 0,
+        expected_base_manifest_hash: base.manifest_hash.clone(),
+        expected_remote_generation: remote.manifest.generation.clone(),
+        apply: remote
+            .manifest
+            .records
+            .iter()
+            .map(|record| match record {
+                LogicalManifestRecord::Live(record) => LogicalDeltaApplyOperation::Put {
+                    key: record.key.clone(),
+                    object_hash: record.object_hash.clone(),
+                    dependencies: record.dependencies.clone(),
+                },
+                _ => unreachable!(),
+            })
+            .collect(),
+        preserve_local_keys: vec![],
+        candidate_object_hashes: remote
+            .manifest
+            .objects
+            .iter()
+            .map(|object| object.hash.clone())
+            .collect(),
+        next_base_manifest_hash: remote.manifest_hash.clone(),
+        next_base_generation_sequence: remote.manifest.generation_sequence.clone(),
+    };
+    let sizes = remote
+        .manifest
+        .objects
+        .iter()
+        .map(|object| (object.hash.clone(), object.size))
+        .collect();
+    let local_hashes = local
+        .manifest
+        .objects
+        .iter()
+        .map(|object| object.hash.clone())
+        .collect();
+    let staging = directory.path().join("owner-roundtrip-staging");
+    let mut target = PersistentLogicalDeltaTarget::new(
+        &mut store,
+        &cas,
+        "peer",
+        "library",
+        "local-0",
+        &remote.manifest_bytes,
+        &staging,
+    )
+    .unwrap();
+    execute_logical_delta_pull(&plan, &local_hashes, &cas, &sizes, &mut source, &mut target)
+        .unwrap();
+    drop(target);
+    assert_eq!(store.read_root(None).unwrap().value, root);
+    assert_eq!(
+        store.read_character("char", None).unwrap().unwrap().value["additionalAssets"],
+        character["additionalAssets"]
+    );
+    assert_eq!(store.list_asset_owner_heads(None).unwrap().value.len(), 5);
+    let received = store.seal_active_logical_generation(&cas).unwrap();
+    assert_eq!(received.manifest.records, remote.manifest.records);
+    commit.expected_revision = store.revision().unwrap();
+    commit.add_character = None;
+    commit.root.as_mut().unwrap()["theme"] = json!("changed");
+    store.commit(&commit).unwrap();
+    let again = store.seal_active_logical_generation(&cas).unwrap();
+    for object in &again.manifest.objects {
+        store
+            .reconstruct_logical_object(&cas, "library", &again.manifest.generation, &object.hash)
+            .unwrap();
+    }
+}
+
 fn descriptor(bytes: &[u8]) -> LogicalManifestObject {
     LogicalManifestObject {
         hash: hash(bytes),

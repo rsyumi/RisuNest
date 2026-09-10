@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     asset_repository::{
-        owner_manifest_codec::{decode_owner_manifest, encode_owner_manifest},
+        owner_manifest_codec::{decode_owner_manifest, encode_owner_manifest, OwnerManifestEntry},
         PayloadCas,
     },
     peer_sync::logical_delta::{
@@ -84,6 +84,7 @@ struct ValidatedOwnerHead {
     head: LogicalOwnerHead,
     tuples: Option<Vec<Value>>,
     dependencies: Vec<LogicalManifestObject>,
+    derived_manifest: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -873,10 +874,20 @@ impl PersistentStore {
                     nonnegative_u64(message_count, "message page count")?,
                 )?
             } else {
-                cas.read_object(object_hash)?
+                match cas.read_object(object_hash)? {
+                    Some(bytes) => bytes,
+                    None => reconstruct_derived_owner_manifest(
+                        &self.connection,
+                        cas,
+                        &pds_generation,
+                        library_id,
+                        generation_id,
+                        object_hash,
+                    )?
                     .ok_or_else(|| StoreError::Validation {
                         message: format!("referenced CAS object {object_hash} is missing"),
-                    })?
+                    })?,
+                }
             }
         };
         verify_object_bytes(&bytes, object_hash, expected_size)?;
@@ -1270,6 +1281,64 @@ pub(super) fn maintain_incremental_asset_alias(
     Ok(())
 }
 
+pub(super) fn refresh_alias_backed_owners(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    keys: &[&str],
+) -> StoreResult<()> {
+    let raw: String = transaction.query_row(
+        "SELECT value FROM root WHERE generation = ?1",
+        [&logical.pds_generation],
+        |row| row.get(0),
+    )?;
+    let root: Value = serde_json::from_str(&raw)?;
+    let stored = load_owner_heads(transaction, &logical.pds_generation, None)?;
+    if owner_parents(&root, None)
+        .iter()
+        .any(|(owner, parent, property)| {
+            !stored.iter().any(|head| &head.owner == owner)
+                && parent
+                    .get(property)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|tuple| {
+                        tuple
+                            .get(1)
+                            .and_then(Value::as_str)
+                            .is_some_and(|key| keys.contains(&key))
+                    })
+        })
+    {
+        replace_kind_projection(transaction, logical, RECORD_KIND_ROOT)?;
+        project_root(
+            transaction,
+            cas,
+            &logical.library_id,
+            &logical.generation_id,
+            &logical.pds_generation,
+        )?;
+    }
+    let mut statement = transaction.prepare(
+        "SELECT character_id FROM characters AS c WHERE generation = ?1 AND NOT EXISTS (
+            SELECT 1 FROM asset_owner_heads AS h WHERE h.generation = c.generation
+            AND h.owner_kind = 'character-additional-assets' AND h.owner_locator = c.character_id)
+            AND EXISTS (SELECT 1 FROM json_each(c.detail, '$.additionalAssets') AS tuple
+                WHERE json_extract(tuple.value, '$[1]') IN (SELECT value FROM json_each(?2)))",
+    )?;
+    let ids = statement
+        .query_map(
+            params![logical.pds_generation, serde_json::to_string(keys)?],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    for id in ids {
+        replace_character_projection(transaction, cas, logical, &id)?;
+    }
+    Ok(())
+}
+
 pub(super) fn maintain_incremental_asset_alias_deletion(
     transaction: &Transaction<'_>,
     logical: &IncrementalLogicalCommit,
@@ -1588,11 +1657,14 @@ fn project_character_by_id(
     let Some((configured_index, raw)) = row else {
         return Ok(false);
     };
-    let mut owner_heads = validate_owner_heads(
-        cas,
-        load_owner_heads(transaction, &logical.pds_generation, Some(character_id))?,
-    )?;
     let mut detail: Value = serde_json::from_str(&raw)?;
+    let mut owner_heads = resolve_owner_heads(
+        transaction,
+        cas,
+        &logical.pds_generation,
+        &detail,
+        Some(character_id),
+    )?;
     strip_character_owner_property(&mut detail, character_id, &mut owner_heads)?;
     let dependencies = owner_dependencies(&owner_heads)?;
     insert_live_record(
@@ -2252,9 +2324,8 @@ fn project_root(
         [pds_generation],
         |row| row.get(0),
     )?;
-    let mut owner_heads =
-        validate_owner_heads(cas, load_owner_heads(transaction, pds_generation, None)?)?;
     let mut value: Value = serde_json::from_str(&raw)?;
+    let mut owner_heads = resolve_owner_heads(transaction, cas, pds_generation, &value, None)?;
     strip_root_owner_properties(&mut value, &mut owner_heads)?;
     let dependencies = owner_dependencies(&owner_heads)?;
     insert_live_record(
@@ -2354,11 +2425,14 @@ fn project_characters(
         let character_id: String = row.get(0)?;
         let configured_index = nonnegative_u64(row.get(1)?, "character configured index")?;
         let raw: String = row.get(2)?;
-        let mut owner_heads = validate_owner_heads(
-            cas,
-            load_owner_heads(transaction, pds_generation, Some(&character_id))?,
-        )?;
         let mut detail: Value = serde_json::from_str(&raw)?;
+        let mut owner_heads = resolve_owner_heads(
+            transaction,
+            cas,
+            pds_generation,
+            &detail,
+            Some(&character_id),
+        )?;
         strip_character_owner_property(&mut detail, &character_id, &mut owner_heads)?;
         let dependencies = owner_dependencies(&owner_heads)?;
         insert_live_record(
@@ -2672,6 +2746,193 @@ fn load_owner_heads(
     Ok(heads)
 }
 
+// Missing stored heads use the same alias-backed interpretation as the
+// compatibility reader. This is a projection, not a mutation of the pinned DB.
+fn resolve_owner_heads(
+    connection: &Connection,
+    cas: &PayloadCas,
+    generation: &str,
+    value: &Value,
+    character_id: Option<&str>,
+) -> StoreResult<Vec<ValidatedOwnerHead>> {
+    let mut heads =
+        validate_owner_heads(cas, load_owner_heads(connection, generation, character_id)?)?;
+    for (owner, parent, property) in owner_parents(value, character_id) {
+        if heads.iter().any(|head| head.head.owner == owner) {
+            continue;
+        }
+        let Some(property_value) = parent.get(property) else {
+            heads.push(ValidatedOwnerHead {
+                head: LogicalOwnerHead::absent(owner),
+                tuples: None,
+                dependencies: Vec::new(),
+                derived_manifest: None,
+            });
+            continue;
+        };
+        let values = property_value
+            .as_array()
+            .ok_or_else(|| missing_source("owner array"))?;
+        let mut entries = Vec::with_capacity(values.len());
+        let mut dependencies = BTreeMap::new();
+        for value in values {
+            let tuple = value
+                .as_array()
+                .filter(|tuple| tuple.len() >= 3)
+                .ok_or_else(|| missing_source("owner tuple"))?;
+            let tuple: [String; 3] = tuple[..3]
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| missing_source("owner tuple string"))
+                })
+                .collect::<StoreResult<Vec<_>>>()?
+                .try_into()
+                .unwrap();
+            let hash: Option<String> = connection.query_row(
+                "SELECT object_hash FROM asset_aliases WHERE generation = ?1 AND kind = 'asset' AND logical_key = ?2",
+                params![generation, tuple[1]], |row| row.get(0),
+            ).optional()?.flatten();
+            let payload_hash = hash
+                .map(|hash| -> StoreResult<[u8; 32]> {
+                    dependencies.insert(hash.clone(), require_cas_size(cas, &hash)?);
+                    hex::decode(&hash)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(|| missing_source("owner payload hash"))
+                })
+                .transpose()?;
+            entries.push(OwnerManifestEntry {
+                tuple,
+                payload_hash,
+            });
+        }
+        let bytes = encode_owner_manifest(&entries).map_err(codec_error)?;
+        let hash = hex::encode(Sha256::digest(&bytes));
+        dependencies.insert(hash.clone(), bytes.len() as u64);
+        heads.push(ValidatedOwnerHead {
+            head: LogicalOwnerHead::unpositioned_present(owner, hash, entries.len() as u64)
+                .map_err(codec_error)?,
+            tuples: Some(
+                entries
+                    .into_iter()
+                    .map(|entry| Value::Array(entry.tuple.into_iter().map(Value::String).collect()))
+                    .collect(),
+            ),
+            dependencies: dependencies
+                .into_iter()
+                .map(|(hash, size)| LogicalManifestObject { hash, size })
+                .collect(),
+            derived_manifest: Some(bytes),
+        });
+    }
+    // Stored and derived heads must have the same order, including after import.
+    heads.sort_by_key(|head| match &head.head.owner {
+        LogicalOwnerLocator::CharacterAdditional { character_id } => (0, 0, character_id.clone()),
+        LogicalOwnerLocator::PersonaEmbeddedModule { index } => (1, *index, String::new()),
+        LogicalOwnerLocator::RootModule { index } => (2, *index, String::new()),
+    });
+    Ok(heads)
+}
+
+fn owner_parents<'a>(
+    value: &'a Value,
+    character_id: Option<&str>,
+) -> Vec<(LogicalOwnerLocator, &'a Value, &'static str)> {
+    if let Some(character_id) = character_id {
+        return vec![(
+            LogicalOwnerLocator::CharacterAdditional {
+                character_id: character_id.to_owned(),
+            },
+            value,
+            "additionalAssets",
+        )];
+    }
+    let mut parents = Vec::new();
+    for (index, module) in value
+        .get("modules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        parents.push((
+            LogicalOwnerLocator::RootModule {
+                index: index as u64,
+            },
+            module,
+            "assets",
+        ));
+    }
+    for (index, persona) in value
+        .get("personas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(module) = persona
+            .get("embeddedModule")
+            .filter(|value| value.is_object())
+        {
+            parents.push((
+                LogicalOwnerLocator::PersonaEmbeddedModule {
+                    index: index as u64,
+                },
+                module,
+                "assets",
+            ));
+        }
+    }
+    parents
+}
+
+fn reconstruct_derived_owner_manifest(
+    connection: &Connection,
+    cas: &PayloadCas,
+    generation: &str,
+    library_id: &str,
+    logical_generation: &str,
+    hash: &str,
+) -> StoreResult<Option<Vec<u8>>> {
+    let mut statement = connection.prepare(
+        "SELECT record_key FROM logical_record_dependencies
+         WHERE library_id = ?1 AND generation_id = ?2 AND object_hash = ?3 ORDER BY record_key",
+    )?;
+    let mut rows = statement.query(params![library_id, logical_generation, hash])?;
+    while let Some(row) = rows.next()? {
+        let (id, raw): (Option<String>, String) =
+            match decode_logical_record_key(&row.get::<_, String>(0)?).map_err(codec_error)? {
+                LogicalRecordLocator::Root => (
+                    None,
+                    connection.query_row(
+                        "SELECT value FROM root WHERE generation = ?1",
+                        [generation],
+                        |row| row.get(0),
+                    )?,
+                ),
+                LogicalRecordLocator::Character { character_id } => {
+                    let raw = connection.query_row(
+                        "SELECT detail FROM characters WHERE generation = ?1 AND character_id = ?2",
+                        params![generation, character_id],
+                        |row| row.get(0),
+                    )?;
+                    (Some(character_id), raw)
+                }
+                _ => continue,
+            };
+        let value: Value = serde_json::from_str(&raw)?;
+        for head in resolve_owner_heads(connection, cas, generation, &value, id.as_deref())? {
+            if head.head.manifest_hash.as_deref() == Some(hash) && head.derived_manifest.is_some() {
+                return Ok(head.derived_manifest);
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn validate_owner_heads(
     cas: &PayloadCas,
     heads: Vec<LogicalOwnerHead>,
@@ -2683,6 +2944,7 @@ fn validate_owner_heads(
                 head,
                 tuples: None,
                 dependencies: Vec::new(),
+                derived_manifest: None,
             });
             continue;
         };
@@ -2718,6 +2980,7 @@ fn validate_owner_heads(
         }
         validated.push(ValidatedOwnerHead {
             head,
+            derived_manifest: None,
             tuples: Some(tuples),
             dependencies: dependencies
                 .into_iter()
@@ -3195,9 +3458,9 @@ fn reconstruct_record(
                 params![pds_generation],
                 "root record source is missing",
             )?;
-            let mut owner_heads =
-                validate_owner_heads(cas, load_owner_heads(connection, pds_generation, None)?)?;
             let mut value: Value = serde_json::from_str(&raw)?;
+            let mut owner_heads =
+                resolve_owner_heads(connection, cas, pds_generation, &value, None)?;
             strip_root_owner_properties(&mut value, &mut owner_heads)?;
             LogicalRecordEnvelope::Root {
                 value,
@@ -3244,11 +3507,14 @@ fn reconstruct_record(
                 )
                 .optional()?
                 .ok_or_else(|| missing_source("character"))?;
-            let mut owner_heads = validate_owner_heads(
-                cas,
-                load_owner_heads(connection, pds_generation, Some(&character_id))?,
-            )?;
             let mut detail: Value = serde_json::from_str(&raw)?;
+            let mut owner_heads = resolve_owner_heads(
+                connection,
+                cas,
+                pds_generation,
+                &detail,
+                Some(&character_id),
+            )?;
             strip_character_owner_property(&mut detail, &character_id, &mut owner_heads)?;
             LogicalRecordEnvelope::Character {
                 configured_index: nonnegative_u64(configured_index, "character configured index")?,
@@ -3894,6 +4160,164 @@ mod tests {
                 0,
                 "{table} retained rows for deleted logical generation"
             );
+        }
+    }
+
+    #[test]
+    fn sparse_owner_alias_changes_reproject_atomically_and_keep_pinned_bytes() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        let (original_hash, _) = seed_all_record_families(&store, &cas);
+        store
+            .connection
+            .execute(
+                "UPDATE root SET value = ?1",
+                [json!({"modules":[{"assets":[["a","same","bin"]]}]}).to_string()],
+            )
+            .unwrap();
+        let first = store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let original = first
+            .manifest
+            .objects
+            .iter()
+            .map(|object| {
+                (
+                    object.hash.clone(),
+                    store
+                        .reconstruct_logical_object(
+                            &cas,
+                            "library",
+                            &first.manifest.generation,
+                            &object.hash,
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let replacement = cas.prepare_bytes(b"replacement owner payload").unwrap();
+        let mut alias = store
+            .read_asset_alias("asset", "same", None)
+            .unwrap()
+            .unwrap()
+            .value;
+        alias.object_hash = Some(replacement.content_hash.clone());
+        alias.size = replacement.byte_size as i64;
+        store.commit_asset_alias(&alias, 0).unwrap();
+        let second = store.seal_active_logical_generation(&cas).unwrap();
+        let mut found = false;
+        for object in &second.manifest.objects {
+            let bytes = store
+                .reconstruct_logical_object(
+                    &cas,
+                    "library",
+                    &second.manifest.generation,
+                    &object.hash,
+                )
+                .unwrap();
+            if let Ok(entries) = decode_owner_manifest(&bytes) {
+                for entry in entries {
+                    if entry.tuple[1] == "same" {
+                        assert_eq!(
+                            entry.payload_hash.map(hex::encode),
+                            Some(replacement.content_hash.clone())
+                        );
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found);
+        assert_ne!(original_hash, replacement.content_hash);
+        store.delete_asset_alias("asset", "same", 1).unwrap();
+        let third = store.seal_active_logical_generation(&cas).unwrap();
+        for object in &third.manifest.objects {
+            let bytes = store
+                .reconstruct_logical_object(
+                    &cas,
+                    "library",
+                    &third.manifest.generation,
+                    &object.hash,
+                )
+                .unwrap();
+            if let Ok(entries) = decode_owner_manifest(&bytes) {
+                for entry in entries {
+                    if entry.tuple[1] == "same" {
+                        assert_eq!(entry.payload_hash, None);
+                    }
+                }
+            }
+        }
+        for (hash, bytes) in original {
+            assert_eq!(
+                store
+                    .reconstruct_logical_object(&cas, "library", &first.manifest.generation, &hash)
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_projection_does_not_hide_invalid_stored_owner_heads() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .connection
+            .execute("UPDATE asset_owner_heads SET entry_count = 9", [])
+            .unwrap();
+        let error = store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("owner manifest entry count does not match"));
+        assert_eq!(store.revision().unwrap(), 0);
+    }
+
+    #[test]
+    fn sparse_owner_heads_prepare_and_reconstruct_without_changing_source() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        let root = json!({"modules":[
+            {"id":"absent"}, {"id":"empty","assets":[]},
+            {"id":"full","assets":[["a","same","BIN",{"extra":true}],["missing","missing","bin"]]}
+        ], "personas":[{"embeddedModule":{"assets":[]}}]});
+        store
+            .connection
+            .execute("UPDATE root SET value = ?1", [root.to_string()])
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM asset_owner_heads", [])
+            .unwrap();
+        let built = store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        for object in &built.manifest.objects {
+            store
+                .reconstruct_logical_object(
+                    &cas,
+                    &built.manifest.library_id,
+                    &built.manifest.generation,
+                    &object.hash,
+                )
+                .unwrap();
+        }
+        assert_eq!(store.read_root(None).unwrap().value, root);
+        assert_eq!(store.revision().unwrap(), 0);
+        assert!(store.list_asset_owner_heads(None).unwrap().value.is_empty());
+        store.commit(&root_commit(0, root)).unwrap();
+        let next = store.seal_active_logical_generation(&cas).unwrap();
+        for object in &next.manifest.objects {
+            store
+                .reconstruct_logical_object(
+                    &cas,
+                    &next.manifest.library_id,
+                    &next.manifest.generation,
+                    &object.hash,
+                )
+                .unwrap();
         }
     }
 

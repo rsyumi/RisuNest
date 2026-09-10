@@ -1562,10 +1562,12 @@ impl PersistentStore {
         key: &str,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        let maintain_logical_index = logical_index::logical_index_is_active(&self.connection)?;
+        let cas = logical_index::logical_index_is_active(&self.connection)?
+            .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
+            .transpose()?;
         commit::delete_asset_alias(
             &mut self.connection,
-            maintain_logical_index,
+            cas.as_ref(),
             kind,
             key,
             expected_revision,

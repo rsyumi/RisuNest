@@ -1,6 +1,112 @@
 use super::*;
 
 #[test]
+fn ordinary_parent_saves_preserve_owner_heads_and_remap_modules() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut value = root(&database);
+    value["modules"] = json!([
+        {"id":"one", "assets":[["a","assets/a","bin"]]},
+        {"id":"two", "assets":[]}
+    ]);
+    let heads = vec![
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "11".repeat(32),
+            1,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 1 },
+            "22".repeat(32),
+            0,
+        ),
+    ];
+    store
+        .commit(&WorkingSetCommit {
+            root: Some(value.clone()),
+            asset_owner_heads: Some(heads.clone()),
+            ..empty_working_set_commit(1)
+        })
+        .unwrap();
+    value["theme"] = json!("changed");
+    store
+        .commit(&WorkingSetCommit {
+            root_mutations: Some(vec![super::super::RootMutation::Set {
+                key: "theme".to_owned(),
+                value: json!("changed"),
+            }]),
+            ..empty_working_set_commit(2)
+        })
+        .unwrap();
+    assert_eq!(store.list_asset_owner_heads(None).unwrap().value, heads);
+    value["modules"].as_array_mut().unwrap().reverse();
+    store
+        .commit(&WorkingSetCommit {
+            root: Some(value),
+            ..empty_working_set_commit(3)
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+            .unwrap()
+            .unwrap()
+            .value
+            .manifest_hash,
+        heads[1].manifest_hash
+    );
+}
+
+#[test]
+fn ordinary_character_save_preserves_head_but_changed_assets_drop_it() {
+    let (_directory, mut store, _database) = open_fixture();
+    let mut detail = store.read_character("char-a", None).unwrap().unwrap().value;
+    detail["additionalAssets"] = json!([["a", "assets/a", "bin"]]);
+    let owner = AssetOwnerLocator::CharacterAdditionalAssets {
+        character_id: "char-a".to_owned(),
+    };
+    let head = AssetOwnerHead::present(owner.clone(), "33".repeat(32), 1);
+    store
+        .commit(&WorkingSetCommit {
+            character: Some(detail.clone()),
+            asset_owner_heads: Some(vec![head.clone()]),
+            ..empty_working_set_commit(1)
+        })
+        .unwrap();
+    let lease = store.acquire_revision(2).unwrap();
+    detail["name"] = json!("Changed name");
+    store
+        .commit(&WorkingSetCommit {
+            character_details: Some(vec![detail.clone()]),
+            ..empty_working_set_commit(2)
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .unwrap()
+            .unwrap()
+            .value,
+        head
+    );
+    detail["additionalAssets"] = json!([]);
+    store
+        .commit(&WorkingSetCommit {
+            character: Some(detail),
+            ..empty_working_set_commit(3)
+        })
+        .unwrap();
+    assert!(store.read_asset_owner_head(&owner, None).unwrap().is_none());
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, Some(&lease.lease))
+            .unwrap()
+            .unwrap()
+            .value,
+        head
+    );
+}
+
+#[test]
 fn asset_owner_occurrences_are_isolated_by_revision_lease() {
     let (_directory, mut store, database) = open_fixture();
     let mut first_root = root(&database);
@@ -201,7 +307,7 @@ fn invalid_or_stale_owner_head_commit_preserves_parent_and_revision() {
 }
 
 #[test]
-fn character_parent_change_invalidates_omitted_owner_head() {
+fn character_name_change_preserves_omitted_owner_head() {
     let (_directory, mut store, _) = open_fixture();
     let mut detail = store
         .read_character("char-a", None)
@@ -219,7 +325,7 @@ fn character_parent_change_invalidates_omitted_owner_head() {
     let shadowed = store
         .commit(&WorkingSetCommit {
             character: Some(detail.clone()),
-            asset_owner_heads: Some(vec![head]),
+            asset_owner_heads: Some(vec![head.clone()]),
             ..empty_working_set_commit(1)
         })
         .expect("commit character owner head");
@@ -239,8 +345,10 @@ fn character_parent_change_invalidates_omitted_owner_head() {
     assert_eq!(
         store
             .read_asset_owner_head(&owner, None)
-            .expect("read invalidated owner head"),
-        None
+            .expect("read retained owner head")
+            .unwrap()
+            .value,
+        head
     );
 }
 
