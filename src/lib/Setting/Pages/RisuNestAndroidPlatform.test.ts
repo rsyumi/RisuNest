@@ -126,4 +126,29 @@ describe('RisuNest Android platform settings', () => {
         expect(notificationBadge?.classList.contains('border-draculared')).toBe(false)
         expect(target.textContent).not.toContain("This feature doesn't work while notifications are off.")
     })
+
+    it('refreshes permission on native resume without browser focus or visibility events', async () => {
+        const target = mountPlatform(false)
+        await tick()
+        expect(target.querySelector('[role="alert"]')).not.toBeNull()
+        target.querySelector('button')?.click()
+
+        mocks.notificationStatus = true
+        window.dispatchEvent(new Event('risunest-android-notifications-changed'))
+        await tick()
+        expect(target.querySelector('[role="status"]')?.textContent).toBe('Allowed')
+        expect(target.querySelector('[role="alert"]')).toBeNull()
+
+        mocks.notificationStatus = false
+        window.dispatchEvent(new Event('risunest-android-notifications-changed'))
+        await tick()
+        expect(target.querySelector('[role="status"]')?.textContent).toBe('Off')
+        expect(target.querySelector('[role="alert"]')).not.toBeNull()
+
+        await unmount(mounted!)
+        mounted = null
+        mocks.androidGenerationNotificationsEnabled.mockClear()
+        window.dispatchEvent(new Event('risunest-android-notifications-changed'))
+        expect(mocks.androidGenerationNotificationsEnabled).not.toHaveBeenCalled()
+    })
 })

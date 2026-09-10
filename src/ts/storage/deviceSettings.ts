@@ -19,7 +19,7 @@ const storageKey = 'risuNestDeviceSettings'
 const defaults: RisuNestDeviceSettings = {
     schema: 'risunest.device-settings/v1',
     performanceProfile: 'normal',
-    androidKeepAliveDuringGeneration: false,
+    androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
     syncAutoListen: false,
     syncListenMethod: 'lan',

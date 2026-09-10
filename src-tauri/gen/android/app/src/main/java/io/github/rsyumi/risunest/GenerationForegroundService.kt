@@ -1,5 +1,6 @@
 package io.github.rsyumi.risunest
 
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -148,12 +149,21 @@ class GenerationForegroundService : Service() {
 
   private fun startInForeground() {
     createNotificationChannel()
+    val openAppIntent = PendingIntent.getActivity(
+      this,
+      GENERATION_FOREGROUND_NOTIFICATION_ID,
+      Intent(this, MainActivity::class.java).addFlags(
+        Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+      ),
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
     startForeground(
       GENERATION_FOREGROUND_NOTIFICATION_ID,
       androidx.core.app.NotificationCompat.Builder(this, GENERATION_FOREGROUND_CHANNEL)
         .setSmallIcon(android.R.drawable.stat_sys_download)
         .setContentTitle(getString(R.string.generation_notification_title))
         .setContentText(getString(R.string.generation_notification_text))
+        .setContentIntent(openAppIntent)
         .setOngoing(true)
         .setOnlyAlertOnce(true)
         .build(),

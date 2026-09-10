@@ -15,7 +15,7 @@ async function loadDeviceSettings() {
 const defaults = {
     schema: 'risunest.device-settings/v1',
     performanceProfile: 'normal',
-    androidKeepAliveDuringGeneration: false,
+    androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
     syncAutoListen: false,
     syncListenMethod: 'lan',
@@ -41,6 +41,14 @@ describe('device settings', () => {
         const { getDeviceSettings } = await loadDeviceSettings()
 
         expect(getDeviceSettings()).toEqual(defaults)
+    })
+
+    it('preserves an explicitly disabled generation keep-alive after reload', async () => {
+        const { updateDeviceSettings } = await loadDeviceSettings()
+        updateDeviceSettings({ androidKeepAliveDuringGeneration: false })
+
+        const { getDeviceSettings } = await loadDeviceSettings()
+        expect(getDeviceSettings().androidKeepAliveDuringGeneration).toBe(false)
     })
 
     it.each([0, 65536, -1, 1.5])('recovers exact defaults from an invalid stored port %s', async (syncFixedPort) => {

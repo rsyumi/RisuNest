@@ -47,9 +47,12 @@
         // event depending on the Android version, so both are observed.
         window.addEventListener('focus', refresh)
         document.addEventListener('visibilitychange', refreshOnVisible)
+        // Android resume does not always produce browser focus/visibility events.
+        window.addEventListener('risunest-android-notifications-changed', refresh)
         return () => {
             window.removeEventListener('focus', refresh)
             document.removeEventListener('visibilitychange', refreshOnVisible)
+            window.removeEventListener('risunest-android-notifications-changed', refresh)
         }
     })
     onDestroy(unsubscribe)

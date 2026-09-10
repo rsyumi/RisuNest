@@ -506,6 +506,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   ) {
     // Peer sync can proceed after denial. Generation keep-alive checks notification
     // availability on each begin and declines to start until it is granted.
+    dispatchNotificationStateRefresh()
   }
   private val rendererRecoveryMarker by lazy {
     val preferences = getSharedPreferences(NATIVE_RESILIENCE_PREFERENCES, MODE_PRIVATE)
@@ -672,6 +673,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     lifecycleFlushDispatcher.onStop()
     super.onStop()
+  }
+
+  override fun onResume() {
+    super.onResume()
+    dispatchNotificationStateRefresh()
+  }
+
+  private fun dispatchNotificationStateRefresh() {
+    lifecycleWebView?.evaluateJavascript(
+      "window.dispatchEvent(new Event('risunest-android-notifications-changed'));",
+      null,
+    )
   }
 
   override fun onSaveInstanceState(outState: Bundle) {
